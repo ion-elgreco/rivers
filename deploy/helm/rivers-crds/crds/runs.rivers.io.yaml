@@ -37,6 +37,12 @@ spec:
         properties:
           spec:
             properties:
+              action:
+                description: |-
+                  Verb this run executes; absent means materialize. Informational
+                  (kubectl) — the pod reads the verb from the run record.
+                nullable: true
+                type: string
               cancelGracePeriodSeconds:
                 default: 300
                 format: uint64

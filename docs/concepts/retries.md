@@ -38,6 +38,10 @@ rs.CodeRepository(..., default_retry_policy=...)    # 3. repo-wide default
 repo.materialize([...], retry=...)                  # acts at the job level for that run
 ```
 
+An [action](actions.md) step is outside this chain: it retries only by its action's
+own `retry=` (none by default), because re-running a half-applied merge or delete
+is a different risk from re-running a materialize.
+
 ## Backoff
 
 `Backoff` is built from named constructors — one per wait shape. Every shape takes a relative `jitter` (a fraction of the computed wait, so it scales with the delay) and most take a `max_delay` ceiling so growth can't run away:
@@ -101,7 +105,7 @@ repo = rs.CodeRepository(
 def skewed_join(): ...
 ```
 
-An unknown name fails at `resolve()` with the registered names listed — never silently at execution time.
+An unknown name fails at `resolve()` with the registered names listed — never silently at execution time. Each repository resolves the name against its own `retries`, so two repositories built from the same assets can give the name different policies.
 
 ## OOM escalation on Kubernetes
 
@@ -143,7 +147,7 @@ Every retried attempt leaves a `StepRetry` event on the run timeline carrying th
 | `rivers/next_delay_ms` | `5000` |
 | `rivers/next_compute` | `{"memory":"16Gi"}` |
 
-The attempt count for a step is the number of its `StepRetry` events plus one; the final `StepSuccess`/`StepFailure` settles the outcome.
+The attempt count for a step is the number of its `StepRetry` events plus one; the final `StepSuccess`/`StepFailure` settles the outcome. Each failed attempt also stores its Python traceback. The run page shows the traceback of each failed step, and the asset page shows each attempt's on its `StepRetry` or `StepFailure` event.
 
 ## Multi-assets
 

@@ -23,6 +23,7 @@ pub struct K8sStepExecutorConfig {
     /// rest of the rivers pods use — the run pod never holds the password
     /// in memory.
     pub surreal_pod_cfg: crate::env::SurrealPodConfig,
+    pub otel_pod_cfg: crate::env::OtelPodConfig,
     pub run_id: String,
     pub run_cr_name: String,
     pub run_cr_uid: String,
@@ -336,8 +337,8 @@ fn build_job_inner(
                             if let Some(pieces) = &workspace_pieces {
                                 env.extend(pieces.main_env.iter().cloned());
                             }
-                            env.extend(config.extra_env.iter().cloned());
-                            env
+                            env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
+                            crate::env::merge_env(env, config.extra_env.iter().cloned())
                         }),
                         ..Default::default()
                     }],
@@ -364,6 +365,7 @@ mod tests {
             module: "my_project.definitions".to_string(),
             surreal_pod_cfg: crate::env::SurrealPodConfig::default()
                 .with_endpoint("ws://surrealdb:8000"),
+            otel_pod_cfg: crate::env::OtelPodConfig::default(),
             run_id: "abc-123".to_string(),
             run_cr_name: "rivers-run-abc-123".to_string(),
             run_cr_uid: "uid-456".to_string(),
@@ -797,6 +799,66 @@ mod tests {
     }
 
     #[test]
+    fn otel_env_forwarded_to_step_pod() {
+        let mut config = test_config();
+        config.otel_pod_cfg = crate::env::OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".to_string(),
+            headers_secret_name: "otel-headers".to_string(),
+            headers_secret_key: "headers".to_string(),
+        };
+        let job = build_step_job(&config, "step");
+        let env = get_env(&job);
+
+        assert_eq!(
+            env_val(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some("https://otlp.example.com:4317".to_string())
+        );
+        assert_eq!(
+            env_val(&env, "RIVERS_OTEL_ENDPOINT"),
+            Some("https://otlp.example.com:4317".to_string())
+        );
+        let envs = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        assert_eq!(
+            crate::env::env_secret_ref(&envs, "OTEL_EXPORTER_OTLP_HEADERS"),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
+        let headers = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
+            .unwrap();
+        assert!(headers.value.is_none());
+    }
+
+    #[test]
+    fn extra_env_replaces_same_named_otel_env() {
+        let mut config = test_config();
+        config.otel_pod_cfg = crate::env::OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".to_string(),
+            ..Default::default()
+        };
+        config.extra_env = vec![EnvVar {
+            name: "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            value: Some("http://team-collector:4317".to_string()),
+            ..Default::default()
+        }];
+        let job = build_step_job(&config, "step");
+        let envs = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+
+        let endpoints: Vec<_> = envs
+            .iter()
+            .filter(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.value.as_deref())
+            .collect();
+        assert_eq!(endpoints, vec![Some("http://team-collector:4317")]);
+    }
+
+    #[test]
     fn extra_env_preserves_secret_key_ref() {
         use k8s_openapi::api::core::v1::{EnvVarSource, SecretKeySelector};
 
@@ -820,15 +882,10 @@ mod tests {
             .clone()
             .unwrap();
         let secret_var = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let secret_ref = secret_var
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "aws-creds");
-        assert_eq!(secret_ref.key, "access-key");
+        assert_eq!(
+            crate::env::env_secret_ref(&envs, "AWS_ACCESS_KEY_ID"),
+            Some(("aws-creds".to_string(), "access-key".to_string()))
+        );
         assert!(secret_var.value.is_none());
     }
 

@@ -90,19 +90,21 @@ pub(crate) use fan_out::{
     load_fan_out_source, persist_dynamic_keys, resolve_predefined_keys,
 };
 pub(crate) use finalize::{
-    collect_input_data_versions, emit_log_output, emit_log_output_via_tx, emit_materialization,
-    emit_observation, emit_partition_failure, emit_step_failure, emit_step_retry,
-    emit_step_retry_via_tx, emit_step_start, emit_step_start_via_tx, emit_step_success,
+    collect_input_data_versions, emit_action_completed, emit_deletion, emit_log_output,
+    emit_log_output_via_tx, emit_materialization, emit_observation, emit_partition_failure,
+    emit_step_failure, emit_step_retry, emit_step_retry_via_tx, emit_step_start,
+    emit_step_start_via_tx, emit_step_success, emit_traceback, emit_traceback_via_tx,
     extract_data_version, now_ts, register_assets_from_nodes, run_failure_hooks, run_success_hooks,
-    step_retry_record,
+    step_retry_record, step_start_record,
 };
 pub(crate) use invoke::{
-    annotation_is, drain_failed_partitions, enumerate_params, execute_step,
-    extract_config_from_annotation, extract_return_hint, get_annotations, is_context_annotation,
+    annotation_is, drain_failed_partitions, enumerate_params, execute_action_step, execute_step,
+    extract_config_from_annotation, extract_return_hint, get_annotations,
+    is_action_context_annotation, is_context_annotation, resolve_annotation,
 };
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,
-    load_self_dependency, map_partition_key_for_upstream, metadata_to_pickle_safe_dict,
-    write_output,
+    load_self_dependency, load_step_output, map_partition_key_for_upstream,
+    metadata_to_pickle_safe_dict, write_output,
 };
 pub(crate) use outputs::{OutputItem, for_each_output};

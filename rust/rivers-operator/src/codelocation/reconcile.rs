@@ -81,6 +81,7 @@ pub struct Context {
     /// is set, `RIVERS_SURREAL_USERNAME` / `_PASSWORD` are emitted via
     /// `valueFrom.secretKeyRef`; otherwise pods connect unauthenticated.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
 }
 
 /// `codeLocation.workspace.*` from the chart, via operator env.
@@ -172,6 +173,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         &resolved_image,
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
+        &ctx.otel_pod_cfg,
     );
     let service = build_service(&cl);
 
@@ -188,7 +190,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         evaluate_deployment_phase(&cl, dep_status.as_ref());
 
     let endpoint = grpc_endpoint(&name, &namespace, cl.spec.grpc_port);
-    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    let now_rfc3339 = jiff::Timestamp::now().to_string();
 
     let prior_status = cl.status.as_ref();
     let mut status = CodeLocationStatus {
@@ -360,7 +362,7 @@ async fn reconcile_git(
                     resolved_image: &resolved_image,
                     image_reason,
                     resolved: &resolved,
-                    fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+                    fetched_at: Some(jiff::Timestamp::now().to_string()),
                     observed,
                 },
             )
@@ -482,6 +484,7 @@ async fn apply_git_workspace(
         resolved_image,
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
+        &ctx.otel_pod_cfg,
         &pieces,
         git_working_dir(git_spec.path.as_deref()),
     );
@@ -680,7 +683,7 @@ async fn patch_git_status(
     cl: &CodeLocation,
     update: GitStatusUpdate<'_>,
 ) -> Result<(), kube_client::Error> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let git_spec = cl.spec.git.as_ref().expect("git status for a git CL");
     let source_reason = if update.resolved.ref_name.is_none() {
@@ -749,7 +752,7 @@ async fn patch_git_error(
     err: &git::GitError,
 ) -> Result<Duration, kube_client::Error> {
     let (reason, retry) = git_error_reason_retry(err);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Failed),
@@ -1136,7 +1139,7 @@ async fn patch_waiting_status(
     generation: Option<i64>,
     cl: &CodeLocation,
 ) -> Result<(), kube_client::Error> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Pending),
@@ -1174,7 +1177,7 @@ async fn patch_error_status(
     cl: &CodeLocation,
     err: &ImageError,
 ) -> Result<(), kube_client::Error> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Failed),

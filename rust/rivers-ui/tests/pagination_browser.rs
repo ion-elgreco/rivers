@@ -42,7 +42,7 @@ fn renders_info_for_first_page() {
     let info = query_one(&target, ".pagination-info")
         .text_content()
         .unwrap();
-    assert_eq!(info, "1 - 25 of 80");
+    assert_eq!(info, "1–25 of 80");
 }
 
 #[wasm_bindgen_test]
@@ -145,5 +145,5 @@ fn zero_page_size_collapses_to_full_range_info() {
     let info = query_one(&target, ".pagination-info")
         .text_content()
         .unwrap();
-    assert_eq!(info, "1 - 42 of 42");
+    assert_eq!(info, "1–42 of 42");
 }

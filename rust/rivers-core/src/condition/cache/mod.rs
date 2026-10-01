@@ -27,10 +27,15 @@ pub struct AssetConditionCache {
     pub downstream_deps: HashMap<String, Vec<String>>,
     /// In-progress runs per asset: asset_key → (run_id → its partition key).
     pub in_progress_assets: HashMap<String, HashMap<String, Option<PartitionKey>>>,
+    /// Live action runs watched for their terminal transition, keyed by run_id.
+    pub live_action_runs: HashMap<String, LiveActionRun>,
     /// Assets whose latest run failed.
     pub failed_assets: HashSet<String>,
     /// Latest failure timestamp per currently-failed asset.
     pub failed_asset_timestamps: HashMap<String, i64>,
+    /// Newest whole-asset deletion seen per asset. A newer one means every
+    /// partition row was dropped, so the asset's partitions are reloaded.
+    pub asset_deletion_ts: HashMap<String, i64>,
     /// Timestamp of the most recent run seen (for cursor-based queries).
     pub last_seen_run_ts: i64,
     /// Timestamp of the most recent observation event seen (cursor for external assets).
@@ -45,7 +50,8 @@ pub struct AssetConditionCache {
     pub last_run_tags: SlotMap<RunTags>,
     /// Run tag sets from materializations completed this tick, per (asset, slot).
     pub tick_materialization_tags: SlotMap<Vec<RunTags>>,
-    /// Full `asset_names` from the latest completed run per (asset, slot).
+    /// `asset_names` from the latest completed run per (asset, slot); a verb
+    /// run keeps only the targets it materialized after the asset.
     pub last_run_asset_names: SlotMap<Arc<[String]>>,
     /// Asset keys that are partitioned.
     partitioned_asset_keys: HashSet<String>,
@@ -96,8 +102,10 @@ impl AssetConditionCache {
             upstream_deps: HashMap::new(),
             downstream_deps: HashMap::new(),
             in_progress_assets: HashMap::new(),
+            live_action_runs: HashMap::new(),
             failed_assets: HashSet::new(),
             failed_asset_timestamps: HashMap::new(),
+            asset_deletion_ts: HashMap::new(),
             last_seen_run_ts: 0,
             last_observation_ts: 0,
             initialized: false,
@@ -326,6 +334,20 @@ impl AssetConditionCache {
                 .get_runs_since(0, Some(status), crate::storage::SortOrder::Asc)
                 .await?;
             for run in &live_runs {
+                // An action run is not a materialization attempt, exactly as in
+                // the steady-state push and the failure floors below — but its
+                // start_time is already below the cursor set above, so watch it
+                // or its completion is never observed.
+                if run.is_action() {
+                    self.live_action_runs.insert(
+                        run.run_id.clone(),
+                        LiveActionRun {
+                            node_names: run.node_names.clone(),
+                            partition_key: run.partition_key.clone(),
+                        },
+                    );
+                    continue;
+                }
                 for asset in &run.node_names {
                     self.track_in_progress_run(
                         asset.clone(),
@@ -340,11 +362,21 @@ impl AssetConditionCache {
         // ExecutionFailed on a fresh cache — persisted eval-state floors are
         // only a rehydration shortcut, not the source of truth. Mirrors the
         // steady-state gates (materialized-by-the-failed-run, or outranked by
-        // a newer materialization, clears the floor).
+        // a newer materialization, clears the floor), including the one in
+        // `apply_run_effects_to_delta` that skips action runs.
         let failed_runs = scoped
             .get_runs_since(0, Some(RunStatus::Failure), crate::storage::SortOrder::Asc)
             .await?;
+        // A whole-asset delete supersedes older failures the same way a newer
+        // materialization does — it also cleared the `last_timestamp` that
+        // `outranked` would otherwise read, so without this every restart
+        // resurrects a deleted asset's long-superseded floors.
+        let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
+        let mut floors: Vec<(&str, &str, i64)> = Vec::new();
         for run in &failed_runs {
+            if run.is_action() {
+                continue;
+            }
             let run_ts = run.end_time.unwrap_or(run.start_time);
             for asset in &run.node_names {
                 if run.partition_key.is_some() && self.is_partitioned(asset) {
@@ -356,29 +388,50 @@ impl AssetConditionCache {
                 let outranked = record
                     .and_then(|r| r.last_timestamp)
                     .is_some_and(|mat| mat >= run_ts);
-                if materialized_here || outranked {
+                let deleted_after = deletion_ts
+                    .get(asset.as_str())
+                    .is_some_and(|&del| del >= run_ts);
+                if materialized_here || outranked || deleted_after {
                     continue;
                 }
-                self.failed_assets.insert(asset.clone());
-                self.failed_asset_timestamps
-                    .entry(asset.clone())
-                    .and_modify(|t| *t = (*t).max(run_ts))
-                    .or_insert(run_ts);
+                floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
             }
         }
+        // The record no longer names a run that materialized the asset before
+        // a delete or a newer run moved it on. The run's own events still do.
+        if !floors.is_empty() {
+            let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
+            let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
+            runs.sort_unstable();
+            runs.dedup();
+            let built = storage.materialized_by_runs(&assets, &runs).await?;
+            floors.retain(|(asset, run_id, _)| {
+                !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
+            });
+        }
+        for (asset, _, run_ts) in floors {
+            self.failed_assets.insert(asset.to_string());
+            self.failed_asset_timestamps
+                .entry(asset.to_string())
+                .and_modify(|t| *t = (*t).max(run_ts))
+                .or_insert(run_ts);
+        }
         // Floors rehydrated from persisted eval-state predate this load; drop
-        // any outranked by a newer materialization (the asset recovered while
-        // the daemon was down — steady state would have cleared them).
+        // any outranked by a newer materialization or deletion (the asset
+        // recovered or was deleted while the daemon was down — steady state
+        // would have cleared them).
         let records = &self.records;
         self.failed_asset_timestamps.retain(|asset, ts| {
             records
                 .get(asset)
                 .and_then(|r| r.last_timestamp)
                 .is_none_or(|mat| mat < *ts)
+                && deletion_ts.get(asset).is_none_or(|&del| del < *ts)
         });
         let floors = &self.failed_asset_timestamps;
         self.failed_assets
             .retain(|asset| floors.contains_key(asset));
+        self.asset_deletion_ts = deletion_ts;
 
         let last_run_ids: Vec<String> = self
             .records
@@ -394,8 +447,15 @@ impl AssetConditionCache {
                 .records
                 .values()
                 .filter_map(|record| {
+                    // Only a Materialization sets `last_run_id`, so this run
+                    // materialized the asset — a verb's `materialized()` too.
                     let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
                     let run_ts = run.end_time.unwrap_or(run.start_time);
+                    let names: Arc<[String]> = if run.is_action() {
+                        self.verb_run_names(&record.asset_key, &run.run_id, &run.node_names)
+                    } else {
+                        Arc::from(run.node_names.as_slice())
+                    };
                     let partitions =
                         run_partition_slots(self.is_partitioned(&record.asset_key), run);
                     let rows: Vec<AssetRunRow> = partitions
@@ -406,7 +466,7 @@ impl AssetConditionCache {
                                 pk,
                                 run_ts,
                                 Arc::from(run.tags.as_slice()),
-                                Arc::from(run.node_names.as_slice()),
+                                Arc::clone(&names),
                             )
                         })
                         .collect();
@@ -436,7 +496,9 @@ impl AssetConditionCache {
         let scoped = storage.for_code_location(ctx);
         for status in [BackfillStatus::Requested, BackfillStatus::InProgress] {
             let backfills = scoped.get_backfills(None, Some(status)).await?;
-            for bf in &backfills {
+            // An action backfill is not a materialization in flight — the
+            // same rule as a live action run.
+            for bf in backfills.iter().filter(|bf| bf.action.is_none()) {
                 for asset in &bf.asset_selection {
                     state
                         .assets
@@ -493,6 +555,28 @@ impl AssetConditionCache {
             .entry(asset.to_string())
             .or_default()
             .insert(partition_key.clone(), Arc::clone(asset_names));
+    }
+
+    /// The targets of verb run `run_id` built with `asset`. A verb's steps may
+    /// run in any order, so another target counts only if its own
+    /// materialization in the run is newer than `asset`'s: a step that ran
+    /// first, returned unchanged() or failed never saw the asset's new data.
+    fn verb_run_names(&self, asset: &str, run_id: &str, names: &[String]) -> Arc<[String]> {
+        let materialized_at = |name: &str| {
+            self.records
+                .get(name)
+                .filter(|r| r.last_run_id.as_deref() == Some(run_id))
+                .and_then(|r| r.last_timestamp)
+        };
+        let asset_ts = materialized_at(asset);
+        names
+            .iter()
+            .filter(|name| {
+                *name == asset
+                    || materialized_at(name).is_some_and(|ts| asset_ts.is_some_and(|a| ts > a))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Track a materialization's run tags for the current tick.

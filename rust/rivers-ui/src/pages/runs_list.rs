@@ -15,11 +15,12 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::components::icons::{IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
-    AssetStack, Crumb, DurationCell, EmptyState, FilterPillGroup, LaunchedByCell, PartitionCell,
+    AssetStack, DurationCell, EmptyState, FilterPillGroup, LaunchedByCell, PartitionCell,
     RiversSearch, StatusChip, Topbar, partition_scheme_for,
 };
 use crate::helpers::{
@@ -28,12 +29,28 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
-use crate::server_fns::actions::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::{BulkRunActionResult, cancel_runs, delete_runs};
 use crate::server_fns::runs::{get_runs_page, get_runs_summary};
 use crate::types::{CodeLocationEntry, RunFilter, RunRecord, RunStatus, RunsSummary};
 
 const GRID: &str = "grid-template-columns: 32px 80px 1.2fr 0.7fr 1.4fr 0.6fr 0.9fr 0.8fr 1fr";
+
+/// Status pills as `(id, label, count)`. Ids are URL values; labels use the
+/// status-chip words.
+fn run_status_pills(counts: [Option<u64>; 5]) -> Vec<(String, String, Option<usize>)> {
+    [
+        ("All", "All"),
+        ("In Progress", "Running"),
+        ("Queued", "Queued"),
+        ("Failure", "Failed"),
+        ("Success", "Success"),
+    ]
+    .into_iter()
+    .zip(counts)
+    .map(|((id, label), n)| (id.to_string(), label.to_string(), n.map(|n| n as usize)))
+    .collect()
+}
 
 fn status_from_tab(tab: &str) -> Option<RunStatus> {
     match tab {
@@ -80,7 +97,7 @@ fn wire_bulk_completion(
                     let detail = r
                         .failed
                         .iter()
-                        .map(|(id, e)| format!("{id}: {e}"))
+                        .map(|(id, e)| format!("{id}: {}", crate::helpers::err_text(&e)))
                         .collect::<Vec<_>>()
                         .join("\n");
                     set_last_result.set(Some((
@@ -91,7 +108,7 @@ fn wire_bulk_completion(
                 }
             }
             Err(e) => set_last_result.set(Some((
-                format!("{fail_verb} failed: {e}"),
+                format!("{fail_verb} failed: {}", crate::helpers::err_text(&e)),
                 true,
                 String::new(),
             ))),
@@ -105,6 +122,7 @@ pub fn RunsListPage() -> impl IntoView {
     let (filter_job, set_filter_job) = signal(String::new());
     let (filter_asset, set_filter_asset) = signal(String::new());
     let (filter_partition, set_filter_partition) = signal(String::new());
+    let (filter_verb, set_filter_verb) = signal(String::new());
     let (page, set_page) = signal(0u64);
     let (page_size, set_page_size) = signal(25u64);
 
@@ -118,22 +136,27 @@ pub fn RunsListPage() -> impl IntoView {
             filter_job.get(),
             filter_asset.get(),
             filter_partition.get(),
+            filter_verb.get(),
             page.get(),
             page_size.get(),
             refresh_tick.get(),
         )
     };
-    let runs_page = Resource::new(page_key, |(tab, job, asset, partition, p, ps, _tick)| {
-        // Empty strings are coerced to `None` server-side in the `From` impl.
-        let filter = RunFilter {
-            status: status_from_tab(&tab),
-            job_name: None,
-            job_substring: Some(job),
-            asset_substring: Some(asset),
-            partition_substring: Some(partition),
-        };
-        async move { get_runs_page(p * ps, ps, filter).await }
-    });
+    let runs_page = Resource::new(
+        page_key,
+        |(tab, job, asset, partition, verb, p, ps, _tick)| {
+            // Empty strings are coerced to `None` server-side in the `From` impl.
+            let filter = RunFilter {
+                status: status_from_tab(&tab),
+                job_name: None,
+                job_substring: Some(job),
+                asset_substring: Some(asset),
+                partition_substring: Some(partition),
+                action: crate::helpers::verb_filter_from_input(&verb),
+            };
+            async move { get_runs_page(p * ps, ps, filter).await }
+        },
+    );
 
     let locations = Resource::new(|| (), |_| list_code_locations());
 
@@ -211,85 +234,59 @@ pub fn RunsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Runs")]>
+        <Topbar
+            title="Runs"
+            subtitle=move || view! {
+                // Derived from `summary` only, so typing in a filter does not
+                // re-render it. On fetch error show "unavailable", not zeros —
+                // zero counts would falsely claim "no runs exist".
+                <Transition>
+                    {move || summary.get().map(|res| match res {
+                        Ok(RunsSummary { total, failure, last_24h, .. }) => view! {
+                            <span class="page-header-num">{total.to_string()}</span>
+                            " total"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{last_24h.to_string()}</span>
+                            " in last 24h"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num page-header-num--error">{failure.to_string()}</span>
+                            " failed"
+                        }.into_any(),
+                        Err(e) => view! {
+                            <span
+                                class="page-header-summary-error"
+                                title=format!("Summary fetch failed: {}", crate::helpers::err_text(&e))
+                            >
+                                "Summary unavailable — will retry on next update"
+                            </span>
+                        }.into_any(),
+                    })}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| reload.run(()))
             />
         </Topbar>
 
-        // Derived from `summary` only, so typing in a job/asset/partition filter
-        // does NOT re-render this block. On fetch error we render "unavailable"
-        // instead of falling back to zeros — zero counts would falsely claim
-        // "no runs exist" and mask the real state.
-        <Transition fallback=move || view! { <GridRowSkeleton rows=2 cols=5/> }>
-            {move || match summary.get() {
-                None => ().into_any(),
-                Some(Ok(s)) => {
-                    let RunsSummary { total, in_progress, queued, failure, success, last_24h } = s;
-                    let status_items: Vec<(String, Option<usize>)> = vec![
-                        ("All".into(), Some(total as usize)),
-                        ("In Progress".into(), Some(in_progress as usize)),
-                        ("Queued".into(), Some(queued as usize)),
-                        ("Failure".into(), Some(failure as usize)),
-                        ("Success".into(), Some(success as usize)),
-                    ];
-                    view! {
-                        <div class="page-header-row" style="align-items: flex-end">
-                            <div class="page-header">
-                                <h1>"Runs"</h1>
-                                <p>
-                                    "All runs · "
-                                    <span class="page-header-num">{total.to_string()}</span>
-                                    " total"
-                                    <span class="page-header-sep">"·"</span>
-                                    <span class="page-header-num">{last_24h.to_string()}</span>
-                                    " in last 24h"
-                                    <span class="page-header-sep">"·"</span>
-                                    <span class="page-header-num page-header-num--error">
-                                        {failure.to_string()}
-                                    </span>
-                                    " failed"
-                                </p>
-                            </div>
-                            <FilterPillGroup
-                                label="STATUS"
-                                items=status_items
-                                active=active_tab_sig
-                                on_select=on_tab
-                            />
-                        </div>
-                    }.into_any()
+        <Transition fallback=move || view! { <GridRowSkeleton rows=1 cols=5/> }>
+            {move || summary.get().map(|res| {
+                let counts = match res {
+                    Ok(s) => [Some(s.total), Some(s.in_progress), Some(s.queued), Some(s.failure), Some(s.success)],
+                    Err(_) => [None; 5],
+                };
+                view! {
+                    <div class="rv-toolbar">
+                        <FilterPillGroup
+                            label="STATUS"
+                            items=run_status_pills(counts)
+                            active=active_tab_sig
+                            on_select=on_tab
+                        />
+                    </div>
                 }
-                Some(Err(e)) => {
-                    let status_items: Vec<(String, Option<usize>)> = vec![
-                        ("All".into(), None),
-                        ("In Progress".into(), None),
-                        ("Queued".into(), None),
-                        ("Failure".into(), None),
-                        ("Success".into(), None),
-                    ];
-                    view! {
-                        <div class="page-header-row" style="align-items: flex-end">
-                            <div class="page-header">
-                                <h1>"Runs"</h1>
-                                <p
-                                    class="page-header-summary-error"
-                                    title=format!("Summary fetch failed: {e}")
-                                >
-                                    "Summary unavailable — will retry on next update"
-                                </p>
-                            </div>
-                            <FilterPillGroup
-                                label="STATUS"
-                                items=status_items
-                                active=active_tab_sig
-                                on_select=on_tab
-                            />
-                        </div>
-                    }.into_any()
-                }
-            }}
+            })}
         </Transition>
 
         <div class="rv-toolbar">
@@ -308,6 +305,11 @@ pub fn RunsListPage() -> impl IntoView {
                 on_input=Callback::new(move |v| { set_filter_partition.set(v); set_page.set(0); })
                 placeholder="partition…"
             />
+            <RiversSearch
+                value=Signal::derive(move || filter_verb.get())
+                on_input=Callback::new(move |v| { set_filter_verb.set(v); set_page.set(0); })
+                placeholder="verb (materialize, delete…)"
+            />
         </div>
 
         <PaginatedView
@@ -320,7 +322,7 @@ pub fn RunsListPage() -> impl IntoView {
             empty=move || view! {
                 <EmptyState
                     message="No runs match the current filters"
-                    hint="clear a filter or widen the status tab"
+                    hint="Clear a filter or pick another status"
                 />
             }
             render={move |rows: Vec<RunRecord>| {
@@ -386,12 +388,14 @@ fn RunsTable(
         })
     };
 
-    // Two-click confirm for delete; any selection change disarms. Local to
-    // the table on purpose: a live-kick re-render also resets to unarmed,
-    // which errs on the safe side.
+    // Two-click confirm for cancel and delete; any selection change disarms.
+    // Local to the table on purpose: a live-kick re-render also resets to
+    // unarmed, which errs on the safe side.
+    let cancel_armed = RwSignal::new(false);
     let delete_armed = RwSignal::new(false);
     Effect::new(move |_| {
         selected.track();
+        cancel_armed.set(false);
         delete_armed.set(false);
     });
 
@@ -399,38 +403,44 @@ fn RunsTable(
         {(n_rows > 0).then(|| view! {
             <div class="bulk-actions">
                 <button
-                    class="bulk-link-btn"
+                    class="link-btn"
                     on:click=move |_| set_selected.set(all_ids.get_value())
                 >
                     {format!("Select all ({n_rows})")}
                 </button>
                 <span class="bulk-sep">"·"</span>
-                <button class="bulk-link-btn" on:click=move |_| set_selected.set(Vec::new())>
+                <button class="link-btn" on:click=move |_| set_selected.set(Vec::new())>
                     "Clear"
                 </button>
                 <Show when=move || !selected_active().is_empty()>
                     <button
-                        class="btn btn-danger"
-                        on:click=move |_| { cancel_action.dispatch(selected_active()); }
+                        class="btn btn-small btn-danger"
+                        on:click=move |_| {
+                            if cancel_armed.get() {
+                                cancel_armed.set(false);
+                                cancel_action.dispatch(selected_active());
+                            } else {
+                                cancel_armed.set(true);
+                            }
+                        }
                         disabled=any_pending
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                            <rect x="3" y="2" width="2.5" height="8"/>
-                            <rect x="6.5" y="2" width="2.5" height="8"/>
-                        </svg>
+                        <IconStop/>
                         {move || {
+                            let runs = crate::helpers::plural(selected_active().len() as u64, "run", "runs");
                             if cancel_pending.get() {
-                                "Canceling...".to_string()
+                                "Canceling…".to_string()
+                            } else if cancel_armed.get() {
+                                format!("Confirm cancel {runs}?")
                             } else {
-                                let n = selected_active().len();
-                                format!("Cancel {n} run{}", if n == 1 { "" } else { "s" })
+                                format!("Cancel {runs}")
                             }
                         }}
                     </button>
                 </Show>
                 <Show when=move || !selected_finished().is_empty()>
                     <button
-                        class="btn btn-danger"
+                        class="btn btn-small btn-danger"
                         on:click=move |_| {
                             if delete_armed.get() {
                                 delete_armed.set(false);
@@ -441,23 +451,15 @@ fn RunsTable(
                         }
                         disabled=any_pending
                     >
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                            <path
-                                d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
-                                stroke="currentColor"
-                                stroke-width="1.1"
-                                stroke-linecap="round"
-                            />
-                        </svg>
+                        <IconTrash/>
                         {move || {
-                            let n = selected_finished().len();
-                            let noun = if n == 1 { "run" } else { "runs" };
+                            let runs = crate::helpers::plural(selected_finished().len() as u64, "run", "runs");
                             if delete_pending.get() {
-                                "Deleting...".to_string()
+                                "Deleting…".to_string()
                             } else if delete_armed.get() {
-                                format!("Confirm delete {n} {noun}?")
+                                format!("Confirm delete {runs}?")
                             } else {
-                                format!("Delete {n} {noun}")
+                                format!("Delete {runs}")
                             }
                         }}
                     </button>
@@ -507,7 +509,7 @@ fn RunRow(
     let run_id = record.run_id.clone();
     let id_for_check = run_id.clone();
     let id_for_toggle = run_id.clone();
-    let (ns, name) = use_current_location().get();
+    let (ns, name) = use_current_location().get_untracked();
     let href = loc_path(&ns, &name, &format!("runs/{}", run_id));
     let short_id = if run_id.len() > 8 {
         run_id[..8].to_string()
@@ -530,13 +532,17 @@ fn RunRow(
         .and_then(|p| p.preview.first())
         .map(|k| partition_scheme_for(k))
         .unwrap_or("·");
-    let launched_cell =
-        match crate::helpers::launched_by_sub_line(&launched_by, job_name.as_deref()) {
-            Some(sub) => {
-                view! { <LaunchedByCell launched_by=launched_by.clone() sub=sub/> }.into_any()
-            }
-            None => view! { <LaunchedByCell launched_by=launched_by/> }.into_any(),
-        };
+    let sub_line = crate::helpers::launched_by_sub_line(&launched_by, job_name.as_deref());
+    // Action runs surface their verb where the job name would sit.
+    let sub_line = match (record.action.clone(), sub_line) {
+        (Some(verb), Some(sub)) => Some(format!("{verb} · {sub}")),
+        (Some(verb), None) => Some(verb),
+        (None, sub) => sub,
+    };
+    let launched_cell = match sub_line {
+        Some(sub) => view! { <LaunchedByCell launched_by=launched_by.clone() sub=sub/> }.into_any(),
+        None => view! { <LaunchedByCell launched_by=launched_by/> }.into_any(),
+    };
 
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
@@ -558,7 +564,7 @@ fn RunRow(
             </span>
             <span class="grid-cell-mono">{short_id}</span>
             {launched_cell}
-            <StatusChip kind=st_kind small=true/>
+            <StatusChip kind=st_kind/>
             <AssetStack assets=asset_names/>
             {partition_val
                 .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p.label()/> }.into_any())

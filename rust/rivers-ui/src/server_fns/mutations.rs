@@ -1,0 +1,590 @@
+//! Server functions for UI mutations (materialize, asset actions, backfills,
+//! run cancel/delete) dispatched via gRPC.
+
+use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::types::{ConfigError, SubmitPartitionKey};
+
+/// Session identity as a proto `UserRef`; `None` in auth mode `none`.
+#[cfg(feature = "ssr")]
+async fn current_user_ref() -> Option<rivers_api::rivers::UserRef> {
+    let identity = super::current_identity().await?;
+    Some(rivers_api::rivers::UserRef {
+        subject: identity.subject,
+        email: identity.email,
+        name: identity.name,
+    })
+}
+
+/// Connect to the code location that owns `run_id` (from its stored
+/// `code_location_id`), regardless of which location the UI is currently
+/// showing — a run-scoped action routed to the page's location would replay
+/// foreign runs against the wrong definitions.
+#[cfg(feature = "ssr")]
+async fn connect_to_run_owner(
+    run_id: &str,
+) -> Result<
+    rivers_api::rivers::code_location_service_client::CodeLocationServiceClient<
+        tonic::transport::Channel,
+    >,
+    ServerFnError,
+> {
+    use rivers_core::storage::StorageBackend;
+    let state = expect_context::<crate::state::AppState>();
+    let record = state
+        .storage
+        .get_run(run_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new(format!("run '{run_id}' not found")))?;
+    let cl = record.code_location_id;
+    let entries = state
+        .registry
+        .list()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let entry = entries
+        .iter()
+        .find(|e| e.identity == cl)
+        // Single-location registries (dev mode) can't cross locations.
+        .or(match entries.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            ServerFnError::new(format!(
+                "code location '{cl}' owning run '{run_id}' is not registered"
+            ))
+        })?;
+    if !entry.is_ready() {
+        return Err(ServerFnError::new(format!(
+            "code location {}/{} is not Ready (phase={})",
+            entry.namespace, entry.name, entry.phase
+        )));
+    }
+    crate::code_location_registry::connect_code_location(&entry.grpc_endpoint)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+#[cfg(feature = "ssr")]
+fn tags_to_proto(tags: Option<Vec<(String, String)>>) -> Vec<rivers_api::rivers::Tag> {
+    tags.unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| rivers_api::rivers::Tag { key: k, value: v })
+        .collect()
+}
+
+/// Convert a UI-side `SubmitPartitionKey` into the proto wire type
+/// `ProtoPartitionKey`. SSR-only because `rivers_api` isn't compiled on
+/// WASM.
+#[cfg(feature = "ssr")]
+fn submit_to_proto(pk: SubmitPartitionKey) -> rivers_api::rivers::ProtoPartitionKey {
+    use rivers_api::rivers::{
+        MultiPartitionDimension, MultiPartitionKey, ProtoPartitionKey, SinglePartitionKey,
+        proto_partition_key,
+    };
+    match pk {
+        SubmitPartitionKey::Single(key) => ProtoPartitionKey {
+            kind: Some(proto_partition_key::Kind::Single(SinglePartitionKey {
+                keys: vec![key],
+            })),
+        },
+        SubmitPartitionKey::Multi(dims) => ProtoPartitionKey {
+            kind: Some(proto_partition_key::Kind::Multi(MultiPartitionKey {
+                dimensions: dims
+                    .into_iter()
+                    .map(|(name, value)| MultiPartitionDimension {
+                        name,
+                        keys: vec![value],
+                    })
+                    .collect(),
+            })),
+        },
+    }
+}
+
+/// Result of a `trigger_materialize` call. Always fire-and-forget — the
+/// caller navigates to the run page (`run_id`) and polls live status.
+/// `status` reports the dispatcher mode (`"queued"` or `"direct"`) so
+/// the UI can adjust copy if needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeResult {
+    pub run_id: String,
+    pub status: String,
+}
+
+/// Trigger a materialization run for `selection` (assets) at the given code
+/// location. `partition_key` is required iff every asset in the selection is
+/// partitioned. `config` is the launch document as JSON, which the backend
+/// validates and stores on the run. Fire-and-forget: returns the
+/// `run_id` immediately; the caller polls the run-detail page for completion.
+#[server]
+pub async fn trigger_materialize(
+    loc_ns: String,
+    loc_name: String,
+    selection: Option<Vec<String>>,
+    partition_key: Option<SubmitPartitionKey>,
+    tags: Option<Vec<(String, String)>>,
+    config: Option<String>,
+) -> Result<MaterializeResult, ServerFnError> {
+    use rivers_api::rivers::MaterializeRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .materialize(MaterializeRequest {
+            selection: selection.unwrap_or_default(),
+            partition_key: partition_key.map(submit_to_proto),
+            tags: tags_to_proto(tags),
+            user: current_user_ref().await,
+            config,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    let r = resp.into_inner();
+    Ok(MaterializeResult {
+        run_id: r.run_id,
+        status: r.status,
+    })
+}
+
+/// Run a named asset action over a selection. Returns the run id.
+/// `whole_asset` is the user's explicit choice to run an Optional-key verb on
+/// every partition; without it the backend rejects a keyless run of one.
+/// `config` is as for [`trigger_materialize`], for the action's config class.
+#[server]
+pub async fn trigger_action(
+    loc_ns: String,
+    loc_name: String,
+    action: String,
+    selection: Vec<String>,
+    partition_key: Option<SubmitPartitionKey>,
+    tags: Option<Vec<(String, String)>>,
+    whole_asset: bool,
+    config: Option<String>,
+) -> Result<String, ServerFnError> {
+    use rivers_api::rivers::RunActionRequest;
+
+    // The backend rejects an empty selection too (all_assets is always false
+    // here) — this copy just fails fast with a clean message instead of a
+    // gRPC status string, and without the round trip.
+    if selection.is_empty() {
+        return Err(ServerFnError::new(format!(
+            "action '{action}' needs at least one asset"
+        )));
+    }
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .run_action(RunActionRequest {
+            action,
+            selection,
+            partition_key: partition_key.map(submit_to_proto),
+            tags: tags_to_proto(tags),
+            user: current_user_ref().await,
+            all_assets: false,
+            whole_asset,
+            config,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    let r = resp.into_inner();
+    if !r.success {
+        return Err(ServerFnError::new(
+            r.error.unwrap_or_else(|| "action failed".to_string()),
+        ));
+    }
+    Ok(r.run_id)
+}
+
+/// Re-execute a run by id, server-side: replays it on its original partition,
+/// reusing tags + job/materialization shape, routed to the run's owning code
+/// location. Returns the new `run_id`. `config` replaces the run's launch
+/// document; `None` reuses it, an empty one runs the definitions as they are.
+#[server]
+pub async fn rerun_run(
+    run_id: String,
+    config: Option<String>,
+) -> Result<MaterializeResult, ServerFnError> {
+    use rivers_api::rivers::RerunRunRequest;
+
+    let mut client = connect_to_run_owner(&run_id).await?;
+
+    let resp = client
+        .rerun_run(RerunRunRequest {
+            run_id,
+            user: current_user_ref().await,
+            config,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    let r = resp.into_inner();
+    Ok(MaterializeResult {
+        run_id: r.run_id,
+        status: r.status,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillRerunResult {
+    pub backfill_id: String,
+    pub num_partitions: u32,
+    pub num_runs: u32,
+    pub status: String,
+}
+
+// `LaunchBackfill` and `MaterializeMissing` both return a `LaunchBackfillResponse`;
+// map it once.
+#[cfg(feature = "ssr")]
+impl From<rivers_api::rivers::LaunchBackfillResponse> for BackfillRerunResult {
+    fn from(r: rivers_api::rivers::LaunchBackfillResponse) -> Self {
+        Self {
+            backfill_id: r.backfill_id,
+            num_partitions: r.num_partitions,
+            num_runs: r.num_runs,
+            status: r.status,
+        }
+    }
+}
+
+/// Re-execute an existing backfill by id. Server reads the original record and resubmits
+/// with identical configuration (partition keys, strategy, failure policy, concurrency, tags).
+#[server]
+pub async fn rerun_backfill(
+    loc_ns: String,
+    loc_name: String,
+    backfill_id: String,
+) -> Result<BackfillRerunResult, ServerFnError> {
+    use rivers_api::rivers::RerunBackfillRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .rerun_backfill(RerunBackfillRequest {
+            backfill_id,
+            dry_run: false,
+            user: current_user_ref().await,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    let r = resp.into_inner();
+    Ok(BackfillRerunResult {
+        backfill_id: r.backfill_id,
+        num_partitions: r.num_partitions,
+        num_runs: r.num_runs,
+        status: r.status,
+    })
+}
+
+/// Backfill an asset's missing partitions — the server computes the set (full
+/// universe − materialized). Backs the "Materialize Missing" button.
+#[server]
+pub async fn materialize_missing_partitions(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+) -> Result<BackfillRerunResult, ServerFnError> {
+    use rivers_api::rivers::MaterializeMissingRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .materialize_missing(MaterializeMissingRequest {
+            asset_key,
+            // Matches `repo.backfill`'s default fan-out.
+            max_concurrency: 4,
+            user: current_user_ref().await,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    Ok(resp.into_inner().into())
+}
+
+/// Launch a backfill over an explicit set of partition keys. With `job_name` set
+/// it targets that job (its own plan + executor; the server resolves its assets,
+/// so `selection` may be empty); otherwise it's an ad-hoc materialization of
+/// `selection`. Used when a multi-partition selection is large enough to warrant
+/// one backfill instead of many individual runs. Strategy defers to each asset's
+/// configured default; concurrency matches `repo.backfill`'s default.
+#[server]
+pub async fn launch_backfill(
+    loc_ns: String,
+    loc_name: String,
+    // `Option` (not a bare `Vec`) so an empty selection survives the server-fn
+    // arg encoding — a job backfill sends `None` (the server resolves the job's
+    // assets). Same reason `trigger_materialize` takes `Option<Vec<String>>`.
+    selection: Option<Vec<String>>,
+    partition_keys: Vec<SubmitPartitionKey>,
+    tags: Option<Vec<(String, String)>>,
+    job_name: Option<String>,
+    /// The verb the child runs execute; `None` materializes. For a job target
+    /// it is the verb the page showed for the job: the backend refuses the
+    /// backfill if the job now runs another one.
+    action: Option<String>,
+    /// As for [`trigger_materialize`]; stored on the backfill and applied to
+    /// every child run.
+    config: Option<String>,
+) -> Result<BackfillRerunResult, ServerFnError> {
+    use rivers_api::rivers::LaunchBackfillRequest;
+
+    // Same rule as `trigger_action`: a `#[server]` fn is a public HTTP
+    // endpoint, so an empty selection with a verb must not reach the backend
+    // and read as "every asset declaring it".
+    if let Some(verb) = &action
+        && job_name.is_none()
+        && selection.as_ref().is_none_or(|s| s.is_empty())
+    {
+        return Err(ServerFnError::new(format!(
+            "backfill with action '{verb}' needs at least one asset"
+        )));
+    }
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .launch_backfill(LaunchBackfillRequest {
+            action,
+            selection: selection.unwrap_or_default(),
+            partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
+            partition_range: None,
+            strategy: None,
+            failure_policy: String::new(),
+            max_concurrency: 4,
+            tags: tags_to_proto(tags),
+            dry_run: false,
+            job_name,
+            user: current_user_ref().await,
+            config,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    Ok(resp.into_inner().into())
+}
+
+/// Run a named job at the given code location. Fire-and-forget: returns
+/// the `run_id` immediately; the caller polls the run-detail page for
+/// completion. The dispatcher mode (`"queued"` or `"direct"`) is not
+/// reported here — the UI navigates to the run page either way.
+/// `action` is the verb the page showed for the job (`None` materializes):
+/// the backend refuses the run if the job now runs another one.
+/// `whole_asset` and `config` are as for [`trigger_action`], for the job's
+/// verb and assets.
+#[server]
+pub async fn execute_job(
+    loc_ns: String,
+    loc_name: String,
+    job_name: String,
+    action: Option<String>,
+    partition_key: Option<SubmitPartitionKey>,
+    whole_asset: bool,
+    config: Option<String>,
+) -> Result<MaterializeResult, ServerFnError> {
+    use rivers_api::rivers::ExecuteJobRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = client
+        .execute_job(ExecuteJobRequest {
+            job_name,
+            partition_key: partition_key.map(submit_to_proto),
+            user: current_user_ref().await,
+            whole_asset,
+            action,
+            config,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+
+    let r = resp.into_inner();
+    Ok(MaterializeResult {
+        run_id: r.run_id,
+        status: String::new(),
+    })
+}
+
+/// Request cancellation of an in-flight run. Routes to the owning code
+/// location's gRPC service, which persists the cancel flag in storage and
+/// signals the run backend (Local in-process / K8s pod kill). Returns
+/// `true` once the request was accepted.
+#[server]
+pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::CancelRunRequest;
+
+    let mut client = connect_to_run_owner(&run_id).await?;
+
+    let resp = client
+        .cancel_run(CancelRunRequest { run_id })
+        .await
+        .map_err(super::grpc_err)?;
+
+    Ok(resp.into_inner().success)
+}
+
+/// Outcome of a bulk run action (cancel / delete). `requested` counts runs
+/// whose request was accepted; `failed` carries `(run_id, error)` for the
+/// rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRunActionResult {
+    pub requested: u32,
+    pub failed: Vec<(String, String)>,
+}
+
+#[cfg(feature = "ssr")]
+async fn cancel_one(run_id: &str) -> Result<(), ServerFnError> {
+    use rivers_api::rivers::CancelRunRequest;
+
+    let mut client = connect_to_run_owner(run_id).await?;
+    client
+        .cancel_run(CancelRunRequest {
+            run_id: run_id.to_string(),
+        })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(())
+}
+
+/// Request cancellation of several runs in one round-trip. Each run routes
+/// to its own owning code location, so a selection spanning locations works;
+/// one run failing (unknown id, location not Ready) doesn't stop the rest.
+#[server]
+pub async fn cancel_runs(run_ids: Vec<String>) -> Result<BulkRunActionResult, ServerFnError> {
+    let mut requested = 0u32;
+    let mut failed = Vec::new();
+    for run_id in run_ids {
+        match cancel_one(&run_id).await {
+            Ok(()) => requested += 1,
+            Err(e) => failed.push((run_id, e.to_string())),
+        }
+    }
+    Ok(BulkRunActionResult { requested, failed })
+}
+
+#[cfg(feature = "ssr")]
+async fn delete_one(run_id: &str) -> Result<(), ServerFnError> {
+    use rivers_api::rivers::DeleteRunRequest;
+
+    let mut client = connect_to_run_owner(run_id).await?;
+    let resp = client
+        .delete_run(DeleteRunRequest {
+            run_id: run_id.to_string(),
+        })
+        .await
+        .map_err(super::grpc_err)?;
+    if !resp.into_inner().success {
+        return Err(ServerFnError::new(format!("run '{run_id}' not found")));
+    }
+    Ok(())
+}
+
+/// Delete a terminal run and its history (events, step logs). The owning
+/// code location refuses runs that are still active — cancel those first.
+#[server]
+pub async fn delete_run(run_id: String) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::DeleteRunRequest;
+
+    let mut client = connect_to_run_owner(&run_id).await?;
+
+    let resp = client
+        .delete_run(DeleteRunRequest { run_id })
+        .await
+        .map_err(super::grpc_err)?;
+
+    Ok(resp.into_inner().success)
+}
+
+/// Delete several terminal runs in one round-trip; same per-run routing and
+/// failure collection as [`cancel_runs`].
+#[server]
+pub async fn delete_runs(run_ids: Vec<String>) -> Result<BulkRunActionResult, ServerFnError> {
+    let mut requested = 0u32;
+    let mut failed = Vec::new();
+    for run_id in run_ids {
+        match delete_one(&run_id).await {
+            Ok(()) => requested += 1,
+            Err(e) => failed.push((run_id, e.to_string())),
+        }
+    }
+    Ok(BulkRunActionResult { requested, failed })
+}
+
+/// The errors each asset's config class reports for `config`, built as a
+/// run builds it: what a launch would be refused for, and what a run
+/// would hit at start.
+#[server]
+pub async fn validate_config(
+    loc_ns: String,
+    loc_name: String,
+    selection: Vec<String>,
+    action: Option<String>,
+    config: String,
+) -> Result<Vec<ConfigError>, ServerFnError> {
+    use rivers_api::rivers::{ValidateConfigRequest, config_loc};
+
+    use crate::types::ConfigLoc;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .validate_config(ValidateConfigRequest {
+            selection,
+            config,
+            action,
+        })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp
+        .into_inner()
+        .errors
+        .into_iter()
+        .map(|e| ConfigError {
+            path: e.path,
+            loc: e
+                .loc
+                .into_iter()
+                .filter_map(|l| l.part)
+                .map(|part| match part {
+                    config_loc::Part::Key(key) => ConfigLoc::Key(key),
+                    config_loc::Part::Index(index) => ConfigLoc::Index(index),
+                })
+                .collect(),
+            message: e.message,
+            kind: e.kind,
+        })
+        .collect())
+}

@@ -24,5 +24,5 @@ pub struct ExternalAsset {
 }
 
 /// Python-exposed marker subclass created via `Asset.external(...)`.
-#[pyclass(name = "ExternalAsset", extends=PyAsset, module = "rivers._core")]
+#[pyclass(name = "ExternalAsset", extends=PyAsset, subclass, module = "rivers._core")]
 pub struct PyExternalAsset;

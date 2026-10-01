@@ -4,6 +4,10 @@ An **asset** is a function that produces a data artifact. Assets form a directed
 
 rivers supports four asset types:
 
+Every type can also be defined as a class — configuration as class attributes, verbs
+as classmethods, shared pieces inherited through base classes. Both forms desugar to
+the same objects; see [Class-Based Assets](../guides/class-assets.md).
+
 ## Single assets
 
 The most common type. A function decorated with `@Asset` that produces one output:
@@ -194,8 +198,11 @@ Trigger observations manually via `CodeRepository.observe()`:
 repo = rs.CodeRepository(assets=[source_table, enriched])
 
 # Observe all external assets (or filter with asset_names=["source_table"])
-observations = repo.observe()
-print(observations["source_table"]["row_count"].raw_value())  # 150000
+result = repo.observe()
+assert result.success
+
+# The metadata lands on the run's Observation events.
+events = repo.storage.get_events_for_run(result.run_id)
 ```
 
 In production, attach an `AutomationCondition.on_cron()` to run observations on a schedule. When the observation records a new `data_version`, downstream assets with `AutomationCondition.eager()` will automatically materialize:
@@ -266,6 +273,19 @@ def events():
 Custom IO handlers can define their own prefixed keys following the same convention.
 
 Metadata is a `dict[str, str]` — all values are strings. IO handlers parse them as needed (e.g. `delta/partition_expr` can be a JSON dict for multi-dimensional partitions).
+
+### Per-run overrides
+
+A launch can add or replace metadata keys for one run through the [launch document](configuration.md#the-launch-document), from Python or the UI's launch dialogs:
+
+```python
+repo.materialize(
+    selection=["events"],
+    config={"assets": {"events": {"metadata": {"delta/mode": "overwrite"}}}},
+)
+```
+
+The merged metadata reaches `context.asset_metadata`, the IO handlers and the engine for that run only; the definition is unchanged. `rivers/executor` set this way picks the executor for that asset's step.
 
 ## Output metadata
 

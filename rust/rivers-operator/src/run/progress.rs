@@ -38,7 +38,7 @@ pub async fn update_progress(
     new_status.total_steps = Some(progress.total_steps);
 
     if new_completed > old_completed {
-        new_status.last_progress_at = Some(chrono::Utc::now().to_rfc3339());
+        new_status.last_progress_at = Some(jiff::Timestamp::now().to_string());
     }
 
     patch_status(runs_api, name, &new_status).await?;
@@ -63,7 +63,7 @@ mod tests {
     use crate::run::test_helpers::*;
 
     async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
-        let ts = chrono::Utc::now().timestamp();
+        let ts = jiff::Timestamp::now().as_second();
         for i in 0..total {
             storage
                 .store_event(&EventRecord {

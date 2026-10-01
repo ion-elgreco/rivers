@@ -179,6 +179,28 @@ pub(crate) fn load_upstream_input(
     handler.call_method1(py, "load_input", (ctx,))
 }
 
+/// Load a step's own output back through its output handler, as the input
+/// of `downstream_name`.
+pub(crate) fn load_step_output(
+    py: Python,
+    step_name: &str,
+    node: &ResolvedNode,
+    downstream_name: &str,
+    partition_key: &Option<PyPartitionKey>,
+    type_hint: Option<&Py<PyAny>>,
+    registry: &IOHandlerRegistry,
+) -> PyResult<Py<PyAny>> {
+    let handler = registry.for_output(py, node);
+    let ctx = PyInputContext {
+        asset_name: step_name.to_string(),
+        downstream_asset: downstream_name.to_string(),
+        asset_metadata: node.metadata(),
+        partition: build_partition_context(node, partition_key)?,
+        type_hint: type_hint.map(|h| h.clone_ref(py)),
+    };
+    handler.call_method1(py, "load_input", (ctx,))
+}
+
 /// Write a result to IO via a handler. Returns the data_version registered by
 /// the IO handler. This is the shared core used by both the in-process
 /// executor and the parallel worker.

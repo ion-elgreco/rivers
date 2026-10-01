@@ -33,7 +33,10 @@ class StoredEvent:
 class StoredLog:
     """One step execution's captured output (``run_logs`` row).
 
-    Streams the step didn't produce are ``None``.
+    Streams the step didn't produce are ``None``. A failed attempt writes its
+    ``traceback`` in a row of its own: JSON with the exception chain
+    (``exceptions``, oldest first, with frames and source lines) and ``text``,
+    the traceback as Python prints it.
     """
 
     id: str
@@ -43,6 +46,7 @@ class StoredLog:
     stdout: str | None
     stderr: str | None
     logs: str | None
+    traceback: str | None
 
 class StaleCause:
     """One reason an asset is considered stale relative to its deps / code version."""
@@ -66,11 +70,14 @@ class AssetRecord:
     code_version: str | None
     """Currently-declared code version on the asset definition."""
     last_event_id: str | None
-    """ID of the most recent materialization event (``None`` if never materialized)."""
+    """ID of the most recent materialization event — or of the ``Deletion`` event
+    after a whole-asset delete. ``None`` if neither happened."""
     last_run_id: str | None
-    """Run ID that produced the most recent materialization."""
+    """Run ID that produced the most recent materialization (``None`` after a
+    whole-asset delete)."""
     last_timestamp: int | None
-    """Nanosecond timestamp of the most recent materialization."""
+    """Nanosecond timestamp of the most recent materialization (``None`` after a
+    whole-asset delete)."""
     last_data_version: str | None
     """Data version recorded by the most recent materialization."""
     last_materialization_code_version: str | None
@@ -178,6 +185,12 @@ class RunRecord:
     block_reason: str | None
     launched_by: LaunchedBy
     """Origin of this run (manual / schedule / sensor / backfill / condition)."""
+    action: str | None
+    """The verb this run executes. ``None`` means materialize."""
+    config: dict[str, Any] | None
+    """The launch document the run was launched with:
+    ``{"assets": {name: {"config": {...}, "metadata": {...}}}, "resources":
+    {key: {...}}}``. ``None`` means the definitions as they are."""
 
 class PoolLimit:
     """Configuration of a concurrency pool."""
@@ -456,6 +469,22 @@ class Storage:
 
     def _free_expired_leases(self) -> int:
         """(Internal) sweep expired leases; return the number of slots freed."""
+        ...
+
+    def _create_run(
+        self,
+        run_id: str,
+        job_name: str,
+        status: str,
+        start_time: int,
+        priority: int = 0,
+        tags: list[tuple[str, str]] = ...,
+        block_reason: str | None = None,
+        node_names: list[str] = ...,
+        action: str | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        """(Internal) create a run record directly — test helper."""
         ...
 
     def get_queued_runs(self) -> list[RunRecord]:

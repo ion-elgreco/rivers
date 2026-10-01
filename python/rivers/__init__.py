@@ -40,15 +40,23 @@ from rivers._core import (
     TagConcurrencyLimit,
 )
 from rivers._core.assets import (
+    ActionConcurrency,
+    ActionContext,
+    ActionOrdering,
+    ActionPartitioning,
+    ActionResult,
     Asset,
+    AssetAction,
     AssetDef,
     AssetExecutionContext,
     DepDef,
     ExternalAsset,
     GraphAsset,
     MultiAsset,
+    Outcome,
     SelfDependency,
     SingleAsset,
+    action,
 )
 from rivers._core.automation import AutomationCondition
 from rivers._core.executor import Executor
@@ -101,6 +109,14 @@ from rivers.resource import Resource
 
 __all__ = [
     "exceptions",
+    "action",
+    "ActionConcurrency",
+    "ActionContext",
+    "ActionOrdering",
+    "ActionPartitioning",
+    "ActionResult",
+    "AssetAction",
+    "Outcome",
     "AssetDef",
     "Asset",
     "AssetExecutionContext",
@@ -175,8 +191,22 @@ __all__ = [
 ]
 
 try:
-    from rivers.io_handlers.delta import DeltaIOHandler
+    from rivers.io_handlers.delta import DeltaAsset, DeltaIOHandler
 
-    __all__ = [*__all__, "DeltaIOHandler"]
-except ImportError:
-    pass
+    __all__ = [*__all__, "DeltaAsset", "DeltaIOHandler"]
+except ImportError as e:
+    _delta_import_error = e
+
+    def __getattr__(name: str):
+        """Point at the missing extra instead of a bare "cannot import name".
+
+        Raises:
+            ImportError: For the Delta names, naming the extra to install.
+            AttributeError: For everything else, as usual.
+        """
+        if name in ("DeltaAsset", "DeltaIOHandler"):
+            raise ImportError(
+                f"{name} requires the Delta extras — install "
+                f"'rivers[delta-pyarrow]' ({_delta_import_error})"
+            ) from _delta_import_error
+        raise AttributeError(f"module 'rivers' has no attribute '{name}'")

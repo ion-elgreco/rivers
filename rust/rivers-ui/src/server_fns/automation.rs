@@ -7,44 +7,55 @@ use crate::types::{
     SensorRecord, TickRecord,
 };
 
-/// Format the next firing of `expr` after `now` in `"%Y-%m-%d %H:%M:%S UTC"`,
-/// or `None` if `expr` doesn't parse / has no next occurrence.
-///
-/// `.with_seconds_optional()` accepts both 5-field (`"*/5 * * * *"`) and
-/// 6-field (`"*/30 0 0 * * *"`) expressions — the daemon scheduler, partition
-/// defs, and condition eval all parse with this flag, so the UI's "next tick"
-/// preview must match or it'll silently disagree with what the daemon ticks.
-///
-/// Gated behind the `ssr` feature because `croner` is an `ssr`-only dep — the
-/// `#[server]` callers below stub themselves out under `hydrate` (the macro
-/// emits a network-call shim instead of the body), so this helper is unused
-/// in wasm builds.
+/// Outcome of an on-demand schedule or sensor tick. A skip is a normal
+/// outcome, not an error.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EvaluateResult {
+    pub run_ids: Vec<String>,
+    pub skip_reason: Option<String>,
+}
+
+/// Next firing of `expr` after `now` as `"%Y-%m-%d %H:%M:%S UTC"`, or `None`
+/// if it doesn't parse. Uses the daemon's cron parser and timezone rules, so
+/// the preview matches the tick the daemon will actually run.
 #[cfg(feature = "ssr")]
-fn next_occurrence_from(expr: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    croner::parser::CronParser::builder()
-        .seconds(croner::parser::Seconds::Optional)
-        .build()
-        .parse(expr)
-        .ok()
-        .and_then(|c| c.find_next_occurrence(&now, false).ok())
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+fn next_occurrence_from(
+    expr: &str,
+    timezone: Option<&str>,
+    now: jiff::Timestamp,
+) -> Option<String> {
+    let cron = rivers_core::timegrid::parse_cron(expr).ok()?;
+    rivers_core::condition::next_cron_occurrence_utc(&cron, now, timezone)
+        .map(|t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string())
 }
 
-/// Compute next tick time for a cron expression. Returns formatted string.
+/// Next tick of one schedule. `timezone` is the schedule's IANA zone.
 #[server]
-pub async fn get_next_tick(cron_expression: String) -> Result<Option<String>, ServerFnError> {
-    Ok(next_occurrence_from(&cron_expression, chrono::Utc::now()))
+pub async fn get_next_tick(
+    cron_expression: String,
+    timezone: Option<String>,
+) -> Result<Option<String>, ServerFnError> {
+    Ok(next_occurrence_from(
+        &cron_expression,
+        timezone.as_deref(),
+        jiff::Timestamp::now(),
+    ))
 }
 
-/// Compute next tick times for multiple cron expressions in a single request.
+/// Next ticks for `(name, cron, timezone)` triples in one request. An empty
+/// timezone means UTC.
 #[server]
 pub async fn get_next_ticks(
-    cron_expressions: Vec<(String, String)>,
+    schedules: Vec<(String, String, String)>,
 ) -> Result<Vec<(String, Option<String>)>, ServerFnError> {
-    let now = chrono::Utc::now();
-    Ok(cron_expressions
+    let now = jiff::Timestamp::now();
+    Ok(schedules
         .into_iter()
-        .map(|(name, expr)| (name, next_occurrence_from(&expr, now)))
+        .map(|(name, expr, tz)| {
+            let tz = (!tz.is_empty()).then_some(tz.as_str());
+            let next = next_occurrence_from(&expr, tz, now);
+            (name, next)
+        })
         .collect())
 }
 
@@ -65,7 +76,7 @@ pub async fn get_schedules(
     let resp = client
         .get_schedules(GetSchedulesRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -103,7 +114,7 @@ pub async fn get_sensors(
     let resp = client
         .get_sensors(GetSensorsRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -134,7 +145,7 @@ pub async fn get_jobs(loc_ns: String, loc_name: String) -> Result<Vec<JobRecord>
     let resp = client
         .get_jobs(GetJobsRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     Ok(resp
         .into_inner()
@@ -144,6 +155,7 @@ pub async fn get_jobs(loc_ns: String, loc_name: String) -> Result<Vec<JobRecord>
             name: j.name,
             asset_selection: j.asset_selection,
             executor_type: j.executor_type,
+            action: j.action,
         })
         .collect())
 }
@@ -188,7 +200,7 @@ pub async fn evaluate_schedule(
     loc_ns: String,
     loc_name: String,
     schedule_name: String,
-) -> Result<Vec<String>, ServerFnError> {
+) -> Result<EvaluateResult, ServerFnError> {
     use rivers_api::rivers::EvaluateScheduleRequest;
 
     let state = expect_context::<crate::state::AppState>();
@@ -200,13 +212,13 @@ pub async fn evaluate_schedule(
     let resp = client
         .evaluate_schedule(EvaluateScheduleRequest { schedule_name })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let inner = resp.into_inner();
-    if let Some(reason) = inner.skip_reason {
-        return Err(ServerFnError::new(format!("Skipped: {reason}")));
-    }
-    Ok(inner.run_ids)
+    Ok(EvaluateResult {
+        run_ids: inner.run_ids,
+        skip_reason: inner.skip_reason,
+    })
 }
 
 #[server]
@@ -214,7 +226,7 @@ pub async fn evaluate_sensor(
     loc_ns: String,
     loc_name: String,
     sensor_name: String,
-) -> Result<Vec<String>, ServerFnError> {
+) -> Result<EvaluateResult, ServerFnError> {
     use rivers_api::rivers::EvaluateSensorRequest;
 
     let state = expect_context::<crate::state::AppState>();
@@ -226,13 +238,13 @@ pub async fn evaluate_sensor(
     let resp = client
         .evaluate_sensor(EvaluateSensorRequest { sensor_name })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let inner = resp.into_inner();
-    if let Some(reason) = inner.skip_reason {
-        return Err(ServerFnError::new(format!("Skipped: {reason}")));
-    }
-    Ok(inner.run_ids)
+    Ok(EvaluateResult {
+        run_ids: inner.run_ids,
+        skip_reason: inner.skip_reason,
+    })
 }
 
 #[server]
@@ -241,27 +253,18 @@ pub async fn observe_asset(
     loc_name: String,
     asset_key: String,
 ) -> Result<bool, ServerFnError> {
-    use rivers_api::rivers::ObserveAssetRequest;
-
-    let state = expect_context::<crate::state::AppState>();
-    let (_, mut client) = state
-        .connect_to(&loc_ns, &loc_name)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let resp = client
-        .observe_asset(ObserveAssetRequest { asset_key })
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let inner = resp.into_inner();
-    if !inner.success {
-        return Err(ServerFnError::new(
-            inner
-                .error
-                .unwrap_or_else(|| "Observation failed".to_string()),
-        ));
-    }
+    // Observe is the built-in action on external assets.
+    crate::server_fns::mutations::trigger_action(
+        loc_ns,
+        loc_name,
+        "observe".to_string(),
+        vec![asset_key],
+        None,
+        None,
+        false,
+        None,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -522,13 +525,16 @@ pub async fn get_condition_tick_detail(
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::next_occurrence_from;
-    use chrono::TimeZone;
 
     #[test]
     fn five_field_cron_parses() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         // Every 5 minutes — next firing after midnight is 00:05.
-        let next = next_occurrence_from("*/5 * * * *", now).expect("should parse");
+        let next = next_occurrence_from("*/5 * * * *", None, now).expect("should parse");
         assert_eq!(next, "2026-01-01 00:05:00 UTC");
     }
 
@@ -537,15 +543,36 @@ mod tests {
         // Regression: parser used to drop 6-field expressions, leaving the
         // UI's "next tick" preview empty for schedules the daemon happily
         // ticks (e.g. sub-minute or seconds-precise crons).
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         // Every 30 seconds at midnight — next firing is 00:00:30.
-        let next = next_occurrence_from("*/30 0 0 * * *", now).expect("should parse");
+        let next = next_occurrence_from("*/30 0 0 * * *", None, now).expect("should parse");
         assert_eq!(next, "2026-01-01 00:00:30 UTC");
     }
 
     #[test]
+    fn schedule_timezone_shifts_the_utc_time() {
+        // 06:00 in New York during daylight saving time is 10:00 UTC.
+        let now = jiff::civil::date(2026, 9, 28)
+            .at(17, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
+        let next =
+            next_occurrence_from("0 6 * * *", Some("America/New_York"), now).expect("should parse");
+        assert_eq!(next, "2026-09-29 10:00:00 UTC");
+    }
+
+    #[test]
     fn invalid_cron_returns_none() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        assert!(next_occurrence_from("not a cron", now).is_none());
+        let now = jiff::civil::date(2026, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
+        assert!(next_occurrence_from("not a cron", None, now).is_none());
     }
 }

@@ -30,7 +30,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -93,7 +93,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -137,7 +137,8 @@ jobs:
             elif command -v apk >/dev/null; then
               apk add --no-cache clang-dev curl unzip
             fi
-            PROTOC_VERSION=28.3
+            # Keep in sync with mise.toml and .github/actions/setup-env.
+            PROTOC_VERSION=36.1
             case "$(uname -m)" in
               x86_64)  PROTOC_ARCH=linux-x86_64 ;;
               aarch64) PROTOC_ARCH=linux-aarch_64 ;;
@@ -189,7 +190,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -210,9 +211,12 @@ jobs:
           name: rivers-ui-pkg
           path: rust/rivers-ui/pkg/
 
-      # rivers-api's prost-build invokes protoc at build time.
+      # rivers-api's prost-build invokes protoc at build time. `3.36.1` is
+      # upstream v36.1 — install-action keeps protoc's legacy `3.` prefix.
       - name: Install protoc
-        run: brew install protobuf
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: protoc@3.36.1
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -251,7 +255,7 @@ jobs:
             arch: x86_64
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -282,9 +286,12 @@ jobs:
         shell: bash
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
 
-      # rivers-api's prost-build invokes protoc at build time.
+      # rivers-api's prost-build invokes protoc at build time. `3.36.1` is
+      # upstream v36.1 — install-action keeps protoc's legacy `3.` prefix.
       - name: Install protoc
-        run: choco install protoc -y --no-progress
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: protoc@3.36.1
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1

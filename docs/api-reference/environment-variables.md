@@ -2,13 +2,14 @@
 
 rivers reads a number of environment variables to configure the daemon, the operator, and the standalone UI binary. Most have sensible defaults.
 
-This page lists user-settable env vars that rivers itself reads. Variables consumed by user code (e.g. `pydantic_settings.BaseSettings`) are out of scope — see [Configuration](../concepts/configuration.md) for that pattern. Operator- and CLI-injected variables (code-location identity, run context, step-pod plumbing) are also omitted — they are managed by rivers itself.
+This page lists user-settable env vars that rivers itself reads. Variables consumed by user code (e.g. `pydantic_settings.BaseSettings`) are out of scope — see [Configuration](../concepts/configuration.md) for that pattern. Operator- and CLI-injected variables (run context, step-pod plumbing) are also omitted — they are managed by rivers itself.
 
 ## Deployment
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RIVERS_DEPLOYMENT` | unset (treated as `dev`) | Either `dev` or `cloud`. `cloud` activates strict checks — most importantly, code-location identity becomes mandatory and rivers panics rather than silently writing under a default identity. Set automatically by `rivers serve` / `execute` / `execute-step`. |
+| `RIVERS_CODE_LOCATION_ID` | unset (code location `default`) | The code location that runs, asset state and pool claims are recorded under. The operator sets it on rivers pods to the `spec.identity` of the `CodeLocation`. Outside those pods, set it (or pass `--code-location-id`) when a [CLI](cli.md#storage-flags) command acts on a deployed code location. |
 
 ## Daemon and automation
 
@@ -25,7 +26,7 @@ Tunes how step workers wait for available slots in a concurrency pool. Durations
 |----------|---------|-------------|
 | `RIVERS_CLAIM_POLL_INTERVAL` | `1s` | How often to re-check storage for an available slot. Shorter = faster pickup, more storage load. |
 | `RIVERS_CLAIM_POLL_JITTER` | `500ms` | Maximum random jitter added to the poll interval to break up correlated retries. |
-| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. |
+| `RIVERS_CLAIM_TIMEOUT` | `600s` (~10 min) | Total time a step waits for a slot before failing with a claim timeout. Time spent waiting on an asset's own pool (behind an exclusive [action](../concepts/actions.md)) does not count. |
 
 ## Operator
 
@@ -62,5 +63,14 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | When set, rivers installs an OpenTelemetry tracing layer that exports to this OTLP endpoint. Leave unset to disable OTel export entirely. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC endpoint. When set, rivers installs an OpenTelemetry tracing layer that exports to it. `https://` endpoints use TLS and verify the server against the system roots plus bundled Mozilla roots. Leave unset to disable OTel export entirely. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | Headers sent with every export, as comma-separated `key=value` pairs. This is where API keys and bearer tokens go, e.g. `authorization=Bearer <token>` or `x-honeycomb-team=<key>`. |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | Path to a PEM file holding the CA that signs the collector's certificate. Replaces the system and bundled roots. Requires an `https://` endpoint. |
+| `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` | unset | Paths to a PEM client certificate and private key for mutual TLS. Set both or neither. Requires an `https://` endpoint. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Export timeout in milliseconds. |
+| `OTEL_EXPORTER_OTLP_TRACES_*` | unset | Traces-specific form of each variable above (`..._TRACES_ENDPOINT`, `..._TRACES_HEADERS`, ...). Takes precedence over the generic one. An empty `..._TRACES_ENDPOINT`, `..._TRACES_HEADERS` or certificate variable counts as unset. |
+| `OTEL_SERVICE_NAME` | `rivers` | `service.name` on exported spans. A `service.name` entry in `OTEL_RESOURCE_ATTRIBUTES` also sets it. Set one or the other, not both. |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | Extra resource attributes on exported spans, as comma-separated `key=value` pairs. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. Honoured by the operator and the UI binary. |
+
+If the exporter cannot be built (for example an unreadable certificate file, or a certificate variable with an `http://` endpoint), rivers logs one error at startup naming the variable and runs with export disabled. Spans are sent in batches; when the process exits normally, rivers sends the spans still queued and waits at most five seconds for the collector. On Kubernetes the [Helm chart](../installation/kubernetes.md#opentelemetry-export) sets the endpoint and headers on every pod for you. The operator reads the endpoint from `RIVERS_OTEL_ENDPOINT`, not from `OTEL_EXPORTER_OTLP_ENDPOINT`.

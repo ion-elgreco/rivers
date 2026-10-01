@@ -9,10 +9,13 @@ from datetime import datetime
 
 import pytest
 import rivers as rs
+from pydantic import BaseModel
+from rivers._core import AutomationDaemon
 from rivers.exceptions import ExecutionError
 
 from _helpers import daily_pd as _daily_pd
 from _helpers import static_pd as _static_pd
+from _polling import wait_until
 
 
 # ---------------------------------------------------------------------------
@@ -459,10 +462,76 @@ class TestBackfillConfig:
         result = repo.backfill(
             selection=["asset"],
             partition_keys=[rs.PartitionKey.single("x")],
-            config={"asset": {"mode": "full_refresh"}},
+            config={"assets": {"asset": {"config": {"mode": "full_refresh"}}}},
         )
         assert result.completed == 1
         assert captured.get("mode") == "full_refresh"
+
+    @pytest.mark.parametrize("action", [None, "purge"], ids=["materialize", "action"])
+    def test_config_without_block_reaches_the_daemons_runs(self, storage, action):
+        """A non-blocking backfill keeps its config on the record, so the
+        children a daemon starts later run with it: `dry_run=True` stays a dry
+        run instead of becoming a real purge. A preview records nothing."""
+        calls = []
+
+        class PurgeConfig(BaseModel):
+            dry_run: bool = False
+
+        def _purge(ctx: rs.ActionContext[PurgeConfig]) -> None:
+            calls.append(("purge", ctx.partition_key, ctx.config.dry_run))
+
+        purge = rs.AssetAction(name="purge", outcome=rs.Outcome.Unmaterialize)(_purge)
+
+        @rs.Asset(partitions_def=_static_pd(["p1", "p2"]), actions=[purge])
+        def events(context: rs.AssetExecutionContext[PurgeConfig]) -> int:
+            calls.append(("materialize", context.partition_key, context.config.dry_run))
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[events], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        p1, p2 = rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")
+        for key in (p1, p2):
+            repo.materialize(partition_key=key)
+        calls.clear()
+        verb = action or "materialize"
+        config = {"assets": {"events": {"config": {"dry_run": True}}}}
+
+        preview = repo.backfill(
+            selection=["events"],
+            partition_keys=[p1],
+            action=action,
+            config=config,
+            block=False,
+            dry_run=True,
+        )
+        assert preview.is_dry_run
+        launched = repo.backfill(
+            selection=["events"],
+            partition_keys=[p1],
+            action=action,
+            config=config,
+            block=False,
+        )
+        assert calls == []
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            wait_until(
+                lambda: (
+                    repo.get_backfill(launched.backfill_id).status
+                    not in ("Requested", "InProgress")
+                ),
+                timeout=20,
+            )
+        finally:
+            daemon.stop()
+        status = repo.get_backfill(launched.backfill_id)
+        assert status.status == "CompletedSuccess"
+        assert calls == [(verb, "p1", True)]
+        assert [repo.storage.get_run(r).config for r in status.run_ids] == [config]
 
 
 # ---------------------------------------------------------------------------
@@ -940,3 +1009,25 @@ class TestRangeDefinitionOrdering:
                     {"size": ("medium", "large"), "regon": ["us"]}
                 ),
             )
+
+
+def test_selectionless_backfill_expands_sorted():
+    """selection=None expands to every asset in sorted order — the expansion
+    lands on child runs, so it must not depend on map iteration order."""
+    pd = rs.PartitionsDefinition.static_(["p1"])
+
+    @rs.Asset(partitions_def=pd, io_handler=rs.InMemoryIOHandler())
+    def zeta(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    @rs.Asset(partitions_def=pd, io_handler=rs.InMemoryIOHandler())
+    def alpha(context: rs.AssetExecutionContext) -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[zeta, alpha], default_executor=rs.Executor.in_process()
+    )
+    res = repo.backfill(partition_keys=[rs.PartitionKey.single("p1")])
+    assert res.completed == 1
+    (rid,) = res.run_ids
+    assert repo.storage.get_run(rid).node_names == ["alpha", "zeta"]

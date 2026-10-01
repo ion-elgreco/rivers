@@ -15,6 +15,10 @@ use crate::partitions::{PartitionContext, PyPartitionKey};
 pub struct PyAssetExecutionContext {
     #[pyo3(get)]
     pub asset_name: String,
+    /// The run this materialization belongs to. None only for
+    /// directly-constructed contexts, which have no run.
+    #[pyo3(get)]
+    pub run_id: Option<String>,
     #[pyo3(get)]
     pub tags: Option<Vec<String>>,
     #[pyo3(get)]
@@ -46,6 +50,7 @@ pub struct PyAssetExecutionContext {
 impl PyAssetExecutionContext {
     pub fn new(
         asset_name: String,
+        run_id: Option<String>,
         tags: Option<Vec<String>>,
         kinds: Vec<String>,
         group: Option<String>,
@@ -57,6 +62,7 @@ impl PyAssetExecutionContext {
     ) -> Self {
         Self {
             asset_name,
+            run_id,
             tags,
             kinds,
             group,
@@ -98,7 +104,7 @@ impl PyAssetExecutionContext {
 #[pymethods]
 impl PyAssetExecutionContext {
     #[new]
-    #[pyo3(signature = (asset_name, tags=None, kinds=vec![], group=None, code_version=None, asset_metadata=None, partition=None, is_multi_asset=false, output_selection=vec![], config=None))]
+    #[pyo3(signature = (asset_name, tags=None, kinds=vec![], group=None, code_version=None, asset_metadata=None, partition=None, is_multi_asset=false, output_selection=vec![], config=None, run_id=None))]
     fn py_new(
         asset_name: String,
         tags: Option<Vec<String>>,
@@ -110,9 +116,11 @@ impl PyAssetExecutionContext {
         is_multi_asset: bool,
         output_selection: Vec<String>,
         config: Option<Py<PyAny>>,
+        run_id: Option<String>,
     ) -> Self {
         Self::new(
             asset_name,
+            run_id,
             tags,
             kinds,
             group,

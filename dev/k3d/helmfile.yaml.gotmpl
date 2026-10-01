@@ -46,8 +46,14 @@ releases:
           # don't deploy it either — the integration suite doesn't touch it.
           enabled: {{ if eq (env "RIVERS_K8S_SKIP_UI") "1" }}false{{ else }}true{{ end }}
           image: rivers-ui:latest
+        # Every code-location, run, and step pod exports traces to the
+        # rivers-dev collector, which requires the token in that Secret.
+        otel:
+          endpoint: http://otel-collector.rivers.svc:4317
+          headers:
+            existingSecret: otel-headers
 
-  # Dev-cluster scaffolding: MinIO + example CodeLocation CRs.
+  # Dev-cluster scaffolding: RustFS + OTLP collector + example CodeLocation CRs.
   - name: rivers-dev
     namespace: rivers
     chart: ./charts/rivers-dev

@@ -21,6 +21,11 @@ pub const ENV_SURREAL_PASSWORD: &str = "RIVERS_SURREAL_PASSWORD";
 pub const ENV_SURREAL_AUTH_SECRET_NAME: &str = "RIVERS_SURREAL_AUTH_SECRET_NAME";
 pub const ENV_SURREAL_AUTH_USERNAME_KEY: &str = "RIVERS_SURREAL_AUTH_USERNAME_KEY";
 pub const ENV_SURREAL_AUTH_PASSWORD_KEY: &str = "RIVERS_SURREAL_AUTH_PASSWORD_KEY";
+pub const ENV_OTEL_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+pub const ENV_RIVERS_OTEL_ENDPOINT: &str = "RIVERS_OTEL_ENDPOINT";
+pub const ENV_OTEL_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+pub const ENV_OTEL_HEADERS_SECRET_NAME: &str = "RIVERS_OTEL_HEADERS_SECRET_NAME";
+pub const ENV_OTEL_HEADERS_SECRET_KEY: &str = "RIVERS_OTEL_HEADERS_SECRET_KEY";
 
 /// Read `name` from the process environment, treating empty strings as
 /// unset (so a `valueFrom.secretKeyRef` that resolves to "" doesn't shadow
@@ -212,62 +217,19 @@ impl Default for SurrealPodConfig {
 ///   pods without holding the password in memory
 pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     let mut env = vec![
-        EnvVar {
-            name: ENV_SURREAL_ENDPOINT.to_string(),
-            value: Some(cfg.endpoint.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: ENV_SURREAL_NAMESPACE.to_string(),
-            value: Some(cfg.namespace.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: ENV_SURREAL_DATABASE.to_string(),
-            value: Some(cfg.database.clone()),
-            ..Default::default()
-        },
+        value_env(ENV_SURREAL_ENDPOINT, &cfg.endpoint),
+        value_env(ENV_SURREAL_NAMESPACE, &cfg.namespace),
+        value_env(ENV_SURREAL_DATABASE, &cfg.database),
     ];
-    if cfg.auth_secret.is_set() {
-        env.push(EnvVar {
-            name: ENV_SURREAL_USERNAME.to_string(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: cfg.auth_secret.secret_name.clone(),
-                    key: cfg.auth_secret.username_key.clone(),
-                    optional: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_PASSWORD.to_string(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: cfg.auth_secret.secret_name.clone(),
-                    key: cfg.auth_secret.password_key.clone(),
-                    optional: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_SECRET_NAME.to_string(),
-            value: Some(cfg.auth_secret.secret_name.clone()),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_USERNAME_KEY.to_string(),
-            value: Some(cfg.auth_secret.username_key.clone()),
-            ..Default::default()
-        });
-        env.push(EnvVar {
-            name: ENV_SURREAL_AUTH_PASSWORD_KEY.to_string(),
-            value: Some(cfg.auth_secret.password_key.clone()),
-            ..Default::default()
-        });
+    let auth = &cfg.auth_secret;
+    if auth.is_set() {
+        env.extend([
+            secret_env(ENV_SURREAL_USERNAME, &auth.secret_name, &auth.username_key),
+            secret_env(ENV_SURREAL_PASSWORD, &auth.secret_name, &auth.password_key),
+            value_env(ENV_SURREAL_AUTH_SECRET_NAME, &auth.secret_name),
+            value_env(ENV_SURREAL_AUTH_USERNAME_KEY, &auth.username_key),
+            value_env(ENV_SURREAL_AUTH_PASSWORD_KEY, &auth.password_key),
+        ]);
     }
     env
 }
@@ -306,6 +268,105 @@ pub fn detect_git_workspace() -> Option<(
     Some((source, volume))
 }
 
+/// OTLP export settings for pods that run Python code. The headers Secret is
+/// referenced by coordinate, like the SurrealDB credentials, so the token
+/// never lands in a pod spec. An empty endpoint emits nothing.
+///
+/// The endpoint is read from `RIVERS_OTEL_ENDPOINT`, never from the standard
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`: a value injected into this pod for a local
+/// sidecar must not be stamped on child pods where nothing listens.
+#[derive(Debug, Clone, Default)]
+pub struct OtelPodConfig {
+    pub endpoint: String,
+    pub headers_secret_name: String,
+    pub headers_secret_key: String,
+}
+
+impl OtelPodConfig {
+    pub fn from_env() -> Self {
+        Self {
+            endpoint: env_nonempty(ENV_RIVERS_OTEL_ENDPOINT).unwrap_or_default(),
+            headers_secret_name: env_nonempty(ENV_OTEL_HEADERS_SECRET_NAME).unwrap_or_default(),
+            headers_secret_key: env_nonempty(ENV_OTEL_HEADERS_SECRET_KEY).unwrap_or_default(),
+        }
+    }
+
+    fn headers_secret_is_set(&self) -> bool {
+        !self.headers_secret_name.is_empty() && !self.headers_secret_key.is_empty()
+    }
+}
+
+pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
+    if cfg.endpoint.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![
+        value_env(ENV_OTEL_ENDPOINT, &cfg.endpoint),
+        value_env(ENV_RIVERS_OTEL_ENDPOINT, &cfg.endpoint),
+    ];
+    if cfg.headers_secret_is_set() {
+        env.extend([
+            secret_env(
+                ENV_OTEL_HEADERS,
+                &cfg.headers_secret_name,
+                &cfg.headers_secret_key,
+            ),
+            value_env(ENV_OTEL_HEADERS_SECRET_NAME, &cfg.headers_secret_name),
+            value_env(ENV_OTEL_HEADERS_SECRET_KEY, &cfg.headers_secret_key),
+        ]);
+    }
+    env
+}
+
+fn value_env(name: &str, value: impl Into<String>) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.into()),
+        ..Default::default()
+    }
+}
+
+fn secret_env(name: &str, secret: &str, key: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret.to_string(),
+                key: key.to_string(),
+                optional: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// `(secret, key)` of the `secretKeyRef` behind env var `name`.
+#[cfg(test)]
+pub(crate) fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
+    env.iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.value_from.as_ref())
+        .and_then(|src| src.secret_key_ref.as_ref())
+        .map(|sk| (sk.name.clone(), sk.key.clone()))
+}
+
+/// Apply `overrides` on top of `base`: a same-named entry replaces the base
+/// one in place, a new name is appended. Server-side apply rejects duplicate
+/// names in a container's env list.
+pub fn merge_env(
+    mut base: Vec<EnvVar>,
+    overrides: impl IntoIterator<Item = EnvVar>,
+) -> Vec<EnvVar> {
+    for var in overrides {
+        match base.iter_mut().find(|e| e.name == var.name) {
+            Some(slot) => *slot = var,
+            None => base.push(var),
+        }
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,24 +382,36 @@ mod tests {
         deployment: Option<&str>,
         f: impl FnOnce() -> R,
     ) -> R {
+        with_vars(
+            &[
+                ("RIVERS_CODE_LOCATION_ID", cl_id),
+                ("RIVERS_CODE_LOCATION_NAME", cl_name),
+                ("RIVERS_DEPLOYMENT", deployment),
+            ],
+            f,
+        )
+    }
+
+    fn with_vars<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let prev_id = std::env::var("RIVERS_CODE_LOCATION_ID").ok();
-        let prev_name = std::env::var("RIVERS_CODE_LOCATION_NAME").ok();
-        let prev_dep = std::env::var("RIVERS_DEPLOYMENT").ok();
         let set = |k: &str, v: Option<&str>| match v {
             Some(v) => unsafe { std::env::set_var(k, v) },
             None => unsafe { std::env::remove_var(k) },
         };
-        set("RIVERS_CODE_LOCATION_ID", cl_id);
-        set("RIVERS_CODE_LOCATION_NAME", cl_name);
-        set("RIVERS_DEPLOYMENT", deployment);
+        let prev: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            set(k, *v);
+        }
         let out = f();
-        set("RIVERS_CODE_LOCATION_ID", prev_id.as_deref());
-        set("RIVERS_CODE_LOCATION_NAME", prev_name.as_deref());
-        set("RIVERS_DEPLOYMENT", prev_dep.as_deref());
+        for (k, v) in &prev {
+            set(k, v.as_deref());
+        }
         out
     }
 
@@ -388,14 +461,6 @@ mod tests {
         env.iter()
             .find(|e| e.name == name)
             .and_then(|e| e.value.clone())
-    }
-
-    fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
-        env.iter()
-            .find(|e| e.name == name)
-            .and_then(|e| e.value_from.as_ref())
-            .and_then(|src| src.secret_key_ref.as_ref())
-            .map(|sk| (sk.name.clone(), sk.key.clone()))
     }
 
     #[test]
@@ -485,5 +550,109 @@ mod tests {
         assert!(!s.is_set());
         s.password_key = "p".into();
         assert!(s.is_set());
+    }
+
+    #[test]
+    fn merge_env_replaces_in_place_and_appends_new_names() {
+        let var = |name: &str, value: &str| EnvVar {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+            ..Default::default()
+        };
+        let merged = merge_env(
+            vec![var("A", "1"), var("B", "2"), var("C", "3")],
+            vec![var("D", "4"), var("B", "user"), var("D", "last")],
+        );
+        let pairs: Vec<_> = merged
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("A", "1"), ("B", "user"), ("C", "3"), ("D", "last")]
+        );
+    }
+
+    #[test]
+    fn build_otel_pod_env_is_empty_without_endpoint() {
+        let cfg = OtelPodConfig {
+            headers_secret_name: "otel-headers".into(),
+            headers_secret_key: "headers".into(),
+            ..Default::default()
+        };
+        assert!(build_otel_pod_env(&cfg).is_empty());
+    }
+
+    #[test]
+    fn build_otel_pod_env_endpoint_only_omits_headers() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            ..Default::default()
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_ENDPOINT).as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
+        assert_eq!(env.len(), 2, "no header env without a Secret: {env:?}");
+    }
+
+    #[test]
+    fn otel_pod_config_from_env_ignores_ambient_otlp_endpoint() {
+        let ambient_only = with_vars(
+            &[
+                (ENV_OTEL_ENDPOINT, Some("http://localhost:4317")),
+                (ENV_RIVERS_OTEL_ENDPOINT, None),
+            ],
+            OtelPodConfig::from_env,
+        );
+        assert_eq!(ambient_only.endpoint, "");
+
+        let both = with_vars(
+            &[
+                (ENV_OTEL_ENDPOINT, Some("http://localhost:4317")),
+                (
+                    ENV_RIVERS_OTEL_ENDPOINT,
+                    Some("https://otlp.example.com:4317"),
+                ),
+            ],
+            OtelPodConfig::from_env,
+        );
+        assert_eq!(both.endpoint, "https://otlp.example.com:4317");
+    }
+
+    #[test]
+    fn build_otel_pod_env_emits_rivers_endpoint_coordinate() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            ..Default::default()
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_value_of(&env, ENV_RIVERS_OTEL_ENDPOINT).as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
+    }
+
+    #[test]
+    fn build_otel_pod_env_with_headers_emits_secret_key_ref_and_coordinates() {
+        let cfg = OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".into(),
+            headers_secret_name: "otel-headers".into(),
+            headers_secret_key: "headers".into(),
+        };
+        let env = build_otel_pod_env(&cfg);
+        assert_eq!(
+            env_secret_ref(&env, ENV_OTEL_HEADERS),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_HEADERS_SECRET_NAME).as_deref(),
+            Some("otel-headers")
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_OTEL_HEADERS_SECRET_KEY).as_deref(),
+            Some("headers")
+        );
     }
 }

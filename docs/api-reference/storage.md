@@ -55,6 +55,15 @@ Each persistent database carries a **schema stamp** — the schema version it wa
 
 The reader/writer split lets a write-breaking migration for newer writers run **without locking out an older read-only UI**: a `Read` open is gated by `min_reader`, a read/write open by `min_writer` (and `min_writer ≥ min_reader` always holds).
 
+| Version | Change | Floors after it (`min_reader`, `min_writer`) |
+|---------|--------|----------------------------------------------|
+| 5 | Exclusive-action pool claims record the partitions they touch | 2, 5 |
+| 6 | Deletions leave tombstones on asset and partition rows | 2, 6 |
+| 7 | An asset's code version and inputs keep the time of the materialization that recorded them | 2, 7 |
+| 8 | Run logs keep each failed attempt's traceback | 2, 7 |
+| 9 | Runs keep the config they were launched with | 2, 7 |
+| 10 | The run config is the launch document; stored rows are rewritten to it | 2, 10 |
+
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
 ### `rivers db migrate`
@@ -178,6 +187,13 @@ asyncio.run(main())
 One step execution's captured output. Logs live in the dedicated `run_logs`
 table (not the events stream); streams the step didn't produce are `None`.
 
+A failed attempt writes its Python traceback in a row of its own, with the
+time of the attempt's `StepFailure` or `StepRetry` event. `traceback` is JSON:
+`exceptions` is the exception chain, oldest first, and each frame keeps the
+source lines around it; `text` is the traceback as Python prints it. The
+process that ran the step captures it, so the source lines come from that
+machine. The run page in the UI shows it.
+
 | Field | Type |
 |-------|------|
 | `id` | `str` |
@@ -187,6 +203,7 @@ table (not the events stream); streams the step didn't produce are `None`.
 | `stdout` | `str \| None` |
 | `stderr` | `str \| None` |
 | `logs` | `str \| None` |
+| `traceback` | `str \| None` |
 
 ### `AssetRecord`
 
@@ -232,6 +249,10 @@ table (not the events stream); streams the step didn't produce are `None`.
 | `partition_key` | `PartitionKey \| None` |
 | `block_reason` | `str \| None` |
 | `launched_by` | `LaunchedBy` |
+| `action` | `str \| None` |
+| `config` | `dict[str, Any] \| None` |
+
+`config` holds the [launch document](../concepts/configuration.md#the-launch-document) the run was launched with; `None` means the definitions as they are.
 
 ### `LaunchedBy`
 

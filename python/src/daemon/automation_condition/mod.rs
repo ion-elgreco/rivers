@@ -1,4 +1,5 @@
 //! Automation condition daemon loop — evaluates condition trees and triggers materializations.
+use jiff::civil;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use engine::ConditionTickEngine;
 fn def_keys_and_universe(
     def: &PartitionsDefinition,
 ) -> (HashSet<CorePartitionKey>, PartitionUniverse) {
-    let now = chrono::Local::now().naive_local();
+    let now = jiff::Zoned::now().datetime();
     let universe = partition_universe_for(def, now);
     let keys = def
         .get_partition_keys_capped(now)
@@ -62,8 +63,8 @@ fn partition_info_from_node(
 /// Watermark the per-tick refresh resumes from.
 fn seeded_watermark(
     def: &PartitionsDefinition,
-    now: chrono::NaiveDateTime,
-) -> chrono::NaiveDateTime {
+    now: civil::DateTime,
+) -> civil::DateTime {
     match def {
         PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).min(now),
         _ => now,
@@ -73,7 +74,7 @@ fn seeded_watermark(
 /// How `def`'s key universe evolves after extraction.
 fn partition_universe_for(
     def: &PartitionsDefinition,
-    now: chrono::NaiveDateTime,
+    now: civil::DateTime,
 ) -> PartitionUniverse {
     match def {
         PartitionsDefinition::Static { .. } => PartitionUniverse::Frozen,
@@ -292,7 +293,6 @@ pub(super) struct ConditionEvalLoopConfig {
     pub tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
-    pub max_evals_retained: Option<usize>,
     /// Upstream partition keys (+ how each set evolves), pre-extracted at daemon start.
     pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
 }
@@ -312,7 +312,6 @@ pub(in crate::daemon) async fn build_condition_engine(
         tick_tx,
         max_ticks_retained,
         eval_tx,
-        max_evals_retained,
         upstream_partition_keys,
     } = config;
 
@@ -384,7 +383,6 @@ pub(in crate::daemon) async fn build_condition_engine(
         tick_tx,
         eval_tx,
         max_ticks_retained,
-        max_evals_retained,
         last_state_persist: 0,
         initial_changes: false,
     };
@@ -419,6 +417,15 @@ pub(in crate::daemon) async fn condition_eval_loop(
         "condition eval loop started"
     );
 
+    // Fixed cadence, not a sleep between passes: sleeping the full interval
+    // after each pass makes the period `interval + pass`, so at 10,000 assets
+    // a 117 ms pass turned a promised 1 s into 1.117 s and lost a tenth of the
+    // passes. `Skip` holds the promised phase without ever bursting to catch
+    // up. The first deadline is one interval out, as it was when this slept
+    // before its first pass.
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -437,7 +444,7 @@ pub(in crate::daemon) async fn condition_eval_loop(
                 tracing::info!(target: "rivers::daemon", "condition eval loop stopped");
                 return;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = ticker.tick() => {}
         }
 
         let now = now_ts();

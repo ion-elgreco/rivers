@@ -5,7 +5,7 @@ use ordermap::OrderSet;
 
 use crate::storage::PartitionKey;
 use crate::timegrid::TimeGrid;
-use chrono::NaiveDateTime;
+use jiff::civil;
 
 /// How an asset's partition universe evolves after extraction.
 #[derive(Clone, Debug)]
@@ -15,7 +15,7 @@ pub enum PartitionUniverse {
     /// Window starts enter the universe as wall-clock time passes.
     TimeWindow {
         grid: TimeGrid,
-        enumerated_to: NaiveDateTime,
+        enumerated_to: civil::DateTime,
     },
     /// Storage-managed: the key set mirrors the `dynamic_partitions` namespace.
     Dynamic { namespace: String },
@@ -38,7 +38,7 @@ pub enum DimensionKind {
     Frozen,
     TimeWindow {
         grid: TimeGrid,
-        enumerated_to: NaiveDateTime,
+        enumerated_to: civil::DateTime,
     },
     Dynamic {
         namespace: String,
@@ -49,7 +49,7 @@ pub enum DimensionKind {
 pub(crate) fn refresh_universe(
     universe: &mut PartitionUniverse,
     all_keys: &mut HashSet<PartitionKey>,
-    now: NaiveDateTime,
+    now: civil::DateTime,
     dynamic_keys: &HashMap<String, HashSet<String>>,
 ) -> bool {
     match universe {
@@ -122,8 +122,8 @@ pub(crate) fn refresh_universe(
 /// dimension — so window-enumeration fixes can't drift between them.
 fn advance_time_window_axis(
     grid: &TimeGrid,
-    enumerated_to: &mut NaiveDateTime,
-    now: NaiveDateTime,
+    enumerated_to: &mut civil::DateTime,
+    now: civil::DateTime,
     mut insert: impl FnMut(String) -> bool,
 ) -> bool {
     let bound = grid.end.map_or(now, |e| e.min(now));

@@ -156,7 +156,8 @@ pub fn PartitionPicker(
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         {format!(
-                            "{total} dynamic partitions — scroll to browse, search to filter, or jump to a key.",
+                            "{} — scroll to browse, search to filter, or jump to a key.",
+                            crate::helpers::plural(total, "dynamic partition", "dynamic partitions"),
                         )}
                     </div>
                     <VirtualPartitionList
@@ -204,7 +205,7 @@ pub fn PartitionPicker(
                                 <div class="exec-dialog-partition-dim">
                                     <label>{dim_name.clone()}</label>
                                     <div class="exec-dialog-partition-hint">
-                                        {format!("{dim_total} values — scroll, search, or jump.")}
+                                        {format!("{} — scroll, search, or jump.", crate::helpers::plural(dim_total as u64, "value", "values"))}
                                     </div>
                                     <VirtualPartitionList
                                         source=KeySource::Asset { asset_key: ak, dimension: dim_name }
@@ -252,6 +253,33 @@ pub fn PartitionPicker(
                 </div>
             }.into_any(),
         }}
+    }
+}
+
+/// The explicit choice to run a verb whose partition key is optional on every
+/// partition. An empty pick never means that: a pick emptied by a live refresh
+/// would otherwise run the verb on the whole asset. Choosing it clears `selected`;
+/// the host hides the picker while it is set.
+#[component]
+pub fn WholeAssetChoice(
+    checked: RwSignal<bool>,
+    selected: RwSignal<Vec<SubmitPartitionKey>>,
+) -> impl IntoView {
+    view! {
+        <label class="whole-asset-choice">
+            <input
+                type="checkbox"
+                prop:checked=move || checked.get()
+                on:change=move |ev| {
+                    let on = event_target_checked(&ev);
+                    if on {
+                        selected.set(Vec::new());
+                    }
+                    checked.set(on);
+                }
+            />
+            "Whole asset (every partition)"
+        </label>
     }
 }
 
@@ -589,10 +617,10 @@ fn VirtualPartitionList(
                     }
                 }
             />
-            <button class="btn btn-tertiary btn-small" on:click=move |_| apply_search()>
+            <button class="btn btn-small" on:click=move |_| apply_search()>
                 "Search"
             </button>
-            <button class="btn btn-tertiary btn-small" on:click=move |_| do_jump()>
+            <button class="btn btn-small" on:click=move |_| do_jump()>
                 "Jump"
             </button>
         </div>
@@ -607,13 +635,13 @@ fn VirtualPartitionList(
                     } else if query.get().is_empty() {
                         format!("{sel} selected · {} total", view_total.get())
                     } else {
-                        format!("{sel} selected · {} matches", view_total.get())
+                        format!("{sel} selected · {}", crate::helpers::plural(view_total.get() as u64, "match", "matches"))
                     }
                 }}
             </span>
             <span class="exec-dialog-partition-actions">
                 <button
-                    class="btn btn-tertiary btn-small"
+                    class="link-btn"
                     on:click=move |_| {
                         let next = !show_selected.get_untracked();
                         show_selected.set(next);
@@ -626,13 +654,14 @@ fn VirtualPartitionList(
                 >
                     {move || {
                         if show_selected.get() {
-                            "Browse".to_string()
+                            "Show all".to_string()
                         } else {
-                            format!("Selected ({})", selected.get().len())
+                            format!("Show selected ({})", selected.get().len())
                         }
                     }}
                 </button>
-                <button class="btn btn-tertiary btn-small" on:click=move |_| selected.set(Vec::new())>
+                <span class="bulk-sep">"·"</span>
+                <button class="link-btn" on:click=move |_| selected.set(Vec::new())>
                     "Clear"
                 </button>
             </span>
@@ -817,16 +846,11 @@ fn PartitionList(
                 {move || format!("{} / {} selected", selected_signal.get().len(), total)}
             </span>
             <span class="exec-dialog-partition-actions">
-                <button
-                    class="btn btn-tertiary btn-small"
-                    on:click=move |_| select_all.run(())
-                >
+                <button class="link-btn" on:click=move |_| select_all.run(())>
                     "Select all"
                 </button>
-                <button
-                    class="btn btn-tertiary btn-small"
-                    on:click=move |_| clear.run(())
-                >
+                <span class="bulk-sep">"·"</span>
+                <button class="link-btn" on:click=move |_| clear.run(())>
                     "Clear"
                 </button>
             </span>

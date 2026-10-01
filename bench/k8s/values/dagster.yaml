@@ -1,0 +1,28 @@
+# Dagster control plane for the startup benchmark.
+# Images are rebuilt natively for arm64 from the same version Dagster ships,
+# because Dagster publishes amd64-only images. `bench/k8s/deploy.py` sets every
+# image repository and tag, so the version is pinned in exactly one place.
+dagsterWebserver:
+  image:
+    pullPolicy: IfNotPresent
+
+dagsterDaemon:
+  image:
+    pullPolicy: IfNotPresent
+
+dagster-user-deployments:
+  enabled: true
+  enableSubchart: true
+  deployments:
+    - name: bench
+      image:
+        pullPolicy: IfNotPresent
+      dagsterApiGrpcArgs:
+        - "--python-file"
+        - "/opt/dagster/app/bench_defs.py"
+      port: 3030
+      env:
+        BENCH_N_ASSETS: "10"
+
+postgresql:
+  enabled: true

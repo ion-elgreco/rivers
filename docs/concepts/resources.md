@@ -87,7 +87,20 @@ CodeRepository shutdown (context manager __exit__ or shutdown())
   └─ calls resource.teardown() for each resource
 ```
 
-Resources are initialized once at resolve time and shared across all executions. They are not re-created per run.
+Resources are initialized once at resolve time and shared across all executions. They are not re-created per run, unless a launch overrides one (below).
+
+## Per-run overrides
+
+A launch can rebuild a resource with different field values for one run through the [launch document](configuration.md#the-launch-document), from Python or the UI's launch dialogs:
+
+```python
+repo.materialize(
+    selection=["my_asset"],
+    config={"resources": {"db": {"connection_string": "postgres://replica/app"}}},
+)
+```
+
+The named resource is built again through its class, from the instance's current fields with these values on top (so validation runs, and a secret keeps its value). A `Resource` built this way gets `setup()` before the run's first step and `teardown()` after its last; the repository's own instance is untouched and keeps serving other runs. A class given as a resource is built once for the run with the values. An IO handler cannot be overridden this way: assets hold it through the registry. An unknown key, or a value the class rejects, is refused before a run exists.
 
 ## IOHandler as resource reference
 
@@ -111,7 +124,7 @@ repo = rs.CodeRepository(
 )
 ```
 
-String references are resolved to the actual handler at `resolve()` time.
+String references are resolved to the actual handler at `resolve()` time, against that repository's resources. Two repositories built from the same assets each use their own handler.
 
 ## Testing
 
@@ -134,4 +147,4 @@ rivers validates all resource references at resolve time:
 
 - Asset/task function parameters that don't match an upstream asset or resource key raise `ConfigurationError`
 - Schedule/sensor evaluation function parameters that don't match a resource key raise `ConfigurationError`
-- IOHandler string references that don't match a resource key raise `ConfigurationError`
+- IOHandler string references that don't match a resource key, or that name a resource which does not implement the IOHandler protocol, raise `AssetDefinitionError`. It is not a subclass of `ConfigurationError`, so catch it separately

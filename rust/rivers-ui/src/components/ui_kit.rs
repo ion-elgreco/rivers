@@ -12,51 +12,14 @@ use leptos_router::components::A;
 /// string normalization, so a mistyped kind shows up in the DOM instead of
 /// being silently rewritten.
 #[component]
-pub fn StatusChip(#[prop(into)] kind: String, #[prop(optional)] small: bool) -> impl IntoView {
+pub fn StatusChip(#[prop(into)] kind: String) -> impl IntoView {
     let dot_cls = format!("dot dot-{kind}");
-    let chip_cls = if small { "chip chip--sm" } else { "chip" };
     view! {
-        <span class={chip_cls}>
+        <span class="chip">
             <span class={dot_cls}></span>
             {kind}
         </span>
     }
-}
-
-#[component]
-pub fn Sparkline(
-    #[prop(into)] points: Vec<f64>,
-    #[prop(optional, into, default = "var(--secondary)".to_string())] color: String,
-    #[prop(optional, default = 120)] width: u32,
-    #[prop(optional, default = 28)] height: u32,
-) -> impl IntoView {
-    if points.len() < 2 {
-        return view! { <svg width=width height=height></svg> }.into_any();
-    }
-    let max = points.iter().cloned().fold(f64::MIN, f64::max);
-    let min = points.iter().cloned().fold(f64::MAX, f64::min);
-    let range = (max - min).max(1e-9);
-    let step = width as f64 / (points.len() - 1) as f64;
-    let mut d = String::with_capacity(points.len() * 12);
-    for (i, v) in points.iter().enumerate() {
-        let x = i as f64 * step;
-        let y = height as f64 - ((v - min) / range) * height as f64;
-        if i == 0 {
-            d.push_str(&format!("M{x:.2},{y:.2}"));
-        } else {
-            d.push_str(&format!(" L{x:.2},{y:.2}"));
-        }
-    }
-    let last_idx = points.len() - 1;
-    let last_x = last_idx as f64 * step;
-    let last_y = height as f64 - ((points[last_idx] - min) / range) * height as f64;
-    view! {
-        <svg width=width height=height style="display:block">
-            <path d=d stroke=color.clone() stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-            <circle cx=format!("{last_x:.2}") cy=format!("{last_y:.2}") r="2.5" fill=color/>
-        </svg>
-    }
-    .into_any()
 }
 
 #[component]
@@ -72,7 +35,7 @@ pub fn SectionHeader(
     }
 }
 
-/// Rail color variant used by [`StatTile`], [`SummaryCard`], and [`AlertCard`].
+/// Rail color variant used by [`StatTile`] and [`SummaryCard`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Rail {
     #[default]
@@ -82,9 +45,6 @@ pub enum Rail {
     Error,
     Running,
     Primary,
-    Warning,
-    Critical,
-    Info,
 }
 
 impl Rail {
@@ -96,9 +56,6 @@ impl Rail {
             Rail::Error => "error",
             Rail::Running => "running",
             Rail::Primary => "primary",
-            Rail::Warning => "warning",
-            Rail::Critical => "critical",
-            Rail::Info => "info",
         };
         format!("{base}-rail {base}-rail--{suffix}")
     }
@@ -128,77 +85,6 @@ pub fn StatTile(
     }
 }
 
-#[component]
-pub fn HeroStat(
-    #[prop(into)] label: String,
-    #[prop(into)] value: String,
-    #[prop(optional, into)] unit: Option<String>,
-    /// Inline `(label, value)` metric pairs rendered in a mono-space row.
-    #[prop(optional)]
-    metrics: Vec<(String, String)>,
-    /// Optional throughput series rendered as a right-side histogram.
-    #[prop(optional)]
-    throughput: Option<Vec<f64>>,
-    #[prop(optional, into)] throughput_label: Option<String>,
-) -> impl IntoView {
-    let metrics_view = metrics
-        .into_iter()
-        .map(|(k, v)| {
-            view! {
-                <span>
-                    <strong>{v}</strong>
-                    " "
-                    {k}
-                </span>
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let right = throughput.map(|points| {
-        let max = points.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-        let n = points.len();
-        let bars = points
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let pct = (v / max * 100.0).clamp(0.0, 100.0);
-                let is_now = i + 1 == n;
-                let is_recent = !is_now && i + 4 >= n;
-                let cls = if is_now {
-                    "bar bar--now"
-                } else if is_recent {
-                    "bar bar--recent"
-                } else {
-                    "bar"
-                };
-                view! { <div class=cls style=format!("height:{pct:.1}%")></div> }
-            })
-            .collect::<Vec<_>>();
-        view! {
-            <div>
-                <div class="section-header-label" style="margin-bottom:10px">
-                    {throughput_label.unwrap_or_else(|| "THROUGHPUT".to_string())}
-                </div>
-                <div class="throughput-bars">{bars}</div>
-            </div>
-        }
-    });
-
-    view! {
-        <div class="hero-stat">
-            <div>
-                <div class="section-header-label hero-stat-label">{label}</div>
-                <h1 class="hero-stat-value">
-                    {value}
-                    {unit.map(|u| view! { <span class="hero-stat-value-unit">{u}</span> })}
-                </h1>
-                <div class="hero-stat-meta">{metrics_view}</div>
-            </div>
-            {right}
-        </div>
-    }
-}
-
 /// `kind` is one of `helpers::CHIP_KINDS` (same vocabulary as [`StatusChip`]).
 #[component]
 pub fn SummaryCard(
@@ -223,7 +109,7 @@ pub fn SummaryCard(
         <div style="min-width:0">
             <div class="summary-card-title">
                 <span class="summary-card-name">{title}</span>
-                <StatusChip kind=kind small=true/>
+                <StatusChip kind=kind/>
             </div>
             <div class="summary-card-desc">{description}</div>
         </div>
@@ -236,57 +122,6 @@ pub fn SummaryCard(
         view! { <A href=h attr:class="summary-card">{body}</A> }.into_any()
     } else {
         view! { <div class="summary-card">{body}</div> }.into_any()
-    }
-}
-
-/// Severity variant for [`AlertCard`]. Maps to the alert-card left rail
-/// color and the `SEV` chip displayed in the header row.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum AlertSev {
-    Critical,
-    Warning,
-    Info,
-}
-
-#[component]
-pub fn AlertCard(
-    sev: AlertSev,
-    #[prop(into)] id: String,
-    /// Timestamp (unix-nanos) for the live-ticking "Xm ago" age label.
-    age_ts: i64,
-    #[prop(into)] title: String,
-    #[prop(optional, into)] rule: Option<String>,
-    #[prop(optional, into)] source: Option<String>,
-) -> impl IntoView {
-    let (sev_cls, rail_cls, label) = match sev {
-        AlertSev::Critical => (
-            "alert-card-sev--critical",
-            "alert-card-rail--critical",
-            "critical",
-        ),
-        AlertSev::Warning => (
-            "alert-card-sev--warning",
-            "alert-card-rail--warning",
-            "warning",
-        ),
-        AlertSev::Info => ("alert-card-sev--info", "alert-card-rail--info", "info"),
-    };
-    view! {
-        <div class="alert-card">
-            <span class=format!("alert-card-rail {rail_cls}")></span>
-            <div class="alert-card-head">
-                <span class=format!("alert-card-sev {sev_cls}")>{label}</span>
-                <span class="alert-card-id">{id}</span>
-                <span class="alert-card-age"><crate::now::RelTime ts=age_ts/></span>
-            </div>
-            <div class="alert-card-title">{title}</div>
-            {(rule.is_some() || source.is_some()).then(|| view! {
-                <div class="alert-card-rule">
-                    {rule.map(|r| view! { <>"rule: "<strong>{r}</strong></> })}
-                    {source.map(|s| view! { <>" · source: "<strong>{s}</strong></> })}
-                </div>
-            })}
-        </div>
     }
 }
 
@@ -326,9 +161,74 @@ impl Crumb {
     }
 }
 
+/// A button with a chevron menu holding one variant. `children` is the main
+/// button; the chevron takes its `variant` class (`btn-primary`,
+/// `btn-danger` or none). Clicks stop at the split, so it can sit in a row
+/// link. Pass `open` to keep the menu open across a re-render.
+#[component]
+pub fn SplitButton(
+    #[prop(into)] variant: Signal<&'static str>,
+    #[prop(into)] disabled: Signal<bool>,
+    #[prop(into)] menu_label: String,
+    on_menu: Callback<()>,
+    #[prop(optional)] open: Option<RwSignal<bool>>,
+    children: Children,
+) -> impl IntoView {
+    let open = open.unwrap_or_else(|| RwSignal::new(false));
+    let stop = |ev: &web_sys::MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+    };
+    view! {
+        <div class="btn-split">
+            {children()}
+            <button
+                class=move || format!("btn {} btn-split-toggle", variant.get())
+                on:click=move |ev| {
+                    stop(&ev);
+                    open.update(|o| *o = !*o);
+                }
+                disabled=disabled
+                title="More options"
+                aria-label="More options"
+                aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string()
+            >
+                <crate::components::icons::IconChevronRight/>
+            </button>
+            <Show when=move || open.get()>
+                <div
+                    class="btn-split-backdrop"
+                    on:click=move |ev| {
+                        stop(&ev);
+                        open.set(false);
+                    }
+                ></div>
+                <div class="btn-split-menu" role="menu">
+                    <button
+                        class="btn-split-menu-item"
+                        role="menuitem"
+                        on:click=move |ev| {
+                            stop(&ev);
+                            open.set(false);
+                            on_menu.run(());
+                        }
+                    >
+                        {menu_label.clone()}
+                    </button>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+/// Page header. List pages pass `title` (+ an optional `subtitle` line);
+/// detail pages pass `crumbs`. Children are the page actions.
 #[component]
 pub fn Topbar(
-    #[prop(into)] crumbs: Vec<Crumb>,
+    #[prop(optional, into)] crumbs: Vec<Crumb>,
+    #[prop(optional, into)] title: Option<String>,
+    #[prop(optional, into)] subtitle: Option<ViewFn>,
     #[prop(optional)] children: Option<Children>,
 ) -> impl IntoView {
     let last = crumbs.len().saturating_sub(1);
@@ -358,42 +258,21 @@ pub fn Topbar(
         })
         .collect();
 
+    let head = match title {
+        Some(t) => view! { <h1 class="topbar-title">{t}</h1> }.into_any(),
+        None => view! { <div class="topbar-crumbs">{rendered}</div> }.into_any(),
+    };
+    let subtitled = subtitle.is_some();
     view! {
         <div class="topbar">
-            <div class="topbar-row">
-                <div class="topbar-crumbs">{rendered}</div>
+            <div class="topbar-row" class:topbar-row--subtitled=subtitled>
+                {head}
                 <div class="topbar-actions">
                     {children.map(|c| c())}
                 </div>
             </div>
+            {subtitle.map(|s| view! { <div class="topbar-subtitle">{s.run()}</div> })}
         </div>
-    }
-}
-
-#[component]
-pub fn FilterPills(children: Children) -> impl IntoView {
-    view! { <div class="filter-pills">{children()}</div> }
-}
-
-#[component]
-pub fn FilterPill(
-    #[prop(into)] label: String,
-    #[prop(optional, into)] count: Option<String>,
-    #[prop(into)] active: Signal<bool>,
-    #[prop(into)] on_click: Callback<()>,
-) -> impl IntoView {
-    let cls = move || {
-        if active.get() {
-            "filter-pill filter-pill--active"
-        } else {
-            "filter-pill"
-        }
-    };
-    view! {
-        <button class=cls on:click=move |_| on_click.run(())>
-            {label}
-            {count.map(|c| view! { <span class="count">{c}</span> })}
-        </button>
     }
 }
 
@@ -585,7 +464,19 @@ pub fn PartitionHeatmap(
 pub fn EmptyState(
     #[prop(into)] message: String,
     #[prop(optional, into)] hint: Option<String>,
+    /// Inside a page section: no illustration, less padding.
+    #[prop(optional)]
+    compact: bool,
 ) -> impl IntoView {
+    if compact {
+        return view! {
+            <div class="empty-state">
+                <span class="empty-state-msg">{message}</span>
+                {hint.map(|h| view! { <span class="empty-state-hint">{h}</span> })}
+            </div>
+        }
+        .into_any();
+    }
     view! {
         <div class="empty-state-rich">
             <svg class="empty-state-wave" width="96" height="40" viewBox="0 0 96 40" fill="none">
@@ -605,10 +496,11 @@ pub fn EmptyState(
                     opacity="0.7"
                 />
             </svg>
-            <div style="color:var(--text); font-weight:500">{message}</div>
-            {hint.map(|h| view! { <div style="margin-top:4px; opacity:0.7">{h}</div> })}
+            <div class="empty-state-msg">{message}</div>
+            {hint.map(|h| view! { <div class="empty-state-hint">{h}</div> })}
         </div>
     }
+    .into_any()
 }
 
 /// ConditionReplay — real per-sub-condition history for a single asset over
@@ -646,12 +538,12 @@ pub fn ConditionReplay(
     view! {
         <div class="cond-replay">
             <Transition fallback=move || view! {
-                <div class="cond-replay-empty">"Loading evaluation history..."</div>
+                <div class="cond-replay-empty">"Loading evaluation history…"</div>
             }>
                 {move || {
                     let records = evals.get().and_then(|r| r.ok()).unwrap_or_default();
 
-                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let now_ns = jiff::Timestamp::now().as_nanosecond() as i64;
                     let window_ns = minutes as i64 * 60 * 1_000_000_000;
                     let mut recent: Vec<_> = records
                         .into_iter()
@@ -867,7 +759,7 @@ pub fn ConditionReplay(
                             <div class="cond-replay-head">
                                 <span class="section-header-label">{format!("CONDITION REPLAY · LAST {minutes} MIN")}</span>
                                 <span class="cond-replay-hint">
-                                    {recent.len().to_string()} " ticks · click a cell to inspect"
+                                    {crate::helpers::plural(recent.len() as u64, "tick", "ticks")} " · click a cell to inspect"
                                 </span>
                             </div>
                             <div class="cond-tracks">{tracks}</div>
@@ -893,20 +785,20 @@ pub fn ConditionReplay(
     }
 }
 
-/// Global evaluation timeline — bucketed bar chart showing when the automation
+/// Evaluation timeline — bucketed bar chart showing when the automation
 /// engine evaluated conditions (bar height = eval count per bucket) and when
 /// those evals resulted in a materialization request (accent-colored bars).
 #[component]
 pub fn EvalTimelineBars(
-    /// (eval_count, had_request) buckets ordered oldest → newest.
+    /// (eval_count, fire_count) buckets ordered oldest → newest.
     #[prop(into)]
-    buckets: Vec<(u32, bool)>,
+    buckets: Vec<(u32, u32)>,
 ) -> impl IntoView {
     let total_ticks: u64 = buckets.iter().map(|(c, _)| *c as u64).sum();
-    let fire_count: usize = buckets.iter().filter(|(_, r)| *r).count();
+    let fire_count: u64 = buckets.iter().map(|(_, f)| *f as u64).sum();
     let n = buckets.len().max(1);
     let mins_per_bucket = 60.0 / n as f64;
-    let last_fire_idx = buckets.iter().rposition(|(_, r)| *r);
+    let last_fire_idx = buckets.iter().rposition(|(_, f)| *f > 0);
     let last_fire_label = last_fire_idx
         .map(|i| {
             let mins_ago = ((n - 1 - i) as f64 * mins_per_bucket).round() as u32;
@@ -921,19 +813,19 @@ pub fn EvalTimelineBars(
     let max = buckets.iter().map(|(c, _)| *c).max().unwrap_or(1).max(1) as f64;
     let bars = buckets
         .into_iter()
-        .map(|(c, req)| {
+        .map(|(c, fires)| {
             let h = (c as f64 / max * 100.0).clamp(2.0, 100.0);
-            let color = if req { "var(--accent)" } else { "var(--bg-highest)" };
-            let plural = if c == 1 { "tick" } else { "ticks" };
-            let title = if req {
-                format!("{c} {plural} · fired")
+            let color = if fires > 0 { "var(--accent)" } else { "var(--bg-highest)" };
+            let ticks = crate::helpers::plural(c as u64, "tick", "ticks");
+            let title = if fires > 0 {
+                format!("{ticks} · {fires} fired")
             } else {
-                format!("{c} {plural}")
+                ticks
             };
             view! {
                 <div
                     title=title
-                    style=format!("flex:1; min-width:1px; height:{h:.0}%; background:{color}; border-radius:1px")
+                    style=format!("flex:1; min-width:1px; height:{h:.0}%; background:{color}; border-radius:var(--round-xs)")
                 ></div>
             }
         })
@@ -942,16 +834,16 @@ pub fn EvalTimelineBars(
     view! {
         <div class="eval-timeline-panel">
             <div class="eval-timeline-head">
-                <span class="section-header-label">"GLOBAL EVALUATION TIMELINE · LAST HOUR"</span>
+                <span class="section-header-label">"EVALUATION TIMELINE · LAST HOUR"</span>
                 <span class="eval-timeline-stats">
                     <span class="eval-timeline-stat">
                         <span class="eval-timeline-stat-num">{total_ticks.to_string()}</span>
-                        " ticks"
+                        {if total_ticks == 1 { " tick" } else { " ticks" }}
                     </span>
                     <span class="eval-timeline-sep">"·"</span>
                     <span class="eval-timeline-stat">
                         <span class="eval-timeline-stat-num" style="color:var(--accent)">{fire_count.to_string()}</span>
-                        " fires"
+                        {if fire_count == 1 { " fire" } else { " fires" }}
                     </span>
                     <span class="eval-timeline-sep">"·"</span>
                     <span class="eval-timeline-stat">
@@ -984,89 +876,41 @@ pub fn EvalTimelineBars(
 }
 
 #[derive(Clone, Debug)]
-pub struct LineageNode {
+pub struct StripRun {
     pub id: String,
-    pub label: String,
-    pub column: u8, // 0 = source, 1 = pipeline, 2 = asset
-    pub row: u8,
+    /// Chip vocabulary from `run_status_kind`.
+    pub kind: &'static str,
+    /// `None` until the run has an end time.
+    pub duration_s: Option<f64>,
 }
 
-#[component]
-pub fn LineageMini(
-    #[prop(into)] nodes: Vec<LineageNode>,
-    #[prop(into)] edges: Vec<(String, String)>,
-) -> impl IntoView {
-    let col_x = [30.0f64, 280.0, 560.0];
-    let row_step = 50.0f64;
-    let nw = 130.0;
-    let nh = 22.0;
-
-    let pos = |n: &LineageNode| -> (f64, f64) {
-        let col = n.column.min(2) as usize;
-        (col_x[col], 20.0 + n.row as f64 * row_step)
-    };
-
-    let edges_rendered: Vec<_> = edges
-        .iter()
-        .filter_map(|(a, b)| {
-            let na = nodes.iter().find(|n| &n.id == a)?;
-            let nb = nodes.iter().find(|n| &n.id == b)?;
-            let (ax, ay) = pos(na);
-            let (bx, by) = pos(nb);
-            let x1 = ax + nw;
-            let y1 = ay + nh / 2.0;
-            let x2 = bx;
-            let y2 = by + nh / 2.0;
-            let d = format!(
-                "M{x1:.1},{y1:.1} C{:.1},{y1:.1} {:.1},{y2:.1} {x2:.1},{y2:.1}",
-                x1 + 60.0,
-                x2 - 60.0
-            );
-            Some(view! { <path d=d class="lineage-mini-edge"/> })
-        })
-        .collect();
-
-    let nodes_rendered: Vec<_> = nodes
-        .iter()
-        .map(|n| {
-            let (x, y) = pos(n);
-            let rail_cls = match n.column {
-                0 => "lineage-mini-rail--source",
-                1 => "lineage-mini-rail--pipeline",
-                _ => "lineage-mini-rail--asset",
-            };
-            view! {
-                <g transform=format!("translate({x:.0}, {y:.0})")>
-                    <rect x="0" y="0" width=nw height=nh rx="2" class="lineage-mini-node"/>
-                    <rect x="0" y="2" width="2" height="18" class=rail_cls/>
-                    <text x="10" y="14" class="lineage-mini-node-text">{n.label.clone()}</text>
-                </g>
-            }
-        })
-        .collect();
-
-    view! {
-        <div class="lineage-mini-wrap">
-            <svg width="100%" height="200" viewBox="0 0 720 200" style="display:block">
-                {edges_rendered}
-                {nodes_rendered}
-            </svg>
-        </div>
+impl StripRun {
+    /// Bars for the newest `n` of `runs` (newest first), oldest on the left.
+    pub fn from_runs(runs: &[crate::types::RunRecord], n: usize) -> Vec<StripRun> {
+        runs.iter()
+            .take(n)
+            .rev()
+            .map(|r| StripRun {
+                id: crate::helpers::short_id(&r.run_id, 8),
+                kind: crate::helpers::run_status_kind(&r.status),
+                duration_s: r.end_time.map(|e| (e - r.start_time).max(0) as f64 / 1e9),
+            })
+            .collect()
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct StripRun {
-    pub id: String,
-    pub status: &'static str, // "ok" | "err" | "retry"
-    pub duration_s: f64,
-    pub live: bool,
+fn format_strip_secs(s: f64) -> String {
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else {
+        crate::helpers::format_seconds(s as i64)
+    }
 }
 
 #[component]
 pub fn RecentRunsStrip(
     #[prop(into)] runs: Vec<StripRun>,
-    #[prop(optional, into, default = "RECENT RUNS".to_string())] label: String,
+    #[prop(optional, into, default = "RUN DURATIONS".to_string())] label: String,
 ) -> impl IntoView {
     if runs.is_empty() {
         return view! {
@@ -1079,46 +923,32 @@ pub fn RecentRunsStrip(
         }
         .into_any();
     }
-    let max = runs
-        .iter()
-        .map(|r| r.duration_s)
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let avg = runs.iter().map(|r| r.duration_s).sum::<f64>() / runs.len() as f64;
-    let ok_count = runs.iter().filter(|r| r.status == "ok").count();
-    let err_count = runs.iter().filter(|r| r.status == "err").count();
-    let avg_offset = (1.0 - (avg / max)) * 60.0 + 8.0;
+    let finished: Vec<f64> = runs.iter().filter_map(|r| r.duration_s).collect();
+    let max = finished.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let avg = (!finished.is_empty()).then(|| finished.iter().sum::<f64>() / finished.len() as f64);
+    let ok_count = runs.iter().filter(|r| r.kind == "success").count();
+    let err_count = runs.iter().filter(|r| r.kind == "failed").count();
 
     let bars = runs
         .iter()
         .map(|r| {
-            let h = (r.duration_s / max * 60.0).max(8.0);
-            let cls = match r.status {
-                "err" => "runs-strip-bar runs-strip-bar--err",
-                "retry" => "runs-strip-bar runs-strip-bar--retry",
-                _ => "runs-strip-bar runs-strip-bar--ok",
+            let h = r.duration_s.map_or(8.0, |d| (d / max * 60.0).max(8.0));
+            let cls = match r.kind {
+                "success" => "runs-strip-bar runs-strip-bar--ok",
+                "failed" => "runs-strip-bar runs-strip-bar--err",
+                "canceled" => "runs-strip-bar runs-strip-bar--canceled",
+                "running" => "runs-strip-bar runs-strip-bar--retry runs-strip-bar--live",
+                _ => "runs-strip-bar runs-strip-bar--retry",
             };
-            let cls = if r.live {
-                format!("{cls} runs-strip-bar--live")
-            } else {
-                cls.to_string()
-            };
-            let x_marker = (r.status == "err").then(|| {
+            let x_marker = (r.kind == "failed").then(|| {
                 view! {
                     <span class="runs-strip-bar-x">"✕"</span>
                 }
             });
-            // Rivers tooltip: "run · status · Xs · [live]"
-            let status_label = match r.status {
-                "err" => "failed",
-                "retry" => "retry",
-                _ => "ok",
+            let tip = match r.duration_s {
+                Some(d) => format!("{} · {} · {}", r.id, r.kind, format_strip_secs(d)),
+                None => format!("{} · {}", r.id, r.kind),
             };
-            let live_suffix = if r.live { " · live" } else { "" };
-            let tip = format!(
-                "{} · {} · {:.1}s{}",
-                r.id, status_label, r.duration_s, live_suffix
-            );
             view! {
                 <div class=cls style=format!("height:{h:.0}px") title=tip>
                     {x_marker}
@@ -1132,78 +962,21 @@ pub fn RecentRunsStrip(
             <div class="runs-strip-head">
                 <span class="section-header-label">{label}</span>
                 <div class="stats">
-                    <span>"avg " {format!("{:.1}s", avg)}</span>
+                    <span>"avg " {avg.map_or_else(|| "—".to_string(), format_strip_secs)}</span>
                     <span style="color:var(--success)">"✓ " {ok_count}</span>
                     <span style="color:var(--error)">"✕ " {err_count}</span>
                 </div>
             </div>
             <div class="runs-strip-bars">
-                <span class="runs-strip-avg" style=format!("top:{avg_offset:.1}px")></span>
+                {avg.map(|a| {
+                    let offset = (1.0 - (a / max)) * 60.0 + 8.0;
+                    view! { <span class="runs-strip-avg" style=format!("top:{offset:.1}px")></span> }
+                })}
                 {bars}
             </div>
         </div>
     }
     .into_any()
-}
-
-#[derive(Clone, Debug)]
-pub struct Tick {
-    pub kind: &'static str, // "schedule" | "sensor" | "condition"
-    pub label: String,
-    /// Minutes from now (0..horizon_minutes).
-    pub at_minutes: f64,
-}
-
-#[component]
-pub fn NextTicksStrip(
-    #[prop(into)] ticks: Vec<Tick>,
-    #[prop(optional, default = 60)] horizon_minutes: u32,
-) -> impl IntoView {
-    let gridlines = (1..=6)
-        .map(|i| {
-            let pct = i as f64 / 7.0 * 100.0;
-            view! { <span class="next-ticks-gridline" style=format!("left:{pct:.1}%")></span> }
-        })
-        .collect::<Vec<_>>();
-
-    let lane_for = |kind: &str| -> i32 {
-        match kind {
-            "schedule" => 0,
-            "sensor" => 1,
-            _ => 2,
-        }
-    };
-    let horizon = horizon_minutes.max(1) as f64;
-    let tick_views = ticks
-        .iter()
-        .map(|t| {
-            let cls = match t.kind {
-                "schedule" => "next-ticks-tick next-ticks-tick--schedule",
-                "sensor" => "next-ticks-tick next-ticks-tick--sensor",
-                _ => "next-ticks-tick next-ticks-tick--condition",
-            };
-            let lane = lane_for(t.kind);
-            let top = 10.0 + lane as f64 * 18.0;
-            let pct = (t.at_minutes / horizon * 100.0).clamp(0.0, 100.0);
-            view! {
-                <span class=cls style=format!("left:{pct:.1}%; top:{top:.0}px") title=t.label.clone()></span>
-            }
-        })
-        .collect::<Vec<_>>();
-
-    view! {
-        <div class="next-ticks">
-            <div class="section-header">
-                <span class="section-header-label">"NEXT " {horizon_minutes} " MIN"</span>
-                <span class="section-header-count">{format!("{} upcoming", ticks.len())}</span>
-            </div>
-            <div class="next-ticks-track">
-                {gridlines}
-                <span class="next-ticks-playhead"></span>
-                {tick_views}
-            </div>
-        </div>
-    }
 }
 
 /// Stacked pool-utilization bar: `used` / `free` / `queued` percentages.
@@ -1396,18 +1169,21 @@ pub fn RiversSearch(
     }
 }
 
+/// Segmented control. Items are `(id, label, optional count)`; `on_select`
+/// receives the id.
 #[component]
 pub fn FilterPillGroup(
-    #[prop(into)] label: String,
-    #[prop(into)] items: Vec<(String, Option<usize>)>,
+    #[prop(optional, into)] label: Option<String>,
+    #[prop(into)] items: Vec<(String, String, Option<usize>)>,
     #[prop(into)] active: Signal<String>,
     #[prop(into)] on_select: Callback<String>,
 ) -> impl IntoView {
     view! {
         <div class="filter-pill-group">
-            <span class="filter-pill-group-label">{label}</span>
-            {items.into_iter().map(|(id, count)| {
+            {label.map(|l| view! { <span class="filter-pill-group-label">{l}</span> })}
+            {items.into_iter().map(|(id, text, count)| {
                 let id_for_cls = id.clone();
+                let id_for_aria = id.clone();
                 let id_for_cb = id.clone();
                 let cb = on_select;
                 let cls = move || {
@@ -1418,8 +1194,12 @@ pub fn FilterPillGroup(
                     }
                 };
                 view! {
-                    <button class=cls on:click=move |_| cb.run(id_for_cb.clone())>
-                        {id.clone()}
+                    <button
+                        class=cls
+                        aria-pressed=move || (active.get() == id_for_aria).to_string()
+                        on:click=move |_| cb.run(id_for_cb.clone())
+                    >
+                        {text}
                         {count.map(|n| view! { <span class="count">{n}</span> })}
                     </button>
                 }
@@ -1428,8 +1208,8 @@ pub fn FilterPillGroup(
     }
 }
 
-/// Underline-style tab bar (replaces the Material-style `.tab-bar`).
-/// Items are `(id, label, optional count)`.
+/// Underline tab bar for switching page content. Items are
+/// `(id, label, optional count)`.
 #[component]
 pub fn UnderlineTabs(
     #[prop(into)] tabs: Vec<(String, String, Option<usize>)>,
@@ -1437,9 +1217,10 @@ pub fn UnderlineTabs(
     #[prop(into)] on_select: Callback<String>,
 ) -> impl IntoView {
     view! {
-        <div class="tabs-underline">
+        <div class="tabs-underline" role="tablist">
             {tabs.into_iter().map(|(id, label, count)| {
                 let id_for_cls = id.clone();
+                let id_for_aria = id.clone();
                 let id_for_cb = id.clone();
                 let cb = on_select;
                 let cls = move || {
@@ -1450,7 +1231,12 @@ pub fn UnderlineTabs(
                     }
                 };
                 view! {
-                    <button class=cls on:click=move |_| cb.run(id_for_cb.clone())>
+                    <button
+                        class=cls
+                        role="tab"
+                        aria-selected=move || (active.get() == id_for_aria).to_string()
+                        on:click=move |_| cb.run(id_for_cb.clone())
+                    >
                         {label}
                         {count.map(|n| view! { <span class="tab-count">{n}</span> })}
                     </button>
@@ -1480,7 +1266,7 @@ pub fn AssetStack(
     let n = assets.len();
     let shown: Vec<_> = assets.iter().take(max).cloned().collect();
     let extra = n.saturating_sub(max);
-    let (lns, lnm) = crate::loc::use_current_location().get();
+    let (lns, lnm) = crate::loc::use_current_location().get_untracked();
     let chips = {
         let navigate = navigate.clone();
         shown
@@ -1555,24 +1341,26 @@ pub fn AssetStack(
 ///
 /// Scheme is derived from the partition key format: a hyphenated ISO date like
 /// `2025-04-19` → `D` (daily), an ISO datetime like `2025-04-19T14` → `H`
-/// (hourly), and anything else → `·` (custom/static).
+/// (hourly). Any other scheme shows no badge.
 #[component]
 pub fn PartitionCell(
-    /// 'D' daily, 'H' hourly, '·' static/no partitioning.
+    /// 'D' daily, 'H' hourly; anything else hides the badge.
     #[prop(into, default = "·".to_string())]
     scheme: String,
     #[prop(optional, into)] count_label: Option<String>,
 ) -> impl IntoView {
     let tip = match scheme.as_str() {
-        "D" => "daily partition",
-        "H" => "hourly partition",
-        _ => "static / no partitioning",
-    }
-    .to_string();
+        "D" => Some("daily partition"),
+        "H" => Some("hourly partition"),
+        _ => None,
+    };
     view! {
         <span class="partition-cell">
-            <span class="partition-cell-badge" data-tip=tip>{scheme}</span>
-            {count_label.map(|c| view! { <span class="partition-cell-count">{c}</span> })}
+            {tip.map(|t| view! { <span class="partition-cell-badge" data-tip=t>{scheme}</span> })}
+            {count_label.map(|c| {
+                let tip = c.clone();
+                view! { <span class="partition-cell-count" title=tip>{c}</span> }
+            })}
         </span>
     }
 }
@@ -1631,11 +1419,11 @@ pub fn LaunchedByCell(
     let sub_line = sub.or(payload);
     view! {
         <span style="display:flex; align-items:center; gap:8px; min-width:0">
-            <span style=format!("color:{color}; font-size:12px; flex-shrink:0; width:14px; text-align:center")>{glyph}</span>
+            <span style=format!("color:{color}; font-size:var(--fs-sm); flex-shrink:0; width:14px; text-align:center")>{glyph}</span>
             <span style="display:flex; flex-direction:column; min-width:0; gap:1px">
-                <span class="grid-cell-mono" style="color:var(--text); font-size:12px">{label}</span>
+                <span class="grid-cell-mono" style="color:var(--text); font-size:var(--fs-sm)">{label}</span>
                 {sub_line.map(|s| view! {
-                    <span class="grid-cell-muted" style="font-size:10.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{s}</span>
+                    <span class="grid-cell-muted" style="font-size:var(--fs-xs); overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{s}</span>
                 })}
             </span>
         </span>
@@ -1662,7 +1450,7 @@ pub fn AssetSummaryRow(
         }
         None => ("var(--text-muted)", None, None, true),
     };
-    let (lns, lnm) = crate::loc::use_current_location().get();
+    let (lns, lnm) = crate::loc::use_current_location().get_untracked();
     let href = crate::loc::loc_path(&lns, &lnm, &format!("assets/{}", asset_key));
     let style = format!("border-left-color: {}", rail_color);
     view! {
@@ -1687,7 +1475,7 @@ pub fn AssetSummaryRow(
 /// Shared by schedule-detail and sensor-detail tick grids.
 #[component]
 pub fn TickRunChips(run_ids: Vec<String>, backfill_ids: Vec<String>) -> impl IntoView {
-    let (lns, lnm) = crate::loc::use_current_location().get();
+    let (lns, lnm) = crate::loc::use_current_location().get_untracked();
     if !backfill_ids.is_empty() {
         let lns_b = lns.clone();
         let lnm_b = lnm.clone();
@@ -1695,13 +1483,13 @@ pub fn TickRunChips(run_ids: Vec<String>, backfill_ids: Vec<String>) -> impl Int
             <span style="display:flex; flex-wrap:wrap; gap:4px">
                 {backfill_ids.into_iter().map(move |bid| {
                     let href = crate::loc::loc_path(&lns_b, &lnm_b, &format!("backfills/{}", bid));
-                    let short = crate::helpers::short_id(&bid, 10);
+                    let short = crate::helpers::short_id(&bid, 8);
                     let title = format!("Backfill {bid}");
                     view! {
                         <A
                             href=href
                             attr:class="tag tag--backfill"
-                            attr:style="font-size:10.5px"
+                            attr:style="font-size:var(--fs-xs)"
                             attr:title=title
                         >
                             <span class="chip-backfill-prefix">"BF"</span>
@@ -1719,7 +1507,7 @@ pub fn TickRunChips(run_ids: Vec<String>, backfill_ids: Vec<String>) -> impl Int
                     let href = crate::loc::loc_path(&lns, &lnm, &format!("runs/{}", id));
                     let short = crate::helpers::short_id(&id, 8);
                     view! {
-                        <A href=href attr:class="tag" attr:style="font-size:10.5px">{short}</A>
+                        <A href=href attr:class="tag" attr:style="font-size:var(--fs-xs)">{short}</A>
                     }
                 }).collect::<Vec<_>>()}
             </span>
@@ -1727,7 +1515,7 @@ pub fn TickRunChips(run_ids: Vec<String>, backfill_ids: Vec<String>) -> impl Int
         .into_any()
     } else {
         view! {
-            <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">"—"</span>
+            <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">"—"</span>
         }
         .into_any()
     }
@@ -1886,41 +1674,6 @@ pub fn DagMinimap(
     .into_any()
 }
 
-/// 20-bar throughput histogram — color-gradient across age (older→surface-highest,
-/// mid→secondary-dim, newest→secondary with glow). Heights are normalized to max.
-#[component]
-pub fn ThroughputBars(
-    #[prop(into)] points: Vec<f64>,
-    #[prop(optional, default = 64)] height_px: u32,
-) -> impl IntoView {
-    if points.is_empty() {
-        return view! { <div style=format!("height:{height_px}px")></div> }.into_any();
-    }
-    let max = points.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-    let n = points.len();
-    let bars = points
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let pct = (v / max * 100.0).clamp(0.0, 100.0);
-            let is_now = i + 1 == n;
-            let is_recent = !is_now && i + 4 >= n;
-            let cls = if is_now {
-                "bar bar--now"
-            } else if is_recent {
-                "bar bar--recent"
-            } else {
-                "bar"
-            };
-            view! { <div class=cls style=format!("height:{pct:.1}%")></div> }
-        })
-        .collect::<Vec<_>>();
-    view! {
-        <div class="throughput-bars" style=format!("height:{height_px}px")>{bars}</div>
-    }
-    .into_any()
-}
-
 /// Queue "bottleneck explainer" card at the top of the queue screen.
 #[component]
 pub fn BottleneckCard(
@@ -1974,9 +1727,9 @@ pub fn DeployCard(
 ) -> impl IntoView {
     let status_chip = status_label.map(|text| {
         let dot_cls = if status_ok {
-            "dot dot-healthy"
+            "dot dot-success"
         } else {
-            "dot dot-warn"
+            "dot dot-stale"
         };
         view! {
             <span class="chip">
@@ -2025,6 +1778,7 @@ pub fn AttentionBanner(
         (Some(c), Some(cb)) => Some(view! {
             <button
                 class="attention-banner-toggle"
+                aria-expanded=move || (!c.get()).to_string()
                 on:click=move |_| cb.run(())
             >
                 <span class="attention-banner-toggle-label">{move || if c.get() { "Expand" } else { "Collapse" }}</span>
@@ -2040,7 +1794,7 @@ pub fn AttentionBanner(
         <div class="attention-banner">
             <span class="attention-banner-dot"></span>
             <span class="attention-banner-msg">
-                <strong>{count}</strong> " " {plural} " need" {(count != 1).then_some("")} " attention"
+                <strong>{count}</strong> " " {plural} {if count == 1 { " needs" } else { " need" }} " attention"
             </span>
             {breakdown.map(|b| view! { <span class="attention-banner-sub">{b}</span> })}
             {toggle_view.map(|t| view! { <span class="attention-banner-spacer"></span> {t} })}
@@ -2136,222 +1890,6 @@ pub fn ProgressBar(
             <div class="rv-progress-fill" style=fill_style></div>
         </div>
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct LayerRollup {
-    pub name: String,
-    pub fresh: usize,
-    pub stale: usize,
-    pub failed: usize,
-    pub total: usize,
-    pub spark: Vec<f64>,
-    pub materializations_24h: usize,
-}
-
-/// Warehouse-state summary strip: one card per asset layer with stacked
-/// fresh/stale/failed bar, 24h sparkline, and a materializations count.
-#[component]
-pub fn AssetsHeroStrip(
-    #[prop(into)] layers: Vec<LayerRollup>,
-    #[prop(optional, into)] active_layer: Option<Signal<Option<String>>>,
-    #[prop(optional)] on_select: Option<Callback<String>>,
-) -> impl IntoView {
-    if layers.is_empty() {
-        return view! { <></> }.into_any();
-    }
-    let cols = layers.len();
-    let rollup_row = layers
-        .into_iter()
-        .map(|l| {
-            let is_active = active_layer
-                .as_ref()
-                .and_then(|s| s.get())
-                .map(|a| a == l.name)
-                .unwrap_or(false);
-            let cls = if is_active {
-                "hero-strip-card hero-strip-card--active"
-            } else {
-                "hero-strip-card"
-            };
-            let total = l.total.max(1) as f64;
-            let fresh_pct = l.fresh as f64 / total * 100.0;
-            let stale_pct = l.stale as f64 / total * 100.0;
-            let failed_pct = l.failed as f64 / total * 100.0;
-            let mats = l.materializations_24h;
-
-            // Build sparkline path
-            let spark_path = if l.spark.is_empty() {
-                String::new()
-            } else {
-                let w = 96.0;
-                let h = 22.0;
-                let step = w / (l.spark.len() - 1).max(1) as f64;
-                let max = l.spark.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
-                l.spark
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let x = i as f64 * step;
-                        let y = 26.0 - (v / max) * h;
-                        if i == 0 {
-                            format!("M{x:.1},{y:.1}")
-                        } else {
-                            format!(" L{x:.1},{y:.1}")
-                        }
-                    })
-                    .collect::<String>()
-            };
-            let spark_area = if spark_path.is_empty() {
-                String::new()
-            } else {
-                format!("{spark_path} L96,28 L0,28 Z")
-            };
-            let name_click = l.name.clone();
-            let cb = on_select;
-            view! {
-                <button
-                    class=cls
-                    on:click=move |_| { if let Some(c) = cb { c.run(name_click.clone()); } }
-                >
-                    <div class="hero-strip-card-head">
-                        <span class="hero-strip-card-name">{l.name.clone()}</span>
-                        <span class="hero-strip-card-count">{l.total}</span>
-                    </div>
-                    <div class="hero-strip-card-stacked">
-                        <span style=format!("width:{fresh_pct:.1}%; background:var(--success)")></span>
-                        <span style=format!("width:{stale_pct:.1}%; background:var(--warning)")></span>
-                        <span style=format!("width:{failed_pct:.1}%; background:var(--error)")></span>
-                    </div>
-                    <svg width="100%" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" style="display:block">
-                        <path d=spark_area fill="rgba(255,143,120,0.2)"/>
-                        <path d=spark_path stroke="var(--accent)" stroke-width="1" fill="none"/>
-                    </svg>
-                    <div class="hero-strip-card-foot">
-                        <span>{mats} " mats · 24h"</span>
-                        <span>{format!("{:.0}% fresh", fresh_pct)}</span>
-                    </div>
-                </button>
-            }
-        })
-        .collect::<Vec<_>>();
-
-    view! {
-        <div class="hero-strip">
-            <div class="hero-strip-head">
-                <div>
-                    <div class="section-header-label">"WAREHOUSE STATE"</div>
-                    <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); margin-top:2px">
-                        "last 24h · click a layer to filter"
-                    </div>
-                </div>
-                <div class="hero-strip-legend">
-                    <span><span class="hero-strip-legend-swatch" style="background:var(--success)"></span>"fresh"</span>
-                    <span><span class="hero-strip-legend-swatch" style="background:var(--warning)"></span>"stale"</span>
-                    <span><span class="hero-strip-legend-swatch" style="background:var(--error)"></span>"failed"</span>
-                </div>
-            </div>
-            <div class="hero-strip-row" style=format!("grid-template-columns:repeat({cols}, 1fr)")>
-                {rollup_row}
-            </div>
-        </div>
-    }.into_any()
-}
-
-/// Blast-radius banner: how many downstream assets/jobs/dashboards depend on
-/// this one. Shows a CRITICAL pill when the fan-out is large. Clicking
-/// "Show list" expands a grid of descendant asset keys.
-#[component]
-pub fn WhoDependsBanner(
-    #[prop(into)] downstream_assets: usize,
-    #[prop(optional, default = 0)] jobs: usize,
-    #[prop(optional, default = 0)] dashboards: usize,
-    #[prop(optional)] is_critical: bool,
-    #[prop(optional, into)] open_href: Option<String>,
-    /// Optional descendant asset keys to render in the expand panel.
-    #[prop(optional)]
-    descendants: Vec<String>,
-) -> impl IntoView {
-    if downstream_assets == 0 && jobs == 0 && dashboards == 0 {
-        return view! {
-            <div class="blast-banner-leaf">
-                <span>"✓"</span>
-                <span>"No downstream assets, jobs, or dashboards depend on this — leaf asset."</span>
-            </div>
-        }
-        .into_any();
-    }
-
-    let (open, set_open) = signal(false);
-    let has_list = !descendants.is_empty();
-    let cls = if is_critical {
-        "blast-banner blast-banner--critical"
-    } else {
-        "blast-banner"
-    };
-    view! {
-        <div class=cls>
-            <div class="blast-banner-head">
-                <div style="display:flex; align-items:center; gap:6px">
-                    <span class="blast-banner-label">"blast radius"</span>
-                    {is_critical.then(|| view! {
-                        <span class="blast-banner-pill">"CRITICAL"</span>
-                    })}
-                </div>
-                <div class="blast-banner-counts">
-                    <span><strong>{downstream_assets}</strong> " " <span class="muted">
-                        {if downstream_assets == 1 { "asset" } else { "assets" }}
-                    </span></span>
-                    <span><strong>{jobs}</strong> " " <span class="muted">
-                        {if jobs == 1 { "job" } else { "jobs" }}
-                    </span></span>
-                    <span><strong>{dashboards}</strong> " " <span class="muted">
-                        {if dashboards == 1 { "dashboard" } else { "dashboards" }}
-                    </span></span>
-                    <span class="muted">"depend on this"</span>
-                </div>
-                <div style="flex:1"></div>
-                {has_list.then(|| view! {
-                    <button
-                        on:click=move |_| set_open.update(|v| *v = !*v)
-                        style="background:transparent; color:var(--text-muted); font-family:'JetBrains Mono',monospace; font-size:11px; border:0; cursor:pointer"
-                    >
-                        {move || if open.get() { "Hide list" } else { "Show list" }}
-                    </button>
-                })}
-                {open_href.map(|href| view! {
-                    <A href=href attr:style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent)">
-                        "open in lineage →"
-                    </A>
-                })}
-            </div>
-            <Show when=move || open.get() && has_list>
-                <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--bg-highest)">
-                    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:6px">
-                        {
-                            let (lns, lnm) = crate::loc::use_current_location().get();
-                            descendants.iter().take(18).map(move |k| {
-                            let href = crate::loc::loc_path(&lns, &lnm, &format!("assets/{}", k));
-                            let label = k.clone();
-                            view! {
-                                <A href=href attr:style="display:flex; gap:8px; padding:6px 10px; background:var(--bg-surface); border-radius:3px; border-left:2px solid var(--secondary); font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--text); text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
-                                    <span style="color:var(--text-muted)">"→"</span>
-                                    {label}
-                                </A>
-                            }
-                        }).collect::<Vec<_>>()
-                        }
-                    </div>
-                    {(descendants.len() > 18).then(|| view! {
-                        <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); margin-top:8px; text-align:center">
-                            {format!("+{} more", descendants.len() - 18)}
-                        </div>
-                    })}
-                </div>
-            </Show>
-        </div>
-    }
-    .into_any()
 }
 
 #[derive(Clone, Debug)]
@@ -2494,4 +2032,226 @@ pub fn EventGlyphTimeline(
             </Show>
         </div>
     }
+}
+
+type EvaluateOutcomeResult = Result<crate::server_fns::automation::EvaluateResult, ServerFnError>;
+
+/// Result of an on-demand schedule or sensor tick, shown under the top bar.
+#[component]
+pub fn EvaluateOutcome(result: EvaluateOutcomeResult) -> impl IntoView {
+    let loc = crate::loc::use_current_location();
+    match result {
+        Err(e) => view! {
+            <div class="error-msg eval-outcome">
+                {format!("Evaluation failed: {}", crate::helpers::err_text(&e))}
+            </div>
+        }
+        .into_any(),
+        Ok(r) if r.run_ids.is_empty() => {
+            let text = match r.skip_reason {
+                Some(reason) => format!("Skipped: {reason}"),
+                None => "Evaluated. No runs requested.".to_string(),
+            };
+            view! { <div class="info-msg eval-outcome">{text}</div> }.into_any()
+        }
+        Ok(r) => {
+            let (ns, name) = loc.get_untracked();
+            let count = crate::helpers::plural(r.run_ids.len() as u64, "run", "runs");
+            let links = r
+                .run_ids
+                .into_iter()
+                .map(|id| {
+                    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{id}"));
+                    let label = crate::helpers::short_id(&id, 8);
+                    view! { <A href=href attr:class="tag">{label}</A> }
+                })
+                .collect::<Vec<_>>();
+            view! {
+                <div class="success-msg eval-outcome">
+                    {format!("Evaluation requested {count}: ")}
+                    {links}
+                </div>
+            }
+            .into_any()
+        }
+    }
+}
+
+/// One-line Evaluate outcome for a table row.
+#[component]
+pub fn EvaluateOutcomeShort(result: EvaluateOutcomeResult) -> impl IntoView {
+    let (text, cls, tip) = match result {
+        Err(e) => {
+            let msg = crate::helpers::err_text(&e);
+            ("failed".to_string(), "text-error", msg)
+        }
+        Ok(r) if r.run_ids.is_empty() => match r.skip_reason {
+            Some(reason) => ("skipped".to_string(), "text-muted", reason),
+            None => ("no runs".to_string(), "text-muted", String::new()),
+        },
+        Ok(r) => (
+            crate::helpers::plural(r.run_ids.len() as u64, "run", "runs"),
+            "text-success",
+            String::new(),
+        ),
+    };
+    view! { <span class=cls style="font-size:var(--fs-xs)" title=tip>{text}</span> }
+}
+
+/// Top-bar feedback after a launch: a link to the new run.
+#[component]
+pub fn RunLaunched(#[prop(into)] run_id: String, #[prop(optional)] queued: bool) -> impl IntoView {
+    let (ns, name) = crate::loc::use_current_location().get_untracked();
+    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{run_id}"));
+    let text = format!(
+        "Run {} {}",
+        crate::helpers::short_id(&run_id, 8),
+        if queued { "queued" } else { "started" },
+    );
+    view! { <A href=href attr:class="launch-result">{text}</A> }
+}
+
+/// Run history table for detail pages (job, backfill, asset). The runs page
+/// keeps its own wider table with selection and launch columns.
+#[component]
+pub fn RunsGrid(
+    rows: Vec<crate::types::RunRecord>,
+    #[prop(optional)] show_assets: bool,
+) -> impl IntoView {
+    let (ns, name) = crate::loc::use_current_location().get_untracked();
+    let grid = if show_assets {
+        "grid-template-columns: 88px 0.7fr 1.5fr 0.9fr 0.8fr 0.6fr"
+    } else {
+        "grid-template-columns: 88px 0.7fr 1.4fr 0.8fr 0.6fr"
+    };
+    view! {
+        <div class="grid-table">
+            <div class="grid-table-head" style=grid>
+                <span>"RUN"</span>
+                <span>"STATUS"</span>
+                {show_assets.then(|| view! { <span>"ASSETS"</span> })}
+                <span>"PARTITION"</span>
+                <span>"STARTED"</span>
+                <span>"DURATION"</span>
+            </div>
+            {rows
+                .into_iter()
+                .map(|r| {
+                    let href = crate::loc::loc_path(&ns, &name, &format!("runs/{}", r.run_id));
+                    let sid = crate::helpers::short_id(&r.run_id, 8);
+                    let rail_cls = format!(
+                        "grid-row-rail grid-row-rail--{}",
+                        crate::helpers::run_status_class(&r.status)
+                    );
+                    let st_kind = crate::helpers::run_status_kind(&r.status);
+                    let start_ts = r.start_time;
+                    let created_abs = crate::helpers::format_timestamp(Some(r.start_time));
+                    let duration = crate::helpers::format_duration(Some(r.start_time), r.end_time);
+                    let assets = r.node_names.clone();
+                    let partition = r.partition_key.clone().map(|p| {
+                        let scheme = p
+                            .preview
+                            .first()
+                            .map(|k| partition_scheme_for(k))
+                            .unwrap_or("·");
+                        view! { <PartitionCell scheme=scheme count_label=p.label()/> }
+                    });
+                    view! {
+                        <A href=href attr:class="grid-row" attr:style=grid attr:title=created_abs>
+                            <span class=rail_cls></span>
+                            <span class="grid-cell-mono">{sid}</span>
+                            <StatusChip kind=st_kind/>
+                            {show_assets.then(|| view! { <AssetStack assets=assets/> })}
+                            {match partition {
+                                Some(cell) => cell.into_any(),
+                                None => view! { <span class="grid-cell-muted">"—"</span> }.into_any(),
+                            }}
+                            <span class="grid-cell-muted"><crate::now::RelTime ts=start_ts/></span>
+                            <span class="grid-cell-muted">{duration}</span>
+                        </A>
+                    }
+                })
+                .collect::<Vec<_>>()}
+        </div>
+    }
+}
+
+/// Blank tiles that complete the last row of a `.meta-tile-grid`, so the
+/// grid's separator colour never shows as an empty block.
+pub fn meta_tile_fill(tiles: usize, cols: usize) -> impl IntoView {
+    let missing = (cols - tiles % cols) % cols;
+    (0..missing)
+        .map(|_| view! { <div class="meta-tile" aria-hidden="true"></div> })
+        .collect_view()
+}
+
+/// Schedule or sensor state ("RUNNING" / "STOPPED" on the wire): a dot and a
+/// lowercase word. Not a status chip — a running chip means a live run.
+#[component]
+pub fn AutomationState(#[prop(into)] status: String) -> impl IntoView {
+    let running = status.eq_ignore_ascii_case("running");
+    let (dot, word) = if running {
+        ("status-dot--ok", "running")
+    } else {
+        ("status-dot--muted", "stopped")
+    };
+    view! {
+        <span class="status-dot-row">
+            <span class=format!("status-dot {dot}")></span>
+            <span class="grid-cell-muted">{word}</span>
+        </span>
+    }
+}
+
+/// Tick history table shared by the schedule and sensor pages.
+#[component]
+pub fn TickHistory(ticks: Vec<crate::types::TickRecord>) -> impl IntoView {
+    if ticks.is_empty() {
+        return view! {
+            <SectionHeader label="TICK HISTORY"/>
+            <EmptyState message="No ticks yet" compact=true/>
+        }
+        .into_any();
+    }
+    const GRID: &str = "grid-template-columns: 120px 130px 1fr 160px";
+    let count = format!("last {}", ticks.len());
+    view! {
+        <SectionHeader label="TICK HISTORY" count=count/>
+        <div class="grid-table">
+            <div class="grid-table-head" style=GRID>
+                <span>"TIME"</span>
+                <span>"STATUS"</span>
+                <span>"DETAIL"</span>
+                <span>"RUNS"</span>
+            </div>
+            {ticks
+                .into_iter()
+                .map(|t| {
+                    let ts = t.timestamp;
+                    let ts_abs = crate::helpers::format_timestamp_nanos(t.timestamp);
+                    let kind = crate::helpers::tick_status_kind(&t.status);
+                    let detail_cls = if t.error.is_some() {
+                        "grid-cell-muted grid-cell-truncate text-error"
+                    } else {
+                        "grid-cell-muted grid-cell-truncate"
+                    };
+                    let detail = t
+                        .skip_reason
+                        .clone()
+                        .or_else(|| t.error.clone())
+                        .or_else(|| crate::helpers::tick_counts_summary(&t.run_ids, &t.backfill_ids))
+                        .unwrap_or_else(|| "—".to_string());
+                    view! {
+                        <div class="grid-row grid-row--plain" style=GRID title=ts_abs>
+                            <span class="grid-cell-muted"><crate::now::RelTime ts=ts/></span>
+                            <StatusChip kind=kind/>
+                            <span class=detail_cls title=detail.clone()>{detail.clone()}</span>
+                            <TickRunChips run_ids=t.run_ids.clone() backfill_ids=t.backfill_ids.clone()/>
+                        </div>
+                    }
+                })
+                .collect::<Vec<_>>()}
+        </div>
+    }
+    .into_any()
 }

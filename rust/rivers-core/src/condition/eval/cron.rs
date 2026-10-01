@@ -2,14 +2,17 @@
 //! and DST-gap resolution.
 use std::collections::HashMap;
 
+use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::{SignedDuration, Timestamp, civil};
+
 /// Validate a cron schedule at construction so bad input is rejected up front.
 pub fn validate_cron(schedule: &str) -> anyhow::Result<()> {
     crate::timegrid::parse_cron(schedule).map(|_| ())
 }
 
-/// Validate an IANA timezone name at construction (parsed via `chrono-tz`).
+/// Validate an IANA timezone name at construction.
 pub fn validate_timezone(tz: &str) -> anyhow::Result<()> {
-    tz.parse::<chrono_tz::Tz>()
+    TimeZone::get(tz)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -18,69 +21,60 @@ pub fn validate_timezone(tz: &str) -> anyhow::Result<()> {
 /// against the declared `timezone`'s WALL CLOCK.
 pub fn next_cron_occurrence_utc(
     cron: &croner::Cron,
-    after: chrono::DateTime<chrono::Utc>,
+    after: Timestamp,
     timezone: Option<&str>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
-
-    let Some(tz) = timezone.and_then(|t| t.parse::<chrono_tz::Tz>().ok()) else {
-        return cron.find_next_occurrence(&after, false).ok();
+) -> Option<Timestamp> {
+    let Some(tz) = timezone.and_then(|t| TimeZone::get(t).ok()) else {
+        let wall = after.to_zoned(TimeZone::UTC).datetime();
+        let next = cron.find_next_occurrence(&wall, false).ok()?;
+        return wall_as_utc(next);
     };
 
-    let resolve_ambiguous = |earliest: chrono::DateTime<chrono_tz::Tz>,
-                             latest: chrono::DateTime<chrono_tz::Tz>| {
-        let e = earliest.with_timezone(&chrono::Utc);
-        if e > after {
-            e
-        } else {
-            latest.with_timezone(&chrono::Utc)
-        }
-    };
+    let resolve_ambiguous =
+        |earliest: Timestamp, latest: Timestamp| if earliest > after { earliest } else { latest };
 
-    let naive_after = after.with_timezone(&tz).naive_local();
-    let fake_after = chrono::Utc.from_utc_datetime(&naive_after);
-    let fake_next = cron.find_next_occurrence(&fake_after, false).ok()?;
-    let wall_next = fake_next.naive_utc();
+    let wall_after = after.to_zoned(tz.clone()).datetime();
+    let wall_next = cron.find_next_occurrence(&wall_after, false).ok()?;
 
     resolve_wall_instant(&tz, wall_next, resolve_ambiguous)
-        .or_else(|| Some(fake_next.max(after + chrono::Duration::minutes(1))))
+        .or_else(|| Some(wall_as_utc(wall_next)?.max(after + SignedDuration::from_mins(1))))
 }
 
-/// Resolve a wall-clock datetime in `tz` to a real UTC instant, walking
-/// forward minute-by-minute through a DST gap (up to 4h) when the wall time
-/// does not exist. `on_ambiguous` picks the instant when the wall time
+/// Read a wall-clock datetime as though it were UTC.
+fn wall_as_utc(wall: civil::DateTime) -> Option<Timestamp> {
+    TimeZone::UTC.to_timestamp(wall).ok()
+}
+
+/// Resolve a wall-clock datetime in `tz` to a real UTC instant. A wall time
+/// inside a DST gap resolves to the transition itself — the first instant the
+/// clock is valid again. `on_ambiguous` picks the instant when the wall time
 /// repeats (fall-back).
 pub(crate) fn resolve_wall_instant(
-    tz: &chrono_tz::Tz,
-    wall: chrono::NaiveDateTime,
-    mut on_ambiguous: impl FnMut(
-        chrono::DateTime<chrono_tz::Tz>,
-        chrono::DateTime<chrono_tz::Tz>,
-    ) -> chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
-    let mut probe = wall;
-    for _ in 0..=240 {
-        match tz.from_local_datetime(&probe) {
-            chrono::LocalResult::Single(dt) => return Some(dt.with_timezone(&chrono::Utc)),
-            chrono::LocalResult::Ambiguous(earliest, latest) => {
-                return Some(on_ambiguous(earliest, latest));
-            }
-            chrono::LocalResult::None => {}
+    tz: &TimeZone,
+    wall: civil::DateTime,
+    mut on_ambiguous: impl FnMut(Timestamp, Timestamp) -> Timestamp,
+) -> Option<Timestamp> {
+    match tz.to_ambiguous_timestamp(wall).offset() {
+        AmbiguousOffset::Unambiguous { offset } => offset.to_timestamp(wall).ok(),
+        AmbiguousOffset::Gap { after, .. } => {
+            // The post-gap offset maps every wall time in the gap to an
+            // instant strictly before the transition, so the next transition
+            // is the gap's end.
+            let before_gap = after.to_timestamp(wall).ok()?;
+            Some(tz.following(before_gap).next()?.timestamp())
         }
-        probe += chrono::Duration::minutes(1);
+        AmbiguousOffset::Fold { before, after } => Some(on_ambiguous(
+            before.to_timestamp(wall).ok()?,
+            after.to_timestamp(wall).ok()?,
+        )),
     }
-    None
 }
 
 /// The first real UTC instant of a wall-clock datetime in `tz`: the earlier
 /// instant when the wall time repeats (fall-back), the first instant after
 /// the gap when it does not exist (spring-forward).
-pub(crate) fn first_real_instant(
-    tz: &chrono_tz::Tz,
-    wall: chrono::NaiveDateTime,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    resolve_wall_instant(tz, wall, |earliest, _| earliest.with_timezone(&chrono::Utc))
+pub(crate) fn first_real_instant(tz: &TimeZone, wall: civil::DateTime) -> Option<Timestamp> {
+    resolve_wall_instant(tz, wall, |earliest, _| earliest)
 }
 
 /// True when a cron occurrence falls within `(prev, now]`, compared as real
@@ -92,25 +86,24 @@ pub(crate) fn cron_tick_between(
     now_nanos: i64,
     timezone: Option<&str>,
 ) -> bool {
-    use chrono::TimeZone;
     use std::cell::RefCell;
 
     thread_local! {
         static CRON_CACHE: RefCell<HashMap<String, croner::Cron>> = RefCell::new(HashMap::new());
-        static TZ_CACHE: RefCell<HashMap<String, Option<chrono_tz::Tz>>> =
+        static TZ_CACHE: RefCell<HashMap<String, Option<TimeZone>>> =
             RefCell::new(HashMap::new());
     }
 
     let prev_secs = prev_nanos / 1_000_000_000;
     let now_secs = now_nanos / 1_000_000_000;
 
-    let tz: Option<chrono_tz::Tz> = timezone.and_then(|t| {
+    let tz: Option<TimeZone> = timezone.and_then(|t| {
         TZ_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if !cache.contains_key(t) {
-                cache.insert(t.to_string(), t.parse().ok());
+                cache.insert(t.to_string(), TimeZone::get(t).ok());
             }
-            cache[t]
+            cache[t].clone()
         })
     });
 
@@ -124,16 +117,19 @@ pub(crate) fn cron_tick_between(
             );
         }
         let cron = &cache[cron_schedule];
-        let (Some(prev), Some(now)) = (
-            chrono::DateTime::from_timestamp(prev_secs, 0),
-            chrono::DateTime::from_timestamp(now_secs, 0),
+        let (Ok(prev), Ok(now)) = (
+            Timestamp::from_second(prev_secs),
+            Timestamp::from_second(now_secs),
         ) else {
             return false;
         };
 
         let Some(tz) = tz else {
+            let wall = prev.to_zoned(TimeZone::UTC).datetime();
             return cron
-                .find_next_occurrence(&prev, false)
+                .find_next_occurrence(&wall, false)
+                .ok()
+                .and_then(wall_as_utc)
                 .map(|next| next <= now)
                 .unwrap_or(false);
         };
@@ -142,15 +138,15 @@ pub(crate) fn cron_tick_between(
         // each to its first real instant; skip occurrences whose instant is
         // already in the past (the repeated fall-back hour projects the wall
         // clock behind real time).
-        let mut fake_cursor = chrono::Utc.from_utc_datetime(&prev.with_timezone(&tz).naive_local());
+        let mut cursor = prev.to_zoned(tz.clone()).datetime();
         for _ in 0..2000 {
-            let Ok(fake_next) = cron.find_next_occurrence(&fake_cursor, false) else {
+            let Ok(next_wall) = cron.find_next_occurrence(&cursor, false) else {
                 return false;
             };
-            match first_real_instant(&tz, fake_next.naive_utc()) {
-                Some(real) if real <= prev => fake_cursor = fake_next,
+            match first_real_instant(&tz, next_wall) {
+                Some(real) if real <= prev => cursor = next_wall,
                 Some(real) => return real <= now,
-                None => fake_cursor = fake_next,
+                None => cursor = next_wall,
             }
         }
         false

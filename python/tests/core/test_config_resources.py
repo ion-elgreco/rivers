@@ -1,6 +1,6 @@
 """Tests for config management and resources."""
 
-from typing import get_args, get_origin
+from typing import Any, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel
@@ -742,7 +742,9 @@ def test_materialize_config_override():
 
     repo = rs.CodeRepository(assets=[cfg_asset])
     repo.materialize(
-        config={"cfg_asset": {"threshold": 0.9, "max_retries": 10}},
+        config={
+            "assets": {"cfg_asset": {"config": {"threshold": 0.9, "max_retries": 10}}}
+        },
     )
     output = repo.load_node("cfg_asset")
     assert output["threshold"] == 0.9
@@ -761,7 +763,7 @@ def test_materialize_config_override_partial():
 
     repo = rs.CodeRepository(assets=[partial_cfg])
     repo.materialize(
-        config={"partial_cfg": {"threshold": 0.8}},
+        config={"assets": {"partial_cfg": {"config": {"threshold": 0.8}}}},
     )
     output = repo.load_node("partial_cfg")
     assert output["threshold"] == 0.8
@@ -954,7 +956,7 @@ def test_asset_auto_derive_config_with_overrides():
 
     repo = rs.CodeRepository(assets=[override_cfg])
     repo.materialize(
-        config={"override_cfg": {"threshold": 0.99}},
+        config={"assets": {"override_cfg": {"config": {"threshold": 0.99}}}},
     )
     assert repo.load_node("override_cfg") == 0.99
 
@@ -1557,13 +1559,14 @@ def test_basemodel_instance_config_with_materialize_overrides():
 
     # With overrides — only specified fields change
     repo.materialize(
-        config={"overridden": {"rate": 9.9}},
+        config={"assets": {"overridden": {"config": {"rate": 9.9}}}},
     )
     assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
 
 
-def test_basemodel_instance_in_asset_fn_config_with_materialize_overrides():
-    """BaseModel instance config is overridden via model_copy at materialize time."""
+def test_resource_instance_overridden_through_the_document():
+    """A BaseModel instance given as a resource is rebuilt for the run with
+    the document's values; only the named fields change."""
 
     class OverridableConfig(BaseModel):
         rate: float = 1.0
@@ -1574,41 +1577,475 @@ def test_basemodel_instance_in_asset_fn_config_with_materialize_overrides():
         return {"rate": resource.rate, "label": resource.label}
 
     repo = rs.CodeRepository(
-        assets=[overridden], resources={"resource": OverridableConfig()}
+        assets=[overridden], resources={"resource": OverridableConfig(label="mine")}
     )
 
-    # Without overrides — defaults used
     repo.materialize()
-    assert repo.load_node("overridden") == {"rate": 1.0, "label": "default"}
+    assert repo.load_node("overridden") == {"rate": 1.0, "label": "mine"}
 
-    # With overrides — only specified fields change
-    repo.materialize(
-        config={"overridden": {"rate": 9.9}},
-    )
-    assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
+    repo.materialize(config={"resources": {"resource": {"rate": 9.9}}})
+    assert repo.load_node("overridden") == {"rate": 9.9, "label": "mine"}
+
+    # The repository's instance is untouched.
+    repo.materialize()
+    assert repo.load_node("overridden") == {"rate": 1.0, "label": "mine"}
 
 
-def test_basemodel_uninitialized_instance_in_asset_fn_config_with_materialize_overrides():
-    """BaseModel instance config is overridden via model_copy at materialize time."""
+def test_asset_config_does_not_reach_resources():
+    """An asset's `config` overrides go to its config class only; a resource
+    with a field of the same name keeps its value."""
 
     class OverridableConfig(BaseModel):
         rate: float = 1.0
         label: str = "default"
 
     @rs.Asset
-    def overridden(resource: OverridableConfig):
-        return {"rate": resource.rate, "label": resource.label}
+    def overridden(
+        context: rs.AssetExecutionContext[OverridableConfig],
+        resource: OverridableConfig,
+    ):
+        return {"config": context.config.rate, "resource": resource.rate}
 
     repo = rs.CodeRepository(
         assets=[overridden], resources={"resource": OverridableConfig()}
     )
+    repo.materialize(config={"assets": {"overridden": {"config": {"rate": 9.9}}}})
+    assert repo.load_node("overridden") == {"config": 9.9, "resource": 1.0}
 
-    # Without overrides — defaults used
+
+# ---------------------------------------------------------------------------
+# Tests: the launch document's metadata overrides and shape
+# ---------------------------------------------------------------------------
+
+
+class RecordingIOHandler(rs.BaseIOHandler):
+    """Keeps each output and the metadata its output context carried."""
+
+    outputs: dict = {}
+    metadata: dict = {}
+
+    def handle_output(self, context, obj):
+        self.outputs[context.asset_name] = obj
+        self.metadata[context.asset_name] = dict(context.asset_metadata or {})
+
+    def load_input(self, context):
+        return self.outputs[context.asset_name]
+
+
+def test_metadata_override_reaches_the_context_and_the_handler():
+    """Keys in the document merge over the asset's own for that run; the
+    step, the IO handler and the record see the result, the definition does
+    not."""
+    handler = RecordingIOHandler()
+
+    @rs.Asset(io_handler=handler, metadata={"tier": "bronze", "owner": "data"})
+    def tagged(context: rs.AssetExecutionContext) -> dict:
+        return dict(context.asset_metadata or {})
+
+    repo = rs.CodeRepository(assets=[tagged], default_executor=rs.Executor.in_process())
+    document = {"assets": {"tagged": {"metadata": {"tier": "gold", "extra": "1"}}}}
+    result = repo.materialize(config=document)
+
+    merged = {"tier": "gold", "owner": "data", "extra": "1"}
+    assert handler.outputs["tagged"] == merged
+    assert handler.metadata["tagged"] == merged
+    assert repo.storage.get_run(result.run_id).config == document
+
     repo.materialize()
-    assert repo.load_node("overridden") == {"rate": 1.0, "label": "default"}
+    assert handler.outputs["tagged"] == {"tier": "bronze", "owner": "data"}
 
-    # With overrides — only specified fields change
-    repo.materialize(
-        config={"overridden": {"rate": 9.9}},
+
+@pytest.mark.parametrize("default", ["in_process", "parallel"])
+def test_metadata_override_picks_the_executor(tmp_path, default):
+    """`rivers/executor` in the document moves steps between executors, as
+    the asset's own metadata would. Two steps move each way: a parallel
+    group of one step runs in-process."""
+    import os
+
+    import obstore.store
+
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
     )
-    assert repo.load_node("overridden") == {"rate": 9.9, "label": "default"}
+
+    def pid_asset(name):
+        @rs.Asset(name=name, io_handler=store)
+        def where() -> int:
+            return os.getpid()
+
+        return where
+
+    names = ["w1", "w2", "m1", "m2"]
+    executor = (
+        rs.Executor.in_process()
+        if default == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+    repo = rs.CodeRepository(
+        assets=[pid_asset(n) for n in names], default_executor=executor
+    )
+    me = os.getpid()
+    in_workers = default == "parallel"
+    repo.materialize()
+    assert [repo.load_node(n) != me for n in names] == [in_workers] * 4
+
+    other = "parallel" if default == "in_process" else "in_process"
+    moved = {"metadata": {"rivers/executor": other}}
+    repo.materialize(config={"assets": {"m1": moved, "m2": moved}})
+    assert [repo.load_node(n) != me for n in ("w1", "w2")] == [in_workers] * 2
+    assert [repo.load_node(n) != me for n in ("m1", "m2")] == [not in_workers] * 2
+
+
+@pytest.mark.parametrize("default", ["in_process", "parallel"])
+def test_execution_picks_the_runs_executor(tmp_path, default):
+    """`execution.executor` replaces the repository's executor for the run;
+    an asset's own `rivers/executor` metadata still wins for its step."""
+    import os
+
+    import obstore.store
+
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    def pid_asset(name, metadata=None):
+        @rs.Asset(name=name, io_handler=store, metadata=metadata)
+        def where() -> int:
+            return os.getpid()
+
+        return where
+
+    other = "parallel" if default == "in_process" else "in_process"
+    repo = rs.CodeRepository(
+        assets=[
+            pid_asset("a"),
+            pid_asset("b"),
+            pid_asset("own", {"rivers/executor": default}),
+            pid_asset("own2", {"rivers/executor": default}),
+        ],
+        default_executor=(
+            rs.Executor.in_process()
+            if default == "in_process"
+            else rs.Executor.parallel(max_workers=2)
+        ),
+    )
+    me = os.getpid()
+    in_workers = default == "parallel"
+    repo.materialize()
+    assert [repo.load_node(n) != me for n in ("a", "b", "own", "own2")] == [
+        in_workers
+    ] * 4
+
+    execution = {"executor": other}
+    if other == "parallel":
+        execution["max_workers"] = 2
+    result = repo.materialize(config={"execution": execution})
+    assert [repo.load_node(n) != me for n in ("a", "b")] == [not in_workers] * 2
+    assert [repo.load_node(n) != me for n in ("own", "own2")] == [in_workers] * 2
+    assert repo.storage.get_run(result.run_id).config == {"execution": execution}
+
+
+def test_execution_applies_to_a_job_with_its_own_executor(tmp_path):
+    import os
+
+    import obstore.store
+
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    @rs.Asset(io_handler=store)
+    def one() -> int:
+        return os.getpid()
+
+    @rs.Asset(io_handler=store)
+    def two() -> int:
+        return os.getpid()
+
+    repo = rs.CodeRepository(
+        assets=[one, two],
+        jobs=[rs.Job(name="j", assets=[one, two], executor=rs.Executor.in_process())],
+        default_executor=rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve()
+    job = repo.get_job("j")
+    job.execute()
+    assert repo.load_node("one") == os.getpid()
+    job.execute(config={"execution": {"executor": "parallel", "max_workers": 2}})
+    assert repo.load_node("one") != os.getpid()
+    assert repo.load_node("two") != os.getpid()
+
+
+@pytest.mark.parametrize(
+    ("execution", "detail"),
+    [
+        ({"executor": "kubernetes"}, "executor must be one of in_process, parallel"),
+        ({"max_workers": 2}, "max_workers applies to the parallel executor"),
+        ({"executor": "parallel", "max_workers": 0}, "must be a positive integer"),
+        ({"workers": 2}, "unknown key 'workers'"),
+    ],
+)
+def test_execution_shape_is_refused_before_a_run_exists(execution, detail):
+    @rs.Asset
+    def plain() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[plain])
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match=detail):
+        repo.materialize(config={"execution": execution})
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_metadata_override_on_a_task_is_refused():
+    @rs.Task
+    def chore(context: rs.TaskExecutionContext) -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[], tasks=[chore], jobs=[rs.Job(name="j", assets=[chore])]
+    )
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="'chore' is a task"):
+        repo.get_job("j").execute(
+            config={"assets": {"chore": {"metadata": {"k": "v"}}}}
+        )
+    assert repo.storage.get_runs(limit=10) == []
+
+
+@pytest.mark.parametrize(
+    ("config", "detail"),
+    [
+        ({"other": {}}, "unknown section 'other'"),
+        (
+            {"assets": {"nope": {"config": {}}}},
+            "config names 'nope', which this launch does not run",
+        ),
+        (
+            {"assets": {"shaped": {"metadata": {"k": 1}}}},
+            "config.assets.shaped.metadata.k must be a string",
+        ),
+        ({"assets": {"shaped": {"fields": {}}}}, "unknown key 'fields'"),
+        ({"assets": {"shaped": {"config": [1]}}}, "must be a JSON object"),
+    ],
+)
+def test_malformed_document_is_refused_before_a_run_exists(config, detail):
+    @rs.Asset
+    def shaped(context: rs.AssetExecutionContext[ThresholdConfig]) -> float:
+        return context.config.threshold
+
+    repo = rs.CodeRepository(assets=[shaped])
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match=detail):
+        repo.materialize(config=config)
+    assert repo.storage.get_runs(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: the launch document's resource overrides
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("default", ["in_process", "parallel"])
+def test_resource_override_is_a_per_run_instance_with_lifecycle(tmp_path, default):
+    """A `Resource` named in the document is rebuilt for the run, set up
+    before its first step and torn down after its last (in this process; a
+    worker runs its own lifecycle on the copy it gets). The repository's
+    instance keeps serving the runs that do not name it."""
+    import obstore.store
+
+    events: list = []
+    store = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    class LifecycleLog(rs.Resource):
+        label: str = "base"
+
+        def setup(self):
+            events.append(f"setup:{self.label}")
+
+        def teardown(self):
+            events.append(f"teardown:{self.label}")
+
+    @rs.Asset(io_handler=store)
+    def first(res: LifecycleLog) -> str:
+        return res.label
+
+    @rs.Asset(io_handler=store)
+    def second(first: str, res: LifecycleLog) -> str:
+        return f"{first}/{res.label}"
+
+    executor = (
+        rs.Executor.in_process()
+        if default == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+    repo = rs.CodeRepository(
+        assets=[first, second],
+        resources={"res": LifecycleLog()},
+        default_executor=executor,
+    )
+    repo.resolve()
+    assert events == ["setup:base"]
+
+    result = repo.materialize(config={"resources": {"res": {"label": "run"}}})
+    assert result.success
+    assert repo.load_node("second") == "run/run"
+    assert events == ["setup:base", "setup:run", "teardown:run"]
+    assert repo.storage.get_run(result.run_id).config == {
+        "resources": {"res": {"label": "run"}}
+    }
+
+    repo.materialize()
+    assert repo.load_node("second") == "base/base"
+    assert events == ["setup:base", "setup:run", "teardown:run"]
+
+
+def test_resource_class_overridden_through_the_document():
+    """A class given as a resource is built once for the run with the values."""
+
+    class Settings(BaseModel):
+        region: str = "eu"
+
+    @rs.Asset
+    def where(settings: Settings) -> str:
+        return settings.region
+
+    repo = rs.CodeRepository(assets=[where], resources={"settings": Settings})
+    repo.materialize(config={"resources": {"settings": {"region": "us"}}})
+    assert repo.load_node("where") == "us"
+    repo.materialize()
+    assert repo.load_node("where") == "eu"
+
+
+def test_resource_override_is_checked_by_the_class():
+    class Pool(rs.Resource):
+        size: int = 2
+
+    @rs.Asset
+    def sized(pool: Pool) -> int:
+        return pool.size
+
+    repo = rs.CodeRepository(assets=[sized], resources={"pool": Pool()})
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="config: resources.pool"):
+        repo.materialize(config={"resources": {"pool": {"size": "many"}}})
+    with pytest.raises(ConfigurationError, match="no resource 'nope'"):
+        repo.materialize(config={"resources": {"nope": {"size": 1}}})
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_io_handler_resource_cannot_be_overridden():
+    handler = rs.InMemoryIOHandler()
+
+    @rs.Asset(io_handler="store")
+    def kept() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[kept], resources={"store": handler})
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="IO handler cannot be overridden"):
+        repo.materialize(config={"resources": {"store": {"x": 1}}})
+    assert repo.storage.get_runs(limit=10) == []
+
+
+# ============================================================================
+# Tests: the launch document is kept on the run record
+# ============================================================================
+
+
+def test_materialize_records_its_config_on_the_run():
+    """The run record keeps the overrides (a rerun replays them, the run page
+    shows them); a run launched with the defaults records none."""
+
+    @rs.Asset
+    def recorded_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        return context.config.threshold
+
+    repo = rs.CodeRepository(assets=[recorded_cfg])
+    with_overrides = repo.materialize(
+        config={"assets": {"recorded_cfg": {"config": {"threshold": 0.9}}}}
+    )
+    defaults = repo.materialize()
+
+    assert repo.load_node("recorded_cfg") == 0.5
+    assert repo.storage.get_run(with_overrides.run_id).config == {
+        "assets": {"recorded_cfg": {"config": {"threshold": 0.9}}}
+    }
+    assert repo.storage.get_run(defaults.run_id).config is None
+
+
+def test_unserializable_config_is_refused():
+    """Every launcher reads the document back from the record, so a value
+    pydantic cannot encode as JSON is an error, not a silent gap."""
+
+    class HandleConfig(BaseModel):
+        model_config = {"arbitrary_types_allowed": True}
+        handle: Any = None
+
+    class Opaque:
+        pass
+
+    @rs.Asset
+    def opaque_cfg(context: rs.AssetExecutionContext[HandleConfig]):
+        return type(context.config.handle).__name__
+
+    repo = rs.CodeRepository(assets=[opaque_cfg])
+    repo.resolve()
+    with pytest.raises(ConfigurationError, match="not JSON-serializable"):
+        repo.materialize(
+            config={"assets": {"opaque_cfg": {"config": {"handle": Opaque()}}}}
+        )
+    assert repo.storage.get_runs(limit=10) == []
+
+
+def test_job_execute_records_its_config():
+    @rs.Asset
+    def job_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        return context.config.max_retries
+
+    repo = rs.CodeRepository(
+        assets=[job_cfg], jobs=[rs.Job(name="j", assets=[job_cfg])]
+    )
+    repo.resolve()
+    result = repo.get_job("j").execute(
+        config={"assets": {"job_cfg": {"config": {"max_retries": 8}}}}
+    )
+
+    assert repo.load_node("job_cfg") == 8
+    assert repo.storage.get_run(result.run_id).config == {
+        "assets": {"job_cfg": {"config": {"max_retries": 8}}}
+    }
+
+
+def test_non_blocking_backfill_keeps_config_for_its_runs():
+    """`block=False` used to refuse config because the record dropped it.
+    The record keeps it now, so the runs a daemon starts later apply it."""
+    seen = []
+
+    @rs.Asset(partitions_def=rs.PartitionsDefinition.static_(["p1", "p2"]))
+    def bf_cfg(context: rs.AssetExecutionContext[ThresholdConfig]):
+        seen.append((context.partition_key, context.config.threshold))
+        return context.config.threshold
+
+    repo = rs.CodeRepository(assets=[bf_cfg], default_executor=rs.Executor.in_process())
+    repo.resolve()
+    launched = repo.backfill(
+        selection=["bf_cfg"],
+        partition_keys=[rs.PartitionKey.single("p1"), rs.PartitionKey.single("p2")],
+        config={"assets": {"bf_cfg": {"config": {"threshold": 0.25}}}},
+        block=False,
+    )
+    assert seen == []
+
+    # What a daemon does with the Requested record.
+    repo.execute_backfill(launched.backfill_id)
+
+    assert sorted(seen) == [("p1", 0.25), ("p2", 0.25)]
+    status = repo.get_backfill(launched.backfill_id)
+    assert status is not None and status.status == "CompletedSuccess"
+    for run_id in status.run_ids:
+        assert repo.storage.get_run(run_id).config == {
+            "assets": {"bf_cfg": {"config": {"threshold": 0.25}}}
+        }

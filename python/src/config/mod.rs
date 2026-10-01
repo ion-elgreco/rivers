@@ -1,5 +1,8 @@
 //! Configuration and resource management — Pydantic model wrappers crossing the PyO3 boundary.
+pub(crate) mod run_config;
+
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyType};
 
 use crate::errors::ConfigurationError;
 
@@ -120,6 +123,54 @@ impl ResourceVariant {
                 None => Ok(inst.clone_ref(py)),
             },
         }
+    }
+
+    /// The class and the keyword arguments a run builds this resource from
+    /// with `overrides`: an instance's own fields (`model_dump`, so a secret
+    /// keeps its value) under the overrides, a class's the overrides alone.
+    /// An IO handler cannot be overridden: nodes hold it through the registry.
+    pub fn run_kwargs<'py>(
+        &self,
+        py: Python<'py>,
+        overrides: &Bound<'py, PyDict>,
+    ) -> PyResult<(Bound<'py, PyType>, Bound<'py, PyDict>)> {
+        let (cls, kwargs) = match self {
+            ResourceVariant::IOHandler(_) => {
+                return Err(ConfigurationError::new_err(
+                    "an IO handler cannot be overridden per run",
+                ));
+            }
+            ResourceVariant::PydanticModel(cls) => {
+                (cls.bind(py).cast::<PyType>()?.clone(), PyDict::new(py))
+            }
+            ResourceVariant::PydanticModelInstance(inst) | ResourceVariant::Resource(inst) => {
+                let inst = inst.bind(py);
+                let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
+                (inst.get_type(), fields)
+            }
+        };
+        kwargs.update(overrides.as_mapping())?;
+        Ok((cls, kwargs))
+    }
+
+    /// This resource rebuilt for one run with `overrides`, validated by its
+    /// class: a fresh instance of the same kind (a class becomes an instance).
+    pub fn for_run(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        overrides: &Bound<'_, PyDict>,
+    ) -> PyResult<ResourceVariant> {
+        let failed = |e: PyErr| {
+            let reason = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
+            ConfigurationError::new_err(format!("config: resources.{key}: {reason}"))
+        };
+        let (cls, kwargs) = self.run_kwargs(py, overrides).map_err(failed)?;
+        let built = cls.call((), Some(&kwargs)).map_err(failed)?.unbind();
+        Ok(match self {
+            ResourceVariant::Resource(_) => ResourceVariant::Resource(built),
+            _ => ResourceVariant::PydanticModelInstance(built),
+        })
     }
 
     pub fn is_io_handler(&self) -> bool {

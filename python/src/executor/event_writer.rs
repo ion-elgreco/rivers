@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{EventRecord, LogRecord, ScopedStorageHandle, StorageBackend};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -23,10 +23,12 @@ const FLUSH_INTERVAL_MS: u64 = 200;
 /// applied at half this value to avoid log spam around the boundary.
 const HIGH_WATER_MARK: usize = 4 * BATCH_SIZE;
 
-/// One message on the writer channel: a structured event or a step's log row.
+/// One message on the writer channel: a structured event, a step's log row,
+/// or events to store at once (see [`store_now`]).
 pub(crate) enum WriterMsg {
     Event(EventRecord),
     Log(LogRecord),
+    StoreNow(Vec<EventRecord>, oneshot::Sender<anyhow::Result<()>>),
 }
 
 impl From<EventRecord> for WriterMsg {
@@ -91,6 +93,14 @@ impl EventWriter {
         let _ = self.sender.send(WriterMsg::Log(log));
     }
 
+    /// [`Self::emit`] that blocks until `events` are stored — see [`store_now`].
+    pub(crate) fn emit_stored(&self, mut events: Vec<EventRecord>) -> anyhow::Result<()> {
+        for event in &mut events {
+            event.code_location_id = self.code_location_id.clone();
+        }
+        io_rt().block_on(store_now(&self.sender, events))
+    }
+
     /// Clone the underlying sender for passing to subsystems (e.g. PoolGuard).
     /// Messages sent through the returned sender bypass `emit`'s
     /// `code_location_id` stamping and must set the field themselves.
@@ -106,14 +116,31 @@ impl EventWriter {
     }
 }
 
-async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) {
+/// Queues `events` behind every event already on `tx` and waits until they
+/// are stored with them. Unlike `emit`, a failed store comes back as the
+/// error. The caller stamps `code_location_id`, as with `sender()`.
+pub(crate) async fn store_now(
+    tx: &mpsc::UnboundedSender<WriterMsg>,
+    events: Vec<EventRecord>,
+) -> anyhow::Result<()> {
+    let (done, stored) = oneshot::channel();
+    tx.send(WriterMsg::StoreNow(events, done))
+        .map_err(|_| anyhow::anyhow!("the event writer has stopped"))?;
+    stored
+        .await
+        .map_err(|_| anyhow::anyhow!("the event writer has stopped"))?
+}
+
+async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) -> anyhow::Result<()> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
-    if let Err(e) = storage.store_events(batch).await {
+    let stored = storage.store_events(batch).await.map(drop);
+    if let Err(e) = &stored {
         warn!("failed to flush event batch: {e:?}");
     }
     batch.clear();
+    stored
 }
 
 async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
@@ -142,7 +169,7 @@ async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: 
                     Some(WriterMsg::Event(event)) => {
                         events.push(event);
                         if events.len() >= BATCH_SIZE {
-                            flush_batch(storage, &mut events).await;
+                            let _ = flush_batch(storage, &mut events).await;
                         }
                     }
                     Some(WriterMsg::Log(log)) => {
@@ -151,15 +178,19 @@ async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: 
                             flush_logs(storage, &mut logs).await;
                         }
                     }
+                    Some(WriterMsg::StoreNow(now, done)) => {
+                        events.extend(now);
+                        let _ = done.send(flush_batch(storage, &mut events).await);
+                    }
                     None => {
-                        flush_batch(storage, &mut events).await;
+                        let _ = flush_batch(storage, &mut events).await;
                         flush_logs(storage, &mut logs).await;
                         return;
                     }
                 }
             }
             _ = interval.tick() => {
-                flush_batch(storage, &mut events).await;
+                let _ = flush_batch(storage, &mut events).await;
                 flush_logs(storage, &mut logs).await;
                 let depth = rx.len();
                 if depth >= HIGH_WATER_MARK && !above_high_water {

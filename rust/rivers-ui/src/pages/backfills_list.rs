@@ -12,11 +12,10 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
-    AssetStack, Crumb, EmptyState, FilterPillGroup, PartitionCell, ProgressBar, StatusChip, Topbar,
+    AssetStack, EmptyState, FilterPillGroup, PartitionCell, ProgressBar, StatusChip, Topbar,
 };
 use crate::helpers::{
-    backfill_status_kind, code_location_label, format_call_multiline, format_duration,
-    format_timestamp,
+    backfill_status_kind, code_location_label, format_duration, format_timestamp,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
@@ -31,7 +30,7 @@ fn rail_class(status: &str) -> &'static str {
         "InProgress" => "running",
         "CompletedSuccess" => "success",
         "CompletedFailed" => "failed",
-        "Canceled" => "warning",
+        "Canceled" => "canceled",
         _ => "queued",
     }
 }
@@ -44,6 +43,22 @@ fn status_from_tab(tab: &str) -> Option<String> {
         "Canceled" => Some("Canceled".into()),
         _ => None,
     }
+}
+
+/// Status pills as `(id, label, count)`. Ids are URL values; labels use the
+/// status-chip words.
+fn backfill_status_pills(counts: [Option<u64>; 5]) -> Vec<(String, String, Option<usize>)> {
+    [
+        ("All", "All"),
+        ("In Progress", "Running"),
+        ("Completed", "Success"),
+        ("Failed", "Failed"),
+        ("Canceled", "Canceled"),
+    ]
+    .into_iter()
+    .zip(counts)
+    .map(|((id, label), n)| (id.to_string(), label.to_string(), n.map(|n| n as usize)))
+    .collect()
 }
 
 #[component]
@@ -102,7 +117,23 @@ pub fn BackfillsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Backfills")]>
+        <Topbar
+            title="Backfills"
+            subtitle=move || view! {
+                <Transition>
+                    {move || summary.get().and_then(|r| r.ok()).map(|s| view! {
+                        <span class="page-header-num">{s.total.to_string()}</span>
+                        {if s.total == 1 { " backfill" } else { " backfills" }}
+                        <span class="page-header-sep">"·"</span>
+                        <span class="page-header-num">{s.in_progress.to_string()}</span>
+                        " running"
+                        <span class="page-header-sep">"·"</span>
+                        <span class="page-header-num page-header-num--error">{s.completed_failed.to_string()}</span>
+                        " failed"
+                    })}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| reload.run(()))
@@ -113,32 +144,25 @@ pub fn BackfillsListPage() -> impl IntoView {
         // back to zero counts, which would falsely claim "no backfills exist".
         <Transition fallback=move || view! { <GridRowSkeleton rows=1 cols=5/> }>
             {move || {
-                let (status_items, error_title): (Vec<(String, Option<usize>)>, Option<String>) =
-                    match summary.get() {
-                        Some(Ok(BackfillsSummary {
-                            total, in_progress, completed_success, completed_failed, canceled,
-                        })) => (
-                            vec![
-                                ("All".into(), Some(total as usize)),
-                                ("In Progress".into(), Some(in_progress as usize)),
-                                ("Completed".into(), Some(completed_success as usize)),
-                                ("Failed".into(), Some(completed_failed as usize)),
-                                ("Canceled".into(), Some(canceled as usize)),
-                            ],
-                            None,
-                        ),
-                        Some(Err(e)) => (
-                            vec![
-                                ("All".into(), None),
-                                ("In Progress".into(), None),
-                                ("Completed".into(), None),
-                                ("Failed".into(), None),
-                                ("Canceled".into(), None),
-                            ],
-                            Some(format!("Summary fetch failed: {e}")),
-                        ),
-                        None => return ().into_any(),
-                    };
+                let (status_items, error_title) = match summary.get() {
+                    Some(Ok(BackfillsSummary {
+                        total, in_progress, completed_success, completed_failed, canceled,
+                    })) => (
+                        backfill_status_pills([
+                            Some(total),
+                            Some(in_progress),
+                            Some(completed_success),
+                            Some(completed_failed),
+                            Some(canceled),
+                        ]),
+                        None,
+                    ),
+                    Some(Err(e)) => (
+                        backfill_status_pills([None; 5]),
+                        Some(format!("Summary fetch failed: {}", crate::helpers::err_text(&e))),
+                    ),
+                    None => return ().into_any(),
+                };
                 view! {
                     <div class="rv-toolbar" title=error_title.unwrap_or_default()>
                         <FilterPillGroup
@@ -156,12 +180,12 @@ pub fn BackfillsListPage() -> impl IntoView {
             {move || match backfills_page.get() {
                 None => view! { <GridRowSkeleton rows=10 cols=9/> }.into_any(),
                 Some(Err(e)) => view! {
-                    <div class="error-msg">{format!("Error loading backfills: {e}")}</div>
+                    <div class="error-msg">{format!("Couldn't load backfills: {}", crate::helpers::err_text(&e))}</div>
                 }.into_any(),
                 Some(Ok(page_data)) if page_data.total == 0 => view! {
                     <EmptyState
                         message="No backfills match this filter"
-                        hint="switch tabs or trigger one from an asset page"
+                        hint="Pick another status, or launch one from an asset page"
                     />
                 }.into_any(),
                 Some(Ok(page_data)) => {
@@ -215,7 +239,7 @@ fn BackfillsTable(rows: Vec<BackfillInfo>, locations: Vec<CodeLocationEntry>) ->
 
 #[component]
 fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoView {
-    let (ns, name) = use_current_location().get();
+    let (ns, name) = use_current_location().get_untracked();
     let href = loc_path(&ns, &name, &format!("backfills/{}", record.backfill_id));
     let short_id = if record.backfill_id.len() > 8 {
         record.backfill_id[..8].to_string()
@@ -241,21 +265,20 @@ fn BackfillRow(record: BackfillInfo, code_location_label: String) -> impl IntoVi
     let progress_sig = Signal::derive(move || progress_ratio);
     let partition_label = format!("{completed} of {total}");
     let run_count = record.run_ids.len();
-    let color = match record.status.as_str() {
-        "CompletedFailed" => "var(--error)",
-        "Canceled" => "var(--warning)",
-        "InProgress" => "var(--secondary)",
-        _ => "var(--success)",
-    }
-    .to_string();
+    let color = crate::helpers::backfill_status_color(&record.status).to_string();
 
     view! {
         <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
             <span class=rail></span>
             <span class="grid-cell-mono">{short_id}</span>
-            <StatusChip kind=st_kind small=true/>
-            <span class="grid-cell-muted grid-cell-code">
-                {format_call_multiline(&record.strategy)}
+            <StatusChip kind=st_kind/>
+            // A destructive sweep must be identifiable while scanning the list,
+            // not only from the detail page.
+            <span class="grid-cell-muted" title=record.strategy_code.clone()>
+                {match &record.action {
+                    Some(verb) => format!("{verb} · {}", record.strategy),
+                    None => record.strategy.clone(),
+                }}
             </span>
             <AssetStack assets=record.asset_selection/>
             <div style="display:flex; flex-direction:column; gap:4px; min-width:0">

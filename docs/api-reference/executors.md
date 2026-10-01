@@ -6,6 +6,9 @@ Base class for execution strategies. Construct via the static factories and pass
 
 The variants — `Executor.InProcess`, `Executor.Parallel`, `Executor.Kubernetes` — are exposed as nested classes for `isinstance` checks.
 
+!!! note "Action runs ignore the executor"
+    The steps of an [action](../concepts/actions.md#where-actions-run) run always execute in the run's own process (the run pod on Kubernetes), one at a time, whatever executor is set.
+
 ### `Executor.in_process()`
 
 Runs every step serially in the calling Python process.
@@ -55,6 +58,10 @@ executor = rs.Executor.kubernetes(
 | `service_account` | `str` | `"rivers-executor"` | Service account bound to worker pods. |
 | `worker_cpu` | `str` | `"500m"` | CPU request/limit for worker pods. |
 | `worker_memory` | `str` | `"512Mi"` | Memory request/limit for worker pods. |
+
+## Per-run executor
+
+A launch can pick the executor for one run through the [launch document](../concepts/configuration.md#the-launch-document): `"execution": {"executor": "in_process"}`, or `"parallel"` with `max_workers` and `max_async_concurrent`. It replaces the repository's default or the job's own executor for that run; a count set without `"executor": "parallel"` is refused. An asset's `rivers/executor` metadata still wins for its step, and a Kubernetes step pod runs its one step in-process whatever the document says. A run launched this way on a Kubernetes default executes its steps in the process that runs the run, not in step pods.
 
 ## Per-asset executor override
 

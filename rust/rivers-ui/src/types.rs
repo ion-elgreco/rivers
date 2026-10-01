@@ -1,6 +1,8 @@
 //! DTO types for the UI — mirrors rivers-core types without surrealdb dependencies.
 //! Used in server function signatures so they work on both SSR and WASM hydration targets.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Format a partition key to match gRPC's `py_partition_key_display` (`Multi` →
@@ -54,7 +56,7 @@ pub enum StaleStatus {
 /// Asset registration + last-materialization snapshot. Mirrors
 /// `rivers_core::storage::AssetRecord` (sans the per-CL identity field —
 /// scoping happens server-side).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetRecord {
     pub asset_key: String,
     pub tags: Vec<String>,
@@ -199,6 +201,39 @@ pub struct RunRecord {
     pub launched_by: LaunchedBy,
     #[serde(default)]
     pub code_location_id: String,
+    /// The verb this run executes. `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// The launch document the run was launched with, as JSON text. `None`
+    /// means the definitions as they are.
+    #[serde(default)]
+    pub config: Option<String>,
+}
+
+/// Which verb a run filter selects. Explicit variants rather than a nested
+/// `Option` so every state survives a JSON round-trip.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum VerbFilter {
+    /// No restriction — materializes and actions alike.
+    #[default]
+    Any,
+    /// Materialize runs only (the ones storing no verb).
+    MaterializeOnly,
+    /// Runs executing exactly this verb.
+    Verb(String),
+}
+
+impl VerbFilter {
+    /// Map to the core filter's nested-`Option` encoding, which is in-process
+    /// only and so never has to survive serialization.
+    #[cfg(feature = "ssr")]
+    fn into_core(self) -> Option<Option<String>> {
+        match self {
+            Self::Any => None,
+            Self::MaterializeOnly => Some(None),
+            Self::Verb(v) => Some(Some(v)),
+        }
+    }
 }
 
 /// Filter passed to the paginated runs server fn. Empty/`None` means no
@@ -216,6 +251,11 @@ pub struct RunFilter {
     pub asset_substring: Option<String>,
     #[serde(default)]
     pub partition_substring: Option<String>,
+    /// Verb the run executes. A nested `Option` cannot cross this boundary:
+    /// `get_runs_page` is `#[server(input = Json)]`, and both `None` and
+    /// `Some(None)` encode as `null`, so "materialize only" was unrepresentable.
+    #[serde(default)]
+    pub action: VerbFilter,
 }
 
 /// A page of rows + the matching total — what every paginated server-fn returns.
@@ -271,6 +311,31 @@ pub enum EventType {
     StepSlotWaiting,
     StepSlotRenewed,
     StepSlotReleased,
+    ActionCompleted,
+    Deletion,
+}
+
+impl EventType {
+    /// Log-style label shown in event tables and tooltips.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EventType::StepStart => "STEP_START",
+            EventType::StepSuccess => "STEP_SUCCESS",
+            EventType::StepFailure => "STEP_FAILURE",
+            EventType::StepRetry => "STEP_RETRY",
+            EventType::Materialization => "MATERIALIZATION",
+            EventType::Observation => "OBSERVATION",
+            EventType::RunQueued => "RUN_QUEUED",
+            EventType::RunDequeued => "RUN_DEQUEUED",
+            EventType::RunLaunchFailed => "RUN_LAUNCH_FAILED",
+            EventType::StepSlotClaimed => "SLOT_CLAIMED",
+            EventType::StepSlotWaiting => "SLOT_WAITING",
+            EventType::StepSlotRenewed => "SLOT_RENEWED",
+            EventType::StepSlotReleased => "SLOT_RELEASED",
+            EventType::ActionCompleted => "ACTION_COMPLETED",
+            EventType::Deletion => "DELETION",
+        }
+    }
 }
 
 /// One row from the events table — drives the run-detail / asset-detail
@@ -298,6 +363,78 @@ pub struct RunLog {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub logs: Option<String>,
+    pub traceback: Option<Traceback>,
+}
+
+/// The traceback stored for `step`'s attempt that ended with the
+/// `StepFailure` or `StepRetry` event at `at`: its row carries that time.
+pub fn traceback_for<'a>(logs: &'a [RunLog], step: &str, at: i64) -> Option<&'a Traceback> {
+    logs.iter()
+        .filter(|l| l.step_key == step && l.timestamp == at)
+        .find_map(|l| l.traceback.as_ref())
+}
+
+/// A failed attempt's Python traceback. Mirrors
+/// `rivers_core::execution::traceback::Traceback`, whose JSON it reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Traceback {
+    /// The exception chain, oldest first. The last entry failed the step.
+    pub exceptions: Vec<ExceptionInfo>,
+    /// The traceback as Python prints it.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExceptionInfo {
+    #[serde(rename = "type")]
+    pub exc_type: String,
+    #[serde(default)]
+    pub module: Option<String>,
+    pub value: String,
+    /// How this exception is linked to the entry before it in the chain.
+    #[serde(default)]
+    pub chain: Option<ChainLink>,
+    pub frames: Vec<TracebackFrame>,
+    #[serde(default)]
+    pub group: Vec<Vec<ExceptionInfo>>,
+    #[serde(default)]
+    pub group_omitted: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainLink {
+    /// Raised `from` the previous exception.
+    Cause,
+    /// Raised while handling the previous exception.
+    Context,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TracebackFrame {
+    pub filename: String,
+    pub abs_path: String,
+    pub function: String,
+    #[serde(default)]
+    pub lineno: Option<u32>,
+    /// First column of the running expression, from 1.
+    #[serde(default)]
+    pub colno: Option<u32>,
+    #[serde(default)]
+    pub end_lineno: Option<u32>,
+    /// Last column of the running expression on `end_lineno`, inclusive.
+    #[serde(default)]
+    pub end_colno: Option<u32>,
+    #[serde(default)]
+    pub pre_context: Vec<String>,
+    #[serde(default)]
+    pub context_line: Option<String>,
+    #[serde(default)]
+    pub post_context: Vec<String>,
+    pub in_app: bool,
+    /// More calls of this same frame right after it, left out.
+    #[serde(default)]
+    pub repeated: u32,
 }
 
 /// Asset DAG topology read from the per-CL storage blob. `edges` are
@@ -310,6 +447,53 @@ pub struct GraphTopology {
 }
 
 impl GraphTopology {
+    /// What the lineage page shows. A node inside a collapsed graph asset
+    /// shows as the outermost collapsed graph around it, and its edges move
+    /// there; then the kind and group filters apply. An empty filter keeps
+    /// everything; a group filter drops ungrouped nodes.
+    pub fn visible(&self, kinds: &[String], groups: &[String], expanded: &[String]) -> Self {
+        use std::collections::{HashMap, HashSet};
+
+        let parent: HashMap<&str, &str> = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.parent_graph.as_deref().map(|p| (n.name.as_str(), p)))
+            .collect();
+        let expanded: HashSet<&str> = expanded.iter().map(String::as_str).collect();
+        let shown_as = |name: &str| -> String {
+            let (mut shown, mut current) = (name, name);
+            for _ in 0..=parent.len() {
+                let Some(&p) = parent.get(current) else { break };
+                if !expanded.contains(p) {
+                    shown = p;
+                }
+                current = p;
+            }
+            shown.to_string()
+        };
+
+        let nodes: Vec<TopologyNode> = self
+            .nodes
+            .iter()
+            .filter(|n| shown_as(&n.name) == n.name)
+            .filter(|n| kinds.is_empty() || kinds.contains(&n.kind))
+            .filter(|n| groups.is_empty() || n.group.as_ref().is_some_and(|g| groups.contains(g)))
+            .cloned()
+            .collect();
+        let names: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        let mut seen = HashSet::new();
+        let edges = self
+            .edges
+            .iter()
+            .map(|(from, to)| (shown_as(from), shown_as(to)))
+            .filter(|(from, to)| {
+                from != to && names.contains(from.as_str()) && names.contains(to.as_str())
+            })
+            .filter(|edge| seen.insert(edge.clone()))
+            .collect();
+        Self { nodes, edges }
+    }
+
     /// Compute (ancestors, descendants) of `node_name` from the edge list.
     /// Ancestors = transitive dependencies; descendants = transitive dependents.
     pub fn lineage(&self, node_name: &str) -> (Vec<String>, Vec<String>) {
@@ -375,53 +559,6 @@ impl GraphTopology {
             .map(|(from, _)| from.clone())
             .collect()
     }
-
-    /// Return a new topology with collapsed graph assets.
-    /// Nodes whose `parent_graph` points to a graph asset NOT in `expanded` are removed.
-    /// Edges to/from removed nodes are rewired to their parent graph asset node.
-    pub fn collapsed(&self, expanded: &std::collections::HashSet<String>) -> GraphTopology {
-        use std::collections::{HashMap, HashSet};
-
-        let mut remap: HashMap<&str, &str> = HashMap::new();
-        for node in &self.nodes {
-            if let Some(ref parent) = node.parent_graph
-                && !expanded.contains(parent)
-            {
-                remap.insert(&node.name, parent.as_str());
-            }
-        }
-
-        let hidden: HashSet<&str> = remap.keys().copied().collect();
-        let nodes: Vec<TopologyNode> = self
-            .nodes
-            .iter()
-            .filter(|n| !hidden.contains(n.name.as_str()))
-            .cloned()
-            .collect();
-
-        let visible: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-
-        let mut edges: Vec<(String, String)> = Vec::new();
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        for (from, to) in &self.edges {
-            let new_from = remap.get(from.as_str()).copied().unwrap_or(from.as_str());
-            let new_to = remap.get(to.as_str()).copied().unwrap_or(to.as_str());
-            // Self-edges arise from internal edges within a collapsed graph.
-            if new_from == new_to {
-                continue;
-            }
-            if !visible.contains(new_from) || !visible.contains(new_to) {
-                continue;
-            }
-            let edge = (new_from.to_string(), new_to.to_string());
-            if seen_edges.insert(edge.clone()) {
-                edges.push(edge);
-            }
-        }
-        edges.sort();
-
-        GraphTopology { nodes, edges }
-    }
 }
 
 /// One node in [`GraphTopology`]. `kind` is one of `"asset"`, `"task"`,
@@ -466,9 +603,12 @@ pub struct JobRecord {
     pub name: String,
     pub asset_selection: Vec<String>,
     pub executor_type: String,
+    /// The verb this job's runs execute; `None` means materialize.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetDefinitionInfo {
     pub asset_key: String,
     pub description: Option<String>,
@@ -484,9 +624,83 @@ pub struct AssetDefinitionInfo {
     pub code_version: Option<String>,
     #[serde(default)]
     pub asset_type: String,
+    /// Named actions this asset supports beyond materialize.
+    #[serde(default)]
+    pub actions: Vec<AssetActionInfo>,
+    /// JSON schema of the asset's config class; `None` when it takes no config.
+    #[serde(default)]
+    pub config_schema: Option<String>,
+    /// The asset's metadata as defined; a launch may add or replace keys.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A resource a launch document may override: its key and the JSON schema
+/// of its class (an instance's current values as the defaults).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceInfo {
+    pub key: String,
+    pub config_schema: String,
+}
+
+/// One step of pydantic's `loc`: a field name or a list index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigLoc {
+    Key(String),
+    Index(u32),
+}
+
+/// One error the definitions found in a launch document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigError {
+    /// Where in the document the checked object sits, e.g.
+    /// `["assets", "raw_users", "config"]`.
+    pub path: Vec<String>,
+    /// pydantic's `loc` inside that object; empty for the object itself.
+    pub loc: Vec<ConfigLoc>,
+    pub message: String,
+    /// pydantic's error type (`missing`, `int_parsing`, `value_error`, ...),
+    /// `required` for a plain model's field left unset, `exception`, or
+    /// `invalid` for a part the definitions refuse.
+    pub kind: String,
+}
+
+/// Mirror of the gRPC `ActionInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetActionInfo {
+    pub name: String,
+    /// "unchanged" | "may_materialize" | "unmaterialize" | "observe"
+    pub outcome: String,
+    pub exclusive: bool,
+    /// "required" | "keyless" | "optional" — partition-key rule for the verb.
+    #[serde(default)]
+    pub partitioning: String,
+    pub description: Option<String>,
+    /// JSON schema of the action's own config class; `None` when it takes none.
+    #[serde(default)]
+    pub config_schema: Option<String>,
+}
+
+impl AssetActionInfo {
+    /// The verb clears materialization state — every surface offering it must
+    /// derive its warning styling from here, not a local string compare.
+    pub fn is_destructive(&self) -> bool {
+        self.outcome == "unmaterialize"
+    }
+
+    /// Whole-asset verb: never takes a partition key (vacuum).
+    pub fn is_keyless(&self) -> bool {
+        self.partitioning == "keyless"
+    }
+
+    /// A key is accepted but not required (delete, optimize, observe): keyless runs
+    /// cover the whole asset.
+    pub fn key_optional(&self) -> bool {
+        self.partitioning == "optional"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionDefinitionInfo {
     pub kind: String,
     /// Single-dim enumerable keys (Static, TimeWindow). Empty for Multi
@@ -541,7 +755,7 @@ pub enum SubmitPartitionKey {
     Multi(Vec<(String, String)>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookInfo {
     pub hook_type: String,
     pub function_name: String,
@@ -640,17 +854,6 @@ pub struct PartitionDetail {
     pub last_timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RunStats {
-    pub total: usize,
-    pub success: usize,
-    pub failure: usize,
-    pub started: usize,
-    pub not_started: usize,
-    pub queued: usize,
-    pub canceled: usize,
-}
-
 /// Filter passed to the paginated backfills server fn. Empty/`None` means no
 /// restriction. Mirrors `rivers_core::storage::BackfillFilter`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -680,7 +883,11 @@ pub struct BackfillsSummary {
 pub struct BackfillInfo {
     pub backfill_id: String,
     pub status: String,
+    /// Plain-language summary, e.g. "one run per region".
     pub strategy: String,
+    /// The Python API form, shown as a tooltip.
+    #[serde(default)]
+    pub strategy_code: String,
     /// `Some` when the backfill targets a named job (runs use the job's plan +
     /// executor); `None` for an ad-hoc asset-selection backfill.
     #[serde(default)]
@@ -700,6 +907,11 @@ pub struct BackfillInfo {
     pub code_location_id: String,
     #[serde(default)]
     pub launched_by: LaunchedBy,
+    /// Verb the child runs execute. `None` means materialize. Without it a
+    /// destructive backfill is indistinguishable from a rebuild, and re-running
+    /// one from the detail page repeats the destruction.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,6 +1077,15 @@ enum StoredMetadataValue {
     },
 }
 
+/// Nanoseconds for a stored `DateRange` bound. The bounds are serialized
+/// wall-clock datetimes with no zone, so they are read as UTC.
+fn wall_nanos(wall: &str) -> i64 {
+    jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", wall)
+        .and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC))
+        .map(|z| z.timestamp().as_nanosecond() as i64)
+        .unwrap_or(0)
+}
+
 impl From<StoredMetadataValue> for MetadataDisplay {
     fn from(v: StoredMetadataValue) -> Self {
         match v {
@@ -896,12 +1117,8 @@ impl From<StoredMetadataValue> for MetadataDisplay {
                 Self::Text(format!("[{text}]"))
             }
             StoredMetadataValue::DateRange { start, end } => {
-                let s = chrono::NaiveDateTime::parse_from_str(&start, "%Y-%m-%dT%H:%M:%S")
-                    .map(|d| d.and_utc().timestamp_nanos_opt().unwrap_or(0))
-                    .unwrap_or(0);
-                let e = chrono::NaiveDateTime::parse_from_str(&end, "%Y-%m-%dT%H:%M:%S")
-                    .map(|d| d.and_utc().timestamp_nanos_opt().unwrap_or(0))
-                    .unwrap_or(0);
+                let s = wall_nanos(&start);
+                let e = wall_nanos(&end);
                 Self::DateRange { start: s, end: e }
             }
             StoredMetadataValue::Schema { ipc_bytes: _ } => {
@@ -1017,6 +1234,8 @@ mod conversions {
                 block_reason: r.block_reason,
                 launched_by: r.launched_by.into(),
                 code_location_id: r.code_location_id,
+                action: r.action,
+                config: r.config,
             }
         }
     }
@@ -1064,6 +1283,7 @@ mod conversions {
                 job_substring: f.job_substring.filter(|s| !s.is_empty()),
                 asset_substring: f.asset_substring.filter(|s| !s.is_empty()),
                 partition_substring: f.partition_substring.filter(|s| !s.is_empty()),
+                action: f.action.into_core(),
             }
         }
     }
@@ -1084,6 +1304,8 @@ mod conversions {
                 rivers_core::storage::EventType::StepSlotWaiting => Self::StepSlotWaiting,
                 rivers_core::storage::EventType::StepSlotRenewed => Self::StepSlotRenewed,
                 rivers_core::storage::EventType::StepSlotReleased => Self::StepSlotReleased,
+                rivers_core::storage::EventType::ActionCompleted => Self::ActionCompleted,
+                rivers_core::storage::EventType::Deletion => Self::Deletion,
             }
         }
     }
@@ -1118,6 +1340,10 @@ mod conversions {
                 stdout: l.stdout,
                 stderr: l.stderr,
                 logs: l.logs,
+                traceback: l
+                    .traceback
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok()),
             }
         }
     }
@@ -1251,18 +1477,31 @@ mod conversions {
 
     impl From<rivers_core::storage::BackfillRecord> for BackfillInfo {
         fn from(b: rivers_core::storage::BackfillRecord) -> Self {
-            let strategy = match &b.strategy {
-                rivers_core::storage::BackfillStrategy::MultiRun => "MultiRun".to_string(),
-                rivers_core::storage::BackfillStrategy::SingleRun => "SingleRun".to_string(),
+            let (strategy, strategy_code) = match &b.strategy {
+                rivers_core::storage::BackfillStrategy::MultiRun => (
+                    "one run per partition".to_string(),
+                    "multi_run()".to_string(),
+                ),
+                rivers_core::storage::BackfillStrategy::SingleRun => {
+                    ("one run".to_string(), "single_run()".to_string())
+                }
                 rivers_core::storage::BackfillStrategy::PerDimension {
                     multi_run,
                     single_run,
-                } => format!("PerDimension(multi_run={multi_run:?}, single_run={single_run:?})"),
+                } => (
+                    if multi_run.is_empty() {
+                        "one run".to_string()
+                    } else {
+                        format!("one run per {}", multi_run.join(" × "))
+                    },
+                    format!("per_dimension(multi_run={multi_run:?}, single_run={single_run:?})"),
+                ),
             };
             Self {
                 backfill_id: b.backfill_id,
                 status: format!("{:?}", b.status),
                 strategy,
+                strategy_code,
                 job_name: b.job_name,
                 asset_selection: b.asset_selection,
                 total_partitions: b
@@ -1281,6 +1520,7 @@ mod conversions {
                 error: b.error,
                 code_location_id: b.code_location_id,
                 launched_by: b.launched_by.into(),
+                action: b.action,
             }
         }
     }
@@ -1355,6 +1595,7 @@ mod conversions {
                 job_substring: Some(String::new()),
                 asset_substring: Some(String::new()),
                 partition_substring: Some(String::new()),
+                action: VerbFilter::Any,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert!(core.status.is_none());
@@ -1362,6 +1603,65 @@ mod conversions {
             assert!(core.job_substring.is_none());
             assert!(core.asset_substring.is_none());
             assert!(core.partition_substring.is_none());
+        }
+
+        /// `get_runs_page` is `#[server(input = Json)]`, so every filter state
+        /// has to survive a JSON round-trip. A nested `Option` did not: both
+        /// `None` and `Some(None)` encode as `null`, so "materialize only"
+        /// silently degraded to "no filter" on the way to the server.
+        #[test]
+        fn verb_filter_survives_json_and_maps_to_core() {
+            for (filter, expected) in [
+                (VerbFilter::Any, None),
+                (VerbFilter::MaterializeOnly, Some(None)),
+                (
+                    VerbFilter::Verb("purge".into()),
+                    Some(Some("purge".to_string())),
+                ),
+            ] {
+                let json = serde_json::to_string(&RunFilter {
+                    action: filter.clone(),
+                    ..Default::default()
+                })
+                .expect("filter serializes");
+                let back: RunFilter = serde_json::from_str(&json).expect("filter deserializes");
+                assert_eq!(back.action, filter, "round-trip changed the verb filter");
+                let core: rivers_core::storage::RunFilter = back.into();
+                assert_eq!(core.action, expected, "core encoding for {filter:?}");
+            }
+        }
+
+        /// A destructive backfill has to stay distinguishable from a rebuild:
+        /// the detail page's "Re-run" threads the record's verb, so dropping it
+        /// in the DTO makes a delete sweep look like a materialize and repeat.
+        #[test]
+        fn backfill_info_keeps_the_verb() {
+            let core = rivers_core::storage::BackfillRecord {
+                backfill_id: "bf1".into(),
+                code_location_id: rivers_core::storage::default_code_location_id(),
+                status: rivers_core::storage::BackfillStatus::InProgress,
+                strategy: rivers_core::storage::BackfillStrategy::MultiRun,
+                failure_policy: rivers_core::storage::BackfillFailurePolicy::Continue,
+                asset_selection: vec!["orders".into()],
+                job_name: None,
+                partition_keys: vec![rivers_core::storage::PartitionKey::Single {
+                    keys: vec!["p1".into()],
+                }],
+                run_ids: vec![],
+                completed_partitions: vec![],
+                failed_partitions: vec![],
+                canceled_partitions: vec![],
+                max_concurrency: 4,
+                tags: vec![],
+                create_time: 0,
+                end_time: None,
+                error: None,
+                launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                action: Some("purge".into()),
+                config: None,
+            };
+            let ui: BackfillInfo = core.into();
+            assert_eq!(ui.action.as_deref(), Some("purge"));
         }
 
         /// Run-list partition labels must use the same canonical `dim=v|dim=v`
@@ -1387,6 +1687,8 @@ mod conversions {
                 }),
                 block_reason: None,
                 launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+                action: None,
+                config: None,
             };
             let ui: RunRecord = core.into();
             let preview = ui
@@ -1425,6 +1727,71 @@ mod conversions {
             );
         }
 
+        /// The UI reads the traceback JSON the executor writes.
+        #[test]
+        fn run_log_reads_the_stored_traceback() {
+            use rivers_core::execution::traceback as core;
+            let json = core::Traceback {
+                exceptions: vec![core::ExceptionInfo {
+                    exc_type: "KeyError".into(),
+                    module: None,
+                    value: "'b'".into(),
+                    chain: Some(core::ChainLink::Cause),
+                    frames: vec![core::Frame {
+                        filename: "assets.py".into(),
+                        abs_path: "/app/assets.py".into(),
+                        function: "sales".into(),
+                        lineno: Some(42),
+                        colno: Some(12),
+                        end_lineno: Some(42),
+                        end_colno: Some(28),
+                        pre_context: vec!["    values = {}".into()],
+                        context_line: Some("    return values['b']".into()),
+                        post_context: vec![],
+                        in_app: true,
+                        repeated: 2,
+                    }],
+                    group: vec![],
+                    group_omitted: 0,
+                }],
+                text: "Traceback (most recent call last):".into(),
+            }
+            .to_json();
+            let stored = rivers_core::storage::StoredLog {
+                id: rivers_core::surrealdb::types::RecordId::new("run_logs", "l1"),
+                code_location_id: "default".into(),
+                run_id: "r1".into(),
+                step_key: "sales".into(),
+                timestamp: 7,
+                stdout: None,
+                stderr: None,
+                logs: None,
+                traceback: Some(json),
+            };
+            let ui: RunLog = stored.into();
+            let tb = ui.traceback.expect("the traceback parses");
+            assert_eq!(tb.text, "Traceback (most recent call last):");
+            let exc = &tb.exceptions[0];
+            assert_eq!(
+                (exc.exc_type.as_str(), exc.value.as_str(), exc.chain),
+                ("KeyError", "'b'", Some(ChainLink::Cause))
+            );
+            let f = &exc.frames[0];
+            assert_eq!(
+                (
+                    f.lineno,
+                    f.colno,
+                    f.end_lineno,
+                    f.end_colno,
+                    f.repeated,
+                    f.in_app
+                ),
+                (Some(42), Some(12), Some(42), Some(28), 2, true)
+            );
+            assert_eq!(f.pre_context, vec!["    values = {}".to_string()]);
+            assert!(f.post_context.is_empty());
+        }
+
         /// Non-empty filter values round-trip unchanged.
         #[test]
         fn run_filter_preserves_non_empty_strings() {
@@ -1434,6 +1801,7 @@ mod conversions {
                 job_substring: Some("daily".into()),
                 asset_substring: Some("orders".into()),
                 partition_substring: Some("2024-01".into()),
+                action: VerbFilter::Any,
             };
             let core: rivers_core::storage::RunFilter = ui.into();
             assert_eq!(core.status, Some(rivers_core::storage::RunStatus::Failure));
@@ -1532,6 +1900,99 @@ mod topology_tests {
         }
     }
 
+    fn inside(name: &str, graph: &str) -> TopologyNode {
+        TopologyNode {
+            name: name.into(),
+            kind: "task".into(),
+            group: None,
+            parent_graph: Some(graph.into()),
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> (String, String) {
+        (from.into(), to.into())
+    }
+
+    fn names(topo: &GraphTopology) -> Vec<&str> {
+        topo.nodes.iter().map(|n| n.name.as_str()).collect()
+    }
+
+    /// A collapsed graph asset stands in for its children: their edges move
+    /// to it, edges between them vanish, and the resulting duplicates merge.
+    #[test]
+    fn visible_folds_children_into_a_collapsed_graph() {
+        let topo = GraphTopology {
+            nodes: vec![
+                node("raw"),
+                node("pipe"),
+                inside("pipe/a", "pipe"),
+                inside("pipe/b", "pipe"),
+                node("report"),
+            ],
+            edges: vec![
+                edge("pipe/a", "raw"),
+                edge("pipe/b", "pipe/a"),
+                edge("pipe", "pipe/b"),
+                edge("report", "pipe/a"),
+                edge("report", "pipe/b"),
+            ],
+        };
+
+        let collapsed = topo.visible(&[], &[], &[]);
+        assert_eq!(names(&collapsed), vec!["raw", "pipe", "report"]);
+        assert_eq!(
+            collapsed.edges,
+            vec![edge("pipe", "raw"), edge("report", "pipe")]
+        );
+
+        let expanded = topo.visible(&[], &[], &["pipe".into()]);
+        assert_eq!(expanded.nodes.len(), 5);
+        assert_eq!(expanded.edges, topo.edges);
+    }
+
+    /// Inside a collapsed outer graph, an expanded inner graph still hides:
+    /// everything shows as the outermost collapsed graph.
+    #[test]
+    fn visible_folds_nested_graphs_into_the_outermost_collapsed_one() {
+        let topo = GraphTopology {
+            nodes: vec![
+                node("src"),
+                node("outer"),
+                inside("inner", "outer"),
+                inside("leaf", "inner"),
+            ],
+            edges: vec![edge("leaf", "src")],
+        };
+        let shown = topo.visible(&[], &[], &["inner".into()]);
+        assert_eq!(names(&shown), vec!["src", "outer"]);
+        assert_eq!(shown.edges, vec![edge("outer", "src")]);
+    }
+
+    #[test]
+    fn visible_applies_kind_and_group_filters() {
+        let grouped = |name: &str, group: Option<&str>| TopologyNode {
+            group: group.map(Into::into),
+            ..node(name)
+        };
+        let topo = GraphTopology {
+            nodes: vec![
+                grouped("a", Some("g1")),
+                grouped("b", Some("g2")),
+                grouped("c", None),
+                inside("t", "b"),
+            ],
+            edges: vec![edge("b", "a"), edge("c", "b")],
+        };
+
+        let g1_g2 = topo.visible(&[], &["g1".into(), "g2".into()], &[]);
+        assert_eq!(names(&g1_g2), vec!["a", "b"]);
+        assert_eq!(g1_g2.edges, vec![edge("b", "a")]);
+
+        let tasks = topo.visible(&["task".into()], &[], &["b".into()]);
+        assert_eq!(names(&tasks), vec!["t"]);
+        assert!(tasks.edges.is_empty());
+    }
+
     /// `summary` depends on `raw_data` → edge `(summary, raw_data)`. Selecting
     /// `raw_data`, `summary` must be DOWNSTREAM (it consumes raw_data), not
     /// upstream. Regression for the swapped lineage labels (issue #57).
@@ -1549,5 +2010,43 @@ mod topology_tests {
         // summary consumes raw_data: raw_data upstream, no downstream.
         assert_eq!(topo.direct_upstream("summary"), vec!["raw_data"]);
         assert!(topo.direct_downstream("summary").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod traceback_tests {
+    use super::*;
+
+    fn log(step: &str, at: i64, text: Option<&str>) -> RunLog {
+        RunLog {
+            id: format!("{step}-{at}"),
+            run_id: "r1".into(),
+            step_key: step.into(),
+            timestamp: at,
+            stdout: text.is_none().then(|| "out".to_string()),
+            stderr: None,
+            logs: None,
+            traceback: text.map(|t| Traceback {
+                exceptions: vec![],
+                text: t.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn traceback_for_pairs_a_row_with_its_event_by_step_and_time() {
+        let logs = vec![
+            log("a", 10, None),
+            log("a", 10, Some("first attempt")),
+            log("a", 20, Some("second attempt")),
+            log("b", 20, Some("other step")),
+        ];
+        let text = |step, at| traceback_for(&logs, step, at).map(|t| t.text.as_str());
+        assert_eq!(text("a", 10), Some("first attempt"));
+        assert_eq!(text("a", 20), Some("second attempt"));
+        assert_eq!(text("b", 20), Some("other step"));
+        // An attempt that stored none never shows another attempt's traceback.
+        assert_eq!(text("a", 15), None);
+        assert_eq!(text("c", 20), None);
     }
 }

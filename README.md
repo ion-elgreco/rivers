@@ -4,7 +4,7 @@
 
 rivers is a Rust-powered orchestration platform built around data assets. Define pipelines in Python; rivers resolves the graph, plans execution - no Python interpreter on the control plane.
 
-[Documentation](https://ion-elgreco.github.io/rivers/) · [Issues](https://github.com/ion-elgreco/rivers/issues) · [Discussions](https://github.com/ion-elgreco/rivers/discussions)
+[Documentation](https://orchestrator.rs/docs/) · [Issues](https://github.com/ion-elgreco/rivers/issues) · [Discussions](https://github.com/ion-elgreco/rivers/discussions)
 
 ## Key features
 
@@ -41,7 +41,7 @@ spec:
 
 The operator resolves the image to a digest, reconciles a `Deployment` + `Service` running `rivers serve`, registers it with the UI's discovery registry, and re-polls the registry to keep the digest fresh. Multi-arch images (`linux/amd64`, `linux/arm64`) and Helm charts are published to `ghcr.io` on every release with SLSA build-provenance attestations.
 
-See the [installation guide](https://ion-elgreco.github.io/rivers/latest/installation/kubernetes/) for the full setup — helm install commands, common values, and an [architecture overview](https://ion-elgreco.github.io/rivers/latest/installation/overview/) with the reconciliation and run sequence diagrams.
+See the [installation guide](https://orchestrator.rs/docs/latest/installation/kubernetes/) for the full setup — helm install commands, common values, and an [architecture overview](https://orchestrator.rs/docs/latest/installation/overview/) with the reconciliation and run sequence diagrams.
 
 ## Install
 
@@ -76,8 +76,12 @@ result = repo.materialize()
 print(repo.load_node("summary"))  # "100 users, 5000 events"
 ```
 
-See the [Getting Started guide](https://ion-elgreco.github.io/rivers/latest/getting-started/) for partitioning, jobs, IO handlers, and the K8s executor.
+See the [Getting Started guide](https://orchestrator.rs/docs/latest/getting-started/) for partitioning, jobs, IO handlers, and the K8s executor.
 
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup (`just develop`, `just test`, `just pre-commit`), code conventions, and the test matrix. The [`docs/`](docs/) directory hosts both the user-facing guides and architectural notes for contributors.
+
+## License
+
+rivers is licensed under the [Apache License, Version 2.0](LICENSE).

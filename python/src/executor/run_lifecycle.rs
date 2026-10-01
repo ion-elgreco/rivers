@@ -20,6 +20,7 @@ use super::Executor;
 use super::ops::now_ts;
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
+use crate::config::run_config::{RunResources, parse_run_config};
 use crate::errors::ExecutionError;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
@@ -42,6 +43,7 @@ pub(crate) struct RunPlanArgs<'a> {
     pub executor: &'a Executor,
     pub storage: &'a ScopedStorageHandle<SurrealStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
+    pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     pub io_handler_registry: &'a IOHandlerRegistry,
 
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
@@ -51,16 +53,59 @@ pub(crate) struct RunPlanArgs<'a> {
     pub init: RunInit,
     pub partition_key: Option<PyPartitionKey>,
     pub tags: Vec<(String, String)>,
-    pub config: Option<HashMap<String, Py<PyAny>>>,
+    /// The launch document, canonical (see [`crate::config::run_config`]).
+    pub config: Option<String>,
 
     pub resume: bool,
     pub raise_on_error: bool,
+}
+
+/// What the launch document changed for this run, else the repository's own.
+struct Applied<'a> {
+    node_map: &'a HashMap<String, ResolvedNode>,
+    resources: &'a HashMap<String, ResourceVariant>,
+    config_overrides: Option<HashMap<String, Py<PyAny>>>,
+    executor: Executor,
 }
 
 pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
     py.import("rivers._capture")?
         .call_method("install", (), None)?;
 
+    // Read before any record write, so a document the definitions refuse
+    // leaves no run behind.
+    let document = args
+        .config
+        .as_deref()
+        .map(|json| parse_run_config(py, json))
+        .transpose()?;
+    let overlay = document
+        .as_ref()
+        .and_then(|d| d.overlay_node_map(py, args.node_map));
+    let run_resources = document
+        .as_ref()
+        .map(|d| RunResources::build(py, d, args.resources))
+        .transpose()?
+        .flatten();
+    let executor = match document.as_ref().and_then(|d| d.execution.as_ref()) {
+        // A step pod runs its one step here whatever the document says.
+        Some(execution) if !super::in_step_pod() => execution.executor(args.executor),
+        _ => args.executor.clone(),
+    };
+    let applied = Applied {
+        node_map: overlay.as_ref().unwrap_or(args.node_map),
+        resources: run_resources.as_ref().map_or(args.resources, |r| &r.map),
+        config_overrides: document.as_ref().and_then(|d| d.config_overrides(py)),
+        executor,
+    };
+    let result = drive(py, args, &applied);
+    if let Some(run_resources) = &run_resources {
+        run_resources.teardown(py);
+    }
+    result
+}
+
+fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRunResult> {
     let node_names = args.plan.all_asset_names();
 
     let started = py.detach(|| -> PyResult<bool> {
@@ -80,6 +125,8 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
                     partition_key: args.partition_key.as_ref().map(|pk| pk.into()),
                     block_reason: None,
                     launched_by,
+                    action: args.plan.action.clone(),
+                    config: args.config,
                 };
                 io_rt()
                     .block_on(args.storage.backend().create_run(&record))
@@ -110,15 +157,16 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
         ));
     }
 
-    let failures = args.executor.execute_plan(
+    let failures = applied.executor.execute_plan(
         py,
         args.plan,
-        args.node_map,
+        applied.node_map,
         &args.partition_key,
         args.storage,
         &args.run_id,
-        args.resources,
-        &args.config,
+        applied.resources,
+        args.retries,
+        &applied.config_overrides,
         args.io_handler_registry,
         args.resume,
     );

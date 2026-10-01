@@ -127,10 +127,14 @@ pub async fn get_asset_events_page(
     let event_types: Vec<String> = match filter.as_str() {
         "mat" => vec!["Materialization".to_string()],
         "fail" => vec!["StepFailure".to_string()],
+        // A deletion flips the asset to Missing, so it must be visible here —
+        // without it the timeline shows no reason for the state change.
         _ => vec![
             "Materialization".to_string(),
             "Observation".to_string(),
             "StepFailure".to_string(),
+            "ActionCompleted".to_string(),
+            "Deletion".to_string(),
         ],
     };
     let (rows, total) = state
@@ -142,26 +146,6 @@ pub async fn get_asset_events_page(
         rows: rows.into_iter().map(Into::into).collect(),
         total,
     })
-}
-
-#[server]
-pub async fn get_asset_events_by_partition(
-    loc_ns: String,
-    loc_name: String,
-    key: String,
-    partition_key: String,
-    limit: Option<usize>,
-) -> Result<Vec<StoredEvent>, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
-    let state = expect_context::<crate::state::AppState>();
-    state
-        .storage
-        .for_code_location(&ctx)
-        .get_partition_events(&key, &partition_key, limit.unwrap_or(50))
-        .await
-        .map(|evts| evts.into_iter().map(Into::into).collect())
-        .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
 #[server]

@@ -1,7 +1,7 @@
 //! PartitionsDefinition — Static, TimeWindow, Multi, and Dynamic partition schemes.
 use std::collections::HashMap;
 
-use chrono::{Local, NaiveDateTime, TimeZone, Utc};
+use jiff::{SignedDuration, civil};
 use croner::Cron;
 use ordermap::OrderSet;
 use pyo3::exceptions::PyNotImplementedError;
@@ -99,8 +99,8 @@ pub enum PartitionsDefinition {
     TimeWindow {
         cron_schedule: Option<String>,
         interval_seconds: Option<f64>,
-        start: NaiveDateTime,
-        end: Option<NaiveDateTime>,
+        start: civil::DateTime,
+        end: Option<civil::DateTime>,
         fmt: String,
     },
     Multi {
@@ -290,7 +290,7 @@ impl PartitionsDefinition {
     }
 
     /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every TimeWindow grid's effective end to `cap`.
-    pub fn get_partition_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<PyPartitionKey>> {
+    pub fn get_partition_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<PyPartitionKey>> {
         match self {
             Self::TimeWindow {
                 cron_schedule,
@@ -333,7 +333,7 @@ impl PartitionsDefinition {
     }
 
     /// Single-dimension variant of [`get_partition_keys_capped`].
-    pub fn enumerate_single_dim_keys_capped(&self, cap: NaiveDateTime) -> PyResult<Vec<String>> {
+    pub fn enumerate_single_dim_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<String>> {
         self.get_partition_keys_capped(cap)?
             .into_iter()
             .map(|pk| match pk {
@@ -376,7 +376,7 @@ impl PartitionsDefinition {
                     let mut idx = 0usize;
                     for_each_cron_tick(expr, start, end_dt, |naive| {
                         if idx >= offset && out.len() < limit {
-                            out.push(naive.format(fmt).to_string());
+                            out.push(naive.strftime(fmt).to_string());
                         }
                         idx += 1;
                         out.len() < limit
@@ -462,12 +462,12 @@ impl PartitionsDefinition {
                 let end_dt = time_window_end(end);
                 if let Some(secs) = interval_seconds {
                     for_each_interval_tick(*secs, start, end_dt, |dt| {
-                        consume(dt.format(fmt).to_string());
+                        consume(dt.strftime(fmt).to_string());
                         true
                     });
                 } else if let Some(expr) = cron_schedule {
                     for_each_cron_tick(expr, start, end_dt, |naive| {
-                        consume(naive.format(fmt).to_string());
+                        consume(naive.strftime(fmt).to_string());
                         true
                     })?;
                 }
@@ -495,7 +495,7 @@ impl PartitionsDefinition {
                     let mut idx = 0usize;
                     let mut found = None;
                     for_each_cron_tick(expr, start, end_dt, |naive| {
-                        if naive.format(fmt).to_string() == key {
+                        if naive.strftime(fmt).to_string() == key {
                             found = Some(idx);
                             return false;
                         }
@@ -548,7 +548,7 @@ impl PartitionsDefinition {
     pub fn compute_time_window(
         &self,
         key: &str,
-    ) -> PyResult<Option<(NaiveDateTime, NaiveDateTime)>> {
+    ) -> PyResult<Option<(civil::DateTime, civil::DateTime)>> {
         let (cron_schedule, interval_seconds, fmt) = match self {
             Self::TimeWindow {
                 cron_schedule,
@@ -566,16 +566,15 @@ impl PartitionsDefinition {
         })?;
 
         if let Some(interval) = interval_seconds {
-            let duration = chrono::Duration::nanoseconds((*interval * 1_000_000_000.0) as i64);
+            let duration = SignedDuration::from_nanos((*interval * 1_000_000_000.0) as i64);
             let window_end = window_start + duration;
             Ok(Some((window_start, window_end)))
         } else if let Some(cron_expr) = cron_schedule {
             let cron = parse_cron(cron_expr)?;
-            let start_utc = Utc.from_utc_datetime(&window_start);
-            let next = cron.find_next_occurrence(&start_utc, false).map_err(|e| {
+            let next = cron.find_next_occurrence(&window_start, false).map_err(|e| {
                 PartitionDefinitionError::new_err(format!("Failed to find next cron tick: {e}"))
             })?;
-            Ok(Some((window_start, next.naive_utc())))
+            Ok(Some((window_start, next)))
         } else {
             Ok(None)
         }
@@ -899,8 +898,8 @@ impl PartitionsDefinition {
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
     fn daily(
-        start: NaiveDateTime,
-        end: Option<NaiveDateTime>,
+        start: civil::DateTime,
+        end: Option<civil::DateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
         let def = Self::TimeWindow {
@@ -917,8 +916,8 @@ impl PartitionsDefinition {
     #[staticmethod]
     #[pyo3(signature = (start, end=None, fmt=None))]
     fn hourly(
-        start: NaiveDateTime,
-        end: Option<NaiveDateTime>,
+        start: civil::DateTime,
+        end: Option<civil::DateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
         let def = Self::TimeWindow {
@@ -935,10 +934,10 @@ impl PartitionsDefinition {
     #[staticmethod]
     #[pyo3(signature = (start, cron_schedule=None, interval_seconds=None, end=None, fmt=None))]
     fn time_window(
-        start: NaiveDateTime,
+        start: civil::DateTime,
         cron_schedule: Option<String>,
         interval_seconds: Option<f64>,
-        end: Option<NaiveDateTime>,
+        end: Option<civil::DateTime>,
         fmt: Option<String>,
     ) -> PyResult<Self> {
         let def = Self::TimeWindow {
@@ -1090,13 +1089,12 @@ fn parse_cron(expr: &str) -> PyResult<Cron> {
 fn validate_time_window_fmt(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
-    start: &NaiveDateTime,
-    end: &Option<NaiveDateTime>,
+    start: &civil::DateTime,
+    end: &Option<civil::DateTime>,
     fmt: &str,
 ) -> PyResult<()> {
     if cron_schedule.is_some() {
-        use chrono::Timelike;
-        if start.nanosecond() != 0 {
+        if start.subsec_nanosecond() != 0 {
             return Err(PartitionDefinitionError::new_err(format!(
                 "cron-gridded time windows require a start on a whole second, got {start}"
             )));
@@ -1104,14 +1102,14 @@ fn validate_time_window_fmt(
     }
     const MAX_TICKS: usize = 1024;
     let horizon = start
-        .checked_add_signed(chrono::Duration::days(1461))
-        .unwrap_or(NaiveDateTime::MAX);
+        .checked_add(SignedDuration::from_hours(35064))
+        .unwrap_or(civil::DateTime::MAX);
     let bound = match end {
         Some(e) => (*e).min(horizon),
         None => horizon,
     };
-    fn round_trip_tick(t: NaiveDateTime, fmt: &str, failure: &mut Option<PyErr>) -> bool {
-        let key = t.format(fmt).to_string();
+    fn round_trip_tick(t: civil::DateTime, fmt: &str, failure: &mut Option<PyErr>) -> bool {
+        let key = t.strftime(fmt).to_string();
         if let Some(ch) = rivers_core::storage::PartitionKey::reserved_display_char(&key) {
             *failure = Some(PartitionDefinitionError::new_err(format!(
                 "fmt '{fmt}' produces keys containing reserved character '{ch}' \
@@ -1154,7 +1152,7 @@ fn validate_time_window_fmt(
     if failure.is_none() && checked < 2 {
         let true_end = match end {
             Some(e) => *e,
-            None => NaiveDateTime::MAX,
+            None => civil::DateTime::MAX,
         };
         let mut taken = 0usize;
         if let Some(secs) = interval_seconds {
@@ -1180,11 +1178,11 @@ fn validate_time_window_key(
     key: &[String],
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
-    start: &NaiveDateTime,
-    end: &Option<NaiveDateTime>,
+    start: &civil::DateTime,
+    end: &Option<civil::DateTime>,
     fmt: &str,
 ) -> PyResult<bool> {
-    let now = Local::now().naive_local();
+    let now = jiff::Zoned::now().datetime();
     let end_dt = end.unwrap_or(now);
     if key.is_empty() {
         return Ok(false);
@@ -1198,23 +1196,20 @@ fn validate_time_window_key(
             return Ok(false);
         }
         if let Some(secs) = interval_seconds {
-            let from_start = dt.signed_duration_since(*start);
+            let from_start = dt.duration_since(*start);
             let interval_ns = (*secs * 1_000_000_000.0) as i64;
             if interval_ns <= 0 {
                 return Ok(false);
             }
-            if from_start
-                .num_nanoseconds()
-                .is_none_or(|n| n % interval_ns != 0)
-            {
+            if i64::try_from(from_start.as_nanos()).is_ok_and(|n| n % interval_ns != 0) {
                 return Ok(false);
             }
         } else if let Some(expr) = cron_schedule {
-            let window_start = (dt - chrono::Duration::hours(26)).max(*start);
-            let window_end = (dt + chrono::Duration::hours(26)).min(end_dt);
+            let window_start = (dt - SignedDuration::from_hours(26)).max(*start);
+            let window_end = (dt + SignedDuration::from_hours(26)).min(end_dt);
             let mut found = false;
             for_each_cron_tick(expr, &window_start, window_end, |naive| {
-                if naive.format(fmt).to_string() == *k {
+                if naive.strftime(fmt).to_string() == *k {
                     found = true;
                     return false;
                 }
@@ -1232,20 +1227,20 @@ fn validate_time_window_key(
 fn enumerate_time_windows(
     cron_schedule: &Option<String>,
     interval_seconds: &Option<f64>,
-    start: &NaiveDateTime,
-    end: &Option<NaiveDateTime>,
+    start: &civil::DateTime,
+    end: &Option<civil::DateTime>,
     fmt: &str,
 ) -> PyResult<Vec<String>> {
     let end_dt = time_window_end(end);
     let mut keys = Vec::new();
     if let Some(secs) = interval_seconds {
         for_each_interval_tick(*secs, start, end_dt, |dt| {
-            keys.push(dt.format(fmt).to_string());
+            keys.push(dt.strftime(fmt).to_string());
             true
         });
     } else if let Some(expr) = cron_schedule {
         for_each_cron_tick(expr, start, end_dt, |naive| {
-            keys.push(naive.format(fmt).to_string());
+            keys.push(naive.strftime(fmt).to_string());
             true
         })?;
     } else {
@@ -1257,12 +1252,12 @@ fn enumerate_time_windows(
 }
 
 /// Effective end bound for a TimeWindow: the explicit `end`, else now.
-fn time_window_end(end: &Option<NaiveDateTime>) -> NaiveDateTime {
-    end.unwrap_or_else(|| Local::now().naive_local())
+fn time_window_end(end: &Option<civil::DateTime>) -> civil::DateTime {
+    end.unwrap_or_else(|| jiff::Zoned::now().datetime())
 }
 
 /// Count of interval windows in `[start, end)`.
-fn interval_window_count(secs: f64, start: &NaiveDateTime, end_dt: NaiveDateTime) -> usize {
+fn interval_window_count(secs: f64, start: &civil::DateTime, end_dt: civil::DateTime) -> usize {
     if end_dt <= *start {
         return 0;
     }
@@ -1270,9 +1265,7 @@ fn interval_window_count(secs: f64, start: &NaiveDateTime, end_dt: NaiveDateTime
     if interval_ns <= 0 {
         return 0;
     }
-    let delta = end_dt - *start;
-    let span_ns =
-        i128::from(delta.num_seconds()) * 1_000_000_000 + i128::from(delta.subsec_nanos());
+    let span_ns = end_dt.duration_since(*start).as_nanos();
     let count = ((span_ns - 1) / interval_ns) + 1;
     count.clamp(0, usize::MAX as i128) as usize
 }
@@ -1280,8 +1273,8 @@ fn interval_window_count(secs: f64, start: &NaiveDateTime, end_dt: NaiveDateTime
 /// Up to `limit` interval keys from index `offset`, via arithmetic seek.
 fn interval_window(
     secs: f64,
-    start: &NaiveDateTime,
-    end_dt: NaiveDateTime,
+    start: &civil::DateTime,
+    end_dt: civil::DateTime,
     fmt: &str,
     offset: usize,
     limit: usize,
@@ -1290,19 +1283,19 @@ fn interval_window(
     if interval_ns <= 0 || limit == 0 {
         return Vec::new();
     }
-    let step = chrono::Duration::nanoseconds(interval_ns);
+    let step = SignedDuration::from_nanos(interval_ns);
     let Some(off_ns) = (offset as i64).checked_mul(interval_ns) else {
         return Vec::new();
     };
-    let Some(mut current) = start.checked_add_signed(chrono::Duration::nanoseconds(off_ns)) else {
+    let Ok(mut current) = start.checked_add(SignedDuration::from_nanos(off_ns)) else {
         return Vec::new();
     };
     let mut out = Vec::with_capacity(limit.min(1024));
     while current < end_dt && out.len() < limit {
-        out.push(current.format(fmt).to_string());
-        current = match current.checked_add_signed(step) {
-            Some(c) => c,
-            None => break,
+        out.push(current.strftime(fmt).to_string());
+        current = match current.checked_add(step) {
+            Ok(c) => c,
+            Err(_) => break,
         };
     }
     out
@@ -1311,8 +1304,8 @@ fn interval_window(
 /// Index of `key` if it's an aligned interval window in `[start, end)`, else `None`.
 fn interval_index(
     secs: f64,
-    start: &NaiveDateTime,
-    end_dt: NaiveDateTime,
+    start: &civil::DateTime,
+    end_dt: civil::DateTime,
     fmt: &str,
     key: &str,
 ) -> Option<usize> {
@@ -1324,7 +1317,7 @@ fn interval_index(
     if dt < *start || dt >= end_dt {
         return None;
     }
-    let delta = (dt - *start).num_nanoseconds()?;
+    let delta = i64::try_from(dt.duration_since(*start).as_nanos()).ok()?;
     if delta % interval_ns != 0 {
         return None;
     }
@@ -1334,23 +1327,23 @@ fn interval_index(
 /// Walk interval windows in `[start, end)` lazily; `f` returns false to stop.
 pub(crate) fn for_each_interval_tick(
     secs: f64,
-    start: &NaiveDateTime,
-    end_dt: NaiveDateTime,
-    mut f: impl FnMut(NaiveDateTime) -> bool,
+    start: &civil::DateTime,
+    end_dt: civil::DateTime,
+    mut f: impl FnMut(civil::DateTime) -> bool,
 ) {
     let interval_ns = (secs * 1_000_000_000.0) as i64;
     if interval_ns <= 0 {
         return;
     }
-    let step = chrono::Duration::nanoseconds(interval_ns);
+    let step = SignedDuration::from_nanos(interval_ns);
     let mut current = *start;
     while current < end_dt {
         if !f(current) {
             break;
         }
-        current = match current.checked_add_signed(step) {
-            Some(c) => c,
-            None => break,
+        current = match current.checked_add(step) {
+            Ok(c) => c,
+            Err(_) => break,
         };
     }
 }
@@ -1358,18 +1351,16 @@ pub(crate) fn for_each_interval_tick(
 /// Walk cron occurrences in `[start, end)` lazily; `f` returns false to stop.
 pub(crate) fn for_each_cron_tick(
     cron_expr: &str,
-    start: &NaiveDateTime,
-    end_dt: NaiveDateTime,
-    mut f: impl FnMut(NaiveDateTime) -> bool,
+    start: &civil::DateTime,
+    end_dt: civil::DateTime,
+    mut f: impl FnMut(civil::DateTime) -> bool,
 ) -> PyResult<()> {
     let cron = parse_cron(cron_expr)?;
-    let start_utc = Utc.from_utc_datetime(start);
-    for tick in cron.iter_from(start_utc, croner::Direction::Forward) {
-        let naive = tick.naive_utc();
-        if naive >= end_dt {
+    for tick in cron.iter_from(*start, croner::Direction::Forward) {
+        if tick >= end_dt {
             break;
         }
-        if !f(naive) {
+        if !f(tick) {
             break;
         }
     }
@@ -1377,14 +1368,13 @@ pub(crate) fn for_each_cron_tick(
 }
 
 /// Whether `t` falls exactly on the cron grid (cron is second-granular).
-pub(crate) fn cron_grid_contains(cron_expr: &str, t: NaiveDateTime) -> PyResult<bool> {
-    use chrono::Timelike;
-    if t.nanosecond() != 0 {
+pub(crate) fn cron_grid_contains(cron_expr: &str, t: civil::DateTime) -> PyResult<bool> {
+    if t.subsec_nanosecond() != 0 {
         return Ok(false);
     }
     let probe_end = t
-        .checked_add_signed(chrono::Duration::seconds(1))
-        .unwrap_or(NaiveDateTime::MAX);
+        .checked_add(SignedDuration::from_secs(1))
+        .unwrap_or(civil::DateTime::MAX);
     let mut hit = false;
     for_each_cron_tick(cron_expr, &t, probe_end, |tick| {
         hit = tick == t;

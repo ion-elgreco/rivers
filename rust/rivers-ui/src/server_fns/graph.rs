@@ -7,6 +7,7 @@
 //! serves a fixed in-memory graph for every CL.
 
 use leptos::prelude::*;
+use leptos::server_fn::codec::Json;
 
 #[allow(unused_imports)]
 use crate::components::dag::layout::{LayoutResult, compute_layout};
@@ -44,15 +45,23 @@ async fn load_topology(
     Ok(topo)
 }
 
-#[server]
+/// Layout of what the lineage page shows: the kind and group filters, with
+/// graph assets outside `expanded` collapsed. See [`GraphTopology::visible`].
+#[server(input = Json)]
 pub async fn get_graph_layout(
     loc_ns: String,
     loc_name: String,
-    center_layers: Option<bool>,
+    center_layers: bool,
+    kinds: Vec<String>,
+    groups: Vec<String>,
+    expanded: Vec<String>,
 ) -> Result<LayoutResult, ServerFnError> {
     let core_topo = load_topology(&loc_ns, &loc_name).await?;
     let topo: GraphTopology = core_topo.into();
-    Ok(compute_layout(&topo, center_layers.unwrap_or(false)))
+    Ok(compute_layout(
+        &topo.visible(&kinds, &groups, &expanded),
+        center_layers,
+    ))
 }
 
 #[server]

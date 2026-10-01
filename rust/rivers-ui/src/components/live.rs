@@ -448,7 +448,7 @@ pub fn LiveStatusChip(
         LiveStatus::Live => "Connected — updates stream in real time",
         LiveStatus::Reconnecting => "Reconnecting — browser is retrying",
         LiveStatus::Stale => {
-            "Live updates unavailable — falling back to 5-min poll. Click Refresh to force a pull."
+            "Live updates unavailable — falling back to 5-min poll. Use the refresh button to force a pull."
         }
     };
     let label = move || match status.get() {
@@ -463,11 +463,12 @@ pub fn LiveStatusChip(
                 <span class="live-chip-label">{label}</span>
             </div>
             <button
-                class="btn btn-small live-chip-refresh"
+                class="btn btn-square live-chip-refresh"
                 on:click=move |_| on_refresh.run(())
                 title="Refresh now"
+                aria-label="Refresh"
             >
-                "Refresh"
+                <crate::components::icons::IconRefresh/>
             </button>
         </div>
     }

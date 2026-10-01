@@ -34,4 +34,54 @@ impl DepDef {
     fn __str__(&self) -> String {
         format!("DepDef(name={}, is_input={})", self.name, self.is_input)
     }
+
+    /// A class-form asset defined in a script ships to loky workers by value,
+    /// `deps` included.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, DepDefParts)> {
+        let Self {
+            name,
+            io_handler,
+            partition_mapping,
+            metadata,
+            is_input,
+        } = self;
+        let ctor = py.import("rivers._core")?.getattr("_reconstruct_dep_def")?;
+        Ok((
+            ctor,
+            (
+                name.clone(),
+                io_handler.as_ref().map(|h| h.to_object(py)),
+                partition_mapping.clone(),
+                metadata.clone(),
+                *is_input,
+            ),
+        ))
+    }
+}
+
+/// `DepDef`'s pickled state, in `_reconstruct_dep_def` order.
+type DepDefParts = (
+    String,
+    Option<Py<PyAny>>,
+    Option<PartitionMapping>,
+    Option<HashMap<String, String>>,
+    bool,
+);
+
+/// Rebuild a `DepDef` from `__reduce__`'s parts; it has no constructor.
+#[pyfunction]
+pub fn _reconstruct_dep_def(
+    name: String,
+    io_handler: Option<IOHandler>,
+    partition_mapping: Option<PartitionMapping>,
+    metadata: Option<HashMap<String, String>>,
+    is_input: bool,
+) -> DepDef {
+    DepDef {
+        name,
+        io_handler,
+        partition_mapping,
+        metadata,
+        is_input,
+    }
 }

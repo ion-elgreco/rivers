@@ -10,11 +10,11 @@ use crate::components::loading_skeleton::TableSkeleton;
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::multi_select::{MultiSelect, SelectOption};
 use crate::components::ui_kit::{
-    AttentionBanner, Crumb, KindBadge, RiversSearch, StatusChip, Tag, Topbar,
+    AttentionBanner, EmptyState, KindBadge, RiversSearch, StatusChip, Tag, Topbar,
 };
-use crate::helpers::{format_relative_time, use_query_param, use_query_param_list};
+use crate::helpers::{use_query_param, use_query_param_list};
 use crate::loc::{loc_path, use_current_location};
-use crate::now::use_now;
+use crate::now::RelTimeOpt;
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::graph::get_graph_topology;
 use crate::server_fns::overview::get_assets_info;
@@ -29,18 +29,12 @@ pub fn AssetsListPage() -> impl IntoView {
     let (search_text, set_search_text) = use_query_param("search", "");
     let (sort_by, _) = use_query_param("sort", "name");
     let (sort_asc_str, _) = use_query_param("asc", "true");
-    let (dimension, set_dimension) = use_query_param("dim", "materialized");
     let sort_asc = Signal::derive(move || sort_asc_str.get() != "false");
     let (selected, set_selected) = signal(Vec::<String>::new());
     let show_dialog = RwSignal::new(false);
+    let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
+    let dialog_destructive = RwSignal::new(false);
     let (attention_collapsed, set_attention_collapsed) = signal(true);
-    // Wrap the setter in a Callback so it's Copy and can be freely captured by
-    // the rendering closures.
-    let (dim_menu_open, set_dim_menu_open) = signal(false);
-    let set_dim_cb: Callback<String> = Callback::new({
-        let set_dim = set_dimension.clone();
-        move |v: String| set_dim(v)
-    });
 
     let loc = use_current_location();
     // Single unfiltered fetch — all filtering happens client-side.
@@ -48,6 +42,8 @@ pub fn AssetsListPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
+    // The materialize dialog's row decoration, from this page's live resource.
+    let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
     let assets_info = Resource::new(
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
@@ -271,19 +267,48 @@ pub fn AssetsListPage() -> impl IntoView {
 
     let selected_signal = Signal::derive(move || selected.get());
 
+    // The selection controls live outside the table's <Transition>.
+    let assets_info_value = crate::helpers::resource_value(assets_info);
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let materialize_picker = Signal::derive(move || {
-        let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
+        let infos = assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
             .collect();
         crate::helpers::partition_picker_for_assets(&selected.get(), &by_key)
     });
+    // Verbs every selected asset declares — the selection submits as one
+    // action run, so anything less than the full intersection can fail.
+    let selection_verbs = Signal::derive(move || {
+        let infos = assets_info_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
+            .into_iter()
+            .map(|i| (i.asset_key.clone(), i))
+            .collect();
+        crate::helpers::common_actions(&selected.get(), &by_key)
+    });
 
-    let select_all = move |_| {
-        let records = sorted_filtered();
-        set_selected.set(records.iter().map(|r| r.asset_key.clone()).collect());
-    };
+    // A click handler can't read the resources, so an effect keeps the
+    // filtered keys in a signal for it.
+    let visible_keys = RwSignal::new(Vec::<String>::new());
+    Effect::new(move |_| {
+        visible_keys.set(
+            sorted_filtered()
+                .iter()
+                .map(|r| r.asset_key.clone())
+                .collect(),
+        );
+    });
+    let select_all = move |_| set_selected.set(visible_keys.get_untracked());
 
     let select_none = move |_| {
         set_selected.set(Vec::new());
@@ -313,44 +338,64 @@ pub fn AssetsListPage() -> impl IntoView {
     });
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Assets")]>
-            <LiveStatusChip
-                status=live_status
-                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
-            />
-        </Topbar>
-
-        <div class="page-header-row" style="align-items: flex-end">
-            <div class="page-header">
-                <h1>"Assets"</h1>
-                // Wrap resource read in Transition so hydration waits for the async fetch.
+        <Topbar
+            title="Assets"
+            subtitle=move || view! {
+                // Transition so hydration waits for the async fetch.
                 <Transition>
                     {move || {
                         let (total, groups, stale, missing) = header_counts.get();
                         view! {
-                            <p>
-                                <span class="page-header-num">{total.to_string()}</span>
-                                " assets"
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num">{groups.to_string()}</span>
-                                " groups"
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num page-header-num--warning">{stale.to_string()}</span>
-                                " stale"
-                                <span class="page-header-sep">"·"</span>
-                                <span class="page-header-num">{missing.to_string()}</span>
-                                " missing"
-                            </p>
+                            <span class="page-header-num">{total.to_string()}</span>
+                            {if total == 1 { " asset" } else { " assets" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{groups.to_string()}</span>
+                            {if groups == 1 { " group" } else { " groups" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num page-header-num--warning">{stale.to_string()}</span>
+                            " stale"
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{missing.to_string()}</span>
+                            " missing"
                         }
                     }}
                 </Transition>
-            </div>
+            }
+        >
+            <LiveStatusChip
+                status=live_status
+                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+            />
             <Show when=move || !selected.get().is_empty()>
-                <button class="btn btn-primary" on:click=move |_| show_dialog.set(true)>
-                    {move || format!("Materialize ({})", selected.get().len())}
+                {move || crate::helpers::sorted_verbs(selection_verbs.get()).into_iter().map(|act| {
+                    let destructive = act.is_destructive();
+                    let label = format!("{}…", crate::helpers::verb_label(&act.name));
+                    let title = crate::helpers::action_title(&act, true);
+                    view! {
+                        <button
+                            class=if destructive { "btn btn-danger" } else { "btn" }
+                            title=title
+                            on:click=move |_| {
+                                dialog_verb.set(Some(act.clone()));
+                                dialog_destructive.set(destructive);
+                                show_dialog.set(true);
+                            }
+                        >{label}</button>
+                    }
+                }).collect::<Vec<_>>()}
+                <button class="btn btn-primary" on:click=move |_| {
+                    dialog_verb.set(None);
+                    dialog_destructive.set(false);
+                    show_dialog.set(true);
+                }>
+                    <crate::components::icons::IconPlay/>
+                    {move || format!(
+                        "Materialize {}…",
+                        crate::helpers::plural(selected.get().len() as u64, "asset", "assets"),
+                    )}
                 </button>
             </Show>
-        </div>
+        </Topbar>
 
         <div class="rv-toolbar">
             <RiversSearch
@@ -392,12 +437,12 @@ pub fn AssetsListPage() -> impl IntoView {
                     let rg = reset_groups.clone();
                     let rs = reset_search.clone();
                     view! {
-                        <button class="btn btn-small" on:click=move |_| {
+                        <button class="link-btn" on:click=move |_| {
                             rt(Vec::new());
                             rk(Vec::new());
                             rg(Vec::new());
                             rs(String::new());
-                        }>"Reset"</button>
+                        }>"Reset filters"</button>
                     }.into_any()
                 } else {
                     view! { <span></span> }.into_any()
@@ -406,26 +451,31 @@ pub fn AssetsListPage() -> impl IntoView {
         </div>
 
         <div class="bulk-actions">
-            <button class="bulk-link-btn" on:click=select_all>
+            <button class="link-btn" on:click=select_all>
                 "Select all "
                 <Transition>
                     {move || format!("({})", sorted_filtered().len())}
                 </Transition>
             </button>
             <span class="bulk-sep">"·"</span>
-            <button class="bulk-link-btn" on:click=select_none>"Clear"</button>
+            <button class="link-btn" on:click=select_none>"Clear"</button>
             <span class="bulk-count">{move || format!("{} selected", selected.get().len())}</span>
         </div>
 
         <Transition fallback=move || view! { <TableSkeleton rows=8 cols=7/> }>
             {move || {
+                if let Some(Err(e)) = all_assets.get() {
+                    return view! {
+                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div>
+                    }.into_any();
+                }
                 let records = sorted_filtered();
                 let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
                 let info_map: std::collections::HashMap<String, _> = infos.into_iter().map(|i| (i.asset_key.clone(), i)).collect();
                 let topo = graph.get().and_then(|r| r.ok());
 
                 if records.is_empty() {
-                    return view! { <div class="empty-state">"No assets found matching filters."</div> }.into_any();
+                    return view! { <EmptyState message="No assets match the filters" hint="Clear a filter to see more"/> }.into_any();
                 }
 
                 let (attention, healthy): (Vec<_>, Vec<_>) = records.into_iter().partition(|r| {
@@ -442,7 +492,6 @@ pub fn AssetsListPage() -> impl IntoView {
                     info_map: &std::collections::HashMap<String, crate::types::AssetDefinitionInfo>,
                     selected: ReadSignal<Vec<String>>,
                     set_selected: WriteSignal<Vec<String>>,
-                    dim: &str,
                     topo: &Option<crate::types::GraphTopology>,
                     loc_ns: &str,
                     loc_name: &str,
@@ -456,53 +505,13 @@ pub fn AssetsListPage() -> impl IntoView {
                     let kinds_str = record.kinds.join(", ");
                     let kinds_for_badge = record.kinds.first().cloned().unwrap_or_else(|| "—".into());
                     let group = record.asset_group.clone().unwrap_or_default();
+                    let group_title = group.clone();
                     let tags_view: Vec<_> = record.tags.iter().take(3).map(|t| view! { <Tag label=t.clone()/> }).collect();
-                    // Snapshot once per row render for the fallback dim_value;
-                    // the live-tick path is the explicit `<RelTime>` cell,
-                    // not this dim_value (which may be replaced by other named
-                    // dimensions).
-                    let now_snapshot = use_now().get();
-                    let last_ts_rel = record.last_timestamp
-                        .map(|t| format_relative_time(t, now_snapshot))
-                        .unwrap_or_else(|| "never".into());
+                    let last_ts = record.last_timestamp;
                     let last_ts_abs = record.last_timestamp
                         .and_then(crate::helpers::nanos_to_datetime)
-                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                        .map(|d| d.strftime("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "—".to_string());
-                    let seed: u32 = record.asset_key.bytes().map(|b| b as u32).sum::<u32>().max(1);
-                    let (dim_value, dim_color) = match dim {
-                        "rows" => {
-                            let rows = (seed as u64 * 1_237) % 9_000_000 + 1_000;
-                            (format!("{rows}"), "var(--text-muted)")
-                        }
-                        "cost" => {
-                            let cents = (seed as u64 * 7) % 4800 + 20;
-                            let dollars = cents as f64 / 100.0;
-                            let c = if dollars > 0.60 { "var(--error)" }
-                                else if dollars > 0.30 { "var(--warning)" }
-                                else { "var(--text-muted)" };
-                            (format!("${dollars:.2}"), c)
-                        }
-                        "freshness" => {
-                            // 0-90 min since last materialization; SLO = 60 min.
-                            let min = (seed % 91) as i64;
-                            if min > 60 {
-                                (format!("breached +{}m", min - 60), "var(--error)")
-                            } else if min > 50 {
-                                (format!("{}m left", 60 - min), "var(--warning)")
-                            } else {
-                                (format!("{}m left", 60 - min), "var(--success)")
-                            }
-                        }
-                        "p95" => {
-                            let s = 2.0 + ((seed % 80) as f64) / 4.0;
-                            let c = if s > 60.0 { "var(--warning)" }
-                                else if s > 15.0 { "var(--text)" }
-                                else { "var(--text-muted)" };
-                            (format!("{s:.1}s"), c)
-                        }
-                        _ => (last_ts_rel.clone(), "var(--text-muted)"),
-                    };
                     let status_kind = crate::helpers::stale_status_kind(&record.stale_status);
                     let rail = match status_kind {
                         "up-to-date" => "grid-row-rail grid-row-rail--success",
@@ -585,29 +594,13 @@ pub fn AssetsListPage() -> impl IntoView {
                             <span class="grid-cell-mono" title=kinds_str.clone()>{key.clone()}</span>
                             <KindBadge kind=kinds_for_badge/>
                             <span class="grid-cell-muted">{if asset_type.is_empty() { "—".into() } else { asset_type }}</span>
-                            <span class="grid-cell-muted">{if group.is_empty() { "—".into() } else { group }}</span>
+                            <span class="grid-cell-muted grid-cell-truncate" title=group_title>{if group.is_empty() { "—".into() } else { group }}</span>
                             <span style="display:flex; gap:4px; flex-wrap:wrap">{tags_view}</span>
-                            <span class="grid-cell-muted" style=format!("color:{dim_color}; font-family:'JetBrains Mono',monospace; font-size:11.5px")>
-                                {dim_value}
-                            </span>
-                            <StatusChip kind=status_kind small=true/>
+                            <span class="grid-cell-muted"><RelTimeOpt ts=last_ts/></span>
+                            <StatusChip kind=status_kind/>
                         </A>
                     }
                 }
-
-                let dim = dimension.get();
-                let dim_options: &[(&str, &str)] = &[
-                    ("materialized", "LAST MATERIALIZED"),
-                    ("rows",         "ROWS WRITTEN"),
-                    ("cost",         "COST / RUN"),
-                    ("freshness",    "FRESHNESS SLO"),
-                    ("p95",          "P95 DURATION"),
-                ];
-                let dim_label = dim_options
-                    .iter()
-                    .find(|(id, _)| *id == dim.as_str())
-                    .map(|(_, l)| *l)
-                    .unwrap_or("LAST MATERIALIZED");
 
                 let collapsed_sig = Signal::derive(move || attention_collapsed.get());
                 let toggle_attention = Callback::new(move |_: ()| {
@@ -630,55 +623,22 @@ pub fn AssetsListPage() -> impl IntoView {
                             <span>"TYPE"</span>
                             <span>"GROUP"</span>
                             <span>"TAGS"</span>
-                            <span class="dim-header-cell">
-                                <button
-                                    class="dim-header-btn"
-                                    on:click=move |ev| {
-                                        ev.stop_propagation();
-                                        set_dim_menu_open.update(|v| *v = !*v);
-                                    }
-                                >
-                                    <span>{dim_label}</span>
-                                    <span class="dim-header-chevron" class:dim-header-chevron--open=move || dim_menu_open.get()>"›"</span>
-                                </button>
-                                <Show when=move || dim_menu_open.get()>
-                                    <div class="dim-menu">
-                                        {dim_options.iter().map(|(id, label)| {
-                                            let id_s = id.to_string();
-                                            let id_for_cls = id_s.clone();
-                                            let cls = move || {
-                                                if dimension.get() == id_for_cls { "dim-menu-item dim-menu-item--active" }
-                                                else { "dim-menu-item" }
-                                            };
-                                            view! {
-                                                <button
-                                                    class=cls
-                                                    on:click=move |ev| {
-                                                        ev.stop_propagation();
-                                                        set_dim_cb.run(id_s.clone());
-                                                        set_dim_menu_open.set(false);
-                                                    }
-                                                >{*label}</button>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
-                                </Show>
-                            </span>
+                            <span>"LAST MATERIALIZED"</span>
                             <span>"STATUS"</span>
                         </div>
                         {(!is_collapsed).then(|| {
                             let (lns, lnm) = loc.get();
-                            attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &dim, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
                         })}
                         {(!is_collapsed && n_attention > 0 && !healthy.is_empty()).then(|| view! {
-                            <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:10px; font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
+                            <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:var(--fs-2xs); font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
                                 <span>{format!("HEALTHY · {}", healthy.len())}</span>
                                 <span style="flex:1; height:1px; background:var(--bg-highest)"></span>
                             </div>
                         })}
                         {{
                             let (lns, lnm) = loc.get();
-                            healthy.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &dim, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            healthy.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
                         }}
                     </div>
                 }.into_any()
@@ -689,6 +649,12 @@ pub fn AssetsListPage() -> impl IntoView {
             show=show_dialog
             asset_keys=selected_signal
             picker=materialize_picker
+            action=dialog_verb
+            destructive=dialog_destructive
+            records=records_by_key
+            records_failed=records_failed
+            definitions=asset_info_by_key
+            resources=launch_resources
         />
     }
 }

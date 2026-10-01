@@ -61,6 +61,7 @@ pub(crate) struct KubernetesBackend {
     /// operator) so step pods get the same `secretKeyRef` without
     /// round-tripping the password value through this process.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
     pub run_cr_name: String,
     pub run_cr_uid: String,
     /// Resolved once via [`rivers_k8s::env::current_code_location_id`]
@@ -131,6 +132,7 @@ impl KubernetesBackend {
     ) -> Self {
         let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
         let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
+        let otel_pod_cfg = rivers_k8s::env::OtelPodConfig::from_env();
         let run_cr_name = std::env::var("RIVERS_RUN_CR_NAME").unwrap_or_default();
         let run_cr_uid = std::env::var("RIVERS_RUN_CR_UID").unwrap_or_default();
         let code_location_id = rivers_k8s::env::current_code_location_id();
@@ -146,6 +148,7 @@ impl KubernetesBackend {
             worker_memory,
             module,
             surreal_pod_cfg,
+            otel_pod_cfg,
             run_cr_name,
             run_cr_uid,
             code_location_id,
@@ -187,6 +190,7 @@ impl KubernetesBackend {
             worker_memory: self.worker_memory.clone(),
             module: self.module.clone(),
             surreal_pod_cfg: self.surreal_pod_cfg.clone(),
+            otel_pod_cfg: self.otel_pod_cfg.clone(),
             run_id: run_id.to_string(),
             run_cr_name: self.run_cr_name.clone(),
             run_cr_uid: self.run_cr_uid.clone(),
@@ -726,7 +730,7 @@ impl ExecutorBackend for KubernetesBackend {
                     step_name: step.name.clone(),
                     event_names: inst.event_names.clone(),
                     mapping_key: inst.mapping_key.clone(),
-                    policy: ctx.retry_policy_for(step).cloned(),
+                    policy: ctx.retry_policy_for(step),
                     compute: ctx.compute_for(step),
                 }
             })

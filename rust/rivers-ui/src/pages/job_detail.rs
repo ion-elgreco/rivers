@@ -5,27 +5,27 @@
 //! `runs` channel bump a `refresh_tick` that refetches the current slice.
 
 use leptos::prelude::*;
-use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::execute_job_dialog::ExecuteJobDialog;
+use crate::components::icons::{IconPlay, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::Pagination;
 use crate::components::ui_kit::{
-    AssetStack, AssetSummaryRow, Crumb, KindBadge, PartitionCell, RecentRunsStrip, StatusChip,
-    StripRun, Topbar,
+    AssetSummaryRow, Crumb, EmptyState, KindBadge, RecentRunsStrip, RunsGrid, SectionHeader,
+    SplitButton, StatusChip, StripRun, Topbar,
 };
 use crate::helpers::{
-    JobPartitionPicker, format_duration, format_timestamp, partition_picker_for_assets,
-    run_status_class, run_status_kind, short_id,
+    JobPartitionPicker, job_partition_picker, job_verb, replay_click, run_status_kind,
+    use_confirm_armed,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::actions::execute_job;
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::get_jobs;
+use crate::server_fns::mutations::execute_job;
 use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_runs_page;
-use crate::types::{AssetDefinitionInfo, RunFilter};
+use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunFilter};
 
 #[component]
 pub fn JobDetailPage() -> impl IntoView {
@@ -59,6 +59,21 @@ pub fn JobDetailPage() -> impl IntoView {
         },
     );
 
+    // Tiles and the strip always describe the newest runs, whatever history page is open.
+    let latest_runs = Resource::new(
+        move || {
+            params.track();
+            (name(), refresh_tick.get())
+        },
+        |(job_name, _tick)| async move {
+            let filter = RunFilter {
+                job_name: Some(job_name),
+                ..Default::default()
+            };
+            get_runs_page(0, 20, filter).await
+        },
+    );
+
     let all_assets = Resource::new(
         move || loc.get(),
         |(ns, name)| get_assets(ns, name, None, None, None),
@@ -78,45 +93,106 @@ pub fn JobDetailPage() -> impl IntoView {
     let (exec_pending, set_exec_pending) = signal(false);
     let (exec_error, set_exec_error) = signal::<Option<String>>(None);
     let show_dialog = RwSignal::new(false);
+    let launch_resources =
+        crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let navigate = leptos_router::hooks::use_navigate();
 
+    // The job, resolved against its assets' declarations: the verb it runs
+    // (if any) and the partition picker that verb allows. `None` until the
+    // job's definition has loaded: with no verb to show, Execute waits.
+    let jobs_value = crate::helpers::resource_value(jobs);
+    let assets_info_value = crate::helpers::resource_value(assets_info);
+    // The dialog's config editor reads the job's assets and their schemas.
+    let job_assets = Signal::derive(move || {
+        let current = name();
+        jobs_value
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|j| j.name == current)
+            .map(|j| j.asset_selection)
+            .unwrap_or_default()
+    });
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
+    let job_launch = Memo::new(
+        move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
+            let current = name();
+            let Some(Ok(jobs_list)) = jobs_value.get() else {
+                return None;
+            };
+            let job = jobs_list.into_iter().find(|j| j.name == current)?;
+            let infos = assets_info_value
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
+                .into_iter()
+                .map(|i| (i.asset_key.clone(), i))
+                .collect();
+            let verb = job_verb(job.action.as_deref(), &job.asset_selection, &by_key);
+            let picker = job_partition_picker(verb.as_ref(), &job.asset_selection, &by_key);
+            Some((verb, picker))
+        },
+    );
     // `JobPartitionPicker::None` means there's nothing for the dialog to
     // show — skip it and submit directly.
-    let job_picker = Signal::derive(move || -> JobPartitionPicker {
-        let current = name();
-        let Some(Ok(jobs_list)) = jobs.get() else {
-            return JobPartitionPicker::None;
-        };
-        let Some(job) = jobs_list.into_iter().find(|j| j.name == current) else {
-            return JobPartitionPicker::None;
-        };
-        let Some(Ok(infos)) = assets_info.get() else {
-            return JobPartitionPicker::None;
-        };
-        let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        partition_picker_for_assets(&job.asset_selection, &by_key)
+    let job_picker = Signal::derive(move || {
+        job_launch
+            .get()
+            .map_or(JobPartitionPicker::None, |(_, picker)| picker)
     });
+    let job_verb_signal = Signal::derive(move || job_launch.get().and_then(|(verb, _)| verb));
+    // The dialog picks partitions and edits config; a job needing neither
+    // runs on the click.
+    let job_opens_dialog = Signal::derive(move || {
+        !matches!(job_picker.get(), JobPartitionPicker::None)
+            || asset_info_by_key.with(|defs| {
+                crate::components::config_editor::launch_takes_config(
+                    &job_assets.get(),
+                    defs,
+                    job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
+                )
+            })
+    });
+    let job_loaded = Signal::derive(move || job_launch.get().is_some());
+    let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
+    let execute_variant = Signal::derive(move || {
+        if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
+            "btn-danger"
+        } else {
+            "btn-primary"
+        }
+    });
 
     let on_execute = move |_| {
-        if !matches!(job_picker.get(), JobPartitionPicker::None) {
+        let Some((verb, _)) = job_launch.get() else {
+            return;
+        };
+        if job_opens_dialog.get() {
             set_exec_error.set(None);
             show_dialog.set(true);
             return;
         }
+        // A destructive verb takes a second click, as on the run page.
+        let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
+        let (dispatch, now_armed) = replay_click(destructive, exec_armed.get());
+        exec_armed.set(now_armed);
+        if !dispatch {
+            return;
+        }
         let job_name = name();
+        let shown = verb.map(|v| v.name);
         let navigate = navigate.clone();
-        let (ns, lname) = loc.get();
+        let (ns, lname) = loc.get_untracked();
         set_exec_pending.set(true);
         set_exec_error.set(None);
         leptos::task::spawn_local(async move {
             let path_ns = ns.clone();
             let path_name = lname.clone();
-            match execute_job(ns, lname, job_name, None).await {
+            match execute_job(ns, lname, job_name, shown, None, false, None).await {
                 Ok(result) if !result.run_id.is_empty() => {
                     let path = loc_path(&path_ns, &path_name, &format!("runs/{}", result.run_id));
                     navigate(&path, Default::default());
@@ -126,7 +202,7 @@ pub fn JobDetailPage() -> impl IntoView {
                     set_exec_pending.set(false);
                 }
                 Err(e) => {
-                    set_exec_error.set(Some(format!("{e}")));
+                    set_exec_error.set(Some(crate::helpers::err_text(&e)));
                     set_exec_pending.set(false);
                 }
             }
@@ -143,7 +219,7 @@ pub fn JobDetailPage() -> impl IntoView {
         }
     });
 
-    let (ns_t, name_t) = loc.get();
+    let (ns_t, name_t) = loc.get_untracked();
     let jobs_href = loc_path(&ns_t, &name_t, "jobs");
     view! {
         <Topbar crumbs=vec![
@@ -154,36 +230,77 @@ pub fn JobDetailPage() -> impl IntoView {
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
-            <button
-                class="btn btn-primary"
-                on:click=on_execute
-                disabled=move || exec_pending.get()
-            >
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                    <path d="M3 2l7 4-7 4V2z"/>
-                </svg>
-                {move || if exec_pending.get() { "Executing..." } else { "Execute" }}
-            </button>
-            {move || exec_error.get().map(|msg| view! {
-                <span class="text-error" style="margin-left: 0.5rem">{msg}</span>
-            })}
+            {move || exec_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
+            // A job that runs on the click offers the dialog from its menu,
+            // for the launch document (metadata, resources, executor).
+            {move || {
+                let on_execute = on_execute.clone();
+                let execute = view! {
+                    <button
+                        class=move || format!("btn {}", execute_variant.get())
+                        on:click=on_execute
+                        disabled=move || exec_pending.get() || !job_loaded.get()
+                    >
+                        {move || if job_verb_signal.get().is_some_and(|v| v.is_destructive()) {
+                            view! { <IconTrash/> }.into_any()
+                        } else {
+                            view! { <IconPlay/> }.into_any()
+                        }}
+                        {move || if exec_pending.get() {
+                            "Executing…".to_string()
+                        } else if exec_armed.get() {
+                            format!(
+                                "Confirm {}?",
+                                job_verb_signal.get().map(|v| v.name).unwrap_or_default()
+                            )
+                        } else if job_opens_dialog.get() {
+                            "Execute…".to_string()
+                        } else {
+                            "Execute".to_string()
+                        }}
+                    </button>
+                };
+                if job_loaded.get() && !job_opens_dialog.get() {
+                    view! {
+                        <SplitButton
+                            variant=execute_variant
+                            disabled=Signal::derive(move || exec_pending.get())
+                            menu_label="Execute with config…"
+                            on_menu=Callback::new(move |()| {
+                                exec_armed.set(false);
+                                set_exec_error.set(None);
+                                show_dialog.set(true);
+                            })
+                        >
+                            {execute}
+                        </SplitButton>
+                    }
+                    .into_any()
+                } else {
+                    execute.into_any()
+                }
+            }}
         </Topbar>
 
         <ExecuteJobDialog
             show=show_dialog
             job_name=dialog_job_name
             picker=job_picker
+            verb=job_verb_signal
+            assets=job_assets
+            definitions=asset_info_by_key
+            resources=launch_resources
         />
 
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let current_name = name();
-                let run_records = runs_page_res
+                let latest = latest_runs
                     .get()
                     .and_then(|r| r.ok())
                     .map(|p| p.rows)
                     .unwrap_or_default();
-                let last_run = run_records.first().cloned();
+                let last_run = latest.first().cloned();
                 let last_run_ts: Option<i64> = last_run.as_ref().map(|r| r.start_time);
                 let last_run_status = last_run.as_ref()
                     .map(|r| run_status_kind(&r.status).to_string());
@@ -200,18 +317,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             };
                             let executor_type = job.executor_type.clone();
 
-                            let strip: Vec<StripRun> = run_records.iter().rev().take(20).rev().map(|r| {
-                                let status = match r.status {
-                                    crate::types::RunStatus::Success => "ok",
-                                    crate::types::RunStatus::Failure => "err",
-                                    crate::types::RunStatus::Started | crate::types::RunStatus::NotStarted | crate::types::RunStatus::Queued => "retry",
-                                    _ => "err",
-                                };
-                                let live = matches!(r.status, crate::types::RunStatus::Started);
-                                let dur = r.end_time.map(|e| (e - r.start_time).max(1) as f64 / 1e9).unwrap_or(5.0);
-                                let id = short_id(&r.run_id, 8);
-                                StripRun { id, status, duration_s: dur, live }
-                            }).collect();
+                            let strip = StripRun::from_runs(&latest, 20);
 
                             let asset_records = all_assets.get().and_then(|r| r.ok()).unwrap_or_default();
 
@@ -221,14 +327,21 @@ pub fn JobDetailPage() -> impl IntoView {
                                         <div class="meta-tile-label">"STATUS"</div>
                                         <div class="meta-tile-value">
                                             {match last_run_status {
-                                                Some(s) => view! { <StatusChip kind=s small=true/> }.into_any(),
+                                                Some(s) => view! { <StatusChip kind=s/> }.into_any(),
                                                 None => view! { <span>"—"</span> }.into_any(),
                                             }}
                                         </div>
                                     </div>
                                     <div class="meta-tile">
-                                        <div class="meta-tile-label">"EXECUTOR"</div>
-                                        <div class="meta-tile-value"><KindBadge kind=executor_type/></div>
+                                        <div class="meta-tile-label">{if job.action.is_some() { "ACTION" } else { "EXECUTOR" }}</div>
+                                        <div class="meta-tile-value">
+                                            // Action steps run in the run's own process whatever
+                                            // the executor, so the verb is the useful fact here.
+                                            {match job.action.clone() {
+                                                Some(verb) => view! { <span class="grid-cell-mono">{verb}</span> }.into_any(),
+                                                None => view! { <KindBadge kind=crate::helpers::executor_label(&executor_type)/> }.into_any(),
+                                            }}
+                                        </div>
                                     </div>
                                     <div class="meta-tile">
                                         <div class="meta-tile-label">"ASSETS"</div>
@@ -243,16 +356,12 @@ pub fn JobDetailPage() -> impl IntoView {
                                 </div>
 
                                 <div style="margin-top:20px">
-                                    <RecentRunsStrip runs=strip label="RECENT RUNS · LAST 20".to_string()/>
+                                    <RecentRunsStrip runs=strip label="RUN DURATIONS · LAST 20".to_string()/>
                                 </div>
 
-                                <div class="section-header-row" style="margin-top:24px">
-                                    <span class="section-header-label">
-                                        {format!("ASSET SELECTION · {}", asset_count)}
-                                    </span>
-                                </div>
+                                <SectionHeader label="ASSET SELECTION" count=asset_count.to_string()/>
                                 {if assets.is_empty() {
-                                    view! { <div class="empty-state">"This job has no asset selection."</div> }.into_any()
+                                    view! { <EmptyState message="Selects all assets" compact=true/> }.into_any()
                                 } else {
                                     view! {
                                         <div class="asset-summary-list">
@@ -265,71 +374,27 @@ pub fn JobDetailPage() -> impl IntoView {
                                 }}
                             }.into_any()
                         } else {
-                            view! { <div class="error-msg">"Job not found."</div> }.into_any()
+                            view! { <div class="error-msg">"Job not found"</div> }.into_any()
                         }
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load job: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
-        <Transition fallback=move || view! { <div class="loading" style="margin-top:24px">"Loading runs..."</div> }>
+        <Transition fallback=move || view! { <div class="loading" style="margin-top:24px">"Loading runs…"</div> }>
             {move || {
                 runs_page_res.get().map(|result| match result {
                     Ok(page_data) => {
                         let run_count = page_data.total;
                         let rows = page_data.rows;
                         view! {
-                            <div class="section-header-row" style="margin-top:28px">
-                                <span class="section-header-label">{format!("RUN HISTORY · {run_count}")}</span>
-                            </div>
+                            <SectionHeader label="RUN HISTORY" count=run_count.to_string()/>
                             {if rows.is_empty() {
-                                view! { <div class="empty-state">"No runs for this job."</div> }.into_any()
+                                view! { <EmptyState message="No runs yet" compact=true/> }.into_any()
                             } else {
-                                const GRID: &str = "grid-template-columns: 88px 0.7fr 1.5fr 0.6fr 0.9fr 0.7fr";
                                 view! {
-                                    <div class="grid-table">
-                                        <div class="grid-table-head" style=GRID>
-                                            <span>"RUN"</span>
-                                            <span>"STATUS"</span>
-                                            <span>"ASSETS"</span>
-                                            <span>"PARTITION"</span>
-                                            <span>"STARTED"</span>
-                                            <span>"DURATION"</span>
-                                        </div>
-                                        {rows.into_iter().map(|r| {
-                                            let run_id = r.run_id.clone();
-                                            let (ns, lname) = loc.get();
-                                            let href = loc_path(&ns, &lname, &format!("runs/{}", run_id));
-                                            let sid = short_id(&run_id, 8);
-                                            let st_class = run_status_class(&r.status);
-                                            let st_kind = run_status_kind(&r.status);
-                                            let start_ts = r.start_time;
-                                            let created_abs = format_timestamp(Some(r.start_time));
-                                            let duration = format_duration(Some(r.start_time), r.end_time);
-                                            let partition_val: Option<String> = r.tags.iter()
-                                                .find(|(k, _)| k == "partition" || k == "partition_key")
-                                                .map(|(_, v)| v.clone());
-                                            let asset_names = r.node_names.clone();
-                                            let rail_cls = format!("grid-row-rail grid-row-rail--{}", st_class);
-                                            let part_scheme = partition_val.as_deref()
-                                                .map(crate::components::ui_kit::partition_scheme_for)
-                                                .unwrap_or("·");
-                                            view! {
-                                                <A href=href attr:class="grid-row" attr:style=GRID attr:title=created_abs>
-                                                    <span class=rail_cls></span>
-                                                    <span class="grid-cell-mono">{sid}</span>
-                                                    <StatusChip kind=st_kind small=true/>
-                                                    <AssetStack assets=asset_names/>
-                                                    {partition_val
-                                                        .map(|p| view! { <PartitionCell scheme=part_scheme count_label=p/> }.into_any())
-                                                        .unwrap_or_else(|| view! { <span class="grid-cell-muted">"—"</span> }.into_any())}
-                                                    <span class="grid-cell-muted"><crate::now::RelTime ts=start_ts/></span>
-                                                    <span class="grid-cell-muted">{duration}</span>
-                                                </A>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
+                                    <RunsGrid rows=rows show_assets=true/>
                                     <Pagination
                                         total=run_count
                                         page=page
@@ -341,7 +406,7 @@ pub fn JobDetailPage() -> impl IntoView {
                             }}
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load runs: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>

@@ -51,7 +51,14 @@ macro_rules! register_submodule {
     ($parent:expr, $mod_name:expr, [$($type:ty as $py_name:expr),* $(,)?]) => {
         register_submodule!($parent, $mod_name, [$($type as $py_name),*], [])
     };
-    ($parent:expr, $mod_name:expr, [$($type:ty as $py_name:expr),* $(,)?], [$($child_type:ty),* $(,)?]) => {{
+    ($parent:expr, $mod_name:expr, [$($type:ty as $py_name:expr),* $(,)?], [$($child_type:ty),* $(,)?]) => {
+        register_submodule!($parent, $mod_name, [$($type as $py_name),*], [$($child_type),*], fns [])
+    };
+    // Classes plus module-level functions (kept on the child module only).
+    ($parent:expr, $mod_name:expr, [$($type:ty as $py_name:expr),* $(,)?], fns [$($f:path),* $(,)?]) => {
+        register_submodule!($parent, $mod_name, [$($type as $py_name),*], [], fns [$($f),*])
+    };
+    ($parent:expr, $mod_name:expr, [$($type:ty as $py_name:expr),* $(,)?], [$($child_type:ty),* $(,)?], fns [$($f:path),* $(,)?]) => {{
         let py = $parent.py();
         let child = pyo3::types::PyModule::new(py, $mod_name)?;
         $(
@@ -59,6 +66,9 @@ macro_rules! register_submodule {
         )*
         $(
             child.add_class::<$child_type>()?;
+        )*
+        $(
+            child.add_function(pyo3::wrap_pyfunction!($f, &child)?)?;
         )*
         $parent.add_submodule(&child)?;
         $(

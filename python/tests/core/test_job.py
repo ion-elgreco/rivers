@@ -524,3 +524,81 @@ def test_job_executes_only_its_assets():
     repo.get_job("job_b").execute()
     assert repo.load_node("shared_source") == 10
     assert repo.load_node("pipeline_b") == 12
+
+
+class _Label(rs.Resource):
+    text: str
+
+
+@pytest.mark.parametrize(
+    "executors", [("in_process", "parallel"), ("parallel", "in_process")]
+)
+def test_repositories_sharing_a_job_run_it_with_their_own_state(tmp_path, executors):
+    """Two repositories built from the same Job and assets each run the job
+    with their own IO handler, resources, default executor and
+    ``retry="standard"`` policy, also after the other one resolved; the Job
+    object keeps only its declaration."""
+    import os
+
+    import obstore.store
+    from rivers.testing import memory_storage
+
+    main_pid = os.getpid()
+
+    @rs.Asset(io_handler="store")
+    def labeled(label: _Label) -> str:
+        return f"{label.text}/{'main' if os.getpid() == main_pid else 'worker'}"
+
+    @rs.Asset(io_handler="store")
+    def broken() -> int:
+        raise ValueError("always")
+
+    job = rs.Job(name="nightly", assets=[labeled, broken], retry="standard")
+
+    def repository(name: str, kind: str, max_retries: int):
+        repo = rs.CodeRepository(
+            assets=[labeled, broken],
+            jobs=[job],
+            default_executor=(
+                rs.Executor.in_process()
+                if kind == "in_process"
+                else rs.Executor.parallel(max_workers=2)
+            ),
+            resources={
+                "label": _Label(text=name),
+                "store": rs.PickleIOHandler(
+                    store=obstore.store.LocalStore(str(tmp_path / name), mkdir=True)
+                ),
+            },
+            retries={"standard": rs.RetryPolicy(max_retries=max_retries)},
+        )
+        storage = memory_storage()
+        repo.resolve(storage=storage)
+        return repo, storage
+
+    def run(repo: rs.CodeRepository, storage: rs.Storage) -> tuple[str, int]:
+        assert not repo.get_job("nightly").execute(raise_on_error=False).success
+        events = [e.event_type for e in storage.get_events_for_asset("broken")]
+        return repo.load_node("labeled"), events.count("StepRetry")
+
+    def stored_files() -> dict[str, list[str]]:
+        return {
+            d.name: sorted(p.name for p in d.rglob("*") if p.is_file())
+            for d in sorted(tmp_path.iterdir())
+        }
+
+    where = {"in_process": "main", "parallel": "worker"}
+    first = repository("first", executors[0], max_retries=1)
+    second = repository("second", executors[1], max_retries=3)
+
+    assert run(*first) == (f"first/{where[executors[0]]}", 1)
+    assert run(*second) == (f"second/{where[executors[1]]}", 3)
+
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            path.unlink()
+    assert run(*first) == (f"first/{where[executors[0]]}", 2)
+    assert stored_files() == {"first": ["labeled.pkl"], "second": []}
+
+    with pytest.raises(ExecutionError, match="not been validated"):
+        job.execute()

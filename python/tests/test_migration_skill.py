@@ -311,7 +311,8 @@ def test_config_reaches_the_asset_through_the_context_generic():
     ) as repo:
         repo.resolve()
         result = repo.materialize(
-            selection=["filtered"], config={"filtered": {"minimum": 7.0}}
+            selection=["filtered"],
+            config={"assets": {"filtered": {"config": {"minimum": 7.0}}}},
         )
 
         assert result.success, result.failed_assets

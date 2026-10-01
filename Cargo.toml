@@ -7,7 +7,7 @@ resolver = "2"
 version = "0.0.0-dev"
 edition = "2024"
 authors = ["Ion Koutsouris <ion@orchestration.rs>"]
-license-file = "LICENSE"
+license = "Apache-2.0"
 repository = "https://github.com/ion-elgreco/rivers"
 description = "Orchestration platform for tasks and assets fully backed by Rust"
 keywords = ["rivers", "orchestrator", "pipelines", "assets", "tasks"]
@@ -22,12 +22,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracin
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+jiff = { version = "0.2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 humantime = "2"
-base64 = "0.22"
+base64 = "0.23"
 regex = "1"
 
 # Async runtime
@@ -70,19 +69,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Domain / misc
 petgraph = "0.8.2"
-croner = "3"
+croner = { version = "4", default-features = false, features = ["jiff"] }
 thiserror = "2"
 once_cell = "1"
-
-# Pin surrealdb to ion-elgreco's fork at the IndexBuilder Arc-cycle fix
-# (https://github.com/ion-elgreco/surrealdb/tree/fix/index-builder-arc-cycle).
-# Without it, every `DEFINE INDEX` permanently leaks the underlying
-# Datastore (RocksDB / SurrealKV handles), which on `Storage.embedded()`
-# tests piles up file descriptors and eventually hangs `Storage.embedded`.
-[patch.crates-io]
-surrealdb = { git = "https://github.com/ion-elgreco/surrealdb.git", rev = "f622ff397b691640f4f0395b8d96e8d4ac3ba1fc" }
-surrealdb-core = { git = "https://github.com/ion-elgreco/surrealdb.git", rev = "f622ff397b691640f4f0395b8d96e8d4ac3ba1fc" }
-surrealdb-types = { git = "https://github.com/ion-elgreco/surrealdb.git", rev = "f622ff397b691640f4f0395b8d96e8d4ac3ba1fc" }
 
 [profile.release]
 lto = true

@@ -1,0 +1,32 @@
+# rivers code location for the Kubernetes benchmark: N no-op assets, sized by
+# BENCH_N_ASSETS, matching what Dagster and Prefect load.
+#
+# `dev/k3d/Dockerfile.code-location` bakes the dev-cluster fixture instead,
+# which carries failing and slow assets and cannot be resized. That is the
+# right image for integration tests and the wrong one for a comparison.
+FROM python:3.10-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+RUN uv venv /app/.venv
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
+
+COPY *.whl /tmp/wheels/
+COPY pyproject.toml /tmp/pyproject.toml
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install /tmp/wheels/*.whl \
+    && cd /tmp && uv pip install --requirement pyproject.toml \
+    && rm -rf /tmp/wheels /tmp/pyproject.toml
+
+COPY bench_pipeline.py /app/bench_pipeline.py
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["rivers"]

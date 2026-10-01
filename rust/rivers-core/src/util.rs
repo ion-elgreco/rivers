@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::NaiveDateTime;
+use jiff::fmt::strtime::BrokenDownTime;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, civil};
 
 /// Wall-clock timestamp in nanoseconds since the Unix epoch.
 pub fn now_ts() -> i64 {
@@ -10,66 +12,50 @@ pub fn now_ts() -> i64 {
         .as_nanos() as i64
 }
 
-/// Parse a partition key against `fmt`. Fully-specified formats (including
-/// timestamp-derived ones like `%s`) go through `parse_from_str`; formats
-/// that omit time fields — date-only, or hourly's `%Y-%m-%dT%H:00` which
-/// carries an hour but no minute — fall back to a `Parsed` pass that
-/// defaults the missing fields to zero instead of dropping them.
-pub fn parse_key_datetime(key: &str, fmt: &str) -> Result<NaiveDateTime, chrono::ParseError> {
-    use chrono::format::{Parsed, StrftimeItems, parse};
-    NaiveDateTime::parse_from_str(key, fmt).or_else(|e| {
-        let mut parsed = Parsed::new();
-        parse(&mut parsed, key, StrftimeItems::new(fmt))?;
-        if parsed.timestamp().is_some() {
-            // The instant came from the timestamp; zero-defaults would
-            // conflict with it — surface the original error instead.
-            return Err(e);
-        }
-        // Coarse fmts (monthly `%Y-%m`, yearly `%Y`) omit calendar fields;
-        // default them to the window start unless week/ordinal info already
-        // pins the date.
-        let has_week_info = parsed.isoweek().is_some()
-            || parsed.week_from_sun().is_some()
-            || parsed.week_from_mon().is_some()
-            || parsed.ordinal().is_some();
-        if parsed.month().is_none() && !has_week_info {
-            parsed.set_month(1)?;
-        }
-        if parsed.day().is_none() && !has_week_info && parsed.weekday().is_none() {
-            parsed.set_day(1)?;
-        }
-        if parsed.hour_div_12().is_none() && parsed.hour_mod_12().is_none() {
-            parsed.set_hour(0)?;
-        }
-        if parsed.minute().is_none() {
-            parsed.set_minute(0)?;
-        }
-        if parsed.second().is_none() {
-            parsed.set_second(0)?;
-        }
-        let date = parsed.to_naive_date()?;
-        let time = parsed.to_naive_time()?;
-        Ok(date.and_time(time))
-    })
+/// Local wall-clock datetime for a nanosecond Unix timestamp.
+pub fn local_datetime(nanos: i64) -> civil::DateTime {
+    Timestamp::from_nanosecond(nanos as i128)
+        .expect("i64 nanoseconds always fall inside jiff's timestamp range")
+        .to_zoned(TimeZone::system())
+        .datetime()
+}
+
+/// Parse a partition key against `fmt`. Formats that pin a whole instant
+/// (`%s`) or a full date go straight through; coarse formats that omit
+/// calendar fields — monthly `%Y-%m`, yearly `%Y` — fall back to a pass that
+/// defaults the missing fields to the window start. Missing time fields need
+/// no such pass: jiff already defaults them to zero, so hourly's
+/// `%Y-%m-%dT%H:00` keeps its hour.
+pub fn parse_key_datetime(key: &str, fmt: &str) -> Result<civil::DateTime, jiff::Error> {
+    let mut tm = BrokenDownTime::parse(fmt, key)?;
+    if let Some(ts) = tm.timestamp() {
+        return Ok(ts.to_zoned(TimeZone::UTC).datetime());
+    }
+    let Err(short) = tm.to_datetime() else {
+        return tm.to_datetime();
+    };
+    // Only reached when the calendar fields are short. A week-date or
+    // day-of-year format resolves on the first try, so the defaults below
+    // can't clobber it.
+    if tm.month().is_none() {
+        tm.set_month(Some(1))?;
+    }
+    if tm.day().is_none() {
+        tm.set_day(Some(1))?;
+    }
+    tm.to_datetime().map_err(|_| short)
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_key_datetime;
-    use chrono::NaiveDate;
-
-    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> chrono::NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, mo, d)
-            .unwrap()
-            .and_hms_opt(h, mi, s)
-            .unwrap()
-    }
+    use jiff::civil::date;
 
     #[test]
     fn date_only_fmt_defaults_to_midnight() {
         assert_eq!(
             parse_key_datetime("2024-01-05", "%Y-%m-%d").unwrap(),
-            dt(2024, 1, 5, 0, 0, 0)
+            date(2024, 1, 5).at(0, 0, 0, 0)
         );
     }
 
@@ -78,7 +64,7 @@ mod tests {
         // `%H:00` carries an hour but no minute — the hour must survive.
         assert_eq!(
             parse_key_datetime("2024-11-03T05:00", "%Y-%m-%dT%H:00").unwrap(),
-            dt(2024, 11, 3, 5, 0, 0)
+            date(2024, 11, 3).at(5, 0, 0, 0)
         );
     }
 
@@ -86,7 +72,7 @@ mod tests {
     fn month_only_fmt_defaults_to_first_day() {
         assert_eq!(
             parse_key_datetime("2024-03", "%Y-%m").unwrap(),
-            dt(2024, 3, 1, 0, 0, 0)
+            date(2024, 3, 1).at(0, 0, 0, 0)
         );
     }
 
@@ -94,7 +80,7 @@ mod tests {
     fn year_only_fmt_defaults_to_january_first() {
         assert_eq!(
             parse_key_datetime("2024", "%Y").unwrap(),
-            dt(2024, 1, 1, 0, 0, 0)
+            date(2024, 1, 1).at(0, 0, 0, 0)
         );
     }
 
@@ -102,7 +88,7 @@ mod tests {
     fn full_datetime_fmt_round_trips() {
         assert_eq!(
             parse_key_datetime("2024-01-05T06:07:08", "%Y-%m-%dT%H:%M:%S").unwrap(),
-            dt(2024, 1, 5, 6, 7, 8)
+            date(2024, 1, 5).at(6, 7, 8, 0)
         );
     }
 
@@ -112,11 +98,11 @@ mod tests {
         // hour/minute fields must not clobber it.
         assert_eq!(
             parse_key_datetime("1704067200", "%s").unwrap(),
-            dt(2024, 1, 1, 0, 0, 0)
+            date(2024, 1, 1).at(0, 0, 0, 0)
         );
         assert_eq!(
             parse_key_datetime("1704110645", "%s").unwrap(),
-            dt(2024, 1, 1, 12, 4, 5)
+            date(2024, 1, 1).at(12, 4, 5, 0)
         );
     }
 

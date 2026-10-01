@@ -3,7 +3,7 @@
 //! 21 variants covering text, numeric, temporal, structured (JSON/table), URL, path,
 //! notebook, and binary (Arrow schema) metadata. `coerce_to_metadata_value()` auto-converts
 //! Python primitives (str, int, float, bool) so users rarely need explicit constructors.
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use jiff::civil;
 use pyo3::exceptions::PyTypeError;
 
 use crate::errors::InvalidMetadataError;
@@ -63,8 +63,8 @@ pub enum MetadataValue {
     List { values: Vec<MetadataValue> },
     /// Date range with start and end datetimes.
     DateRange {
-        start: NaiveDateTime,
-        end: NaiveDateTime,
+        start: civil::DateTime,
+        end: civil::DateTime,
     },
     /// Arrow schema (stored as IPC bytes for serialization).
     Schema { ipc_bytes: Vec<u8> },
@@ -169,7 +169,7 @@ impl MetadataValue {
     }
 
     #[staticmethod]
-    fn date_range(start: NaiveDateTime, end: NaiveDateTime) -> Self {
+    fn date_range(start: civil::DateTime, end: civil::DateTime) -> Self {
         Self::DateRange { start, end }
     }
 
@@ -326,8 +326,8 @@ impl MetadataValue {
     }
 }
 
-fn fmt_naive_datetime(dt: &NaiveDateTime) -> String {
-    let micro = dt.nanosecond() / 1000;
+fn fmt_naive_datetime(dt: &civil::DateTime) -> String {
+    let micro = dt.subsec_nanosecond() / 1000;
     if micro == 0 {
         format!(
             "datetime.datetime({}, {}, {}, {}, {}, {})",

@@ -5,7 +5,7 @@ description: Translate a Dagster or Prefect project to rivers, the Rust-powered 
 
 # Migrate to rivers
 
-Port a Dagster or Prefect project to [rivers](https://ion-elgreco.github.io/rivers/) without inventing API.
+Port a Dagster or Prefect project to [rivers](https://orchestrator.rs/docs/) without inventing API.
 
 rivers is asset-centric like Dagster, so most Dagster concepts map closely — but the spellings differ in ways that look right and fail at import. Prefect maps loosely: its flows are imperative, rivers' graph is declarative, so parts of a Prefect project need design decisions rather than translation.
 
@@ -15,7 +15,7 @@ rivers is asset-centric like Dagster, so most Dagster concepts map closely — b
 
 1. Check `references/rivers-api.md` (in this skill) — signature-exact, generated from the type stubs.
 2. If it isn't there, read the stubs directly: `python/rivers/_core/**/__init__.pyi` in the rivers source, or `python -c "import rivers; help(rivers.X)"`.
-3. Only then, the [docs site](https://ion-elgreco.github.io/rivers/).
+3. Only then, the [docs site](https://orchestrator.rs/docs/).
 
 Guessing costs more than checking: `PartitionsDefinition.static_` (trailing underscore), `MetadataValue.float_`, `daily(start=datetime(...))` (a `datetime`, not a string) are all things a confident guess gets wrong.
 

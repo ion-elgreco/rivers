@@ -40,7 +40,7 @@ pub fn shell() -> impl IntoView {
     // Stamp server-now so `App` uses the same value SSR rendered with, and
     // so the WASM hydrate path can read it back from the body before the
     // first reactive render. See `crate::now` for the full handshake.
-    let server_now = chrono::Utc::now().timestamp();
+    let server_now = jiff::Timestamp::now().as_second();
     provide_context(crate::now::SsrInitialNow(server_now));
     let favicon_href = crate::favicon::data_uri();
     view! {
@@ -65,9 +65,9 @@ pub fn shell() -> impl IntoView {
                         if (!el) return;
                         var text = el.getAttribute('data-copy');
                         navigator.clipboard.writeText(text).then(function() {
-                            var orig = el.textContent;
-                            el.textContent = 'Copied!';
-                            setTimeout(function() { el.textContent = orig; }, 1000);
+                            el.setAttribute('data-copied', '');
+                            clearTimeout(el._copiedTimer);
+                            el._copiedTimer = setTimeout(function() { el.removeAttribute('data-copied'); }, 1000);
                         });
                     });
                 "#}</script>
@@ -94,20 +94,20 @@ fn RootRedirect() -> impl IntoView {
     );
 
     view! {
-        <Suspense fallback=|| view! { <div class="redirect-msg">"Discovering code locations…"</div> }>
+        <Suspense fallback=|| view! { <div class="loading">"Discovering code locations…"</div> }>
             {move || first.get().map(|res| match res {
                 Ok(Some((ns, name))) => {
                     let path = format!("/locations/{ns}/{name}");
                     view! { <Redirect path=path/> }.into_any()
                 }
                 Ok(None) => view! {
-                    <div class="redirect-msg">
+                    <div class="empty-state">
                         "No Ready code location yet. Apply a CodeLocation CR or wait for the operator to reconcile."
                     </div>
                 }.into_any(),
                 Err(e) => view! {
-                    <div class="redirect-msg redirect-msg--error">
-                        {format!("Failed to query code locations: {e}")}
+                    <div class="error-msg">
+                        {format!("Failed to query code locations: {}", crate::helpers::err_text(&e))}
                     </div>
                 }.into_any(),
             })}

@@ -8,9 +8,9 @@ inputs:
     default: "3.13"
 
   rust-toolchain:
-    description: "The Rust toolchain to set up"
+    description: "The Rust toolchain to set up. Empty (the default) installs the version pinned in rust-toolchain.toml."
     required: false
-    default: "stable"
+    default: ""
 
   cache:
     description: "Enable Swatinem rust-cache via setup-rust-toolchain. Release workflows should set this to 'false'"
@@ -81,33 +81,22 @@ runs:
         cache-on-failure: "true"
         rustflags: "-D warnings -C symbol-mangling-version=v0"
 
-    - name: Install protoc
-      shell: bash
-      run: |
-        set -euo pipefail
-        case "$RUNNER_OS" in
-          Linux)
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq protobuf-compiler
-            ;;
-          macOS)
-            brew install protobuf
-            ;;
-          Windows)
-            choco install protoc -y --no-progress
-            ;;
-          *)
-            echo "Unsupported runner OS: $RUNNER_OS" >&2
-            exit 1
-            ;;
-        esac
-
+    # protoc is needed by rivers-api's prost-build. install-action pulls the
+    # official upstream release, so all three runner OSes get the same version
+    # instead of whatever apt/brew/choco happen to ship. protoc keeps a legacy
+    # `3.` prefix here: `3.36.1` is upstream v36.1. Keep the version in sync
+    # with `protobuf` in mise.toml and PROTOC_VERSION in release-python.yaml.
+    #
+    # install-action resolves the version against a manifest baked into the
+    # release we pin, so the pin has to be at least as new as the protoc
+    # release. Too old and it fails with "protoc@<version> is not supported".
+    #
     # wasm-bindgen-cli is used by `just wasm` / `just wasm-dev` (driven directly
     # so we can pass a custom cargo profile — wasm-pack can't)
-    - name: Install wasm-bindgen-cli + wasm-pack
-      uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+    - name: Install protoc + wasm tooling
+      uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
       with:
-        tool: wasm-bindgen-cli@0.2.121,wasm-pack@0.14.0
+        tool: protoc@3.36.1,wasm-bindgen-cli@0.2.121,wasm-pack@0.14.0
 
     # Cross-compile linker (cargo-zigbuild + zig) — only release
     # workflows opt into this.

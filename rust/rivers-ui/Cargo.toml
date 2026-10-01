@@ -2,6 +2,7 @@
 name = "rivers-ui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -21,7 +22,6 @@ ssr = [
     "dep:tonic",
     "dep:clap",
     "dep:anyhow",
-    "dep:croner",
     "dep:cron-descriptor",
     "dep:tracing",
     "dep:tracing-subscriber",
@@ -62,7 +62,6 @@ leptos_meta = { version = "0.8" }
 leptos_router = { version = "0.8" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono.workspace = true
 ansi-to-html = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
@@ -76,7 +75,6 @@ rivers-api = { path = "../rivers-api", optional = true }
 rivers-k8s = { path = "../rivers-k8s", optional = true }
 tonic = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
-croner = { workspace = true, optional = true }
 cron-descriptor = { version = "0.1", optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
@@ -85,7 +83,7 @@ tower-http = { workspace = true, features = ["compression-br", "compression-gzip
 futures-util = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-axum-extra = { version = "0.10", features = ["cookie-private"], optional = true }
+axum-extra = { version = "0.12", features = ["cookie-private"], optional = true }
 # Same cookie version axum-extra re-exports; enables Key::derive_from (HKDF
 # expansion of 32-byte secrets) via feature unification.
 cookie = { version = "0.18", features = ["key-expansion"], optional = true }
@@ -113,23 +111,36 @@ web-sys = { version = "0.3", features = [
     "AbortController",
     "AbortSignal",
     "AddEventListenerOptions",
+    # Lineage canvas: context-menu placement (getBoundingClientRect) and
+    # distinguishing a bare-canvas click from the overlay chrome (classList).
+    "DomRect",
+    "DomTokenList",
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = "0.1"
+jiff.workspace = true
+
+# `js` routes `Timestamp::now()` through `Date.now()`. The browser bundle
+# never resolves IANA names, so the tzdb bundles stay out of the WASM.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jiff = { version = "0.2", default-features = false, features = ["std", "serde", "js"] }
 
 # Brotli quality 11 of the 5 MB WASM bundle takes 2.5 min on a 0.5 vCPU
 # pod and ~2 s per request via `CompressionLayer` — both unacceptable, so
 # `build.rs` precompresses once on the host and `lib.rs` `include_bytes!`s
 # the result.
 [build-dependencies]
-brotli = "8"
+brotli = "9"
 
 # Native (non-wasm) dev-deps. Tokio's `test-util` (for `start_paused = true`
 # + `tokio::time::advance`) and `tokio-stream` are only needed by the
 # channel_loop reconnect / code_location_registry tests; no production
 # impact and they don't compile for wasm32.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# `openidconnect::IdTokenClaims::new` takes chrono instants, so the OIDC
+# flow tests build claims with chrono even though rivers itself is on jiff.
+chrono = "0.4"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
 # `ServiceExt::oneshot` for router-level auth tests.

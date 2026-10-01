@@ -87,6 +87,9 @@ const ICON_POOLS: &str = r#"<rect x="3" y="4" width="18" height="5" rx="1"/><rec
 const ICON_QUEUE: &str = r#"<circle cx="6" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="2" fill="currentColor" stroke="none"/>"#;
 const ICON_DEPLOYMENT: &str = r#"<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="10" x2="20" y2="10"/><circle cx="8" cy="7" r="1"/><circle cx="12" cy="7" r="1"/>"#;
 
+const ICON_SEARCH: &str =
+    r#"<circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>"#;
+
 const ICON_COLLAPSE: &str = r#"<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>"#;
 
 /// Signed-in user: avatar + name opening an account menu (identity header +
@@ -160,6 +163,7 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
 #[component]
 pub fn Shell(children: Children) -> impl IntoView {
     let collapsed = RwSignal::new(false);
+    let search_open = RwSignal::new(false);
     let collapsed_signal = Signal::derive(move || collapsed.get());
 
     // Populated once per Shell mount. Registry state is long-lived on the
@@ -223,15 +227,17 @@ pub fn Shell(children: Children) -> impl IntoView {
                         <span class="sidebar-toggle-icon" class:sidebar-toggle-icon--collapsed=move || collapsed.get() inner_html=ICON_COLLAPSE>
                         </span>
                     </button>
-                    <div class="search-hint" class:nav-label--hidden=move || collapsed.get()>
-                        "Press "<kbd>"Cmd+K"</kbd>" to search"
-                    </div>
+                    <button class="search-hint" title="Search" on:click=move |_| search_open.set(true)>
+                        <span class="nav-icon" inner_html=nav_svg(ICON_SEARCH)></span>
+                        <span class="nav-label" class:nav-label--hidden=move || collapsed.get()>"Search"</span>
+                        <kbd>"Cmd+K"</kbd>
+                    </button>
                 </div>
             </nav>
             <main class="main-content">
                 {children()}
             </main>
-            <GlobalSearch/>
+            <GlobalSearch open=search_open/>
         </div>
     }
 }

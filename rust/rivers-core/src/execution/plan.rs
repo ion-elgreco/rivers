@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::graph::AssetGraph;
+use crate::assets::graph::{AssetGraph, ancestors, descendants};
 use crate::composition::InvocationKind;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,12 +69,47 @@ impl ExecutionStep {
     }
 }
 
+/// Asset order within an action run. Ordering bounds partial failure — it
+/// decides which half-completed states are reachable — it cannot make a
+/// multi-asset action atomic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionOrdering {
+    /// Targets are independent (optimize, merge).
+    #[default]
+    Unordered,
+    /// Upstream targets first.
+    UpstreamFirst,
+    /// Downstream targets first (delete) — an asset exists only while its
+    /// upstream does, the LIFO rule of FK teardown.
+    DownstreamFirst,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionPlan {
     pub steps: Vec<ExecutionStep>,
+    /// The verb every step executes. `None` means materialize — read it
+    /// through [`ExecutionPlan::verb`] / [`ExecutionPlan::is_action`] rather
+    /// than matching the field, so the default reads as a decision. Every
+    /// executor backend must make that decision: a backend that ignores the
+    /// verb silently materializes whatever it was handed.
+    pub action: Option<String>,
 }
 
 impl ExecutionPlan {
+    /// The verb this plan runs, or `None` for materialize.
+    pub fn verb(&self) -> Option<&str> {
+        self.action.as_deref()
+    }
+
+    /// True when this plan runs a named action rather than materializing.
+    pub fn is_action(&self) -> bool {
+        self.action.is_some()
+    }
+
+    /// True when this plan materializes (no named verb).
+    pub fn is_materialize(&self) -> bool {
+        self.action.is_none()
+    }
     /// Build an execution plan from a resolved asset graph (deps before dependents).
     #[tracing::instrument(skip_all, target = "rivers::execution")]
     pub fn from_graph(graph: &AssetGraph) -> Self {
@@ -100,7 +135,70 @@ impl ExecutionPlan {
             })
             .collect();
 
-        Self { steps }
+        Self {
+            steps,
+            action: None,
+        }
+    }
+
+    /// Build a plan that runs `action` once per target, without pulling in
+    /// upstream nodes — an action operates on existing data and never invokes
+    /// the producing function. `ordering` sequences targets that are related
+    /// in the asset graph; unrelated targets stay parallel.
+    #[tracing::instrument(skip_all, target = "rivers::execution", fields(targets = targets.len()))]
+    pub fn for_action(
+        graph: &AssetGraph,
+        action: &str,
+        targets: &[String],
+        ordering: ActionOrdering,
+    ) -> Self {
+        // Collapse duplicates (first occurrence wins): one step per unique
+        // target, or a repeated name runs the verb once per occurrence. The
+        // materialize path dedups by construction in `from_subgraph`.
+        let mut seen = HashSet::new();
+        let targets: Vec<String> = targets
+            .iter()
+            .filter(|t| seen.insert(t.as_str()))
+            .cloned()
+            .collect();
+
+        // One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
+        // reachability probes made DownstreamFirst T·(T−1)² whole-graph
+        // walks: minutes of pure planning at a few hundred targets, re-run per
+        // backfill child under the repository's state read lock.
+        let related_targets = |closure: HashSet<String>| -> Vec<String> {
+            targets
+                .iter()
+                .filter(|t| closure.contains(t.as_str()))
+                .cloned()
+                .collect()
+        };
+
+        let steps = targets
+            .iter()
+            .map(|target| {
+                let plan_dependencies = match ordering {
+                    ActionOrdering::Unordered => Vec::new(),
+                    // Wait for every related target upstream of this one.
+                    ActionOrdering::UpstreamFirst => related_targets(ancestors(graph, target)),
+                    // Wait for every related target this one is upstream of
+                    // (its dependents).
+                    ActionOrdering::DownstreamFirst => related_targets(descendants(graph, target)),
+                };
+                ExecutionStep {
+                    name: target.clone(),
+                    kind: StepKind::Normal,
+                    outputs: Vec::new(),
+                    plan_dependencies,
+                    graph_dependencies: Vec::new(),
+                }
+            })
+            .collect();
+
+        Self {
+            steps,
+            action: Some(action.to_string()),
+        }
     }
 
     /// Build an execution plan from a subset of nodes, grouping multi-asset outputs
@@ -239,7 +337,10 @@ impl ExecutionPlan {
             });
         }
 
-        Self { steps }
+        Self {
+            steps,
+            action: None,
+        }
     }
 
     /// Apply step kinds from a map; steps not in the map remain Normal.
@@ -261,27 +362,69 @@ impl ExecutionPlan {
     }
 
     /// Group steps into levels for parallel execution; level-N steps depend only on 0..N-1.
+    ///
+    /// Each step's level is resolved by descending into its dependencies first,
+    /// so the result does not depend on the order `steps` happens to be in.
+    /// `from_graph`/`from_subgraph` emit topologically; `for_action` emits in
+    /// target order, which the caller derives from a HashMap.
     pub fn group_steps_by_level(&self) -> Vec<Vec<usize>> {
-        let mut levels: Vec<Vec<usize>> = Vec::new();
-        let mut step_levels: HashMap<String, usize> = HashMap::new();
-
+        // Multi-asset outputs resolve to their owning step.
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
         for (idx, step) in self.steps.iter().enumerate() {
-            let level = if step.plan_dependencies.is_empty() {
-                0
-            } else {
-                step.plan_dependencies
-                    .iter()
-                    .map(|dep| step_levels.get(dep).copied().unwrap_or(0) + 1)
-                    .max()
-                    .unwrap_or(0)
-            };
-
-            step_levels.insert(step.name.clone(), level);
-            // Register all outputs at the same level so downstream deps resolve.
+            by_name.insert(step.name.as_str(), idx);
             for output in &step.outputs {
-                step_levels.insert(output.clone(), level);
+                by_name.insert(output.as_str(), idx);
             }
+        }
 
+        // Post-order DFS. A dep that is unknown, self-referential, or a
+        // back-edge counts as level 0, which bounds a malformed plan to
+        // finite work rather than a hang.
+        let mut level_of: Vec<Option<usize>> = vec![None; self.steps.len()];
+        let mut on_stack = vec![false; self.steps.len()];
+        for root in 0..self.steps.len() {
+            if level_of[root].is_some() {
+                continue;
+            }
+            let mut stack = vec![(root, false)];
+            while let Some((idx, settle)) = stack.pop() {
+                if settle {
+                    level_of[idx] = Some(
+                        self.steps[idx]
+                            .plan_dependencies
+                            .iter()
+                            .map(|dep| {
+                                by_name
+                                    .get(dep.as_str())
+                                    .and_then(|&d| level_of[d])
+                                    .unwrap_or(0)
+                                    + 1
+                            })
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    on_stack[idx] = false;
+                    continue;
+                }
+                if level_of[idx].is_some() || on_stack[idx] {
+                    continue;
+                }
+                on_stack[idx] = true;
+                stack.push((idx, true));
+                for dep in &self.steps[idx].plan_dependencies {
+                    if let Some(&d) = by_name.get(dep.as_str())
+                        && level_of[d].is_none()
+                        && !on_stack[d]
+                    {
+                        stack.push((d, false));
+                    }
+                }
+            }
+        }
+
+        let mut levels: Vec<Vec<usize>> = Vec::new();
+        for (idx, level) in level_of.iter().enumerate() {
+            let level = level.unwrap_or(0);
             while levels.len() <= level {
                 levels.push(Vec::new());
             }
@@ -555,6 +698,7 @@ mod tests {
     #[test]
     fn test_all_asset_names_with_multi_output() {
         let plan = ExecutionPlan {
+            action: None,
             steps: vec![
                 ExecutionStep {
                     name: "step_1".to_string(),
@@ -640,6 +784,194 @@ mod tests {
         assert_eq!(level0_names, vec!["a", "b"]);
         assert_eq!(levels[1].len(), 1);
         assert_eq!(plan.steps[levels[1][0]].name, "c");
+    }
+
+    #[test]
+    fn test_for_action_unordered_is_flat() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "optimize",
+            &["a".into(), "b".into(), "c".into()],
+            ActionOrdering::Unordered,
+        );
+
+        assert_eq!(plan.action.as_deref(), Some("optimize"));
+        assert_eq!(plan.steps.len(), 3);
+        for step in &plan.steps {
+            assert!(step.plan_dependencies.is_empty());
+            assert!(step.graph_dependencies.is_empty());
+            assert!(step.outputs.is_empty());
+        }
+        assert_eq!(plan.group_steps_by_level().len(), 1);
+    }
+
+    #[test]
+    fn test_for_action_never_pulls_in_upstream() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"])]);
+        let plan =
+            ExecutionPlan::for_action(&graph, "optimize", &["b".into()], ActionOrdering::Unordered);
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
+    }
+
+    #[test]
+    fn test_for_action_downstream_first_orders_teardown() {
+        // events -> rollups (rollups depends on events); delete must run
+        // rollups before events. Unrelated "other" stays parallel.
+        let graph = make_graph(vec![
+            ("events", vec![]),
+            ("rollups", vec!["events"]),
+            ("other", vec![]),
+        ]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &["events".into(), "rollups".into(), "other".into()],
+            ActionOrdering::DownstreamFirst,
+        );
+
+        let events = plan.steps.iter().find(|s| s.name == "events").unwrap();
+        assert_eq!(events.plan_dependencies, vec!["rollups".to_string()]);
+        let rollups = plan.steps.iter().find(|s| s.name == "rollups").unwrap();
+        assert!(rollups.plan_dependencies.is_empty());
+        let other = plan.steps.iter().find(|s| s.name == "other").unwrap();
+        assert!(other.plan_dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_for_action_upstream_first_orders_buildup() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "compact",
+            &["a".into(), "c".into()],
+            ActionOrdering::UpstreamFirst,
+        );
+
+        let c = plan.steps.iter().find(|s| s.name == "c").unwrap();
+        // b is not a target, but a is transitively upstream of c.
+        assert_eq!(c.plan_dependencies, vec!["a".to_string()]);
+        let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
+        assert!(a.plan_dependencies.is_empty());
+    }
+
+    /// Ordered action planning must stay linear in the graph: it re-runs per
+    /// backfill child, under the repository's state read lock. The old
+    /// T·(T−1)² whole-graph reachability walks took over a minute of pure
+    /// planning at 400 targets.
+    #[test]
+    fn test_for_action_ordering_scales_linearly() {
+        let n = 200;
+        let names: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
+        let defs: Vec<(&str, Vec<&str>)> = (0..n)
+            .map(|i| {
+                let deps = if i == 0 {
+                    vec![]
+                } else {
+                    vec![names[i - 1].as_str()]
+                };
+                (names[i].as_str(), deps)
+            })
+            .collect();
+        let graph = make_graph(defs);
+
+        let start = std::time::Instant::now();
+        let plan =
+            ExecutionPlan::for_action(&graph, "delete", &names, ActionOrdering::DownstreamFirst);
+        let elapsed = start.elapsed();
+
+        assert_eq!(plan.steps.len(), n);
+        // The root of the chain waits on every downstream target.
+        let root = plan.steps.iter().find(|s| s.name == "a0").unwrap();
+        assert_eq!(root.plan_dependencies.len(), n - 1);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "downstream-first planning took {elapsed:?} for {n} chained targets"
+        );
+    }
+
+    /// Duplicate names in an action selection must collapse to one step — a
+    /// destructive verb must not execute once per occurrence. The materialize
+    /// path dedups by construction; this is its action-side counterpart.
+    #[test]
+    fn test_for_action_dedups_duplicate_targets() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &["b".into(), "a".into(), "b".into()],
+            ActionOrdering::DownstreamFirst,
+        );
+
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["b", "a"],
+            "duplicates collapse, first-occurrence order kept"
+        );
+        let a = plan.steps.iter().find(|s| s.name == "a").unwrap();
+        assert_eq!(
+            a.plan_dependencies,
+            vec!["b".to_string()],
+            "ordering still holds on the deduped set"
+        );
+    }
+
+    /// Levels must not depend on the order targets arrive in — the caller
+    /// derives the target list from a HashMap, so every permutation is
+    /// reachable, and a level that puts `a` alongside its downstream `b` is
+    /// exactly the concurrent teardown `DownstreamFirst` exists to prevent.
+    #[test]
+    fn test_for_action_levels_independent_of_target_order() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
+
+        let level_names = |plan: &ExecutionPlan| -> Vec<Vec<String>> {
+            plan.group_steps_by_level()
+                .into_iter()
+                .map(|level| {
+                    let mut names: Vec<String> =
+                        level.iter().map(|&i| plan.steps[i].name.clone()).collect();
+                    names.sort();
+                    names
+                })
+                .collect()
+        };
+
+        for perm in [
+            ["a", "b", "c"],
+            ["a", "c", "b"],
+            ["b", "a", "c"],
+            ["b", "c", "a"],
+            ["c", "a", "b"],
+            ["c", "b", "a"],
+        ] {
+            let targets: Vec<String> = perm.iter().map(|s| s.to_string()).collect();
+
+            let plan = ExecutionPlan::for_action(
+                &graph,
+                "purge",
+                &targets,
+                ActionOrdering::DownstreamFirst,
+            );
+            assert_eq!(
+                level_names(&plan),
+                vec![vec!["c"], vec!["b"], vec!["a"]],
+                "downstream-first levels for targets {perm:?}"
+            );
+
+            let plan = ExecutionPlan::for_action(
+                &graph,
+                "compact",
+                &targets,
+                ActionOrdering::UpstreamFirst,
+            );
+            assert_eq!(
+                level_names(&plan),
+                vec![vec!["a"], vec!["b"], vec!["c"]],
+                "upstream-first levels for targets {perm:?}"
+            );
+        }
     }
 
     #[test]

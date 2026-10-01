@@ -90,15 +90,20 @@ def _cluster_ready() -> bool:
         return False
 
 
-pytestmark = cluster_gate(
-    _cluster_ready(),
-    (
-        f"k3d cluster '{KUBECTL_CONTEXT}' / namespace '{NAMESPACE}' / "
-        f"registry Service '{REGISTRY_SERVICE_NAME}' / baseline CodeLocation "
-        f"'{BASELINE_CODE_LOCATION}' (Ready) not all present — "
-        "run `just k8s-up` first"
+pytestmark = [
+    cluster_gate(
+        _cluster_ready(),
+        (
+            f"k3d cluster '{KUBECTL_CONTEXT}' / namespace '{NAMESPACE}' / "
+            f"registry Service '{REGISTRY_SERVICE_NAME}' / baseline CodeLocation "
+            f"'{BASELINE_CODE_LOCATION}' (Ready) not all present — "
+            "run `just k8s-up` first"
+        ),
     ),
-)
+    # 180s image builds/waits — past the 60s project default, whose thread
+    # method os._exit()s the whole run instead of failing one test.
+    pytest.mark.timeout(600),
+]
 
 
 # ---------------------------------------------------------------------------

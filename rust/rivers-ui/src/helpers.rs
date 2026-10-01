@@ -110,45 +110,23 @@ pub fn use_query_param_list(
     (value, set_value)
 }
 
-/// Read a query parameter as usize, defaulting to `default` if absent.
-pub fn use_query_param_usize(
-    key: &'static str,
-    default: usize,
-) -> (Signal<usize>, impl Fn(usize) + Clone + 'static) {
-    let (raw, set_raw) = use_query_param(key, &default.to_string());
-
-    let value = Signal::derive(move || raw.get().parse::<usize>().unwrap_or(default));
-
-    let set_value = move |n: usize| {
-        set_raw(if n == default {
-            String::new()
-        } else {
-            n.to_string()
-        });
-    };
-
-    (value, set_value)
+/// Convert a nanosecond timestamp to a UTC instant.
+pub fn nanos_to_datetime(ts: i64) -> Option<jiff::Timestamp> {
+    jiff::Timestamp::from_nanosecond(ts as i128).ok()
 }
 
-/// Convert a nanosecond timestamp to a chrono DateTime.
-pub fn nanos_to_datetime(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    let secs = ts / 1_000_000_000;
-    let nanos = (ts % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, nanos)
-}
-
-/// Format an optional nanosecond timestamp as "YYYY-MM-DD HH:MM:SS" or "-".
+/// Format an optional nanosecond timestamp as "YYYY-MM-DD HH:MM:SS" or "—".
 pub fn format_timestamp(ts: Option<i64>) -> String {
     ts.and_then(nanos_to_datetime)
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
-/// Format a nanosecond timestamp (non-optional) as "YYYY-MM-DD HH:MM:SS" or "-".
+/// Format a nanosecond timestamp (non-optional) as "YYYY-MM-DD HH:MM:SS" or "—".
 pub fn format_timestamp_nanos(ts: i64) -> String {
     nanos_to_datetime(ts)
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Format a count of seconds as a compact human-readable duration.
@@ -165,9 +143,10 @@ pub fn format_seconds(secs: i64) -> String {
 /// Format a duration between two optional nanosecond timestamps.
 pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
     match (start, end) {
+        (Some(s), Some(e)) if e - s < 1_000_000_000 => "<1s".to_string(),
         (Some(s), Some(e)) => format_seconds((e - s) / 1_000_000_000),
-        (Some(_), None) => "Running...".to_string(),
-        _ => "-".to_string(),
+        (Some(_), None) => "Running…".to_string(),
+        _ => "—".to_string(),
     }
 }
 
@@ -183,7 +162,7 @@ pub fn format_elapsed(start_ns: Option<i64>, end_ns: Option<i64>, now_secs: i64)
             let end_secs = end_ns.map(|e| e / 1_000_000_000).unwrap_or(now_secs);
             format_seconds((end_secs - start_secs).max(0))
         }
-        None => "-".to_string(),
+        None => "—".to_string(),
     }
 }
 
@@ -265,13 +244,23 @@ pub fn backfill_status_kind(status: &str) -> &'static str {
     }
 }
 
-/// Map a tick status string to a CSS class suffix.
-pub fn tick_status_class(status: &str) -> &'static str {
+/// Colour for a backfill's progress bar and rail, matching its status chip.
+pub fn backfill_status_color(status: &str) -> &'static str {
+    match status {
+        "CompletedFailed" => "var(--error)",
+        "Canceled" => "var(--text-muted)",
+        "InProgress" | "Requested" => "var(--secondary)",
+        _ => "var(--success)",
+    }
+}
+
+/// Status-chip kind for a schedule or sensor tick.
+pub fn tick_status_kind(status: &str) -> &'static str {
     match status {
         "Success" | "Requested" => "success",
-        "Failure" => "failure",
-        "Skipped" => "muted",
-        _ => "muted",
+        "Failure" => "failed",
+        "Skipped" => "skipped",
+        _ => "pending",
     }
 }
 
@@ -279,7 +268,7 @@ pub fn tick_status_class(status: &str) -> &'static str {
 ///
 /// `now` is unix seconds; pass [`crate::now::use_now`]`().get()` from a
 /// reactive scope so the label re-renders on each clock tick. Tests/non-
-/// reactive callers can pass `chrono::Utc::now().timestamp()` directly.
+/// reactive callers can pass `jiff::Timestamp::now().as_second()` directly.
 pub fn format_relative_time(ts: i64, now: i64) -> String {
     let secs = ts / 1_000_000_000;
     let diff = now - secs;
@@ -299,47 +288,58 @@ pub fn format_relative_time(ts: i64, now: i64) -> String {
         return format!("{}d ago", diff / 86400);
     }
     nanos_to_datetime(ts)
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .map(|d| d.strftime("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
-/// Format a function-call-style value like `PerDimension(multi_run=["a"], single_run=["b"])`
-/// into a multi-line display form when it has at least two top-level, comma-separated args.
-/// Single-arg or unparenthesized strings are returned unchanged. Brackets inside arguments
-/// are respected (top-level comma split only).
-pub fn format_call_multiline(s: &str) -> String {
-    let Some(open) = s.find('(') else {
-        return s.to_string();
+/// Badge text for a job executor: "InProcess" → "in-process",
+/// "Parallel(4)" → "parallel · 4".
+pub fn executor_label(raw: &str) -> String {
+    let (name, arg) = match raw.split_once('(') {
+        Some((name, rest)) => (name, rest.strip_suffix(')')),
+        None => (raw, None),
     };
-    if !s.ends_with(')') {
-        return s.to_string();
+    match (name, arg) {
+        ("InProcess", _) => "in-process".to_string(),
+        ("Parallel", Some(n)) => format!("parallel · {n}"),
+        ("Parallel", None) => "parallel".to_string(),
+        ("Kubernetes", _) => "kubernetes".to_string(),
+        _ => raw.to_string(),
     }
-    let prefix = &s[..open];
-    let inner = &s[open + 1..s.len() - 1];
-    let mut parts: Vec<&str> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0usize;
-    for (i, b) in inner.bytes().enumerate() {
-        match b {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&inner[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
+}
+
+/// "TimeWindow" → "time window", "Multi" → "multi".
+pub fn partition_kind_label(kind: &str) -> String {
+    match kind {
+        "TimeWindow" => "time window".to_string(),
+        other => other.to_ascii_lowercase(),
     }
-    parts.push(&inner[start..]);
-    if parts.len() < 2 {
-        return s.to_string();
+}
+
+/// Button text for an action verb: "optimize" → "Optimize",
+/// "rebuild_index" → "Rebuild index". Tooltips keep the declared name.
+pub fn verb_label(verb: &str) -> String {
+    let spaced = verb.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
-    let body = parts
-        .iter()
-        .map(|p| format!("  {},", p.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{prefix}(\n{body}\n)")
+}
+
+/// "1 run", "3 runs".
+pub fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Error text for the UI, without server_fn's "error running server
+/// function:" prefix on `ServerFnError::ServerError`.
+pub fn err_text(e: &impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    match s.strip_prefix("error running server function: ") {
+        Some(msg) => msg.to_string(),
+        None => s,
+    }
 }
 
 /// Truncate an id-like string for compact display. Returns an owned String
@@ -574,6 +574,289 @@ pub fn partition_picker_for_assets(
     }
 }
 
+/// A resource's value, copied into a signal by an effect. Read this instead
+/// of the resource where no `<Transition>` wraps the read (top bars, dialogs,
+/// event handlers, memos). The server and the browser's first render both see
+/// `None`, so hydration matches; the browser fills in the value right after.
+pub fn resource_value<T>(resource: Resource<T>) -> ReadSignal<Option<T>>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let (value, set_value) = signal(None);
+    Effect::new(move |_| set_value.set(resource.get()));
+    value
+}
+
+/// Asset records keyed by asset_key from a page's `get_assets` resource,
+/// plus whether the latest fetch failed. Keeps the last good map on `Err`
+/// so a transient failure doesn't blank every consumer — the flag is what
+/// surfaces the failure (the materialize dialog's staleness warning).
+pub fn records_by_key(
+    all_assets: Resource<Result<Vec<crate::types::AssetRecord>, ServerFnError>>,
+) -> (
+    Memo<std::collections::HashMap<String, crate::types::AssetRecord>>,
+    Memo<bool>,
+) {
+    let latest = resource_value(all_assets);
+    let records =
+        Memo::new(
+            move |prev: Option<&std::collections::HashMap<_, _>>| match latest.get() {
+                Some(Ok(assets)) => assets
+                    .into_iter()
+                    .map(|a| (a.asset_key.clone(), a))
+                    .collect(),
+                _ => prev.cloned().unwrap_or_default(),
+            },
+        );
+    let failed = Memo::new(move |_| matches!(latest.get(), Some(Err(_))));
+    (records, failed)
+}
+
+/// Asset definitions by key from a page's `get_assets_info` value; empty
+/// until it loads or when it failed.
+pub fn definitions_by_key(
+    assets_info: ReadSignal<Option<Result<Vec<crate::types::AssetDefinitionInfo>, ServerFnError>>>,
+) -> Memo<std::collections::HashMap<String, crate::types::AssetDefinitionInfo>> {
+    Memo::new(move |_| {
+        assets_info.with(|info| match info {
+            Some(Ok(infos)) => infos
+                .iter()
+                .map(|i| (i.asset_key.clone(), i.clone()))
+                .collect(),
+            _ => Default::default(),
+        })
+    })
+}
+
+/// The runs list's verb input: empty is any run, `materialize` is runs with no
+/// verb, anything else is runs of exactly that verb.
+pub fn verb_filter_from_input(input: &str) -> crate::types::VerbFilter {
+    use crate::types::VerbFilter;
+    match input.trim() {
+        "" => VerbFilter::Any,
+        "materialize" => VerbFilter::MaterializeOnly,
+        verb => VerbFilter::Verb(verb.to_string()),
+    }
+}
+
+/// The asset an implicit exclusive-action pool (`__asset__:<asset>`) belongs
+/// to; `None` for a user pool.
+pub fn asset_pool_asset(pool_key: &str) -> Option<&str> {
+    pool_key.strip_prefix("__asset__:")
+}
+
+/// POOLS / SLOTS CLAIMED tiles over user pools only: an asset's implicit pool
+/// admits by partition overlap, not by slots, so it has no capacity to add up.
+/// Returns `(pool count, claimed slots, slots suffix)`.
+pub fn user_pool_totals(pools: &[crate::types::PoolInfo]) -> (usize, u32, String) {
+    let user: Vec<&crate::types::PoolInfo> = pools
+        .iter()
+        .filter(|p| asset_pool_asset(&p.pool_key).is_none())
+        .collect();
+    let claimed = user.iter().map(|p| p.claimed_count).sum();
+    let slot_sum: i32 = user
+        .iter()
+        .filter(|p| p.slot_limit > 0)
+        .map(|p| p.slot_limit)
+        .sum();
+    let suffix = if user.iter().any(|p| p.slot_limit < 0) || slot_sum == 0 {
+        "claimed".to_string()
+    } else {
+        format!("of {slot_sum}")
+    };
+    (user.len(), claimed, suffix)
+}
+
+/// Prefix a run's summary label with its verb, so an action run never reads
+/// as a plain materialization (a finished delete is not a green rebuild).
+pub fn with_verb(label: String, action: Option<&str>) -> String {
+    match action {
+        Some(verb) => format!("{verb} · {label}"),
+        None => label,
+    }
+}
+
+/// Click on a replay button (re-run a run, re-execute a backfill). Replaying
+/// an action re-applies its verb — a delete deletes again — so it takes a
+/// second click; a materialize replays at once. Returns `(dispatch, armed)`.
+pub fn replay_click(is_action: bool, armed: bool) -> (bool, bool) {
+    match (is_action, armed) {
+        (false, _) => (true, false),
+        (true, false) => (false, true),
+        (true, true) => (true, false),
+    }
+}
+
+/// Armed state for a two-click confirm, disarmed whenever `track` reports a
+/// change. Pages outlive their route params, so a confirm armed on one job
+/// would otherwise fire the next job's verb on its first click.
+pub fn use_confirm_armed(track: impl Fn() + Send + Sync + 'static) -> RwSignal<bool> {
+    let armed = RwSignal::new(false);
+    Effect::new(move |_| {
+        track();
+        armed.set(false);
+    });
+    armed
+}
+
+/// Close a dialog when the path changes under it. Pages outlive their route
+/// params, so an open dialog would otherwise run its verb on another code
+/// location, asset or job than the one it shows.
+pub fn close_on_navigation(show: RwSignal<bool>) {
+    let pathname = use_location().pathname;
+    Effect::new(move |prev: Option<String>| {
+        let path = pathname.get();
+        if prev.is_some_and(|p| p != path) {
+            show.set(false);
+        }
+        path
+    });
+}
+
+/// Text for a Re-execute button: an action replay names the verb it
+/// re-applies.
+pub fn replay_button_text(action: Option<&str>, armed: bool, pending: bool) -> String {
+    match action {
+        _ if pending => "Re-executing…".to_string(),
+        Some(verb) if armed => format!("Confirm re-execute {verb}?"),
+        Some(verb) => format!("Re-execute {verb}"),
+        None => "Re-execute".to_string(),
+    }
+}
+
+/// Actions an asset offers as generic verb buttons — everything but
+/// `observe`, which external assets surface through their own Observe button.
+pub fn offered_actions(info: &AssetDefinitionInfo) -> Vec<crate::types::AssetActionInfo> {
+    info.actions
+        .iter()
+        .filter(|a| a.name != "observe")
+        .cloned()
+        .collect()
+}
+
+/// Hover title for an action trigger button. `on_selection` switches to the
+/// multi-select wording the bulk surfaces use.
+pub fn action_title(act: &crate::types::AssetActionInfo, on_selection: bool) -> String {
+    act.description
+        .clone()
+        .unwrap_or_else(|| match (act.is_destructive(), on_selection) {
+            (true, true) => format!(
+                "Run '{}' on the selection — clears materialization state",
+                act.name
+            ),
+            (false, true) => format!("Run action '{}' on the selection", act.name),
+            (true, false) => format!("Run '{}' — clears materialization state", act.name),
+            (false, false) => format!("Run action '{}'", act.name),
+        })
+}
+
+/// Verb buttons in row order: plain verbs first, destructive verbs last.
+/// The sort is stable, so declaration order holds within each group.
+pub fn sorted_verbs(
+    mut verbs: Vec<crate::types::AssetActionInfo>,
+) -> Vec<crate::types::AssetActionInfo> {
+    verbs.sort_by_key(|v| v.is_destructive());
+    verbs
+}
+
+/// Actions every asset in `assets` declares, in the first asset's declaration
+/// order. An action run targets the whole selection, so a verb any member
+/// lacks (or an asset with no info yet) offers nothing. `observe` is excluded
+/// — external assets surface it through their own Observe button.
+pub fn common_actions(
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> Vec<crate::types::AssetActionInfo> {
+    let Some(first) = assets.first() else {
+        return Vec::new();
+    };
+    let Some(base) = asset_info_by_key.get(first) else {
+        return Vec::new();
+    };
+    base.actions
+        .iter()
+        .filter(|a| a.name != "observe")
+        .filter_map(|a| {
+            // One pass over the selection per verb: bail if any member lacks
+            // the verb, collecting each member's variant on the way.
+            // Outcomes may diverge per asset for one verb name, and this row
+            // only drives the confirmation styling (execution re-resolves per
+            // target) — so a destructive variant on ANY member wins over the
+            // first asset's.
+            let variants: Option<Vec<&crate::types::AssetActionInfo>> = assets
+                .iter()
+                .map(|k| {
+                    asset_info_by_key
+                        .get(k)?
+                        .actions
+                        .iter()
+                        .find(|b| b.name == a.name)
+                })
+                .collect();
+            let variants = variants?;
+            Some(
+                (*variants
+                    .iter()
+                    .find(|b| b.is_destructive())
+                    .unwrap_or(&variants[0]))
+                .clone(),
+            )
+        })
+        .collect()
+}
+
+/// The verb a job's runs execute, resolved against its assets' declarations
+/// (a destructive variant on any asset wins, as in [`common_actions`]).
+/// `None` is a materialize job. Declarations not loaded yet read as the worst
+/// case — destructive, key required — so a confirmation is never skipped.
+pub fn job_verb(
+    action: Option<&str>,
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> Option<crate::types::AssetActionInfo> {
+    let verb = action?;
+    let fallback = |outcome: &str, partitioning: &str| crate::types::AssetActionInfo {
+        name: verb.to_string(),
+        outcome: outcome.to_string(),
+        exclusive: false,
+        partitioning: partitioning.to_string(),
+        description: None,
+        config_schema: None,
+    };
+    if verb == "observe" {
+        return Some(fallback("observe", "optional"));
+    }
+    Some(
+        common_actions(assets, asset_info_by_key)
+            .into_iter()
+            .find(|a| a.name == verb)
+            .unwrap_or_else(|| fallback("unmaterialize", "required")),
+    )
+}
+
+/// `job name → verb` for the code location's action jobs; materialize jobs
+/// are absent. Schedules and sensors name a job, and this says what it does.
+pub fn job_actions_by_name(
+    jobs: &[crate::types::JobRecord],
+) -> std::collections::HashMap<String, String> {
+    jobs.iter()
+        .filter_map(|j| Some((j.name.clone(), j.action.clone()?)))
+        .collect()
+}
+
+/// Picker shape for launching a job: a whole-asset verb takes no key, so its
+/// job gets no picker; everything else picks from the assets' partitions.
+pub fn job_partition_picker(
+    verb: Option<&crate::types::AssetActionInfo>,
+    assets: &[String],
+    asset_info_by_key: &std::collections::HashMap<String, AssetDefinitionInfo>,
+) -> JobPartitionPicker {
+    if verb.is_some_and(|v| v.is_keyless()) {
+        return JobPartitionPicker::None;
+    }
+    partition_picker_for_assets(assets, asset_info_by_key)
+}
+
 /// Cartesian product of per-dimension selections — used by the Multi
 /// dialog flow to expand the user's `{color: [r,g], size: [s]}` choices
 /// into individual partition keys, one per concrete combination. Each
@@ -706,10 +989,10 @@ mod js {
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_login_redirect_if_unauthorized() {
     leptos::task::spawn_local(async {
-        if let Err(e) = crate::server_fns::user::get_current_user().await {
-            if is_unauthorized(&e) {
-                redirect_to_login();
-            }
+        if let Err(e) = crate::server_fns::user::get_current_user().await
+            && is_unauthorized(&e)
+        {
+            redirect_to_login();
         }
     });
 }
@@ -765,6 +1048,71 @@ pub fn launched_by_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verb_filter_reads_the_runs_list_input() {
+        use crate::types::VerbFilter;
+        assert_eq!(verb_filter_from_input(""), VerbFilter::Any);
+        assert_eq!(verb_filter_from_input("  "), VerbFilter::Any);
+        assert_eq!(
+            verb_filter_from_input("materialize"),
+            VerbFilter::MaterializeOnly
+        );
+        assert_eq!(
+            verb_filter_from_input(" delete "),
+            VerbFilter::Verb("delete".to_string())
+        );
+    }
+
+    #[test]
+    fn implicit_asset_pools_stay_out_of_slot_totals() {
+        let pool = |key: &str, limit: i32, claimed: u32| crate::types::PoolInfo {
+            pool_key: key.to_string(),
+            slot_limit: limit,
+            lease_duration_secs: 60,
+            claimed_count: claimed,
+            pending_count: 0,
+        };
+        assert_eq!(asset_pool_asset("__asset__:orders"), Some("orders"));
+        assert_eq!(asset_pool_asset("db"), None);
+        let pools = [pool("db", 4, 1), pool("__asset__:orders", -1, 2)];
+        assert_eq!(user_pool_totals(&pools), (1, 1, "of 4".to_string()));
+    }
+
+    #[test]
+    fn run_labels_name_the_verb() {
+        assert_eq!(with_verb("orders".to_string(), None), "orders");
+        assert_eq!(
+            with_verb("orders".to_string(), Some("delete")),
+            "delete · orders"
+        );
+    }
+
+    #[test]
+    fn replaying_an_action_takes_a_second_click() {
+        // Materialize: dispatch at once, nothing armed.
+        assert_eq!(replay_click(false, false), (true, false));
+        // A verb: the first click arms, the second dispatches and disarms.
+        assert_eq!(replay_click(true, false), (false, true));
+        assert_eq!(replay_click(true, true), (true, false));
+    }
+
+    #[test]
+    fn replay_button_names_the_verb_it_reapplies() {
+        assert_eq!(replay_button_text(None, false, false), "Re-execute");
+        assert_eq!(
+            replay_button_text(Some("delete"), false, false),
+            "Re-execute delete"
+        );
+        assert_eq!(
+            replay_button_text(Some("delete"), true, false),
+            "Confirm re-execute delete?"
+        );
+        assert_eq!(
+            replay_button_text(Some("delete"), true, true),
+            "Re-executing…"
+        );
+    }
 
     #[test]
     fn initials_take_first_and_last_word() {
@@ -829,12 +1177,13 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_none() {
-        assert_eq!(format_timestamp(None), "-");
+        assert_eq!(format_timestamp(None), "—");
     }
 
     #[test]
     fn test_format_duration_completed() {
         let s = 1_000_000_000i64;
+        assert_eq!(format_duration(Some(0), Some(s / 2)), "<1s");
         assert_eq!(format_duration(Some(0), Some(30 * s)), "30s");
         assert_eq!(format_duration(Some(0), Some(125 * s)), "2m 5s");
         assert_eq!(format_duration(Some(0), Some(7265 * s)), "2h 1m");
@@ -842,13 +1191,13 @@ mod tests {
 
     #[test]
     fn test_format_duration_running() {
-        assert_eq!(format_duration(Some(100), None), "Running...");
+        assert_eq!(format_duration(Some(100), None), "Running…");
     }
 
     #[test]
     fn test_format_duration_no_start() {
-        assert_eq!(format_duration(None, None), "-");
-        assert_eq!(format_duration(None, Some(100)), "-");
+        assert_eq!(format_duration(None, None), "—");
+        assert_eq!(format_duration(None, Some(100)), "—");
     }
 
     #[test]
@@ -944,6 +1293,9 @@ mod tests {
             group: None,
             code_version: None,
             asset_type: "asset".to_string(),
+            actions: vec![],
+            config_schema: None,
+            metadata: Default::default(),
         }
     }
 
@@ -973,6 +1325,167 @@ mod tests {
             .into_iter()
             .map(|i| (i.asset_key.clone(), i))
             .collect()
+    }
+
+    fn with_actions(asset_key: &str, verbs: &[(&str, &str)]) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, None);
+        info.actions = verbs
+            .iter()
+            .map(|(name, outcome)| crate::types::AssetActionInfo {
+                name: name.to_string(),
+                outcome: outcome.to_string(),
+                exclusive: false,
+                partitioning: "required".to_string(),
+                description: None,
+                config_schema: None,
+            })
+            .collect();
+        info
+    }
+
+    fn partitioned_with(
+        asset_key: &str,
+        verb: &str,
+        outcome: &str,
+        partitioning: &str,
+    ) -> AssetDefinitionInfo {
+        let mut info = make_info(asset_key, Some(&["p1", "p2"]));
+        info.actions = vec![crate::types::AssetActionInfo {
+            name: verb.to_string(),
+            outcome: outcome.to_string(),
+            exclusive: true,
+            partitioning: partitioning.to_string(),
+            description: None,
+            config_schema: None,
+        }];
+        info
+    }
+
+    #[test]
+    fn job_verb_resolves_the_declaration_behind_a_job() {
+        let infos = make_map(vec![
+            partitioned_with("events", "vacuum", "unchanged", "keyless"),
+            partitioned_with("orders", "delete", "unmaterialize", "optional"),
+        ]);
+        let assets = |a: &str| vec![a.to_string()];
+        assert_eq!(job_verb(None, &assets("events"), &infos), None);
+        let vacuum = job_verb(Some("vacuum"), &assets("events"), &infos).unwrap();
+        assert!(vacuum.is_keyless() && !vacuum.is_destructive());
+        assert!(
+            job_verb(Some("delete"), &assets("orders"), &infos)
+                .unwrap()
+                .is_destructive()
+        );
+        // Infos not loaded yet: assume the verb destroys data and needs a key.
+        let unknown = job_verb(Some("delete"), &assets("ghost"), &infos).unwrap();
+        assert!(unknown.is_destructive() && !unknown.is_keyless());
+        // `observe` never destroys and takes a key or not.
+        assert!(
+            job_verb(Some("observe"), &assets("ghost"), &infos)
+                .unwrap()
+                .key_optional()
+        );
+    }
+
+    #[test]
+    fn job_actions_by_name_keeps_only_action_jobs() {
+        let job = |name: &str, action: Option<&str>| crate::types::JobRecord {
+            name: name.to_string(),
+            asset_selection: vec![],
+            executor_type: "in_process".to_string(),
+            action: action.map(String::from),
+        };
+        let map = job_actions_by_name(&[job("etl", None), job("purge", Some("delete"))]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("purge").map(String::as_str), Some("delete"));
+    }
+
+    #[test]
+    fn a_whole_asset_verb_job_gets_no_partition_picker() {
+        let infos = make_map(vec![partitioned_with(
+            "events",
+            "vacuum",
+            "unchanged",
+            "keyless",
+        )]);
+        let assets = vec!["events".to_string()];
+        let vacuum = job_verb(Some("vacuum"), &assets, &infos);
+        assert!(matches!(
+            job_partition_picker(vacuum.as_ref(), &assets, &infos),
+            JobPartitionPicker::None
+        ));
+        // A materialize job over the same asset still picks keys.
+        assert!(!matches!(
+            job_partition_picker(None, &assets, &infos),
+            JobPartitionPicker::None
+        ));
+    }
+
+    #[test]
+    fn common_actions_intersects_and_keeps_declaration_order() {
+        let infos = make_map(vec![
+            with_actions(
+                "a",
+                &[
+                    ("compact", "unchanged"),
+                    ("destroy", "unmaterialize"),
+                    ("refresh", "may_materialize"),
+                ],
+            ),
+            with_actions(
+                "b",
+                &[("refresh", "may_materialize"), ("compact", "unchanged")],
+            ),
+        ]);
+        let verbs: Vec<String> = common_actions(&["a".into(), "b".into()], &infos)
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        // "destroy" only on `a`; order follows `a`'s declaration.
+        assert_eq!(verbs, vec!["compact", "refresh"]);
+    }
+
+    #[test]
+    fn common_actions_excludes_observe_and_unknown_assets() {
+        let infos = make_map(vec![
+            with_actions("a", &[("observe", "observe"), ("compact", "unchanged")]),
+            with_actions("b", &[("observe", "observe"), ("compact", "unchanged")]),
+        ]);
+        let both = common_actions(&["a".into(), "b".into()], &infos);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "compact");
+        assert!(!both[0].is_destructive());
+        // A selected asset with no info yet must offer nothing rather than a
+        // verb that may fail on it.
+        assert!(common_actions(&["a".into(), "ghost".into()], &infos).is_empty());
+        assert!(common_actions(&[], &infos).is_empty());
+    }
+
+    #[test]
+    fn destructive_verbs_are_flagged() {
+        let infos = make_map(vec![with_actions("a", &[("destroy", "unmaterialize")])]);
+        let acts = common_actions(&["a".into()], &infos);
+        assert!(acts[0].is_destructive());
+    }
+
+    /// Outcomes may legally diverge per asset for one verb name, and the
+    /// merged entry drives the confirmation styling — so the destructive
+    /// variant must win no matter which asset was shift-clicked first.
+    #[test]
+    fn destructive_variant_wins_regardless_of_selection_order() {
+        let infos = make_map(vec![
+            with_actions("benign", &[("purge", "unchanged")]),
+            with_actions("dangerous", &[("purge", "unmaterialize")]),
+        ]);
+        for order in [["benign", "dangerous"], ["dangerous", "benign"]] {
+            let sel: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+            let acts = common_actions(&sel, &infos);
+            assert_eq!(acts.len(), 1);
+            assert!(
+                acts[0].is_destructive(),
+                "a destructive variant on any member must flag the merged entry (order {order:?})"
+            );
+        }
     }
 
     fn picker(assets: &[&str], infos: &HashMap<String, AssetDefinitionInfo>) -> JobPartitionPicker {

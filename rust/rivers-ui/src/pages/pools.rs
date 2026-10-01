@@ -5,7 +5,7 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
-use crate::components::ui_kit::{Crumb, PoolUtilBar, StatTile, Topbar};
+use crate::components::ui_kit::{EmptyState, PoolUtilBar, StatTile, Topbar};
 use crate::helpers::{format_seconds, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::RelTime;
@@ -55,7 +55,7 @@ pub fn PoolsPage() -> impl IntoView {
         move || (loc.get(), expanded_pool.get(), refresh_tick.get()),
         |((ns, name), pool_key, _)| async move {
             match pool_key {
-                Some(key) => get_pool_detail(ns, name, key).await.ok(),
+                Some(key) => Some(get_pool_detail(ns, name, key).await),
                 None => None,
             }
         },
@@ -68,34 +68,27 @@ pub fn PoolsPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Pools")]>
+        <Topbar title="Pools" subtitle=|| "Concurrency slots across the cluster">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>
 
-        <div class="page-header">
-            <h1>"Pools"</h1>
-            <p>"Concurrency slots across the cluster"</p>
-        </div>
-
         <Transition>
             {move || {
                 let list = pools.get().and_then(|r| r.ok()).unwrap_or_default();
-                let n = list.len();
-                let claimed: u32 = list.iter().map(|p| p.claimed_count).sum();
+                let (n, claimed, slots_suffix) = crate::helpers::user_pool_totals(&list);
+                let asset_pools = list.len() - n;
                 let pending: u32 = list.iter().map(|p| p.pending_count).sum();
-                let slot_sum: i32 = list.iter().filter(|p| p.slot_limit > 0).map(|p| p.slot_limit).sum();
-                let has_unlimited = list.iter().any(|p| p.slot_limit < 0);
-                let slots_suffix = if has_unlimited || slot_sum == 0 {
-                    "claimed".to_string()
+                let pools_suffix = if asset_pools > 0 {
+                    format!("active · {}", crate::helpers::plural(asset_pools as u64, "asset pool", "asset pools"))
                 } else {
-                    format!("of {slot_sum}")
+                    "active".to_string()
                 };
                 view! {
                     <div class="stats-grid" style="grid-template-columns:repeat(3, 1fr); margin-bottom:24px">
-                        <StatTile label="POOLS" value=n.to_string() suffix="active"/>
+                        <StatTile label="POOLS" value=n.to_string() suffix=pools_suffix/>
                         <StatTile label="SLOTS CLAIMED" value=claimed.to_string() suffix=slots_suffix/>
                         <StatTile label="STEPS PENDING" value=pending.to_string() suffix="across all pools"/>
                     </div>
@@ -108,7 +101,7 @@ pub fn PoolsPage() -> impl IntoView {
                 pools.get().map(|result| match result {
                     Ok(pool_list) => {
                         if pool_list.is_empty() {
-                            return view! { <div class="empty-state">"No concurrency pools configured."</div> }.into_any();
+                            return view! { <EmptyState message="No concurrency pools configured"/> }.into_any();
                         }
 
                         view! {
@@ -152,7 +145,7 @@ pub fn PoolsPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error loading pools: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load pools: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -171,7 +164,7 @@ fn PoolRow(
     waiting: Vec<RunRecord>,
     expanded_pool: ReadSignal<Option<String>>,
     set_expanded_pool: WriteSignal<Option<String>>,
-    detail: Resource<Option<PoolDetail>>,
+    detail: Resource<Option<Result<PoolDetail, ServerFnError>>>,
 ) -> impl IntoView {
     let pool_key_click = pool_key.clone();
     let pool_key_check = pool_key.clone();
@@ -191,11 +184,21 @@ fn PoolRow(
         "var(--success)"
     };
 
-    let util_label = if limit < 0 {
+    // An asset's implicit pool admits exclusive actions by partition overlap;
+    // slots and a percentage mean nothing there, so it shows its holders.
+    let asset = crate::helpers::asset_pool_asset(&pool_key).map(str::to_string);
+    let util_label = if asset.is_some() {
+        format!("{used} holding")
+    } else if limit < 0 {
         format!("{used}/∞")
     } else {
         format!("{used}/{limit}")
     };
+    let display_name = match &asset {
+        Some(a) => format!("{a} · asset pool"),
+        None => pool_key.clone(),
+    };
+    let is_asset_pool = asset.is_some();
 
     let is_expanded =
         Signal::derive(move || expanded_pool.get().as_deref() == Some(pool_key_check.as_str()));
@@ -206,9 +209,9 @@ fn PoolRow(
         <div class="pool-row">
             <div class="pool-row-header">
                 <div class="pool-row-left">
-                    <div class="pool-row-name">{pool_key.clone()}</div>
+                    <div class="pool-row-name" title=pool_key.clone()>{display_name}</div>
                     <div class="pool-row-util" style=format!("color:{util_color}")>
-                        {format!("{:.0}% · {util_label}", pct)}
+                        {if is_asset_pool { util_label } else { format!("{:.0}% · {util_label}", pct) }}
                     </div>
                 </div>
 
@@ -260,7 +263,8 @@ fn PoolRow(
                         </span>
                     })}
                     <button
-                        class="btn btn-tertiary"
+                        class="btn"
+                        aria-expanded=move || is_expanded.get().to_string()
                         on:click=move |_| {
                             if expanded_pool.get_untracked().as_deref() == Some(pool_key_click.as_str()) {
                                 set_expanded_pool.set(None);
@@ -268,17 +272,10 @@ fn PoolRow(
                                 set_expanded_pool.set(Some(pool_key_click.clone()));
                             }
                         }
-                        style="justify-content:center"
                     >
                         {move || if is_expanded.get() { "Hide holders" } else { "Show holders" }}
-                        <span
-                            class="chev-btn"
-                            class:chev-btn--open=move || is_expanded.get()
-                            style="margin-left:6px"
-                        >
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M3 2l3 3-3 3"/>
-                            </svg>
+                        <span class="chev-btn" class:chev-btn--open=move || is_expanded.get()>
+                            <crate::components::icons::IconChevronRight/>
                         </span>
                     </button>
                 </div>
@@ -295,10 +292,10 @@ fn PoolRow(
                             let job = r.job_name.clone().unwrap_or_else(|| "—".into());
                             view! {
                                 <div style="display:grid; grid-template-columns:32px 100px 1fr 100px; gap:12px; align-items:center; padding:6px 0">
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11px">{format!("#{}", i + 1)}</span>
-                                    <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--secondary); font-size:11.5px">{short}</A>
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{job}</span>
-                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right"><RelTime ts=start_ts/></span>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-xs)">{format!("#{}", i + 1)}</span>
+                                    <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--secondary); font-size:var(--fs-sm)">{short}</A>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{job}</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right"><RelTime ts=start_ts/></span>
                                 </div>
                             }
                         }).collect();
@@ -314,10 +311,15 @@ fn PoolRow(
 
                     {move || {
                         match detail.get() {
-                            Some(Some(d)) if pool_key_detail.with_value(|k| d.info.pool_key == *k) => {
+                            Some(Some(Ok(d))) if pool_key_detail.with_value(|k| d.info.pool_key == *k) => {
                                 view! { <HoldersTable detail=d/> }.into_any()
                             }
-                            _ => view! { <div class="loading" style="margin-top:12px">"Loading holders..."</div> }.into_any(),
+                            Some(Some(Err(e))) => view! {
+                                <div class="error-msg" style="margin-top:12px">
+                                    {format!("Couldn't load holders: {}", crate::helpers::err_text(&e))}
+                                </div>
+                            }.into_any(),
+                            _ => view! { <div class="loading" style="margin-top:12px">"Loading holders…"</div> }.into_any(),
                         }
                     }}
                 </div>
@@ -332,13 +334,13 @@ fn HoldersTable(detail: PoolDetail) -> impl IntoView {
         return view! {
             <div style="margin-top:12px">
                 <div class="section-header-label" style="margin-bottom:6px">"SLOT HOLDERS"</div>
-                <div class="empty-state">"No active slot holders."</div>
+                <EmptyState message="No active slot holders" compact=true/>
             </div>
         }
         .into_any();
     }
 
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let now = jiff::Timestamp::now().as_nanosecond() as i64;
     const GRID: &str = "grid-template-columns: 100px 2fr 60px 140px 140px";
 
     view! {
@@ -362,16 +364,16 @@ fn HoldersTable(detail: PoolDetail) -> impl IntoView {
                     let expires = format_lease_remaining(h.lease_expires_at, now);
                     let lease_class = lease_time_class(h.lease_expires_at, now);
                     let lease_style = match lease_class {
-                        "lease-expired" => "color:var(--error); font-size:11.5px",
-                        "lease-expiring" => "color:var(--warning); font-size:11.5px",
-                        _ => "color:var(--text-muted); font-size:11.5px",
+                        "lease-expired" => "color:var(--error); font-size:var(--fs-sm)",
+                        "lease-expiring" => "color:var(--warning); font-size:var(--fs-sm)",
+                        _ => "color:var(--text-muted); font-size:var(--fs-sm)",
                     };
                     view! {
                         <div class="grid-row grid-row--plain" style=GRID>
-                            <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--text); font-size:11.5px">{short}</A>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{h.step_key}</span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{h.slots_consumed.to_string()}</span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{claimed}</span>
+                            <A href=run_href attr:class="grid-cell-mono" attr:style="color:var(--text); font-size:var(--fs-sm)">{short}</A>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{h.step_key}</span>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{h.slots_consumed.to_string()}</span>
+                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{claimed}</span>
                             <span class="grid-cell-mono" style=lease_style>{expires}</span>
                         </div>
                     }

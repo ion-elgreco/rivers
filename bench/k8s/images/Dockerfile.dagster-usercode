@@ -1,0 +1,6 @@
+# Dagster code location for the benchmark: N no-op assets, size set by env.
+ARG BASE=dagster-bench:latest
+FROM ${BASE}
+
+COPY bench_defs.py /opt/dagster/app/bench_defs.py
+WORKDIR /opt/dagster/app

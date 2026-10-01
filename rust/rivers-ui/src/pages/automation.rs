@@ -7,11 +7,13 @@ use leptos_router::components::A;
 
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::TableSkeleton;
-use crate::components::ui_kit::{Crumb, EmptyState, Topbar, UnderlineTabs};
-use crate::helpers::{short_id, use_query_param};
+use crate::components::ui_kit::{
+    AutomationState, EmptyState, EvaluateOutcomeShort, SectionHeader, Topbar, UnderlineTabs,
+};
+use crate::helpers::{job_actions_by_name, short_id, use_query_param};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::automation::{
-    evaluate_schedule, evaluate_sensor, get_condition_tick_detail, get_condition_ticks,
+    evaluate_schedule, evaluate_sensor, get_condition_tick_detail, get_condition_ticks, get_jobs,
     get_latest_condition_evals, get_next_ticks, get_schedules, get_sensors,
 };
 use crate::server_fns::overview::get_assets_info;
@@ -53,6 +55,18 @@ pub fn AutomationPage() -> impl IntoView {
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
     );
+    // Job definitions are static for the session; they say which job a
+    // schedule or sensor runs as an action.
+    let jobs = Resource::new(
+        move || loc.get(),
+        |(ns, name)| async move { get_jobs(ns, name).await },
+    );
+    let job_actions = move || -> HashMap<String, String> {
+        jobs.get()
+            .and_then(|r| r.ok())
+            .map(|js| job_actions_by_name(&js))
+            .unwrap_or_default()
+    };
 
     let sched_records =
         move || -> Vec<ScheduleRecord> { schedules.get().and_then(|r| r.ok()).unwrap_or_default() };
@@ -70,9 +84,15 @@ pub fn AutomationPage() -> impl IntoView {
 
     let next_ticks = Resource::new(
         move || {
-            let exprs: Vec<(String, String)> = sched_records()
+            let exprs: Vec<(String, String, String)> = sched_records()
                 .iter()
-                .map(|s| (s.name.clone(), s.cron_schedule.clone()))
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        s.cron_schedule.clone(),
+                        s.timezone.clone().unwrap_or_default(),
+                    )
+                })
                 .collect();
             (refresh_tick.get(), exprs)
         },
@@ -145,7 +165,7 @@ pub fn AutomationPage() -> impl IntoView {
     let tick_detail_loading = RwSignal::new(false);
     let fetch_tick_detail = Action::new(move |tick_id: &String| {
         let id = tick_id.clone();
-        let (ns, name) = loc.get();
+        let (ns, name) = loc.get_untracked();
         async move {
             tick_detail_loading.set(true);
             let result = get_condition_tick_detail(ns, name, id)
@@ -194,35 +214,33 @@ pub fn AutomationPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Automation")]>
+        <Topbar
+            title="Automation"
+            subtitle=move || view! {
+                <Transition>
+                    {move || {
+                        let n_sched = sched_records().len();
+                        let n_sensors = sensor_records().len();
+                        let n_cond = condition_assets().len();
+                        view! {
+                            <span class="page-header-num">{n_sched.to_string()}</span>
+                            {if n_sched == 1 { " schedule" } else { " schedules" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{n_sensors.to_string()}</span>
+                            {if n_sensors == 1 { " sensor" } else { " sensors" }}
+                            <span class="page-header-sep">"·"</span>
+                            <span class="page-header-num">{n_cond.to_string()}</span>
+                            {if n_cond == 1 { " declarative condition" } else { " declarative conditions" }}
+                        }
+                    }}
+                </Transition>
+            }
+        >
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>
-
-        <div class="page-header">
-            <h1>"Automation"</h1>
-            <Transition>
-                {move || {
-                    let n_sched = sched_records().len();
-                    let n_sensors = sensor_records().len();
-                    let n_cond = condition_assets().len();
-                    view! {
-                        <p>
-                            <span class="page-header-num">{n_sched.to_string()}</span>
-                            " schedules"
-                            <span class="page-header-sep">"·"</span>
-                            <span class="page-header-num">{n_sensors.to_string()}</span>
-                            " sensors"
-                            <span class="page-header-sep">"·"</span>
-                            <span class="page-header-num">{n_cond.to_string()}</span>
-                            " declarative conditions"
-                        </p>
-                    }
-                }}
-            </Transition>
-        </div>
 
 
         {
@@ -244,11 +262,23 @@ pub fn AutomationPage() -> impl IntoView {
                 let asc = sort_asc.get();
                 let (loc_ns, loc_name) = loc.get();
 
+                // A failed fetch must not read as "nothing defined".
+                let load_error = match tab.as_str() {
+                    "sensors" => sensors.get().and_then(|r| r.err()),
+                    "conditions" => assets_info.get().and_then(|r| r.err()),
+                    _ => schedules.get().and_then(|r| r.err()),
+                };
+                if let Some(e) = load_error {
+                    return view! {
+                        <div class="error-msg">{format!("Couldn't load automation: {}", crate::helpers::err_text(&e))}</div>
+                    }.into_any();
+                }
+
                 match tab.as_str() {
                     "sensors" => {
                         let mut records = sensor_records();
                         sort_sensors(&mut records, &field, asc);
-                        render_sensors_table(records, loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
+                        render_sensors_table(records, job_actions(), loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
                     }
                     "conditions" => {
                         let mut assets = condition_assets();
@@ -266,7 +296,7 @@ pub fn AutomationPage() -> impl IntoView {
                         let mut records = sched_records();
                         let ticks = next_ticks_map();
                         sort_schedules(&mut records, &field, asc);
-                        render_schedules_table(records, ticks, loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
+                        render_schedules_table(records, ticks, job_actions(), loc_ns, loc_name, toggle_sort.clone(), sort_indicator.clone())
                     }
                 }
             }}
@@ -324,6 +354,7 @@ type SortIndicator = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
 fn render_schedules_table(
     records: Vec<ScheduleRecord>,
     next_ticks: HashMap<String, String>,
+    job_actions: HashMap<String, String>,
     loc_ns: String,
     loc_name: String,
     toggle_sort: SortToggle,
@@ -333,7 +364,7 @@ fn render_schedules_table(
         return view! {
             <EmptyState
                 message="No schedules defined"
-                hint="add @schedule(cron='0 */6 * * *') decorators in your code location"
+                hint="Add an @rs.Schedule(cron_schedule=…, job_name=…) to your code location"
             />
         }
         .into_any();
@@ -368,9 +399,8 @@ fn render_schedules_table(
                 let eval_name = name.clone();
                 let href = loc_path(&loc_ns, &loc_name, &format!("automation/schedules/{}", name));
                 let job_name = s.job_name.clone();
-                let tick_text = next_ticks.get(&s.name).cloned().unwrap_or_else(|| "-".to_string());
+                let tick_text = next_ticks.get(&s.name).cloned().unwrap_or_else(|| "—".to_string());
                 let status_raw = s.status.clone();
-                let status_running = status_raw.eq_ignore_ascii_case("running");
 
                 let eval_ns = loc_ns.clone();
                 let eval_loc = loc_name.clone();
@@ -397,20 +427,17 @@ fn render_schedules_table(
                             <button
                                 class="icon-btn copyable"
                                 title="Copy cron expression"
+                                aria-label="Copy cron expression"
                                 data-copy={cron_copy}
                             >
-                                <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2">
-                                    <rect x="4" y="4" width="8" height="8" rx="1"/>
-                                    <path d="M10 4V3a1 1 0 00-1-1H3a1 1 0 00-1 1v6a1 1 0 001 1h1"/>
-                                </svg>
+                                <crate::components::icons::IconCopy/>
                             </button>
                         </span>
-                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:11.5px">{job_name}</span>
-                        <span class="status-dot-row">
-                            <span class=format!("status-dot status-dot--{}", if status_running { "ok" } else { "muted" })></span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{status_raw}</span>
+                        <span class="grid-cell-mono" style="color:var(--secondary); font-size:var(--fs-sm)">
+                            {job_actions.get(&job_name).map(|v| format!("{job_name} · {v}")).unwrap_or(job_name)}
                         </span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{tick_text}</span>
+                        <AutomationState status=status_raw/>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{tick_text}</span>
                         <span style="display:flex; gap:4px; flex-wrap:wrap">
                             {s.tags.iter().map(|(k, v)| {
                                 view! { <span class="tag">{format!("{k}={v}")}</span> }
@@ -418,25 +445,13 @@ fn render_schedules_table(
                         </span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
                             <button
-                                class="btn btn-tertiary"
+                                class="btn"
                                 on:click=move |_| { eval_action.dispatch(()); }
                                 disabled=move || eval_pending.get()
-                                style="justify-content:center"
                             >
-                                {move || if eval_pending.get() { "..." } else { "Evaluate" }}
+                                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate" }}
                             </button>
-                            {move || eval_action.value().get().map(|result| match result {
-                                Ok(run_ids) => view! {
-                                    <span class="text-success" style="font-size:11px">
-                                        {format!("{} run(s)", run_ids.len())}
-                                    </span>
-                                }.into_any(),
-                                Err(e) => view! {
-                                    <span class="text-error" style="font-size:11px">
-                                        {format!("{e}")}
-                                    </span>
-                                }.into_any(),
-                            })}
+                            {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
                     </div>
                 }
@@ -447,6 +462,7 @@ fn render_schedules_table(
 
 fn render_sensors_table(
     records: Vec<SensorRecord>,
+    job_actions: HashMap<String, String>,
     loc_ns: String,
     loc_name: String,
     toggle_sort: SortToggle,
@@ -456,7 +472,7 @@ fn render_sensors_table(
         return view! {
             <EmptyState
                 message="No sensors defined"
-                hint="add @sensor() event-driven triggers in your code location"
+                hint="Add an @rs.Sensor(job_name=…) to your code location"
             />
         }
         .into_any();
@@ -499,7 +515,6 @@ fn render_sensors_table(
                     s.asset_selection.join(" · ")
                 };
                 let status_raw = s.status.clone();
-                let status_running = status_raw.eq_ignore_ascii_case("running");
 
                 let eval_ns = loc_ns.clone();
                 let eval_loc = loc_name.clone();
@@ -517,39 +532,25 @@ fn render_sensors_table(
                         {match job_name.clone() {
                             Some(jn) => {
                                 let job_href = loc_path(&loc_ns, &loc_name, &format!("jobs/{}", jn));
+                                let label = job_actions.get(&jn).map(|v| format!("{jn} · {v}")).unwrap_or(jn);
                                 view! {
-                                    <A href=job_href attr:class="grid-cell-mono sensor-job-link">{jn}</A>
+                                    <A href=job_href attr:class="grid-cell-mono sensor-job-link">{label}</A>
                                 }.into_any()
                             }
                             None => view! { <span class="grid-cell-muted">"—"</span> }.into_any()
                         }}
-                        <span class="status-dot-row">
-                            <span class=format!("status-dot status-dot--{}", if status_running { "ok" } else { "muted" })></span>
-                            <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{status_raw}</span>
-                        </span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{interval}</span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
+                        <AutomationState status=status_raw/>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{interval}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0">{asset_selection_str}</span>
                         <span style="display:flex; align-items:center; gap:6px; justify-content:flex-end">
                             <button
-                                class="btn btn-tertiary"
+                                class="btn"
                                 on:click=move |_| { eval_action.dispatch(()); }
                                 disabled=move || eval_pending.get()
-                                style="justify-content:center"
                             >
-                                {move || if eval_pending.get() { "..." } else { "Evaluate" }}
+                                {move || if eval_pending.get() { "Evaluating…" } else { "Evaluate" }}
                             </button>
-                            {move || eval_action.value().get().map(|result| match result {
-                                Ok(run_ids) => view! {
-                                    <span class="text-success" style="font-size:11px">
-                                        {format!("{} run(s)", run_ids.len())}
-                                    </span>
-                                }.into_any(),
-                                Err(e) => view! {
-                                    <span class="text-error" style="font-size:11px">
-                                        {format!("{e}")}
-                                    </span>
-                                }.into_any(),
-                            })}
+                            {move || eval_action.value().get().map(|result| view! { <EvaluateOutcomeShort result/> })}
                         </span>
                     </div>
                 }
@@ -577,7 +578,7 @@ fn render_conditions_tab(
         return view! {
             <EmptyState
                 message="No assets with automation conditions"
-                hint="attach AutomationCondition.eager() to an asset for declarative materialization"
+                hint="Set automation_condition=rs.AutomationCondition.eager() on an asset"
             />
         }
         .into_any();
@@ -599,17 +600,17 @@ fn render_conditions_tab(
     const GRID: &str = "grid-template-columns: 24px 1.8fr 2fr 0.9fr 0.9fr 0.8fr";
 
     let timeline_view = (!ticks.is_empty()).then(|| {
-        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let now = jiff::Timestamp::now().as_nanosecond() as i64;
         let window_ns: i64 = 60 * 60 * 1_000_000_000;
         let bucket_ns = window_ns / 60;
-        let mut buckets: Vec<(u32, bool)> = vec![(0, false); 60];
+        let mut buckets: Vec<(u32, u32)> = vec![(0, 0); 60];
         for t in ticks.iter() {
             let age = now.saturating_sub(t.timestamp);
             if age >= 0 && age < window_ns {
                 let idx = (59 - (age / bucket_ns).min(59)) as usize;
                 buckets[idx].0 += 1;
                 if t.total_fired > 0 {
-                    buckets[idx].1 = true;
+                    buckets[idx].1 += 1;
                 }
             }
         }
@@ -670,9 +671,7 @@ fn render_conditions_tab(
                             class="chev-btn"
                             class:chev-btn--open=move || is_expanded.get()
                         >
-                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M3 2l3 3-3 3"/>
-                            </svg>
+                            <crate::components::icons::IconChevronRight/>
                         </span>
                         <A
                             href=href
@@ -681,14 +680,14 @@ fn render_conditions_tab(
                         >{asset_key}</A>
                         <code
                             class="grid-cell-mono"
-                            style="color:var(--text-muted); font-size:11.5px; background:transparent; padding:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0"
+                            style="color:var(--text-muted); font-size:var(--fs-sm); background:transparent; padding:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0"
                             title={condition.clone()}
                         >{condition.clone()}</code>
-                        <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">
+                        <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">
                             <crate::now::RelTimeOpt ts=last_eval_ts/>
                         </span>
-                        <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:11.5px")>{result_label}</span>
-                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right">{evals_formatted}</span>
+                        <span class="grid-cell-mono" style=format!("color:{result_color}; font-size:var(--fs-sm)")>{result_label}</span>
+                        <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right">{evals_formatted}</span>
                     </div>
                     <Show when=move || is_expanded.get()>
                         <div class="grid-row-expansion grid-row-expansion--accent">
@@ -701,18 +700,14 @@ fn render_conditions_tab(
 
         {if ticks.is_empty() {
             view! {
-                <div class="section-header-row" style="margin-top:28px">
-                    <span class="section-header-label">"EVALUATION TICKS"</span>
-                </div>
-                <div class="empty-state">"No evaluation ticks recorded yet."</div>
+                <SectionHeader label="EVALUATION TICKS"/>
+                <EmptyState message="No evaluation ticks yet" compact=true/>
             }.into_any()
         } else {
             const GRID: &str = "grid-template-columns: 24px 1.1fr 0.5fr 0.55fr 0.55fr 1.2fr 1.2fr";
             let tick_count = ticks.len();
             view! {
-                <div class="section-header-row" style="margin-top:28px">
-                    <span class="section-header-label">{format!("EVALUATION TICKS · LAST {tick_count}")}</span>
-                </div>
+                <SectionHeader label="EVALUATION TICKS" count=format!("last {tick_count}")/>
                 <div class="grid-table">
                     <div class="grid-table-head" style=GRID>
                         <span></span>
@@ -768,23 +763,23 @@ fn render_conditions_tab(
                             view! {
                                 <span class="status-dot-row" style="justify-content:flex-end">
                                     <span class="status-dot status-dot--accent"></span>
-                                    <span class="grid-cell-mono" style="color:var(--accent); font-size:11.5px">{fired.to_string()}</span>
+                                    <span class="grid-cell-mono" style="color:var(--accent); font-size:var(--fs-sm)">{fired.to_string()}</span>
                                 </span>
                             }.into_any()
                         } else {
                             view! {
-                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px; text-align:right">"—"</span>
+                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm); text-align:right">"—"</span>
                             }.into_any()
                         };
 
                         let runs_cell = if run_ids.is_empty() {
                             if fired > 0 && backfill_ids.is_empty() {
                                 view! {
-                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px" title="No direct runs — expand the row for per-asset detail.">"—"</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)" title="No direct runs — expand the row for per-asset detail.">"—"</span>
                                 }.into_any()
                             } else {
                                 view! {
-                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">"—"</span>
+                                    <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">"—"</span>
                                 }.into_any()
                             }
                         } else {
@@ -809,7 +804,7 @@ fn render_conditions_tab(
 
                         let backfills_cell = if backfill_ids.is_empty() {
                             view! {
-                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:11.5px">"—"</span>
+                                <span class="grid-cell-mono" style="color:var(--text-comment); font-size:var(--fs-sm)">"—"</span>
                             }.into_any()
                         } else {
                             let chips = {
@@ -817,17 +812,16 @@ fn render_conditions_tab(
                                 let loc_name_chip = loc_name_iter.clone();
                                 backfill_ids.into_iter().map(move |bid| {
                                 let href = loc_path(&loc_ns_chip, &loc_name_chip, &format!("backfills/{}", bid));
-                                let short = short_id(&bid, 10);
+                                let short = short_id(&bid, 8);
                                 let title = format!("Backfill {bid}");
                                 view! {
                                     <A
                                         href=href
-                                        attr:class="tag"
-                                        attr:style="background:color-mix(in oklab, var(--secondary) 12%, transparent); color:var(--secondary); border:1px solid color-mix(in oklab, var(--secondary) 30%, transparent)"
+                                        attr:class="tag tag--backfill"
                                         attr:title=title
                                         on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
                                     >
-                                        <span style="font-size:9px; letter-spacing:0.04em; margin-right:4px; opacity:0.7">"BF"</span>
+                                        <span class="chip-backfill-prefix">"BF"</span>
                                         {short}
                                     </A>
                                 }
@@ -843,15 +837,13 @@ fn render_conditions_tab(
                                     class="chev-btn"
                                     class:chev-btn--open=move || is_expanded.get()
                                 >
-                                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M3 2l3 3-3 3"/>
-                                    </svg>
+                                    <crate::components::icons::IconChevronRight/>
                                 </span>
-                                <span class="grid-cell-mono" style="color:var(--text); font-size:11.5px">
+                                <span class="grid-cell-mono" style="color:var(--text); font-size:var(--fs-sm)">
                                     <crate::now::RelTime ts=ts_now/>
                                 </span>
-                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px">{dur_label}</span>
-                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11.5px; text-align:right">{evaluated.to_string()}</span>
+                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm)">{dur_label}</span>
+                                <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-sm); text-align:right">{evaluated.to_string()}</span>
                                 {fired_cell}
                                 {runs_cell}
                                 {backfills_cell}
@@ -865,11 +857,11 @@ fn render_conditions_tab(
                                         let loc_ns_inner = loc_ns_show.clone();
                                         let loc_name_inner = loc_name_show.clone();
                                         if tick_detail_loading.get() {
-                                            return view! { <span class="text-muted" style="font-size:11.5px">"Loading..."</span> }.into_any();
+                                            return view! { <span class="text-muted" style="font-size:var(--fs-sm)">"Loading…"</span> }.into_any();
                                         }
                                         let detail = tick_detail.get();
                                         if detail.evals.is_empty() {
-                                            return view! { <span class="text-muted" style="font-size:11.5px">"No evaluations found."</span> }.into_any();
+                                            return view! { <span class="text-muted" style="font-size:var(--fs-sm)">"No evaluations found."</span> }.into_any();
                                         }
                                         let fired_evals: Vec<_> = detail.evals.iter().filter(|e| e.fired).cloned().collect();
                                         let total = detail.evals.len();
@@ -889,25 +881,24 @@ fn render_conditions_tab(
                                             <div style="display:flex; flex-direction:column; gap:10px">
                                                 <div style="display:flex; align-items:baseline; gap:10px; flex-wrap:wrap">
                                                     <span class="section-header-label">"PER-ASSET RESULT"</span>
-                                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:11px">
+                                                    <span class="grid-cell-mono" style="color:var(--text-muted); font-size:var(--fs-xs)">
                                                         {format!(
-                                                            "{total} conditions evaluated · {} requested · {} run{} · {} backfill{}",
+                                                            "{} evaluated · {} requested · {} · {}",
+                                                            crate::helpers::plural(total as u64, "condition", "conditions"),
                                                             fired_evals.len(),
-                                                            unique_runs,
-                                                            if unique_runs == 1 { "" } else { "s" },
-                                                            unique_backfills,
-                                                            if unique_backfills == 1 { "" } else { "s" },
+                                                            crate::helpers::plural(unique_runs as u64, "run", "runs"),
+                                                            crate::helpers::plural(unique_backfills as u64, "backfill", "backfills"),
                                                         )}
                                                     </span>
                                                     {(without_link > 0).then(|| view! {
-                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:11px">
+                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:var(--fs-xs)">
                                                             {format!("{without_link} requested but no run/backfill linked")}
                                                         </span>
                                                     })}
                                                 </div>
                                                 {if fired_evals.is_empty() {
                                                     view! {
-                                                        <div class="text-muted" style="font-size:11.5px">
+                                                        <div class="text-muted" style="font-size:var(--fs-sm)">
                                                             "No materializations requested in this tick."
                                                         </div>
                                                     }.into_any()
@@ -934,16 +925,16 @@ fn render_conditions_tab(
                                                                     let lnm = loc_name_e.clone();
                                                                     let chips = backfill_ids.into_iter().map(move |bid| {
                                                                         let href = loc_path(&lns, &lnm, &format!("backfills/{}", bid));
-                                                                        let short = short_id(&bid, 10);
+                                                                        let short = short_id(&bid, 8);
                                                                         let title = format!("Backfill {bid}");
                                                                         view! {
                                                                             <A
                                                                                 href=href
-                                                                                attr:class="tag"
-                                                                                attr:style="font-size:10.5px; background:color-mix(in oklab, var(--secondary) 12%, transparent); color:var(--secondary); border:1px solid color-mix(in oklab, var(--secondary) 30%, transparent)"
+                                                                                attr:class="tag tag--backfill"
+                                                                                attr:style="font-size:var(--fs-xs)"
                                                                                 attr:title=title
                                                                             >
-                                                                                <span style="font-size:9px; letter-spacing:0.04em; margin-right:4px; opacity:0.7">"BF"</span>
+                                                                                <span class="chip-backfill-prefix">"BF"</span>
                                                                                 {short}
                                                                             </A>
                                                                         }
@@ -958,7 +949,7 @@ fn render_conditions_tab(
                                                                         let href = loc_path(&lns, &lnm, &format!("runs/{}", rid));
                                                                         let short = short_id(&rid, 8);
                                                                         view! {
-                                                                            <A href=href attr:class="tag" attr:style="font-size:10.5px" attr:title="Run">{short}</A>
+                                                                            <A href=href attr:class="tag" attr:style="font-size:var(--fs-xs)" attr:title="Run">{short}</A>
                                                                         }
                                                                     }).collect::<Vec<_>>();
                                                                     view! {
@@ -966,14 +957,14 @@ fn render_conditions_tab(
                                                                     }.into_any()
                                                                 } else {
                                                                     view! {
-                                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:10.5px" title="Requested but no run or backfill linked — likely batched elsewhere or dropped">
+                                                                        <span class="grid-cell-mono" style="color:var(--warning); font-size:var(--fs-xs)" title="Requested but no run or backfill linked — likely batched elsewhere or dropped">
                                                                             "no run"
                                                                         </span>
                                                                     }.into_any()
                                                                 };
                                                                 view! {
                                                                     <div style="display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:6px 10px; background:var(--bg-surface); border-radius:3px">
-                                                                        <A href=asset_href attr:class="grid-cell-mono" attr:style="color:var(--accent); font-size:11.5px; font-weight:500">{key}</A>
+                                                                        <A href=asset_href attr:class="grid-cell-mono" attr:style="color:var(--accent); font-size:var(--fs-sm); font-weight:500">{key}</A>
                                                                         {links_view}
                                                                     </div>
                                                                 }

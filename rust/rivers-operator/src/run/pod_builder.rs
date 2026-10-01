@@ -48,6 +48,7 @@ pub fn build_executor_pod(
     resume: bool,
     cl_env: &[EnvVar],
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     workspace_cfg: &WorkspaceConfig,
 ) -> Pod {
     let spec = &run.spec;
@@ -215,8 +216,8 @@ pub fn build_executor_pod(
                             }
                         }
                     }
-                    env.extend(cl_env.iter().cloned());
-                    env
+                    env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
+                    rivers_k8s::env::merge_env(env, cl_env.iter().cloned())
                 }),
                 ..Default::default()
             }],
@@ -265,6 +266,7 @@ mod tests {
     fn test_run() -> Run {
         let spec = RunSpec {
             job_name: None,
+            action: None,
             code_location_ref: CodeLocationRef {
                 name: "demo".to_string(),
                 identity: "demo-id".to_string(),
@@ -304,6 +306,7 @@ mod tests {
             resume,
             cl_env,
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
             &WorkspaceConfig::default(),
         )
     }
@@ -339,6 +342,7 @@ mod tests {
             false,
             &[],
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
             &shared,
         );
         let pod_spec = pod.spec.unwrap();
@@ -379,6 +383,7 @@ mod tests {
             false,
             &[],
             &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
             &WorkspaceConfig::default(), // shared_enabled: false
         );
         let pod_spec = pod.spec.unwrap();
@@ -410,6 +415,68 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|e| e.name == "RIVERS_RUN_SOURCE")
+        );
+    }
+
+    fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
+        env.iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value_from.as_ref())
+            .and_then(|src| src.secret_key_ref.as_ref())
+            .map(|sk| (sk.name.clone(), sk.key.clone()))
+    }
+
+    #[test]
+    fn otel_settings_are_stamped_on_the_run_pod() {
+        let run = test_run();
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &[],
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig {
+                endpoint: "https://otlp.example.com:4317".to_string(),
+                headers_secret_name: "otel-headers".to_string(),
+                headers_secret_key: "headers".to_string(),
+            },
+            &WorkspaceConfig::default(),
+        );
+        let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
+
+        let endpoint = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap();
+        assert_eq!(
+            endpoint.value.as_deref(),
+            Some("https://otlp.example.com:4317")
+        );
+
+        assert_eq!(
+            env_secret_ref(&envs, "OTEL_EXPORTER_OTLP_HEADERS"),
+            Some(("otel-headers".to_string(), "headers".to_string()))
+        );
+        let headers = envs
+            .iter()
+            .find(|e| e.name == "OTEL_EXPORTER_OTLP_HEADERS")
+            .unwrap();
+        assert!(headers.value.is_none());
+
+        // Coordinates the run pod re-emits on step pods.
+        let coord = envs
+            .iter()
+            .find(|e| e.name == "RIVERS_OTEL_HEADERS_SECRET_NAME")
+            .unwrap();
+        assert_eq!(coord.value.as_deref(), Some("otel-headers"));
+        let endpoint_coord = envs
+            .iter()
+            .find(|e| e.name == "RIVERS_OTEL_ENDPOINT")
+            .unwrap();
+        assert_eq!(
+            endpoint_coord.value.as_deref(),
+            Some("https://otlp.example.com:4317")
         );
     }
 
@@ -568,6 +635,37 @@ mod tests {
     }
 
     #[test]
+    fn cl_env_replaces_same_named_otel_env() {
+        let run = test_run();
+        let cl_env = vec![EnvVar {
+            name: "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            value: Some("http://team-collector:4317".to_string()),
+            ..Default::default()
+        }];
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &cl_env,
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig {
+                endpoint: "https://otlp.example.com:4317".to_string(),
+                ..Default::default()
+            },
+            &WorkspaceConfig::default(),
+        );
+        let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
+
+        let endpoints: Vec<_> = envs
+            .iter()
+            .filter(|e| e.name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.value.as_deref())
+            .collect();
+        assert_eq!(endpoints, vec![Some("http://team-collector:4317")]);
+    }
+
+    #[test]
     fn test_build_executor_pod_propagates_cl_env() {
         use k8s_openapi::api::core::v1::{EnvVarSource, SecretKeySelector};
 
@@ -599,15 +697,10 @@ mod tests {
         assert_eq!(bucket.value.as_deref(), Some("my-bucket"));
 
         let key = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let secret_ref = key
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(secret_ref.name, "aws-creds");
-        assert_eq!(secret_ref.key, "access-key");
+        assert_eq!(
+            env_secret_ref(&envs, "AWS_ACCESS_KEY_ID"),
+            Some(("aws-creds".to_string(), "access-key".to_string()))
+        );
         assert!(key.value.is_none());
 
         let cl_name = envs

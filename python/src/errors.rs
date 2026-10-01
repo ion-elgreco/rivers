@@ -36,6 +36,16 @@ create_exception!(rivers, StorageError, pyo3::exceptions::PyException);
 // `rivers dev` prompt catches this specific type to offer `rivers db migrate`.
 create_exception!(rivers, SchemaMigrationNeededError, StorageError);
 create_exception!(rivers, TaskDefinitionError, pyo3::exceptions::PyException);
+// A parallel worker raises this around a failed step's own exception. Its
+// attributes carry that exception, the step's logs, and its traceback back to
+// the parent: an exception type with its own `__reduce__` drops attributes set
+// on it, while this one's pickling keeps them. The parent unwraps it, so it
+// never reaches user code.
+create_exception!(
+    rivers._core.exceptions,
+    WorkerStepError,
+    pyo3::exceptions::PyException
+);
 
 pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent_module.py();
@@ -87,6 +97,7 @@ pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> 
         py.get_type::<SchemaMigrationNeededError>(),
     )?;
     child.add("TaskDefinitionError", py.get_type::<TaskDefinitionError>())?;
+    child.add("WorkerStepError", py.get_type::<WorkerStepError>())?;
 
     parent_module.add_submodule(&child)?;
     py.import("sys")?

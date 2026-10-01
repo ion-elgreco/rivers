@@ -52,6 +52,7 @@ def sometimes_bigger(ctx): ...    # 8Gi → 16Gi → 32Gi → 64Gi
 ## Scope
 
 - Effective on the **Kubernetes** executor. The in-process and parallel executors have no per-step compute envelope; a `compute=` there logs a warning and is ignored.
+- Applies to materialize steps only. An [action](actions.md#where-actions-run) step runs in the run pod and uses the run pod's resources.
 - Multi-assets: one step is one pod, so `compute` is declared on `Asset.from_multi(compute=...)` itself, not per output:
 
     ```python

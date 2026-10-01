@@ -1,6 +1,6 @@
 site_name: rivers
 site_description: Orchestration platform for tasks and assets fully backed by Rust
-site_url: https://ion-elgreco.github.io/rivers/
+site_url: https://orchestrator.rs/docs/
 repo_url: https://github.com/ion-elgreco/rivers
 repo_name: rivers
 
@@ -14,19 +14,21 @@ theme:
   favicon: assets/logo.svg
   icon:
     repo: fontawesome/brands/github
+  # Dark first. With no `media` key Material takes the first palette as the
+  # default, and each palette carries the toggle that leaves it.
   palette:
-    - scheme: default
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
     - scheme: slate
       primary: deep purple
       accent: amber
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
   features:
     - content.code.copy
     - content.code.annotate
@@ -48,6 +50,7 @@ nav:
       - Dagster: comparisons/dagster.md
   - Concepts:
       - Assets: concepts/assets.md
+      - Asset Actions: concepts/actions.md
       - Jobs & Executors: concepts/jobs.md
       - Partitions: concepts/partitions.md
       - IO Handlers: concepts/io-handlers.md
@@ -63,6 +66,7 @@ nav:
       - Kubernetes: installation/kubernetes.md
   - Guides:
       - Migrating from Dagster/Prefect: guides/migrating.md
+      - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
       - Delta Lake: guides/delta-lake.md

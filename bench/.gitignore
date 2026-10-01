@@ -1,0 +1,2 @@
+# A sweep writes here after every point and promotes it on success.
+results/*.partial.json

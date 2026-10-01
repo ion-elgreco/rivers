@@ -232,8 +232,8 @@ def test_time_window_mapping_phase_mismatch_rejected():
         match=re.escape(
             "Asset 'downstream' depends on 'upstream': time_window mapping "
             "requires the downstream grid to be a subgrid of the upstream "
-            "grid: downstream start 2024-01-01 00:30:00 is not aligned to "
-            "the upstream grid (start 2024-01-01 00:00:00, interval 3600s)"
+            "grid: downstream start 2024-01-01T00:30:00 is not aligned to "
+            "the upstream grid (start 2024-01-01T00:00:00, interval 3600s)"
         ),
     ):
         make_repo(_tw_edge(down, up))

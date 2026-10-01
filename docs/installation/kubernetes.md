@@ -382,6 +382,52 @@ loudly. See the [authentication guide](../guides/authentication.md) for the
 full option set, proxy header mappings, allowlists, and the launched-by
 audit trail.
 
+## OpenTelemetry export
+
+Every pod that runs rivers Python code (code-location, run, step) can
+export traces over OTLP/gRPC. The operator and UI do not export traces. Set
+the endpoint once; the operator stamps it on every pod it creates, and the
+run pod stamps it on its step pods. The chart gives the endpoint to the
+operator as `RIVERS_OTEL_ENDPOINT`, so an `OTEL_EXPORTER_OTLP_ENDPOINT` that
+something else injects into the operator pod does not reach your pods:
+
+```yaml
+otel:
+  endpoint: https://otlp.example.com:4317
+```
+
+Most hosted backends need an API key or bearer token. Put it in a Secret in
+OTLP header form and reference the Secret. The value reaches pods via
+`valueFrom.secretKeyRef` and never lands in a pod spec or CR:
+
+```bash
+kubectl -n rivers create secret generic otel-headers \
+  --from-literal=headers='authorization=Bearer ...'
+```
+
+```yaml
+otel:
+  endpoint: https://otlp.example.com:4317
+  headers:
+    existingSecret: otel-headers   # key: headers
+```
+
+`https://` endpoints use TLS with the image's system roots plus bundled
+Mozilla roots, so images without a CA bundle work too. To override the
+endpoint or headers for one code location, set the same
+`OTEL_EXPORTER_OTLP_*` variables in `CodeLocation.spec.env`; each entry there
+replaces the chart value of the same name. A node-local collector endpoint
+such as `http://$(HOST_IP):4317` cannot go in `otel.endpoint`. Leave
+`otel.endpoint` unset and put two entries in `CodeLocation.spec.env`: first
+`HOST_IP` from a `status.hostIP` `fieldRef`, then the endpoint. Kubernetes
+expands `$(HOST_IP)` only from entries earlier in the list.
+
+Spans from every pod have the service name `rivers`. To tell code locations
+apart in your backend, set `OTEL_SERVICE_NAME` in each `CodeLocation.spec.env`,
+for example `analytics`. Its run and step pods get the same name. The
+[environment variable reference](../api-reference/environment-variables.md#observability)
+lists every variable rivers reads.
+
 ## Open ports
 
 | Port    | Component         | Purpose                                       |
@@ -409,6 +455,21 @@ helm upgrade rivers \
 
 Existing `CodeLocation` resources are re-reconciled against the new
 operator without re-creation.
+
+Then migrate the storage schema once, before the upgraded UI and code
+locations open the database — a newer build refuses an older database until
+it is migrated. Run it from any image that has the new rivers:
+
+```sh
+rivers db migrate --surreal-endpoint ws://surrealdb:8000
+```
+
+A migration can also raise the oldest build allowed to *write* (see
+[Schema versioning](../api-reference/storage.md#schema-versioning-migration)).
+When it does, rebuild every `CodeLocation` image on the new rivers version
+right after migrating: an image built on an older rivers is refused as a
+writer and its code location stops serving. Schema versions 5 and 6 (asset
+actions) both raise the write floor.
 
 ## Uninstall
 

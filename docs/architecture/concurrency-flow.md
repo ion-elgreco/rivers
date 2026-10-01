@@ -180,6 +180,8 @@ The claim polling loop can be tuned via environment variables. Values are human-
 
 With the defaults, a step waiting for pool slots will timeout after 10 minutes. To allow longer waits (e.g. for long-running batch workloads), increase `RIVERS_CLAIM_TIMEOUT`. To fail faster, lower it.
 
+The timeout counts only time blocked on user pools. A step blocked only on an asset's implicit `__asset__:` pool — held by an exclusive action or by a materialize of an asset that has one — waits without a limit: the holder is a live step that renews its lease, so the wait ends when that step ends (or its lease expires).
+
 **Per-backend behavior:**
 
 | Backend | Pool step execution |

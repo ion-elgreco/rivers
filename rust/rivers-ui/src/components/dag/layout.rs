@@ -2,16 +2,17 @@
 
 use crate::types::GraphTopology;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const NODE_WIDTH: f64 = 200.0;
 const NODE_HEIGHT: f64 = 48.0;
 const LAYER_GAP_X: f64 = 260.0;
 const NODE_GAP_Y: f64 = 16.0;
 const PADDING: f64 = 60.0;
-const GROUP_PAD: f64 = 14.0;
-const GROUP_LABEL_H: f64 = 30.0;
-const SECTION_GAP: f64 = 24.0;
+// The canvas draws no group boxes, so a group section only needs a wider gap
+// than NODE_GAP_Y to set it apart: GROUP_PAD + SECTION_GAP + GROUP_PAD.
+const GROUP_PAD: f64 = 8.0;
+const SECTION_GAP: f64 = 16.0;
 /// Width of the arrowhead marker in user-space units.
 pub const ARROW_W: f64 = 10.0;
 
@@ -100,18 +101,349 @@ pub struct LayoutResult {
     pub height: f64,
 }
 
-// ─── Compound Sugiyama layout ───────────────────────────────────────────────
+// ─── Clusters and packing ───────────────────────────────────────────────────
 
-/// Compute a layered DAG layout using the Compound Sugiyama algorithm:
-///  1. Longest-path layer assignment
-///  2. Dummy node insertion for long edges
-///  3. Iterative barycenter crossing minimisation (group-aware)
-///  4. Y-coordinate assignment with neighbour-averaging refinement
+/// Space between packed clusters.
+const CLUSTER_GAP: f64 = 40.0;
+/// Width:height of the canvas the packing aims to fill.
+const TARGET_ASPECT: f64 = 1.6;
+/// Strip widths tried when packing clusters.
+const PACK_WIDTH_STEPS: usize = 40;
+/// Above this many clusters, rows replace the skyline, whose cost grows with
+/// the cube of the cluster count.
+const SKYLINE_MAX_CLUSTERS: usize = 64;
+
+/// Lay out a DAG. Nodes joined by an edge or a shared group form a cluster;
+/// each cluster gets its own layered layout, and the clusters are packed to
+/// fill a wide canvas.
 pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutResult {
     if topology.nodes.is_empty() {
         return LayoutResult::default();
     }
+    let lay_out = |cluster: &GraphTopology| {
+        if cluster.edges.is_empty() {
+            trim(grid_cluster(cluster))
+        } else {
+            trim(layout_cluster(cluster, center_layers))
+        }
+    };
+    let clusters = split_clusters(topology);
+    let parts = if clusters.len() == 1 {
+        vec![lay_out(topology)]
+    } else {
+        clusters.iter().map(lay_out).collect()
+    };
+    pack(parts)
+}
 
+/// A cluster without edges has no layers to show, so its nodes fill columns
+/// top to bottom, in a grid near TARGET_ASPECT, instead of one tall column.
+fn grid_cluster(topology: &GraphTopology) -> LayoutResult {
+    let n = topology.nodes.len();
+    let step_y = NODE_HEIGHT + NODE_GAP_Y;
+    let cols = ((n as f64 * TARGET_ASPECT * step_y / LAYER_GAP_X)
+        .sqrt()
+        .round() as usize)
+        .clamp(1, n.max(1));
+    let rows = n.div_ceil(cols);
+    let nodes: Vec<LayoutNode> = topology
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| LayoutNode {
+            id: nd.name.clone(),
+            kind: nd.kind.clone(),
+            group: nd.group.clone(),
+            parent_graph: nd.parent_graph.clone(),
+            x: (i / rows) as f64 * LAYER_GAP_X,
+            y: (i % rows) as f64 * step_y,
+            width: NODE_WIDTH,
+            height: NODE_HEIGHT,
+        })
+        .collect();
+    let mut groups: Vec<LayoutGroup> = Vec::new();
+    for node in &nodes {
+        let Some(name) = &node.group else { continue };
+        let (x0, y0) = (node.x - GROUP_PAD, node.y - GROUP_PAD);
+        let (x1, y1) = (
+            node.x + node.width + GROUP_PAD,
+            node.y + node.height + GROUP_PAD,
+        );
+        match groups.iter_mut().find(|g| &g.name == name) {
+            Some(g) => {
+                let (gx1, gy1) = (g.x + g.width, g.y + g.height);
+                g.x = g.x.min(x0);
+                g.y = g.y.min(y0);
+                g.width = gx1.max(x1) - g.x;
+                g.height = gy1.max(y1) - g.y;
+            }
+            None => groups.push(LayoutGroup {
+                name: name.clone(),
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            }),
+        }
+    }
+    LayoutResult {
+        nodes,
+        edges: Vec::new(),
+        groups,
+        width: 0.0,
+        height: 0.0,
+    }
+}
+
+/// Sub-topologies of nodes joined by an edge or a shared group, in the
+/// order their first node appears. A single cluster comes back empty-handed
+/// (no nodes copied): the caller lays out the topology itself.
+fn split_clusters(topology: &GraphTopology) -> Vec<GraphTopology> {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra.max(rb)] = ra.min(rb);
+        }
+    }
+
+    let n = topology.nodes.len();
+    let index: HashMap<&str, usize> = topology
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| (nd.name.as_str(), i))
+        .collect();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for (from, to) in &topology.edges {
+        if let (Some(&a), Some(&b)) = (index.get(from.as_str()), index.get(to.as_str())) {
+            union(&mut parent, a, b);
+        }
+    }
+    let mut group_first: HashMap<&str, usize> = HashMap::new();
+    for (i, nd) in topology.nodes.iter().enumerate() {
+        if let Some(g) = nd.group.as_deref() {
+            let first = *group_first.entry(g).or_insert(i);
+            union(&mut parent, first, i);
+        }
+    }
+
+    let roots: HashSet<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
+    if roots.len() == 1 {
+        return vec![GraphTopology::default()];
+    }
+    let mut slot_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut slot_of_node = vec![0usize; n];
+    let mut clusters: Vec<GraphTopology> = Vec::new();
+    for (i, node) in topology.nodes.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let slot = *slot_of_root.entry(root).or_insert_with(|| {
+            clusters.push(GraphTopology::default());
+            clusters.len() - 1
+        });
+        slot_of_node[i] = slot;
+        clusters[slot].nodes.push(node.clone());
+    }
+    for (from, to) in &topology.edges {
+        if let (Some(&a), Some(_)) = (index.get(from.as_str()), index.get(to.as_str())) {
+            clusters[slot_of_node[a]]
+                .edges
+                .push((from.clone(), to.clone()));
+        }
+    }
+    clusters
+}
+
+fn shift(layout: &mut LayoutResult, dx: f64, dy: f64) {
+    for n in &mut layout.nodes {
+        n.x += dx;
+        n.y += dy;
+    }
+    for g in &mut layout.groups {
+        g.x += dx;
+        g.y += dy;
+    }
+    for e in &mut layout.edges {
+        for p in &mut e.waypoints {
+            p.0 += dx;
+            p.1 += dy;
+        }
+    }
+}
+
+/// Move a layout's content to (0, 0) and size the layout to that content.
+fn trim(mut layout: LayoutResult) -> LayoutResult {
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut include = |ax: f64, ay: f64, bx: f64, by: f64| {
+        x0 = x0.min(ax);
+        y0 = y0.min(ay);
+        x1 = x1.max(bx);
+        y1 = y1.max(by);
+    };
+    for n in &layout.nodes {
+        include(n.x, n.y, n.x + n.width, n.y + n.height);
+    }
+    for g in &layout.groups {
+        include(g.x, g.y, g.x + g.width, g.y + g.height);
+    }
+    for e in &layout.edges {
+        for &(x, y) in &e.waypoints {
+            include(x, y, x, y);
+        }
+    }
+    shift(&mut layout, -x0, -y0);
+    layout.width = x1 - x0;
+    layout.height = y1 - y0;
+    layout
+}
+
+/// Pack trimmed cluster layouts into one. Of the strip widths tried, keeps
+/// the one whose result shows largest when fitted to a TARGET_ASPECT canvas.
+fn pack(mut parts: Vec<LayoutResult>) -> LayoutResult {
+    // Stable: equal sizes keep their first-node order.
+    parts.sort_by(|a, b| {
+        b.height
+            .total_cmp(&a.height)
+            .then(b.width.total_cmp(&a.width))
+    });
+    let sizes: Vec<(f64, f64)> = parts.iter().map(|p| (p.width, p.height)).collect();
+    let narrowest = sizes.iter().map(|s| s.0).fold(0.0, f64::max);
+    let widest = sizes.iter().map(|s| s.0).sum::<f64>() + CLUSTER_GAP * (sizes.len() - 1) as f64;
+    let packer = if sizes.len() <= SKYLINE_MAX_CLUSTERS {
+        skyline_pack
+    } else {
+        shelf_pack
+    };
+
+    let (mut best_scale, mut best_area) = (f64::NEG_INFINITY, f64::INFINITY);
+    let mut positions: Vec<(f64, f64)> = Vec::new();
+    for step in 0..PACK_WIDTH_STEPS {
+        let width = narrowest + (widest - narrowest) * step as f64 / (PACK_WIDTH_STEPS - 1) as f64;
+        let candidate = packer(&sizes, width);
+        let (w, h) = extent(&sizes, &candidate);
+        let (cw, ch) = (w + 2.0 * PADDING, h + 2.0 * PADDING);
+        let scale = (TARGET_ASPECT / cw).min(1.0 / ch);
+        let area = cw * ch;
+        if scale > best_scale + 1e-12 || ((scale - best_scale).abs() <= 1e-12 && area < best_area) {
+            (best_scale, best_area, positions) = (scale, area, candidate);
+        }
+    }
+
+    let (w, h) = extent(&sizes, &positions);
+    let mut out = LayoutResult {
+        width: w + 2.0 * PADDING,
+        height: h + 2.0 * PADDING,
+        ..Default::default()
+    };
+    for (mut part, (x, y)) in parts.into_iter().zip(positions) {
+        shift(&mut part, x + PADDING, y + PADDING);
+        out.nodes.append(&mut part.nodes);
+        out.edges.append(&mut part.edges);
+        out.groups.append(&mut part.groups);
+    }
+    out
+}
+
+fn extent(sizes: &[(f64, f64)], positions: &[(f64, f64)]) -> (f64, f64) {
+    sizes
+        .iter()
+        .zip(positions)
+        .fold((0.0, 0.0), |(w, h), (&(sw, sh), &(x, y))| {
+            (f64::max(w, x + sw), f64::max(h, y + sh))
+        })
+}
+
+/// Bottom-left skyline packing: each rect goes to the lowest spot, then the
+/// leftmost, where it fits inside `width`.
+fn skyline_pack(sizes: &[(f64, f64)], width: f64) -> Vec<(f64, f64)> {
+    const EPS: f64 = 1e-6;
+    // Segments (x, width, top) from left to right, covering the strip plus
+    // the trailing gap of its last rect.
+    let strip = width + CLUSTER_GAP;
+    let mut sky: Vec<(f64, f64, f64)> = vec![(0.0, strip, 0.0)];
+    let mut positions = Vec::with_capacity(sizes.len());
+    for &(w, h) in sizes {
+        let mut best: Option<(f64, f64)> = None; // (y, x)
+        for i in 0..sky.len() {
+            let x = sky[i].0;
+            if x > 0.0 && x + w > width + EPS {
+                break;
+            }
+            let end = (x + w + CLUSTER_GAP).min(strip);
+            let y = sky[i..]
+                .iter()
+                .take_while(|seg| seg.0 < end - EPS)
+                .fold(0.0f64, |top, seg| top.max(seg.2));
+            if best.is_none_or(|(by, bx)| y < by - EPS || ((y - by).abs() <= EPS && x < bx)) {
+                best = Some((y, x));
+            }
+        }
+        let (y, x) = best.unwrap_or((0.0, 0.0));
+        positions.push((x, y));
+
+        let end = (x + w + CLUSTER_GAP).min(strip);
+        let mut next = Vec::with_capacity(sky.len() + 2);
+        for &(sx, sw, top) in &sky {
+            let se = sx + sw;
+            if se <= x + EPS || sx >= end - EPS {
+                next.push((sx, sw, top));
+                continue;
+            }
+            if sx < x {
+                next.push((sx, x - sx, top));
+            }
+            if se > end {
+                next.push((end, se - end, top));
+            }
+        }
+        next.push((x, end - x, y + h + CLUSTER_GAP));
+        next.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sky.clear();
+        for seg in next {
+            match sky.last_mut() {
+                Some(last) if (last.2 - seg.2).abs() <= EPS => last.1 += seg.1,
+                _ => sky.push(seg),
+            }
+        }
+    }
+    positions
+}
+
+/// Row packing: left to right, starting a new row when the next rect
+/// doesn't fit.
+fn shelf_pack(sizes: &[(f64, f64)], width: f64) -> Vec<(f64, f64)> {
+    let (mut x, mut y, mut row_h) = (0.0f64, 0.0f64, 0.0f64);
+    sizes
+        .iter()
+        .map(|&(w, h)| {
+            if x > 0.0 && x + w > width + 1e-6 {
+                x = 0.0;
+                y += row_h + CLUSTER_GAP;
+                row_h = 0.0;
+            }
+            let at = (x, y);
+            x += w + CLUSTER_GAP;
+            row_h = row_h.max(h);
+            at
+        })
+        .collect()
+}
+
+// ─── Compound Sugiyama layout ───────────────────────────────────────────────
+
+/// Lay out one cluster with the Compound Sugiyama algorithm:
+///  1. Longest-path layer assignment
+///  2. Dummy node insertion for long edges
+///  3. Iterative barycenter crossing minimisation (group-aware)
+///  4. Y-coordinate assignment with neighbour-averaging refinement
+fn layout_cluster(topology: &GraphTopology, center_layers: bool) -> LayoutResult {
     let n = topology.nodes.len();
 
     let name_to_idx: HashMap<&str, usize> = topology
@@ -392,7 +724,7 @@ pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutRe
                     y += SECTION_GAP;
                 }
                 if g.is_some() && !is_d {
-                    y += GROUP_LABEL_H + GROUP_PAD;
+                    y += GROUP_PAD;
                 }
                 cur_grp = Some(g);
             }
@@ -474,7 +806,7 @@ pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutRe
         if let Some(top) = topmost {
             let target = PADDING
                 + if groups[top].is_some() {
-                    GROUP_LABEL_H + GROUP_PAD
+                    GROUP_PAD
                 } else {
                     0.0
                 };
@@ -556,7 +888,7 @@ pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutRe
         let mut sorted: Vec<(&str, f64, f64)> = Vec::new(); // (group, top, bot)
         for &node in bucket {
             if let Some(g) = ext_group[node] {
-                let top = y_pos[node] - GROUP_PAD - GROUP_LABEL_H;
+                let top = y_pos[node] - GROUP_PAD;
                 let bot = y_pos[node] + NODE_HEIGHT + GROUP_PAD;
                 if let Some(entry) = sorted.iter_mut().find(|e| e.0 == g) {
                     entry.1 = entry.1.min(top);
@@ -703,9 +1035,9 @@ pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutRe
         .map(|((name, _), (min_x, min_y, max_x, max_y))| LayoutGroup {
             name: name.to_string(),
             x: min_x - GROUP_PAD,
-            y: min_y - GROUP_PAD - GROUP_LABEL_H,
+            y: min_y - GROUP_PAD,
             width: (max_x - min_x) + GROUP_PAD * 2.0,
-            height: (max_y - min_y) + GROUP_PAD * 2.0 + GROUP_LABEL_H,
+            height: (max_y - min_y) + GROUP_PAD * 2.0,
         })
         .collect();
 
@@ -929,7 +1261,7 @@ fn resolve_overlaps(
     let first = bucket[0];
     let min_first = PADDING
         + if groups[first].is_some() && !is_dummy[first] {
-            GROUP_LABEL_H + GROUP_PAD
+            GROUP_PAD
         } else {
             0.0
         };
@@ -979,7 +1311,7 @@ fn min_gap(prev: usize, curr: usize, groups: &[Option<&str>], is_dummy: &[bool])
         NODE_GAP_Y
     } else if prev_d {
         let extra = if groups[curr].is_some() && !curr_d {
-            GROUP_LABEL_H + GROUP_PAD
+            GROUP_PAD
         } else {
             0.0
         };
@@ -996,7 +1328,7 @@ fn min_gap(prev: usize, curr: usize, groups: &[Option<&str>], is_dummy: &[bool])
             }
             gap += SECTION_GAP;
             if curr_g.is_some() {
-                gap += GROUP_LABEL_H + GROUP_PAD;
+                gap += GROUP_PAD;
             }
         }
         gap
@@ -1042,18 +1374,9 @@ mod tests {
 
         // Groups
         for g in &result.groups {
-            let hdr = 28.0;
             svg.push_str(&format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"8\" fill=\"#282a36\" stroke=\"#3a3f4b\" stroke-width=\"1\"/>",
-                g.x, g.y, g.width, hdr
-            ));
-            svg.push_str(&format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#1c1e26\" fill-opacity=\"0.6\" stroke=\"#3a3f4b\" stroke-width=\"1\"/>",
-                g.x, g.y + hdr, g.width, (g.height - hdr).max(0.0)
-            ));
-            svg.push_str(&format!(
-                "<text x=\"{}\" y=\"{}\" fill=\"#a0a4b0\" font-size=\"12\" font-weight=\"600\" font-family=\"monospace\">{}</text>",
-                g.x + 12.0, g.y + 18.0, g.name
+                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"6\" fill=\"none\" stroke=\"#3a3f4b\" stroke-width=\"1\"/>",
+                g.x, g.y, g.width, g.height
             ));
         }
 
@@ -1125,6 +1448,126 @@ mod tests {
                 ("validate_data".into(), "enriched_orders".into()),
             ],
         }
+    }
+
+    fn real_demo_topology() -> GraphTopology {
+        serde_json::from_str(include_str!("../../../tests/fixtures/demo_topology.json"))
+            .expect("fixture parses")
+    }
+
+    fn find<'a>(result: &'a LayoutResult, id: &str) -> &'a LayoutNode {
+        result
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .expect("node is laid out")
+    }
+
+    fn overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+        a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+    }
+
+    fn rect(n: &LayoutNode) -> (f64, f64, f64, f64) {
+        (n.x, n.y, n.x + n.width, n.y + n.height)
+    }
+
+    fn bounds<'a>(nodes: impl Iterator<Item = &'a LayoutNode>) -> (f64, f64, f64, f64) {
+        nodes.fold(
+            (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |b, n| {
+                (
+                    b.0.min(n.x),
+                    b.1.min(n.y),
+                    b.2.max(n.x + n.width),
+                    b.3.max(n.y + n.height),
+                )
+            },
+        )
+    }
+
+    /// The demo used to stack every cluster into the same 4 columns: 1160x2526,
+    /// shown at 29% when fitted to the canvas.
+    #[test]
+    fn demo_layout_is_wide_without_overlaps() {
+        let topo = real_demo_topology().visible(&[], &[], &[]);
+        let result = compute_layout(&topo, false);
+        assert_eq!(result.nodes.len(), topo.nodes.len());
+        assert!(
+            result.width > result.height,
+            "{}x{}",
+            result.width,
+            result.height
+        );
+        for (i, a) in result.nodes.iter().enumerate() {
+            for b in &result.nodes[i + 1..] {
+                assert!(!overlap(rect(a), rect(b)), "{} overlaps {}", a.id, b.id);
+            }
+        }
+    }
+
+    #[test]
+    fn a_separate_chain_stays_on_one_row() {
+        let result = compute_layout(&real_demo_topology().visible(&[], &[], &[]), false);
+        let rows: HashSet<i64> = ["slow_step_a", "slow_step_b", "slow_step_c", "slow_step_d"]
+            .iter()
+            .map(|id| find(&result, id).y.round() as i64)
+            .collect();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// `backfill_demo` is a two-node chain plus two nodes without edges; they
+    /// share a cluster, so they sit together (3 rows, not 767px apart as
+    /// before) and no other node lands between them.
+    #[test]
+    fn a_group_stays_together() {
+        let result = compute_layout(&real_demo_topology().visible(&[], &[], &[]), false);
+        let in_group = |n: &&LayoutNode| n.group.as_deref() == Some("backfill_demo");
+        let area = bounds(result.nodes.iter().filter(in_group));
+        assert!(
+            area.3 - area.1 <= 3.0 * (NODE_HEIGHT + NODE_GAP_Y),
+            "{area:?}"
+        );
+        for n in result.nodes.iter().filter(|n| !in_group(n)) {
+            assert!(
+                !overlap(area, rect(n)),
+                "{} sits inside backfill_demo",
+                n.id
+            );
+        }
+    }
+
+    #[test]
+    fn clusters_sit_one_gap_apart() {
+        let topo = GraphTopology {
+            nodes: ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| node(n, "asset", None))
+                .collect(),
+            edges: vec![("b".into(), "a".into()), ("d".into(), "c".into())],
+        };
+        let result = compute_layout(&topo, false);
+        let first = bounds(["a", "b"].iter().map(|id| find(&result, id)));
+        let second = bounds(["c", "d"].iter().map(|id| find(&result, id)));
+        let gap_x = (second.0 - first.2).max(first.0 - second.2);
+        let gap_y = (second.1 - first.3).max(first.1 - second.3);
+        assert!(
+            (gap_x.max(gap_y) - CLUSTER_GAP).abs() < 0.5,
+            "gap {gap_x} / {gap_y}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_edges_fills_columns() {
+        let analytics = vec!["analytics".to_string()];
+        let result = compute_layout(&real_demo_topology().visible(&[], &analytics, &[]), false);
+        let columns: HashSet<i64> = result.nodes.iter().map(|n| n.x.round() as i64).collect();
+        assert_eq!(result.nodes.len(), 8);
+        assert!(columns.len() > 1, "8 nodes without edges formed one column");
     }
 
     #[test]

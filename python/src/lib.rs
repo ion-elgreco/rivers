@@ -9,7 +9,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use opentelemetry::trace::TracerProvider;
 use pyo3::prelude::*;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -35,6 +34,7 @@ mod job;
 pub mod log_capture;
 pub mod metadata;
 pub mod net;
+mod otel;
 pub mod partitions;
 mod repository;
 pub mod result_types;
@@ -72,27 +72,18 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .compact()
         .with_writer(log_capture::TeeWriter);
 
-    // Optional OTel layer — activates when OTEL_EXPORTER_OTLP_ENDPOINT is set
+    // Optional OTel layer — activates when an OTLP endpoint is configured
     let mut otel_build_err = None;
-    let otel_layer = if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        match opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .build()
-        {
-            Ok(exp) => {
-                let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                    .with_batch_exporter(exp)
-                    .with_resource(
-                        opentelemetry_sdk::Resource::builder()
-                            .with_service_name("rivers")
-                            .build(),
-                    )
-                    .build();
-                let tracer = provider.tracer("rivers");
+    let otel_layer = if otel::export_enabled() {
+        match otel::tracer() {
+            Ok(tracer) => {
+                m.py()
+                    .import("atexit")?
+                    .call_method1("register", (pyo3::wrap_pyfunction!(otel::shutdown, m)?,))?;
                 Some(tracing_opentelemetry::layer().with_tracer(tracer))
             }
             Err(err) => {
-                otel_build_err = Some(err.to_string());
+                otel_build_err = Some(format!("{err:#}"));
                 None
             }
         }
@@ -167,6 +158,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         executor::parallel::worker::worker_execute_step,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_retry_policy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_backoff, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_func_ref,
         m
@@ -189,6 +182,18 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_partition_context,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::action::_reconstruct_asset_action,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        assets::dep_def::_reconstruct_dep_def,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        automation::condition::_reconstruct_automation_condition,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::runtime_info, m)?)?;

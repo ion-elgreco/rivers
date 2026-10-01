@@ -2,6 +2,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 
+use jiff::{SignedDuration, civil};
+
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -706,9 +708,8 @@ fn validate_time_window_grid_compat(
                      is not a multiple of upstream interval {ui}s"
                 )));
             }
-            let aligned = (*down_start - *up_start)
-                .num_nanoseconds()
-                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0);
+            let aligned = i64::try_from(down_start.duration_since(*up_start).as_nanos())
+                .is_ok_and(|ns| ns.rem_euclid(up_ns) == 0);
             if !aligned {
                 return Err(MappingValidationError::DefinitionError(format!(
                     "{mapping} mapping requires the downstream grid to be a \
@@ -721,30 +722,29 @@ fn validate_time_window_grid_compat(
         _ => {
             const PROBE_TICKS: usize = 1024;
             let horizon = down_start
-                .checked_add_signed(chrono::Duration::days(1461))
-                .unwrap_or(chrono::NaiveDateTime::MAX);
+                .checked_add(SignedDuration::from_hours(35064))
+                .unwrap_or(civil::DateTime::MAX);
             let horizon = match down_end {
                 Some(e) => (*e).min(horizon),
                 None => horizon,
             };
-            let on_upstream = |t: chrono::NaiveDateTime| -> Result<bool, String> {
+            let on_upstream = |t: civil::DateTime| -> Result<bool, String> {
                 match (up_cron, up_interval) {
                     (Some(expr), _) => cron_grid_contains(expr, t).map_err(|e| e.to_string()),
                     (None, Some(ui)) => {
                         let up_ns = (ui * 1_000_000_000.0) as i64;
                         Ok(up_ns > 0
-                            && (t - *up_start)
-                                .num_nanoseconds()
-                                .is_some_and(|ns| ns.rem_euclid(up_ns) == 0))
+                            && i64::try_from(t.duration_since(*up_start).as_nanos())
+                                .is_ok_and(|ns| ns.rem_euclid(up_ns) == 0))
                     }
                     (None, None) => Ok(false),
                 }
             };
-            let mut offgrid: Option<chrono::NaiveDateTime> = None;
+            let mut offgrid: Option<civil::DateTime> = None;
             let mut walk_err: Option<String> = None;
             let mut count = 0usize;
             {
-                let mut visit = |t: chrono::NaiveDateTime| -> bool {
+                let mut visit = |t: civil::DateTime| -> bool {
                     count += 1;
                     match on_upstream(t) {
                         Ok(true) => count < PROBE_TICKS,
@@ -768,10 +768,10 @@ fn validate_time_window_grid_compat(
             if walk_err.is_none() && offgrid.is_none() && count < 2 {
                 let true_end = match down_end {
                     Some(e) => *e,
-                    None => chrono::NaiveDateTime::MAX,
+                    None => civil::DateTime::MAX,
                 };
                 let mut taken = 0usize;
-                let mut visit2 = |t: chrono::NaiveDateTime| -> bool {
+                let mut visit2 = |t: civil::DateTime| -> bool {
                     taken += 1;
                     match on_upstream(t) {
                         Ok(true) => taken < 2,
@@ -806,7 +806,7 @@ fn validate_time_window_grid_compat(
                      subgrid of the upstream grid: downstream window start {t} \
                      (key '{}') is not on the upstream grid ({upstream_grid}), \
                      so that key would never exist upstream",
-                    t.format(down_fmt)
+                    t.strftime(down_fmt)
                 )));
             }
         }

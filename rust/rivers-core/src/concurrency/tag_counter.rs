@@ -207,6 +207,8 @@ mod tests {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         }
     }
 

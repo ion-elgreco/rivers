@@ -16,10 +16,11 @@ mise install --locked
 
 If you prefer to manage tools yourself, the individual prerequisites are listed below.
 
-- **Rust** (stable) — install via [rustup](https://rustup.rs)
+- **Rust** — install via [rustup](https://rustup.rs); it picks up the version pinned in `rust-toolchain.toml`
 - **Python** ≥ 3.10
 - **[uv](https://docs.astral.sh/uv/)** — package manager for the Python side
 - **[just](https://github.com/casey/just)** — task runner; all dev commands go through the `justfile` at the repo root
+- **[protoc](https://github.com/protocolbuffers/protobuf/releases)** — the gRPC crate generates Rust from `proto/rivers.proto` at build time; the version is pinned in `mise.toml`
 - **Docker** + **[k3d](https://k3d.io/)** + **[helmfile](https://helmfile.readthedocs.io/)** — only needed for local Kubernetes development and integration tests
 
 Optional, only for specific recipes:

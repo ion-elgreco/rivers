@@ -159,9 +159,9 @@ pub struct RetryPolicy {
 }
 
 /// How a policy is attached before resolution — inline, or a name into the
-/// repository `retries` registry. `resolve_retry_refs` collapses every `Named`
-/// to `Inline` at `resolve()`, so resolved nodes only ever hold a concrete
-/// policy. Mirrors the IO-handler `Instance`/`ResourceRef` split.
+/// repository `retries` registry. Each repository resolves a `Named` ref at
+/// `resolve()` into its own nodes, which only ever hold a concrete policy; the
+/// definition keeps the name. Mirrors the IO-handler `Instance`/`ResourceRef` split.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RetryRef {
     Inline(RetryPolicy),

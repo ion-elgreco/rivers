@@ -4,17 +4,20 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
+use crate::components::icons::{IconChevronRight, IconCopy, IconRetry, IconStop, IconTrash};
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::pagination::{InfiniteEventList, PaginatedView};
-use crate::components::ui_kit::{Crumb, StatusChip, Topbar};
+use crate::components::rerun_dialog::RerunConfigDialog;
+use crate::components::traceback::RunFailures;
+use crate::components::ui_kit::{Crumb, EmptyState, SplitButton, StatusChip, Topbar};
 use crate::helpers::{
     code_location_label, format_elapsed, format_relative_time, format_timestamp,
     launched_by_display, nanos_to_datetime, run_status_kind, short_id,
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
-use crate::server_fns::actions::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::{cancel_run, delete_run, rerun_run};
 use crate::server_fns::runs::{
     get_run, get_run_asset_events_page, get_run_logs, get_run_step_events,
     get_run_structured_events_page,
@@ -136,13 +139,20 @@ pub fn RunDetailPage() -> impl IntoView {
         },
         |(id, _)| get_run_step_events(id),
     );
-    let run_logs = Resource::new(
-        move || {
-            params.track();
-            (run_id(), refresh_tick.get())
-        },
-        |(id, _)| get_run_logs(id),
-    );
+    // Client-only on purpose. RunLogPanel is mounted outside the resource
+    // Transition, so if the server resolved this the SSR markup would carry log
+    // rows and tab badges that the freshly-hydrated (still empty) client tree
+    // does not have — an unrecoverable hydration mismatch.
+    let run_logs = LocalResource::new(move || {
+        params.track();
+        let id = run_id();
+        refresh_tick.get();
+        async move { get_run_logs(id).await }
+    });
+    let run_logs_list =
+        Signal::derive(move || run_logs.get().and_then(|r| r.ok()).unwrap_or_default());
+    // Read outside the step events' Transition, so through the effect-filled copy.
+    let step_events_value = crate::helpers::resource_value(step_events);
     let topology = Resource::new(
         move || loc.get(),
         |(ns, name)| async move { crate::server_fns::graph::get_graph_topology(ns, name).await },
@@ -155,11 +165,15 @@ pub fn RunDetailPage() -> impl IntoView {
     // reset it. Reset only when the selected asset or the run changes.
     let (mat_page, set_mat_page) = signal(0u64);
     let (obs_page, set_obs_page) = signal(0u64);
+    let (act_page, set_act_page) = signal(0u64);
+    let (del_page, set_del_page) = signal(0u64);
     Effect::new(move |_| {
         selected_step.track();
         run_id_memo.track();
         set_mat_page.set(0);
         set_obs_page.set(0);
+        set_act_page.set(0);
+        set_del_page.set(0);
     });
     let (log_tab, set_log_tab) = signal("events".to_string());
     let (log_level, set_log_level) = signal("all".to_string());
@@ -170,9 +184,23 @@ pub fn RunDetailPage() -> impl IntoView {
     // actions route by the run's owning location, not the page's.
     let reexecute = Action::new(move |run_id: &String| {
         let run_id = run_id.clone();
-        async move { rerun_run(run_id).await }
+        async move { rerun_run(run_id, None).await }
     });
     let reexecute_pending = reexecute.pending();
+    let reexecute_armed = RwSignal::new(false);
+    let rerun_menu = RwSignal::new(false);
+    let rerun_dialog = RwSignal::new(false);
+    let config_open = RwSignal::new(false);
+    let run_value = crate::helpers::resource_value(run);
+    let run_record = Signal::derive(move || run_value.get().and_then(|r| r.ok()).flatten());
+    // The dialog checks the document against the location that owns the run.
+    let run_owner = Signal::derive(move || {
+        let cl = run_record.with(|r| r.as_ref().map(|r| r.code_location_id.clone()));
+        let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
+        cl.and_then(|cl| entries.into_iter().find(|e| e.identity == cl))
+            .map(|e| (e.namespace, e.name))
+            .unwrap_or_else(|| loc.get())
+    });
 
     let cancel = Action::new(move |id: &String| {
         let id = id.clone();
@@ -187,17 +215,59 @@ pub fn RunDetailPage() -> impl IntoView {
     let delete_pending = delete.pending();
     // Two-click confirm; disarm when navigating to a different run.
     let delete_armed = RwSignal::new(false);
+    let cancel_armed = RwSignal::new(false);
     Effect::new(move |_| {
         run_id_memo.track();
         delete_armed.set(false);
+        cancel_armed.set(false);
+        reexecute_armed.set(false);
+        rerun_menu.set(false);
+        config_open.set(false);
     });
     // A deleted run has no page to stay on — back to the list. Ok(false)
     // means the run was already gone, which lands in the same place.
     let navigate = leptos_router::hooks::use_navigate();
+    let navigate_rerun = navigate.clone();
     Effect::new(move |_| {
         if let Some(Ok(_)) = delete.value().get() {
             let (ns, name) = loc.get_untracked();
             navigate(&loc_path(&ns, &name, "runs"), Default::default());
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Ok(r)) = reexecute.value().get()
+            && !r.run_id.is_empty()
+        {
+            let (ns, name) = loc.get_untracked();
+            navigate_rerun(
+                &loc_path(&ns, &name, &format!("runs/{}", r.run_id)),
+                Default::default(),
+            );
+        }
+    });
+    let action_error = RwSignal::new(Option::<String>::None);
+    Effect::new(move |_| {
+        if let Some(Err(e)) = reexecute.value().get() {
+            action_error.set(Some(format!(
+                "Re-execute failed: {}",
+                crate::helpers::err_text(&e)
+            )));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Err(e)) = cancel.value().get() {
+            action_error.set(Some(format!(
+                "Cancel failed: {}",
+                crate::helpers::err_text(&e)
+            )));
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(Err(e)) = delete.value().get() {
+            action_error.set(Some(format!(
+                "Delete failed: {}",
+                crate::helpers::err_text(&e)
+            )));
         }
     });
 
@@ -210,72 +280,51 @@ pub fn RunDetailPage() -> impl IntoView {
     view! {
         <div class="run-detail-layout">
         <div class="run-detail-main">
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
-            {move || {
-                run.get().map(|result| match result {
-                    Ok(Some(record)) => {
-                        let rerun_run_id = record.run_id.clone();
-                        let status_kind = run_status_kind(&record.status);
-                        let sid = short_id(&record.run_id, 8);
-                        let is_active_status = crate::helpers::run_is_active(&record.status);
-                        let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
-                        // Reactive elapsed: ticks once per second while end_time
-                        // is None (run still in flight), freezes when end_time
-                        // is set.
-                        let run_start_ns = record.start_time;
-                        let run_end_ns = record.end_time;
-                        let elapsed_label = move || {
-                            format_elapsed(Some(run_start_ns), run_end_ns, use_now().get())
-                        };
-                        let (ns, name) = loc.get();
-                        let runs_href = loc_path(&ns, &name, "runs");
-                        let cl_id = record.code_location_id.clone();
-                        let cl_label = {
-                            let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
-                            code_location_label(&cl_id, &entries)
-                        };
-                        view! {
-                            <Topbar crumbs=vec![
-                                Crumb::linked("Runs", runs_href),
-                                Crumb::new(sid.clone()).mono(),
-                            ]>
-                                <LiveStatusChip
-                                    status=live_status
-                                    on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
-                                />
-                                <button
-                                    class="btn btn-tertiary"
-                                    title="Export run events (CSV)"
-                                    disabled=true
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                                        <path d="M7 2v7M4 6l3 3 3-3M2 11h10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    "Export"
-                                </button>
-                                <button
-                                    class="btn btn-tertiary"
-                                    on:click=move |_| { reexecute.dispatch(rerun_run_id.clone()); }
-                                    disabled=move || reexecute_pending.get()
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
-                                        <path d="M12 7a5 5 0 11-1.5-3.5M12 1.5V4H9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    {move || if reexecute_pending.get() { "Retrying..." } else { "Retry from" }}
-                                </button>
+        {move || {
+            let id = run_id_memo.get();
+            let (ns, name) = loc.get();
+            let runs_href = loc_path(&ns, &name, "runs");
+            view! {
+                <Topbar crumbs=vec![
+                    Crumb::linked("Runs", runs_href),
+                    Crumb::new(short_id(&id, 8)).mono().copyable(id.clone()),
+                ]>
+                    <LiveStatusChip
+                        status=live_status
+                        on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+                    />
+                    {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}
+                    <Transition>
+                        {move || run.get().and_then(|r| r.ok()).flatten().map(|record| {
+                            let rerun_run_id = record.run_id.clone();
+                            let rerun_verb = record.action.clone();
+                            let rerun_verb_text = rerun_verb.clone();
+                            let is_active_status = crate::helpers::run_is_active(&record.status);
+                            view! {
                                 {is_active_status.then(|| {
                                     let cancel_id = record.run_id.clone();
                                     view! {
                                         <button
                                             class="btn btn-danger"
-                                            on:click=move |_| { cancel.dispatch(cancel_id.clone()); }
+                                            on:click=move |_| {
+                                                if cancel_armed.get() {
+                                                    cancel_armed.set(false);
+                                                    action_error.set(None);
+                                                    cancel.dispatch(cancel_id.clone());
+                                                } else {
+                                                    cancel_armed.set(true);
+                                                }
+                                            }
                                             disabled=move || cancel_pending.get()
                                         >
-                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                                                <rect x="3" y="2" width="2.5" height="8"/>
-                                                <rect x="6.5" y="2" width="2.5" height="8"/>
-                                            </svg>
-                                            {move || if cancel_pending.get() { "Canceling..." } else { "Cancel run" }}
+                                            <IconStop/>
+                                            {move || if cancel_pending.get() {
+                                                "Canceling…"
+                                            } else if cancel_armed.get() {
+                                                "Confirm cancel?"
+                                            } else {
+                                                "Cancel run"
+                                            }}
                                         </button>
                                     }
                                 })}
@@ -287,6 +336,7 @@ pub fn RunDetailPage() -> impl IntoView {
                                             on:click=move |_| {
                                                 if delete_armed.get() {
                                                     delete_armed.set(false);
+                                                    action_error.set(None);
                                                     delete.dispatch(delete_id.clone());
                                                 } else {
                                                     delete_armed.set(true);
@@ -294,16 +344,9 @@ pub fn RunDetailPage() -> impl IntoView {
                                             }
                                             disabled=move || delete_pending.get()
                                         >
-                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                                                <path
-                                                    d="M2 3h8M4.5 3V1.8h3V3M3 3l.6 7.2h4.8L9 3M4.9 5v3.5M7.1 5v3.5"
-                                                    stroke="currentColor"
-                                                    stroke-width="1.1"
-                                                    stroke-linecap="round"
-                                                />
-                                            </svg>
+                                            <IconTrash/>
                                             {move || if delete_pending.get() {
-                                                "Deleting..."
+                                                "Deleting…"
                                             } else if delete_armed.get() {
                                                 "Confirm delete?"
                                             } else {
@@ -312,7 +355,68 @@ pub fn RunDetailPage() -> impl IntoView {
                                         </button>
                                     }
                                 })}
-                            </Topbar>
+                                {(!is_active_status).then(move || view! {
+                                    <SplitButton
+                                        variant="btn-primary"
+                                        disabled=Signal::derive(move || reexecute_pending.get())
+                                        menu_label="Re-execute with config…"
+                                        on_menu=Callback::new(move |()| {
+                                            reexecute_armed.set(false);
+                                            rerun_dialog.set(true);
+                                        })
+                                        open=rerun_menu
+                                    >
+                                        <button
+                                            class="btn btn-primary"
+                                            on:click=move |_| {
+                                                let (dispatch, armed) = crate::helpers::replay_click(
+                                                    rerun_verb.is_some(),
+                                                    reexecute_armed.get(),
+                                                );
+                                                reexecute_armed.set(armed);
+                                                if dispatch {
+                                                    action_error.set(None);
+                                                    reexecute.dispatch(rerun_run_id.clone());
+                                                }
+                                            }
+                                            disabled=move || reexecute_pending.get()
+                                        >
+                                            <IconRetry/>
+                                            {move || crate::helpers::replay_button_text(
+                                                rerun_verb_text.as_deref(),
+                                                reexecute_armed.get(),
+                                                reexecute_pending.get(),
+                                            )}
+                                        </button>
+                                    </SplitButton>
+                                })}
+                            }
+                        })}
+                    </Transition>
+                </Topbar>
+            }
+        }}
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
+            {move || {
+                run.get().map(|result| match result {
+                    Ok(Some(record)) => {
+                        let sid = short_id(&record.run_id, 8);
+                        let status_kind = run_status_kind(&record.status);
+                        let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
+                        // Reactive elapsed: ticks once per second while end_time
+                        // is None (run still in flight), freezes when end_time
+                        // is set.
+                        let run_start_ns = record.start_time;
+                        let run_end_ns = record.end_time;
+                        let elapsed_label = move || {
+                            format_elapsed(Some(run_start_ns), run_end_ns, use_now().get())
+                        };
+                        let cl_id = record.code_location_id.clone();
+                        let cl_label = {
+                            let entries = locations.get().and_then(|r| r.ok()).unwrap_or_default();
+                            code_location_label(&cl_id, &entries)
+                        };
+                        view! {
 
                             <div class="run-header-block">
                                 <div class="section-header-label">{
@@ -323,7 +427,12 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }</div>
                                 <div class="run-trigger-meta">
                                     <StatusChip kind=status_kind.to_string()/>
-                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, chrono::Utc::now().timestamp())>{format_timestamp(Some(record.start_time))}</span>
+                                    {record.action.clone().map(|verb| view! {
+                                        <span class="run-trigger-meta-item" title="asset action">
+                                            "action "<span class="run-trigger-meta-value">{verb}</span>
+                                        </span>
+                                    })}
+                                    <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, jiff::Timestamp::now().as_second())>{format_timestamp(Some(record.start_time))}</span>
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
                                     <span class="run-trigger-meta-sep">"·"</span>
@@ -367,51 +476,95 @@ pub fn RunDetailPage() -> impl IntoView {
                                 }
                             })}
 
+                            {record.config.as_ref().map(|config| {
+                                let pretty = serde_json::from_str::<serde_json::Value>(config)
+                                    .and_then(|v| serde_json::to_string_pretty(&v))
+                                    .unwrap_or_else(|_| config.clone());
+                                let copy_text = pretty.clone();
+                                view! {
+                                    <div class="run-config">
+                                        <div class="run-config-head">
+                                            <button
+                                                class="run-config-toggle"
+                                                on:click=move |_| config_open.update(|o| *o = !*o)
+                                                aria-expanded=move || config_open.get().to_string()
+                                            >
+                                                <span class="chev-btn" class:chev-btn--open=move || config_open.get()>
+                                                    <IconChevronRight/>
+                                                </span>
+                                                <span class="section-header-label">"CONFIG"</span>
+                                            </button>
+                                            <button
+                                                class="btn btn-small copyable"
+                                                data-copy=copy_text
+                                                title="Copy the launch config as JSON"
+                                            >
+                                                <IconCopy/>"Copy"
+                                            </button>
+                                        </div>
+                                        <Show when=move || config_open.get()>
+                                            <pre class="run-config-text">{pretty.clone()}</pre>
+                                        </Show>
+                                    </div>
+                                }
+                            })}
+
                         }.into_any()
                     }
-                    Ok(None) => view! { <div class="error-msg">"Run not found."</div> }.into_any(),
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Ok(None) => view! { <div class="error-msg">"Run not found"</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load run: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
-        <div class="tab-content">
-            <Transition fallback=move || view! { <div class="loading">"Loading timeline..."</div> }>
-                {move || {
-                    let run_data = run.get().and_then(|r| r.ok()).flatten();
-                    let steps = step_events.get()?.ok()?;
-                    let run_start = run_data.as_ref().map(|r| r.start_time);
-                    Some(view! {
-                        <RunTimelinePanel
-                            events={steps}
-                            run_start={run_start}
-                            node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
-                            topology={topology.get().and_then(|r| r.ok())}
-                            selected_step=selected_step
-                            on_select=set_selected_step
-                            view_mode=view_mode
-                            set_view_mode=set_view_mode
-                        />
-                    })
-                }}
-            </Transition>
-            // Created once (not in the resource Transition) so a live refresh can't
-            // re-mount it and reset the scroll buffer. `run_logs` is reactive, so
-            // stdout/stderr still update live.
-            <RunLogPanel
-                run_id=run_id_memo
-                refresh_tick=refresh_tick
-                run_logs=Signal::derive(move || {
-                    run_logs.get().and_then(|r| r.ok()).unwrap_or_default()
-                })
-                selected_step=selected_step
-                on_clear=set_selected_step
-                log_tab=log_tab
-                set_log_tab=set_log_tab
-                log_level=log_level
-                set_log_level=set_log_level
-            />
-        </div>
+        <Transition>
+            <Show when=move || !matches!(run.get(), Some(Ok(None)))>
+                <div class="tab-content">
+                    <RunFailures
+                        step_events=Signal::derive(move || {
+                            step_events_value.get().and_then(|r| r.ok()).unwrap_or_default()
+                        })
+                        run_logs=run_logs_list
+                    />
+                    <Transition fallback=move || view! { <div class="loading">"Loading timeline…"</div> }>
+                        {move || {
+                            let run_data = run.get().and_then(|r| r.ok()).flatten();
+                            let steps = step_events.get()?.ok()?;
+                            let run_start = run_data.as_ref().map(|r| r.start_time);
+                            Some(view! {
+                                <RunTimelinePanel
+                                    events={steps}
+                                    run_start={run_start}
+                                    node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
+                                    topology={topology.get().and_then(|r| r.ok())}
+                                    selected_step=selected_step
+                                    on_select=set_selected_step
+                                    view_mode=view_mode
+                                    set_view_mode=set_view_mode
+                                />
+                            })
+                        }}
+                    </Transition>
+                    // Mounted once (not in a closure over the run) so a live refresh can't
+                    // re-mount it and reset the scroll buffer. `run_logs` is reactive, so
+                    // stdout/stderr still update live.
+                    <RunLogPanel
+                        run_id=run_id_memo
+                        refresh_tick=refresh_tick
+                        run_logs=run_logs_list
+                        logs_error=Signal::derive(move || {
+                            run_logs.get().and_then(|r| r.err()).map(|e| crate::helpers::err_text(&e))
+                        })
+                        selected_step=selected_step
+                        on_clear=set_selected_step
+                        log_tab=log_tab
+                        set_log_tab=set_log_tab
+                        log_level=log_level
+                        set_log_level=set_log_level
+                    />
+                </div>
+            </Show>
+        </Transition>
 
         </div>
 
@@ -431,12 +584,17 @@ pub fn RunDetailPage() -> impl IntoView {
                             set_mat_page=set_mat_page
                             obs_page=obs_page
                             set_obs_page=set_obs_page
+                            act_page=act_page
+                            set_act_page=set_act_page
+                            del_page=del_page
+                            set_del_page=set_del_page
                             on_close=set_selected_step
                         />
                     })
                 }}
             </Transition>
         </Show>
+        <RerunConfigDialog show=rerun_dialog run=run_record location=run_owner/>
         </div>
     }
 }
@@ -528,7 +686,7 @@ fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static st
 /// Event log lives in the main LogPanel below — selection filters it, so we
 /// don't duplicate here.
 #[component]
-fn RunAssetDrawer(
+pub fn RunAssetDrawer(
     asset_key: String,
     run_id: String,
     step_events: Vec<StoredEvent>,
@@ -537,6 +695,10 @@ fn RunAssetDrawer(
     set_mat_page: WriteSignal<u64>,
     obs_page: ReadSignal<u64>,
     set_obs_page: WriteSignal<u64>,
+    act_page: ReadSignal<u64>,
+    set_act_page: WriteSignal<u64>,
+    del_page: ReadSignal<u64>,
+    set_del_page: WriteSignal<u64>,
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
@@ -634,6 +796,54 @@ fn RunAssetDrawer(
             },
         )
     };
+    // Action runs report through ActionCompleted events — without this third
+    // card the metadata an action attaches is unreachable from the run page.
+    let (act_page_size, set_act_page_size) = signal(25u64);
+    let actions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (act_page.get(), act_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(
+                        run_id,
+                        asset_key,
+                        "ActionCompleted".to_string(),
+                        p * ps,
+                        ps,
+                    )
+                    .await
+                }
+            },
+        )
+    };
+    // A delete run's only asset event is its Deletion.
+    let (del_page_size, set_del_page_size) = signal(25u64);
+    let deletions_page = {
+        let run_id = run_id.clone();
+        let asset_key = asset_key.clone();
+        Resource::new(
+            move || (del_page.get(), del_page_size.get()),
+            move |(p, ps)| {
+                let run_id = run_id.clone();
+                let asset_key = asset_key.clone();
+                async move {
+                    get_run_asset_events_page(run_id, asset_key, "Deletion".to_string(), p * ps, ps)
+                        .await
+                }
+            },
+        )
+    };
+    let del_total = Signal::derive(move || {
+        deletions_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
     let mat_total = Signal::derive(move || {
         materializations_page
             .get()
@@ -648,9 +858,16 @@ fn RunAssetDrawer(
             .map(|p| p.total)
             .unwrap_or(0)
     });
+    let act_total = Signal::derive(move || {
+        actions_page
+            .get()
+            .and_then(|r| r.ok())
+            .map(|p| p.total)
+            .unwrap_or(0)
+    });
     let step_count = asset_step_events.len() as u64;
 
-    let (loc_ns, loc_name) = use_current_location().get();
+    let (loc_ns, loc_name) = use_current_location().get_untracked();
     let asset_href = loc_path(&loc_ns, &loc_name, &format!("assets/{asset_key}"));
     view! {
         <div class="run-asset-drawer">
@@ -663,8 +880,9 @@ fn RunAssetDrawer(
                     </div>
                 </div>
                 <button
-                    class="run-asset-drawer-close"
+                    class="icon-btn"
                     title="Close"
+                    aria-label="Close"
                     on:click=move |_| on_close.set(None)
                 >"×"</button>
             </div>
@@ -685,7 +903,7 @@ fn RunAssetDrawer(
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"EVENTS"</div>
-                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + step_count).to_string()}</div>
+                        <div class="run-asset-drawer-kv-value">{move || (mat_total.get() + obs_total.get() + act_total.get() + del_total.get() + step_count).to_string()}</div>
                     </div>
                     <div class="run-asset-drawer-kv">
                         <div class="run-asset-drawer-kv-label">"UPSTREAM"</div>
@@ -699,6 +917,18 @@ fn RunAssetDrawer(
                         <div class="run-asset-drawer-kv-label">"OBSERVATIONS"</div>
                         <div class="run-asset-drawer-kv-value">{move || obs_total.get().to_string()}</div>
                     </div>
+                    <Show when={move || act_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"ACTIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || act_total.get().to_string()}</div>
+                        </div>
+                    </Show>
+                    <Show when={move || del_total.get() > 0}>
+                        <div class="run-asset-drawer-kv">
+                            <div class="run-asset-drawer-kv-label">"DELETIONS"</div>
+                            <div class="run-asset-drawer-kv-value">{move || del_total.get().to_string()}</div>
+                        </div>
+                    </Show>
                 </div>
             </div>
 
@@ -745,6 +975,38 @@ fn RunAssetDrawer(
                         set_page_size=set_obs_page_size
                         render={move |rows: Vec<crate::types::StoredEvent>| view! {
                             <div class="run-asset-drawer-materializations">{render_event_cards(rows, "observation")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || act_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"ACTION"</div>
+                    <PaginatedView
+                        data=actions_page
+                        page=act_page
+                        set_page=set_act_page
+                        page_size=act_page_size
+                        set_page_size=set_act_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "action")}</div>
+                        }.into_any()}
+                    />
+                </div>
+            </Show>
+
+            <Show when={move || del_total.get() > 0}>
+                <div class="run-asset-drawer-section">
+                    <div class="section-header-label" style="margin-bottom:8px">"DELETION"</div>
+                    <PaginatedView
+                        data=deletions_page
+                        page=del_page
+                        set_page=set_del_page
+                        page_size=del_page_size
+                        set_page_size=set_del_page_size
+                        render={move |rows: Vec<crate::types::StoredEvent>| view! {
+                            <div class="run-asset-drawer-materializations">{render_event_cards(rows, "deletion")}</div>
                         }.into_any()}
                     />
                 </div>
@@ -916,22 +1178,24 @@ fn RunTimelinePanel(
             <div class="run-view-panel-header">
                 <span class="section-header-label">{move || header_label.get()}</span>
                 <div class="run-view-panel-actions">
-                    <div class="view-pill-group">
-                        {["dag", "gantt"].into_iter().map(|v| {
+                    <div class="filter-pill-group">
+                        {[("dag", "DAG"), ("gantt", "Gantt")].into_iter().map(|(v, label)| {
                             let vs = v.to_string();
                             let vs_for_cls = vs.clone();
+                            let vs_for_aria = vs.clone();
                             view! {
                                 <button
-                                    class=move || if view_mode.get() == vs_for_cls { "view-pill view-pill--active" } else { "view-pill" }
+                                    class=move || if view_mode.get() == vs_for_cls { "filter-pill filter-pill--active" } else { "filter-pill" }
+                                    aria-pressed=move || (view_mode.get() == vs_for_aria).to_string()
                                     on:click=move |_| set_view_mode.set(vs.clone())
-                                >{v}</button>
+                                >{label}</button>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
                 </div>
             </div>
             {if !has_steps {
-                view! { <div class="empty-state" style="margin:20px 16px">"No execution steps recorded yet."</div> }.into_any()
+                view! { <div class="run-view-empty"><EmptyState message="No steps recorded yet" compact=true/></div> }.into_any()
             } else {
                 view! { {body_view} }.into_any()
             }}
@@ -947,10 +1211,16 @@ struct LaneRow {
     width_pct: f64,
 }
 
+/// Finer units for shorter spans, so the axis ticks of a fast run stay distinct.
 fn fmt_dur_short(secs: f64) -> String {
     let abs = secs.abs();
-    if abs < 1.0 {
-        // Sub-second: show millis so a sub-second run doesn't render every tick as "0s".
+    if abs == 0.0 {
+        "0ms".to_string()
+    } else if abs < 0.001 {
+        format!("{}µs", (abs * 1e6).round() as i64)
+    } else if abs < 0.01 {
+        format!("{:.1}ms", abs * 1000.0)
+    } else if abs < 1.0 {
         format!("{}ms", (abs * 1000.0).round() as i64)
     } else if abs < 10.0 {
         format!("{:.1}s", abs)
@@ -1046,26 +1316,8 @@ fn RunGanttBody(
 }
 fn format_log_timestamp(ts: i64) -> String {
     nanos_to_datetime(ts)
-        .map(|d| d.format("%H:%M:%S%.3f").to_string())
+        .map(|d| d.strftime("%H:%M:%S%.3f").to_string())
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn event_type_label(evt: &StoredEvent) -> &'static str {
-    match evt.event_type {
-        EventType::StepStart => "STEP_START",
-        EventType::StepSuccess => "STEP_SUCCESS",
-        EventType::StepFailure => "STEP_FAILURE",
-        EventType::StepRetry => "STEP_RETRY",
-        EventType::Materialization => "MATERIALIZATION",
-        EventType::Observation => "OBSERVATION",
-        EventType::RunQueued => "RUN_QUEUED",
-        EventType::RunDequeued => "RUN_DEQUEUED",
-        EventType::RunLaunchFailed => "RUN_LAUNCH_FAILED",
-        EventType::StepSlotClaimed => "SLOT_CLAIMED",
-        EventType::StepSlotWaiting => "SLOT_WAITING",
-        EventType::StepSlotRenewed => "SLOT_RENEWED",
-        EventType::StepSlotReleased => "SLOT_RELEASED",
-    }
 }
 
 fn event_row_class(evt: &StoredEvent) -> &'static str {
@@ -1081,6 +1333,8 @@ fn event_row_class(evt: &StoredEvent) -> &'static str {
         EventType::StepSlotClaimed | EventType::StepSlotReleased => "log-row--info",
         EventType::StepSlotWaiting => "log-row--warn",
         EventType::StepSlotRenewed => "log-row--muted",
+        EventType::ActionCompleted => "log-row--success",
+        EventType::Deletion => "log-row--warn",
     }
 }
 
@@ -1150,6 +1404,20 @@ fn event_info(evt: &StoredEvent) -> String {
         }
         EventType::StepSlotRenewed => "Lease renewed".to_string(),
         EventType::StepSlotReleased => "Released pool slots".to_string(),
+        EventType::ActionCompleted => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Action completed{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
+        EventType::Deletion => {
+            let action = metadata_value(evt, "action");
+            format!(
+                "Materialization state cleared{}",
+                action.map(|a| format!(" ({a})")).unwrap_or_default()
+            )
+        }
     }
 }
 
@@ -1373,6 +1641,7 @@ fn RunLogPanel(
     run_id: Memo<String>,
     refresh_tick: ReadSignal<u32>,
     run_logs: Signal<Vec<RunLog>>,
+    logs_error: Signal<Option<String>>,
     selected_step: ReadSignal<Option<String>>,
     on_clear: WriteSignal<Option<String>>,
     log_tab: ReadSignal<String>,
@@ -1428,74 +1697,65 @@ fn RunLogPanel(
         <div class="log-panel">
             <div class="log-panel-header">
                 <span class="log-panel-label">"LOGS"</span>
-                <div class="log-panel-tabs">
-                    <button
-                        class=move || if log_tab.get() == "events" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("events".to_string())
-                    >"events"</button>
-                    <button
-                        class=move || if log_tab.get() == "logs" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("logs".to_string())
-                        disabled=move || all_logs.get().is_empty()
-                    >
-                        "logs"
-                        {move || (!all_logs.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge">{all_logs.get().len()}</span>
-                        })}
-                    </button>
-                    <button
-                        class=move || if log_tab.get() == "stdout" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("stdout".to_string())
-                        disabled=move || all_stdout.get().is_empty()
-                    >
-                        "stdout"
-                        {move || (!all_stdout.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge">{all_stdout.get().len()}</span>
-                        })}
-                    </button>
-                    <button
-                        class=move || if log_tab.get() == "stderr" { "log-tab log-tab--active" } else { "log-tab" }
-                        on:click=move |_| set_log_tab.set("stderr".to_string())
-                        disabled=move || all_stderr.get().is_empty()
-                    >
-                        "stderr"
-                        {move || (!all_stderr.get().is_empty()).then(|| view! {
-                            <span class="log-tab-badge log-tab-badge--error">{all_stderr.get().len()}</span>
-                        })}
-                    </button>
+                <div class="filter-pill-group">
+                    {[("events", "Events"), ("logs", "Logs"), ("stdout", "Stdout"), ("stderr", "Stderr")]
+                        .into_iter()
+                        .map(|(tab, label)| {
+                            let lines = move || match tab {
+                                "logs" => all_logs.get().len(),
+                                "stdout" => all_stdout.get().len(),
+                                "stderr" => all_stderr.get().len(),
+                                _ => 0,
+                            };
+                            let count_cls = if tab == "stderr" { "count count--error" } else { "count" };
+                            view! {
+                                <button
+                                    class=move || if log_tab.get() == tab { "filter-pill filter-pill--active" } else { "filter-pill" }
+                                    aria-pressed=move || (log_tab.get() == tab).to_string()
+                                    on:click=move |_| set_log_tab.set(tab.to_string())
+                                    disabled=move || tab != "events" && lines() == 0
+                                >
+                                    {label}
+                                    {move || (lines() > 0).then(|| view! { <span class=count_cls>{lines()}</span> })}
+                                </button>
+                            }
+                        })
+                        .collect::<Vec<_>>()}
                 </div>
                 <Show when=move || selected_step.get().is_some()>
                     <button
                         class="log-filter-chip"
+                        title="Clear the asset filter"
                         on:click=move |_| on_clear.set(None)
                     >
                         {move || format!("Filtered: {}", selected_step.get().unwrap_or_default())}
-                        <span class="log-filter-chip-x">" x"</span>
+                        <span class="log-filter-chip-x" aria-hidden="true">" ×"</span>
                     </button>
                 </Show>
                 <Show when=move || matches!(log_tab.get().as_str(), "logs" | "stdout" | "stderr")>
-                    <div class="log-panel-tabs log-level-pills" style="margin-left:auto">
-                        {["all", "info", "debug", "warn", "error"].into_iter().map(|lvl| {
-                            let lvl_s = lvl.to_string();
-                            let lvl_for_cls = lvl_s.clone();
-                            let level_cls = move || {
-                                let active = log_level.get() == lvl_for_cls;
-                                let base = if active { "log-tab log-tab--active" } else { "log-tab" };
-                                match lvl_for_cls.as_str() {
-                                    "info" => format!("{base} log-tab--info"),
-                                    "debug" => format!("{base} log-tab--debug"),
-                                    "warn" => format!("{base} log-tab--warn"),
-                                    "error" => format!("{base} log-tab--error"),
-                                    _ => base.to_string(),
+                    <div class="filter-pill-group" style="margin-left:auto">
+                        {[("all", "All"), ("info", "Info"), ("debug", "Debug"), ("warn", "Warn"), ("error", "Error")]
+                            .into_iter()
+                            .map(|(lvl, label)| {
+                                let tint = match lvl {
+                                    "info" => " filter-pill--info",
+                                    "warn" => " filter-pill--warn",
+                                    "error" => " filter-pill--error",
+                                    _ => "",
+                                };
+                                view! {
+                                    <button
+                                        class=move || if log_level.get() == lvl {
+                                            format!("filter-pill filter-pill--active{tint}")
+                                        } else {
+                                            format!("filter-pill{tint}")
+                                        }
+                                        aria-pressed=move || (log_level.get() == lvl).to_string()
+                                        on:click=move |_| set_log_level.set(lvl.to_string())
+                                    >{label}</button>
                                 }
-                            };
-                            view! {
-                                <button
-                                    class=level_cls
-                                    on:click=move |_| set_log_level.set(lvl_s.clone())
-                                >{lvl}</button>
-                            }
-                        }).collect::<Vec<_>>()}
+                            })
+                            .collect::<Vec<_>>()}
                     </div>
                 </Show>
                 <div
@@ -1507,6 +1767,9 @@ fn RunLogPanel(
                 </div>
             </div>
 
+            {move || logs_error.get().map(|msg| view! {
+                <div class="error-msg log-panel-error">{format!("Couldn't load logs: {msg}")}</div>
+            })}
             <div style=move || if log_tab.get() == "events" { "" } else { "display:none" }>
                 <div class="log-event-row log-event-head">
                     <span class="log-col-time">"Time"</span>
@@ -1523,7 +1786,7 @@ fn RunLogPanel(
                         let row_class = event_row_class(&evt);
                         let ts = format_log_timestamp(evt.timestamp);
                         let asset = evt.asset_key.clone().unwrap_or_default();
-                        let etype = event_type_label(&evt);
+                        let etype = evt.event_type.label();
                         let info = event_info(&evt);
                         view! {
                             <div class=format!("log-event-row {row_class}")>
@@ -1583,6 +1846,20 @@ fn RunLogPanel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_spans_keep_axis_ticks_distinct() {
+        let labels: Vec<String> = (0..=8)
+            .map(|i| fmt_dur_short(i as f64 * 0.001 / 8.0))
+            .collect();
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+        assert_eq!(fmt_dur_short(0.0), "0ms");
+        assert_eq!(fmt_dur_short(0.000_125), "125µs");
+        assert_eq!(fmt_dur_short(0.0042), "4.2ms");
+        assert_eq!(fmt_dur_short(0.25), "250ms");
+        assert_eq!(fmt_dur_short(3.0), "3.0s");
+    }
 
     fn ev(event_type: EventType, partition_key: Option<&str>) -> StoredEvent {
         StoredEvent {

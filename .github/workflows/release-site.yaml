@@ -1,0 +1,53 @@
+name: release-site
+
+# Publishes the landing page (www/) to the ROOT of the `gh-pages` branch.
+# The versioned docs live under `docs/` on the same branch and are owned by
+# `release-docs.yaml` via mike's `--deploy-prefix docs`. Both workflows push
+# to `gh-pages`, so they share a concurrency group to serialise.
+#
+# One-time setup required outside this workflow:
+# - In repo Settings -> Pages, set the custom domain to `orchestrator.rs`.
+#   `www/CNAME` keeps the file in place on every publish.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "www/**"
+      - ".github/workflows/release-site.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish landing page
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # the site-deploy recipe pushes to gh-pages
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git for the gh-pages push
+        env:
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          git config user.name "${ACTOR}"
+          git config user.email "${ACTOR}@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Publish
+        run: just site-deploy

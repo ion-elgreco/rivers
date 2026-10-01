@@ -3,7 +3,9 @@
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
-use crate::types::{EventsPage, RunFilter, RunLog, RunRecord, RunsPage, RunsSummary, StoredEvent};
+use crate::types::{
+    EventsPage, RunFilter, RunLog, RunRecord, RunsPage, RunsSummary, StoredEvent, Traceback,
+};
 
 /// Latest runs across all code locations. `status` accepts the wire-string
 /// form of [`RunStatus`] (`"Success"`, `"Failure"`, `"Started"`,
@@ -56,18 +58,6 @@ pub async fn get_runs_by_ids(run_ids: Vec<String>) -> Result<Vec<RunRecord>, Ser
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-#[server]
-pub async fn get_run_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-    let state = expect_context::<crate::state::AppState>();
-    state
-        .storage
-        .get_events_for_run(&run_id)
-        .await
-        .map(|evts| evts.into_iter().map(Into::into).collect())
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
 /// Step events for a run — backs the timeline/DAG.
 #[server]
 pub async fn get_run_step_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {
@@ -91,6 +81,27 @@ pub async fn get_run_logs(run_id: String) -> Result<Vec<RunLog>, ServerFnError> 
         .await
         .map(|logs| logs.into_iter().map(Into::into).collect())
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// The traceback of `step_key`'s attempt that ended with the `StepFailure` or
+/// `StepRetry` event at `at`, for pages that do not load the run's logs.
+#[server]
+pub async fn get_step_traceback(
+    run_id: String,
+    step_key: String,
+    at: i64,
+) -> Result<Option<Traceback>, ServerFnError> {
+    use rivers_core::storage::StorageBackend;
+    let state = expect_context::<crate::state::AppState>();
+    let logs: Vec<RunLog> = state
+        .storage
+        .get_run_logs(&run_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(crate::types::traceback_for(&logs, &step_key, at).cloned())
 }
 
 /// A page of a run's structured (non-log) events, optionally scoped to one
@@ -160,10 +171,7 @@ pub async fn get_runs_page(
 #[server]
 pub async fn get_runs_summary() -> Result<RunsSummary, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
-    let cutoff = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_sub(86_400_000_000_000);
+    let cutoff = (jiff::Timestamp::now().as_nanosecond() as i64).saturating_sub(86_400_000_000_000);
     state
         .storage
         .get_all_runs_summary(cutoff)
@@ -208,7 +216,7 @@ pub async fn get_runs_for_asset(
     let runs = state
         .storage
         .for_code_location(&ctx)
-        .get_runs(limit.unwrap_or(1000), None)
+        .get_runs(1000, None)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(runs

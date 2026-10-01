@@ -1,5 +1,6 @@
 """Integration tests for storage wiring across the API surface."""
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -342,16 +343,45 @@ def test_cleanup_storage_noop_if_missing(tmp_path: Path):
 
 def test_create_storage_memory():
     """_create_storage with memory=True returns in-memory storage."""
-    storage = _create_storage(memory=True, storage_path="unused")
+    storage, scratch = _create_storage(
+        memory=True, storage_path="unused", surreal_endpoint=None
+    )
     assert storage.type == rs.StorageType.Memory
+    assert scratch is None
 
 
 def test_create_storage_embedded(tmp_path: Path):
     """_create_storage with memory=False returns embedded storage."""
     path = str(tmp_path / "db")
-    storage = _create_storage(memory=False, storage_path=path)
+    storage, scratch = _create_storage(
+        memory=False, storage_path=path, surreal_endpoint=None
+    )
     assert storage.type == rs.StorageType.Embedded
     assert Path(path).exists()
+    assert scratch is None
+
+
+def test_scratch_store_closes_when_the_repository_releases_it(tmp_path, monkeypatch):
+    """Windows cannot remove the flagless scratch store while its files are
+    open, so the repository's release must close it: the same path then
+    opens again in this process."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    storage, scratch = _create_storage(
+        memory=False, storage_path=None, surreal_endpoint=None
+    )
+    assert Path(scratch).parent == tmp_path
+    storage.kv_set("kept", b"value")
+
+    @rs.Asset(io_handler=rs.InMemoryIOHandler())
+    def numbers() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[numbers])
+    repo.resolve(storage=storage)
+    del storage
+    repo._release_storage()
+
+    assert rs.Storage.embedded(scratch).kv_get("kept") == b"value"
 
 
 # --- CLI integration tests ---
@@ -783,3 +813,22 @@ def test_run_status_round_trip(status: str):
     record = storage.get_run(run_id)
     assert record is not None
     assert record.status == status
+
+
+def test_run_record_keeps_its_config():
+    """`RunRecord.config` round-trips as the launch document the run was
+    given; a run launched with the definitions as they are reads back `None`."""
+    storage = rs.Storage.memory()
+    document = {
+        "assets": {
+            "a": {
+                "config": {"threshold": 0.9, "mode": "full"},
+                "metadata": {"tier": "gold"},
+            }
+        }
+    }
+    storage._create_run("with-cfg", "", "Queued", 1, node_names=["a"], config=document)
+    storage._create_run("defaults", "", "Queued", 2, node_names=["a"])
+
+    assert storage.get_run("with-cfg").config == document
+    assert storage.get_run("defaults").config is None

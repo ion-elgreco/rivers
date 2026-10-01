@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, RunStats};
+use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, ResourceInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
@@ -25,32 +25,32 @@ pub struct DeploymentInfo {
     pub daemon_sensors: usize,
 }
 
+/// The resources a launch document may override, for the launch dialogs.
 #[server]
-pub async fn get_run_stats() -> Result<RunStats, ServerFnError> {
-    use rivers_core::storage::{RunStatus, StorageBackend};
-    let state = expect_context::<crate::state::AppState>();
+pub async fn get_resources_info(
+    loc_ns: String,
+    loc_name: String,
+) -> Result<Vec<ResourceInfo>, ServerFnError> {
+    use rivers_api::rivers::GetAssetsInfoRequest;
 
-    let runs = state
-        .storage
-        .get_all_runs(10000, None)
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let mut stats = RunStats {
-        total: runs.len(),
-        ..Default::default()
-    };
-    for run in &runs {
-        match run.status {
-            RunStatus::Success => stats.success += 1,
-            RunStatus::Failure => stats.failure += 1,
-            RunStatus::Started => stats.started += 1,
-            RunStatus::NotStarted => stats.not_started += 1,
-            RunStatus::Queued => stats.queued += 1,
-            RunStatus::Canceled => stats.canceled += 1,
-        }
-    }
-    Ok(stats)
+    let resp = client
+        .get_assets_info(GetAssetsInfoRequest {})
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp
+        .into_inner()
+        .resources
+        .into_iter()
+        .map(|r| ResourceInfo {
+            key: r.key,
+            config_schema: r.config_schema,
+        })
+        .collect())
 }
 
 #[server]
@@ -70,7 +70,7 @@ pub async fn get_assets_info(
     let resp = client
         .get_assets_info(GetAssetsInfoRequest {})
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(super::grpc_err)?;
 
     let mut assets: Vec<AssetDefinitionInfo> = resp
         .into_inner()
@@ -104,6 +104,18 @@ pub async fn get_assets_info(
                     function_name: h.function_name,
                 })
                 .collect();
+            let actions = a
+                .actions
+                .into_iter()
+                .map(|act| crate::types::AssetActionInfo {
+                    name: act.name,
+                    outcome: act.outcome,
+                    exclusive: act.exclusive,
+                    partitioning: act.partitioning,
+                    description: act.description,
+                    config_schema: act.config_schema,
+                })
+                .collect();
             AssetDefinitionInfo {
                 asset_key: a.asset_key,
                 description: a.description,
@@ -118,6 +130,9 @@ pub async fn get_assets_info(
                 group: a.group,
                 code_version: a.code_version,
                 asset_type: a.asset_type,
+                actions,
+                config_schema: a.config_schema,
+                metadata: a.metadata,
             }
         })
         .collect();
@@ -305,7 +320,7 @@ pub async fn get_partition_keys_page(
             dimension,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .map_err(super::grpc_err)?
         .into_inner();
     Ok((resp.keys, resp.total))
 }
@@ -333,7 +348,7 @@ pub async fn get_partition_key_index(
             dimension,
         })
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .map_err(super::grpc_err)?
         .into_inner();
     Ok(resp.index)
 }
@@ -445,7 +460,7 @@ pub async fn get_deployment_info(
                 .unwrap_or(0);
         }
 
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         if let Ok(resp) = client.get_schedules(GetSchedulesRequest {}).await {
             let schedules = resp.into_inner().schedules;
             daemon_schedules = schedules.len();

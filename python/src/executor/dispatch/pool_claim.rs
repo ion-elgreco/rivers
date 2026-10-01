@@ -11,7 +11,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{
-    ConcurrencyClaimStatus, DEFAULT_LEASE_DURATION_SECS, EventRecord, EventType,
+    AssetScope, ConcurrencyClaimStatus, DEFAULT_LEASE_DURATION_SECS, EventRecord, EventType,
     ScopedStorageHandle, StorageBackend,
 };
 use tokio::sync::mpsc;
@@ -40,6 +40,19 @@ static CLAIM_POLL_JITTER: LazyLock<Duration> =
     LazyLock::new(|| parse_duration_env("RIVERS_CLAIM_POLL_JITTER", DEFAULT_CLAIM_POLL_JITTER));
 static CLAIM_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| parse_duration_env("RIVERS_CLAIM_TIMEOUT", DEFAULT_CLAIM_TIMEOUT));
+
+/// The run was cancelled while the step waited for its slots. Asset-pool waits
+/// never time out, so the wait polls cancellation instead.
+#[derive(Debug)]
+pub(crate) struct ClaimCancelled;
+
+impl std::fmt::Display for ClaimCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("run cancelled while waiting for pool slots")
+    }
+}
+
+impl std::error::Error for ClaimCancelled {}
 
 /// Holds claimed concurrency slots and a background lease renewal task.
 /// If dropped without calling `release()`, slots are reclaimed by lease expiry
@@ -75,11 +88,12 @@ impl PoolGuard {
     pub async fn acquire(
         storage: &ScopedStorageHandle<SurrealStorage>,
         pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
         run_id: &str,
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
-        claim_async_poll(storage, pools, run_id, step_key, &events).await?;
+        claim_async_poll(storage, pools, scope, run_id, step_key, &events).await?;
         let renewal = AbortOnDrop(spawn_lease_renewal(
             storage.clone(),
             run_id.to_string(),
@@ -100,12 +114,14 @@ impl PoolGuard {
         py: Python,
         storage: &ScopedStorageHandle<SurrealStorage>,
         pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
         run_id: &str,
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
         let storage_c = storage.clone();
         let pools = pools.to_vec();
+        let scope = scope.cloned();
         let run_id_s = run_id.to_string();
         let step_key_s = step_key.to_string();
         let events_c = events.clone();
@@ -113,6 +129,7 @@ impl PoolGuard {
             io_rt().block_on(claim_async_poll(
                 &storage_c,
                 &pools,
+                scope.as_ref(),
                 &run_id_s,
                 &step_key_s,
                 &events_c,
@@ -131,6 +148,54 @@ impl PoolGuard {
             renewal,
             events,
         })
+    }
+
+    /// One claim attempt, never waiting: `None` when a pool is busy right now.
+    /// Lets a caller run free steps first and come back to busy ones.
+    pub fn try_acquire_blocking(
+        py: Python,
+        storage: &ScopedStorageHandle<SurrealStorage>,
+        pools: &[(String, u32)],
+        scope: Option<&AssetScope>,
+        run_id: &str,
+        step_key: &str,
+        events: mpsc::UnboundedSender<WriterMsg>,
+    ) -> anyhow::Result<Option<Self>> {
+        let status = py.detach(|| {
+            io_rt().block_on(storage.scoped().claim_concurrency_slots(
+                pools,
+                run_id,
+                step_key,
+                0,
+                DEFAULT_LEASE_DURATION_SECS,
+                scope,
+            ))
+        })?;
+        if !matches!(status, ConcurrencyClaimStatus::Claimed) {
+            return Ok(None);
+        }
+        let pool_names: Vec<String> = pools.iter().map(|(k, _)| k.clone()).collect();
+        emit_event(
+            &events,
+            storage.code_location_id(),
+            run_id,
+            step_key,
+            EventType::StepSlotClaimed,
+            vec![("pools".to_string(), pool_names.join(","))],
+        );
+        let renewal = AbortOnDrop(spawn_lease_renewal(
+            storage.clone(),
+            run_id.to_string(),
+            step_key.to_string(),
+            events.clone(),
+        ));
+        Ok(Some(Self {
+            storage: storage.clone(),
+            run_id: run_id.to_string(),
+            step_key: step_key.to_string(),
+            renewal,
+            events,
+        }))
     }
 
     /// Release slots and stop lease renewal (async).
@@ -182,6 +247,7 @@ impl PoolGuard {
 async fn claim_async_poll(
     storage: &ScopedStorageHandle<SurrealStorage>,
     pools: &[(String, u32)],
+    scope: Option<&AssetScope>,
     run_id: &str,
     step_key: &str,
     events: &mpsc::UnboundedSender<WriterMsg>,
@@ -189,14 +255,21 @@ async fn claim_async_poll(
     let poll_interval = *CLAIM_POLL_INTERVAL;
     let max_jitter = *CLAIM_POLL_JITTER;
     let timeout = *CLAIM_TIMEOUT;
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let code_location_id = storage.code_location_id();
 
     let mut attempt: u32 = 0;
     loop {
         match storage
             .scoped()
-            .claim_concurrency_slots(pools, run_id, step_key, 0, DEFAULT_LEASE_DURATION_SECS)
+            .claim_concurrency_slots(
+                pools,
+                run_id,
+                step_key,
+                0,
+                DEFAULT_LEASE_DURATION_SECS,
+                scope,
+            )
             .await?
         {
             ConcurrencyClaimStatus::Claimed => {
@@ -212,7 +285,11 @@ async fn claim_async_poll(
                 return Ok(());
             }
             ConcurrencyClaimStatus::Pending { position, reason } => {
-                if tokio::time::Instant::now() >= deadline {
+                // The timeout counts only time blocked on user pools: an
+                // asset pool's holder is a live step, so the wait ends with it.
+                if reason.only_asset_pools() {
+                    deadline = tokio::time::Instant::now() + timeout;
+                } else if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "step '{step_key}' timed out waiting for pool slots after {timeout:?}"
                     );
@@ -245,6 +322,14 @@ async fn claim_async_poll(
                         reason = %reason,
                         "step pending for pool slots, will retry"
                     );
+                }
+                if storage
+                    .backend()
+                    .is_cancelled(run_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Err(ClaimCancelled.into());
                 }
                 let jitter = rand_jitter(attempt, max_jitter);
                 tokio::time::sleep(poll_interval + jitter).await;

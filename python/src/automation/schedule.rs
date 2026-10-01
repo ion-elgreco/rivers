@@ -169,6 +169,8 @@ pub struct PyBackfillRequest {
     pub max_concurrency: u32,
     /// Tags to attach to the backfill and all its runs.
     pub tags: Option<HashMap<String, String>>,
+    /// The verb child runs execute. `None` means materialize.
+    pub action: Option<String>,
 }
 
 #[pymethods]
@@ -182,6 +184,7 @@ impl PyBackfillRequest {
         failure_policy = None,
         max_concurrency = 4,
         tags = None,
+        action = None,
     ))]
     fn new(
         selection: Vec<String>,
@@ -191,8 +194,19 @@ impl PyBackfillRequest {
         failure_policy: Option<String>,
         max_concurrency: u32,
         tags: Option<HashMap<String, String>>,
-    ) -> Self {
-        Self {
+        action: Option<String>,
+    ) -> PyResult<Self> {
+        // An empty selection means "every asset" to backfill_inner — for a
+        // verb that is a fan-out across the code location, never a default.
+        if let Some(verb) = &action
+            && selection.is_empty()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "BackfillRequest(action='{verb}') got an empty selection: name the \
+                 assets to run '{verb}' on"
+            )));
+        }
+        Ok(Self {
             selection,
             partition_keys,
             partition_range,
@@ -200,18 +214,20 @@ impl PyBackfillRequest {
             failure_policy,
             max_concurrency,
             tags,
-        }
+            action,
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "BackfillRequest(selection={:?}, partitions={}, max_concurrency={})",
+            "BackfillRequest(selection={:?}, partitions={}, max_concurrency={}, action={:?})",
             self.selection,
             self.partition_keys
                 .as_ref()
                 .map(|k| k.len().to_string())
                 .unwrap_or_else(|| "range".to_string()),
             self.max_concurrency,
+            self.action,
         )
     }
 
@@ -227,6 +243,7 @@ impl PyBackfillRequest {
             Option<String>,
             u32,
             Option<HashMap<String, String>>,
+            Option<String>,
         ),
     ) {
         let s = slf.borrow();
@@ -240,6 +257,7 @@ impl PyBackfillRequest {
                 s.failure_policy.clone(),
                 s.max_concurrency,
                 s.tags.clone(),
+                s.action.clone(),
             ),
         )
     }

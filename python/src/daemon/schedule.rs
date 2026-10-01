@@ -100,6 +100,7 @@ pub(super) async fn evaluate_schedule_sync(
                 launched_by: rivers_core::storage::LaunchedBy::Schedule {
                     name: name.to_string(),
                 },
+                config: None,
             }],
             vec![], // no materialization requests for schedules
             vec![],

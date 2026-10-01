@@ -13,6 +13,15 @@ use crate::storage::{
     StorageBackend,
 };
 
+/// A UTC instant, for schedules and tick windows.
+fn utc(y: i16, mo: i8, d: i8, h: i8, mi: i8, sec: i8) -> jiff::Timestamp {
+    jiff::civil::date(y, mo, d)
+        .at(h, mi, sec, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+}
+
 fn make_record(key: &str) -> AssetRecord {
     AssetRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -3011,16 +3020,8 @@ fn dep_updated_floor_compares_mapped_downstream_key() {
     let grid = crate::timegrid::TimeGrid {
         cron_schedule: None,
         interval_seconds: Some(86400.0),
-        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap(),
-        end: Some(
-            chrono::NaiveDate::from_ymd_opt(2024, 2, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap(),
-        ),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+        end: Some(jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0)),
         fmt: "%Y-%m-%d".to_string(),
     };
 
@@ -5751,6 +5752,8 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     storage.create_run(&run).await.unwrap();
 
@@ -5823,6 +5826,8 @@ async fn bench_cache_tick<S: StorageBackend>(
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         };
         storage.create_run(&run).await.unwrap();
         for key in &touched {
@@ -6230,6 +6235,8 @@ async fn test_cache_detects_in_progress_completion_as_change() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6335,6 +6342,8 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         partition_key: Some(part(k)),
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     storage
         .create_runs(&[
@@ -6557,6 +6566,8 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
         partition_key: Some(part(k)),
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     let mk_event = |run_id: &str, k: &str, ts: i64| EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -6688,6 +6699,8 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
         partition_key: Some(part(k)),
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     storage
         .create_runs(&[mk_run("run_a", "a"), mk_run("run_b", "b")])
@@ -6806,6 +6819,8 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6890,6 +6905,8 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -6988,6 +7005,8 @@ async fn test_failed_joint_run_step_success_records_tick_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7082,6 +7101,8 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7148,6 +7169,8 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7232,6 +7255,8 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     // run-s is the newest, so the seeded cursor sits above run-q / run-n.
     storage
@@ -7300,6 +7325,8 @@ async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7373,6 +7400,8 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7441,6 +7470,8 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
             partition_key: Some(spk("2024-01-01")),
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7507,6 +7538,8 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
         partition_key: Some(spk(pk)),
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     storage
         .create_run(&mk("R1", "p1", "a", 2000))
@@ -7588,6 +7621,8 @@ async fn test_in_progress_partition_keys_expands_batched_members() {
             }),
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7633,6 +7668,8 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -7712,6 +7749,8 @@ async fn test_later_finishing_run_keeps_latest_tags() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -7809,6 +7848,8 @@ async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -7911,6 +7952,8 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8084,6 +8127,8 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
     // a: failed, never materialized afterwards → floor stands.
     storage
@@ -8147,6 +8192,482 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
 }
 
 #[tokio::test]
+async fn test_initial_load_ignores_failed_action_runs() {
+    // A failed `compact` is not a failed materialization attempt. The steady
+    // state already knows that (apply_run_effects_to_delta); after a daemon
+    // restart initial_load rebuilds the floor from run history and must reach
+    // the same answer, or a failed action latches ExecutionFailed forever.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+
+    storage
+        .create_run(&RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("compact".to_string()),
+            config: None,
+        })
+        .await
+        .unwrap();
+    storage
+        .update_run_status("run-compact", RunStatus::Failure, Some(2_500))
+        .await
+        .unwrap();
+
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState {
+            is_initial: true,
+            ..Default::default()
+        },
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::ExecutionFailed,
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    );
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a failed action run must not raise the materialization failure floor"
+    );
+}
+
+#[tokio::test]
+async fn test_materializing_action_triggers_downstream_eager() {
+    // events → rollup, both built by the joint run r1. A `refresh` verb whose
+    // `materialized()` rewrote events is new data rollup has not seen, like a
+    // materialize of events alone: eager() must request rollup, in steady
+    // state and after a restart.
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("events"), make_record("rollup")])
+        .await
+        .unwrap();
+    let node = |name: &str| TopologyNode {
+        name: name.into(),
+        kind: NodeKind::Asset,
+        group: None,
+        parent_graph: None,
+    };
+    storage
+        .kv_set(
+            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+            &serde_json::to_vec(&GraphTopology {
+                nodes: vec![node("events"), node("rollup")],
+                edges: vec![("rollup".to_string(), "events".to_string())],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run = |run_id: &str, assets: &[&str], ts: i64, action: Option<&str>| RunRecord {
+        run_id: run_id.to_string(),
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        job_name: None,
+        status: RunStatus::Success,
+        start_time: ts,
+        end_time: Some(ts),
+        tags: vec![],
+        node_names: assets.iter().map(|a| a.to_string()).collect(),
+        priority: 0,
+        partition_key: None,
+        block_reason: None,
+        launched_by: LaunchedBy::Manual { user: None },
+        action: action.map(str::to_string),
+        config: None,
+    };
+    let materialization = |run_id: &str, asset: &str, ts: i64| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: EventType::Materialization {
+            data_version: Some(format!("dv_{run_id}")),
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    storage
+        .create_run(&run("r1", &["events", "rollup"], 1_000, None))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            materialization("r1", "events", 1_000),
+            materialization("r1", "rollup", 1_000),
+        ])
+        .await
+        .unwrap();
+
+    let eager_rollup = || {
+        ConditionPass::new(
+            AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "rollup".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        )
+    };
+    let mut pass = eager_rollup();
+    pass.refresh_cache(&storage, 1_500).await.unwrap();
+    assert!(
+        pass.run(1_500, false).plan.unpartitioned.is_empty(),
+        "precondition: r1 built rollup together with events"
+    );
+
+    storage
+        .create_run(&run("r2", &["events"], 2_000, Some("refresh")))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[materialization("r2", "events", 2_000)])
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, 2_500).await.unwrap();
+    assert_eq!(
+        pass.run(2_500, false).plan.unpartitioned,
+        ["rollup"],
+        "the verb's materialized() must trigger eager() on rollup"
+    );
+
+    let mut restarted = eager_rollup();
+    restarted.refresh_cache(&storage, 3_000).await.unwrap();
+    assert_eq!(
+        restarted.run(3_000, false).plan.unpartitioned,
+        ["rollup"],
+        "a restarted daemon must reach the same answer"
+    );
+}
+
+#[tokio::test]
+async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
+    // events → daily_summary, both built by r1. `refresh` over both runs its
+    // targets one at a time in name order, so daily_summary's step runs first.
+    // A daily_summary that materialized before events, returned unchanged()
+    // or failed has not seen the new events: eager() must request it. One
+    // that materialized after events needs no second build. Steady state and
+    // a restart agree.
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{EventRecord, EventType};
+
+    let node = |name: &str| TopologyNode {
+        name: name.into(),
+        kind: NodeKind::Asset,
+        group: None,
+        parent_graph: None,
+    };
+    let event = |run_id: &str, asset: &str, ts: i64, materialized: bool| EventRecord {
+        code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+        event_type: if materialized {
+            EventType::Materialization {
+                data_version: Some(format!("dv_{run_id}")),
+            }
+        } else {
+            EventType::ActionCompleted
+        },
+        asset_key: Some(asset.to_string()),
+        run_id: run_id.to_string(),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    let eager_summary = || {
+        ConditionPass::new(
+            AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "daily_summary".to_string(),
+                condition: ConditionNode::eager(),
+                partition_info: None,
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        )
+    };
+
+    for (case, summary, status, requested) in [
+        (
+            "built before events",
+            Some((2_000, true)),
+            RunStatus::Success,
+            &["daily_summary"][..],
+        ),
+        (
+            "unchanged",
+            Some((2_000, false)),
+            RunStatus::Success,
+            &["daily_summary"],
+        ),
+        ("failed", None, RunStatus::Failure, &["daily_summary"]),
+        (
+            "built after events",
+            Some((2_200, true)),
+            RunStatus::Success,
+            &[],
+        ),
+    ] {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+        storage
+            .for_code_location(&ctx)
+            .register_assets(&[make_record("events"), make_record("daily_summary")])
+            .await
+            .unwrap();
+        storage
+            .kv_set(
+                &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
+                &serde_json::to_vec(&GraphTopology {
+                    nodes: vec![node("events"), node("daily_summary")],
+                    edges: vec![("daily_summary".to_string(), "events".to_string())],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let run = |run_id: &str, status: RunStatus, start: i64, end: i64, action: Option<&str>| {
+            RunRecord {
+                run_id: run_id.to_string(),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                job_name: None,
+                status,
+                start_time: start,
+                end_time: Some(end),
+                tags: vec![],
+                node_names: vec!["daily_summary".to_string(), "events".to_string()],
+                priority: 0,
+                partition_key: None,
+                block_reason: None,
+                launched_by: LaunchedBy::Manual { user: None },
+                action: action.map(str::to_string),
+                config: None,
+            }
+        };
+        storage
+            .create_run(&run("r1", RunStatus::Success, 1_000, 1_000, None))
+            .await
+            .unwrap();
+        storage
+            .store_events(&[
+                event("r1", "events", 1_000, true),
+                event("r1", "daily_summary", 1_000, true),
+            ])
+            .await
+            .unwrap();
+
+        let mut pass = eager_summary();
+        pass.refresh_cache(&storage, 1_500).await.unwrap();
+        assert!(
+            pass.run(1_500, false).plan.unpartitioned.is_empty(),
+            "{case}: precondition: r1 built daily_summary together with events"
+        );
+
+        storage
+            .create_run(&run("r2", status, 1_900, 2_300, Some("refresh")))
+            .await
+            .unwrap();
+        let mut events = vec![event("r2", "events", 2_100, true)];
+        events.extend(
+            summary.map(|(ts, materialized)| event("r2", "daily_summary", ts, materialized)),
+        );
+        storage.store_events(&events).await.unwrap();
+        pass.refresh_cache(&storage, 2_500).await.unwrap();
+        assert_eq!(
+            pass.run(2_500, false).plan.unpartitioned,
+            requested,
+            "{case}"
+        );
+
+        let mut restarted = eager_summary();
+        restarted.refresh_cache(&storage, 3_000).await.unwrap();
+        assert_eq!(
+            restarted.run(3_000, false).plan.unpartitioned,
+            requested,
+            "{case}: a restarted daemon must reach the same answer"
+        );
+    }
+}
+
+/// Storage + cache fixture for the live-action-run tests: one asset `a` and a
+/// `Started` run carrying `action`, created before the caller's first refresh.
+async fn storage_with_live_action_run(
+    action: Option<&str>,
+) -> crate::storage::surrealdb_backend::SurrealStorage {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+    storage
+        .create_run(&crate::storage::RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: crate::storage::RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: action.map(str::to_string),
+            config: None,
+        })
+        .await
+        .unwrap();
+    storage
+}
+
+fn in_progress_pass(cache: AssetConditionCache) -> crate::condition::pass::ConditionPass {
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::InProgress,
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    )
+}
+
+#[tokio::test]
+async fn test_initial_load_ignores_live_action_runs() {
+    // An in-flight `compact` is not an in-flight *materialization*. If
+    // initial_load tracks it, `eager()`'s `!in_flight()` — and every dependent's
+    // `!any_deps_in_progress()` — stays suppressed until the action finishes.
+    // Twin of test_initial_load_ignores_failed_action_runs, live side.
+    use crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+    let storage = storage_with_live_action_run(Some("compact")).await;
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live action run must not read as an in-flight materialization"
+    );
+}
+
+#[tokio::test]
+async fn test_initial_load_still_tracks_live_materialize_runs() {
+    // Falsifies the guard above: the same fixture without a verb must still be
+    // tracked, or the fix would simply disable in-flight tracking.
+    use crate::storage::DEFAULT_CODE_LOCATION_ID;
+
+    let storage = storage_with_live_action_run(None).await;
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live materialize run must still read as in-flight"
+    );
+}
+
+#[tokio::test]
+async fn test_steady_state_refresh_ignores_live_action_runs() {
+    // Steady-state twin: the new-runs path in fetch_refresh_delta pushes
+    // InProgressChange::Push for every non-terminal run and must apply the same
+    // guard initial_load does, or the answer flips depending on whether the
+    // action started before or after the daemon did.
+    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+    storage
+        .for_code_location(&ctx)
+        .register_assets(&[make_record("a")])
+        .await
+        .unwrap();
+
+    let mut pass = in_progress_pass(AssetConditionCache::new(
+        DEFAULT_CODE_LOCATION_ID.to_string(),
+    ));
+    // First refresh initializes the cache with no runs at all.
+    pass.refresh_cache(&storage, 1_000).await.unwrap();
+
+    storage
+        .create_run(&crate::storage::RunRecord {
+            run_id: "run-compact".to_string(),
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            job_name: None,
+            status: crate::storage::RunStatus::Started,
+            start_time: 2_000,
+            end_time: None,
+            tags: vec![],
+            node_names: vec!["a".to_string()],
+            priority: 0,
+            partition_key: None,
+            block_reason: None,
+            launched_by: LaunchedBy::Manual { user: None },
+            action: Some("compact".to_string()),
+            config: None,
+        })
+        .await
+        .unwrap();
+
+    // Second refresh takes the steady-state delta path.
+    pass.refresh_cache(&storage, 10_000).await.unwrap();
+    let out = pass.run(10_000, false);
+    assert!(
+        !out.plan.unpartitioned.contains(&"a".to_string()),
+        "a live action run must not read as in-flight on the steady-state path"
+    );
+}
+
+#[tokio::test]
 async fn test_recover_pending_dispatch_clears_is_initial() {
     // V-06: a first-tick crash restarts with a fresh state (is_initial=true) plus
     // a persisted intent. Recovery must clear the global is_initial, or the next
@@ -8175,6 +8696,8 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Condition,
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8239,6 +8762,8 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Condition,
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8314,6 +8839,8 @@ async fn test_recover_pending_dispatch_restores_handled_keys() {
             partition_key: Some(spk("k")),
             block_reason: None,
             launched_by: LaunchedBy::Condition,
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8397,6 +8924,8 @@ async fn test_recover_pending_dispatch_backfill_id_no_false_match() {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::default(),
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8510,6 +9039,8 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Condition,
+        action: None,
+        config: None,
     };
     let mk_event = |run_id: &str, asset: &str, dv: &str, ts: i64| crate::storage::EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -8727,6 +9258,8 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8833,6 +9366,8 @@ async fn test_restart_does_not_replay_newest_run_tick_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -8885,6 +9420,8 @@ async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
 
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -8962,6 +9499,8 @@ async fn test_failure_floor_survives_daemon_restart() {
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     };
 
     let mut pass = ConditionPass::new(
@@ -9062,6 +9601,8 @@ async fn test_initial_load_seeds_observation_cursor() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9116,6 +9657,8 @@ async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9180,6 +9723,8 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
             partition_key: Some(spk("2024-01-01")),
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9256,6 +9801,8 @@ async fn test_queued_run_is_not_cleared_by_sweep() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9307,6 +9854,8 @@ async fn test_cache_does_not_store_empty_run_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9350,6 +9899,8 @@ async fn test_cache_does_not_store_empty_run_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9419,6 +9970,8 @@ async fn test_cache_tick_materialization_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9483,6 +10036,8 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -9498,6 +10053,29 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
         "should record materializations even with empty tags"
     );
     assert_eq!(tick_tags.unwrap(), &vec![Arc::from(vec![])]);
+}
+
+/// The question the old per-asset `step_completion` answered, rebuilt from a
+/// batch result: did this asset finish in any of these runs, and which of them
+/// did its step succeed in?
+async fn completion(
+    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    asset: &str,
+    runs: &[String],
+) -> (bool, Vec<String>) {
+    use crate::storage::StorageBackend;
+    let outcomes = storage
+        .step_outcomes(std::slice::from_ref(&asset.to_string()), runs)
+        .await
+        .unwrap();
+    let mut succeeded: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.succeeded)
+        .map(|o| o.run_id.clone())
+        .collect();
+    succeeded.sort();
+    succeeded.dedup();
+    (!outcomes.is_empty(), succeeded)
 }
 
 #[tokio::test]
@@ -9583,72 +10161,82 @@ async fn test_step_completion_sql_query() {
 
     // Test 1: asset "a" in run-query-test → true
     assert!(
-        storage
-            .step_completion("a", std::slice::from_ref(&run_id))
+        completion(&storage, "a", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' in run-query-test"
     );
 
     // Test 2: asset "b" in run-query-test → true
     assert!(
-        storage
-            .step_completion("b", std::slice::from_ref(&run_id))
+        completion(&storage, "b", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'b' in run-query-test"
     );
 
     // Test 3: asset "a" in other-run → true
     assert!(
-        storage
-            .step_completion("a", std::slice::from_ref(&other_run))
+        completion(&storage, "a", std::slice::from_ref(&other_run))
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' in run-other"
     );
 
     // Test 4: asset "c" (doesn't exist) → false
     assert!(
-        !storage
-            .step_completion("c", std::slice::from_ref(&run_id))
+        !completion(&storage, "c", std::slice::from_ref(&run_id))
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess for 'c'"
     );
 
     // Test 5: asset "a" in non-existent run → false
     assert!(
-        !storage
-            .step_completion("a", &["run-nonexistent".to_string()])
+        !completion(&storage, "a", &["run-nonexistent".to_string()])
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess in non-existent run"
     );
 
     // Test 6: asset "a" in multiple run_ids → true (matches first)
     assert!(
-        storage
-            .step_completion("a", &[run_id.clone(), other_run.clone()])
+        completion(&storage, "a", &[run_id.clone(), other_run.clone()])
             .await
-            .unwrap()
             .0,
         "should find StepSuccess for 'a' across multiple run_ids"
     );
 
     // Test 7: asset "b" in other_run only → false (b only has events in run_id)
     assert!(
-        !storage
-            .step_completion("b", std::slice::from_ref(&other_run))
+        !completion(&storage, "b", std::slice::from_ref(&other_run))
             .await
-            .unwrap()
             .0,
         "should NOT find StepSuccess for 'b' in run-other"
+    );
+
+    // Test 8: both assets in one call, each answered from its own runs.
+    let outcomes = storage
+        .step_outcomes(
+            &["a".to_string(), "b".to_string()],
+            &[run_id.clone(), other_run.clone()],
+        )
+        .await
+        .unwrap();
+    let mut pairs: Vec<(String, String)> = outcomes
+        .iter()
+        .map(|o| (o.asset_key.clone(), o.run_id.clone()))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs,
+        vec![
+            ("a".to_string(), other_run.clone()),
+            ("a".to_string(), run_id.clone()),
+            ("b".to_string(), run_id.clone()),
+        ],
+        "one call must answer for every asset without inventing a 'b' in run-other"
     );
 }
 
@@ -9680,7 +10268,7 @@ async fn test_step_completion_single_pass() {
         .unwrap();
 
     let runs = vec!["run-fail".to_string(), "run-ok".to_string()];
-    let (completed, succeeded) = storage.step_completion("a", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "a", &runs).await;
     assert!(completed, "a completed a step in the given runs");
     assert_eq!(
         succeeded,
@@ -9688,16 +10276,37 @@ async fn test_step_completion_single_pass() {
         "every succeeding run must be identified"
     );
 
-    let (completed, succeeded) = storage.step_completion("b", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "b", &runs).await;
     assert!(completed, "a failure is still a completion");
     assert!(
         succeeded.is_empty(),
         "no success run for a failed-only asset"
     );
 
-    let (completed, succeeded) = storage.step_completion("c", &runs).await.unwrap();
+    let (completed, succeeded) = completion(&storage, "c", &runs).await;
     assert!(!completed, "no events for 'c' in the given runs");
     assert!(succeeded.is_empty());
+
+    // The point of the batch: three assets, one round trip, each still keyed
+    // to the run its own step finished in.
+    let outcomes = storage
+        .step_outcomes(&["a".to_string(), "b".to_string(), "c".to_string()], &runs)
+        .await
+        .unwrap();
+    let mut seen: Vec<(String, String, bool)> = outcomes
+        .iter()
+        .map(|o| (o.asset_key.clone(), o.run_id.clone(), o.succeeded))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("a".to_string(), "run-fail".to_string(), false),
+            ("a".to_string(), "run-ok".to_string(), true),
+            ("b".to_string(), "run-ok".to_string(), false),
+        ],
+        "one call must carry each asset's own outcome per run"
+    );
 }
 
 // ── Partition-aware tests ───────────────────────────────────────────────
@@ -9868,8 +10477,8 @@ fn test_time_window_mapping_shifts_selections_by_offset() {
     let grid = TimeGrid {
         cron_schedule: Some("0 0 * * *".into()),
         interval_seconds: None,
-        start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().into(),
-        end: Some(chrono::NaiveDate::from_ymd_opt(2024, 2, 1).unwrap().into()),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+        end: Some(jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0)),
         fmt: "%Y-%m-%d".into(),
     };
     let m = PartitionMappingKind::TimeWindow {
@@ -9979,10 +10588,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
-        .unwrap()
-        .and_hms_opt(12, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 5).at(12, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -10021,10 +10627,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -10054,10 +10657,7 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["us", "eu", "ap"], &["us"], &[("us", 100)]);
     let fmts: HashMap<String, TimeWindowSource> = HashMap::new(); // "a" is not time-partitioned
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let empty_partition_statuses = HashMap::new();
     let pctx = PartitionEvalContext {
@@ -10105,10 +10705,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
             grid: None,
         },
     )]);
-    let now_local = chrono::NaiveDate::from_ymd_opt(2020, 1, 5)
-        .unwrap()
-        .and_hms_opt(12, 0, 0)
-        .unwrap();
+    let now_local = jiff::civil::date(2020, 1, 5).at(12, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let pctx = PartitionEvalContext {
         all_keys: &pdata.all_keys,
@@ -13919,7 +14516,6 @@ fn test_partitioned_on_cron_no_deps_fires_all_partitions() {
 
 #[test]
 fn test_cron_tick_respects_timezone() {
-    use chrono::{TimeZone, Utc};
     // "0 9 * * *" in America/New_York must fire when the NY wall clock crosses 09:00
     // (= 13:00 UTC in EDT), not 09:00 UTC.
     let record = make_materialized_record("a", 100);
@@ -13931,16 +14527,8 @@ fn test_cron_tick_respects_timezone() {
     };
 
     // Window 12:30→13:30 UTC (08:30→09:30 EDT); the 09:00 EDT tick (13:00 UTC) lies inside.
-    let prev_tick = Utc
-        .with_ymd_and_hms(2026, 6, 16, 12, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
-    let now = Utc
-        .with_ymd_and_hms(2026, 6, 16, 13, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
+    let prev_tick = utc(2026, 6, 16, 12, 30, 0).as_nanosecond() as i64;
+    let now = utc(2026, 6, 16, 13, 30, 0).as_nanosecond() as i64;
     let prev = AssetConditionState {
         last_tick_timestamp: Some(prev_tick),
         ..Default::default()
@@ -13969,7 +14557,6 @@ fn test_cron_tick_respects_timezone() {
 
 #[test]
 fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
-    use chrono::{TimeZone, Utc};
     // On the DST fall-back day (2025-11-02), a noon schedule must still fire and the call
     // must terminate (the naive-as-UTC croner path can't spin on the fall-back).
     let record = make_materialized_record("a", 100);
@@ -13980,16 +14567,8 @@ fn test_cron_tick_across_dst_fallback_terminates_and_fires() {
         timezone: Some("America/New_York".to_string()),
     };
     // 16:00 UTC (11:00 EST) → 17:30 UTC (12:30 EST); noon EST = 17:00 UTC.
-    let prev_tick = Utc
-        .with_ymd_and_hms(2025, 11, 2, 16, 0, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
-    let now = Utc
-        .with_ymd_and_hms(2025, 11, 2, 17, 30, 0)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
+    let prev_tick = utc(2025, 11, 2, 16, 0, 0).as_nanosecond() as i64;
+    let now = utc(2025, 11, 2, 17, 30, 0).as_nanosecond() as i64;
     let prev = AssetConditionState {
         last_tick_timestamp: Some(prev_tick),
         ..Default::default()
@@ -15129,6 +15708,8 @@ async fn test_pending_run_confirmed_by_storage_clears_pending() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -15274,6 +15855,8 @@ async fn test_pending_eviction_only_drops_phantom_run_id_not_other_runs() {
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -15379,6 +15962,8 @@ fn run_record(
         partition_key: None,
         block_reason: None,
         launched_by: LaunchedBy::Manual { user: None },
+        action: None,
+        config: None,
     }
 }
 
@@ -16686,7 +17271,6 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
 /// fire at the declared wall time, and the UTC instant shifts across DST while the wall time stays fixed.
 #[test]
 fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16694,24 +17278,24 @@ fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
         .unwrap();
 
     // No timezone → evaluated in UTC: next 09:00 UTC.
-    let after = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+    let after = utc(2024, 1, 15, 0, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, None),
-        Some(Utc.with_ymd_and_hms(2024, 1, 15, 9, 0, 0).unwrap()),
+        Some(utc(2024, 1, 15, 9, 0, 0)),
     );
 
     // America/New_York, winter (EST = UTC-5): 09:00 local → 14:00 UTC.
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2024, 1, 15, 14, 0, 0).unwrap()),
+        Some(utc(2024, 1, 15, 14, 0, 0)),
         "09:00 EST must be 14:00 UTC, not 09:00 UTC"
     );
 
     // Same schedule, summer (EDT = UTC-4): 09:00 local → 13:00 UTC (shifts an hour across DST, wall time fixed).
-    let summer = Utc.with_ymd_and_hms(2024, 7, 15, 0, 0, 0).unwrap();
+    let summer = utc(2024, 7, 15, 0, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, summer, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2024, 7, 15, 13, 0, 0).unwrap()),
+        Some(utc(2024, 7, 15, 13, 0, 0)),
         "09:00 EDT must be 13:00 UTC"
     );
 }
@@ -16720,7 +17304,6 @@ fn test_next_cron_occurrence_utc_respects_timezone_and_dst() {
 /// first valid instant after the gap (03:00 EDT = 07:00 UTC), not the skipped wall time misread as UTC.
 #[test]
 fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16728,10 +17311,10 @@ fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
         .unwrap();
 
     // 2026-03-08 01:00 EST = 06:00 UTC, one wall-clock hour before the gap.
-    let after = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+    let after = utc(2026, 3, 8, 6, 0, 0);
     assert_eq!(
         next_cron_occurrence_utc(&cron, after, Some("America/New_York")),
-        Some(Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()),
+        Some(utc(2026, 3, 8, 7, 0, 0)),
         "gap occurrence must fire at the first valid wall time after the gap (03:00 EDT)"
     );
 }
@@ -16741,7 +17324,6 @@ fn test_next_cron_occurrence_utc_spring_forward_gap_advances_to_gap_end() {
 /// the next occurrence must be strictly after `after`.
 #[test]
 fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
-    use chrono::{TimeZone, Utc};
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
         .build()
@@ -16750,7 +17332,7 @@ fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
 
     // 06:05 UTC = 01:05 EST (second pass of the repeated 01:00-02:00 hour); next 01:30 is
     // ambiguous: 01:30 EDT = 05:30 UTC (past) vs 01:30 EST = 06:30 UTC.
-    let after = Utc.with_ymd_and_hms(2025, 11, 2, 6, 5, 0).unwrap();
+    let after = utc(2025, 11, 2, 6, 5, 0);
     let next = next_cron_occurrence_utc(&cron, after, Some("America/New_York"))
         .expect("occurrence must exist");
     assert!(
@@ -16760,7 +17342,7 @@ fn test_next_cron_occurrence_utc_fall_back_never_returns_past_instant() {
     );
     assert_eq!(
         next,
-        Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap(),
+        utc(2025, 11, 2, 6, 30, 0),
         "the first 01:30 wall time after 01:05 EST is 01:30 EST"
     );
 }
@@ -16898,6 +17480,8 @@ async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run
             partition_key: None,
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -17032,6 +17616,8 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
             partition_key: Some(spk("p")),
             block_reason: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         })
         .await
         .unwrap();
@@ -17244,4 +17830,159 @@ fn test_nested_dep_floor_propagates_to_every_depth() {
             );
         }
     }
+}
+
+/// An unpartitioned asset whose data was deleted must read Missing again:
+/// the deletion clears the record's materialization state, so `on_missing`
+/// can re-fire. Regression: the deletion stamped its own run onto
+/// `last_run_id`, which `Missing` keys off — the asset stayed "materialized"
+/// forever and automation never rebuilt it.
+#[tokio::test]
+async fn deleted_asset_reads_missing_again() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = DEFAULT_CODE_LOCATION_ID.to_string();
+    let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
+    let scoped = storage.for_code_location(&ctx_cl);
+
+    scoped
+        .register_assets(&[make_record("table")])
+        .await
+        .unwrap();
+    let event = |event_type, ts| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type,
+        asset_key: Some("table".to_string()),
+        run_id: format!("run-{ts}"),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+
+    storage
+        .store_events(&[event(
+            crate::storage::EventType::Materialization {
+                data_version: Some("dv1".to_string()),
+            },
+            1000,
+        )])
+        .await
+        .unwrap();
+    let record = scoped.get_asset_record("table").await.unwrap().unwrap();
+    let mat_event_id = record.last_event_id.clone();
+    let records = HashMap::from([("table".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    assert!(
+        !evaluate(
+            &ConditionNode::Missing,
+            &make_ctx("table", &record, &records, &deps)
+        )
+        .fired,
+        "a materialized asset must not read Missing"
+    );
+
+    storage
+        .store_events(&[event(crate::storage::EventType::Deletion, 2000)])
+        .await
+        .unwrap();
+    let record = scoped.get_asset_record("table").await.unwrap().unwrap();
+    let records = HashMap::from([("table".to_string(), record.clone())]);
+    assert!(
+        evaluate(
+            &ConditionNode::Missing,
+            &make_ctx("table", &record, &records, &deps)
+        )
+        .fired,
+        "a deleted asset must read Missing so automation can rebuild it"
+    );
+    // `is_some()` alone is vacuous — the materialization already set it. The
+    // deletion event itself must own the pointer for timelines to resolve.
+    assert!(record.last_event_id.is_some());
+    assert_ne!(
+        record.last_event_id, mat_event_id,
+        "the deletion, not the prior materialization, owns the last event"
+    );
+}
+
+/// Deleting an asset must not read to downstream as "the dependency produced
+/// something new" — `NewlyUpdated` compares `last_timestamp` against the
+/// downstream's own, so a deletion that moves it forward triggers a
+/// materialization from data that no longer exists.
+#[tokio::test]
+async fn deleted_asset_does_not_read_newly_updated_downstream() {
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = DEFAULT_CODE_LOCATION_ID.to_string();
+    let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
+    let scoped = storage.for_code_location(&ctx_cl);
+
+    scoped
+        .register_assets(&[make_record("events"), make_record("rollups")])
+        .await
+        .unwrap();
+    let event = |asset: &str, event_type, ts| crate::storage::EventRecord {
+        code_location_id: cl.clone(),
+        event_type,
+        asset_key: Some(asset.to_string()),
+        run_id: format!("run-{asset}-{ts}"),
+        partition_key: None,
+        timestamp: ts,
+        metadata: vec![],
+        input_data_versions: vec![],
+    };
+    let mat = |dv: &str| crate::storage::EventType::Materialization {
+        data_version: Some(dv.to_string()),
+    };
+
+    storage
+        .store_events(&[event("events", mat("dv-e"), 1000)])
+        .await
+        .unwrap();
+    storage
+        .store_events(&[event("rollups", mat("dv-r"), 1100)])
+        .await
+        .unwrap();
+    storage
+        .store_events(&[event("events", crate::storage::EventType::Deletion, 2000)])
+        .await
+        .unwrap();
+
+    let events = scoped.get_asset_record("events").await.unwrap().unwrap();
+    let rollups = scoped.get_asset_record("rollups").await.unwrap().unwrap();
+    let records = HashMap::from([
+        ("events".to_string(), events.clone()),
+        ("rollups".to_string(), rollups.clone()),
+    ]);
+    let deps = HashMap::from([("rollups".to_string(), vec!["events".to_string()])]);
+
+    // NewlyUpdated(events) as evaluated for rollups: target is the dep, root
+    // is the asset whose automation would fire.
+    let ctx = EvalContext {
+        target_key: "events",
+        root_key: "rollups",
+        target_record: &events,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &EMPTY_BACKFILL,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &DEFAULT_STATE,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 3_000,
+        is_initial: false,
+        partitions: None,
+        root_partition_floor: None,
+    };
+    assert!(
+        !evaluate(&ConditionNode::NewlyUpdated, &ctx).fired,
+        "a deleted upstream must not look freshly materialized to downstream"
+    );
 }

@@ -6,21 +6,21 @@ use leptos_router::components::A;
 use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::StatsSkeleton;
 use crate::components::ui_kit::{
-    Crumb, DonutStatCard, FeaturedDonut, Rail, SectionHeader, StatTile, SummaryCard, Topbar,
+    DonutStatCard, EmptyState, FeaturedDonut, Rail, SectionHeader, StatTile, SummaryCard, Topbar,
 };
 use crate::helpers::{run_status_kind, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::{get_schedules, get_sensors};
-use crate::server_fns::overview::{get_assets_info, get_run_stats};
-use crate::server_fns::runs::get_runs;
+use crate::server_fns::overview::get_assets_info;
+use crate::server_fns::runs::{get_runs, get_runs_summary};
 
 #[component]
 pub fn OverviewPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
     let loc = use_current_location();
 
-    let stats = Resource::new(move || refresh_tick.get(), |_| get_run_stats());
+    let stats = Resource::new(move || refresh_tick.get(), |_| get_runs_summary());
     let recent_runs = Resource::new(move || refresh_tick.get(), |_| get_runs(Some(10), None));
     let assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
@@ -46,7 +46,7 @@ pub fn OverviewPage() -> impl IntoView {
     );
 
     view! {
-        <Topbar crumbs=vec![Crumb::new("Overview")]>
+        <Topbar title="Overview">
             <LiveStatusChip
                 status=live_status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
@@ -60,7 +60,7 @@ pub fn OverviewPage() -> impl IntoView {
                         let total = s.total;
                         let success = s.success;
                         let failure = s.failure;
-                        let started = s.started;
+                        let started = s.in_progress;
                         let rate = if total > 0 { success as f64 / total as f64 } else { 0.0 };
                         let success_rate_pct = format!("{:.1}%", rate * 100.0);
                         let ring_success = Signal::derive(move || rate);
@@ -74,9 +74,9 @@ pub fn OverviewPage() -> impl IntoView {
                         view! {
                             <div style="margin-bottom:36px; padding:24px 0 0">
                                 <FeaturedDonut
-                                    label="● LIVE · TOTAL RUNS · 24H"
+                                    label="● LIVE · TOTAL RUNS"
                                     value=format!("{total}")
-                                    unit="runs".to_string()
+                                    unit=if total == 1 { "run" } else { "runs" }.to_string()
                                     ring_value=ring_success
                                     color="var(--success)".to_string()
                                     metrics=vec![
@@ -115,7 +115,7 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load run counts: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
@@ -149,7 +149,11 @@ pub fn OverviewPage() -> impl IntoView {
                         }
                         let n_groups = groups.len();
                         let n_assets = records.len();
-                        let count_label = format!("{n_groups} groups · {n_assets} assets");
+                        let count_label = format!(
+                            "{} · {}",
+                            crate::helpers::plural(n_groups as u64, "group", "groups"),
+                            crate::helpers::plural(n_assets as u64, "asset", "assets"),
+                        );
                         let (ns, name) = loc.get();
                         view! {
                             <SectionHeader label="ASSET HEALTH" count=count_label/>
@@ -188,13 +192,13 @@ pub fn OverviewPage() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
-                    Err(e) => view! { <div class="error-msg">{format!("Error: {e}")}</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })
             }}
         </Transition>
 
         <SectionHeader label="AUTOMATION" count="schedules · sensors · conditions"/>
-        <Transition fallback=move || view! { <div class="loading">"Loading..."</div> }>
+        <Transition fallback=move || view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let sched = schedules.get().and_then(|r| r.ok()).unwrap_or_default();
                 let sens = sensors.get().and_then(|r| r.ok()).unwrap_or_default();
@@ -236,7 +240,7 @@ pub fn OverviewPage() -> impl IntoView {
                 {move || {
                     let runs_all = recent_runs.get().and_then(|r| r.ok()).unwrap_or_default();
                     if runs_all.is_empty() {
-                        view! { <div class="empty-state" style="padding:16px">"No recent runs."</div> }.into_any()
+                        view! { <EmptyState message="No recent runs" compact=true/> }.into_any()
                     } else {
                         let (ns, name) = loc.get();
                         view! {
@@ -245,6 +249,7 @@ pub fn OverviewPage() -> impl IntoView {
                                     let sid = short_id(&r.run_id, 8);
                                     let assets = r.node_names.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
                                     let desc = if assets.is_empty() { "—".to_string() } else { assets };
+                                    let desc = crate::helpers::with_verb(desc, r.action.as_deref());
                                     let kind = run_status_kind(&r.status).to_string();
                                     let glyph = if r.job_name.is_some() { "▶" } else { "◉" };
                                     let title = format!("{glyph} {sid}");

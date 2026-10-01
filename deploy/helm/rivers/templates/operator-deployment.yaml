@@ -58,6 +58,7 @@ spec:
             - name: RIVERS_NAMESPACE
               value: {{ include "rivers.namespace" . }}
             {{- include "rivers.surrealEnv" . | nindent 12 }}
+            {{- with include "rivers.otelEnv" . }}{{ . | nindent 12 }}{{- end }}
             - name: RIVERS_CODE_LOCATION_SERVICE_ACCOUNT
               value: {{ .Values.executor.serviceAccountName | quote }}
             - name: RIVERS_METRICS_ADDR

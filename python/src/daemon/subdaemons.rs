@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pyo3::prelude::*;
 use rivers_core::run_backend::RunHealthStatus;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
@@ -80,7 +80,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
                                 "backfill queued execution failed"
                             );
                         }
-                    } else if let Err(e) = repo_ref.execute_backfill_inner(&backfill_id, None) {
+                    } else if let Err(e) = repo_ref.execute_backfill_inner(&backfill_id) {
                         tracing::error!(
                             target: "rivers::daemon",
                             backfill_id = %backfill_id,
@@ -286,24 +286,17 @@ async fn sweep_stalled_not_started(
     }
 }
 
-async fn fail_unlaunched_run(
+/// Mark a run that never reached execution `Failure` and persist the reason as
+/// a `RunLaunchFailed` event. Shared by the queue coordinator's start-timeout
+/// sweep and the direct dispatcher's launch-error path.
+pub(crate) async fn fail_unlaunched_run(
     storage: &SurrealStorage,
     code_location_id: &str,
     run_id: &str,
     error: &str,
 ) {
-    if let Err(e) = storage
-        .update_run_status(run_id, RunStatus::Failure, Some(now_ts()))
-        .await
-    {
-        tracing::error!(
-            target: "rivers::coordinator",
-            run_id = %run_id,
-            error = %e,
-            "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
-        );
-        return;
-    }
+    // Event first: the terminal status is what readers poll on, so writing it
+    // last means anyone who sees `Failure` already sees the reason.
     if let Err(e) = storage
         .store_event(&EventRecord {
             code_location_id: code_location_id.to_string(),
@@ -323,6 +316,24 @@ async fn fail_unlaunched_run(
             error = %e,
             "failed to persist RunLaunchFailed event"
         );
+    }
+    match storage.fail_run_if_active(run_id, now_ts()).await {
+        Err(e) => {
+            tracing::error!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                error = %e,
+                "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
+            );
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                "launch error for an already-terminal run — leaving its status"
+            );
+        }
+        Ok(true) => {}
     }
 }
 
@@ -458,7 +469,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
                 .await;
             }
 
-            let now = Utc::now();
+            let now = Timestamp::now();
             let due: Vec<DueEval> = collect_and_mark_due(&mut automations, now);
             eval_dispatcher.spawn_due(due, &mut join_set, now).await;
 
@@ -478,7 +489,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
                     Some(Ok(tick_result)) = join_set.join_next(), if !join_set.is_empty() => {
                         let completed_idx = tick_result.index;
                         process_tick_result(&mut automations, &tick_tx, &handle, &run_dispatcher, &backfill_dispatcher, tick_result, max_ticks_retained).await;
-                        let now_inner = Utc::now();
+                        let now_inner = Timestamp::now();
                         if automations[completed_idx].is_due(now_inner) {
                             break;
                         }
@@ -506,10 +517,7 @@ pub(crate) fn spawn_schedule_sensor_loop(
 /// records, and mark each as dispatched (transitions cron's next_occurrence /
 /// sensor's last_eval + in_flight). Mutating `automations` here keeps the
 /// per-entry state machine driven by a single side-effect site.
-fn collect_and_mark_due(
-    automations: &mut [AutomationEntry],
-    now: chrono::DateTime<Utc>,
-) -> Vec<DueEval> {
+fn collect_and_mark_due(automations: &mut [AutomationEntry], now: Timestamp) -> Vec<DueEval> {
     let due_indices: Vec<usize> = automations
         .iter()
         .enumerate()

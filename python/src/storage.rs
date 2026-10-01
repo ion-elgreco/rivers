@@ -76,6 +76,7 @@ pub struct PyStoredLog {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub logs: Option<String>,
+    pub traceback: Option<String>,
 }
 
 impl From<StoredLog> for PyStoredLog {
@@ -88,6 +89,7 @@ impl From<StoredLog> for PyStoredLog {
             stdout: l.stdout,
             stderr: l.stderr,
             logs: l.logs,
+            traceback: l.traceback,
         }
     }
 }
@@ -99,6 +101,7 @@ impl PyStoredLog {
             self.stdout.as_ref().map(|_| "stdout"),
             self.stderr.as_ref().map(|_| "stderr"),
             self.logs.as_ref().map(|_| "logs"),
+            self.traceback.as_ref().map(|_| "traceback"),
         ]
         .into_iter()
         .flatten()
@@ -372,25 +375,53 @@ impl From<LaunchedBy> for PyLaunchedBy {
 #[pyclass(
     name = "RunRecord",
     frozen,
-    get_all,
     skip_from_py_object,
     module = "rivers._core"
 )]
 #[derive(Clone)]
 pub struct PyRunRecord {
+    #[pyo3(get)]
     pub run_id: String,
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
     /// when the run targets a user-defined `Job`.
+    #[pyo3(get)]
     pub job_name: Option<String>,
+    #[pyo3(get)]
     pub status: String,
+    #[pyo3(get)]
     pub start_time: i64,
+    #[pyo3(get)]
     pub end_time: Option<i64>,
+    #[pyo3(get)]
     pub tags: Vec<(String, String)>,
+    #[pyo3(get)]
     pub node_names: Vec<String>,
+    #[pyo3(get)]
     pub priority: i32,
+    #[pyo3(get)]
     pub partition_key: Option<PyPartitionKey>,
+    #[pyo3(get)]
     pub block_reason: Option<String>,
+    #[pyo3(get)]
     pub launched_by: PyLaunchedBy,
+    /// The verb this run executes. `None` means materialize.
+    #[pyo3(get)]
+    pub action: Option<String>,
+    /// See [`RunRecord::config`]; the `config` getter parses it.
+    pub config_json: Option<String>,
+}
+
+#[pymethods]
+impl PyRunRecord {
+    /// The launch document the run was launched with (see
+    /// `CodeRepository.materialize`). `None` means the definitions' defaults.
+    #[getter]
+    fn config(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.config_json
+            .as_deref()
+            .map(|json| Ok(py.import("json")?.call_method1("loads", (json,))?.unbind()))
+            .transpose()
+    }
 }
 
 impl From<RunRecord> for PyRunRecord {
@@ -407,6 +438,8 @@ impl From<RunRecord> for PyRunRecord {
             partition_key: r.partition_key.as_ref().map(PyPartitionKey::from),
             block_reason: r.block_reason,
             launched_by: r.launched_by.into(),
+            action: r.action,
+            config_json: r.config,
         }
     }
 }
@@ -857,8 +890,15 @@ impl PyStorage {
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
         let storage =
             py.detach(|| SurrealStorage::new_embedded_blocking(path).map_err(to_py_err))?;
-        tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (test runtime)");
+        tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (own runtime)");
         Ok(Self::from_storage(storage, PyStorageType::Embedded))
+    }
+
+    /// CLI scratch store: embedded storage on its own runtime, so dropping it
+    /// releases its files before the scratch directory is removed.
+    #[staticmethod]
+    fn _scratch(py: Python<'_>, path: &str) -> PyResult<Self> {
+        Self::_test_embedded(py, path)
     }
 
     /// Test-only: in-memory counterpart of [`_test_embedded`](Self::_test_embedded).
@@ -1319,7 +1359,7 @@ impl PyStorage {
             let status = io_rt()
                 .block_on(
                     self.scoped()
-                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs),
+                        .claim_concurrency_slots(&pools, run_id, step_key, priority, secs, None),
                 )
                 .map_err(to_py_err)?;
             Ok(PyConcurrencyClaimStatus::from(status))
@@ -1402,7 +1442,8 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
         py: Python<'_>,
@@ -1413,8 +1454,12 @@ impl PyStorage {
         priority: i32,
         tags: Vec<(String, String)>,
         block_reason: Option<String>,
+        node_names: Vec<String>,
+        action: Option<String>,
+        config: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
+        let config = crate::config::run_config::run_config_to_json(py, config.as_ref())?;
         let record = RunRecord {
             run_id: run_id.to_string(),
             code_location_id: self.cl().to_string(),
@@ -1427,11 +1472,13 @@ impl PyStorage {
             start_time,
             end_time: None,
             tags,
-            node_names: vec![],
+            node_names,
             priority,
             partition_key: None,
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
+            action,
+            config,
         };
         py.detach(|| {
             io_rt()
@@ -1485,6 +1532,8 @@ impl PyStorage {
             end_time: None,
             error: None,
             launched_by: LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
         };
         py.detach(|| {
             io_rt()

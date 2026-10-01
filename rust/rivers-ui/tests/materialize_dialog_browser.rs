@@ -10,13 +10,20 @@
 
 mod common;
 
-use common::{click, flush_effects, fresh_mount_target, nav_to, query_all, query_one};
+use common::{
+    Reply, click, flush_effects, fresh_mount_target, go_back, install_routing_fetch_mock, nav_to,
+    query_all, query_one, request_bodies, set_checked, wait_until, yield_macro,
+};
+use std::collections::HashMap;
+
 use leptos::mount::mount_to;
 use leptos::prelude::*;
-use leptos_router::components::Router;
+use leptos_router::components::{FlatRoutes, Route, Router};
+use leptos_router::hooks::use_location;
+use leptos_router::path;
 use rivers_ui::components::materialize_dialog::MaterializeDialog;
 use rivers_ui::helpers::JobPartitionPicker;
-use rivers_ui::types::PartitionDimensionInfo;
+use rivers_ui::types::{AssetActionInfo, PartitionDimensionInfo};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::HtmlInputElement;
@@ -32,6 +39,7 @@ fn mount_no_picker(show: RwSignal<bool>, asset_keys: Vec<String>) -> web_sys::Ht
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(move || asset_keys.clone())
+                    records=Signal::derive(HashMap::new)
                 />
             </Router>
         }
@@ -57,6 +65,7 @@ fn mount_with_picker(
                 <MaterializeDialog
                     show=show
                     asset_keys=Signal::derive(move || asset_keys.clone())
+                    records=Signal::derive(HashMap::new)
                     picker=picker_signal
                 />
             </Router>
@@ -74,15 +83,33 @@ fn show_false_renders_no_modal() {
 }
 
 #[wasm_bindgen_test]
-async fn show_true_renders_modal_header_and_one_checkbox_per_asset() {
+async fn show_true_renders_modal_header_and_one_row_per_asset() {
     let show = RwSignal::new(true);
     let host = mount_no_picker(show, vec!["a".into(), "b".into(), "c".into()]);
     flush_effects().await;
 
     let header = query_one(&host, ".modal-header h2").text_content().unwrap();
-    assert_eq!(header, "Materialize Assets");
+    assert_eq!(header, "Materialize");
 
-    assert_eq!(query_all(&host, ".checkbox-list .checkbox-item").len(), 3);
+    assert_eq!(
+        query_all(&host, ".mat-dialog-asset-list .mat-dialog-asset-row").len(),
+        3
+    );
+}
+
+#[wasm_bindgen_test]
+async fn asset_rows_render_without_waiting_on_the_metadata_fetch() {
+    // There is no server in the CSR harness, so `get_assets` can only fail —
+    // the list must still render every key, just without status decoration.
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
+    flush_effects().await;
+
+    let names: Vec<String> = query_all(&host, ".mat-dialog-asset-name")
+        .into_iter()
+        .map(|el| el.text_content().unwrap_or_default())
+        .collect();
+    assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[wasm_bindgen_test]
@@ -91,7 +118,7 @@ async fn assets_default_to_all_selected_when_dialog_opens() {
     let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
     flush_effects().await;
 
-    let checked: Vec<bool> = query_all(&host, ".checkbox-list input[type=checkbox]")
+    let checked: Vec<bool> = query_all(&host, ".mat-dialog-asset-row input[type=checkbox]")
         .into_iter()
         .map(|el| {
             let input: HtmlInputElement = el.dyn_into().unwrap();
@@ -102,12 +129,44 @@ async fn assets_default_to_all_selected_when_dialog_opens() {
 }
 
 #[wasm_bindgen_test]
+async fn clear_deselects_every_asset_and_select_all_restores_them() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into(), "b".into()]);
+    flush_effects().await;
+
+    let link_named = |name: &str| {
+        query_all(&host, ".mat-dialog-col-actions .link-btn")
+            .into_iter()
+            .find(|el| el.text_content().unwrap_or_default() == name)
+            .unwrap()
+    };
+
+    click(&link_named("Clear"), false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "Nothing selected"
+    );
+
+    click(&link_named("Select all"), false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "2 assets · 1 run"
+    );
+}
+
+#[wasm_bindgen_test]
 async fn deselecting_all_assets_disables_submit_button() {
     let show = RwSignal::new(true);
     let host = mount_no_picker(show, vec!["a".into()]);
     flush_effects().await;
 
-    let cb_el = query_one(&host, ".checkbox-list input[type=checkbox]");
+    let cb_el = query_one(&host, ".mat-dialog-asset-row input[type=checkbox]");
     let cb: HtmlInputElement = cb_el.clone().dyn_into().unwrap();
     cb.set_checked(false);
 
@@ -155,6 +214,50 @@ async fn add_tag_button_appends_to_tag_list() {
     assert!(tags[0].text_content().unwrap().contains("env=prod"));
 }
 
+/// Tags are submitted with the run (including `rivers/priority`), so one left
+/// over from a previous open would silently attach to the next action run.
+#[wasm_bindgen_test]
+async fn reopening_drops_the_previous_tags() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into()]);
+    flush_effects().await;
+
+    let inputs = query_all(&host, ".tag-input-row .form-input");
+    let key_input: HtmlInputElement = inputs[0].clone().dyn_into().unwrap();
+    let val_input: HtmlInputElement = inputs[1].clone().dyn_into().unwrap();
+    key_input.set_value("env");
+    val_input.set_value("prod");
+
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    key_input
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+    val_input
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+    flush_effects().await;
+
+    click(&query_one(&host, ".tag-input-row .btn"), false);
+    flush_effects().await;
+    assert_eq!(query_all(&host, ".tag-list .tag").len(), 1);
+
+    show.set(false);
+    flush_effects().await;
+    show.set(true);
+    flush_effects().await;
+
+    assert!(
+        query_all(&host, ".tag-list .tag").is_empty(),
+        "tags from the previous open must not carry over"
+    );
+    let inputs = query_all(&host, ".tag-input-row .form-input");
+    let key_input: HtmlInputElement = inputs[0].clone().dyn_into().unwrap();
+    let val_input: HtmlInputElement = inputs[1].clone().dyn_into().unwrap();
+    assert_eq!(key_input.value(), "");
+    assert_eq!(val_input.value(), "");
+}
+
 #[wasm_bindgen_test]
 async fn removing_a_tag_drops_it_from_the_list() {
     let show = RwSignal::new(true);
@@ -181,7 +284,7 @@ async fn removing_a_tag_drops_it_from_the_list() {
     assert_eq!(query_all(&host, ".tag-list .tag").len(), 1);
 
     // Click the per-tag remove button.
-    click(&query_one(&host, ".tag-list .tag-remove"), false);
+    click(&query_one(&host, ".tag-list .icon-btn"), false);
     flush_effects().await;
     assert_eq!(query_all(&host, ".tag-list .tag").len(), 0);
 }
@@ -203,7 +306,7 @@ async fn cancel_hides_dialog() {
 }
 
 #[wasm_bindgen_test]
-async fn submit_button_label_reflects_partition_count_under_multi_picker() {
+async fn summary_rail_reflects_partition_count_under_multi_picker() {
     let show = RwSignal::new(true);
     let host = mount_with_picker(
         show,
@@ -229,10 +332,14 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
     );
     flush_effects().await;
 
-    // Initially no partitions selected → label = "Materialize" (n=0 → 1).
+    // Nothing picked yet — the rail asks for a partition and submit stays off.
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · select a partition"
+    );
     let btn = query_one(&host, ".modal-footer .btn-primary");
-    assert_eq!(btn.text_content().unwrap(), "Materialize");
-    // Disabled because multi picker requires at least one selection.
     assert!(btn.has_attribute("disabled"));
 
     // Select two colors + the size → 2 cartesian combos.
@@ -244,7 +351,685 @@ async fn submit_button_label_reflects_partition_count_under_multi_picker() {
     click(&rows[2], false);
     flush_effects().await;
 
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 2 partitions · 2 runs"
+    );
     let btn = query_one(&host, ".modal-footer .btn-primary");
-    assert_eq!(btn.text_content().unwrap(), "Materialize 2 runs");
+    assert_eq!(btn.text_content().unwrap(), "Materialize");
     assert!(!btn.has_attribute("disabled"));
+}
+
+#[wasm_bindgen_test]
+async fn crossing_the_backfill_threshold_switches_the_rail_and_button() {
+    let show = RwSignal::new(true);
+    let host = mount_with_picker(
+        show,
+        vec!["asset.a".into()],
+        JobPartitionPicker::SingleDim {
+            keys: vec!["k1".into(), "k2".into(), "k3".into()],
+            truncated: false,
+        },
+    );
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    for row in rows.iter().take(3) {
+        click(row, false);
+        flush_effects().await;
+    }
+
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 3 partitions · 1 backfill"
+    );
+    assert_eq!(
+        query_one(&host, ".modal-footer .btn-primary")
+            .text_content()
+            .unwrap(),
+        "Backfill 3 partitions"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn unpartitioned_selection_says_so_instead_of_showing_a_picker() {
+    let show = RwSignal::new(true);
+    let host = mount_no_picker(show, vec!["a".into()]);
+    flush_effects().await;
+
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 0);
+    assert!(
+        query_one(&host, ".mat-dialog-note")
+            .text_content()
+            .unwrap()
+            .contains("Not partitioned")
+    );
+}
+
+/// The picker owns the reset, but it is only mounted for a partitioned
+/// selection — reopening on an unpartitioned asset used to submit the previous
+/// open's keys.
+#[wasm_bindgen_test]
+async fn reopening_unpartitioned_drops_the_previous_partition_keys() {
+    let show = RwSignal::new(true);
+    let picker = RwSignal::new(JobPartitionPicker::SingleDim {
+        keys: vec!["k1".into(), "k2".into()],
+        truncated: false,
+    });
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(move || picker.get())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 1 partition · 1 run"
+    );
+
+    // Cancel, then reopen against an unpartitioned asset.
+    show.set(false);
+    flush_effects().await;
+    picker.set(JobPartitionPicker::None);
+    show.set(true);
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · 1 run",
+        "an unpartitioned open inherited the previous selection's keys"
+    );
+}
+
+/// Values in only some dimensions expand to no key; an optional-key verb must
+/// not read that as "whole asset" and submit a keyless delete.
+#[wasm_bindgen_test]
+async fn optional_key_verb_blocks_a_partial_multi_pick() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(|| JobPartitionPicker::Multi {
+                        dimensions: vec![
+                            PartitionDimensionInfo {
+                                name: "color".into(),
+                                keys: vec!["r".into(), "g".into()],
+                                total_count: 2,
+                                keys_truncated: false,
+                            },
+                            PartitionDimensionInfo {
+                                name: "size".into(),
+                                keys: vec!["s".into(), "m".into()],
+                                total_count: 2,
+                                keys_truncated: false,
+                            },
+                        ],
+                        asset_key: None,
+                        truncated: false,
+                    })
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "delete".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                            config_schema: None,
+                        })
+                    })
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false); // color = r; size left empty
+    flush_effects().await;
+
+    let submit = query_one(&host, ".modal-footer .btn-danger");
+    assert!(
+        submit.has_attribute("disabled"),
+        "a partial pick would submit a keyless delete"
+    );
+    assert_eq!(
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap(),
+        "1 asset · select a partition"
+    );
+}
+
+/// A live refresh on the Assets list rebuilds a paged picker and empties the
+/// pick. An emptied pick must leave the delete disabled, not turn it into an
+/// enabled whole-asset delete: only the explicit whole-asset choice does that.
+#[wasm_bindgen_test]
+async fn optional_key_verb_needs_a_partition_or_the_whole_asset() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["events".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                        keys: vec!["2026-09-01".into(), "2026-09-02".into()],
+                        truncated: false,
+                    })
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "delete".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                            config_schema: None,
+                        })
+                    })
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    let summary = || {
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap()
+    };
+    let submit_disabled =
+        || query_one(&host, ".modal-footer .btn-danger").has_attribute("disabled");
+
+    // Pick a partition, then lose it.
+    let rows = query_all(&host, ".exec-dialog-partition-row");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert_eq!(summary(), "1 asset · 1 partition · 1 run");
+    click(&rows[0], false);
+    flush_effects().await;
+    assert!(
+        submit_disabled(),
+        "an emptied pick would delete the whole asset"
+    );
+    assert_eq!(summary(), "1 asset · select a partition");
+
+    set_checked(&query_one(&host, ".whole-asset-choice input"), true);
+    flush_effects().await;
+    assert!(!submit_disabled());
+    assert_eq!(summary(), "1 asset · whole asset · 1 run");
+    assert_eq!(query_all(&host, ".exec-dialog-partition-row").len(), 0);
+}
+
+/// Nothing else in the product distinguishes an `Outcome.Unmaterialize` verb
+/// from a benign one, so the dialog has to.
+#[wasm_bindgen_test]
+async fn destructive_verb_is_named_and_flagged() {
+    let show = RwSignal::new(true);
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["a".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    action=Signal::derive(|| {
+                        Some(AssetActionInfo {
+                            name: "purge".to_string(),
+                            outcome: "unmaterialize".to_string(),
+                            exclusive: true,
+                            partitioning: "optional".to_string(),
+                            description: None,
+                            config_schema: None,
+                        })
+                    })
+                    destructive=Signal::derive(|| true)
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".modal-header h2").text_content().unwrap(),
+        "Purge"
+    );
+    assert!(
+        query_one(&host, ".mat-dialog-warning")
+            .text_content()
+            .unwrap()
+            .contains("Clears materialization state")
+    );
+    assert_eq!(query_all(&host, ".modal-footer .btn-danger").len(), 1);
+}
+
+/// A page outlives a change of its route params, and the dialog submits
+/// against the code location current at the click. After a Back from staging
+/// to prod, an open delete deleted prod's partition while it showed the same
+/// verb, asset and partition.
+#[wasm_bindgen_test]
+async fn back_to_another_code_location_closes_the_dialog() {
+    let (_mock, requests) = install_routing_fetch_mock(|_| Reply::Pending);
+    nav_to("/locations/prod/core/assets/events");
+    nav_to("/locations/staging/core/assets/events");
+    let show = RwSignal::new(true);
+    let target = fresh_mount_target();
+    let host = target.clone();
+    mount_to(target, move || {
+        view! {
+            <Router>
+                <FlatRoutes fallback=|| view! { <div class="no-route"></div> }>
+                    <Route
+                        path=path!("/locations/:loc_ns/:loc_name/assets/:key")
+                        view=move || {
+                            let pathname = use_location().pathname;
+                            view! {
+                                <span class="route-path">{move || pathname.get()}</span>
+                                <MaterializeDialog
+                                    show=show
+                                    asset_keys=Signal::derive(|| vec!["events".to_string()])
+                                    records=Signal::derive(HashMap::new)
+                                    picker=Signal::derive(|| JobPartitionPicker::SingleDim {
+                                        keys: vec!["2026-09-01".into(), "2026-09-02".into()],
+                                        truncated: false,
+                                    })
+                                    action=Signal::derive(|| {
+                                        Some(AssetActionInfo {
+                                            name: "delete".to_string(),
+                                            outcome: "unmaterialize".to_string(),
+                                            exclusive: true,
+                                            partitioning: "optional".to_string(),
+                                            description: None,
+                                            config_schema: None,
+                                        })
+                                    })
+                                    destructive=Signal::derive(|| true)
+                                />
+                            }
+                        }
+                    />
+                </FlatRoutes>
+            </Router>
+        }
+    })
+    .forget();
+    assert!(
+        wait_until(|| !query_all(&host, ".exec-dialog-partition-row").is_empty()).await,
+        "the dialog never rendered"
+    );
+    // The dialog's opening Effects reset the pick: let them run first.
+    yield_macro().await;
+
+    click(&query_all(&host, ".exec-dialog-partition-row")[0], false);
+    let summary = || {
+        query_one(&host, ".mat-dialog-summary")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| summary() == "1 asset · 1 partition · 1 run").await,
+        "the pick never registered (at {})",
+        summary()
+    );
+
+    go_back();
+    let route_path = || {
+        query_one(&host, ".route-path")
+            .text_content()
+            .unwrap_or_default()
+    };
+    assert!(
+        wait_until(|| route_path() == "/locations/prod/core/assets/events").await,
+        "Back never reached prod (at {})",
+        route_path()
+    );
+    // Whatever is still on screen, a click must not reach prod.
+    if let Some(submit) = host.query_selector(".modal-footer .btn-danger").unwrap() {
+        click(&submit, false);
+    }
+    for _ in 0..5 {
+        yield_macro().await;
+    }
+
+    let sent: Vec<web_sys::Request> = requests
+        .borrow()
+        .iter()
+        .filter(|r| r.url().contains("trigger_action"))
+        .cloned()
+        .collect();
+    assert_eq!(request_bodies(&sent).await, Vec::<String>::new());
+    assert!(!show.get_untracked(), "the dialog stayed open on prod");
+    assert!(query_all(&host, ".modal-overlay").is_empty());
+}
+
+// ── Config editor ──
+
+const PIPELINE_SCHEMA: &str = r#"{"properties":{"api_key":{"title":"Api Key","type":"string"},"batch_size":{"default":100,"title":"Batch Size","type":"integer"}},"required":["api_key"],"title":"PipelineConfig","type":"object","x-settings":true}"#;
+
+fn definition(key: &str, config_schema: Option<&str>) -> rivers_ui::types::AssetDefinitionInfo {
+    rivers_ui::types::AssetDefinitionInfo {
+        asset_key: key.to_string(),
+        description: None,
+        partition_def: None,
+        hooks: vec![],
+        io_handler: None,
+        has_self_dependency: false,
+        is_external: false,
+        automation_condition: None,
+        tags: vec![],
+        kinds: vec![],
+        group: None,
+        code_version: None,
+        asset_type: "asset".to_string(),
+        actions: vec![],
+        config_schema: config_schema.map(str::to_string),
+        metadata: Default::default(),
+    }
+}
+
+fn mount_with_definitions(
+    show: RwSignal<bool>,
+    definitions: Vec<rivers_ui::types::AssetDefinitionInfo>,
+) -> web_sys::HtmlElement {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let keys: Vec<String> = definitions.iter().map(|d| d.asset_key.clone()).collect();
+    let by_key: HashMap<String, rivers_ui::types::AssetDefinitionInfo> = definitions
+        .into_iter()
+        .map(|d| (d.asset_key.clone(), d))
+        .collect();
+    mount_to(target.clone(), move || {
+        let keys = keys.clone();
+        let by_key = by_key.clone();
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(move || keys.clone())
+                    records=Signal::derive(HashMap::new)
+                    definitions=Signal::derive(move || by_key.clone())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    target
+}
+
+/// Type `value` into the editor: set the value and fire `input`, as a user does.
+fn type_config(host: &web_sys::HtmlElement, value: &str) {
+    let textarea = query_one(host, ".config-editor-text");
+    js_sys::Reflect::set(&textarea, &"value".into(), &value.into()).unwrap();
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    textarea
+        .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+        .unwrap();
+}
+
+fn editor_value(host: &web_sys::HtmlElement) -> String {
+    js_sys::Reflect::get(&query_one(host, ".config-editor-text"), &"value".into())
+        .unwrap()
+        .as_string()
+        .unwrap_or_default()
+}
+
+fn submit_disabled(host: &web_sys::HtmlElement) -> bool {
+    js_sys::Reflect::get(
+        &query_one(host, ".modal-footer .btn-primary"),
+        &"disabled".into(),
+    )
+    .unwrap()
+    .as_bool()
+    .unwrap_or(false)
+}
+
+/// An asset without config still gets the editor: the document's
+/// `execution` section applies to any launch, and metadata can be added.
+#[wasm_bindgen_test]
+async fn config_editor_offers_execution_for_a_plain_asset() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("plain", None)]);
+    flush_effects().await;
+
+    assert_eq!(editor_value(&host), "{\n  \"execution\": {}\n}");
+    assert!(!submit_disabled(&host));
+    type_config(&host, "{\"execution\": {\"max_workers\": 2}}");
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "1:16 execution: max_workers needs \"executor\": \"parallel\""
+    );
+    assert!(submit_disabled(&host));
+}
+
+/// The editor opens on the launch document with each configured asset's
+/// defaults. A field without a default is hinted as required but never
+/// pre-filled, so nothing is sent for it unless typed.
+#[wasm_bindgen_test]
+async fn config_editor_prefills_defaults_and_hints_required_fields() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(
+        show,
+        vec![
+            definition("plain", None),
+            definition("api_data", Some(PIPELINE_SCHEMA)),
+        ],
+    );
+    flush_effects().await;
+
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
+    );
+    assert_eq!(
+        query_one(&host, ".config-editor-hint-fields")
+            .text_content()
+            .unwrap_or_default(),
+        "assets.api_data.config.api_key"
+    );
+    assert!(query_all(&host, ".config-field").is_empty());
+    assert!(!submit_disabled(&host));
+}
+
+/// Malformed text blocks the submit with the reason; Reset restores the
+/// defaults and unblocks it.
+#[wasm_bindgen_test]
+async fn invalid_config_blocks_submit_until_reset() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("api_data", Some(PIPELINE_SCHEMA))]);
+    flush_effects().await;
+
+    type_config(&host, "{\"assets\": ");
+    flush_effects().await;
+    let error = query_one(&host, ".code-editor-issue")
+        .text_content()
+        .unwrap_or_default();
+    assert_eq!(error, "1:12 Expected a value");
+    assert!(!query_all(&host, ".code-editor-mark").is_empty());
+    assert!(submit_disabled(&host));
+
+    type_config(&host, "{\"other\": {\"x\": 1}}");
+    flush_effects().await;
+    assert_eq!(
+        query_one(&host, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "1:2 unknown field 'other'; expected one of assets, execution"
+    );
+    assert!(submit_disabled(&host));
+
+    click(&query_one(&host, ".config-editor .link-btn"), false);
+    flush_effects().await;
+    assert!(query_all(&host, ".code-editor-issue").is_empty());
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
+    );
+    assert!(!submit_disabled(&host));
+}
+
+const STRICT_SCHEMA: &str = r#"{"properties":{"token":{"title":"Token","type":"string"},"limit":{"default":1,"title":"Limit","type":"integer"}},"required":["token"],"title":"StrictConfig","type":"object"}"#;
+
+/// A field a plain model needs and the document leaves unset blocks the
+/// submit; the hint's button sets it. (`api_key` above is a settings
+/// field the environment may set, so it only hints.)
+#[wasm_bindgen_test]
+async fn a_plain_models_required_field_blocks_submit_until_set() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(show, vec![definition("strict", Some(STRICT_SCHEMA))]);
+    flush_effects().await;
+
+    assert_eq!(
+        query_one(&host, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "4:17 assets.strict.config.token: required"
+    );
+    assert!(submit_disabled(&host));
+
+    click(&query_one(&host, ".config-editor-hint .link-btn"), false);
+    flush_effects().await;
+    assert!(query_all(&host, ".code-editor-issue").is_empty());
+    assert!(!submit_disabled(&host));
+    let value: serde_json::Value = serde_json::from_str(&editor_value(&host)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "assets": {"strict": {"config": {"limit": 1, "token": ""}}},
+            "execution": {}
+        })
+    );
+}
+
+/// The repository's resources come pre-filled with their current values;
+/// the schema underlines a wrong value under a key.
+#[wasm_bindgen_test]
+async fn config_editor_prefills_resource_values() {
+    nav_to("/locations/default/demo");
+    let target = fresh_mount_target();
+    let show = RwSignal::new(true);
+    let definitions: HashMap<String, rivers_ui::types::AssetDefinitionInfo> = [(
+        "api_data".to_string(),
+        definition("api_data", Some(PIPELINE_SCHEMA)),
+    )]
+    .into_iter()
+    .collect();
+    let resources = vec![rivers_ui::types::ResourceInfo {
+        key: "db".to_string(),
+        config_schema: r#"{"properties":{"pool_size":{"default":2,"type":"integer"}},"title":"Db","type":"object"}"#.to_string(),
+    }];
+    mount_to(target.clone(), move || {
+        let definitions = definitions.clone();
+        let resources = resources.clone();
+        view! {
+            <Router>
+                <MaterializeDialog
+                    show=show
+                    asset_keys=Signal::derive(|| vec!["api_data".to_string()])
+                    records=Signal::derive(HashMap::new)
+                    definitions=Signal::derive(move || definitions.clone())
+                    resources=Signal::derive(move || resources.clone())
+                />
+            </Router>
+        }
+    })
+    .forget();
+    flush_effects().await;
+
+    assert!(
+        editor_value(&target)
+            .ends_with(
+                "  \"execution\": {},\n  \"resources\": {\n    \"db\": {\n      \"pool_size\": 2\n    }\n  }\n}"
+            ),
+        "{}",
+        editor_value(&target)
+    );
+    type_config(
+        &target,
+        "{\"resources\": {\"db\": {\"pool_size\": \"many\"}}}",
+    );
+    flush_effects().await;
+    assert_eq!(
+        query_one(&target, ".code-editor-issue")
+            .text_content()
+            .unwrap_or_default(),
+        "1:36 resources.db.pool_size: expected integer, got string"
+    );
+    assert!(submit_disabled(&target));
+}
+
+/// Unchecking the only configured asset leaves the editor with the
+/// document's `execution` section; checking it again brings the defaults
+/// back (the user had not typed).
+#[wasm_bindgen_test]
+async fn config_editor_follows_the_checked_assets() {
+    let show = RwSignal::new(true);
+    let host = mount_with_definitions(
+        show,
+        vec![
+            definition("plain", None),
+            definition("api_data", Some(PIPELINE_SCHEMA)),
+        ],
+    );
+    flush_effects().await;
+    assert_eq!(query_all(&host, ".config-editor").len(), 1);
+
+    let checkboxes = query_all(&host, ".mat-dialog-asset-list .asset-row-check");
+    set_checked(&checkboxes[1], false);
+    flush_effects().await;
+    assert_eq!(editor_value(&host), "{\n  \"execution\": {}\n}");
+
+    set_checked(&checkboxes[1], true);
+    // The template effect runs after the Show has mounted the textarea, so
+    // the value binding follows one microtask later.
+    flush_effects().await;
+    flush_effects().await;
+    assert_eq!(
+        editor_value(&host),
+        "{\n  \"assets\": {\n    \"api_data\": {\n      \"config\": {\n        \"batch_size\": 100\n      }\n    }\n  },\n  \"execution\": {}\n}"
+    );
 }

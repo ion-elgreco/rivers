@@ -1,0 +1,13 @@
+# Prefect has no code location object, so there is nothing for a chart to
+# serve. A flow reaches a worker by being registered against the server, which
+# is a client call. This image runs that call once, in-cluster, so the
+# benchmark can time it the same way it times the other two.
+#
+# PREFECT_VERSION must match bench/envs/pyproject.toml and
+# bench/k8s/values/prefect.yaml, or the local and in-cluster measurements run
+# a different Prefect. `bench/k8s/deploy.py` sets this build argument.
+ARG PREFECT_VERSION=3.8.5
+FROM prefecthq/prefect:${PREFECT_VERSION}-python3.11
+
+COPY bench_flows.py /opt/prefect/bench_flows.py
+WORKDIR /opt/prefect

@@ -13,12 +13,20 @@ import logging
 import os
 import pickle
 import time
-from datetime import datetime
+from datetime import date, datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal
 
 import obstore.store
-from pydantic import BaseModel
+import pyarrow as pa
+from deltalake import write_deltalake
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from rivers import (
+    ActionContext,
+    ActionResult,
     Asset,
+    AssetAction,
     AssetDef,
     AssetExecutionContext,
     AutomationCondition,
@@ -26,17 +34,21 @@ from rivers import (
     BackfillStrategy,
     BashTask,
     CodeRepository,
+    DeltaAsset,
+    DeltaIOHandler,
     Executor,
     Hook,
     HookContext,
     Job,
     MetadataValue,
     Observation,
+    Outcome,
     OutputContext,
     PartitionKey,
     PartitionMapping,
     PartitionsDefinition,
     PickleIOHandler,
+    Resource,
     RunQueueConfig,
     RunRequest,
     Schedule,
@@ -50,6 +62,7 @@ from rivers import (
     SkipReason,
     TagConcurrencyLimit,
     Task,
+    action,
 )
 
 # =============================================================================
@@ -57,15 +70,89 @@ from rivers import (
 # =============================================================================
 
 
+class CrmApi(Resource):
+    """The CRM the ingestion reads from; a launch can point it elsewhere."""
+
+    base_url: str = "https://crm.example.com"
+    timeout_s: int = 10
+    api_key: SecretStr = SecretStr("demo-key")
+
+
 class _IngestionSettings(BaseModel):
     source_system: str = "demo"
     batch_size: int = 100
     include_inactive: bool = False
+    mode: Literal["incremental", "full"] = "incremental"
+
+    @field_validator("source_system")
+    @classmethod
+    def _lowercase(cls, value: str) -> str:
+        if value != value.lower():
+            raise ValueError("source_system must be lowercase")
+        return value
 
 
 class _AnalyticsSettings(BaseModel):
     revenue_threshold: float = 50.0
     top_n_products: int = 5
+
+
+class Region(str, Enum):
+    EU = "eu"
+    US = "us"
+
+
+class Endpoint(BaseModel):
+    host: str = "localhost"
+    port: int = Field(5432, ge=1, le=65535)
+
+
+class Credentials(BaseModel):
+    user: str
+    password: SecretStr = SecretStr("")
+
+
+class _ConfigShowcase(BaseModel):
+    """One field per type the launch dialog's config editor handles."""
+
+    # Scalars, with the bounds the editor checks while typing
+    name: str = Field("showcase", min_length=1, max_length=16)
+    batch_size: int = Field(100, ge=1, le=10_000)
+    threshold: float = Field(0.5, gt=0, lt=1)
+    step: float = Field(0.25, multiple_of=0.05)
+    dry_run: bool = False
+    # Choices: a Literal, a single-value Literal and an Enum
+    mode: Literal["fast", "slow"] = "fast"
+    kind: Literal["showcase"] = "showcase"
+    region: Region = Region.EU
+    # Optionals and unions
+    comment: str | None = None
+    ratio: int | float = 1
+    # Nested models: one optional, one with a required field
+    endpoint: Endpoint = Endpoint()
+    fallback: Endpoint | None = None
+    credentials: Credentials | None = None
+    # Lists, tuples and dicts
+    tags: list[str] = Field(["demo"], max_length=3)
+    window: tuple[int, str] = (7, "days")
+    weights: dict[str, float] = {"orders": 1.0}
+    extra: dict[str, Any] = {}
+    # A secret is never pre-filled
+    api_key: SecretStr = SecretStr("demo-key")
+    # Formats, patterns and validators are checked by the code location
+    since: datetime = datetime(2025, 1, 1)
+    day: date = date(2025, 1, 1)
+    output_dir: Path = Path("/tmp/showcase")
+    version: str = Field("1.0.0", pattern=r"^\d+\.\d+\.\d+$")
+    # No default: the launch is refused until it is set
+    run_label: str
+
+    @field_validator("tags")
+    @classmethod
+    def _unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("tags must be unique")
+        return value
 
 
 # =============================================================================
@@ -89,7 +176,7 @@ if _deployment == "cloud":
         bucket=os.environ.get("RIVERS_S3_BUCKET", "rivers-io"),
         config={
             "endpoint": os.environ.get(
-                "RIVERS_S3_ENDPOINT", "http://minio.rivers.svc:9000"
+                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
             ),
             "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
             "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
@@ -100,6 +187,19 @@ if _deployment == "cloud":
     raw_io = VersionedPickleIOHandler(store=_s3_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_s3_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_s3_store, prefix="output")
+    delta_io = DeltaIOHandler(
+        table_uri=f"s3://{os.environ.get('RIVERS_S3_BUCKET', 'rivers-io')}/delta",
+        mode="append",
+        storage_options={
+            "AWS_ENDPOINT_URL": os.environ.get(
+                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
+            ),
+            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+            "AWS_ALLOW_HTTP": "true",
+        },
+    )
 else:
     _io_root = os.path.join(os.getcwd(), ".rivers", "demo-io")
     os.makedirs(_io_root, exist_ok=True)
@@ -107,6 +207,7 @@ else:
     raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
     processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
     output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
+    delta_io = DeltaIOHandler(table_uri=os.path.join(_io_root, "delta"), mode="append")
 
 
 # =============================================================================
@@ -173,9 +274,10 @@ external_weather_data = Asset.external(
     hooks=[log_success, alert_failure],
     pool="database",
 )
-def raw_users() -> dict:
-    """Simulate raw user data ingestion using pipeline config."""
-    settings = _IngestionSettings()
+def raw_users(context: AssetExecutionContext[_IngestionSettings], crm: CrmApi) -> dict:
+    """Simulate raw user data ingestion using pipeline config and the CRM resource."""
+    settings = context.config
+    context.add_output_metadata({"crm": f"{crm.base_url} ({crm.timeout_s}s)"})
     users = [
         {"id": 1, "name": "Alice", "region": "us-east", "active": True, "tier": "pro"},
         {"id": 2, "name": "Bob", "region": "us-west", "active": True, "tier": "free"},
@@ -198,7 +300,7 @@ def raw_users() -> dict:
     ]
     if not settings.include_inactive:
         users = [u for u in users if u["active"]]
-    return {"users": users, "source": settings.source_system}
+    return {"users": users, "source": settings.source_system, "mode": settings.mode}
 
 
 @Asset(
@@ -328,12 +430,26 @@ def active_users(context: AssetExecutionContext, raw_users: dict) -> dict:
     return {"users": active}
 
 
+# Decorator-form assets attach actions as AssetAction objects;
+# `profile` shows up as a button on the enriched_orders asset page.
+def _profile_orders(ctx: ActionContext) -> None:
+    ctx.log.info("[profile] sampling join quality for %s", ctx.asset_name)
+
+
+profile_orders = AssetAction(
+    name="profile",
+    outcome=Outcome.Unchanged,
+    description="Sample the join output and log quality stats",
+)(_profile_orders)
+
+
 @Asset(
     io_handler=processed_io,
     tags=["processing"],
     kinds="transform",
     group="data_processing",
     code_version="1.0",
+    actions=[profile_orders],
 )
 def enriched_orders(
     context: AssetExecutionContext, raw_orders: dict, raw_products: dict
@@ -1133,6 +1249,111 @@ def metadata_showcase(context: AssetExecutionContext) -> dict:
 
 
 # =============================================================================
+# Config Showcase (one field per type the launch dialog's config editor handles)
+# =============================================================================
+
+
+@Asset(
+    io_handler=output_io,
+    tags=["demo", "config"],
+    kinds="showcase",
+    group="demo",
+    code_version="1.0",
+    metadata={"purpose": "Test of every field type in the config editor"},
+)
+def config_showcase(context: AssetExecutionContext[_ConfigShowcase]) -> dict:
+    """Asset whose config has one field per type the config editor handles.
+    The values the launch resolved to are its output metadata."""
+    values = context.config.model_dump(mode="json")
+    context.add_output_metadata(
+        {"config": MetadataValue.json(json.dumps(values, indent=2))}
+    )
+    return values
+
+
+# =============================================================================
+# Failure Showcase (always fails, so the UI has a traceback to show)
+# =============================================================================
+
+# The trailing commas make this invalid JSON.
+_PRICING_RULES = """
+{
+    "default_margin": 0.25,
+    "category_margins": {"books": 0.10, "electronics": 0.15,},
+}
+"""
+
+
+def _parse_pricing_rules(raw: str) -> dict:
+    return json.loads(raw)
+
+
+@Asset(
+    io_handler=output_io,
+    tags=["demo", "failure"],
+    kinds="showcase",
+    group="demo",
+)
+def broken_pricing_rules() -> dict:
+    """Always fails: its pricing rules are not valid JSON. The run page shows
+    the traceback, with json's frames folded and the parse error as the cause."""
+    try:
+        return _parse_pricing_rules(_PRICING_RULES)
+    except json.JSONDecodeError as e:
+        raise ValueError("pricing rules are not valid JSON") from e
+
+
+# =============================================================================
+# Asset Actions — native DeltaAsset with built-in maintenance verbs
+# =============================================================================
+# `event_log` is a real Delta table. `optimize`, `vacuum`, and `delete` come
+# from the DeltaAsset base — each a button on the asset page doing the real
+# Delta operation (compaction, file cleanup, row deletion + state clear).
+# `optimize` is exclusive: it serializes against materialize and other
+# exclusive verbs via the implicit __asset__:event_log pool. On this tiny
+# table the verbs finish in milliseconds, so the serialization won't be
+# visible on the Gantt — the pool page shows the exclusive claim instead.
+# `refresh` shows a custom verb on top of the base.
+
+
+class EventLog(DeltaAsset):
+    """Append-only event log stored as a Delta table."""
+
+    name = "event_log"
+    io_handler = delta_io
+    tags = ["maintenance", "actions-demo"]
+    group = "maintenance_demo"
+
+    @classmethod
+    def materialize(cls, context: AssetExecutionContext) -> pa.Table:
+        events = pa.table(
+            {"id": list(range(100)), "event": [f"evt-{i:03d}" for i in range(100)]}
+        )
+        context.add_output_metadata({"rows": MetadataValue.int(events.num_rows)})
+        return events
+
+    @action(
+        outcome=Outcome.MayMaterialize,
+        description="Pull late-arriving events; materializes only when data changed",
+    )
+    @classmethod
+    def refresh(cls, ctx: ActionContext) -> ActionResult:
+        if int(time.time()) % 2:
+            ctx.log.info("[refresh] no late events for %s", ctx.asset_name)
+            return ActionResult.unchanged()
+        handler = ctx.io_handler
+        late = pa.table({"id": [int(time.time())], "event": ["evt-late"]})
+        write_deltalake(
+            handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata),
+            late,
+            mode="append",
+            storage_options=handler.storage_options,
+        )
+        ctx.log.info("[refresh] appended late events to %s", ctx.asset_name)
+        return ActionResult.materialized(metadata={"late_rows": 1})
+
+
+# =============================================================================
 # Jobs
 # =============================================================================
 
@@ -1166,6 +1387,12 @@ slow_pipeline_job = Job(
 metadata_showcase_job = Job(
     "metadata_showcase",
     assets=[metadata_showcase],
+    executor=Executor.in_process(),
+)
+
+failure_showcase_job = Job(
+    "failure_showcase",
+    assets=[broken_pricing_rules],
     executor=Executor.in_process(),
 )
 
@@ -1252,6 +1479,20 @@ def hourly_skip_example(context: ScheduleEvaluationContext):
     if hour < 6 or hour > 22:
         return SkipReason(f"Outside business hours (hour={hour})")
     return RunRequest(run_key=f"hourly-{context.scheduled_execution_time}")
+
+
+@Schedule(
+    cron_schedule="*/5 * * * *",
+    job_name="failure_showcase",
+    name="failure_showcase_schedule",
+    default_status=ScheduleStatus.Running,
+    description="Run broken_pricing_rules every 5 minutes; every run fails",
+)
+def failure_showcase_schedule(context: ScheduleEvaluationContext):
+    return RunRequest(
+        run_key=f"failure-{context.scheduled_execution_time}",
+        tags={"triggered_by": "Schedule"},
+    )
 
 
 # =============================================================================
@@ -1627,6 +1868,12 @@ all_assets = [
     slow_step_d,
     # Metadata showcase
     metadata_showcase,
+    # Config showcase
+    config_showcase,
+    # Failure showcase
+    broken_pricing_rules,
+    # Actions demo (class form)
+    EventLog,
     # Backfill showcase
     daily_events,
     daily_aggregates,
@@ -1658,6 +1905,7 @@ repo = CodeRepository(
         full_pipeline_job,
         slow_pipeline_job,
         metadata_showcase_job,
+        failure_showcase_job,
         backfill_demo_job,
         multi_partition_demo_job,
         million_partition_job,
@@ -1668,8 +1916,10 @@ repo = CodeRepository(
         daily_analytics_schedule,
         slow_pipeline_schedule,
         hourly_skip_example,
+        failure_showcase_schedule,
     ],
     sensors=[new_data_sensor, file_watcher_sensor, data_quality_sensor],
+    resources={"crm": CrmApi()},
     run_queue=RunQueueConfig(
         max_concurrent_runs=3,
         tag_concurrency_limits=[

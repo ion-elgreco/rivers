@@ -1,10 +1,10 @@
 //! Browser-based component tests for the small `ui_kit` primitives that
 //! don't depend on the router (`leptos_router::components::A`) or any
-//! external context: `StatusChip`, `Sparkline`, `KindBadge`, `Tag`,
-//! `EmptyState`, `ProgressBar`, `SectionHeader`.
+//! external context: `StatusChip`, `KindBadge`, `Tag`, `EmptyState`,
+//! `ProgressBar`, `SectionHeader`.
 //!
 //! Tests pin the most refactor-sensitive concerns: the kind → CSS-class
-//! mapping (StatusChip / KindBadge / Sparkline degenerate paths) and
+//! mapping (StatusChip / KindBadge) and
 //! the prop-driven shape of the rendered DOM.
 
 #![cfg(target_arch = "wasm32")]
@@ -15,11 +15,41 @@ use common::{flush_effects, fresh_mount_target, query_all, query_one};
 use leptos::mount::mount_to;
 use leptos::prelude::*;
 use rivers_ui::components::ui_kit::{
-    EmptyState, KindBadge, ProgressBar, SectionHeader, Sparkline, StatusChip, Tag,
+    EmptyState, KindBadge, ProgressBar, SectionHeader, StatusChip, Tag,
 };
+use rivers_ui::helpers::use_confirm_armed;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+/// A page survives route-param changes, so a confirm armed on job A must not
+/// fire job B's destructive verb on B's first click.
+#[wasm_bindgen_test]
+async fn confirm_disarms_when_its_key_changes() {
+    let key = RwSignal::new("job_a".to_string());
+    let armed_slot = RwSignal::new(None::<RwSignal<bool>>);
+    let target = fresh_mount_target();
+    let _handle = mount_to(target, move || {
+        armed_slot.set(Some(use_confirm_armed(move || key.track())));
+        view! { <span /> }
+    });
+    flush_effects().await;
+    let armed = armed_slot.get_untracked().unwrap();
+
+    armed.set(true);
+    flush_effects().await;
+    assert!(
+        armed.get_untracked(),
+        "arming must stick while the key holds"
+    );
+
+    key.set("job_b".to_string());
+    flush_effects().await;
+    assert!(
+        !armed.get_untracked(),
+        "the confirm followed the user to job_b"
+    );
+}
 
 #[wasm_bindgen_test]
 fn status_chip_uses_kind_in_class_and_label() {
@@ -29,49 +59,12 @@ fn status_chip_uses_kind_in_class_and_label() {
     });
 
     let chip = query_one(&target, "span.chip");
-    assert!(!chip.class_name().contains("chip--sm"));
     assert!(chip.text_content().unwrap().contains("success"));
     assert!(
         query_one(&target, "span.dot")
             .class_name()
             .contains("dot-success")
     );
-}
-
-#[wasm_bindgen_test]
-fn status_chip_small_variant_adds_modifier_class() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! { <StatusChip kind="warning" small=true /> }
-    });
-    assert!(
-        query_one(&target, "span.chip")
-            .class_name()
-            .contains("chip--sm")
-    );
-}
-
-#[wasm_bindgen_test]
-fn sparkline_with_zero_or_one_point_renders_empty_svg() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! { <Sparkline points=vec![1.0_f64] /> }
-    });
-
-    // Empty-svg branch: no <path>, no <circle>.
-    assert_eq!(query_all(&target, "svg path").len(), 0);
-    assert_eq!(query_all(&target, "svg circle").len(), 0);
-}
-
-#[wasm_bindgen_test]
-fn sparkline_with_multiple_points_renders_path_and_endpoint_circle() {
-    let target = fresh_mount_target();
-    let _handle = mount_to(target.clone(), || {
-        view! { <Sparkline points=vec![1.0_f64, 2.0, 3.0, 2.0] /> }
-    });
-
-    assert_eq!(query_all(&target, "svg path").len(), 1);
-    assert_eq!(query_all(&target, "svg circle").len(), 1);
 }
 
 #[wasm_bindgen_test]

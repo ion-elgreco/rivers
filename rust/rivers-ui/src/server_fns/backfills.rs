@@ -7,37 +7,6 @@ use crate::types::{
     BackfillFilter, BackfillInfo, BackfillPartitionsPage, BackfillsPage, BackfillsSummary,
 };
 
-/// Backfills owned by `(loc_ns, loc_name)`. `status` accepts the wire-string
-/// form of `BackfillStatus` (`"Requested"`, `"InProgress"`,
-/// `"CompletedSuccess"`, `"CompletedFailed"`, `"Canceled"`); unknown values
-/// disable the filter. `limit` defaults to 50.
-#[server]
-pub async fn get_backfills(
-    loc_ns: String,
-    loc_name: String,
-    limit: Option<usize>,
-    status: Option<String>,
-) -> Result<Vec<BackfillInfo>, ServerFnError> {
-    use rivers_core::storage::{BackfillStatus, StorageBackend};
-    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
-    let state = expect_context::<crate::state::AppState>();
-    let status_filter = status.and_then(|s| match s.as_str() {
-        "Requested" => Some(BackfillStatus::Requested),
-        "InProgress" => Some(BackfillStatus::InProgress),
-        "CompletedSuccess" => Some(BackfillStatus::CompletedSuccess),
-        "CompletedFailed" => Some(BackfillStatus::CompletedFailed),
-        "Canceled" => Some(BackfillStatus::Canceled),
-        _ => None,
-    });
-    state
-        .storage
-        .for_code_location(&ctx)
-        .get_backfills(Some(limit.unwrap_or(50)), status_filter)
-        .await
-        .map(|bfs| bfs.into_iter().map(Into::into).collect())
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
 #[server]
 pub async fn get_backfill(backfill_id: String) -> Result<Option<BackfillInfo>, ServerFnError> {
     use rivers_core::storage::StorageBackend;

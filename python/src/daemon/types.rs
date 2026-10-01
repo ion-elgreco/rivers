@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use pyo3::prelude::*;
 use rivers_core::storage::{ConditionEvalRecord, TickRecord};
 
@@ -49,6 +49,8 @@ pub(crate) struct RunRequestData {
     /// requests in one tick share the automation's origin; gRPC launches carry
     /// the acting user.
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// See [`rivers_core::storage::RunRecord::config`]; stamped on the record.
+    pub(crate) config: Option<String>,
 }
 
 /// Materialization-shape run request — pre-resolved asset selection with
@@ -68,6 +70,11 @@ pub(crate) struct MaterializationRequestData {
     pub(crate) partition_key: Option<rivers_core::storage::PartitionKey>,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// The verb the run executes; `None` means materialize. Reruns of action
+    /// runs carry the original verb.
+    pub(crate) action: Option<String>,
+    /// See [`rivers_core::storage::RunRecord::config`]; stamped on the record.
+    pub(crate) config: Option<String>,
 }
 
 /// A run re-execution from a stored `RunRecord`: `Job` → `dispatch_jobs`,
@@ -75,6 +82,15 @@ pub(crate) struct MaterializationRequestData {
 pub(crate) enum RunRerunRequest {
     Job(RunRequestData),
     Materialization(MaterializationRequestData),
+}
+
+impl RunRerunRequest {
+    pub(crate) fn config_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Job(r) => &mut r.config,
+            Self::Materialization(m) => &mut m.config,
+        }
+    }
 }
 
 /// What a backfill runs each partition as: an ad-hoc materialization of an asset
@@ -104,6 +120,11 @@ pub(crate) struct BackfillRequestData {
     pub(crate) backfill_id: Option<String>,
     /// Provenance stamped on the `BackfillRecord`.
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
+    /// The verb child runs execute. `None` means materialize.
+    pub(crate) action: Option<String>,
+    /// See [`rivers_core::storage::BackfillRecord::config`]; every child run
+    /// is launched with it.
+    pub(crate) config: Option<String>,
 }
 
 pub(crate) enum TickOutcome {
@@ -225,7 +246,7 @@ pub(crate) struct TickResult {
     pub(crate) result: Result<EvalOutcome, String>,
     pub(crate) prev_cursor: Option<String>,
     #[allow(dead_code)]
-    pub(crate) dispatched_at: chrono::DateTime<Utc>,
+    pub(crate) dispatched_at: Timestamp,
 }
 
 pub(crate) struct TickWriteMsg {
@@ -235,7 +256,6 @@ pub(crate) struct TickWriteMsg {
 
 pub(crate) struct ConditionEvalWriteMsg {
     pub(crate) evals: Vec<ConditionEvalRecord>,
-    pub(crate) max_evals_retained: Option<usize>,
 }
 
 pub(crate) type BoxedPyFuture = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;

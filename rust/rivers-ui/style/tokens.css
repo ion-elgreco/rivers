@@ -25,6 +25,7 @@
 
     /* Secondary — flowing cyan */
     --secondary: #50e1f9;
+    --secondary-dim: color-mix(in srgb, var(--secondary) 35%, transparent);
 
     /* Semantic (Rivers palette) */
     --success: #7dd67a;
@@ -32,27 +33,52 @@
     --error: #ff6e84;
     --info: #50e1f9;                  /* secondary doubles as info */
 
-    /* Semantic tinted backgrounds (15% opacity of the saturated semantic) */
-    --success-bg: rgba(34, 197, 94, 0.15);
-    --warning-bg: rgba(234, 179, 8, 0.15);
-    --error-bg: rgba(255, 110, 132, 0.15);
-    --info-bg: rgba(80, 225, 249, 0.15);
+    /* Semantic tinted backgrounds (15% of the semantic color) */
+    --success-bg: color-mix(in srgb, var(--success) 15%, transparent);
+    --warning-bg: color-mix(in srgb, var(--warning) 15%, transparent);
+    --error-bg: color-mix(in srgb, var(--error) 15%, transparent);
+    --info-bg: color-mix(in srgb, var(--info) 15%, transparent);
+
+    /* JSON syntax (config editor) */
+    --syn-key: var(--secondary);
+    --syn-string: var(--success);
+    --syn-number: var(--warning);
+    --syn-keyword: var(--accent);
+    --syn-punct: var(--text-muted);
+    --syn-invalid: var(--error);
 
     /* Accent tints (--accent at varying opacity, for hover/active/border states) */
-    --accent-bg: rgba(255, 143, 120, 0.15);
-    --accent-bg-soft: rgba(255, 143, 120, 0.1);
-    --accent-bg-strong: rgba(255, 143, 120, 0.2);
-    --accent-border: rgba(255, 143, 120, 0.4);
+    --accent-bg: color-mix(in srgb, var(--accent) 15%, transparent);
+    --accent-bg-soft: color-mix(in srgb, var(--accent) 10%, transparent);
+    --accent-bg-strong: color-mix(in srgb, var(--accent) 20%, transparent);
+    --accent-border: color-mix(in srgb, var(--accent) 40%, transparent);
 
     /* Ambient shadow (tinted) */
     --shadow-ambient: 0 0 32px -4px rgba(80, 225, 249, 0.04);
     --shadow-float: 0 0 32px -4px rgba(80, 225, 249, 0.06);
+    --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.5);        /* menus, popovers, panels */
+    --shadow-overlay: 0 4px 16px rgba(0, 0, 0, 0.3);     /* canvas overlays */
 
-    /* Roundedness — industrial, not playful (aligned with Rivers scale) */
-    --round-xs: 0.125rem;  /* 2px — swatches, thin rails */
-    --round-sm: 0.25rem;   /* 4px — buttons, chips, pills (Rivers --r-sm) */
-    --round-md: 0.375rem;  /* 6px — cards, inputs (Rivers --r-md) */
-    --round-lg: 0.5rem;    /* 8px — panels, containers (Rivers --r-lg) */
+    /* Floating surfaces */
+    --glass-bg: color-mix(in srgb, var(--bg-hover) 80%, transparent);   /* blurred modals, menus */
+    --tooltip-bg: color-mix(in srgb, var(--bg-hover) 96%, transparent);
+
+    /* Roundedness — industrial, not playful */
+    --round-xs: 2px;   /* swatches, thin rails */
+    --round-sm: 4px;   /* buttons, chips, pills */
+    --round-md: 6px;   /* cards, inputs */
+    --round-lg: 8px;   /* panels, containers */
+
+    /* Type scale */
+    --fs-3xs: 9px;     /* glyph ticks, tiny prefixes */
+    --fs-2xs: 10px;    /* caps labels, table heads, badges */
+    --fs-xs: 11px;     /* chips, tags, small buttons */
+    --fs-sm: 12px;     /* meta text, buttons, nav */
+    --fs-md: 13px;     /* body */
+    --fs-lg: 14px;
+    --fs-xl: 16px;     /* panel titles */
+    --fs-2xl: 18px;
+    --fs-3xl: 22px;    /* page titles */
 
     /* Density — default comfy */
     --dens-row: 44px;
@@ -88,10 +114,8 @@
     --dens-gap: 10px;
 }
 
-.font-mono { font-family: "JetBrains Mono", "SF Mono", "Cascadia Code", monospace; }
-
 /* Selection */
-::selection { background: rgba(255, 143, 120, 0.3); }
+::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
 
 /* Focus ring */
 :focus-visible { outline: 2px solid var(--secondary); outline-offset: 2px; }
@@ -107,11 +131,15 @@ html, body {
     color: var(--text);
     min-height: 100vh;
     font-size: 14px;
+    color-scheme: dark;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
     font-feature-settings: "ss01", "cv11";
 }
+
+/* Form controls default to the UA font, not the page font. */
+button, input, select, textarea { font-family: inherit; }
 
 .layout {
     display: flex;

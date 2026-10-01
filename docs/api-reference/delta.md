@@ -55,6 +55,108 @@ These metadata keys override handler defaults per-asset:
 | `delta/version` | `int` | Delta table version after write. |
 | `rivers/schema` | `Schema` | Arrow schema of the written table. |
 
+### Methods for action bodies
+
+An [action](../concepts/actions.md) receives the asset's resolved handler as
+`ctx.io_handler`. These methods expose the same URI and partition resolution
+the write path uses, so a `delete`/`optimize` body targets exactly the rows the
+materialize path would have written.
+
+#### `asset_table_uri(asset_name, asset_metadata=None)`
+
+Returns `{table_uri}/{leaf}`, honoring a `delta/root_name` override in
+`asset_metadata`. Pass `ctx.asset_name` and `ctx.asset_metadata`.
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def optimize(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
+    DeltaTable(uri, storage_options=ctx.io_handler.storage_options).optimize.compact()
+```
+
+#### `partition_predicate(asset_metadata, partition)`
+
+Returns a SQL predicate covering the partition(s), honoring
+`delta/partition_expr`. Pass `ctx.asset_metadata` and `ctx.partition`.
+
+```python
+@rs.action(outcome=rs.Outcome.Unmaterialize)
+@classmethod
+def delete(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
+    predicate = ctx.io_handler.partition_predicate(ctx.asset_metadata, ctx.partition)
+    DeltaTable(uri, storage_options=ctx.io_handler.storage_options).delete(predicate)
+```
+
+#### `partition_filters(asset_metadata, partition)`
+
+Returns delta-rs `partition_filters` for the partition(s), honoring
+`delta/partition_expr`: a list of `(column, op, value)` conjunctions, one per
+partition key. `optimize.compact` and `optimize.z_order` take one conjunction per
+call.
+
+```python
+@rs.action(outcome=rs.Outcome.Unchanged)
+@classmethod
+def compact(cls, ctx: rs.ActionContext) -> None:
+    uri = ctx.io_handler.asset_table_uri(ctx.asset_name, ctx.asset_metadata)
+    table = DeltaTable(uri, storage_options=ctx.io_handler.storage_options)
+    for filters in ctx.io_handler.partition_filters(ctx.asset_metadata, ctx.partition):
+        table.optimize.compact(partition_filters=filters)
+```
+
+`partition` is required: reach these only from a keyed action run. On a
+non-partitioned asset, delete the whole table instead of building a predicate.
+
+---
+
+## `DeltaAsset`
+
+Asset base class with the standard Delta maintenance verbs built in. Subclass it,
+define `materialize`, and `optimize`, `vacuum`, and `delete` appear as
+[actions](../concepts/actions.md), resolved against the asset's `DeltaIOHandler`
+(its own `io_handler` or the repository default). Sets `kinds = "delta"`.
+
+```python
+from rivers.io_handlers.delta import DeltaAsset  # also exported as rs.DeltaAsset
+
+class Orders(DeltaAsset):
+    io_handler = WAREHOUSE
+
+    @classmethod
+    def materialize(cls) -> pl.DataFrame: ...
+```
+
+| Verb | Declaration | Behavior |
+|------|-------------|----------|
+| `optimize` | `Unchanged` + `Exclusive` + `Optional` key | `optimize.compact()`, or `z_order` when `z_order_by` is configured. With a key, rewrites only that partition's files via `partition_filters`; without one, the whole table. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
+| `vacuum` | `Unchanged` + `Exclusive` + `Keyless` | Removes files no longer referenced by the table. Table-wide: runs without a partition key on partitioned assets too; a supplied key is rejected. |
+| `delete` | `Unmaterialize` + `Exclusive` + `DownstreamFirst` + `Optional` key | Deletes the keyed partition's rows via `partition_predicate`, or every row without a key — on partitioned assets both forms are valid. From the UI or gRPC, the keyless form needs an explicit whole-asset choice. |
+
+A verb requires the asset to resolve a `DeltaIOHandler` — anything else fails the
+step with a `TypeError` naming the requirement. On a table that does not exist yet,
+`optimize` and `vacuum` report `ActionResult.unchanged()` instead of failing, so a
+fleet-wide `repo.run_action("optimize")` skips never-materialized assets; `delete`
+still applies its `Unmaterialize` outcome, so dangling state clears even when the
+physical table is already gone. A subclass redefining a verb replaces the built-in.
+
+### `OptimizeConfig`
+
+Per-asset overrides via `run_action("optimize", config={"assets": {"<asset>": {"config": {...}}}})`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_size` | `int \| None` | `None` | Desired file size in bytes (`None` uses the deltalake default). |
+| `z_order_by` | `list[str] \| None` | `None` | Z-order by these columns instead of plain compaction. |
+
+### `VacuumConfig`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `retention_hours` | `int \| None` | `None` | Files older than this are removed (`None` uses the table's retention, 168h by default). |
+| `enforce_retention_duration` | `bool` | `True` | Refuse retention windows shorter than the table's configured minimum. |
+
 ---
 
 ## `DeltaTypeHandler`

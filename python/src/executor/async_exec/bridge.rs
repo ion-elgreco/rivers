@@ -9,8 +9,6 @@ use std::sync::Mutex;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 
-use crate::runtime::rt;
-
 pub(crate) struct AsyncBridge {
     pub(crate) task_locals: TaskLocals,
     loop_obj: Py<PyAny>,
@@ -40,13 +38,6 @@ impl AsyncBridge {
             loop_obj: loop_obj.unbind(),
             loop_thread: Mutex::new(Some(loop_thread)),
         })
-    }
-
-    /// Await a Python coroutine synchronously: convert to Rust future, release GIL, block on it.
-    /// Used for single-step sequential execution (e.g. in execute_step, async generator __anext__).
-    pub(crate) fn run_coroutine(&self, py: Python, coroutine: Bound<PyAny>) -> PyResult<Py<PyAny>> {
-        let future = pyo3_async_runtimes::into_future_with_locals(&self.task_locals, coroutine)?;
-        py.detach(|| rt().block_on(future))
     }
 
     pub(crate) fn shutdown(&self, py: Python) {

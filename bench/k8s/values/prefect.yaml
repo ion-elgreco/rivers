@@ -1,0 +1,13 @@
+# Prefect server control plane for the startup benchmark.
+# Prefect publishes native arm64 images, so no rebuild is needed.
+# `bench/k8s/deploy.py` sets the image tag, so the version is pinned in
+# exactly one place.
+server:
+  image:
+    repository: prefecthq/prefect
+    pullPolicy: IfNotPresent
+
+postgresql:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
