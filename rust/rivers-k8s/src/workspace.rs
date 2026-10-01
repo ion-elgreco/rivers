@@ -235,7 +235,7 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
             env.push(env_var("RIVERS_WORKSPACE_MIN_AGE", age));
         }
     }
-    env.extend(spec.extra_env.iter().cloned());
+    let env = crate::env::merge_env(env, spec.extra_env.iter().cloned());
 
     let mut mounts = vec![
         workspace_mount(spec, false),
@@ -603,6 +603,34 @@ mod tests {
                 { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
             ])
         );
+    }
+
+    #[test]
+    fn user_env_replaces_same_named_sync_env() {
+        let mut s = spec(shared());
+        s.extra_env.push(EnvVar {
+            name: "UV_CACHE_DIR".to_string(),
+            value: Some("/custom-cache".to_string()),
+            ..Default::default()
+        });
+        let fb = WorkspaceSpec {
+            volume: fallback(),
+            ..s.clone()
+        };
+        for (shape, pieces) in [
+            ("builder shared", builder_pod_pieces(&s)),
+            ("builder fallback", builder_pod_pieces(&fb)),
+            ("consumer fallback", consumer_pod_pieces(&fb)),
+        ] {
+            let env = pieces.init_containers[0].env.as_ref().unwrap();
+            let cache: Vec<_> = env
+                .iter()
+                .filter(|e| e.name == "UV_CACHE_DIR")
+                .map(|e| e.value.as_deref())
+                .collect();
+            // Server-side apply rejects duplicate names in a container's env.
+            assert_eq!(cache, vec![Some("/custom-cache")], "{shape}");
+        }
     }
 
     #[test]
