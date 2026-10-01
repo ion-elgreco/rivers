@@ -441,6 +441,8 @@ mod tests {
                 phase: "Ready".into(),
                 observed_generation: 1,
                 identity: "id-a".into(),
+                resolved_commit: String::new(),
+                resolved_ref: String::new(),
             }),
         };
         apply_event(&cache, &mut staging, &mut synced, ev).await;
@@ -469,6 +471,8 @@ mod tests {
                 phase: String::new(),
                 observed_generation: 0,
                 identity: String::new(),
+                resolved_commit: String::new(),
+                resolved_ref: String::new(),
             }),
         };
         apply_event(&cache, &mut staging, &mut synced, deleted).await;
@@ -590,6 +594,8 @@ mod tests {
             phase: phase.into(),
             observed_generation: 7,
             identity: format!("id-{name}"),
+            resolved_commit: String::new(),
+            resolved_ref: String::new(),
         }
     }
 
