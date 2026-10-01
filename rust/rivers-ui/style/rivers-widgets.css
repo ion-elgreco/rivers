@@ -1281,8 +1281,12 @@ code[title],
    column in that row only and push the row out of line with the header. */
 .grid-row > *,
 .grid-table-head > * { min-width: 0; }
-/* A row's action button, at the end of its column. */
+/* A row's action button fills its column, so a lone button and a split
+   one line up. A longer label (a confirm) may grow past it. */
 .grid-cell-action { display: flex; justify-content: flex-end; }
+.grid-cell-action > .btn,
+.grid-cell-action > .btn-split { min-width: 100%; }
+.grid-cell-action > .btn-split > .btn:first-child { flex: 1; }
 .grid-row > .chip,
 .grid-row > .kind-badge,
 .grid-row > .rv-tag { justify-self: start; }

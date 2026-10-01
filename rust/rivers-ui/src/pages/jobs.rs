@@ -153,7 +153,7 @@ pub fn JobsListPage() -> impl IntoView {
                                 />
                             }.into_any());
                         }
-                        const GRID: &str = "grid-template-columns: 1.4fr 0.7fr 1.6fr 0.8fr 1.1fr 150px";
+                        const GRID: &str = "grid-template-columns: 1.4fr 0.7fr 1.6fr 0.8fr 1.1fr 136px";
                         view! {
                             <div class="grid-table">
                                 <div class="grid-table-head" style=GRID>
