@@ -106,9 +106,9 @@ impl CodeLocationImpl {
                         Some(func) => func.clone_ref(py),
                         None => continue,
                     },
-                    None => match node.callable(py) {
-                        Ok(func) => func,
-                        Err(_) => continue,
+                    None => match node.config_fn(py) {
+                        Some(func) => func,
+                        None => continue,
                     },
                 };
                 let Some(cls) = config_class(py, &func).map_err(|e| e.to_string())? else {
@@ -578,13 +578,8 @@ impl CodeLocationService for CodeLocationImpl {
                             }
                         })
                         .collect();
-                    // Only a Python function has a context annotation to read
-                    // (a bash task or an external asset without observe has none).
                     let config_schema = node
-                        .annotations(py)
-                        .ok()
-                        .flatten()
-                        .and_then(|_| node.callable(py).ok())
+                        .config_fn(py)
                         .and_then(|f| config_schema_or_log(py, &f, name));
 
                     assets.push(AssetDefinitionInfo {

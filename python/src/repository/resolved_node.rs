@@ -718,6 +718,17 @@ impl ResolvedNode {
         }
     }
 
+    /// The function whose context annotation names the node's config class.
+    /// `None` for a bash task, which has none: Python before 3.11 cannot read
+    /// a signature from its `__call__`. Also `None` for an external asset
+    /// without observe.
+    pub fn config_fn(&self, py: Python) -> Option<Py<PyAny>> {
+        match self {
+            ResolvedNode::BashTask(_) => None,
+            _ => self.callable(py).ok(),
+        }
+    }
+
     /// Returns None for BashTask and ExternalAsset without observe_fn.
     pub fn annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         match self {

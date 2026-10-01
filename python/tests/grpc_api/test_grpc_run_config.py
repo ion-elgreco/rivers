@@ -142,8 +142,12 @@ def _build_repo(tmp_path, run_queue=None):
     def uses_db(db: DbResource):
         return f"{db.dsn}/{db.pool_size}/{db.token.get_secret_value()}"
 
+    # A bash task has no function, so no config class.
+    shell = rs.BashTask(name="shell", command="true")
+
     job = rs.Job(name="cfg_job", assets=[configured])
     tidy_job = rs.Job(name="tidy_job", assets=[tidy])
+    shell_job = rs.Job(name="shell_job", assets=[shell, configured])
     return rs.CodeRepository(
         assets=[
             plain,
@@ -156,8 +160,8 @@ def _build_repo(tmp_path, run_queue=None):
             pid2,
             uses_db,
         ],
-        tasks=[tidy],
-        jobs=[job, tidy_job],
+        tasks=[tidy, shell],
+        jobs=[job, tidy_job, shell_job],
         resources={"db": DbResource(), "store": handler},
         default_executor=rs.Executor.in_process(),
         run_queue=run_queue,
@@ -484,6 +488,32 @@ def test_rerun_rejects_a_bad_config(direct, config, detail):
     assert len(repo.storage.get_runs(limit=100)) == runs_before
 
 
+@pytest.mark.parametrize("launch", ["materialize", "execute_job"])
+def test_a_launch_with_a_bash_task_checks_the_rest(direct, launch):
+    stub, pb2, repo = direct
+    config = _cfg(configured={"threshold": 0.2})
+    if launch == "materialize":
+        run_id = stub.Materialize(
+            pb2.MaterializeRequest(selection=["shell", "configured"], config=config)
+        ).run_id
+    else:
+        run_id = stub.ExecuteJob(
+            pb2.ExecuteJobRequest(job_name="shell_job", config=config)
+        ).run_id
+    run = wait_for_run_terminal(repo.storage, run_id)
+    assert run.status == "Success"
+    assert _STORE["configured"]["threshold"] == 0.2
+
+    with pytest.raises(grpc.RpcError) as exc:
+        stub.ExecuteJob(
+            pb2.ExecuteJobRequest(
+                job_name="shell_job", config=_cfg(configured={"threshold": "hot"})
+            )
+        )
+    assert exc.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "assets.configured.config.threshold" in exc.value.details()
+
+
 # ── Backfills ──
 
 
@@ -733,6 +763,20 @@ def _validate(stub, pb2, document, selection, action=None):
             e.message,
         )
         for e in stub.ValidateConfig(request).errors
+    ]
+
+
+def test_validate_config_skips_a_bash_task(direct):
+    stub, pb2, _ = direct
+    assert _validate(stub, pb2, {}, ["shell"]) == []
+    errors = _validate(
+        stub,
+        pb2,
+        {"assets": {"configured": {"config": {"threshold": "hot"}}}},
+        ["shell", "configured"],
+    )
+    assert [e[:3] for e in errors] == [
+        (_at("configured"), ("threshold",), "float_parsing")
     ]
 
 
