@@ -31,6 +31,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::crd::code_location::{Dependencies, DependencyMode};
+use crate::crd::run::{GitCoordinates, RunSource};
 
 pub const WORKSPACE_VOLUME: &str = "workspace";
 pub const GIT_CREDS_VOLUME: &str = "git-credentials";
@@ -360,12 +361,41 @@ fn volumes_without_creds(spec: &WorkspaceSpec, read_only_pvc: bool) -> Vec<Volum
     vec![workspace_volume(spec, read_only_pvc)]
 }
 
+/// The tree's provenance and volume ride along on every pod that runs from
+/// it: [`crate::env::detect_git_workspace`] reads them back in-pod, so the
+/// Runs and step Jobs a pod launches get the same tree.
 fn main_env(spec: &WorkspaceSpec) -> Vec<EnvVar> {
-    vec![
+    let source = serde_json::to_string(&run_source(spec)).expect("RunSource serializes");
+    let mut env = vec![
         env_var("VIRTUAL_ENV", VENV_PATH),
         // In the pod template ⇒ a new commit rolls the Deployment.
         env_var("RIVERS_GIT_COMMIT", &spec.commit),
-    ]
+        env_var(crate::env::ENV_RUN_SOURCE, &source),
+    ];
+    match &spec.volume {
+        WorkspaceVolume::SharedPvc { claim_name } => {
+            env.push(env_var(crate::env::ENV_WORKSPACE_PVC, claim_name));
+        }
+        WorkspaceVolume::EmptyDir { size_limit } => {
+            if let Some(limit) = size_limit {
+                env.push(env_var(crate::env::ENV_WORKSPACE_EMPTYDIR_LIMIT, &limit.0));
+            }
+        }
+    }
+    env
+}
+
+fn run_source(spec: &WorkspaceSpec) -> RunSource {
+    RunSource {
+        git: GitCoordinates {
+            url: spec.git_url.clone(),
+            commit: spec.commit.clone(),
+            r#ref: spec.git_ref.clone(),
+            path: spec.path.clone(),
+            secret_name: spec.secret_name.clone(),
+        },
+        dependencies: spec.deps.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +536,13 @@ mod tests {
             json!([
                 { "name": "VIRTUAL_ENV", "value": "/workspace/venv" },
                 { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
+                { "name": "RIVERS_RUN_SOURCE", "value": concat!(
+                    r#"{"git":{"url":"https://forge.example/acme/pipelines.git","#,
+                    r#""commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","#,
+                    r#""ref":"refs/heads/main","path":"analytics","secretName":"git-creds"},"#,
+                    r#""dependencies":{"mode":"auto","extras":["dev"],"timeoutSeconds":300}}"#,
+                ) },
+                { "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" },
             ])
         );
     }
@@ -536,9 +573,25 @@ mod tests {
                 { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
             ])
         );
-        // Main container identical across modes.
+        // Main container: same mounts; env differs only in the volume entry.
         assert_eq!(fb.main_mounts, shared_pieces.main_mounts);
-        assert_eq!(fb.main_env, shared_pieces.main_env);
+        let (fb_volume_env, fb_env): (Vec<_>, Vec<_>) = fb
+            .main_env
+            .iter()
+            .partition(|e| e.name == crate::env::ENV_WORKSPACE_EMPTYDIR_LIMIT);
+        let (shared_volume_env, shared_env): (Vec<_>, Vec<_>) = shared_pieces
+            .main_env
+            .iter()
+            .partition(|e| e.name == crate::env::ENV_WORKSPACE_PVC);
+        assert_eq!(fb_env, shared_env);
+        assert_eq!(
+            serde_json::to_value(&fb_volume_env).unwrap(),
+            json!([{ "name": "RIVERS_WORKSPACE_EMPTYDIR_LIMIT", "value": "2Gi" }])
+        );
+        assert_eq!(
+            serde_json::to_value(&shared_volume_env).unwrap(),
+            json!([{ "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" }])
+        );
     }
 
     #[test]

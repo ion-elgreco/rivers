@@ -10,7 +10,7 @@ use rivers_core::storage::CoordinatorRunInfo;
 use serde_json::json;
 
 use crate::crd::run::{
-    CANCEL_ANNOTATION, CodeLocationRef, Executor, ResourceSpec, Run, RunPhase, RunSpec,
+    CANCEL_ANNOTATION, CodeLocationRef, Executor, ResourceSpec, Run, RunPhase, RunSource, RunSpec,
 };
 
 /// Backoff schedule for transient `Run` CR creation failures.
@@ -49,6 +49,11 @@ pub struct K8sRunBackendConfig {
     /// both the `Run` CR's `codeLocationRef.identity` and every
     /// `RunRecord.code_location_id` row in storage.
     pub code_location_id: String,
+    /// Git provenance of the tree this pod runs, from `RIVERS_RUN_SOURCE`
+    /// (git-sourced CodeLocations only). Stamped as `spec.source` on every
+    /// `Run` CR: the webhook does not stamp digest-pinned Runs, so this is
+    /// the only way they get a workspace.
+    pub source: Option<RunSource>,
 }
 
 /// Materializes runs as `Run` custom resources in Kubernetes. The operator's
@@ -89,11 +94,7 @@ impl K8sRunBackendConfig {
                     identity: self.code_location_id.clone(),
                 },
                 image: self.image.clone(),
-                // Git provenance for daemon-dispatched runs is stamped here
-                // (not by the webhook — this path is the digest escape
-                // hatch) once the CL pod env carries the coordinates; until
-                // then git runs are dispatched without it. RFC-044 P3b.
-                source: None,
+                source: self.source.clone(),
                 module: self.module.clone(),
                 target,
                 job_name: run_info.job_name.clone(),
@@ -267,6 +268,7 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "rivers".to_string())]),
             code_location_name: "demo".to_string(),
             code_location_id: "demo".to_string(),
+            source: None,
         }
     }
 
@@ -332,6 +334,35 @@ mod tests {
             }
         );
         assert!(run.status.is_none());
+    }
+
+    #[test]
+    fn build_cr_stamps_the_pods_own_source() {
+        let source = json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "path": "analytics",
+                "secretName": "git-creds",
+            },
+            "dependencies": {
+                "mode": "uvSync",
+                "extras": ["ml"],
+                "groups": ["prod"],
+                "timeoutSeconds": 900,
+            },
+        });
+        let config = K8sRunBackendConfig {
+            image: format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a".repeat(32)),
+            source: Some(serde_json::from_value(source.clone()).unwrap()),
+            ..test_config()
+        };
+
+        let run = config.build_run_cr(&test_run_info());
+
+        assert_eq!(serde_json::to_value(&run.spec.source).unwrap(), source);
+        assert_eq!(run.spec.image, config.image);
     }
 
     #[test]

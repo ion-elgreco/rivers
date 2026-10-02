@@ -182,39 +182,8 @@ pub fn build_executor_pod(
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
-                    if let (Some(pieces), Some(wspec)) = (&pieces, &workspace_spec) {
+                    if let Some(pieces) = &pieces {
                         env.extend(pieces.main_env.iter().cloned());
-                        // The hop to step Jobs: the in-pod builder rebuilds
-                        // the same WorkspaceSpec from these (RFC-044).
-                        env.push(EnvVar {
-                            name: rivers_k8s::env::ENV_RUN_SOURCE.to_string(),
-                            value: Some(
-                                serde_json::to_string(
-                                    spec.source.as_ref().expect("workspace implies source"),
-                                )
-                                .expect("RunSource serializes"),
-                            ),
-                            ..Default::default()
-                        });
-                        match &wspec.volume {
-                            rivers_k8s::workspace::WorkspaceVolume::SharedPvc { claim_name } => {
-                                env.push(EnvVar {
-                                    name: rivers_k8s::env::ENV_WORKSPACE_PVC.to_string(),
-                                    value: Some(claim_name.clone()),
-                                    ..Default::default()
-                                });
-                            }
-                            rivers_k8s::workspace::WorkspaceVolume::EmptyDir { size_limit } => {
-                                if let Some(limit) = size_limit {
-                                    env.push(EnvVar {
-                                        name: rivers_k8s::env::ENV_WORKSPACE_EMPTYDIR_LIMIT
-                                            .to_string(),
-                                        value: Some(limit.0.clone()),
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                        }
                     }
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
                     rivers_k8s::env::merge_env(env, cl_env.iter().cloned())

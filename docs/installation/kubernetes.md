@@ -188,6 +188,12 @@ step pod — a wide fan-out starts as fast as image mode. Without RWX
 storage every pod builds its own tree; that's fine for
 `executor: parallel` but slow for wide `executor: kubernetes` fan-outs.
 
+**Which commit a run uses**: a run launched from the code-location pod
+(UI launches, schedules, sensors, backfills) pins the commit that pod
+serves, so during a rollout each run uses the same tree as the pod that
+launched it. A `Run` you create yourself without `image` pins the
+CodeLocation's current `status.resolvedCommit`.
+
 **Egress**: in shared mode only the code-location pod needs outbound
 access to the git host and the package index (run/step pods fetch
 nothing); in fallback mode every pod does. Adjust NetworkPolicies

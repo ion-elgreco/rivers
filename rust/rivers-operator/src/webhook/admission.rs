@@ -131,8 +131,9 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
             ));
         }
         // On this path the caller is its own authority for provenance too:
-        // the in-cluster daemon dispatches runs with a pre-set digest AND
-        // stamps the commit its own code runs. Validate shape, not origin.
+        // the code-location pod (`K8sRunBackend`) dispatches runs with a
+        // pre-set digest AND stamps the source of its own tree. Validate
+        // shape, not origin.
         if let Some(source) = &run.spec.source {
             let commit = &source.git.commit;
             if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {

@@ -234,30 +234,37 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     env
 }
 
-/// Git-workspace envs stamped on the run executor pod by the operator and
-/// read back inside the pod to attach the same tree to step Jobs
-/// (RFC-044). `RIVERS_RUN_SOURCE` carries the Run's stamped `spec.source`
-/// as JSON — one typed channel instead of a fan of `RIVERS_GIT_*` vars.
+/// Git-workspace envs on every pod that runs from a tree (code-location
+/// pod, run executor pod, step Jobs), read back in-pod so the Runs and step
+/// Jobs it launches get the same tree (RFC-044). `RIVERS_RUN_SOURCE`
+/// carries the tree's `RunSource` as JSON — one typed channel instead of a
+/// fan of `RIVERS_GIT_*` vars.
 pub const ENV_RUN_SOURCE: &str = "RIVERS_RUN_SOURCE";
 /// Shared-mode PVC claim name; unset/empty means emptyDir fallback.
 pub const ENV_WORKSPACE_PVC: &str = "RIVERS_WORKSPACE_PVC";
 pub const ENV_WORKSPACE_EMPTYDIR_LIMIT: &str = "RIVERS_WORKSPACE_EMPTYDIR_LIMIT";
 
-/// Rehydrate the git workspace coordinates inside the run executor pod.
-/// `None` for image-mode runs (no `RIVERS_RUN_SOURCE`).
-pub fn detect_git_workspace() -> Option<(
-    crate::crd::run::RunSource,
-    crate::workspace::WorkspaceVolume,
-)> {
+/// Git provenance of the tree this pod runs. `None` in image mode (no
+/// `RIVERS_RUN_SOURCE`).
+pub fn detect_run_source() -> Option<crate::crd::run::RunSource> {
     let source_json = env_nonempty(ENV_RUN_SOURCE)?;
-    let source: crate::crd::run::RunSource = match serde_json::from_str(&source_json) {
-        Ok(s) => s,
+    match serde_json::from_str(&source_json) {
+        Ok(s) => Some(s),
         Err(e) => {
             // A malformed value is an operator/pod version skew bug — fail
             // loudly rather than silently running image-mode.
             panic!("{ENV_RUN_SOURCE} is not valid RunSource JSON: {e}");
         }
-    };
+    }
+}
+
+/// Rehydrate the git workspace coordinates inside a pod that runs from a
+/// tree. `None` in image mode (no `RIVERS_RUN_SOURCE`).
+pub fn detect_git_workspace() -> Option<(
+    crate::crd::run::RunSource,
+    crate::workspace::WorkspaceVolume,
+)> {
+    let source = detect_run_source()?;
     let volume = match env_nonempty(ENV_WORKSPACE_PVC) {
         Some(claim_name) => crate::workspace::WorkspaceVolume::SharedPvc { claim_name },
         None => crate::workspace::WorkspaceVolume::EmptyDir {
@@ -570,6 +577,80 @@ mod tests {
         assert_eq!(
             pairs,
             vec![("A", "1"), ("B", "user"), ("C", "3"), ("D", "last")]
+        );
+    }
+
+    #[test]
+    fn code_location_pod_env_hands_its_tree_to_what_it_launches() {
+        use crate::crd::code_location::{Dependencies, DependencyMode};
+        use crate::crd::run::{GitCoordinates, RunSource};
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, builder_pod_pieces};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let source = RunSource {
+            git: GitCoordinates {
+                url: "https://forge.example/acme/pipelines.git".to_string(),
+                commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
+                r#ref: Some("refs/heads/main".to_string()),
+                path: Some("analytics".to_string()),
+                secret_name: Some("git-creds".to_string()),
+            },
+            dependencies: Dependencies {
+                mode: DependencyMode::Requirements,
+                files: vec!["requirements/prod.txt".to_string()],
+                extras: vec![],
+                groups: vec![],
+                timeout_seconds: Some(900),
+            },
+        };
+        for volume in [
+            WorkspaceVolume::SharedPvc {
+                claim_name: "analytics-workspace".to_string(),
+            },
+            WorkspaceVolume::EmptyDir {
+                size_limit: Some(Quantity("5Gi".to_string())),
+            },
+        ] {
+            let pod_env = builder_pod_pieces(&WorkspaceSpec {
+                key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
+                volume: volume.clone(),
+                runtime_image: "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff".to_string(),
+                git_url: source.git.url.clone(),
+                commit: source.git.commit.clone(),
+                git_ref: source.git.r#ref.clone(),
+                path: source.git.path.clone(),
+                secret_name: source.git.secret_name.clone(),
+                deps: source.dependencies.clone(),
+                keep_config_map: Some("analytics-workspace-keep".to_string()),
+                keep_revisions: Some(3),
+                min_tree_age: Some("1h".to_string()),
+                extra_env: vec![],
+            })
+            .main_env;
+            let vars: Vec<(&str, Option<&str>)> = [
+                ENV_RUN_SOURCE,
+                ENV_WORKSPACE_PVC,
+                ENV_WORKSPACE_EMPTYDIR_LIMIT,
+            ]
+            .into_iter()
+            .map(|name| {
+                let value = pod_env
+                    .iter()
+                    .find(|e| e.name == name)
+                    .and_then(|e| e.value.as_deref());
+                (name, value)
+            })
+            .collect();
+
+            assert_eq!(
+                with_vars(&vars, detect_git_workspace),
+                Some((source.clone(), volume))
+            );
+            assert_eq!(with_vars(&vars, detect_run_source), Some(source.clone()));
+        }
+        assert_eq!(
+            with_vars(&[(ENV_RUN_SOURCE, None)], detect_run_source),
+            None
         );
     }
 

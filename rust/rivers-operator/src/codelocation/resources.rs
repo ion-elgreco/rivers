@@ -252,8 +252,9 @@ pub fn build_git_deployment(
 
     // Base env minus user env, then workspace env (PYTHONPATH as the
     // belt-and-braces for anything that chdirs; VIRTUAL_ENV;
-    // RIVERS_GIT_COMMIT — the rollout trigger), then user env merged last
-    // so it overrides by name.
+    // RIVERS_GIT_COMMIT — the rollout trigger; the tree's source + volume,
+    // stamped on the Runs this pod launches), then user env merged last so
+    // it overrides by name.
     let mut env = build_base_env(cl, resolved_runtime_image, surreal_pod_cfg, otel_pod_cfg);
     env.push(EnvVar {
         name: "PYTHONPATH".to_string(),
@@ -738,18 +739,26 @@ mod tests {
                 "ref": { "branch": "main" },
                 "path": "analytics",
                 "secretRef": { "name": "git-creds" },
+                "dependencies": { "mode": "uvSync", "extras": ["ml"] },
             },
             "module": "analytics.pipeline",
         })
     }
 
-    fn git_pieces(cl: &CodeLocation) -> rivers_k8s::workspace::WorkspacePodPieces {
+    fn shared_volume() -> rivers_k8s::workspace::WorkspaceVolume {
+        rivers_k8s::workspace::WorkspaceVolume::SharedPvc {
+            claim_name: workspace_pvc_name("analytics"),
+        }
+    }
+
+    fn git_pieces(
+        cl: &CodeLocation,
+        volume: rivers_k8s::workspace::WorkspaceVolume,
+    ) -> rivers_k8s::workspace::WorkspacePodPieces {
         let git = cl.spec.git.as_ref().unwrap();
         rivers_k8s::workspace::builder_pod_pieces(&rivers_k8s::workspace::WorkspaceSpec {
             key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
-            volume: rivers_k8s::workspace::WorkspaceVolume::SharedPvc {
-                claim_name: workspace_pvc_name("analytics"),
-            },
+            volume,
             runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
             git_url: git.url.clone(),
             commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
@@ -820,7 +829,7 @@ mod tests {
     #[test]
     fn git_deployment_runs_from_the_workspace() {
         let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
-        let pieces = git_pieces(&cl);
+        let pieces = git_pieces(&cl, shared_volume());
         let d = build_git_deployment(
             &cl,
             "ghcr.io/rt@sha256:1a2b3c4dff",
@@ -885,6 +894,60 @@ mod tests {
             env["RIVERS_CODE_LOCATION_IMAGE"],
             "ghcr.io/rt@sha256:1a2b3c4dff"
         );
+    }
+
+    #[test]
+    fn git_deployment_hands_its_tree_to_the_runs_it_launches() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let expected_source: rivers_k8s::crd::run::RunSource = serde_json::from_value(json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "path": "analytics",
+                "secretName": "git-creds",
+            },
+            "dependencies": { "mode": "uvSync", "extras": ["ml"] },
+        }))
+        .unwrap();
+        let fallback = rivers_k8s::workspace::WorkspaceVolume::EmptyDir {
+            size_limit: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+                "5Gi".to_string(),
+            )),
+        };
+
+        for (volume, pvc, emptydir_limit) in [
+            (shared_volume(), Some("analytics-workspace"), None),
+            (fallback, None, Some("5Gi")),
+        ] {
+            let d = build_git_deployment(
+                &cl,
+                "ghcr.io/rt@sha256:1a2b3c4dff",
+                "rivers-code-location",
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &git_pieces(&cl, volume),
+                git_working_dir(Some("analytics")),
+            );
+            let pod = d.spec.unwrap().template.spec.unwrap();
+            let env: std::collections::HashMap<String, Option<String>> = pod.containers[0]
+                .env
+                .clone()
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.value))
+                .collect();
+            let value = |name: &str| env.get(name).cloned().flatten();
+
+            let source: Option<rivers_k8s::crd::run::RunSource> =
+                value("RIVERS_RUN_SOURCE").map(|json| serde_json::from_str(&json).unwrap());
+            assert_eq!(source.as_ref(), Some(&expected_source), "{pvc:?}");
+            assert_eq!(value("RIVERS_WORKSPACE_PVC").as_deref(), pvc);
+            assert_eq!(
+                value("RIVERS_WORKSPACE_EMPTYDIR_LIMIT").as_deref(),
+                emptydir_limit
+            );
+        }
     }
 
     #[test]

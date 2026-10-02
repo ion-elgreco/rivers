@@ -113,11 +113,12 @@ pub struct RunSpec {
     pub service_account_name: String,
 
     /// Git provenance for runs against a git-sourced CodeLocation
-    /// (RFC-044). Stamped by the admission webhook from the CL's status on
-    /// CREATE; immutable after; absent for image-mode runs (including the
-    /// digest escape hatch, which is image-mode by definition). In shared
-    /// workspace mode nothing downstream fetches from these coordinates —
-    /// they are the run's provenance record and the UI's "which commit?".
+    /// (RFC-044). Stamped on CREATE by the admission webhook from the CL's
+    /// status, or, for a digest-pinned `image`, by the code-location pod
+    /// that launches the run (the commit of its own tree); immutable after;
+    /// absent for image-mode runs. In shared workspace mode nothing
+    /// downstream fetches from these coordinates — they are the run's
+    /// provenance record and the UI's "which commit?".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RunSource>,
 }
