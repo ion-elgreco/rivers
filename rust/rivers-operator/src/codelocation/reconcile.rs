@@ -23,7 +23,7 @@ use kube_client::api::{Api, Patch, PatchParams};
 use kube_runtime::controller::Action;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
-    CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationStatus,
+    CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationSpec, CodeLocationStatus,
     IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
     REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
     REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_UNREACHABLE, REASON_MIN_REPLICAS,
@@ -34,7 +34,9 @@ use rivers_k8s::crd::code_location::{
 use super::git::{self, GitCredentials, GitResolveRequest};
 
 use super::image_auth::resolve_auth;
-use super::registry::{RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest};
+use super::registry::{
+    ImageRef, RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest,
+};
 use super::resources::{
     build_deployment, build_git_deployment, build_keep_config_map, build_service,
     build_workspace_pvc, deployment_name, git_working_dir, grpc_endpoint, keep_config_map_name,
@@ -70,7 +72,7 @@ pub struct Context {
     pub git: Arc<super::git::GitResolver>,
     /// Default runtime image for git CLs that don't set `spec.image`.
     /// Chart-configured via `RIVERS_RUNTIME_IMAGE`.
-    pub runtime_image: String,
+    pub runtime_image: ImageRef,
     pub leader: Arc<LeaderGate>,
     pub code_location_service_account: String,
     /// Chart-level workspace settings for git-sourced CLs.
@@ -266,32 +268,26 @@ async fn reconcile_git(
         .expect("reconcile_git dispatched for a non-git CodeLocation");
 
     // Runtime image first, through the same registry pipeline as image mode.
-    let runtime_image = cl
-        .spec
-        .image
-        .clone()
-        .unwrap_or_else(|| ctx.runtime_image.clone());
     let timer = Instant::now();
-    let (resolved_image, image_reason) =
-        match resolve_image_ref(cl, runtime_image, ctx, secrets_api).await {
-            ImageOutcome::Resolved {
-                resolved_image,
-                reason,
-                ..
-            } => {
-                metrics::observe_resolution_seconds(timer.elapsed().as_secs_f64());
-                (resolved_image, reason)
-            }
-            ImageOutcome::AwaitingLeader => {
-                patch_waiting_status(code_locations_api, &name, generation, cl).await?;
-                return Ok(Action::requeue(FOLLOWER_WAIT));
-            }
-            ImageOutcome::Error(err) => {
-                let retry = err.retry_after();
-                patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
-                return Ok(Action::requeue(retry));
-            }
-        };
+    let (resolved_image, image_reason) = match resolve_image(cl, ctx, secrets_api).await {
+        ImageOutcome::Resolved {
+            resolved_image,
+            reason,
+            ..
+        } => {
+            metrics::observe_resolution_seconds(timer.elapsed().as_secs_f64());
+            (resolved_image, reason)
+        }
+        ImageOutcome::AwaitingLeader => {
+            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+            return Ok(Action::requeue(FOLLOWER_WAIT));
+        }
+        ImageOutcome::Error(err) => {
+            let retry = err.retry_after();
+            patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
+            return Ok(Action::requeue(retry));
+        }
+    };
 
     let poll = parse_refresh_interval(git_spec.poll_interval.as_deref());
 
@@ -850,28 +846,45 @@ async fn resolve_image(
     ctx: &Context,
     secrets_api: &Api<Secret>,
 ) -> ImageOutcome {
-    // Git CLs are dispatched to reconcile_git() before this point.
-    let Some(image) = cl.spec.image.clone() else {
+    if cl.spec.image.is_none() && !cl.spec.is_git() {
         return ImageOutcome::Error(ImageError::Transient(
             "spec.image is unset on an image-mode CodeLocation".into(),
         ));
-    };
-    resolve_image_ref(cl, image, ctx, secrets_api).await
+    }
+    let image = wanted_image(&cl.spec, &ctx.runtime_image);
+    resolve_image_ref(cl, &image, ctx, secrets_api).await
 }
 
-/// Resolve a concrete image ref (repository string) to a pinned digest —
-/// shared by image mode (`spec.image`) and git mode (runtime image, which
-/// may be the chart default rather than a spec field).
+/// The image a CL's pods run, before digest resolution: `spec.image` with
+/// the CL's own tag / digest, else (git mode) the chart's runtime default,
+/// whose tag and digest give way to `spec.tag` / `spec.digest` when either
+/// is set.
+fn wanted_image(spec: &CodeLocationSpec, runtime_default: &ImageRef) -> ImageRef {
+    let digest = spec.digest.clone().filter(|d| !d.is_empty());
+    let repository = match &spec.image {
+        Some(image) => image.clone(),
+        None if digest.is_none() && spec.tag.is_none() => return runtime_default.clone(),
+        None => runtime_default.repository.clone(),
+    };
+    ImageRef {
+        repository,
+        tag: spec.tag.clone(),
+        digest,
+    }
+}
+
+/// Resolve `image` to a pinned digest reference: its digest pins it without
+/// a registry call, else its tag (`latest` when it has none) is looked up.
+/// One path for image mode and both git cases (see [`wanted_image`]).
 async fn resolve_image_ref(
     cl: &CodeLocation,
-    image: String,
+    image: &ImageRef,
     ctx: &Context,
     secrets_api: &Api<Secret>,
 ) -> ImageOutcome {
     // Explicit digest wins immediately — no leader gating, no HTTP.
-    if cl.spec.has_pinned_digest() {
-        let digest = cl.spec.digest.as_deref().unwrap_or_default();
-        let resolved = format!("{image}@{digest}");
+    if let Some(digest) = &image.digest {
+        let resolved = format!("{}@{digest}", image.repository);
         return ImageOutcome::Resolved {
             resolved_image: resolved,
             reason: REASON_DIGEST_PINNED,
@@ -909,7 +922,7 @@ async fn resolve_image_ref(
         .map(|r| r.name.clone())
         .collect();
 
-    let registry_host = first_component(&image).unwrap_or_default();
+    let registry_host = first_component(&image.repository).unwrap_or_default();
     let auth: RegistryAuth = if secret_names.is_empty() {
         RegistryAuth::Anonymous
     } else {
@@ -917,8 +930,8 @@ async fn resolve_image_ref(
     };
 
     let req = ResolveRequest {
-        image: image.clone(),
-        tag: cl.spec.effective_tag().to_string(),
+        image: image.repository.clone(),
+        tag: image.tag.clone().unwrap_or_else(|| "latest".to_string()),
         auth,
         immutable_hint,
         cache_ttl: refresh,
@@ -926,7 +939,7 @@ async fn resolve_image_ref(
 
     match ctx.registry.resolve(&req).await {
         Ok(res) => {
-            let resolved = format!("{}@{}", image, res.digest());
+            let resolved = format!("{}@{}", image.repository, res.digest());
             let immutable = matches!(res, Resolution::Immutable { .. });
             ImageOutcome::Resolved {
                 resolved_image: resolved,
@@ -1258,7 +1271,6 @@ mod fastrand {
 mod tests {
     use super::*;
     use kube_client::api::ObjectMeta;
-    use rivers_k8s::crd::code_location::CodeLocationSpec;
 
     fn make_cl(spec: serde_json::Value) -> CodeLocation {
         let parsed: CodeLocationSpec = serde_json::from_value(spec).unwrap();
@@ -1480,14 +1492,237 @@ mod tests {
         assert_eq!(git_source_display(&pinned, &pinned_ref), "9f3c1ab (pinned)");
     }
 
-    #[test]
-    fn image_outcome_pinned_digest_bypass() {
-        // We can't easily await resolve_image without a Context, so just
-        // sanity-check the spec helper that drives the short-circuit.
-        let cl = make_cl(serde_json::json!({
-            "image": "ghcr.io/acme/pipeline",
-            "digest": "sha256:abc"
-        }));
-        assert!(cl.spec.has_pinned_digest());
+    mod image_resolution {
+        use super::*;
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn digest(c: char) -> String {
+            format!("sha256:{}", c.to_string().repeat(64))
+        }
+
+        /// A leader whose registry client talks plain HTTP (wiremock).
+        fn context(runtime_image: &str) -> Context {
+            Context {
+                client: mock_client(Arc::new(std::sync::Mutex::new(MockApiState::default()))),
+                namespace: "y".into(),
+                registry: Arc::new(RegistryClient::with_insecure(true)),
+                git: Arc::new(git::GitResolver::new(Duration::from_secs(5))),
+                runtime_image: runtime_image.parse().unwrap(),
+                leader: Arc::new(LeaderGate::leading()),
+                code_location_service_account: "rivers-code-location".into(),
+                workspace: WorkspaceConfig::default(),
+                surreal_pod_cfg: Default::default(),
+                otel_pod_cfg: Default::default(),
+            }
+        }
+
+        fn host(server: &MockServer) -> String {
+            server.uri().strip_prefix("http://").unwrap().to_string()
+        }
+
+        /// Serves `digest` for exactly one HEAD of `manifest_path`.
+        async fn registry_serving(manifest_path: &str, digest: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path(manifest_path))
+                .respond_with(
+                    ResponseTemplate::new(200).insert_header("docker-content-digest", digest),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        async fn registry_never_called() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn git_cl(fields: serde_json::Value) -> CodeLocation {
+            let mut spec = serde_json::json!({
+                "git": { "url": "https://forge.example/r.git", "ref": { "branch": "main" } },
+            });
+            spec.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            make_cl(spec)
+        }
+
+        async fn resolve(cl: &CodeLocation, ctx: &Context) -> (String, &'static str) {
+            let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), "y");
+            match resolve_image(cl, ctx, &secrets).await {
+                ImageOutcome::Resolved {
+                    resolved_image,
+                    reason,
+                    ..
+                } => (resolved_image, reason),
+                ImageOutcome::AwaitingLeader => panic!("expected an image, got AwaitingLeader"),
+                ImageOutcome::Error(err) => panic!("expected an image, got {err:?}"),
+            }
+        }
+
+        #[test]
+        fn wanted_image_picks_tag_and_digest() {
+            let repository = "ghcr.io/ion-elgreco/rivers-runtime";
+            let default_digest = digest('c');
+            let spec_digest = digest('d');
+            let tagged: ImageRef = format!("{repository}:0.5.0-py3.12").parse().unwrap();
+            let pinned: ImageRef = format!("{repository}@{default_digest}").parse().unwrap();
+            let want = |repository: &str, tag: Option<&str>, digest: Option<&String>| ImageRef {
+                repository: repository.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.cloned(),
+            };
+
+            let cases = [
+                // git without spec.image: spec.tag / spec.digest replace both
+                // of the default's parts.
+                (
+                    git_cl(serde_json::json!({})),
+                    &pinned,
+                    want(repository, None, Some(&default_digest)),
+                ),
+                (
+                    git_cl(serde_json::json!({ "tag": "0.6.0-py3.13" })),
+                    &pinned,
+                    want(repository, Some("0.6.0-py3.13"), None),
+                ),
+                (
+                    git_cl(serde_json::json!({ "digest": spec_digest })),
+                    &tagged,
+                    want(repository, None, Some(&spec_digest)),
+                ),
+                // An empty digest counts as unset.
+                (
+                    git_cl(serde_json::json!({ "digest": "" })),
+                    &tagged,
+                    tagged.clone(),
+                ),
+                (
+                    make_cl(serde_json::json!({ "image": "ghcr.io/acme/pipeline", "digest": "" })),
+                    &tagged,
+                    want("ghcr.io/acme/pipeline", None, None),
+                ),
+            ];
+            for (cl, default, expected) in cases {
+                let spec = serde_json::to_string(&cl.spec).unwrap();
+                assert_eq!(wanted_image(&cl.spec, default), expected, "{spec}");
+            }
+        }
+
+        #[tokio::test]
+        async fn git_default_resolves_its_own_tag() {
+            let digest = digest('a');
+            let server = registry_serving(
+                "/v2/ion-elgreco/rivers-runtime/manifests/0.5.0-py3.12",
+                &digest,
+            )
+            .await;
+            let host = host(&server);
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime:0.5.0-py3.12"));
+
+            let (image, reason) = resolve(&git_cl(serde_json::json!({})), &ctx).await;
+
+            assert_eq!(image, format!("{host}/ion-elgreco/rivers-runtime@{digest}"));
+            assert_eq!(reason, REASON_DIGEST_RESOLVED);
+        }
+
+        #[tokio::test]
+        async fn git_spec_tag_replaces_the_default_tag() {
+            let digest = digest('b');
+            let server = registry_serving(
+                "/v2/ion-elgreco/rivers-runtime/manifests/0.6.0-py3.13",
+                &digest,
+            )
+            .await;
+            let host = host(&server);
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime:0.5.0-py3.12"));
+
+            let cl = git_cl(serde_json::json!({ "tag": "0.6.0-py3.13" }));
+            let (image, _) = resolve(&cl, &ctx).await;
+
+            assert_eq!(image, format!("{host}/ion-elgreco/rivers-runtime@{digest}"));
+        }
+
+        #[tokio::test]
+        async fn git_default_digest_is_pinned_without_a_registry_call() {
+            let server = registry_never_called().await;
+            let host = host(&server);
+            let digest = digest('c');
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime@{digest}"));
+
+            let (image, reason) = resolve(&git_cl(serde_json::json!({})), &ctx).await;
+
+            assert_eq!(image, format!("{host}/ion-elgreco/rivers-runtime@{digest}"));
+            assert_eq!(reason, REASON_DIGEST_PINNED);
+        }
+
+        #[tokio::test]
+        async fn git_default_without_tag_or_digest_resolves_latest() {
+            let digest = digest('d');
+            let server = registry_serving("/v2/rivers-runtime/manifests/latest", &digest).await;
+            let host = host(&server);
+            let ctx = context(&format!("{host}/rivers-runtime"));
+
+            let (image, _) = resolve(&git_cl(serde_json::json!({})), &ctx).await;
+
+            assert_eq!(image, format!("{host}/rivers-runtime@{digest}"));
+        }
+
+        #[tokio::test]
+        async fn git_spec_image_ignores_the_default_tag() {
+            let digest = digest('e');
+            let server = registry_serving("/v2/acme/runtime/manifests/latest", &digest).await;
+            let host = host(&server);
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime:0.5.0-py3.12"));
+
+            let cl = git_cl(serde_json::json!({ "image": format!("{host}/acme/runtime") }));
+            let (image, _) = resolve(&cl, &ctx).await;
+
+            assert_eq!(image, format!("{host}/acme/runtime@{digest}"));
+        }
+
+        #[tokio::test]
+        async fn image_mode_resolves_spec_tag() {
+            let digest = digest('f');
+            let server = registry_serving("/v2/acme/pipeline/manifests/v1.2.3", &digest).await;
+            let host = host(&server);
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime:0.5.0-py3.12"));
+
+            let cl = make_cl(serde_json::json!({
+                "image": format!("{host}/acme/pipeline"),
+                "tag": "v1.2.3",
+            }));
+            let (image, reason) = resolve(&cl, &ctx).await;
+
+            assert_eq!(image, format!("{host}/acme/pipeline@{digest}"));
+            assert_eq!(reason, REASON_DIGEST_RESOLVED);
+        }
+
+        #[tokio::test]
+        async fn image_mode_spec_digest_is_pinned_without_a_registry_call() {
+            let server = registry_never_called().await;
+            let host = host(&server);
+            let digest = digest('9');
+            let ctx = context(&format!("{host}/ion-elgreco/rivers-runtime:0.5.0-py3.12"));
+
+            let cl = make_cl(serde_json::json!({
+                "image": format!("{host}/acme/pipeline"),
+                "tag": "v1.2.3",
+                "digest": digest,
+            }));
+            let (image, reason) = resolve(&cl, &ctx).await;
+
+            assert_eq!(image, format!("{host}/acme/pipeline@{digest}"));
+            assert_eq!(reason, REASON_DIGEST_PINNED);
+        }
     }
 }

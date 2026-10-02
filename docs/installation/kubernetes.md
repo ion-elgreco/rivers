@@ -165,10 +165,14 @@ kubectl -n rivers get rcl
 ```
 
 How it composes with `image`: `spec.image` is always *the container the
-pods run*. Omit it in git mode to get the chart's default
-`rivers-runtime` (per-Python-version tags, `codeLocation.runtime.*`); set
-it to use a private mirror or a different interpreter
-(`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`).
+pods run*. Omit it in git mode to run the chart's default runtime image
+(`codeLocation.runtime.*`, by default
+`ghcr.io/ion-elgreco/rivers-runtime:<chart version>-py3.12`). `spec.tag`
+or `spec.digest` on its own replaces that image's tag or digest, e.g.
+`tag: 0.5.0-py3.11` for another interpreter. Set `spec.image` to use a
+private mirror (`image: harbor.internal/rivers/rivers-runtime`,
+`tag: 0.5.0-py3.11`); as in image mode, it then resolves `spec.tag`
+(default `latest`) or `spec.digest`.
 
 **Dependencies** come from the repo itself: `uv.lock` ⇒
 `uv sync --locked`, else `requirements.txt` ⇒ `uv pip install`, else

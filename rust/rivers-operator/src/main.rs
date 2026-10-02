@@ -141,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_GIT_TIMEOUT_SECONDS);
 
+    let runtime_image = std::env::var(RUNTIME_IMAGE_ENV)
+        .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string())
+        .parse::<codelocation::ImageRef>()
+        .map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
+
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),
         namespace: namespace.clone(),
@@ -150,8 +155,7 @@ async fn main() -> anyhow::Result<()> {
         git: Arc::new(codelocation::git::GitResolver::new(
             std::time::Duration::from_secs(git_timeout),
         )),
-        runtime_image: std::env::var(RUNTIME_IMAGE_ENV)
-            .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string()),
+        runtime_image,
         workspace: workspace_cfg,
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)

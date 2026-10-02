@@ -355,7 +355,8 @@ spec:
               tag:
                 description: |-
                   Tag to resolve to a digest. Ignored when `digest` is set. Defaults to
-                  `latest` if both are omitted.
+                  `latest` if both are omitted, except in git mode without `image`: the
+                  chart's default runtime image then keeps its own tag or digest.
                 nullable: true
                 type: string
             type: object

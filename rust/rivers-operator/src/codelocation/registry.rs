@@ -547,6 +547,45 @@ fn exponential_backoff(consecutive_errors: u32, cap: Duration) -> Duration {
     std::cmp::min(scaled, cap)
 }
 
+/// `[host[:port]/]path[:tag][@sha256:<hex>]`: only a `:` after the last `/`
+/// starts a tag.
+static IMAGE_REF_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"^(?P<repository>(?:[^/:@\s]+(?::[0-9]+)?/)?[^/:@\s]+(?:/[^/:@\s]+)*)",
+        r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?",
+        r"(?:@(?P<digest>sha256:[0-9a-f]{64}))?$",
+    ))
+    .unwrap()
+});
+
+/// An image reference split into its repository (registry host included),
+/// tag and digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRef {
+    pub repository: String,
+    pub tag: Option<String>,
+    pub digest: Option<String>,
+}
+
+impl std::str::FromStr for ImageRef {
+    type Err = anyhow::Error;
+
+    fn from_str(reference: &str) -> anyhow::Result<Self> {
+        let parts = IMAGE_REF_RE.captures(reference).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{reference}' is not an image reference \
+                 (repository[:tag][@sha256:<64 lowercase hex>])"
+            )
+        })?;
+        let part = |name| parts.name(name).map(|m| m.as_str().to_string());
+        Ok(Self {
+            repository: parts["repository"].to_string(),
+            tag: part("tag"),
+            digest: part("digest"),
+        })
+    }
+}
+
 /// Parse `image` into `(registry, repository)`. Docker-style shorthand
 /// (`alpine`, `library/alpine`) is normalized to `registry-1.docker.io`; all
 /// other forms are split on the first `/`.
@@ -653,6 +692,83 @@ mod tests {
         let (reg, repo) = parse_image_ref("localhost:5000/my/img").unwrap();
         assert_eq!(reg, "localhost:5000");
         assert_eq!(repo, "my/img");
+    }
+
+    #[test]
+    fn image_ref_splits_repository_tag_and_digest() {
+        let digest = format!("sha256:{}", "0a".repeat(32));
+        let pinned = format!("ghcr.io/acme/rt@{digest}");
+        let tagged_and_pinned = format!("localhost:5111/rt:dev@{digest}");
+        let cases = [
+            (
+                "ghcr.io/ion-elgreco/rivers-runtime:0.5.0-py3.12",
+                "ghcr.io/ion-elgreco/rivers-runtime",
+                Some("0.5.0-py3.12"),
+                None,
+            ),
+            (
+                rivers_k8s::defaults::RUNTIME_IMAGE,
+                "ghcr.io/ion-elgreco/rivers-runtime",
+                Some("latest"),
+                None,
+            ),
+            (
+                "localhost:5111/rivers-runtime:dev",
+                "localhost:5111/rivers-runtime",
+                Some("dev"),
+                None,
+            ),
+            (
+                "localhost:5111/rivers-runtime",
+                "localhost:5111/rivers-runtime",
+                None,
+                None,
+            ),
+            ("rivers-runtime", "rivers-runtime", None, None),
+            (&pinned, "ghcr.io/acme/rt", None, Some(digest.as_str())),
+            (
+                &tagged_and_pinned,
+                "localhost:5111/rt",
+                Some("dev"),
+                Some(digest.as_str()),
+            ),
+        ];
+        for (reference, repository, tag, digest) in cases {
+            let expected = ImageRef {
+                repository: repository.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.map(str::to_string),
+            };
+            assert_eq!(
+                reference.parse::<ImageRef>().unwrap(),
+                expected,
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_ref_rejects_malformed_references() {
+        let short_digest = "ghcr.io/acme/rt@sha256:abc".to_string();
+        let upper_digest = format!("ghcr.io/acme/rt@sha256:{}", "AB".repeat(32));
+        let sha512 = format!("ghcr.io/acme/rt@sha512:{}", "ab".repeat(64));
+        for reference in [
+            "",
+            "ghcr.io/acme/rt:",
+            "ghcr.io/acme/rt/",
+            "ghcr.io//rt",
+            "ghcr.io/acme/rt:a:b",
+            "ghcr.io/acme/rt latest",
+            &short_digest,
+            &upper_digest,
+            &sha512,
+        ] {
+            let err = reference.parse::<ImageRef>().unwrap_err();
+            assert!(
+                err.to_string().contains("is not an image reference"),
+                "{reference}: {err}"
+            );
+        }
     }
 
     #[test]

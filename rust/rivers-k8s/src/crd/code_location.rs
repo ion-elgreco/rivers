@@ -102,7 +102,8 @@ pub struct CodeLocationSpec {
     pub git: Option<GitSource>,
 
     /// Tag to resolve to a digest. Ignored when `digest` is set. Defaults to
-    /// `latest` if both are omitted.
+    /// `latest` if both are omitted, except in git mode without `image`: the
+    /// chart's default runtime image then keeps its own tag or digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 
@@ -361,15 +362,6 @@ impl CodeLocationSpec {
     pub fn is_git(&self) -> bool {
         self.git.is_some()
     }
-
-    pub fn has_pinned_digest(&self) -> bool {
-        self.digest.as_deref().is_some_and(|d| !d.is_empty())
-    }
-
-    /// Defaults to "latest" when neither tag nor digest is supplied.
-    pub fn effective_tag(&self) -> &str {
-        self.tag.as_deref().unwrap_or("latest")
-    }
 }
 
 fn resource_requirements_is_empty(r: &ResourceRequirements) -> bool {
@@ -417,42 +409,6 @@ mod tests {
         assert!(spec.service_account_name.is_none());
         assert!(spec.image_pull_secrets.is_empty());
         assert!(spec.env.is_empty());
-    }
-
-    #[test]
-    fn has_pinned_digest() {
-        let tag_only: CodeLocationSpec = serde_json::from_value(serde_json::json!({
-            "image": "img", "tag": "v1"
-        }))
-        .unwrap();
-        assert!(!tag_only.has_pinned_digest());
-
-        let digest: CodeLocationSpec = serde_json::from_value(serde_json::json!({
-            "image": "img", "digest": "sha256:abc"
-        }))
-        .unwrap();
-        assert!(digest.has_pinned_digest());
-
-        let empty_digest: CodeLocationSpec = serde_json::from_value(serde_json::json!({
-            "image": "img", "digest": ""
-        }))
-        .unwrap();
-        assert!(!empty_digest.has_pinned_digest());
-    }
-
-    #[test]
-    fn effective_tag_fallback() {
-        let no_tag: CodeLocationSpec = serde_json::from_value(serde_json::json!({
-            "image": "img"
-        }))
-        .unwrap();
-        assert_eq!(no_tag.effective_tag(), "latest");
-
-        let tagged: CodeLocationSpec = serde_json::from_value(serde_json::json!({
-            "image": "img", "tag": "v2.0.0"
-        }))
-        .unwrap();
-        assert_eq!(tagged.effective_tag(), "v2.0.0");
     }
 
     #[test]

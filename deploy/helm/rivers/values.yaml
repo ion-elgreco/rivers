@@ -245,14 +245,14 @@ ui:
 
 codeLocation:
   runtime:
-    # Default runtime for git-sourced CodeLocations that don't set spec.image.
-    # Empty resolves to
+    # Default runtime for git-sourced CodeLocations that don't set spec.image:
+    # repo:tag or repo@sha256:... (no tag means latest). Empty resolves to
     #   ghcr.io/ion-elgreco/rivers-runtime:{appVersion}-py{pythonVersion}.
     # Point at an internal mirror for air-gapped clusters; pair with
     # spec.imagePullSecrets on the CodeLocation.
     image: ""
-    # Interpreter variant the default tag selects. Per-CodeLocation
-    # overrides go on spec.image / spec.tag.
+    # Interpreter variant the default tag selects. A CodeLocation's spec.tag
+    # (e.g. 0.5.0-py3.11) or spec.digest replaces the default's tag/digest.
     pythonVersion: "3.12"
   workspace:
     # Shared workspace: one RWX PVC per git CodeLocation; trees (code+venv)
