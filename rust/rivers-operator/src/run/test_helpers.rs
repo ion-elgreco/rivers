@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
@@ -28,6 +29,9 @@ pub struct ApiRequest {
 pub struct MockApiState {
     pub pods: BTreeMap<String, Pod>,
     pub code_locations: BTreeMap<String, CodeLocation>,
+    /// An apply replaces only `spec`: the seeded `metadata.generation` and
+    /// `status` stand for what the Deployment controller reports.
+    pub deployments: BTreeMap<String, Deployment>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -44,6 +48,7 @@ impl Default for MockApiState {
         Self {
             pods: BTreeMap::new(),
             code_locations,
+            deployments: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -65,7 +70,7 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
             s.requests.push(ApiRequest {
                 method: method.clone(),
                 path: path.clone(),
-                body: body_json,
+                body: body_json.clone(),
             });
 
             let response = match method.as_str() {
@@ -83,6 +88,11 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                             json_response(200, &serde_json::to_value(cl).unwrap())
                         } else {
                             json_response(404, &not_found_status())
+                        }
+                    } else if let Some(name) = object_name(&path, "deployments") {
+                        match s.deployments.get(name) {
+                            Some(d) => json_response(200, &serde_json::to_value(d).unwrap()),
+                            None => json_response(404, &not_found_status()),
                         }
                     } else {
                         json_response(200, &serde_json::json!({}))
@@ -112,6 +122,33 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                         }),
                     )
                 }
+                "PATCH" if object_name(&path, "deployments").is_some() => {
+                    let name = object_name(&path, "deployments").unwrap();
+                    let applied: Option<Deployment> = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok());
+                    let stored = s.deployments.entry(name.to_string()).or_default();
+                    if let Some(applied) = applied {
+                        stored.spec = applied.spec;
+                    }
+                    json_response(200, &serde_json::to_value(&*stored).unwrap())
+                }
+                "PATCH" if path.contains("/services/") => {
+                    json_response(200, body_json.as_ref().unwrap_or(&serde_json::json!({})))
+                }
+                "PATCH" if object_name(&path, "codelocations").is_some() => {
+                    let name = object_name(&path, "codelocations").unwrap();
+                    let status = body_json.as_ref().and_then(|b| b.get("status")).cloned();
+                    match s.code_locations.get_mut(name) {
+                        Some(cl) => {
+                            if let Some(status) = status {
+                                cl.status = serde_json::from_value(status).ok();
+                            }
+                            json_response(200, &serde_json::to_value(&*cl).unwrap())
+                        }
+                        None => json_response(404, &not_found_status()),
+                    }
+                }
                 "PATCH" => {
                     let run_json = serde_json::json!({
                         "apiVersion": "rivers.io/v1alpha1",
@@ -135,6 +172,11 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
     });
 
     kube_client::Client::new(service, "default")
+}
+
+/// `x` in `…/<plural>/x` or `…/<plural>/x/status`.
+fn object_name<'a>(path: &'a str, plural: &str) -> Option<&'a str> {
+    path.split(&format!("/{plural}/")).nth(1)?.split('/').next()
 }
 
 fn json_response(status: u16, body: &serde_json::Value) -> Response<http_body_util::Full<Bytes>> {

@@ -287,6 +287,7 @@ pub struct CodeLocationStatus {
     /// Fully-qualified digest reference (`repo@sha256:...`) that the
     /// reconciler has pinned. For multi-arch images this is the index digest,
     /// so each node can still descend into per-platform manifests at pull time.
+    /// In git mode, the runtime image of `runSource`'s tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_image: Option<String>,
 
@@ -308,20 +309,29 @@ pub struct CodeLocationStatus {
     pub conditions: Vec<CodeLocationCondition>,
 
     /// Short display of the pinned code version, for the print column.
-    /// `ghcr.io/acme/p@sha256:abc1234` (image) or `main@9f3c1ab` (git).
+    /// `ghcr.io/acme/p@sha256:abc1234` (image) or `main@9f3c1ab` (git:
+    /// `runSource`'s commit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
-    /// git mode: full 40-hex commit the reconciler pinned.
+    /// git mode: full 40-hex commit of `runSource`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_commit: Option<String>,
 
-    /// git mode: the ref that matched, e.g. `refs/heads/main`.
+    /// git mode: the ref `runSource`'s commit came from, e.g.
+    /// `refs/heads/main`; absent for a pinned commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ref: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fetched_at: Option<String>,
+
+    /// git mode: the source runs get — that of the last tree every
+    /// code-location pod ran and was ready on. A newer commit takes over
+    /// only when its rollout finishes; until then, and for good if it fails
+    /// to build, runs keep this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_source: Option<crate::crd::run::RunSource>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -700,11 +710,21 @@ mod tests {
 
     #[test]
     fn status_git_fields_round_trip_camel_case() {
+        let run_source: crate::crd::run::RunSource = serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "secretName": "git-creds",
+            },
+        }))
+        .unwrap();
         let status = CodeLocationStatus {
             source: Some("main@9f3c1ab".to_string()),
             resolved_commit: Some("9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string()),
             resolved_ref: Some("refs/heads/main".to_string()),
             last_fetched_at: Some("2026-07-26T00:00:00Z".to_string()),
+            run_source: Some(run_source.clone()),
             ..Default::default()
         };
         let v = serde_json::to_value(&status).unwrap();
@@ -715,11 +735,15 @@ mod tests {
         );
         assert_eq!(v["resolvedRef"], "refs/heads/main");
         assert_eq!(v["lastFetchedAt"], "2026-07-26T00:00:00Z");
+        assert_eq!(v["runSource"]["git"]["secretName"], "git-creds");
+        let back: CodeLocationStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back.run_source, Some(run_source));
 
         let empty = serde_json::to_value(CodeLocationStatus::default()).unwrap();
         assert!(empty.get("source").is_none());
         assert!(empty.get("resolvedCommit").is_none());
         assert!(empty.get("resolvedRef").is_none());
         assert!(empty.get("lastFetchedAt").is_none());
+        assert!(empty.get("runSource").is_none());
     }
 }

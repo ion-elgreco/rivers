@@ -195,11 +195,22 @@ step pod — a wide fan-out starts as fast as image mode. Without RWX
 storage every pod builds its own tree; that's fine for
 `executor: parallel` but slow for wide `executor: kubernetes` fan-outs.
 
-**Which commit a run uses**: a run launched from the code-location pod
-(UI launches, schedules, sensors, backfills) pins the commit that pod
-serves, so during a rollout each run uses the same tree as the pod that
-launched it. A `Run` you create yourself without `image` pins the
-CodeLocation's current `status.resolvedCommit`.
+**Which commit a run uses**: runs get the last *fully rolled-out* commit.
+After a push, the operator rolls the code-location pods to the new
+commit, but `status.resolvedCommit` moves to it only when every pod runs
+it and is ready. `status.runSource` records that tree's full source (url,
+commit, path, Secret, dependencies) and `status.resolvedImage` its
+runtime image; both move with `resolvedCommit`. Until then runs keep the
+previous commit, and if the new commit fails to build they keep it until
+a later commit rolls out. Meanwhile the CodeLocation stays `Ready`: the git
+Deployment never takes an old pod down before its replacement is ready, so
+`spec.replicas` pods stay ready throughout (a rollout needs room for one
+extra pod). A `Run` you create yourself without `image` gets this commit.
+A run launched from a code-location pod (UI launches, schedules, sensors,
+backfills) pins the commit that pod serves, so during a rollout each run
+uses the same tree as the pod that launched it. To wait until a push is
+live:
+`kubectl -n rivers wait rcl/analytics --for=jsonpath='{.status.resolvedCommit}'=<sha>`.
 
 **Egress**: in shared mode only the code-location pod needs outbound
 access to the git host and the package index (run/step pods fetch
@@ -209,7 +220,11 @@ accordingly.
 **When things fail**, `kubectl describe rcl analytics` carries the
 answer: `RefNotFound` / `GitAuthFailed` / `GitHostKeyRejected` on the
 `SourceResolved` condition for resolution problems, and a failed install
-surfaces `uv`'s error tail in `status.message`.
+surfaces `uv`'s error tail in `status.message`. A rollout shows on the
+`DeploymentAvailable` condition: reason `RollingOut` while it runs, or
+`ProgressDeadlineExceeded` when it is stuck (for example, the new commit
+fails to install), with a message that names the commit being rolled out
+and the commit runs still use.
 
 ## Helm chart customizations
 

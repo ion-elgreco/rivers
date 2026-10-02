@@ -420,7 +420,7 @@ spec:
                 nullable: true
                 type: integer
               resolvedCommit:
-                description: 'git mode: full 40-hex commit the reconciler pinned.'
+                description: 'git mode: full 40-hex commit of `runSource`.'
                 nullable: true
                 type: string
               resolvedImage:
@@ -428,16 +428,93 @@ spec:
                   Fully-qualified digest reference (`repo@sha256:...`) that the
                   reconciler has pinned. For multi-arch images this is the index digest,
                   so each node can still descend into per-platform manifests at pull time.
+                  In git mode, the runtime image of `runSource`'s tree.
                 nullable: true
                 type: string
               resolvedRef:
-                description: 'git mode: the ref that matched, e.g. `refs/heads/main`.'
+                description: |-
+                  git mode: the ref `runSource`'s commit came from, e.g.
+                  `refs/heads/main`; absent for a pinned commit.
                 nullable: true
                 type: string
+              runSource:
+                description: |-
+                  git mode: the source runs get — that of the last tree every
+                  code-location pod ran and was ready on. A newer commit takes over
+                  only when its rollout finishes; until then, and for good if it fails
+                  to build, runs keep this one.
+                nullable: true
+                properties:
+                  dependencies:
+                    default:
+                      mode: auto
+                    properties:
+                      extras:
+                        description: '`uvSync` mode: `--extra` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      files:
+                        description: '`requirements` mode: files relative to `path`. Default `requirements.txt`.'
+                        items:
+                          type: string
+                        type: array
+                      groups:
+                        description: '`uvSync` mode: `--group` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      mode:
+                        default: auto
+                        description: |-
+                          `auto` picks `uvSync` when `uv.lock` exists, else `requirements` when
+                          `requirements.txt` exists, else installs nothing. Detection happens in
+                          the workspace pod — the operator never reads repo contents.
+                        enum:
+                        - auto
+                        - uvSync
+                        - requirements
+                        - none
+                        type: string
+                      timeoutSeconds:
+                        description: Wall-clock budget for fetch + install. Default 600s.
+                        format: uint64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  git:
+                    properties:
+                      commit:
+                        description: Full 40-hex commit — the pin.
+                        type: string
+                      path:
+                        nullable: true
+                        type: string
+                      ref:
+                        description: Matched ref (`refs/heads/main`) — fetch fallback + display.
+                        nullable: true
+                        type: string
+                      secretName:
+                        description: |-
+                          Credentials Secret name — used only by fallback-mode consumers,
+                          which fetch for themselves.
+                        nullable: true
+                        type: string
+                      url:
+                        type: string
+                    required:
+                    - commit
+                    - url
+                    type: object
+                required:
+                - git
+                type: object
               source:
                 description: |-
                   Short display of the pinned code version, for the print column.
-                  `ghcr.io/acme/p@sha256:abc1234` (image) or `main@9f3c1ab` (git).
+                  `ghcr.io/acme/p@sha256:abc1234` (image) or `main@9f3c1ab` (git:
+                  `runSource`'s commit).
                 nullable: true
                 type: string
             type: object

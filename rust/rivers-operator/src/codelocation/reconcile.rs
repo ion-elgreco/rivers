@@ -38,13 +38,14 @@ use super::registry::{
     ImageRef, RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest,
 };
 use super::resources::{
-    build_deployment, build_git_deployment, build_keep_config_map, build_service,
+    MAIN_CONTAINER, build_deployment, build_git_deployment, build_keep_config_map, build_service,
     build_workspace_pvc, deployment_name, git_working_dir, grpc_endpoint, keep_config_map_name,
     service_name, workspace_pvc_name,
 };
 use crate::leader::LeaderGate;
 use crate::metrics;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
+use rivers_k8s::crd::run::RunSource;
 use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
 
 /// Default registry-refresh interval when the CR does not override it.
@@ -210,6 +211,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         resolved_commit: prior_status.and_then(|s| s.resolved_commit.clone()),
         resolved_ref: prior_status.and_then(|s| s.resolved_ref.clone()),
         last_fetched_at: prior_status.and_then(|s| s.last_fetched_at.clone()),
+        run_source: None,
     };
     push_condition(
         &mut status,
@@ -266,6 +268,32 @@ async fn reconcile_git(
         .git
         .as_ref()
         .expect("reconcile_git dispatched for a non-git CodeLocation");
+    let endpoint = grpc_endpoint(&name, namespace, cl.spec.grpc_port);
+
+    // Followers neither resolve nor apply: they refresh what the Deployment
+    // shows and keep the leader's resolution conditions, so both replicas
+    // publish the same status.
+    if !ctx.leader.is_leader() {
+        let published = cl.status.as_ref().is_some_and(|s| {
+            s.run_source.is_some()
+                || s.conditions
+                    .iter()
+                    .any(|c| c.r#type == CONDITION_SOURCE_RESOLVED)
+        });
+        if published {
+            let rollout = observe_git_deployment(&name, deployments_api).await;
+            let update = GitStatusUpdate {
+                resolution: None,
+                fetched_at: None,
+                rollout,
+                endpoint,
+            };
+            patch_git_status(code_locations_api, &name, cl, update).await?;
+        } else {
+            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+        }
+        return Ok(Action::requeue(FOLLOWER_WAIT));
+    }
 
     // Runtime image first, through the same registry pipeline as image mode.
     let timer = Instant::now();
@@ -290,36 +318,6 @@ async fn reconcile_git(
     };
 
     let poll = parse_refresh_interval(git_spec.poll_interval.as_deref());
-
-    // Followers reuse the leader's pinned commit instead of polling the
-    // remote, and refresh status only — the leader owns the applies (a
-    // brief drift window until the next leader pass is acceptable).
-    if !ctx.leader.is_leader() {
-        if let Some(prior_commit) = cl.status.as_ref().and_then(|s| s.resolved_commit.clone()) {
-            let resolved = git::ResolvedRef {
-                commit: prior_commit,
-                ref_name: cl.status.as_ref().and_then(|s| s.resolved_ref.clone()),
-            };
-            let observed = observe_git_deployment(cl, &name, namespace, deployments_api).await;
-            patch_git_status(
-                code_locations_api,
-                &name,
-                generation,
-                cl,
-                GitStatusUpdate {
-                    resolved_image: &resolved_image,
-                    image_reason,
-                    resolved: &resolved,
-                    fetched_at: None,
-                    observed,
-                },
-            )
-            .await?;
-        } else {
-            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
-        }
-        return Ok(Action::requeue(FOLLOWER_WAIT));
-    }
 
     let credentials = match git_credentials(git_spec, secrets_api).await {
         Ok(credentials) => credentials,
@@ -347,22 +345,19 @@ async fn reconcile_git(
                 &resolved,
             )
             .await?;
-            let observed = observe_git_deployment(cl, &name, namespace, deployments_api).await;
-            let phase = observed.phase.clone();
-            patch_git_status(
-                code_locations_api,
-                &name,
-                generation,
-                cl,
-                GitStatusUpdate {
-                    resolved_image: &resolved_image,
+            let rollout = observe_git_deployment(&name, deployments_api).await;
+            let rolling_out = !rollout.complete;
+            let update = GitStatusUpdate {
+                resolution: Some(GitResolution {
+                    image: resolved_image,
                     image_reason,
-                    resolved: &resolved,
-                    fetched_at: Some(jiff::Timestamp::now().to_string()),
-                    observed,
-                },
-            )
-            .await?;
+                    resolved,
+                }),
+                fetched_at: Some(jiff::Timestamp::now().to_string()),
+                rollout,
+                endpoint,
+            };
+            let phase = patch_git_status(code_locations_api, &name, cl, update).await?;
 
             let pinned = request
                 .r#ref
@@ -374,7 +369,7 @@ async fn reconcile_git(
                 .tag
                 .as_deref()
                 .is_some_and(super::registry::looks_immutable);
-            let requeue = if !matches!(phase, CodeLocationPhase::Ready) {
+            let requeue = if rolling_out || !matches!(phase, CodeLocationPhase::Ready) {
                 Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
             } else if pinned {
                 Action::await_change()
@@ -455,11 +450,12 @@ async fn apply_git_workspace(
             build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref()),
         )
         .await?;
-        // Keep-set: the current tree + every non-terminal run's tree. One
-        // LIST per reconcile is fine at reconcile cadence; a stale snapshot
-        // is covered by keepRevisions + minTreeAge (see the RFC's prune
-        // soundness argument). The ConfigMap indirection means this refresh
-        // never rolls the Deployment.
+        // Keep-set: the tree being rolled out, the tree runs get until that
+        // rollout finishes, and every non-terminal run's tree. One LIST per
+        // reconcile is fine at reconcile cadence; a stale snapshot is covered
+        // by keepRevisions + minTreeAge (see the RFC's prune soundness
+        // argument). The ConfigMap indirection means this refresh never
+        // rolls the Deployment.
         let runs_api: Api<rivers_k8s::crd::run::Run> =
             Api::namespaced(ctx.client.clone(), namespace);
         let runs = runs_api
@@ -467,10 +463,11 @@ async fn apply_git_workspace(
             .await
             .map(|l| l.items)
             .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "listing Runs for the keep-set; keeping current tree only");
+                tracing::warn!(error = %e, "listing Runs for the keep-set; keeping the CL's own trees only");
                 Vec::new()
             });
-        let keep = workspace_keep_csv(&key, &name, &runs);
+        let serving_key = cl.status.as_ref().and_then(Tree::serving).map(|t| t.key());
+        let keep = workspace_keep_csv(&key, serving_key.as_deref(), &name, &runs);
         let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
         apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
     }
@@ -492,52 +489,135 @@ async fn apply_git_workspace(
     Ok(())
 }
 
-/// Read the Deployment's phase + endpoint without mutating anything —
-/// shared by the leader (post-apply) and follower (status refresh) paths.
-async fn observe_git_deployment(
-    cl: &CodeLocation,
-    name: &str,
-    namespace: &str,
-    deployments_api: &Api<Deployment>,
-) -> ObservedDeployment {
-    let dep_status = deployments_api
+/// Read the git Deployment without mutating anything — shared by the leader
+/// (post-apply) and follower (status refresh) paths.
+async fn observe_git_deployment(name: &str, deployments_api: &Api<Deployment>) -> GitRollout {
+    let deployment = deployments_api
         .get_status(&deployment_name(name))
         .await
         .ok();
-    let (phase, ready_replicas, deployment_reason, deployment_ok) =
-        evaluate_deployment_phase(cl, dep_status.as_ref());
-    ObservedDeployment {
-        phase,
-        ready_replicas,
-        deployment_reason,
-        deployment_ok,
-        endpoint: grpc_endpoint(name, namespace, cl.spec.grpc_port),
+    git_rollout(deployment.as_ref())
+}
+
+/// A git CL's code as its pods run it: the runtime image plus the source the
+/// workspace was built from.
+#[derive(Clone, Debug, PartialEq)]
+struct Tree {
+    image: String,
+    source: RunSource,
+}
+
+impl Tree {
+    /// The tree runs get, per `status`.
+    fn serving(status: &CodeLocationStatus) -> Option<Self> {
+        Some(Self {
+            image: status.resolved_image.clone()?,
+            source: status.run_source.clone()?,
+        })
+    }
+
+    /// The tree `deployment`'s pod template runs: its main container's
+    /// image and `RIVERS_RUN_SOURCE`.
+    fn of_template(deployment: &Deployment) -> Option<Self> {
+        let container = deployment
+            .spec
+            .as_ref()?
+            .template
+            .spec
+            .as_ref()?
+            .containers
+            .iter()
+            .find(|c| c.name == MAIN_CONTAINER)?;
+        let source = container
+            .env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)?
+            .value
+            .as_deref()?;
+        Some(Self {
+            image: container.image.clone()?,
+            source: serde_json::from_str(source).ok()?,
+        })
+    }
+
+    fn key(&self) -> String {
+        workspace::workspace_key(&self.source.git.commit, &self.image)
     }
 }
 
-struct ObservedDeployment {
-    phase: CodeLocationPhase,
+/// What the git Deployment shows: the tree its pod template runs, and how
+/// far that template has rolled out.
+#[derive(Debug, Default)]
+struct GitRollout {
+    template: Option<Tree>,
+    /// Every pod runs the current template and is ready.
+    complete: bool,
+    /// `None` when the Deployment or its status could not be read.
     ready_replicas: Option<i32>,
-    deployment_reason: &'static str,
-    deployment_ok: bool,
-    endpoint: String,
+    deadline_exceeded: bool,
 }
 
-/// Keep-set for the prune step: the CL's current tree plus the tree of
-/// every non-terminal Run referencing it — queued (`Pending`, or no status
-/// yet) and `Cancelling` included, not just `Running`; a run waiting on a
-/// concurrency pool is precisely the one most likely to sit through
-/// several commits. Keys, not commits: each run's tree is keyed on the
-/// runtime digest *it* pinned. Sorted + deduped so the ConfigMap value is
+fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
+    let Some((deployment, status)) = deployment.and_then(|d| Some((d, d.status.as_ref()?))) else {
+        return GitRollout::default();
+    };
+    GitRollout {
+        template: Tree::of_template(deployment),
+        complete: rollout_complete(deployment),
+        ready_replicas: Some(status.ready_replicas.unwrap_or(0)),
+        deadline_exceeded: generation_observed(deployment)
+            && has_progress_deadline_exceeded(status),
+    }
+}
+
+/// Every pod runs the current template and is ready, and no pod of an older
+/// template is left. Ready counts alone include the old ReplicaSet's pods.
+fn rollout_complete(deployment: &Deployment) -> bool {
+    let (Some(spec), Some(status)) = (&deployment.spec, &deployment.status) else {
+        return false;
+    };
+    let desired = spec.replicas.unwrap_or(1);
+    let all = |count: Option<i32>| count.unwrap_or(0) >= desired;
+    desired > 0
+        && generation_observed(deployment)
+        && all(status.updated_replicas)
+        && all(status.ready_replicas)
+        && all(status.available_replicas)
+        && status.replicas.unwrap_or(0) == status.updated_replicas.unwrap_or(0)
+}
+
+/// The Deployment controller has seen the current template; until then the
+/// status describes the previous one.
+fn generation_observed(deployment: &Deployment) -> bool {
+    let observed = deployment
+        .status
+        .as_ref()
+        .and_then(|s| s.observed_generation);
+    matches!(
+        (observed, deployment.metadata.generation),
+        (Some(seen), Some(current)) if seen >= current
+    )
+}
+
+/// Keep-set for the prune step: the tree being rolled out (`target_key`),
+/// the tree runs get until that rollout finishes (`serving_key`), plus the
+/// tree of every non-terminal Run referencing the CL — queued (`Pending`, or
+/// no status yet) and `Cancelling` included, not just `Running`; a run
+/// waiting on a concurrency pool is precisely the one most likely to sit
+/// through several commits. Keys, not commits: each run's tree is keyed on
+/// the runtime digest *it* pinned. Sorted + deduped so the ConfigMap value is
 /// deterministic and refreshes don't churn.
 fn workspace_keep_csv(
-    current_key: &str,
+    target_key: &str,
+    serving_key: Option<&str>,
     cl_name: &str,
     runs: &[rivers_k8s::crd::run::Run],
 ) -> String {
     use rivers_k8s::crd::run::RunPhase;
     let mut keys = std::collections::BTreeSet::new();
-    keys.insert(current_key.to_string());
+    keys.insert(target_key.to_string());
+    keys.extend(serving_key.map(str::to_string));
     for run in runs {
         if run.spec.code_location_ref.name != cl_name {
             continue;
@@ -647,97 +727,176 @@ fn git_error_reason_retry(err: &git::GitError) -> (&'static str, Duration) {
     }
 }
 
-/// `main@9f3c1ab` for branches/tags, `9f3c1ab (pinned)` for explicit commits.
-fn git_source_display(
-    resolved: &git::ResolvedRef,
-    wanted: &rivers_k8s::crd::code_location::GitRef,
-) -> String {
-    let short = &resolved.commit[..resolved.commit.len().min(7)];
-    let name = wanted
-        .branch
-        .as_deref()
-        .or(wanted.tag.as_deref())
-        .filter(|s| !s.is_empty());
+/// `main@9f3c1ab` for a branch or tag, `9f3c1ab (pinned)` for a pinned commit.
+fn source_display(source: &RunSource) -> String {
+    let commit = &source.git.commit;
+    let short = commit.get(..7).unwrap_or(commit);
+    let name = source.git.r#ref.as_deref().map(|r| {
+        r.strip_prefix("refs/heads/")
+            .or_else(|| r.strip_prefix("refs/tags/"))
+            .unwrap_or(r)
+    });
     match name {
         Some(name) => format!("{name}@{short}"),
         None => format!("{short} (pinned)"),
     }
 }
 
-struct GitStatusUpdate<'a> {
-    resolved_image: &'a str,
-    image_reason: &'static str,
-    resolved: &'a git::ResolvedRef,
-    fetched_at: Option<String>,
-    observed: ObservedDeployment,
+/// Names the tree being rolled out and the tree runs keep meanwhile; `None`
+/// when the rollout does not change the tree.
+fn rollout_message(target: Option<&Tree>, serving: Option<&Tree>, stuck: bool) -> Option<String> {
+    let target = target.filter(|t| Some(*t) != serving)?;
+    let with_image = serving.is_some_and(|s| s.image != target.image);
+    let describe = |tree: &Tree| {
+        let source = source_display(&tree.source);
+        if with_image {
+            format!("{source} on {}", tree.image)
+        } else {
+            source
+        }
+    };
+    let rollout = if stuck {
+        format!(
+            "rollout of {} exceeded its progress deadline",
+            describe(target)
+        )
+    } else {
+        format!("rolling out {}", describe(target))
+    };
+    Some(match serving {
+        Some(serving) => format!("{rollout}; runs use {}", describe(serving)),
+        None => rollout,
+    })
 }
 
+struct GitStatusUpdate {
+    /// `None` on followers: resolution is the leader's.
+    resolution: Option<GitResolution>,
+    fetched_at: Option<String>,
+    rollout: GitRollout,
+    endpoint: String,
+}
+
+/// The leader's runtime-image and ref resolution of this pass.
+struct GitResolution {
+    image: String,
+    image_reason: &'static str,
+    resolved: git::ResolvedRef,
+}
+
+/// Publish a git CL's status; returns the phase it published.
 async fn patch_git_status(
     code_locations_api: &Api<CodeLocation>,
     name: &str,
-    generation: Option<i64>,
     cl: &CodeLocation,
-    update: GitStatusUpdate<'_>,
-) -> Result<(), kube_client::Error> {
-    let now = jiff::Timestamp::now().to_string();
+    update: GitStatusUpdate,
+) -> Result<CodeLocationPhase, kube_client::Error> {
+    let status = git_status(cl, update, &jiff::Timestamp::now().to_string());
+    let phase = status.phase.clone().unwrap_or(CodeLocationPhase::Deploying);
+    if !status_substantively_equal(cl.status.as_ref(), &status) {
+        patch_status(code_locations_api, name, &status).await?;
+    }
+    Ok(phase)
+}
+
+/// Git-mode status. Runs get the serving tree: the pod template's once every
+/// pod runs it and is ready, until then the prior status's — a commit that
+/// is still building, or fails to build, never reaches a run. A rollout in
+/// progress or stuck shows on `DeploymentAvailable`, not in the phase.
+fn git_status(cl: &CodeLocation, update: GitStatusUpdate, now: &str) -> CodeLocationStatus {
     let prior = cl.status.as_ref();
-    let git_spec = cl.spec.git.as_ref().expect("git status for a git CL");
-    let source_reason = if update.resolved.ref_name.is_none() {
-        REASON_COMMIT_PINNED
+    let rollout = &update.rollout;
+    let serving = match &rollout.template {
+        Some(template) if rollout.complete => Some(template.clone()),
+        _ => prior.and_then(Tree::serving),
+    };
+    let desired = cl.spec.replicas;
+    let ready =
+        serving.is_some() && desired > 0 && rollout.ready_replicas.is_some_and(|r| r >= desired);
+    let (deployment_reason, deployment_message) = if rollout.ready_replicas.is_none() {
+        (REASON_NO_DEPLOYMENT_STATUS, None)
+    } else if ready && rollout.complete {
+        (REASON_MIN_REPLICAS, None)
     } else {
-        REASON_COMMIT_RESOLVED
+        let reason = if rollout.deadline_exceeded {
+            REASON_PROGRESS_DEADLINE
+        } else {
+            REASON_ROLLING_OUT
+        };
+        let message = rollout_message(
+            rollout.template.as_ref(),
+            serving.as_ref(),
+            rollout.deadline_exceeded,
+        );
+        (reason, message)
     };
     let mut status = CodeLocationStatus {
-        phase: Some(update.observed.phase.clone()),
-        observed_generation: generation,
-        resolved_image: Some(update.resolved_image.to_string()),
-        grpc_endpoint: Some(update.observed.endpoint.clone()),
-        last_reconciled: Some(now.clone()),
-        ready_replicas: update.observed.ready_replicas,
+        phase: Some(if ready {
+            CodeLocationPhase::Ready
+        } else {
+            CodeLocationPhase::Deploying
+        }),
+        observed_generation: cl.metadata.generation,
+        resolved_image: serving.as_ref().map(|t| t.image.clone()),
+        grpc_endpoint: Some(update.endpoint),
+        last_reconciled: Some(now.to_string()),
+        ready_replicas: rollout.ready_replicas,
         message: None,
         conditions: Vec::new(),
-        source: Some(git_source_display(update.resolved, &git_spec.r#ref)),
-        resolved_commit: Some(update.resolved.commit.clone()),
-        resolved_ref: update.resolved.ref_name.clone(),
+        source: serving.as_ref().map(|t| source_display(&t.source)),
+        resolved_commit: serving.as_ref().map(|t| t.source.git.commit.clone()),
+        resolved_ref: serving.as_ref().and_then(|t| t.source.git.r#ref.clone()),
         last_fetched_at: update
             .fetched_at
             .or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
+        run_source: serving.map(|t| t.source),
     };
-    push_condition(
-        &mut status,
-        prior,
-        CONDITION_IMAGE_RESOLVED,
-        "True",
-        update.image_reason,
-        Some(update.resolved_image.to_string()),
-        &now,
-    );
-    push_condition(
-        &mut status,
-        prior,
-        CONDITION_SOURCE_RESOLVED,
-        "True",
-        source_reason,
-        Some(update.resolved.commit.clone()),
-        &now,
-    );
+    match update.resolution {
+        Some(resolution) => {
+            let source_reason = if resolution.resolved.ref_name.is_none() {
+                REASON_COMMIT_PINNED
+            } else {
+                REASON_COMMIT_RESOLVED
+            };
+            push_condition(
+                &mut status,
+                prior,
+                CONDITION_IMAGE_RESOLVED,
+                "True",
+                resolution.image_reason,
+                Some(resolution.image),
+                now,
+            );
+            push_condition(
+                &mut status,
+                prior,
+                CONDITION_SOURCE_RESOLVED,
+                "True",
+                source_reason,
+                Some(resolution.resolved.commit),
+                now,
+            );
+        }
+        None => status.conditions.extend(
+            prior
+                .iter()
+                .flat_map(|s| &s.conditions)
+                .filter(|c| {
+                    c.r#type == CONDITION_IMAGE_RESOLVED || c.r#type == CONDITION_SOURCE_RESOLVED
+                })
+                .cloned(),
+        ),
+    }
     push_condition(
         &mut status,
         prior,
         CONDITION_DEPLOYMENT_AVAILABLE,
-        if update.observed.deployment_ok {
-            "True"
-        } else {
-            "False"
-        },
-        update.observed.deployment_reason,
-        None,
-        &now,
+        if ready { "True" } else { "False" },
+        deployment_reason,
+        deployment_message,
+        now,
     );
-    if status_substantively_equal(prior, &status) {
-        return Ok(());
-    }
-    patch_status(code_locations_api, name, &status).await
+    status
 }
 
 async fn patch_git_error(
@@ -763,6 +922,7 @@ async fn patch_git_error(
         resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
         resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
         last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+        run_source: prior.and_then(|s| s.run_source.clone()),
     };
     push_condition(
         &mut status,
@@ -1099,6 +1259,7 @@ fn status_substantively_equal(
         && prior.source == new.source
         && prior.resolved_commit == new.resolved_commit
         && prior.resolved_ref == new.resolved_ref
+        && prior.run_source == new.run_source
 }
 
 /// Append a condition, preserving `last_transition_time` from the prior
@@ -1167,6 +1328,7 @@ async fn patch_waiting_status(
         resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
         resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
         last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+        run_source: prior.and_then(|s| s.run_source.clone()),
     };
     push_condition(
         &mut status,
@@ -1205,6 +1367,7 @@ async fn patch_error_status(
         resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
         resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
         last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+        run_source: prior.and_then(|s| s.run_source.clone()),
     };
     push_condition(
         &mut status,
@@ -1403,7 +1566,7 @@ mod tests {
             run_for("other", 'f', Some(RunPhase::Running)),       // different CL
         ];
 
-        let keep = workspace_keep_csv("current-key", "analytics", &runs);
+        let keep = workspace_keep_csv("current-key", None, "analytics", &runs);
         let entries: Vec<&str> = keep.split(',').collect();
         assert!(entries.contains(&"current-key"));
         // a (Running + statusless dedup), b (Pending — queued runs hold
@@ -1461,35 +1624,22 @@ mod tests {
     }
 
     #[test]
-    fn git_source_display_shapes() {
-        use rivers_k8s::crd::code_location::GitRef;
-        let commit = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string();
-
-        let on_branch = git::ResolvedRef {
-            commit: commit.clone(),
-            ref_name: Some("refs/heads/main".into()),
-        };
-        let branch = GitRef {
-            branch: Some("main".into()),
+    fn source_display_shapes() {
+        let at = |r#ref: Option<&str>| RunSource {
+            git: rivers_k8s::crd::run::GitCoordinates {
+                url: "https://forge.example/r.git".into(),
+                commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".into(),
+                r#ref: r#ref.map(str::to_string),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        assert_eq!(git_source_display(&on_branch, &branch), "main@9f3c1ab");
-
-        let tag = GitRef {
-            tag: Some("v1.2.3".into()),
-            ..Default::default()
-        };
-        assert_eq!(git_source_display(&on_branch, &tag), "v1.2.3@9f3c1ab");
-
-        let pinned_ref = GitRef {
-            commit: Some(commit.clone()),
-            ..Default::default()
-        };
-        let pinned = git::ResolvedRef {
-            commit,
-            ref_name: None,
-        };
-        assert_eq!(git_source_display(&pinned, &pinned_ref), "9f3c1ab (pinned)");
+        assert_eq!(source_display(&at(Some("refs/heads/main"))), "main@9f3c1ab");
+        assert_eq!(
+            source_display(&at(Some("refs/tags/v1.2.3"))),
+            "v1.2.3@9f3c1ab"
+        );
+        assert_eq!(source_display(&at(None)), "9f3c1ab (pinned)");
     }
 
     mod image_resolution {
@@ -1723,6 +1873,480 @@ mod tests {
 
             assert_eq!(image, format!("{host}/acme/pipeline@{digest}"));
             assert_eq!(reason, REASON_DIGEST_PINNED);
+        }
+    }
+
+    mod rollout {
+        use super::*;
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        use k8s_openapi::api::apps::v1::DeploymentStatus;
+        use serde_json::json;
+
+        const RUNTIME: &str = "ghcr.io/ion-elgreco/rivers-runtime";
+        const URL: &str = "https://forge.example/r.git";
+
+        fn commit(c: char) -> String {
+            c.to_string().repeat(40)
+        }
+
+        fn digest(c: char) -> String {
+            format!("sha256:{}", c.to_string().repeat(64))
+        }
+
+        fn runtime(c: char) -> String {
+            format!("{RUNTIME}@{}", digest(c))
+        }
+
+        fn run_source_json(c: char) -> serde_json::Value {
+            json!({ "git": { "url": URL, "commit": commit(c) }, "dependencies": { "mode": "auto" } })
+        }
+
+        /// Status of a git CL whose every pod runs commit `c` on runtime `c`.
+        fn serving_status(c: char) -> serde_json::Value {
+            json!({
+                "phase": "Ready",
+                "observedGeneration": 1,
+                "resolvedImage": runtime(c),
+                "resolvedCommit": commit(c),
+                "runSource": run_source_json(c),
+                "source": format!("{} (pinned)", &commit(c)[..7]),
+                "readyReplicas": 1,
+            })
+        }
+
+        /// Git CL pinned to commit `target` on runtime digest `target` — no
+        /// registry or git traffic — with `prior` as its status.
+        fn git_cl_at(target: char, prior: serde_json::Value) -> CodeLocation {
+            let mut cl = make_cl(json!({
+                "git": { "url": URL, "ref": { "commit": commit(target) } },
+                "digest": digest(target),
+            }));
+            cl.status = Some(serde_json::from_value(prior).unwrap());
+            cl
+        }
+
+        fn deployment(generation: i64, status: DeploymentStatus) -> Deployment {
+            Deployment {
+                metadata: ObjectMeta {
+                    name: Some("x".into()),
+                    generation: Some(generation),
+                    ..Default::default()
+                },
+                spec: None,
+                status: Some(status),
+            }
+        }
+
+        /// One replica: the old pod is ready, the surge pod of the new
+        /// template is not.
+        fn mid_rollout() -> Deployment {
+            deployment(
+                2,
+                DeploymentStatus {
+                    observed_generation: Some(2),
+                    replicas: Some(2),
+                    updated_replicas: Some(1),
+                    ready_replicas: Some(1),
+                    available_replicas: Some(1),
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn rolled_out() -> Deployment {
+            deployment(
+                2,
+                DeploymentStatus {
+                    observed_generation: Some(2),
+                    replicas: Some(1),
+                    updated_replicas: Some(1),
+                    ready_replicas: Some(1),
+                    available_replicas: Some(1),
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn condition<'a>(status: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+            status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == kind)
+                .unwrap_or_else(|| panic!("no {kind} condition: {status}"))
+        }
+
+        type ApiState = Arc<std::sync::Mutex<MockApiState>>;
+
+        /// Mock API server holding `cl`, whose Deployment applies keep
+        /// `observed`'s generation and status.
+        fn api_with(cl: CodeLocation, observed: Deployment) -> ApiState {
+            let state = ApiState::default();
+            {
+                let mut s = state.lock().unwrap();
+                s.code_locations.insert("x".into(), cl);
+                s.deployments.insert("x".into(), observed);
+            }
+            state
+        }
+
+        /// One reconcile pass over the stored CL; returns the status it
+        /// patched, if any.
+        async fn pass(state: &ApiState, leader: LeaderGate) -> Option<serde_json::Value> {
+            let (cl, seen) = {
+                let s = state.lock().unwrap();
+                (s.code_locations["x"].clone(), s.requests.len())
+            };
+            let ctx = Context {
+                client: mock_client(state.clone()),
+                namespace: "y".into(),
+                registry: Arc::new(RegistryClient::with_insecure(true)),
+                git: Arc::new(git::GitResolver::new(Duration::from_secs(5))),
+                runtime_image: format!("{RUNTIME}:0.5.0-py3.12").parse().unwrap(),
+                leader: Arc::new(leader),
+                code_location_service_account: "rivers-code-location".into(),
+                workspace: WorkspaceConfig::default(),
+                surreal_pod_cfg: Default::default(),
+                otel_pod_cfg: Default::default(),
+            };
+            reconcile(Arc::new(cl), Arc::new(ctx)).await.unwrap();
+
+            let s = state.lock().unwrap();
+            s.requests[seen..]
+                .iter()
+                .rev()
+                .find(|r| r.method == "PATCH" && r.path.ends_with("/codelocations/x/status"))
+                .map(|r| r.body.as_ref().unwrap()["status"].clone())
+        }
+
+        async fn leader_pass(cl: CodeLocation, observed: Deployment) -> serde_json::Value {
+            pass(&api_with(cl, observed), LeaderGate::leading())
+                .await
+                .expect("no status patch")
+        }
+
+        fn tree(c: char) -> Tree {
+            Tree {
+                image: runtime(c),
+                source: serde_json::from_value(run_source_json(c)).unwrap(),
+            }
+        }
+
+        fn rollout(template: char, complete: bool, ready: i32) -> GitRollout {
+            GitRollout {
+                template: Some(tree(template)),
+                complete,
+                ready_replicas: Some(ready),
+                deadline_exceeded: false,
+            }
+        }
+
+        /// The status a leader that resolved `target` publishes for `rollout`.
+        fn leader_status(
+            cl: &CodeLocation,
+            target: char,
+            rollout: GitRollout,
+        ) -> CodeLocationStatus {
+            let update = GitStatusUpdate {
+                resolution: Some(GitResolution {
+                    image: runtime(target),
+                    image_reason: REASON_DIGEST_PINNED,
+                    resolved: git::ResolvedRef {
+                        commit: commit(target),
+                        ref_name: None,
+                    },
+                }),
+                fetched_at: None,
+                rollout,
+                endpoint: grpc_endpoint("x", "y", 3001),
+            };
+            git_status(cl, update, "2026-10-03T00:00:00Z")
+        }
+
+        fn available(status: &CodeLocationStatus) -> (&str, Option<&str>, Option<&str>) {
+            let c = status
+                .conditions
+                .iter()
+                .find(|c| c.r#type == CONDITION_DEPLOYMENT_AVAILABLE)
+                .expect("DeploymentAvailable condition");
+            (&c.status, c.reason.as_deref(), c.message.as_deref())
+        }
+
+        #[test]
+        fn mid_rollout_keeps_runs_on_the_rolled_out_tree() {
+            // Both pods still run a; the first pod of b is not ready.
+            let mut cl = git_cl_at('b', serving_status('a'));
+            cl.spec.replicas = 2;
+
+            let status = leader_status(&cl, 'b', rollout('b', false, 2));
+
+            assert_eq!(status.phase, Some(CodeLocationPhase::Ready));
+            assert_eq!(status.resolved_commit, Some(commit('a')));
+            assert_eq!(status.resolved_ref, None);
+            assert_eq!(status.resolved_image, Some(runtime('a')));
+            assert_eq!(status.run_source, Some(tree('a').source));
+            assert_eq!(status.source.as_deref(), Some("aaaaaaa (pinned)"));
+            let message = format!(
+                "rolling out bbbbbbb (pinned) on {}; runs use aaaaaaa (pinned) on {}",
+                runtime('b'),
+                runtime('a')
+            );
+            assert_eq!(
+                available(&status),
+                ("True", Some(REASON_ROLLING_OUT), Some(message.as_str()))
+            );
+        }
+
+        #[test]
+        fn completed_rollout_moves_every_serving_field_to_the_template() {
+            let mut cl = git_cl_at('b', serving_status('a'));
+            cl.spec.replicas = 2;
+
+            let status = leader_status(&cl, 'b', rollout('b', true, 2));
+
+            assert_eq!(status.phase, Some(CodeLocationPhase::Ready));
+            assert_eq!(status.resolved_commit, Some(commit('b')));
+            assert_eq!(status.resolved_ref, None);
+            assert_eq!(status.resolved_image, Some(runtime('b')));
+            assert_eq!(status.run_source, Some(tree('b').source));
+            assert_eq!(status.source.as_deref(), Some("bbbbbbb (pinned)"));
+            assert_eq!(
+                available(&status),
+                ("True", Some(REASON_MIN_REPLICAS), None)
+            );
+        }
+
+        #[test]
+        fn first_rollout_stays_deploying_until_it_completes() {
+            // The one pod is ready, but the controller has not confirmed the
+            // rollout and no tree has rolled out before.
+            let mut cl = git_cl_at('b', json!({}));
+            cl.status = None;
+
+            let status = leader_status(&cl, 'b', rollout('b', false, 1));
+
+            assert_eq!(status.phase, Some(CodeLocationPhase::Deploying));
+            assert_eq!(status.resolved_commit, None);
+            assert_eq!(status.resolved_image, None);
+            assert_eq!(status.run_source, None);
+            assert_eq!(status.source, None);
+            assert_eq!(
+                available(&status),
+                (
+                    "False",
+                    Some(REASON_ROLLING_OUT),
+                    Some("rolling out bbbbbbb (pinned)")
+                )
+            );
+        }
+
+        #[test]
+        fn failed_build_keeps_runs_on_the_rolled_out_tree_and_says_so() {
+            // b fails to build: its pod never gets ready, the old pod serves.
+            let cl = git_cl_at('b', serving_status('a'));
+            let rollout = GitRollout {
+                template: Some(Tree {
+                    image: runtime('a'),
+                    ..tree('b')
+                }),
+                deadline_exceeded: true,
+                ..rollout('b', false, 1)
+            };
+
+            let status = leader_status(&cl, 'b', rollout);
+
+            assert_eq!(status.phase, Some(CodeLocationPhase::Ready));
+            assert_eq!(status.resolved_commit, Some(commit('a')));
+            assert_eq!(status.run_source, Some(tree('a').source));
+            assert_eq!(
+                available(&status),
+                (
+                    "True",
+                    Some(REASON_PROGRESS_DEADLINE),
+                    Some(
+                        "rollout of bbbbbbb (pinned) exceeded its progress deadline; \
+                         runs use aaaaaaa (pinned)"
+                    )
+                )
+            );
+        }
+
+        #[test]
+        fn rollout_completes_only_when_every_pod_runs_the_current_template() {
+            let deployment =
+                |replicas, generation, [observed, total, updated, ready, available]: [i32; 5]| {
+                    Deployment {
+                        metadata: ObjectMeta {
+                            generation: Some(generation),
+                            ..Default::default()
+                        },
+                        spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
+                            replicas: Some(replicas),
+                            ..Default::default()
+                        }),
+                        status: Some(DeploymentStatus {
+                            observed_generation: Some(observed.into()),
+                            replicas: Some(total),
+                            updated_replicas: Some(updated),
+                            ready_replicas: Some(ready),
+                            available_replicas: Some(available),
+                            ..Default::default()
+                        }),
+                    }
+                };
+            let cases = [
+                (
+                    "every pod updated and ready",
+                    deployment(2, 3, [3, 2, 2, 2, 2]),
+                    true,
+                ),
+                (
+                    "template not yet seen by the controller",
+                    deployment(2, 3, [2, 2, 2, 2, 2]),
+                    false,
+                ),
+                ("old pod left", deployment(2, 3, [3, 3, 2, 2, 2]), false),
+                (
+                    "new pod not created",
+                    deployment(2, 3, [3, 2, 1, 2, 2]),
+                    false,
+                ),
+                (
+                    "new pod not ready",
+                    deployment(2, 3, [3, 2, 2, 1, 1]),
+                    false,
+                ),
+                (
+                    "new pod not available",
+                    deployment(2, 3, [3, 2, 2, 2, 1]),
+                    false,
+                ),
+                ("scaled to zero", deployment(0, 3, [3, 0, 0, 0, 0]), false),
+            ];
+            for (case, d, complete) in cases {
+                assert_eq!(rollout_complete(&d), complete, "{case}");
+            }
+        }
+
+        #[test]
+        fn rollout_reads_the_tree_from_the_pod_template() {
+            let cl = git_cl_at('b', serving_status('a'));
+            let pieces = workspace::builder_pod_pieces(&WorkspaceSpec {
+                key: tree('b').key(),
+                volume: WorkspaceVolume::EmptyDir { size_limit: None },
+                runtime_image: runtime('b'),
+                git_url: URL.into(),
+                commit: commit('b'),
+                git_ref: None,
+                path: None,
+                secret_name: None,
+                deps: Default::default(),
+                keep_config_map: None,
+                keep_revisions: None,
+                min_tree_age: None,
+                extra_env: Vec::new(),
+            });
+            let mut d = build_git_deployment(
+                &cl,
+                &runtime('b'),
+                "rivers-code-location",
+                &Default::default(),
+                &Default::default(),
+                &pieces,
+                git_working_dir(None),
+            );
+            d.metadata.generation = Some(2);
+            d.status = Some(DeploymentStatus {
+                observed_generation: Some(2),
+                ready_replicas: Some(1),
+                conditions: Some(vec![k8s_openapi::api::apps::v1::DeploymentCondition {
+                    type_: "Progressing".into(),
+                    status: "False".into(),
+                    reason: Some("ProgressDeadlineExceeded".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+
+            let rollout = git_rollout(Some(&d));
+            assert_eq!(rollout.template, Some(tree('b')));
+            assert!(rollout.deadline_exceeded);
+
+            // Until the controller sees this template, the deadline is the
+            // previous rollout's.
+            d.status.as_mut().unwrap().observed_generation = Some(1);
+            assert!(!git_rollout(Some(&d)).deadline_exceeded);
+        }
+
+        #[test]
+        fn keep_set_holds_the_serving_tree_beside_the_target() {
+            let keep = workspace_keep_csv(&tree('b').key(), Some(&tree('a').key()), "x", &[]);
+
+            assert_eq!(keep, format!("{},{}", tree('a').key(), tree('b').key()));
+        }
+
+        #[tokio::test]
+        async fn leader_keeps_runs_on_the_rolled_out_tree_while_a_commit_rolls_out() {
+            let status = leader_pass(git_cl_at('b', serving_status('a')), mid_rollout()).await;
+
+            assert_eq!(status["phase"], "Ready");
+            assert_eq!(status["resolvedCommit"], commit('a'));
+            assert_eq!(status["resolvedImage"], runtime('a'));
+            assert_eq!(status["runSource"], run_source_json('a'));
+            let available = condition(&status, CONDITION_DEPLOYMENT_AVAILABLE);
+            assert_eq!(available["reason"], REASON_ROLLING_OUT, "{available}");
+            assert!(
+                available["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(&commit('b')[..7])),
+                "{available}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leader_moves_runs_to_the_new_tree_once_every_pod_runs_it() {
+            let status = leader_pass(git_cl_at('b', serving_status('a')), rolled_out()).await;
+
+            assert_eq!(status["phase"], "Ready");
+            assert_eq!(status["resolvedCommit"], commit('b'));
+            assert_eq!(status["resolvedImage"], runtime('b'));
+            assert_eq!(status["runSource"], run_source_json('b'));
+            assert_eq!(status["source"], format!("{} (pinned)", &commit('b')[..7]));
+            let available = condition(&status, CONDITION_DEPLOYMENT_AVAILABLE);
+            assert_eq!(available["reason"], REASON_MIN_REPLICAS, "{available}");
+        }
+
+        #[tokio::test]
+        async fn follower_publishes_nothing_new_after_the_leader_mid_rollout() {
+            let state = api_with(git_cl_at('b', serving_status('a')), mid_rollout());
+
+            let leader = pass(&state, LeaderGate::leading()).await;
+            assert_eq!(leader.unwrap()["resolvedCommit"], commit('a'));
+            // Same Deployment, the leader's status: a follower that disagreed
+            // would patch here, and the two would overwrite each other.
+            assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[tokio::test]
+        async fn image_mode_publishes_the_new_digest_mid_rollout_as_before() {
+            let image = |c: char| format!("ghcr.io/acme/pipeline@{}", digest(c));
+            let mut cl =
+                make_cl(json!({ "image": "ghcr.io/acme/pipeline", "digest": digest('b') }));
+            cl.status = Some(
+                serde_json::from_value(json!({ "phase": "Ready", "resolvedImage": image('a') }))
+                    .unwrap(),
+            );
+
+            let status = leader_pass(cl, mid_rollout()).await;
+
+            assert_eq!(status["phase"], "Ready");
+            assert_eq!(status["resolvedImage"], image('b'));
+            assert_eq!(status["source"], image('b'));
+            assert_eq!(status.get("runSource"), None, "{status}");
+            assert_eq!(
+                condition(&status, CONDITION_DEPLOYMENT_AVAILABLE)["reason"],
+                REASON_MIN_REPLICAS
+            );
         }
     }
 }

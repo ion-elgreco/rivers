@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{
+    Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
+};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
 };
@@ -16,6 +18,7 @@ use rivers_k8s::crd::code_location::CodeLocation;
 
 pub const COMPONENT_LABEL: &str = "code-location";
 pub const MANAGED_BY: &str = "rivers-operator";
+pub const MAIN_CONTAINER: &str = "code-location";
 
 /// Deterministic name for the owned Service — the registry surfaces this, so
 /// it must be predictable from the CR name alone.
@@ -116,7 +119,7 @@ pub fn build_deployment(
                     ),
                     image_pull_secrets: pull_secrets,
                     containers: vec![Container {
-                        name: "code-location".to_string(),
+                        name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_image.to_string()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
                         command: Some(vec!["rivers".to_string()]),
@@ -278,6 +281,16 @@ pub fn build_git_deployment(
                 match_labels: Some(lbls.clone()),
                 ..Default::default()
             },
+            // Old pods keep serving the rolled-out tree until their
+            // replacements are ready: the ready count never drops below
+            // spec.replicas, even when a new commit never builds.
+            strategy: Some(DeploymentStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateDeployment {
+                    max_unavailable: Some(IntOrString::Int(0)),
+                    max_surge: None,
+                }),
+            }),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(lbls.clone()),
@@ -294,7 +307,7 @@ pub fn build_git_deployment(
                     init_containers: Some(pieces.init_containers.clone()),
                     volumes: Some(pieces.volumes.clone()),
                     containers: vec![Container {
-                        name: "code-location".to_string(),
+                        name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_runtime_image.to_string()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
                         command: Some(vec![rivers_k8s::workspace::VENV_RIVERS_BIN.to_string()]),
@@ -895,6 +908,45 @@ mod tests {
             env["RIVERS_CODE_LOCATION_IMAGE"],
             "ghcr.io/rt@sha256:1a2b3c4dff"
         );
+    }
+
+    #[test]
+    fn git_deployment_takes_an_old_pod_down_only_after_its_replacement_is_ready() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let d = build_git_deployment(
+            &cl,
+            "ghcr.io/rt@sha256:1a2b3c4dff",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &git_pieces(&cl, shared_volume()),
+            git_working_dir(Some("analytics")),
+        );
+
+        // maxSurge stays the Kubernetes default (25%, at least one pod).
+        assert_eq!(
+            serde_json::to_value(&d.spec.unwrap().strategy).unwrap(),
+            json!({ "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } })
+        );
+    }
+
+    #[test]
+    fn image_deployment_keeps_the_default_strategy() {
+        let cl = make_cl(
+            json!({ "image": "ghcr.io/acme/pipeline", "tag": "v1.0.0" }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/acme/pipeline@sha256:abc",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+        );
+
+        assert_eq!(d.spec.unwrap().strategy, None);
     }
 
     #[test]
