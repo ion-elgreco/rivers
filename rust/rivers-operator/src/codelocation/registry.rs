@@ -709,7 +709,7 @@ mod tests {
             (
                 rivers_k8s::defaults::RUNTIME_IMAGE,
                 "ghcr.io/ion-elgreco/rivers-runtime",
-                Some("latest"),
+                Some(concat!(env!("CARGO_PKG_VERSION"), "-py3.12")),
                 None,
             ),
             (

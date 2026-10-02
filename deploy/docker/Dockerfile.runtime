@@ -1,14 +1,19 @@
 # rivers-runtime — base image for git-sourced CodeLocations (RFC-044).
 #
 # Carries python, uv, git, CA certs, the rivers CLI, and
-# rivers-workspace-sync. Published per Python version:
+# rivers-workspace-sync. Published per Python version for linux/amd64 and
+# linux/arm64 by the release-python workflow:
 #   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13
 #
-# Build context must contain the rivers wheel under wheels/ (CI drops the
-# release wheel there; `just k3d-runtime-image` stages a local build).
+# Build context must contain the rivers wheel under wheels/ (the release
+# stages the glibc wheel of the image's arch there; `just k8s-build` stages
+# a local build).
+#
 # Deliberately NOT distroless: git + uv are hard requirements and
-# rivers-workspace-sync is a shell script. Hardening = pinned minimal base,
-# non-root, no build toolchain, CVE scanning in CI.
+# rivers-workspace-sync is a shell script. Hardening: slim Debian base,
+# non-root user, no build toolchain. Not pinned: the python base tag and
+# uv:latest follow upstream at build time. CI does not scan the image for
+# CVEs.
 ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim-bookworm
 

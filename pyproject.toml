@@ -23,6 +23,7 @@ dev = [
     "grpcio>=1.82.1",
     "grpcio-tools>=1.82.1",
     "kr8s>=0.20",
+    "pyyaml>=6.0",
     "rumdl>=0.2.37",
     # Memory sampling for the comparison benchmark in bench/.
     "psutil>=7.0",
