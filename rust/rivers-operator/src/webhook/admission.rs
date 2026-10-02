@@ -16,16 +16,15 @@ use kube_client::Api;
 use kube_core::DynamicObject;
 use kube_core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview, Operation};
 use rivers_api::CodeLocationEntry;
-use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase};
+use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, CodeLocationSpec};
 use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
 use crate::codelocation::DirectoryState;
 
 /// Bundle of the kube/cache handles the admission handler reads from. The
-/// `code_locations` API is `Option` because tests don't have a kube `Client`
-/// and exercise only the cache-hit + immutability paths; production wiring
-/// always passes `Some`.
+/// `code_locations` API is `Option` so tests can run cache-only; production
+/// wiring always passes `Some`.
 #[derive(Clone)]
 pub(super) struct AdmissionDeps {
     pub directory: Arc<DirectoryState>,
@@ -116,7 +115,7 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
     };
 
     // Escape hatch: user pre-set image to a digest. Validate format and
-    // accept without consulting the CodeLocation — the user has explicitly
+    // accept without resolving from the CodeLocation — the user has explicitly
     // bypassed CL resolution. Identity stamping is skipped on this path:
     // `Run.codeLocationRef.identity` is observability-only metadata, and
     // the executor pod scopes its storage from the operator-injected
@@ -130,20 +129,14 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
                 run.spec.image
             ));
         }
-        // On this path the caller is its own authority for provenance too:
-        // the code-location pod (`K8sRunBackend`) dispatches runs with a
-        // pre-set digest AND stamps the source of its own tree. Validate
-        // shape, not origin.
-        if let Some(source) = &run.spec.source {
-            let commit = &source.git.commit;
-            if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return RunOutcome::Rejected(format!(
-                    "spec.source.git.commit '{commit}' is not a full 40-hex commit SHA"
-                ));
-            }
-            if source.git.url.is_empty() {
-                return RunOutcome::Rejected("spec.source.git.url is empty".into());
-            }
+        // The code-location pod (`K8sRunBackend`) dispatches runs with a
+        // pre-set digest AND the source of its own tree.
+        if let Some(source) = &run.spec.source
+            && let Err(message) =
+                check_self_stamped_source(source, ref_ns, ref_name, deps, &git_allowed_hosts())
+                    .await
+        {
+            return RunOutcome::Rejected(message);
         }
         return RunOutcome::AcceptedAsIs;
     }
@@ -217,6 +210,65 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
         identity: entry.identity,
         source,
     }
+}
+
+/// Escape-hatch provenance: commit, ref, path and dependencies are the
+/// caller's own (e.g. a pod still serving the previous commit), but the url
+/// and Secret must be the CodeLocation's — a fallback-mode run pod mounts
+/// that Secret and sends its credentials to that url.
+async fn check_self_stamped_source(
+    source: &RunSource,
+    namespace: &str,
+    name: &str,
+    deps: &AdmissionDeps,
+    allowed_hosts: &[String],
+) -> Result<(), String> {
+    let git = &source.git;
+    if git.commit.len() != 40 || !git.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "spec.source.git.commit '{}' is not a full 40-hex commit SHA",
+            git.commit
+        ));
+    }
+    if git.url.is_empty() {
+        return Err("spec.source.git.url is empty".into());
+    }
+    validate_git_url("spec.source.git.url", &git.url, allowed_hosts)?;
+
+    let spec = match lookup_spec_with_fallback(deps, namespace, name).await {
+        Ok(Some(spec)) => spec,
+        Ok(None) => {
+            return Err(format!(
+                "codeLocation '{name}' not found in namespace '{namespace}'"
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "live lookup of codeLocation '{namespace}/{name}' failed: {e}"
+            ));
+        }
+    };
+    let Some(cl_git) = &spec.git else {
+        return Err(format!(
+            "codeLocation '{namespace}/{name}' is not git-sourced; remove spec.source"
+        ));
+    };
+    if git.url != cl_git.url {
+        return Err(format!(
+            "spec.source.git.url does not match spec.git.url of codeLocation '{namespace}/{name}'"
+        ));
+    }
+    let cl_secret = cl_git.secret_ref.as_ref().map(|s| s.name.as_str());
+    if git.secret_name.as_deref() != cl_secret {
+        let show = |s: Option<&str>| s.map_or_else(|| "none".to_string(), |s| format!("'{s}'"));
+        return Err(format!(
+            "spec.source.git.secretName {} does not match spec.git.secretRef {} \
+             of codeLocation '{namespace}/{name}'",
+            show(git.secret_name.as_deref()),
+            show(cl_secret),
+        ));
+    }
+    Ok(())
 }
 
 fn check_run_update(req: &AdmissionRequest<Run>) -> RunOutcome {
@@ -376,18 +428,24 @@ fn validate_git_source(cl: &CodeLocation, allowed_hosts: &[String]) -> Result<()
         return Ok(());
     };
     git.r#ref.validate()?;
-    let url = url::Url::parse(&git.url)
-        .map_err(|e| format!("spec.git.url '{}' is not a valid url: {e}", git.url))?;
+    validate_git_url("spec.git.url", &git.url, allowed_hosts)
+}
+
+/// Supported scheme and the operator's host allowlist. `field` names the
+/// url in messages.
+fn validate_git_url(field: &str, raw: &str, allowed_hosts: &[String]) -> Result<(), String> {
+    let url =
+        url::Url::parse(raw).map_err(|e| format!("{field} '{raw}' is not a valid url: {e}"))?;
     match url.scheme() {
         "https" | "http" | "ssh" => {}
         other => {
             return Err(format!(
-                "spec.git.url scheme '{other}' is unsupported (use https:// or ssh://)"
+                "{field} scheme '{other}' is unsupported (use https:// or ssh://)"
             ));
         }
     }
     let Some(host) = url.host_str() else {
-        return Err(format!("spec.git.url '{}' has no host", git.url));
+        return Err(format!("{field} '{raw}' has no host"));
     };
     if !host_allowed(host, allowed_hosts) {
         return Err(format!(
@@ -451,11 +509,7 @@ fn is_uuid_v4(s: &str) -> bool {
     uuid.get_version_num() == 4
 }
 
-/// Cache lookup with one-shot live `GET` fallback. The live `GET` MUST be a
-/// quorum read against etcd — kube's default `GetParams` (no resource_version
-/// set) does exactly that, bypassing the API server's watch cache. A stale
-/// watch cache could otherwise mirror the same not-found the local reflector
-/// saw, defeating the fallback.
+/// Cache lookup with one-shot live `GET` fallback ([`live_get`]).
 async fn lookup_with_fallback(
     deps: &AdmissionDeps,
     namespace: &str,
@@ -464,18 +518,36 @@ async fn lookup_with_fallback(
     if let Some(entry) = deps.directory.lookup(namespace, name).await {
         return Ok(Some(entry));
     }
+    Ok(live_get(deps, name)
+        .await?
+        .as_ref()
+        .and_then(crate::codelocation::directory::project_entry))
+}
+
+/// The CodeLocation's spec: cache first, then a one-shot live `GET`
+/// ([`live_get`]).
+async fn lookup_spec_with_fallback(
+    deps: &AdmissionDeps,
+    namespace: &str,
+    name: &str,
+) -> anyhow::Result<Option<Arc<CodeLocationSpec>>> {
+    if let Some(spec) = deps.directory.lookup_spec(namespace, name).await {
+        return Ok(Some(spec));
+    }
+    Ok(live_get(deps, name).await?.map(|cl| Arc::new(cl.spec)))
+}
+
+/// The live `GET` MUST be a quorum read against etcd — kube's default
+/// `GetParams` (no resource_version set) does exactly that, bypassing the API
+/// server's watch cache. A stale watch cache could otherwise mirror the same
+/// not-found the local reflector saw, defeating the fallback.
+async fn live_get(deps: &AdmissionDeps, name: &str) -> anyhow::Result<Option<CodeLocation>> {
     let Some(api) = deps.code_locations.as_ref() else {
         return Ok(None);
     };
-    let cl = match api
-        .get_opt(name)
+    api.get_opt(name)
         .await
-        .map_err(|e| anyhow::Error::new(e).context("live GET on CodeLocation (quorum read)"))?
-    {
-        Some(cl) => cl,
-        None => return Ok(None),
-    };
-    Ok(crate::codelocation::directory::project_entry(&cl))
+        .map_err(|e| anyhow::Error::new(e).context("live GET on CodeLocation (quorum read)"))
 }
 
 #[cfg(test)]
@@ -571,7 +643,6 @@ pub(crate) fn cl_admission_request_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivers_k8s::crd::code_location::CodeLocationSpec;
     use rivers_k8s::crd::run::RunSpec;
 
     fn build_run(name: &str, image: &str) -> Run {
@@ -621,7 +692,12 @@ mod tests {
         entry.resolved_commit = commit.to_string();
         entry.resolved_ref = "refs/heads/main".to_string();
         state.upsert(entry).await;
-        let spec: CodeLocationSpec = serde_json::from_value(serde_json::json!({
+        state.upsert_spec(ns, name, Arc::new(git_spec())).await;
+        state
+    }
+
+    fn git_spec() -> CodeLocationSpec {
+        serde_json::from_value(serde_json::json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
                 "ref": { "branch": "main" },
@@ -631,9 +707,32 @@ mod tests {
             },
             "module": "analytics.pipeline",
         }))
-        .unwrap();
-        state.upsert_spec(ns, name, Arc::new(spec)).await;
+        .unwrap()
+    }
+
+    /// Only the cached spec of `team-data/analytics` — all the escape hatch reads.
+    async fn spec_directory(spec: serde_json::Value) -> Arc<DirectoryState> {
+        let state = Arc::new(DirectoryState::new());
+        let spec: CodeLocationSpec = serde_json::from_value(spec).unwrap();
         state
+            .upsert_spec("team-data", "analytics", Arc::new(spec))
+            .await;
+        state
+    }
+
+    /// Digest-pinned Run carrying its own `spec.source` (escape hatch).
+    fn self_stamped_run(source: RunSource) -> Run {
+        let mut run = build_run("analytics", &format!("ghcr.io/x@sha256:{}", "a".repeat(64)));
+        run.spec.source = Some(source);
+        run
+    }
+
+    async fn expect_rejected(run: &Run, deps: &AdmissionDeps) -> String {
+        let req = admission_request_create("uid-hatch", "team-data", run);
+        match mutate_run(&req, deps).await {
+            RunOutcome::Rejected(msg) => msg,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     fn expected_run_source() -> RunSource {
@@ -693,7 +792,7 @@ mod tests {
         // Daemon-dispatched runs pre-set a digest image AND their own
         // provenance — the daemon pins the commit its own code runs.
         let digest_image = format!("ghcr.io/x@sha256:{}", "a".repeat(64));
-        let state = Arc::new(DirectoryState::new());
+        let state = git_directory("team-data", "analytics", COMMIT).await;
         let mut run = build_run("analytics", &digest_image);
         run.spec.source = Some(expected_run_source());
         let req = admission_request_create("uid-git-4", "team-data", &run);
@@ -712,6 +811,180 @@ mod tests {
             mutate_run(&req, &AdmissionDeps::cache_only(state)).await,
             RunOutcome::Rejected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_other_repo_url() {
+        // The source url is where a fallback run pod sends the CL's
+        // credentials.
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let mut source = expected_run_source();
+        source.git.url = "https://attacker.example/acme/pipelines.git".to_string();
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(
+            msg.contains("spec.source.git.url does not match spec.git.url"),
+            "{msg}"
+        );
+        assert!(msg.contains("'team-data/analytics'"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_other_secret_name() {
+        // The source secretName is the Secret a fallback run pod mounts.
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let mut source = expected_run_source();
+        source.git.secret_name = Some("db-credentials".to_string());
+        let msg = expect_rejected(&self_stamped_run(source.clone()), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName 'db-credentials' does not match \
+                 spec.git.secretRef 'git-creds'"
+            ),
+            "{msg}"
+        );
+
+        source.git.secret_name = None;
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName none does not match spec.git.secretRef 'git-creds'"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_secret_when_codelocation_has_none() {
+        let deps = AdmissionDeps::cache_only(
+            spec_directory(serde_json::json!({
+                "git": {
+                    "url": "https://forge.example/acme/pipelines.git",
+                    "ref": { "branch": "main" },
+                },
+            }))
+            .await,
+        );
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName 'git-creds' does not match spec.git.secretRef none"
+            ),
+            "{msg}"
+        );
+
+        // Neither side naming a Secret is a match.
+        let mut source = expected_run_source();
+        source.git.secret_name = None;
+        let req =
+            admission_request_create("uid-hatch-nosecret", "team-data", &self_stamped_run(source));
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_host_outside_allowed_hosts() {
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let source = expected_run_source();
+        check_self_stamped_source(
+            &source,
+            "team-data",
+            "analytics",
+            &deps,
+            &["Forge.Example".to_string()],
+        )
+        .await
+        .unwrap();
+        let err = check_self_stamped_source(
+            &source,
+            "team-data",
+            "analytics",
+            &deps,
+            &["github.com".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("git host 'forge.example'"), "{err}");
+        assert!(err.contains("allowedHosts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_for_image_mode_codelocation() {
+        let deps = AdmissionDeps::cache_only(
+            spec_directory(serde_json::json!({
+                "image": "ghcr.io/acme/pipeline",
+                "tag": "v1",
+            }))
+            .await,
+        );
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert!(
+            msg.contains("codeLocation 'team-data/analytics' is not git-sourced"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_when_codelocation_missing() {
+        let deps = AdmissionDeps::cache_only(Arc::new(DirectoryState::new()));
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert_eq!(
+            msg,
+            "codeLocation 'analytics' not found in namespace 'team-data'"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_own_repo_at_another_commit_and_path() {
+        // A pod still serving the previous commit during a rollout stamps
+        // that commit; ref, path and dependencies follow the commit.
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let mut source = expected_run_source();
+        source.git.commit = "b".repeat(40);
+        source.git.r#ref = Some("refs/heads/release".to_string());
+        source.git.path = Some("legacy/analytics".to_string());
+        source.dependencies =
+            serde_json::from_value(serde_json::json!({ "mode": "none" })).unwrap();
+        let req =
+            admission_request_create("uid-hatch-other", "team-data", &self_stamped_run(source));
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_reads_codelocation_with_live_get_on_cache_miss() {
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        let api_state = Arc::new(std::sync::Mutex::new(MockApiState::default()));
+        api_state.lock().unwrap().code_locations.insert(
+            "analytics".to_string(),
+            CodeLocation::new("analytics", git_spec()),
+        );
+        let deps = AdmissionDeps {
+            directory: Arc::new(DirectoryState::new()),
+            code_locations: Some(Api::namespaced(mock_client(api_state.clone()), "team-data")),
+        };
+
+        let mut source = expected_run_source();
+        source.git.secret_name = Some("db-credentials".to_string());
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(msg.contains("'db-credentials'"), "{msg}");
+
+        let req = admission_request_create(
+            "uid-hatch-live",
+            "team-data",
+            &self_stamped_run(expected_run_source()),
+        );
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+
+        let gets: Vec<String> = api_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(
+            gets,
+            vec!["/apis/rivers.io/v1alpha1/namespaces/team-data/codelocations/analytics"; 2]
+        );
     }
 
     #[tokio::test]
