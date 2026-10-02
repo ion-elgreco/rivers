@@ -42,7 +42,8 @@ LABEL org.opencontainers.image.title="rivers-runtime" \
       org.opencontainers.image.revision="${RIVERS_REVISION}" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
-# Non-root by default; matches the fsGroup the chart sets on workspace pods.
+# Non-root by default. The operator sets this GID as fsGroup on git-mode pods
+# (rivers_k8s::workspace::RUNTIME_GID); change both together.
 RUN groupadd -g 65532 rivers && useradd -u 65532 -g 65532 -m rivers
 USER 65532:65532
 

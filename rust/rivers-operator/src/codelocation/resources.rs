@@ -290,6 +290,7 @@ pub fn build_git_deployment(
                             .unwrap_or_else(|| code_location_service_account.to_string()),
                     ),
                     image_pull_secrets: pull_secrets,
+                    security_context: Some(pieces.pod_security_context.clone()),
                     init_containers: Some(pieces.init_containers.clone()),
                     volumes: Some(pieces.volumes.clone()),
                     containers: vec![Container {
@@ -894,6 +895,38 @@ mod tests {
             env["RIVERS_CODE_LOCATION_IMAGE"],
             "ghcr.io/rt@sha256:1a2b3c4dff"
         );
+    }
+
+    #[test]
+    fn git_deployment_sets_the_runtime_fs_group() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let fallback = rivers_k8s::workspace::WorkspaceVolume::EmptyDir { size_limit: None };
+        for (shape, volume) in [("shared", shared_volume()), ("fallback", fallback)] {
+            let d = build_git_deployment(
+                &cl,
+                "ghcr.io/rt@sha256:1a2b3c4dff",
+                "rivers-code-location",
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &git_pieces(&cl, volume),
+                git_working_dir(Some("analytics")),
+            );
+            let pod = d.spec.unwrap().template.spec.unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&pod.security_context).unwrap(),
+                json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "{shape}"
+            );
+            let modes: Vec<_> = pod
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.name == "git-credentials")
+                .map(|v| v.secret.unwrap().default_mode)
+                .collect();
+            assert_eq!(modes, vec![Some(0o440)], "{shape}");
+        }
     }
 
     #[test]

@@ -87,6 +87,7 @@ pub fn build_executor_pod(
         spec: Some(PodSpec {
             service_account_name: Some(spec.service_account_name.clone()),
             restart_policy: Some("Never".to_string()),
+            security_context: pieces.as_ref().map(|p| p.pod_security_context.clone()),
             init_containers: pieces
                 .as_ref()
                 .filter(|p| !p.init_containers.is_empty())
@@ -369,10 +370,47 @@ mod tests {
     }
 
     #[test]
+    fn git_run_executor_pod_sets_the_runtime_fs_group() {
+        let mut run = git_run();
+        run.spec.source.as_mut().unwrap().git.secret_name = Some("git-creds".to_string());
+        for (shared_enabled, secret_modes) in [(true, vec![]), (false, vec![Some(0o440)])] {
+            let pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &[],
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig {
+                    shared_enabled,
+                    ..Default::default()
+                },
+            );
+            let pod_spec = pod.spec.unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&pod_spec.security_context).unwrap(),
+                serde_json::json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "shared_enabled={shared_enabled}"
+            );
+            let modes: Vec<_> = pod_spec
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.name == "git-credentials")
+                .map(|v| v.secret.unwrap().default_mode)
+                .collect();
+            assert_eq!(modes, secret_modes, "shared_enabled={shared_enabled}");
+        }
+    }
+
+    #[test]
     fn image_mode_executor_pod_untouched_by_workspace_wiring() {
         let run = test_run();
         let pod = build(&run, "p", "run-123", false, &[]);
         let pod_spec = pod.spec.unwrap();
+        assert!(pod_spec.security_context.is_none());
         assert!(pod_spec.init_containers.is_none());
         assert!(pod_spec.volumes.is_none());
         let c = &pod_spec.containers[0];

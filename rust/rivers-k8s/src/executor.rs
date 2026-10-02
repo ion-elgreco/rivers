@@ -251,6 +251,9 @@ fn build_job_inner(
                 spec: Some(PodSpec {
                     service_account_name: Some(config.service_account.clone()),
                     restart_policy: Some("Never".to_string()),
+                    security_context: workspace_pieces
+                        .as_ref()
+                        .map(|p| p.pod_security_context.clone()),
                     init_containers: workspace_pieces
                         .as_ref()
                         .filter(|p| !p.init_containers.is_empty())
@@ -464,9 +467,47 @@ mod tests {
     }
 
     #[test]
+    fn git_step_job_sets_the_runtime_fs_group() {
+        for (shape, volume, secret_modes) in [
+            (
+                "shared",
+                crate::workspace::WorkspaceVolume::SharedPvc {
+                    claim_name: "analytics-workspace".to_string(),
+                },
+                vec![],
+            ),
+            (
+                "fallback",
+                crate::workspace::WorkspaceVolume::EmptyDir { size_limit: None },
+                vec![Some(0o440)],
+            ),
+        ] {
+            let mut config = test_config();
+            config.workspace = Some(git_workspace(volume));
+            let job = build_step_job(&config, "parse_document");
+            let pod = job.spec.unwrap().template.spec.unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&pod.security_context).unwrap(),
+                serde_json::json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "{shape}"
+            );
+            let modes: Vec<_> = pod
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.name == "git-credentials")
+                .map(|v| v.secret.unwrap().default_mode)
+                .collect();
+            assert_eq!(modes, secret_modes, "{shape}");
+        }
+    }
+
+    #[test]
     fn image_mode_step_job_is_untouched_by_workspace_wiring() {
         let job = build_step_job(&test_config(), "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
+        assert!(pod.security_context.is_none());
         assert!(pod.init_containers.is_none());
         assert!(pod.volumes.is_none());
         let c = &pod.containers[0];

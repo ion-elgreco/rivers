@@ -25,8 +25,8 @@
 //!   the prune surface.
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMapKeySelector, Container, EnvVar, EnvVarSource, SecretVolumeSource,
-    SecurityContext, Volume, VolumeMount,
+    Capabilities, ConfigMapKeySelector, Container, EnvVar, EnvVarSource, PodSecurityContext,
+    SecretVolumeSource, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -45,6 +45,8 @@ pub const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
 pub const VENV_PATH: &str = "/workspace/venv";
 pub const SYNC_COMMAND: &str = "rivers-workspace-sync";
 pub const KEEP_CONFIG_MAP_KEY: &str = "keep";
+/// GID of the runtime image's `USER` (deploy/docker/Dockerfile.runtime).
+pub const RUNTIME_GID: i64 = 65532;
 
 /// `<commit[..12]>-<digest[..8]>`: the tree is keyed on *both* the code and
 /// the interpreter it was built against — a chart upgrade that moves the
@@ -113,6 +115,7 @@ pub struct WorkspacePodPieces {
     pub volumes: Vec<Volume>,
     pub main_mounts: Vec<VolumeMount>,
     pub main_env: Vec<EnvVar>,
+    pub pod_security_context: PodSecurityContext,
 }
 
 /// Pieces for the **code-location pod** — the one pod that materializes
@@ -123,6 +126,7 @@ pub fn builder_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
         volumes: volumes(spec, /* read_only_pvc */ false),
         main_mounts: vec![workspace_mount(spec, /* read_only */ false)],
         main_env: main_env(spec),
+        pod_security_context: pod_security_context(),
     }
 }
 
@@ -164,12 +168,14 @@ pub fn consumer_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
             volumes: volumes_without_creds(spec, /* read_only_pvc */ true),
             main_mounts: vec![workspace_mount(spec, /* read_only */ true)],
             main_env: main_env(spec),
+            pod_security_context: pod_security_context(),
         },
         WorkspaceVolume::EmptyDir { .. } => WorkspacePodPieces {
             init_containers: vec![sync_init_container(spec, SyncRole::Consumer)],
             volumes: volumes(spec, false),
             main_mounts: vec![workspace_mount(spec, false)],
             main_env: main_env(spec),
+            pod_security_context: pod_security_context(),
         },
     }
 }
@@ -289,6 +295,17 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
     }
 }
 
+/// The non-root sync container reads the root-owned Secret files, and writes
+/// the shared PVC where the storage driver applies fsGroup, through this group.
+/// `OnRootMismatch`: otherwise every pod start re-chowns every tree on the PVC.
+fn pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        fs_group: Some(RUNTIME_GID),
+        fs_group_change_policy: Some("OnRootMismatch".to_string()),
+        ..Default::default()
+    }
+}
+
 fn env_var(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -348,7 +365,7 @@ fn volumes(spec: &WorkspaceSpec, read_only_pvc: bool) -> Vec<Volume> {
             name: GIT_CREDS_VOLUME.to_string(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(secret.clone()),
-                default_mode: Some(0o400),
+                default_mode: Some(0o440),
                 ..Default::default()
             }),
             ..Default::default()
@@ -522,7 +539,7 @@ mod tests {
             serde_json::to_value(&pieces.volumes).unwrap(),
             json!([
                 { "name": "workspace", "persistentVolumeClaim": { "claimName": "analytics-workspace" } },
-                { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 256 } },
+                { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
             ])
         );
         assert_eq!(
@@ -557,7 +574,7 @@ mod tests {
             serde_json::to_value(&fb.volumes).unwrap(),
             json!([
                 { "name": "workspace", "emptyDir": { "sizeLimit": "2Gi" } },
-                { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 256 } },
+                { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
             ])
         );
         // No /workspaces root mount (nothing to prune), otherwise identical.
@@ -656,6 +673,22 @@ mod tests {
                 { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
             ])
         );
+    }
+
+    #[test]
+    fn every_pod_shape_sets_the_runtime_fs_group() {
+        for (shape, pieces) in [
+            ("builder shared", builder_pod_pieces(&spec(shared()))),
+            ("builder fallback", builder_pod_pieces(&spec(fallback()))),
+            ("consumer shared", consumer_pod_pieces(&spec(shared()))),
+            ("consumer fallback", consumer_pod_pieces(&spec(fallback()))),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&pieces.pod_security_context).unwrap(),
+                json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "{shape}"
+            );
+        }
     }
 
     #[test]
