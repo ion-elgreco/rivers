@@ -619,7 +619,6 @@ fn workspace_keep_csv(
     cl_name: &str,
     runs: &[rivers_k8s::crd::run::Run],
 ) -> String {
-    use rivers_k8s::crd::run::RunPhase;
     let mut keys = std::collections::BTreeSet::new();
     keys.insert(target_key.to_string());
     keys.extend(serving_key.map(str::to_string));
@@ -627,10 +626,11 @@ fn workspace_keep_csv(
         if run.spec.code_location_ref.name != cl_name {
             continue;
         }
-        let terminal = matches!(
-            run.status.as_ref().and_then(|s| s.phase.as_ref()),
-            Some(RunPhase::Succeeded) | Some(RunPhase::Failed) | Some(RunPhase::Cancelled)
-        );
+        let terminal = run
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_ref())
+            .is_some_and(|p| p.is_terminal());
         if terminal {
             continue;
         }
@@ -1513,6 +1513,7 @@ mod fastrand {
 mod tests {
     use super::*;
     use kube_client::api::ObjectMeta;
+    use rivers_k8s::crd::run::{Run, RunCrdStatus, RunPhase, RunSpec};
 
     fn make_cl(spec: serde_json::Value) -> CodeLocation {
         let parsed: CodeLocationSpec = serde_json::from_value(spec).unwrap();
@@ -1610,65 +1611,96 @@ mod tests {
         );
     }
 
+    const KEEP_SET_RUNTIME: &str =
+        "ghcr.io/rt@sha256:1a2b3c4d00000000000000000000000000000000000000000000000000000000";
+
+    fn source_at(commit_char: char) -> RunSource {
+        serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/r.git",
+                "commit": commit_char.to_string().repeat(40),
+            },
+            "runtimeImage": KEEP_SET_RUNTIME,
+        }))
+        .unwrap()
+    }
+
+    fn run_for(cl: &str, commit_char: char, phase: Option<RunPhase>) -> Run {
+        let spec: RunSpec = serde_json::from_value(serde_json::json!({
+            "codeLocationRef": { "name": cl },
+            "image": KEEP_SET_RUNTIME,
+            "target": "*",
+            "source": source_at(commit_char),
+        }))
+        .unwrap();
+        let mut run = Run::new(&format!("run-{commit_char}"), spec);
+        run.status = phase.map(|p| RunCrdStatus {
+            phase: Some(p),
+            ..Default::default()
+        });
+        run
+    }
+
     #[test]
     fn keep_set_holds_current_and_non_terminal_runs() {
-        use rivers_k8s::crd::run::{Run, RunCrdStatus, RunPhase, RunSpec};
-
-        const RUNTIME: &str =
-            "ghcr.io/rt@sha256:1a2b3c4d00000000000000000000000000000000000000000000000000000000";
-
-        fn source_at(commit_char: char) -> RunSource {
-            serde_json::from_value(serde_json::json!({
-                "git": {
-                    "url": "https://forge.example/r.git",
-                    "commit": commit_char.to_string().repeat(40),
-                },
-                "runtimeImage": RUNTIME,
-            }))
-            .unwrap()
-        }
-
-        fn run_for(cl: &str, commit_char: char, phase: Option<RunPhase>) -> Run {
-            let spec: RunSpec = serde_json::from_value(serde_json::json!({
-                "codeLocationRef": { "name": cl },
-                "image": RUNTIME,
-                "target": "*",
-                "source": source_at(commit_char),
-            }))
-            .unwrap();
-            let mut run = Run::new(&format!("run-{commit_char}"), spec);
-            run.status = phase.map(|p| RunCrdStatus {
-                phase: Some(p),
-                ..Default::default()
-            });
-            run
-        }
-
         let runs = vec![
             run_for("analytics", 'a', Some(RunPhase::Running)),
             run_for("analytics", 'b', Some(RunPhase::Pending)),
             run_for("analytics", 'c', Some(RunPhase::Cancelling)),
             run_for("analytics", 'd', Some(RunPhase::Succeeded)), // released
             run_for("analytics", 'e', Some(RunPhase::Failed)),    // released
+            run_for("analytics", 'g', Some(RunPhase::TimedOut)),  // released
             run_for("analytics", 'a', None),                      // no status yet == not terminal
             run_for("other", 'f', Some(RunPhase::Running)),       // different CL
         ];
 
         let keep = workspace_keep_csv("current-key", None, "analytics", &runs);
-        let entries: Vec<&str> = keep.split(',').collect();
-        assert!(entries.contains(&"current-key"));
+
         // a (Running + statusless dedup), b (Pending — queued runs hold
-        // their tree), c (Cancelling).
-        let a_key = source_at('a').workspace_key();
-        let b_key = source_at('b').workspace_key();
-        let c_key = source_at('c').workspace_key();
-        assert!(entries.contains(&a_key.as_str()), "{keep}");
-        assert!(entries.contains(&b_key.as_str()), "{keep}");
-        assert!(entries.contains(&c_key.as_str()), "{keep}");
-        // Terminal runs release; other CLs' runs are not ours.
-        assert_eq!(entries.len(), 4, "dedup + releases: {keep}");
-        let d_key = source_at('d').workspace_key();
-        assert!(!entries.contains(&d_key.as_str()));
+        // their tree), c (Cancelling). Terminal runs release; other CLs'
+        // runs are not ours.
+        assert_eq!(
+            keep,
+            format!(
+                "{},{},{},current-key",
+                source_at('a').workspace_key(),
+                source_at('b').workspace_key(),
+                source_at('c').workspace_key(),
+            )
+        );
+    }
+
+    #[test]
+    fn keep_set_holds_a_run_tree_until_the_run_is_terminal() {
+        let table = [
+            (None, true),
+            (Some(RunPhase::Pending), true),
+            (Some(RunPhase::Running), true),
+            (Some(RunPhase::Cancelling), true),
+            (Some(RunPhase::Succeeded), false),
+            (Some(RunPhase::Failed), false),
+            (Some(RunPhase::Cancelled), false),
+            (Some(RunPhase::TimedOut), false),
+        ];
+        let run_key = source_at('a').workspace_key();
+
+        for (phase, kept) in table {
+            assert_eq!(
+                kept,
+                !phase.as_ref().is_some_and(RunPhase::is_terminal),
+                "{phase:?}"
+            );
+            let run = run_for("analytics", 'a', phase.clone());
+
+            let keep = workspace_keep_csv("current-key", None, "analytics", &[run]);
+
+            let expected = if kept {
+                format!("{run_key},current-key")
+            } else {
+                "current-key".to_string()
+            };
+            assert_eq!(keep, expected, "{phase:?}");
+        }
     }
 
     #[test]
