@@ -1504,7 +1504,8 @@ impl FromPyObject<'_, '_> for PartitionMappingDict {
     type Error = PyErr;
 
     fn extract(ob: pyo3::Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
-        let dict = ob.cast::<PyDict>()?;
+        // Iterate a copy: `name` can run user code, and other threads can change the dict.
+        let dict = ob.cast::<PyDict>()?.copy()?;
         let mut map = HashMap::with_capacity(dict.len());
         for (key, value) in dict.iter() {
             let key_str = if let Ok(s) = key.extract::<String>() {
