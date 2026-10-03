@@ -123,6 +123,9 @@ operator:
     # Hosts spec.git.url may point at. Empty admits any host; the admission
     # webhook rejects CRs pointing elsewhere.
     allowedHosts: []
+    # Allow http:// git urls: code and git credentials travel unencrypted.
+    # Only for a git host on a trusted network.
+    allowInsecure: false
     # Ref-resolution timeout per poll.
     timeoutSeconds: 30
   registry:

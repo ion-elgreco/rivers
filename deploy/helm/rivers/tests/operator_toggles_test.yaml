@@ -66,3 +66,23 @@ tests:
             - name: webhook-cert
               mountPath: /etc/webhook-cert
               readOnly: true
+
+  - it: refuses http:// git urls by default
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_GIT_ALLOW_INSECURE
+            value: "false"
+
+  - it: allows http:// git urls when operator.git.allowInsecure is true
+    set:
+      operator.git.allowInsecure: true
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_GIT_ALLOW_INSECURE
+            value: "true"

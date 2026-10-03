@@ -43,6 +43,12 @@ pub enum GitError {
     /// here. Terminal until the CR changes.
     #[error("invalid git ref: {0}")]
     InvalidRef(String),
+    /// `spec.git.url` breaks the operator's url rules ([`check_url`]). The
+    /// admission webhook refuses such a url, so only a CodeLocation it did
+    /// not check gets here. Terminal until the CR or the operator's
+    /// settings change.
+    #[error("invalid git url: {0}")]
+    InvalidUrl(String),
     /// Credentials rejected (or unusable — e.g. an unreadable private key,
     /// or an ssh url without a user). Terminal until the Secret or the CR
     /// changes.
@@ -311,15 +317,95 @@ pub enum Transport {
 
 impl Transport {
     pub fn of(url: &str) -> Result<Self, GitError> {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| GitError::Malformed(format!("invalid git url '{url}': {e}")))?;
-        match parsed.scheme() {
+        Self::of_url(&parse_url(url)?)
+    }
+
+    fn of_url(url: &url::Url) -> Result<Self, GitError> {
+        match url.scheme() {
             "http" | "https" => Ok(Transport::Http),
             "ssh" => Ok(Transport::Ssh),
-            other => Err(GitError::Malformed(format!(
-                "unsupported git url scheme '{other}' (https:// or ssh://)"
+            other => Err(GitError::InvalidUrl(format!(
+                "unsupported scheme '{other}' — use https:// or ssh://"
             ))),
         }
+    }
+}
+
+/// The error leaves the url out: it may hold a password.
+fn parse_url(raw: &str) -> Result<url::Url, GitError> {
+    url::Url::parse(raw).map_err(|e| GitError::InvalidUrl(e.to_string()))
+}
+
+/// The rules for a git url; the admission webhook applies them too. The url
+/// is copied into pod env, Runs and the tree's `.git/config`, so a password
+/// belongs in the git Secret, not in it. `http://` sends the code and the
+/// Secret's credentials unencrypted, so it needs
+/// `operator.git.allowInsecure`. And git must connect to the host that the
+/// operator and the webhook read: curl reads the host after a `\`, where
+/// `url` ends it, and an ssh url must pass [`ssh::parse_ssh_url`].
+pub fn check_url(raw: &str, allow_insecure: bool) -> Result<Transport, GitError> {
+    let invalid = |problem: &str| -> Result<Transport, GitError> {
+        Err(GitError::InvalidUrl(problem.to_string()))
+    };
+    let url = parse_url(raw)?;
+    let transport = Transport::of_url(&url)?;
+    if url.password().is_some() {
+        return invalid(
+            "the url has a password — put the credentials in the git Secret (spec.git.secretRef)",
+        );
+    }
+    match transport {
+        Transport::Http if raw.contains('\\') => {
+            invalid("the url has a '\\', which git and the operator read differently — use '/'")
+        }
+        Transport::Http if url.scheme() == "http" && !allow_insecure => invalid(
+            "http:// sends the code and the git Secret's credentials unencrypted — use \
+             https://, or set operator.git.allowInsecure to true for a git host on a trusted \
+             network",
+        ),
+        Transport::Http => Ok(transport),
+        Transport::Ssh => ssh::parse_ssh_url(raw).map(|_| transport),
+    }
+}
+
+const ALLOW_INSECURE_ENV: &str = "RIVERS_GIT_ALLOW_INSECURE";
+const ALLOWED_HOSTS_ENV: &str = "RIVERS_GIT_ALLOWED_HOSTS";
+
+/// The chart's `operator.git` settings, via operator env.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitConfig {
+    /// `operator.git.allowInsecure`: `http://` urls are admitted and fetched.
+    pub allow_insecure: bool,
+    /// `operator.git.allowedHosts`: the hosts the admission webhook admits;
+    /// empty admits any host.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl GitConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let allow_insecure = match get(ALLOW_INSECURE_ENV).as_deref().map(str::trim) {
+            None | Some("" | "false" | "0") => false,
+            Some("true" | "1") => true,
+            Some(other) => anyhow::bail!(
+                "{ALLOW_INSECURE_ENV} (operator.git.allowInsecure): expected true or false, \
+                 got {other:?}"
+            ),
+        };
+        let allowed_hosts = get(ALLOWED_HOSTS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(String::from)
+            .collect();
+        Ok(Self {
+            allow_insecure,
+            allowed_hosts,
+        })
     }
 }
 
@@ -452,12 +538,14 @@ enum CacheEntry {
 pub struct GitResolver {
     http: reqwest::Client,
     timeout: std::time::Duration,
+    /// `operator.git.allowInsecure`: `http://` urls may be fetched.
+    allow_insecure: bool,
     fingerprints: std::hash::RandomState,
     cache: tokio::sync::Mutex<Cache>,
 }
 
 impl GitResolver {
-    pub fn new(timeout: std::time::Duration) -> Self {
+    pub fn new(timeout: std::time::Duration, allow_insecure: bool) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(super::USER_AGENT)
             .build()
@@ -465,6 +553,7 @@ impl GitResolver {
         Self {
             http,
             timeout,
+            allow_insecure,
             fingerprints: std::hash::RandomState::new(),
             cache: Default::default(),
         }
@@ -481,9 +570,7 @@ impl GitResolver {
         now: std::time::Instant,
     ) -> Result<ResolvedRef, GitFailure> {
         // Also for a pinned commit: the pods fetch it with this url.
-        if Transport::of(&req.url)? == Transport::Ssh {
-            ssh::parse_ssh_url(&req.url)?;
-        }
+        check_url(&req.url, self.allow_insecure)?;
         // The pods take a pinned commit as written, and the webhook may not
         // have checked this CR.
         req.r#ref.validate().map_err(GitError::InvalidRef)?;
@@ -723,10 +810,16 @@ mod resolver_tests {
         }
     }
 
+    /// A resolver that may fetch the `http://` urls of the test git servers
+    /// (`operator.git.allowInsecure`).
+    fn resolver() -> GitResolver {
+        GitResolver::new(TIMEOUT, true)
+    }
+
     #[tokio::test]
     async fn caches_branch_resolution_within_ttl() {
         let server = mock_git_server(1).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = request(
             format!("{}/acme/pipelines.git", server.uri()),
             fixtures::branch("main"),
@@ -742,7 +835,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn expired_ttl_refetches() {
         let server = mock_git_server(2).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let mut req = request(
             format!("{}/acme/pipelines.git", server.uri()),
             fixtures::branch("main"),
@@ -756,7 +849,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn immutable_tag_is_cached_past_ttl() {
         let server = mock_git_server(1).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let mut req = request(
             format!("{}/acme/pipelines.git", server.uri()),
             fixtures::tag("v1.0.0"),
@@ -772,7 +865,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn pinned_commit_never_touches_the_network() {
         let server = mock_git_server(0).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let pinned = rivers_k8s::crd::code_location::GitRef {
             commit: Some(fixtures::oid('9')),
             ..Default::default()
@@ -794,7 +887,7 @@ mod resolver_tests {
         };
         let req = request(format!("{}/acme/pipelines.git", server.uri()), pinned);
 
-        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        let failure = resolver().resolve(&req).await.unwrap_err();
         assert_eq!(
             failure.error.to_string(),
             format!(
@@ -810,7 +903,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn ssh_scheme_dispatches_through_russh() {
         let port = test_server::spawn_server(ServerBehaviour::default()).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = GitResolveRequest {
             url: format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git"),
             r#ref: fixtures::branch("main"),
@@ -831,7 +924,7 @@ mod resolver_tests {
         let (port, _) = test_server::spawn_stalled_host(StalledHost::Silent).await;
         let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
         let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
-        let resolver = GitResolver::new(Duration::from_secs(1));
+        let resolver = GitResolver::new(Duration::from_secs(1), false);
 
         let failure = tokio::time::timeout(Duration::from_secs(5), resolver.resolve(&req))
             .await
@@ -853,7 +946,7 @@ mod resolver_tests {
         let port = test_server::spawn_server(server).await;
         let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
         let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
-        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        let failure = resolver().resolve(&req).await.unwrap_err();
         (port, failure)
     }
 
@@ -905,7 +998,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn ssh_url_with_non_ssh_credentials_is_auth_failed() {
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = GitResolveRequest {
             url: "ssh://git@forge.example/r.git".to_string(),
             r#ref: fixtures::branch("main"),
@@ -951,7 +1044,7 @@ mod resolver_tests {
         let server = ServerBehaviour::default();
         let port = test_server::spawn_server(server.clone()).await;
         let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let cases = [
             ("passphrase-protected", test_server::PASSPHRASE_KEY),
             ("not a key", "not a private key\n"),
@@ -982,7 +1075,7 @@ mod resolver_tests {
     async fn an_unusable_known_hosts_fails_the_same_way_before_connecting() {
         let server = ServerBehaviour::default();
         let port = test_server::spawn_server(server.clone()).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let cases = [
             ("empty", String::new()),
             (
@@ -1018,7 +1111,7 @@ mod resolver_tests {
         let known_hosts = format!("forge.example {}", test_server::HOST_PUB);
         let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
 
-        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        let failure = resolver().resolve(&req).await.unwrap_err();
         assert_eq!(
             failure.error.to_string(),
             format!(
@@ -1064,7 +1157,7 @@ mod resolver_tests {
     async fn an_ssh_url_without_a_user_fails_before_connecting() {
         let (server, req) = userless_ssh_request(fixtures::branch("main")).await;
 
-        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        let failure = resolver().resolve(&req).await.unwrap_err();
         assert_userless_failure(&failure, &req);
         assert_eq!(server.connections(), 0);
     }
@@ -1078,20 +1171,92 @@ mod resolver_tests {
         };
         let (server, req) = userless_ssh_request(pinned).await;
 
-        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        let failure = resolver().resolve(&req).await.unwrap_err();
         assert_userless_failure(&failure, &req);
         assert_eq!(server.connections(), 0);
     }
 
     #[tokio::test]
-    async fn unsupported_scheme_is_malformed() {
-        let resolver = GitResolver::new(TIMEOUT);
+    async fn unsupported_scheme_is_an_invalid_url() {
+        let resolver = resolver();
         let req = request(
             "ftp://forge.example/r.git".to_string(),
             fixtures::branch("m"),
         );
         let err = resolver.resolve(&req).await.unwrap_err().error;
-        assert!(matches!(err, GitError::Malformed(_)), "{err}");
+        assert!(matches!(err, GitError::InvalidUrl(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "invalid git url: unsupported scheme 'ftp' — use https:// or ssh://"
+        );
+    }
+
+    /// `failure` is terminal, with `message`.
+    #[track_caller]
+    fn assert_invalid_url(failure: &GitFailure, message: &str) {
+        assert!(
+            matches!(failure.error, GitError::InvalidUrl(_)),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(failure.error.to_string(), message);
+        assert_eq!(failure.retry_after, None);
+    }
+
+    const HTTP_REFUSED: &str = "invalid git url: http:// sends the code and the git Secret's \
+        credentials unencrypted — use https://, or set operator.git.allowInsecure to true for a \
+        git host on a trusted network";
+
+    #[tokio::test]
+    async fn an_http_url_fails_for_good_without_a_fetch_unless_the_operator_allows_it() {
+        let server = mock_git_server(1).await;
+        let main = main_of(&server);
+        let pinned = request(
+            main.url.clone(),
+            GitRef {
+                commit: Some(fixtures::oid('9')),
+                ..Default::default()
+            },
+        );
+        let refusing = GitResolver::new(TIMEOUT, false);
+
+        // Also a pinned commit: the pods would fetch it over http.
+        for req in [&main, &pinned] {
+            let failure = refusing.resolve(req).await.unwrap_err();
+            assert_invalid_url(&failure, HTTP_REFUSED);
+        }
+        assert_eq!(polls(&server).await, 0);
+
+        // With operator.git.allowInsecure, the same url resolves.
+        let resolved = resolver().resolve(&main).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+    }
+
+    #[tokio::test]
+    async fn a_password_in_the_url_fails_for_good_without_a_fetch() {
+        let http = mock_git_server(0).await;
+        let ssh = ServerBehaviour::default();
+        let port = test_server::spawn_server(ssh.clone()).await;
+        let refused = "invalid git url: the url has a password — put the credentials in the git \
+                       Secret (spec.git.secretRef)";
+
+        let over_http = request(
+            format!(
+                "http://{USER}:{TOKEN}@{}/acme/pipelines.git",
+                http.address()
+            ),
+            fixtures::branch("main"),
+        );
+        let failure = resolver().resolve(&over_http).await.unwrap_err();
+        assert_invalid_url(&failure, refused);
+        assert_eq!(polls(&http).await, 0);
+
+        let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
+        let mut over_ssh = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+        over_ssh.url = format!("ssh://git:{TOKEN}@127.0.0.1:{port}/acme/pipelines.git");
+        let failure = resolver().resolve(&over_ssh).await.unwrap_err();
+        assert_invalid_url(&failure, refused);
+        assert_eq!(ssh.connections(), 0);
     }
 
     /// A git server answering ref polls with each response its number of
@@ -1131,7 +1296,7 @@ mod resolver_tests {
             (ResponseTemplate::new(503), None),
         ])
         .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = main_of(&server);
 
         let mut now = Instant::now();
@@ -1170,7 +1335,7 @@ mod resolver_tests {
             (adv_response(), None),
         ])
         .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = main_of(&server);
         let start = Instant::now();
         resolver.resolve_at(&req, start).await.unwrap();
@@ -1198,7 +1363,7 @@ mod resolver_tests {
     async fn concurrent_failures_of_a_ref_count_once() {
         let slow_503 = ResponseTemplate::new(503).set_delay(Duration::from_millis(200));
         let server = git_server(vec![(slow_503, None)]).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = main_of(&server);
         let now = Instant::now();
 
@@ -1225,7 +1390,7 @@ mod resolver_tests {
             (ResponseTemplate::new(503), None),
         ])
         .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let req = main_of(&server);
         let start = Instant::now();
         resolver.resolve_at(&req, start).await.unwrap_err();
@@ -1250,7 +1415,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn requests_carry_the_operator_user_agent() {
         let server = mock_git_server(1).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
 
         resolver.resolve(&main_of(&server)).await.unwrap();
 
@@ -1284,7 +1449,7 @@ mod resolver_tests {
             .respond_with(adv_response())
             .mount(&server)
             .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let main = main_of(&server);
         let other = request(
             format!("{}/acme/other.git", server.uri()),
@@ -1332,7 +1497,7 @@ mod resolver_tests {
             (adv_response(), None),
         ])
         .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let main = main_of(&server);
         let dev = request(main.url.clone(), fixtures::branch("dev"));
         let start = Instant::now();
@@ -1382,7 +1547,7 @@ mod resolver_tests {
         for (status, retry_after, shortest, longest) in cases {
             let response = ResponseTemplate::new(status).insert_header("retry-after", retry_after);
             let server = git_server(vec![(response, None)]).await;
-            let failure = GitResolver::new(TIMEOUT)
+            let failure = resolver()
                 .resolve_at(&main_of(&server), Instant::now())
                 .await
                 .unwrap_err();
@@ -1413,7 +1578,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn each_request_sets_how_old_a_cached_commit_may_be() {
         let server = git_server(vec![(adv_response(), Some(1)), (pushed_response(), None)]).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let daily = GitResolveRequest {
             cache_ttl: Duration::from_secs(24 * 3600),
             ..main_of(&server)
@@ -1477,7 +1642,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn a_resolution_is_shared_only_with_the_same_credentials() {
         let server = private_git_server().await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let url = format!("{}/acme/pipelines.git", server.uri());
         let release = |credentials| GitResolveRequest {
             credentials,
@@ -1529,7 +1694,7 @@ mod resolver_tests {
             (ResponseTemplate::new(401), None),
         ])
         .await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let every_minute = GitResolveRequest {
             credentials: basic(USER, TOKEN),
             cache_ttl: Duration::from_secs(60),
@@ -1563,7 +1728,7 @@ mod resolver_tests {
 
     #[test]
     fn a_cache_key_holds_no_secret() {
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let key = |credentials| {
             let req = GitResolveRequest {
                 credentials,
@@ -1637,7 +1802,7 @@ mod resolver_tests {
     #[tokio::test]
     async fn an_insert_drops_the_refs_no_request_used_for_a_day() {
         let server = git_server(vec![(adv_response(), None)]).await;
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let hour = Duration::from_secs(3600);
         let daily = |git_ref| GitResolveRequest {
             cache_ttl: 24 * hour,
@@ -1686,7 +1851,7 @@ mod resolver_tests {
             servers.push(git_server(vec![(throttled, Some(1)), (adv_response(), None)]).await);
         }
         let host = |server: &MockServer| server.address().to_string();
-        let resolver = GitResolver::new(TIMEOUT);
+        let resolver = resolver();
         let start = Instant::now();
         for server in &servers {
             resolver
@@ -1907,5 +2072,47 @@ mod tests {
             parse_advertisement(&v),
             Err(GitError::Malformed(_))
         ));
+    }
+
+    fn git_config(vars: &[(&str, &str)]) -> anyhow::Result<GitConfig> {
+        GitConfig::from_lookup(&|name| {
+            vars.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn git_config_reads_the_charts_operator_git_settings() {
+        assert_eq!(git_config(&[]).unwrap(), GitConfig::default());
+        assert_eq!(
+            git_config(&[
+                ("RIVERS_GIT_ALLOW_INSECURE", "true"),
+                ("RIVERS_GIT_ALLOWED_HOSTS", "gitea.internal, github.com,"),
+            ])
+            .unwrap(),
+            GitConfig {
+                allow_insecure: true,
+                allowed_hosts: vec!["gitea.internal".to_string(), "github.com".to_string()],
+            }
+        );
+        for (value, allow_insecure) in [("false", false), ("", false), ("1", true), ("0", false)] {
+            let config = git_config(&[("RIVERS_GIT_ALLOW_INSECURE", value)]).unwrap();
+            assert_eq!(config.allow_insecure, allow_insecure, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn git_config_refuses_an_allow_insecure_it_cannot_read() {
+        for value in ["yes", "on", "2", "ture"] {
+            let err = git_config(&[("RIVERS_GIT_ALLOW_INSECURE", value)]).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "RIVERS_GIT_ALLOW_INSECURE (operator.git.allowInsecure): expected true or \
+                     false, got {value:?}"
+                )
+            );
+        }
     }
 }

@@ -65,9 +65,14 @@ pub(crate) async fn fetch_advertisement_with_cap(
     timeout: Duration,
     cap: usize,
 ) -> Result<Vec<u8>, GitError> {
+    // Credentials come from the git Secret only, as in the pods; the url's
+    // user would go out as a second `Authorization` header.
+    let mut repo = super::parse_url(repo_url)?;
+    let _ = repo.set_username("");
+    let _ = repo.set_password(None);
     let url = format!(
         "{}/info/refs?service=git-upload-pack",
-        repo_url.trim_end_matches('/')
+        repo.as_str().trim_end_matches('/')
     );
     let mut request = client.get(&url).timeout(timeout);
     if let GitAuth::Basic { username, password } = auth {
@@ -268,6 +273,79 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, GitError::Unreachable(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn error_messages_leave_out_the_urls_user_and_password() {
+        for (status, error) in [
+            (
+                403,
+                "git authentication failed: HTTP 403 Forbidden from {url}",
+            ),
+            (
+                404,
+                "ref not found: repository not found at {url} (HTTP 404)",
+            ),
+            (
+                503,
+                "git host unreachable: HTTP 503 Service Unavailable from {url}",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            for userinfo in ["bot@", "bot:ghp_S3cr3t@"] {
+                let repo = format!("http://{userinfo}{}/r.git", server.address());
+                let err = fetch_advertisement(&client(), &repo, &GitAuth::Anonymous, TIMEOUT)
+                    .await
+                    .unwrap_err();
+
+                let url = format!(
+                    "http://{}/r.git/info/refs?service=git-upload-pack",
+                    server.address()
+                );
+                assert_eq!(err.to_string(), error.replace("{url}", &url), "{repo}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_secrets_credentials_are_sent_never_the_urls_user() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(advertisement_response())
+            .mount(&server)
+            .await;
+        let repo = format!("http://bot@{}/r.git", server.address());
+        let secret = GitAuth::Basic {
+            username: "ci-bot".to_string(),
+            password: "ghp_S3cr3t".to_string(),
+        };
+        let from_secret = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("ci-bot:ghp_S3cr3t")
+        );
+
+        for (case, auth, sent) in [
+            ("no Secret", GitAuth::Anonymous, vec![]),
+            ("a Secret", secret, vec![from_secret]),
+        ] {
+            fetch_advertisement(&client(), &repo, &auth, TIMEOUT)
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let authorization: Vec<&str> = requests
+                .last()
+                .unwrap()
+                .headers
+                .get_all("authorization")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            assert_eq!(authorization, sent, "{case}");
+        }
     }
 
     #[tokio::test]

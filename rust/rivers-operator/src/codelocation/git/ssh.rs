@@ -55,27 +55,46 @@ pub struct SshTarget {
     pub repo_path: String,
 }
 
-/// A url without a user is an auth failure, not a default: the pods' ssh
-/// would log in as their own account, not as the user resolved with here.
+/// `raw` as git's ssh transport reads it (connect.c `parse_connect_url`):
+/// git percent-decodes the url, the host part runs to the first `/`, and
+/// ssh takes the user from it up to the last `@`. A url that `url` reads
+/// with another host is refused, so the host the webhook allows is the one
+/// the pods connect to. A url without a user is an auth failure, not a
+/// default: the pods' ssh would log in as their own account, not as the
+/// user resolved with here.
 pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
-    let url = url::Url::parse(raw)
-        .map_err(|e| GitError::Malformed(format!("invalid ssh url '{raw}': {e}")))?;
+    let invalid = |problem: &str| GitError::InvalidUrl(format!("the ssh url {problem}"));
+    let url = super::parse_url(raw)?;
     if url.scheme() != "ssh" {
-        return Err(GitError::Malformed(format!(
-            "'{raw}' is not an ssh:// url (scp-style 'git@host:path' is not supported)"
-        )));
+        return Err(GitError::InvalidUrl(
+            "not an ssh:// url (scp-style 'git@host:path' is not supported)".to_string(),
+        ));
+    }
+    let after_scheme = raw.split_once("://").map_or("", |(_, rest)| rest);
+    let (authority, path_text) =
+        after_scheme.split_at(after_scheme.find('/').unwrap_or(after_scheme.len()));
+    if authority.contains(['?', '#']) {
+        return Err(invalid(
+            "has '?' or '#' before its path, which git reads as part of the host",
+        ));
+    }
+    if git_url_decode(authority).contains(&b'/') {
+        return Err(invalid(
+            "has an escaped '/' before its path, where git ends the host",
+        ));
     }
     let host = match url.host() {
         Some(url::Host::Ipv6(address)) => address.to_string(),
         Some(host) => host.to_string(),
-        None => return Err(GitError::Malformed(format!("'{raw}' has no host"))),
+        None => return Err(invalid("has no host")),
     };
-    // Also refuses `?` or `#` before the first `/`: `url` ends the host
-    // there, git does not.
+    if host.contains('%') {
+        return Err(invalid(
+            "has a '%' escape in its host — write the host as is",
+        ));
+    }
     if url.path().is_empty() || url.path() == "/" {
-        return Err(GitError::Malformed(format!(
-            "'{raw}' has no repository path"
-        )));
+        return Err(invalid("has no repository path"));
     }
     if url.username().is_empty() {
         return Err(GitError::AuthFailed(format!(
@@ -83,23 +102,23 @@ pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
             with_git_user(&url)
         )));
     }
+    let user = String::from_utf8(git_url_decode(url.username()))
+        .map_err(|_| invalid("has a user that is not UTF-8 once percent-decoded"))?;
     Ok(SshTarget {
-        user: url.username().to_string(),
+        user,
         host,
         port: url.port().unwrap_or(22),
-        repo_path: upload_pack_path(raw)?,
+        repo_path: upload_pack_path(path_text)?,
     })
 }
 
 /// The path git's ssh transport asks `git-upload-pack` for (connect.c
-/// `parse_connect_url`): the url text from the first `/` after the host,
+/// `parse_connect_url`): `text`, the url from the first `/` after the host,
 /// percent-decoded, without the `/` before a `~` — `~user/…` and `~/…` are
 /// relative to a home directory on the host.
-fn upload_pack_path(raw: &str) -> Result<String, GitError> {
-    let after_scheme = raw.split_once("://").map_or("", |(_, rest)| rest);
-    let text = after_scheme.find('/').map_or("", |i| &after_scheme[i..]);
+fn upload_pack_path(text: &str) -> Result<String, GitError> {
     let path = String::from_utf8(git_url_decode(text)).map_err(|_| {
-        GitError::Malformed(format!(
+        GitError::InvalidUrl(format!(
             "the repository path '{text}' is not UTF-8 once percent-decoded"
         ))
     })?;
@@ -1460,26 +1479,52 @@ mod tests {
     }
 
     #[test]
-    fn a_path_that_is_not_utf8_once_decoded_is_malformed() {
+    fn a_path_that_is_not_utf8_once_decoded_is_an_invalid_url() {
         let err = parse_ssh_url("ssh://git@host/%FF.git").unwrap_err();
         assert!(
-            matches!(err, GitError::Malformed(ref m)
+            matches!(err, GitError::InvalidUrl(ref m)
                 if m == "the repository path '/%FF.git' is not UTF-8 once percent-decoded"),
             "{err:?}"
         );
     }
 
     #[test]
-    fn a_query_or_fragment_before_the_path_is_refused() {
-        // git's host runs up to the first `/`, so ssh would log in to
-        // `evil`; `url` ends the host at `?`/`#` and sees `host`.
-        for url in ["ssh://git@host#@evil/r.git", "ssh://git@host?@evil/r.git"] {
+    fn a_url_git_reads_with_another_host_is_refused() {
+        // git percent-decodes the url and its host runs up to the first `/`;
+        // ssh takes the user up to the last `@`. So ssh would connect to
+        // `evil` (or, last, to `host`) where `url` sees another host.
+        let fragment = "the ssh url has '?' or '#' before its path, which git reads as part of \
+                        the host";
+        let cases = [
+            ("ssh://git@host#@evil/r.git", fragment),
+            ("ssh://git@host?@evil/r.git", fragment),
+            (
+                "ssh://evil%2F@host/r.git",
+                "the ssh url has an escaped '/' before its path, where git ends the host",
+            ),
+            (
+                "ssh://git@h%6Fst/r.git",
+                "the ssh url has a '%' escape in its host — write the host as is",
+            ),
+        ];
+        for (url, problem) in cases {
             let err = parse_ssh_url(url).unwrap_err();
             assert!(
-                matches!(err, GitError::Malformed(ref m)
-                    if *m == format!("'{url}' has no repository path")),
-                "{err:?}"
+                matches!(err, GitError::InvalidUrl(ref m) if m == problem),
+                "{url}: {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_user_is_percent_decoded_as_git_does() {
+        // What git 2.49 hands ssh: `deploy@host`, `git@x@host`.
+        for (url, user) in [
+            ("ssh://d%65ploy@host/r.git", "deploy"),
+            ("ssh://git%40x@host/r.git", "git@x"),
+            ("ssh://git@host/r.git", "git"),
+        ] {
+            assert_eq!(parse_ssh_url(url).unwrap().user, user, "{url}");
         }
     }
 

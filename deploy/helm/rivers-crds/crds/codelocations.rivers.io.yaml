@@ -248,7 +248,9 @@ spec:
                   url:
                     description: |-
                       `https://host/org/repo.git` or `ssh://git@host/org/repo.git`. An
-                      `ssh://` url must name the user (`git` on most git hosts).
+                      `ssh://` url must name the user (`git` on most git hosts). No
+                      password in the url: credentials go in the `secretRef` Secret.
+                      `http://` only if the operator allows it (`operator.git.allowInsecure`).
                     type: string
                   workspaceSize:
                     description: |-

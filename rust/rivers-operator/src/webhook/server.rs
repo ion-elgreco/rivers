@@ -36,6 +36,7 @@ use kube_core::admission::AdmissionReview;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
 
+use crate::codelocation::git::GitConfig;
 use crate::codelocation::{DirectoryState, ImageRef};
 use crate::webhook::admission::{
     AdmissionDeps, handle_codelocation_admission, handle_run_admission,
@@ -84,6 +85,7 @@ struct WebhookState {
 /// from `cert_path` / `key_path` (typically a Secret mounted by the Helm
 /// chart), and a background task polls those paths every
 /// [`CERT_RELOAD_INTERVAL`] to pick up cert-manager rotations in-process.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: SocketAddr,
     cert_path: PathBuf,
@@ -91,6 +93,7 @@ pub async fn serve(
     directory: Arc<DirectoryState>,
     code_locations: Api<CodeLocation>,
     runtime_image: ImageRef,
+    git: GitConfig,
     synced: Synced,
 ) -> Result<()> {
     let state = WebhookState {
@@ -98,6 +101,7 @@ pub async fn serve(
             directory,
             code_locations: Some(code_locations),
             runtime_image,
+            git,
         },
         synced,
     };
@@ -174,10 +178,10 @@ async fn mutate_run_handler(
 }
 
 async fn mutate_codelocation_handler(
-    State(_state): State<WebhookState>,
+    State(state): State<WebhookState>,
     Json(review): Json<AdmissionReview<CodeLocation>>,
 ) -> impl IntoResponse {
-    let response = handle_codelocation_admission(review).await;
+    let response = handle_codelocation_admission(review, &state.deps.git).await;
     (StatusCode::OK, Json(response))
 }
 

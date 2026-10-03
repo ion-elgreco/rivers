@@ -82,6 +82,8 @@ spec:
               value: {{ include "rivers.runtimeImage" . | quote }}
             - name: RIVERS_GIT_TIMEOUT_SECONDS
               value: {{ .Values.operator.git.timeoutSeconds | quote }}
+            - name: RIVERS_GIT_ALLOW_INSECURE
+              value: {{ .Values.operator.git.allowInsecure | quote }}
             {{- with .Values.codeLocation.workspace }}
             - name: RIVERS_WORKSPACE_SHARED_ENABLED
               value: {{ .shared.enabled | quote }}

@@ -39,6 +39,7 @@ pub const REASON_COMMIT_RESOLVED: &str = "CommitResolved";
 pub const REASON_COMMIT_PINNED: &str = "CommitPinned";
 pub const REASON_REF_NOT_FOUND: &str = "RefNotFound";
 pub const REASON_INVALID_REF: &str = "InvalidRef";
+pub const REASON_INVALID_URL: &str = "InvalidUrl";
 pub const REASON_GIT_AUTH_FAILED: &str = "GitAuthFailed";
 pub const REASON_GIT_UNREACHABLE: &str = "GitUnreachable";
 pub const REASON_GIT_RATE_LIMITED: &str = "GitRateLimited";
@@ -162,7 +163,9 @@ pub struct CodeLocationSpec {
 #[serde(rename_all = "camelCase")]
 pub struct GitSource {
     /// `https://host/org/repo.git` or `ssh://git@host/org/repo.git`. An
-    /// `ssh://` url must name the user (`git` on most git hosts).
+    /// `ssh://` url must name the user (`git` on most git hosts). No
+    /// password in the url: credentials go in the `secretRef` Secret.
+    /// `http://` only if the operator allows it (`operator.git.allowInsecure`).
     pub url: String,
 
     /// Which revision to pin. Exactly one field set.

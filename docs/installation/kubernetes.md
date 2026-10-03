@@ -228,6 +228,21 @@ key types that `known_hosts` lists for it. If `secretRef` names a Secret
 that does not exist, or that the operator may not read, the CodeLocation
 fails with reason `GitAuthFailed`.
 
+**Url rules**: put credentials only in the Secret. The url goes into the
+pods' environment, into each run's `spec.source` and into the tree's
+`.git/config`, so the webhook rejects a url with a password
+(`https://bot:TOKEN@…`). A user alone (`https://bot@…`, `ssh://git@…`) is
+fine. The webhook rejects `http://` urls unless `operator.git.allowInsecure`
+is `true`: over http, the code and the Secret's credentials are not
+encrypted, so enable it only for a git host on a trusted network. The
+webhook also rejects a url that sends git to another host than the one the
+url seems to name: a `\` in an `https://` or `http://` url, or, in an
+`ssh://` url, `?`, `#` or `%2F` before the path or a `%` escape in the
+host. The same rules apply to `spec.source.git.url` of a `Run` that you
+create with your own `spec.source`. A CodeLocation that has such a url all
+the same (for example, one created before these checks) fails with reason
+`InvalidUrl`, and the operator does not fetch from its url.
+
 **Shared workspace** (recommended where you have RWX storage): set
 `codeLocation.workspace.shared.enabled=true` and the code+venv is built
 once on a per-CL PVC, then mounted read-only by every run and step pod —
@@ -311,11 +326,11 @@ accordingly. The operator's requests to git hosts and registries carry
 `User-Agent: rivers-operator/<version>`, for firewalls that filter on it.
 
 **When things fail**, `kubectl describe rcl analytics` carries the
-answer: `RefNotFound` / `InvalidRef` / `GitAuthFailed` / `GitHostKeyRejected` /
-`GitMalformedResponse` on the `SourceResolved` condition for resolution
-problems, and a failed install surfaces `uv`'s error tail in
-`status.message`. A resolution problem sets the phase to `Failed`, and
-new runs are rejected until you fix it. A git host that does not answer
+answer: `RefNotFound` / `InvalidRef` / `InvalidUrl` / `GitAuthFailed` /
+`GitHostKeyRejected` / `GitMalformedResponse` on the `SourceResolved`
+condition for resolution problems, and a failed install surfaces `uv`'s
+error tail in `status.message`. A resolution problem sets the phase to
+`Failed`, and new runs are rejected until you fix it. A git host that does not answer
 (connection error, HTTP 5xx, or no complete answer within
 `operator.git.timeoutSeconds`, 30 seconds by default) does not take the
 CodeLocation down: it stays `Ready` on the commit it serves, with
@@ -350,6 +365,11 @@ operator:
   # registries (e.g. k3d's local registry); CodeLocations against an
   # HTTP registry must otherwise pre-set spec.digest.
   allowInsecureRegistry: false
+  git:
+    # In production, leave false. http:// git urls send the code and the
+    # git credentials unencrypted; enable only for a git host on a trusted
+    # network.
+    allowInsecure: false
 
   webhook:
     # selfSigned (default): chart generates a self-signed CA + serving

@@ -29,9 +29,9 @@ use rivers_k8s::crd::code_location::{
     IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
     REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
     REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED,
-    REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
-    REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR,
-    REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
+    REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_INVALID_URL, REASON_MIN_REPLICAS,
+    REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED,
+    REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
 };
 
 use super::git::{self, GitCredentials, GitResolveRequest};
@@ -803,6 +803,7 @@ fn git_error_reason_retry(err: &git::GitError) -> (&'static str, Duration) {
     match err {
         git::GitError::RefNotFound(_) => (REASON_REF_NOT_FOUND, TERMINAL_RETRY),
         git::GitError::InvalidRef(_) => (REASON_INVALID_REF, TERMINAL_RETRY),
+        git::GitError::InvalidUrl(_) => (REASON_INVALID_URL, TERMINAL_RETRY),
         git::GitError::AuthFailed(_) => (REASON_GIT_AUTH_FAILED, TERMINAL_RETRY),
         git::GitError::HostKeyRejected(_) | git::GitError::KnownHostsUnavailable(_) => {
             (REASON_GIT_HOST_KEY_REJECTED, TERMINAL_RETRY)
@@ -1847,6 +1848,11 @@ mod tests {
                 TERMINAL_RETRY,
             ),
             (
+                GitError::InvalidUrl("x".into()),
+                REASON_INVALID_URL,
+                TERMINAL_RETRY,
+            ),
+            (
                 GitError::AuthFailed("x".into()),
                 REASON_GIT_AUTH_FAILED,
                 TERMINAL_RETRY,
@@ -1920,7 +1926,7 @@ mod tests {
                 client: mock_client(Arc::new(std::sync::Mutex::new(MockApiState::default()))),
                 namespace: "y".into(),
                 registry: Arc::new(RegistryClient::with_insecure(true)),
-                git: Arc::new(git::GitResolver::new(Duration::from_secs(5))),
+                git: Arc::new(git::GitResolver::new(Duration::from_secs(5), false)),
                 runtime_image: runtime_image.parse().unwrap(),
                 leader: Arc::new(LeaderGate::leading()),
                 code_location_service_account: "rivers-code-location".into(),
@@ -2497,8 +2503,10 @@ mod tests {
             state
         }
 
+        /// A resolver that may fetch the `http://` urls of the test git hosts
+        /// (`operator.git.allowInsecure`).
         fn resolver() -> Arc<git::GitResolver> {
-            Arc::new(git::GitResolver::new(Duration::from_secs(5)))
+            Arc::new(git::GitResolver::new(Duration::from_secs(5), true))
         }
 
         /// One reconcile pass over the stored CL, resolving refs with `git`;
@@ -3549,6 +3557,49 @@ mod tests {
                 )]
             );
             assert_eq!(requeue, Action::requeue(TERMINAL_RETRY));
+        }
+
+        #[tokio::test]
+        async fn an_http_code_location_fails_without_a_request_unless_the_operator_allows_it() {
+            // Created before the webhook refused http://, or with no webhook.
+            let forge = forge(vec![advertisement()]).await;
+            let state = api_with(branch_cl(&forge), rolled_out());
+            let refusing = Arc::new(git::GitResolver::new(Duration::from_secs(5), false));
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &refusing).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            let error = "invalid git url: http:// sends the code and the git Secret's \
+                         credentials unencrypted — use https://, or set \
+                         operator.git.allowInsecure to true for a git host on a trusted network";
+            assert_eq!(status["phase"], "Failed", "{status}");
+            assert_eq!(status["message"], error);
+            assert_eq!(
+                source_resolved(&status),
+                ("False", REASON_INVALID_URL, error)
+            );
+            assert_eq!(forge.received_requests().await.unwrap().len(), 0);
+            let writes: Vec<_> = requests
+                .iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| (r.method.as_str(), r.path.as_str()))
+                .collect();
+            assert_eq!(
+                writes,
+                [(
+                    "PATCH",
+                    "/apis/rivers.io/v1alpha1/namespaces/y/codelocations/x/status"
+                )]
+            );
+            assert_eq!(requeue, Action::requeue(TERMINAL_RETRY));
+
+            // With operator.git.allowInsecure, the same code location rolls out.
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+            assert_eq!(status["resolvedCommit"], commit('a'), "{status}");
+            assert_eq!(forge.received_requests().await.unwrap().len(), 1);
         }
 
         #[tokio::test]

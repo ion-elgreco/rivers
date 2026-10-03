@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let workspace_cfg = codelocation::WorkspaceConfig::from_env()?;
+    let git_cfg = codelocation::git::GitConfig::from_env()?;
 
     let client = Client::try_default().await?;
     let namespace = rivers_k8s::env::detect_namespace();
@@ -115,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
             ALLOW_INSECURE_REGISTRY_ENV
         );
     }
+    if git_cfg.allow_insecure {
+        tracing::warn!("operator.git.allowInsecure is set; http:// git urls are allowed");
+    }
 
     let git_timeout = std::env::var(GIT_TIMEOUT_SECONDS_ENV)
         .ok()
@@ -137,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         git: Arc::new(codelocation::git::GitResolver::new(
             std::time::Duration::from_secs(git_timeout),
+            git_cfg.allow_insecure,
         )),
         runtime_image: runtime_image.clone(),
         workspace: workspace_cfg,
@@ -164,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         namespace.clone(),
         directory_state,
         runtime_image,
+        git_cfg,
         synced,
     )
     .await?;
@@ -262,6 +268,7 @@ async fn spawn_webhook_server(
     namespace: String,
     directory: Arc<codelocation::DirectoryState>,
     runtime_image: codelocation::ImageRef,
+    git: codelocation::git::GitConfig,
     synced: webhook::Synced,
 ) -> anyhow::Result<()> {
     if std::env::var(WEBHOOK_DISABLED_ENV).as_deref() == Ok("1") {
@@ -295,6 +302,7 @@ async fn spawn_webhook_server(
             server_directory,
             code_locations_api,
             runtime_image,
+            git,
             synced,
         )
         .await
