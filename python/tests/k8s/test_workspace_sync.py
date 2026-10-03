@@ -5,7 +5,9 @@ script prunes it to the wheels built from source (``uv cache prune --ci``).
 Fallback pods install without a cache, so there is nothing to prune. Past
 the recency and age floors, the tree prune keeps a tree only when its whole
 name is in the keep-set. A floor that is not a whole number skips the tree
-prune.
+prune. The prune renames a tree to ``.deleting-<key>-…`` before it deletes
+it, so a prune that is killed mid-delete leaves no partial tree with
+``.ready`` under the key. The next prune deletes what was left.
 
 Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 ``uv.lock``, else its ``requirements.txt``. A member of a uv workspace has no
@@ -19,6 +21,9 @@ urls use ``identity`` and ``known_hosts``, other urls ``username`` and
 from __future__ import annotations
 
 import os
+import shutil
+import signal
+import sys
 import time
 
 import pytest
@@ -120,16 +125,19 @@ OLD_TREES = {"old-1": 2 * DAY, "old-2": 3 * DAY, "old-3": 4 * DAY}
 
 
 def _sibling_trees(workspace_sync, ages: dict[str, int]) -> None:
+    """Built trees on the volume, last modified ``age`` seconds ago."""
     now = time.time()
     for name, age in ages.items():
-        (workspace_sync.volume / name).mkdir()
-        os.utime(workspace_sync.volume / name, (now - age, now - age))
+        tree = workspace_sync.volume / name
+        (tree / "venv" / "bin").mkdir(parents=True)
+        (tree / "venv" / "bin" / "rivers").touch()
+        (tree / ".ready").touch()
+        os.utime(tree, (now - age, now - age))
 
 
-def _trees(workspace_sync) -> list[str]:
-    return sorted(
-        p.name for p in workspace_sync.volume.iterdir() if not p.name.startswith(".")
-    )
+def _volume(workspace_sync) -> list[str]:
+    """Every entry at the volume root, dot entries included."""
+    return sorted(p.name for p in workspace_sync.volume.iterdir())
 
 
 @pytest.mark.parametrize(
@@ -157,7 +165,7 @@ def test_prune_deletes_nothing_when_it_cannot_read_a_floor(
     )
 
     assert built.returncode == 0, built.stderr
-    assert _trees(workspace_sync) == ["old-1", "old-2", "old-3", "tree"]
+    assert _volume(workspace_sync) == ["old-1", "old-2", "old-3", "tree"]
     assert (
         f"workspace-sync: prune: skipped — RIVERS_WORKSPACE_KEEP_REVISIONS="
         f"'{keep_revisions}' and RIVERS_WORKSPACE_MIN_AGE_SECONDS='{min_age}' "
@@ -187,7 +195,96 @@ def test_prune_removes_the_old_trees_past_both_floors(
     )
 
     assert built.returncode == 0, built.stderr
-    assert _trees(workspace_sync) == left
+    assert _volume(workspace_sync) == [".prune.lock", *left]
+    ready = [
+        name for name in left if (workspace_sync.volume / name / ".ready").exists()
+    ]
+    assert ready == left
+
+
+EVICTED = "4b1d2c3e4f5a-1a2b3c4d-37c771fd"
+# The code location serves `tree`: every other tree older than an hour goes.
+SERVING_TREE = {
+    "RIVERS_WORKSPACE_KEEP": "tree",
+    "RIVERS_WORKSPACE_KEEP_REVISIONS": "0",
+    "RIVERS_WORKSPACE_MIN_AGE_SECONDS": "3600",
+}
+
+# `rm` stopped by SIGKILL: it deletes the `venv` directories under its
+# targets, then kills the script that runs it, as the kubelet ends an init
+# container. Calls whose targets hold no `venv` run the real `rm`.
+_KILLED_RM = """\
+import os, shutil, signal, sys
+from pathlib import Path
+
+targets = [Path(arg) for arg in sys.argv[1:] if not arg.startswith("-")]
+venvs = [venv for target in targets if target.is_dir() for venv in target.rglob("venv")]
+if not venvs:
+    os.execv(REAL_RM, ["rm", *sys.argv[1:]])
+for venv in venvs:
+    shutil.rmtree(venv, ignore_errors=True)
+os.kill(os.getppid(), signal.SIGKILL)
+sys.exit(137)
+"""
+
+
+def _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit: str) -> None:
+    """Start the code-location pod; its prune is killed while it deletes EVICTED."""
+    bin_dir = tmp_path / "killed-rm"
+    bin_dir.mkdir()
+    rm = bin_dir / "rm"
+    rm.write_text(f"#!{sys.executable}\nREAL_RM = {shutil.which('rm')!r}\n{_KILLED_RM}")
+    rm.chmod(0o755)
+
+    killed = workspace_sync.run(
+        commit,
+        shared=True,
+        PATH=f"{bin_dir}{os.pathsep}{workspace_sync.env['PATH']}",
+        **SERVING_TREE,
+    )
+
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+
+
+def test_a_tree_whose_prune_was_killed_is_built_again(workspace_sync, tmp_path):
+    _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
+    commit = workspace_sync.commit(UV_PROJECT)
+    _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit)
+
+    # The code location is pinned back to the commit of the evicted tree.
+    evicted = workspace_sync.volume / EVICTED
+    rebuilt = workspace_sync.run(
+        commit,
+        shared=True,
+        RIVERS_WORKSPACE_DIR=str(evicted),
+        RIVERS_WORKSPACE_KEEP=EVICTED,
+    )
+
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    assert workspace_sync.uv_calls() == [
+        _install(workspace_sync),
+        ["sync", "--locked", "--project", str(evicted / "src")],
+        PRUNE_CACHE,
+    ]
+    assert (evicted / "venv" / "bin" / "rivers").exists()
+
+
+def test_the_next_prune_deletes_the_tree_a_killed_prune_left(workspace_sync, tmp_path):
+    _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
+    commit = workspace_sync.commit(UV_PROJECT)
+    _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit)
+
+    entries = _volume(workspace_sync)
+    assert entries[1:] == [".prune.lock", "tree"], entries
+    assert entries[0].startswith(f".deleting-{EVICTED}-"), entries
+    aside = workspace_sync.volume / entries[0]
+    assert (aside / ".ready").exists()
+    assert not (aside / "venv").exists()
+
+    pruned = workspace_sync.run(commit, shared=True, **SERVING_TREE)
+
+    assert pruned.returncode == 0, pruned.stderr
+    assert _volume(workspace_sync) == [".prune.lock", "tree"]
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])

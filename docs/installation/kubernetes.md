@@ -258,7 +258,9 @@ operator does not start if it cannot read `minTreeAge` (for example `1d`,
 limits, for example because `spec.env` sets
 `RIVERS_WORKSPACE_MIN_AGE_SECONDS` or `RIVERS_WORKSPACE_KEEP_REVISIONS` to
 a value that is not a whole number, it deletes no tree, and its init
-container log gives the reason.
+container log gives the reason. Before the pod deletes a tree, it renames
+it to `.deleting-<key>-…`. If the pod stops during a deletion, no part of
+the tree stays under its key, and the next pod start deletes the rest.
 
 **Which commit a run uses**: runs get the last *fully rolled-out* commit.
 After a push, the operator rolls the code-location pods to the new
