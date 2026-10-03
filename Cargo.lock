@@ -6849,6 +6849,7 @@ dependencies = [
  "kube-core",
  "kube-derive",
  "kube_quantity",
+ "regex",
  "rivers-core",
  "rust_decimal",
  "schemars 1.2.2",

@@ -172,6 +172,15 @@ SHA. A CodeLocation that has one all the same (for example, one created
 before these checks) fails with reason `InvalidRef`, and the operator
 does not deploy it.
 
+**Project directory**: `path` is relative to the repository root, like
+`analytics` or `services/analytics`. Leave it out for the repository
+root. The webhook rejects a `path` that starts with `/`, that has a `..`
+segment, or that has a `.` or empty segment (`./analytics`,
+`services//analytics`): one spelling for each directory, so that each
+directory gets one tree. A `/` at the end is fine. The same applies to
+`spec.source.git.path` of a `Run` that you create with your own
+`spec.source`.
+
 How it composes with `image`: `spec.image` is always *the container the
 pods run*. Omit it in git mode to run the chart's default runtime image
 (`codeLocation.runtime.*`, by default
@@ -264,6 +273,15 @@ download again on the next build. In fallback mode, pods install with
 (`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`) must hold
 the checkout and the venv. During an install, uv's temporary copy of the
 wheels is in the container's `/tmp`, outside this limit.
+
+**Workspace size**: `spec.git.workspaceSize` and the chart's
+`codeLocation.workspace.shared.size` and `codeLocation.workspace.sizeLimit`
+are Kubernetes quantities more than zero, like `10Gi`, `500M` or `1e9`.
+`5GB` is not a quantity: write `5G` (10^9 bytes) or `5Gi` (2^30 bytes).
+The API server and the webhook reject any other `workspaceSize`, and the
+operator does not start with any other chart value. In shared mode, the
+size is the request of the PVC that the operator creates; the operator does
+not resize a PVC that is already there.
 
 **Old trees**: in shared mode, each time a code-location pod starts, it
 deletes old trees from the PVC. It keeps the trees that the CodeLocation
@@ -403,6 +421,18 @@ stuck (for example, the new commit fails to install), with a message that
 names the commit being rolled out and the commit runs still use, followed
 by the build error when a pod cannot build that commit.
 
+If the API server refuses an object of a git CodeLocation (its
+Deployment, Service, workspace PVC or keep ConfigMap), for example because
+of a policy, a quota or a value that it does not take, `DeploymentAvailable`
+has reason `ApplyFailed` and the API server's error, after
+`applying Deployment 'analytics' failed:` (or the object that failed). The
+same error is in `status.message`. The pods that run keep running, so a
+CodeLocation that serves a commit stays `Ready` on it and runs keep using
+it. Before the first commit has rolled out there is nothing to serve, and
+the CodeLocation is `Failed`. The operator tries again when you change the
+CodeLocation, else after 5 minutes, or after 1 minute for a server error
+(HTTP 5xx), a conflict or throttling.
+
 ## Helm chart customizations
 
 Drop these into a `values.yaml` and pass `-f values.yaml` on
@@ -420,6 +450,9 @@ operator:
     # git credentials unencrypted; enable only for a git host on a trusted
     # network.
     allowInsecure: false
+    # Time for one ref resolution, in whole seconds above 0; the operator
+    # does not start with any other value.
+    timeoutSeconds: 30
 
   webhook:
     # selfSigned (default): chart generates a self-signed CA + serving

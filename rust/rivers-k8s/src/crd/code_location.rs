@@ -49,6 +49,8 @@ pub const REASON_GIT_HOST_KEY_REJECTED: &str = "GitHostKeyRejected";
 pub const REASON_GIT_MALFORMED_RESPONSE: &str = "GitMalformedResponse";
 pub const REASON_RUNS_USE_WORKSPACE: &str = "RunsUseWorkspace";
 pub const REASON_RUNS_NOT_LISTED: &str = "RunsNotListed";
+/// The API server refused an object of the code location.
+pub const REASON_APPLY_FAILED: &str = "ApplyFailed";
 
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
@@ -175,8 +177,10 @@ pub struct GitSource {
     /// Which revision to pin. Exactly one field set.
     pub r#ref: GitRef,
 
-    /// Subdirectory of the repo holding the project. Becomes the container's
-    /// `workingDir`, so `spec.module` is imported relative to it.
+    /// Subdirectory of the repo holding the project, relative to its root
+    /// (`analytics`, `services/analytics`), without `.` or `..` segments.
+    /// Becomes the container's `workingDir`, so `spec.module` is imported
+    /// relative to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
@@ -194,8 +198,10 @@ pub struct GitSource {
     pub dependencies: Dependencies,
 
     /// Per-CL override for the workspace volume size: the PVC request in
-    /// shared mode, the `emptyDir` cap in fallback mode.
+    /// shared mode, the `emptyDir` cap in fallback mode. A Kubernetes
+    /// quantity more than zero, like `10Gi` or `500M`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("pattern" = crate::quantity::POSITIVE_PATTERN, "minimum" = 1))]
     pub workspace_size: Option<Quantity>,
 }
 
@@ -747,6 +753,24 @@ mod tests {
             ["commit"];
         for commit in [pinned, serving] {
             assert_eq!(commit["pattern"], "^[0-9a-f]{40}$", "{commit}");
+        }
+    }
+
+    #[test]
+    fn crd_schema_takes_only_workspace_sizes_more_than_zero() {
+        let crd = serde_json::to_value(CodeLocation::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let size = &spec["properties"]["git"]["properties"]["workspaceSize"];
+        assert_eq!(size["x-kubernetes-int-or-string"], true, "{size}");
+        // The API server applies `pattern` to the string form only and
+        // `minimum` to the integer form only.
+        assert_eq!(size["minimum"], 1.0, "{size}");
+        let pattern = regex::Regex::new(size["pattern"].as_str().expect("a pattern")).unwrap();
+        for taken in ["10Gi", "500M", "1e9", "1.5Gi", ".5", "+1", "5000000000"] {
+            assert!(pattern.is_match(taken), "{taken}");
+        }
+        for refused in ["5GB", "-1Gi", "abc", "0", "0.0Gi", "", " 10Gi", "1e"] {
+            assert!(!pattern.is_match(refused), "{refused}");
         }
     }
 

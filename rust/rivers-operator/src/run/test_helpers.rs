@@ -43,6 +43,9 @@ pub struct MockApiState {
     /// The PVCs, by name: a create adds one, a GET answers it, a DELETE
     /// removes it.
     pub pvcs: BTreeMap<String, PersistentVolumeClaim>,
+    /// Writes the API server refuses, by `<plural>/<name>` of the object: a
+    /// create or apply of it answers this Status and changes nothing.
+    pub refused: BTreeMap<String, kube_core::Status>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -63,6 +66,7 @@ impl Default for MockApiState {
             secrets: BTreeMap::new(),
             config_maps: BTreeMap::new(),
             pvcs: BTreeMap::new(),
+            refused: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -88,6 +92,14 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                 body: body_json.clone(),
             });
 
+            if let Some(status) = written_object(&method, &path, body_json.as_ref())
+                .and_then(|object| s.refused.get(&object))
+            {
+                return Ok(json_response(
+                    status.code,
+                    &serde_json::to_value(status).unwrap(),
+                ));
+            }
             let response = match method.as_str() {
                 "GET" => {
                     if path.ends_with("/pods") {
@@ -264,6 +276,19 @@ fn pod_list(pods: &BTreeMap<String, Pod>, path: &str, query: &str) -> serde_json
         })
         .collect();
     serde_json::json!({ "apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": items })
+}
+
+/// `<plural>/<name>` of the object that a create (POST) or an apply (PATCH)
+/// writes.
+fn written_object(method: &str, path: &str, body: Option<&serde_json::Value>) -> Option<String> {
+    let mut parts = path.split("/namespaces/").nth(1)?.split('/').skip(1);
+    let plural = parts.next()?;
+    let name = match method {
+        "POST" => body?.pointer("/metadata/name")?.as_str()?,
+        "PATCH" => parts.next()?,
+        _ => return None,
+    };
+    Some(format!("{plural}/{name}"))
 }
 
 /// `x` in `…/<plural>/x` or `…/<plural>/x/status`.

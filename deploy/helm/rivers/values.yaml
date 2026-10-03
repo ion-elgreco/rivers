@@ -126,7 +126,8 @@ operator:
     # Allow http:// git urls: code and git credentials travel unencrypted.
     # Only for a git host on a trusted network.
     allowInsecure: false
-    # Ref-resolution timeout per poll.
+    # Ref-resolution timeout per poll: whole seconds above 0; the operator
+    # does not start otherwise.
     timeoutSeconds: 30
   registry:
     # gRPC port for the CodeLocationRegistry service.
@@ -264,8 +265,11 @@ codeLocation:
     shared:
       enabled: false
       storageClass: ""
+      # PVC request per CL; spec.git.workspaceSize overrides it.
       size: 20Gi
     # emptyDir cap in fallback mode; spec.git.workspaceSize overrides per CL.
+    # size and sizeLimit: Kubernetes quantities above 0, like 20Gi or 500M;
+    # the operator does not start otherwise.
     sizeLimit: 2Gi
     # Trees always retained by recency, regardless of the keep-set.
     keepRevisions: 3

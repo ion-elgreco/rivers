@@ -11,6 +11,7 @@ use k8s_openapi::api::apps::v1::{
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube_client::ResourceExt;
@@ -177,11 +178,10 @@ pub fn git_working_dir(path: Option<&str>) -> String {
 /// garbage-collects it (and every tree on it) on CL delete.
 pub fn build_workspace_pvc(
     cl: &CodeLocation,
-    size: &str,
+    size: &Quantity,
     storage_class: Option<&str>,
 ) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
-    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(workspace_pvc_name(&cl.name_any())),
@@ -194,10 +194,7 @@ pub fn build_workspace_pvc(
             access_modes: Some(vec!["ReadWriteMany".to_string()]),
             storage_class_name: storage_class.map(str::to_string),
             resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
-                requests: Some(BTreeMap::from([(
-                    "storage".to_string(),
-                    Quantity(size.to_string()),
-                )])),
+                requests: Some(BTreeMap::from([("storage".to_string(), size.clone())])),
                 ..Default::default()
             }),
             ..Default::default()
@@ -802,7 +799,7 @@ mod tests {
     #[test]
     fn workspace_pvc_matches_golden() {
         let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
-        let pvc = build_workspace_pvc(&cl, "20Gi", Some("nfs-rwx"));
+        let pvc = build_workspace_pvc(&cl, &Quantity("20Gi".into()), Some("nfs-rwx"));
         let expected = json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
@@ -996,9 +993,7 @@ mod tests {
         }))
         .unwrap();
         let fallback = rivers_k8s::workspace::WorkspaceVolume::EmptyDir {
-            size_limit: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                "5Gi".to_string(),
-            )),
+            size_limit: Some(Quantity("5Gi".to_string())),
         };
 
         for (volume, pvc, emptydir_limit) in [

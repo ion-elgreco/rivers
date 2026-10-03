@@ -232,6 +232,9 @@ async fn check_self_stamped_source(
         return Err("spec.source.git.url is empty".into());
     }
     validate_git_url("spec.source.git.url", &git.url, &deps.git)?;
+    if let Some(path) = &git.path {
+        validate_git_path("spec.source.git.path", path)?;
+    }
     let runtime = source
         .runtime_image
         .parse::<ImageRef>()
@@ -520,8 +523,9 @@ fn check_codelocation_update(
 
 /// Validate the source shape (RFC-044): at least one of `image`/`git`
 /// (re-checked here for API servers whose CEL support predates the CRD
-/// rule), a well-formed one-of `git.ref`, and the url rules of
-/// [`validate_git_url`].
+/// rule), a well-formed one-of `git.ref`, the url rules of
+/// [`validate_git_url`], a `path` inside the repository and a workspace size
+/// the API server takes.
 fn validate_git_source(cl: &CodeLocation, git_config: &GitConfig) -> Result<(), String> {
     if cl.spec.image.is_none() && cl.spec.git.is_none() {
         return Err("one of spec.image or spec.git must be set".to_string());
@@ -530,7 +534,50 @@ fn validate_git_source(cl: &CodeLocation, git_config: &GitConfig) -> Result<(), 
         return Ok(());
     };
     git.r#ref.validate()?;
-    validate_git_url("spec.git.url", &git.url, git_config)
+    validate_git_url("spec.git.url", &git.url, git_config)?;
+    if let Some(path) = &git.path {
+        validate_git_path("spec.git.path", path)?;
+    }
+    if let Some(size) = git
+        .workspace_size
+        .as_ref()
+        .filter(|size| !rivers_k8s::quantity::is_positive(&size.0))
+    {
+        return Err(format!(
+            "spec.git.workspaceSize '{}' must be a Kubernetes quantity more than zero, like 10Gi \
+             or 500M",
+            size.0
+        ));
+    }
+    Ok(())
+}
+
+/// The pods build and run the project at `$SRC/<path>`: `path` names a
+/// directory of the checkout in one spelling, so that one directory gets one
+/// workspace tree. A trailing `/` is fine; empty is the repository root.
+fn validate_git_path(field: &str, path: &str) -> Result<(), String> {
+    if path.starts_with('/') {
+        return Err(format!(
+            "{field} '{path}' must be relative to the repository root, like analytics or \
+             services/analytics — remove the leading '/'"
+        ));
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    let segments: Vec<&str> = path.strip_suffix('/').unwrap_or(path).split('/').collect();
+    if segments.contains(&"..") {
+        return Err(format!(
+            "{field} '{path}' must stay inside the repository — remove the '..'"
+        ));
+    }
+    if segments.iter().any(|s| s.is_empty() || *s == ".") {
+        return Err(format!(
+            "{field} '{path}' has an empty or '.' segment — write it like analytics or \
+             services/analytics, or leave it out for the repository root"
+        ));
+    }
+    Ok(())
 }
 
 /// The operator's url rules ([`git::check_url`]) and host allowlist. `field`
@@ -1896,6 +1943,162 @@ mod tests {
         assert_eq!(
             cl_update(&labelled, &new),
             CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// What the webhook answers for a new git CodeLocation whose `spec.git`
+    /// also has `fields`.
+    fn created_with(fields: serde_json::Value) -> CodeLocationOutcome {
+        let mut git = serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" },
+        });
+        git.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        mutate_codelocation(
+            &cl_admission_request_create("uid-cl-git-fields", "team-data", &build_git_cl(git)),
+            &GitConfig::default(),
+        )
+    }
+
+    fn size_rejection(size: &str) -> String {
+        format!(
+            "spec.git.workspaceSize '{size}' must be a Kubernetes quantity more than zero, like \
+             10Gi or 500M"
+        )
+    }
+
+    #[test]
+    fn cl_create_takes_only_a_workspace_size_more_than_zero() {
+        use serde_json::json;
+        for (size, shown) in [
+            (json!("5GB"), "5GB"),
+            (json!("-1Gi"), "-1Gi"),
+            (json!("abc"), "abc"),
+            (json!("0"), "0"),
+            (json!("0.0Gi"), "0.0Gi"),
+            (json!(" 10Gi"), " 10Gi"),
+            (json!(0), "0"),
+            (json!(-1), "-1"),
+        ] {
+            assert_eq!(
+                created_with(json!({ "workspaceSize": size })),
+                CodeLocationOutcome::Rejected(size_rejection(shown)),
+                "{size}"
+            );
+        }
+        for size in [
+            json!("10Gi"),
+            json!("500M"),
+            json!("1e9"),
+            json!("1.5Gi"),
+            json!(5_000_000_000_u64),
+        ] {
+            assert!(
+                matches!(
+                    created_with(json!({ "workspaceSize": size })),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{size}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_to_a_workspace_size_the_api_server_does_not_take_is_rejected() {
+        let old = git_cl_on("https://forge.example/r.git");
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().workspace_size = Some(
+            k8s_openapi::apimachinery::pkg::api::resource::Quantity("5GB".to_string()),
+        );
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(size_rejection("5GB"))
+        );
+
+        // One admitted before this rule keeps taking updates that leave its
+        // source alone; its pods show the API server's answer instead.
+        let mut labelled = new.clone();
+        labelled.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(
+            cl_update(&labelled, &new),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// What the webhook answers for a self-stamped run of [`git_cl`] whose
+    /// source has `path`.
+    async fn self_stamped_at(path: &str) -> RunOutcome {
+        let mut source = expected_run_source();
+        source.git.path = Some(path.to_string());
+        let req =
+            admission_request_create("uid-hatch-path", "team-data", &self_stamped_run(source));
+        mutate_run(&req, &watching(git_cl()).await).await
+    }
+
+    #[tokio::test]
+    async fn paths_outside_the_repository_or_in_another_spelling_are_rejected() {
+        let outside = "must stay inside the repository — remove the '..'";
+        let absolute = "must be relative to the repository root, like analytics or \
+                        services/analytics — remove the leading '/'";
+        let spelling = "has an empty or '.' segment — write it like analytics or \
+                        services/analytics, or leave it out for the repository root";
+        for (path, problem) in [
+            ("../x", outside),
+            ("a/../../b", outside),
+            ("analytics/..", outside),
+            ("/abs", absolute),
+            ("/", absolute),
+            ("./analytics", spelling),
+            ("services//analytics", spelling),
+            ("analytics//", spelling),
+            (".", spelling),
+        ] {
+            assert_eq!(
+                created_with(serde_json::json!({ "path": path })),
+                CodeLocationOutcome::Rejected(format!("spec.git.path '{path}' {problem}")),
+                "{path}"
+            );
+            assert_eq!(
+                self_stamped_at(path).await,
+                RunOutcome::Rejected(format!("spec.source.git.path '{path}' {problem}")),
+                "{path}"
+            );
+        }
+        for path in [
+            "analytics",
+            "services/analytics",
+            "analytics/",
+            ".config/app",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    created_with(serde_json::json!({ "path": path })),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{path}"
+            );
+            assert_eq!(
+                self_stamped_at(path).await,
+                RunOutcome::AcceptedAsIs,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_to_a_path_outside_the_repository_is_rejected() {
+        let old = git_cl_on("https://forge.example/r.git");
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().path = Some("../shared".to_string());
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(
+                "spec.git.path '../shared' must stay inside the repository — remove the '..'"
+                    .to_string()
+            )
         );
     }
 

@@ -203,8 +203,10 @@ spec:
                     type: object
                   path:
                     description: |-
-                      Subdirectory of the repo holding the project. Becomes the container's
-                      `workingDir`, so `spec.module` is imported relative to it.
+                      Subdirectory of the repo holding the project, relative to its root
+                      (`analytics`, `services/analytics`), without `.` or `..` segments.
+                      Becomes the container's `workingDir`, so `spec.module` is imported
+                      relative to it.
                     nullable: true
                     type: string
                   pollInterval:
@@ -255,8 +257,11 @@ spec:
                   workspaceSize:
                     description: |-
                       Per-CL override for the workspace volume size: the PVC request in
-                      shared mode, the `emptyDir` cap in fallback mode.
+                      shared mode, the `emptyDir` cap in fallback mode. A Kubernetes
+                      quantity more than zero, like `10Gi` or `500M`.
+                    minimum: 1.0
                     nullable: true
+                    pattern: ^\+?([0-9]*[1-9][0-9]*(\.[0-9]*)?|[0-9]*\.[0-9]*[1-9][0-9]*)([numkMGTPE]|[KMGTPE]i|[eE][+-]?[0-9]+)?$
                     x-kubernetes-int-or-string: true
                 required:
                 - ref

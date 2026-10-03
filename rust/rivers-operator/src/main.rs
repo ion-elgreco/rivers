@@ -44,8 +44,6 @@ const WEBHOOK_DISABLED_ENV: &str = "RIVERS_WEBHOOK_DISABLED";
 // (e.g. k3d's HTTP-only local registry). Default is HTTPS.
 const ALLOW_INSECURE_REGISTRY_ENV: &str = "RIVERS_ALLOW_INSECURE_REGISTRY";
 const RUNTIME_IMAGE_ENV: &str = "RIVERS_RUNTIME_IMAGE";
-const GIT_TIMEOUT_SECONDS_ENV: &str = "RIVERS_GIT_TIMEOUT_SECONDS";
-const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -120,11 +118,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("operator.git.allowInsecure is set; http:// git urls are allowed");
     }
 
-    let git_timeout = std::env::var(GIT_TIMEOUT_SECONDS_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_GIT_TIMEOUT_SECONDS);
-
     let runtime_image = std::env::var(RUNTIME_IMAGE_ENV)
         .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string())
         .parse::<codelocation::ImageRef>()
@@ -140,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
             allow_insecure_registry,
         )),
         git: Arc::new(codelocation::git::GitResolver::new(
-            std::time::Duration::from_secs(git_timeout),
+            git_cfg.timeout,
             git_cfg.allow_insecure,
         )),
         runtime_image: runtime_image.clone(),

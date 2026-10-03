@@ -370,15 +370,28 @@ pub fn check_url(raw: &str, allow_insecure: bool) -> Result<Transport, GitError>
 
 const ALLOW_INSECURE_ENV: &str = "RIVERS_GIT_ALLOW_INSECURE";
 const ALLOWED_HOSTS_ENV: &str = "RIVERS_GIT_ALLOWED_HOSTS";
+const TIMEOUT_SECONDS_ENV: &str = "RIVERS_GIT_TIMEOUT_SECONDS";
 
 /// The chart's `operator.git` settings, via operator env.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitConfig {
     /// `operator.git.allowInsecure`: `http://` urls are admitted and fetched.
     pub allow_insecure: bool,
     /// `operator.git.allowedHosts`: the hosts the admission webhook admits;
     /// empty admits any host.
     pub allowed_hosts: Vec<String>,
+    /// `operator.git.timeoutSeconds`: how long one ref resolution may take.
+    pub timeout: std::time::Duration,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            allow_insecure: false,
+            allowed_hosts: Vec::new(),
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
 }
 
 impl GitConfig {
@@ -402,9 +415,20 @@ impl GitConfig {
             .filter(|host| !host.is_empty())
             .map(String::from)
             .collect();
+        let timeout = match get(TIMEOUT_SECONDS_ENV).as_deref().map(str::trim) {
+            None | Some("") => Self::default().timeout,
+            Some(seconds) => match seconds.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => std::time::Duration::from_secs(seconds),
+                _ => anyhow::bail!(
+                    "{TIMEOUT_SECONDS_ENV} (operator.git.timeoutSeconds): expected a whole \
+                     number of seconds more than zero, got {seconds:?}"
+                ),
+            },
+        };
         Ok(Self {
             allow_insecure,
             allowed_hosts,
+            timeout,
         })
     }
 }
@@ -2094,11 +2118,40 @@ mod tests {
             GitConfig {
                 allow_insecure: true,
                 allowed_hosts: vec!["gitea.internal".to_string(), "github.com".to_string()],
+                ..GitConfig::default()
             }
+        );
+        for (value, seconds) in [("", 30), ("45", 45), (" 600 ", 600)] {
+            let config = git_config(&[("RIVERS_GIT_TIMEOUT_SECONDS", value)]).unwrap();
+            assert_eq!(
+                config.timeout,
+                std::time::Duration::from_secs(seconds),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            git_config(&[]).unwrap().timeout,
+            std::time::Duration::from_secs(30)
         );
         for (value, allow_insecure) in [("false", false), ("", false), ("1", true), ("0", false)] {
             let config = git_config(&[("RIVERS_GIT_ALLOW_INSECURE", value)]).unwrap();
             assert_eq!(config.allow_insecure, allow_insecure, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn git_config_refuses_a_timeout_it_cannot_read() {
+        for value in ["0", "abc", "-1", "1.5", "30s", "00"] {
+            match git_config(&[("RIVERS_GIT_TIMEOUT_SECONDS", value)]) {
+                Ok(config) => panic!("timeout {value:?} accepted: {config:?}"),
+                Err(err) => assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "RIVERS_GIT_TIMEOUT_SECONDS (operator.git.timeoutSeconds): expected a \
+                         whole number of seconds more than zero, got {value:?}"
+                    )
+                ),
+            }
         }
     }
 

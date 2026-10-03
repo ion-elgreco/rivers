@@ -26,13 +26,14 @@ use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
     CONDITION_WORKSPACE_KEPT, CodeLocation, CodeLocationCondition, CodeLocationPhase,
-    CodeLocationSpec, CodeLocationStatus, GitRef, IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED,
-    REASON_AWAITING_LEADER, REASON_COMMIT_PINNED, REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED,
-    REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED, REASON_GIT_HOST_KEY_REJECTED,
-    REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED, REASON_GIT_UNREACHABLE,
-    REASON_INVALID_REF, REASON_INVALID_URL, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
-    REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR,
-    REASON_ROLLING_OUT, REASON_RUNS_NOT_LISTED, REASON_RUNS_USE_WORKSPACE, REASON_TAG_NOT_FOUND,
+    CodeLocationSpec, CodeLocationStatus, GitRef, IMMUTABLE_TAG_ANNOTATION, REASON_APPLY_FAILED,
+    REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED, REASON_COMMIT_RESOLVED,
+    REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
+    REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED,
+    REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_INVALID_URL, REASON_MIN_REPLICAS,
+    REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED,
+    REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_RUNS_NOT_LISTED,
+    REASON_RUNS_USE_WORKSPACE, REASON_TAG_NOT_FOUND,
 };
 
 use super::git::{self, GitCredentials, GitResolveRequest};
@@ -105,8 +106,8 @@ pub struct WorkspaceConfig {
     /// Shared RWX PVC per CL (true) vs per-pod emptyDir (false).
     pub shared_enabled: bool,
     pub storage_class: Option<String>,
-    pub shared_size: String,
-    pub empty_dir_limit: String,
+    pub shared_size: Quantity,
+    pub empty_dir_limit: Quantity,
     pub keep_revisions: u32,
     pub min_tree_age: Duration,
 }
@@ -116,8 +117,8 @@ impl Default for WorkspaceConfig {
         Self {
             shared_enabled: false,
             storage_class: None,
-            shared_size: "20Gi".to_string(),
-            empty_dir_limit: "2Gi".to_string(),
+            shared_size: Quantity("20Gi".to_string()),
+            empty_dir_limit: Quantity("2Gi".to_string()),
             keep_revisions: 3,
             min_tree_age: Duration::from_secs(3600),
         }
@@ -136,11 +137,27 @@ impl WorkspaceConfig {
             cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
         }
         cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
+        let size = |var: &str, value: String| {
+            if rivers_k8s::quantity::is_positive(&value) {
+                Ok(Quantity(value))
+            } else {
+                Err(anyhow::anyhow!(
+                    "{var}: expected a Kubernetes quantity more than zero, like 10Gi or 500M, \
+                     got {value:?}"
+                ))
+            }
+        };
         if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
-            cfg.shared_size = v;
+            cfg.shared_size = size(
+                "RIVERS_WORKSPACE_SHARED_SIZE (codeLocation.workspace.shared.size)",
+                v,
+            )?;
         }
         if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
-            cfg.empty_dir_limit = v;
+            cfg.empty_dir_limit = size(
+                "RIVERS_WORKSPACE_EMPTYDIR_LIMIT (codeLocation.workspace.sizeLimit)",
+                v,
+            )?;
         }
         if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS") {
             cfg.keep_revisions = v.trim().parse().map_err(|_| {
@@ -174,7 +191,7 @@ impl WorkspaceConfig {
             .git
             .as_ref()
             .and_then(|git| git.workspace_size.clone())
-            .unwrap_or_else(|| Quantity(self.empty_dir_limit.clone()));
+            .unwrap_or_else(|| self.empty_dir_limit.clone());
         WorkspaceVolume::EmptyDir {
             size_limit: Some(size_limit),
         }
@@ -519,10 +536,18 @@ async fn reconcile_git(
     // Followers neither resolve nor apply: they refresh what the Deployment
     // shows and keep the leader's resolution conditions, so both replicas
     // publish the same status. A Failed status shows nothing of the
-    // Deployment, and only the leader's next resolution clears it.
+    // Deployment, and a refused object only the leader's apply saw: only the
+    // leader's next pass clears either.
     if !ctx.leader.is_leader() {
         let prior = cl.status.as_ref();
-        if prior.is_some_and(|s| s.phase == Some(CodeLocationPhase::Failed)) {
+        let leaders_alone = prior.is_some_and(|s| {
+            s.phase == Some(CodeLocationPhase::Failed)
+                || s.conditions.iter().any(|c| {
+                    c.r#type == CONDITION_DEPLOYMENT_AVAILABLE
+                        && c.reason.as_deref() == Some(REASON_APPLY_FAILED)
+                })
+        });
+        if leaders_alone {
             return Ok(Action::requeue(FOLLOWER_WAIT));
         }
         let published = prior.is_some_and(|s| {
@@ -537,6 +562,7 @@ async fn reconcile_git(
                 resolution: None,
                 fetched_at: None,
                 rollout,
+                apply_failure: None,
                 endpoint,
             };
             patch_git_status(code_locations_api, &name, cl, update).await?;
@@ -574,6 +600,7 @@ async fn reconcile_git(
                         resolution: Some(GitResolution::ImageFailed(err)),
                         fetched_at: None,
                         rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
+                        apply_failure: None,
                         endpoint,
                     };
                     patch_git_status(code_locations_api, &name, cl, update).await?;
@@ -614,6 +641,7 @@ async fn reconcile_git(
                     }),
                     fetched_at: None,
                     rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
+                    apply_failure: None,
                     endpoint,
                 };
                 patch_git_status(code_locations_api, &name, cl, update).await?;
@@ -634,13 +662,17 @@ async fn reconcile_git(
         &resolved,
     )
     .await?;
-    if !applied {
-        tracing::info!(
-            code_location = %name,
-            "the workspace PVC is being deleted; the rollout waits until it is gone"
-        );
-        return Ok(Action::requeue(DEPLOYMENT_ROLLOUT_POLL));
-    }
+    let refusal = match applied {
+        Applied::All => None,
+        Applied::WaitingForPvc => {
+            tracing::info!(
+                code_location = %name,
+                "the workspace PVC is being deleted; the rollout waits until it is gone"
+            );
+            return Ok(Action::requeue(DEPLOYMENT_ROLLOUT_POLL));
+        }
+        Applied::Refused(failure) => Some(failure),
+    };
     let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
     let rolling_out = !rollout.complete;
     let update = GitStatusUpdate {
@@ -651,11 +683,14 @@ async fn reconcile_git(
         }),
         fetched_at: Some(jiff::Timestamp::now().to_string()),
         rollout,
+        apply_failure: refusal.as_ref().map(|failure| failure.message.clone()),
         endpoint,
     };
     let phase = patch_git_status(code_locations_api, &name, cl, update).await?;
 
-    let requeue = if rolling_out || !matches!(phase, CodeLocationPhase::Ready) {
+    let requeue = if let Some(failure) = refusal {
+        Action::requeue(failure.retry)
+    } else if rolling_out || !matches!(phase, CodeLocationPhase::Ready) {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
     } else {
         git_requeue(&git_spec.r#ref, poll, refresh_after, immutable)
@@ -691,10 +726,52 @@ fn git_requeue(
     }
 }
 
+/// What [`apply_git_workspace`] did.
+enum Applied {
+    All,
+    /// Nothing: the workspace PVC is being deleted.
+    WaitingForPvc,
+    /// The API server refused an object; the objects after it are not
+    /// applied.
+    Refused(ApplyFailure),
+}
+
+/// An object of a git code location that the API server refused.
+struct ApplyFailure {
+    /// `applying Deployment 'x' failed: <the API server's message>`.
+    message: String,
+    /// When the leader tries again.
+    retry: Duration,
+}
+
+/// An API error of `action` is the API server's refusal, which the code
+/// location shows; any other error is the reconcile's. A refused object
+/// stays refused until the CR or the cluster's rules change; a server
+/// error, a conflict or throttling may pass.
+fn refused(action: &str, error: kube_client::Error) -> Result<Applied, Error> {
+    let status = match error {
+        kube_client::Error::Api(status) => status,
+        other => return Err(other.into()),
+    };
+    let answer = if status.message.is_empty() {
+        format!("{} {}", status.code, status.reason)
+    } else {
+        status.message
+    };
+    let retry = if status.code >= 500 || matches!(status.code, 409 | 429) {
+        Duration::from_secs(60)
+    } else {
+        TERMINAL_RETRY
+    };
+    Ok(Applied::Refused(ApplyFailure {
+        message: format!("{action} failed: {answer}"),
+        retry,
+    }))
+}
+
 /// Apply the git CL's owned resources: (shared mode) the workspace PVC and
 /// keep ConfigMap, then the Deployment + Service running out of the
-/// materialized tree. `false`, with nothing applied, while the workspace
-/// PVC is being deleted.
+/// materialized tree.
 async fn apply_git_workspace(
     cl: &CodeLocation,
     ctx: &Context,
@@ -703,7 +780,7 @@ async fn apply_git_workspace(
     services_api: &Api<Service>,
     resolved_image: &str,
     resolved: &git::ResolvedRef,
-) -> Result<bool, Error> {
+) -> Result<Applied, Error> {
     let name = cl.name_any();
     let git_spec = cl.spec.git.as_ref().expect("git CL");
     let wspec = WorkspaceSpec {
@@ -728,17 +805,17 @@ async fn apply_git_workspace(
     if ctx.workspace.shared_enabled {
         let pvc_size = git_spec
             .workspace_size
-            .as_ref()
-            .map(|q| q.0.clone())
+            .clone()
             .unwrap_or_else(|| ctx.workspace.shared_size.clone());
         let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
-        let usable = ensure_workspace_pvc(
-            &pvc_api,
-            build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref()),
-        )
-        .await?;
-        if !usable {
-            return Ok(false);
+        let pvc = build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref());
+        match ensure_workspace_pvc(&pvc_api, pvc).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Applied::WaitingForPvc),
+            Err(e) => {
+                let claim = workspace_pvc_name(&name);
+                return refused(&format!("creating PersistentVolumeClaim '{claim}'"), e);
+            }
         }
         // Keep-set: the tree being rolled out, the tree runs get until that
         // rollout finishes, and every non-terminal run's tree, from the run
@@ -763,7 +840,10 @@ async fn apply_git_workspace(
                 runs.iter().map(Arc::as_ref),
             );
             let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-            apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
+            if let Err(e) = apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await {
+                let keep_name = keep_config_map_name(&name);
+                return refused(&format!("applying ConfigMap '{keep_name}'"), e);
+            }
         } else {
             tracing::info!("the Run store has not synced yet; the keep-set in force stays");
         }
@@ -779,11 +859,20 @@ async fn apply_git_workspace(
         git_working_dir(git_spec.path.as_deref()),
     );
     let service = build_service(cl);
-    tokio::try_join!(
+    let (deployed, served) = tokio::join!(
         apply_deployment(deployments_api, &deployment),
         apply_service(services_api, &service),
-    )?;
-    Ok(true)
+    );
+    if let Err(e) = deployed {
+        return refused(
+            &format!("applying Deployment '{}'", deployment_name(&name)),
+            e,
+        );
+    }
+    if let Err(e) = served {
+        return refused(&format!("applying Service '{}'", service_name(&name)), e);
+    }
+    Ok(Applied::All)
 }
 
 /// Read the git Deployment and, until its rollout is complete, its pods,
@@ -1188,6 +1277,9 @@ struct GitStatusUpdate {
     resolution: Option<GitResolution>,
     fetched_at: Option<String>,
     rollout: GitRollout,
+    /// The leader's apply of this pass: the object the API server refused,
+    /// and its answer ([`ApplyFailure::message`]).
+    apply_failure: Option<String>,
     endpoint: String,
 }
 
@@ -1225,7 +1317,9 @@ async fn patch_git_status(
 /// is still building, or fails to build, never reaches a run. A rollout in
 /// progress or stuck shows on `DeploymentAvailable`, not in the phase, with
 /// the error of a failed build of its tree, which `status.message` also
-/// shows unless a resolution error is there.
+/// shows unless a resolution error is there. An object the API server
+/// refused shows the same way: the cluster still runs what it ran before,
+/// so the serving tree serves on; with no serving tree the phase is Failed.
 fn git_status(
     cl: &CodeLocation,
     update: GitStatusUpdate,
@@ -1241,12 +1335,19 @@ fn git_status(
     let desired = cl.spec.replicas;
     let ready =
         serving.is_some() && desired > 0 && rollout.ready_replicas.is_some_and(|r| r >= desired);
+    let failed = update.apply_failure.is_some() && serving.is_none();
     let build_failure = rollout
         .template
         .as_ref()
         .zip(rollout.build_failure.as_ref())
         .map(|(target, failed)| build_failure_message(target, failed));
-    let (deployment_reason, deployment_message) = if rollout.ready_replicas.is_none() {
+    let (deployment_reason, deployment_message) = if let Some(failure) = &update.apply_failure {
+        let message = match &serving {
+            Some(serving) => format!("{failure}; runs use {}", source_display(serving)),
+            None => failure.clone(),
+        };
+        (REASON_APPLY_FAILED, Some(message))
+    } else if rollout.ready_replicas.is_none() {
         (REASON_NO_DEPLOYMENT_STATUS, None)
     } else if ready && rollout.complete {
         (REASON_MIN_REPLICAS, None)
@@ -1272,14 +1373,16 @@ fn git_status(
     let mut status = CodeLocationStatus {
         phase: Some(if ready {
             CodeLocationPhase::Ready
+        } else if failed {
+            CodeLocationPhase::Failed
         } else {
             CodeLocationPhase::Deploying
         }),
         observed_generation: cl.metadata.generation,
         resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
-        grpc_endpoint: Some(update.endpoint),
+        grpc_endpoint: (!failed).then_some(update.endpoint),
         last_reconciled: Some(now.to_string()),
-        ready_replicas: rollout.ready_replicas,
+        ready_replicas: rollout.ready_replicas.filter(|_| !failed),
         message: None,
         conditions: Vec::new(),
         source: serving.as_ref().map(source_display),
@@ -1364,6 +1467,7 @@ fn git_status(
                 && (c.r#type == CONDITION_IMAGE_RESOLVED || c.r#type == CONDITION_SOURCE_RESOLVED)
         })
         .and_then(|c| c.message.clone())
+        .or(update.apply_failure)
         .or(build_failure);
     status
 }
@@ -2012,6 +2116,49 @@ mod tests {
             match workspace_config(&[(var, value)]) {
                 Ok(cfg) => panic!("{var}={value} accepted: {cfg:?}"),
                 Err(e) => assert_eq!(e.to_string(), expected),
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_config_reads_the_chart_sizes() {
+        let sizes = |vars: &[(&str, &str)]| {
+            let cfg = workspace_config(vars).unwrap();
+            (cfg.shared_size.0, cfg.empty_dir_limit.0)
+        };
+        assert_eq!(sizes(&[]), ("20Gi".into(), "2Gi".into()));
+        assert_eq!(
+            sizes(&[
+                ("RIVERS_WORKSPACE_SHARED_SIZE", "50Gi"),
+                ("RIVERS_WORKSPACE_EMPTYDIR_LIMIT", "1e9"),
+            ]),
+            ("50Gi".into(), "1e9".into())
+        );
+    }
+
+    #[test]
+    fn workspace_config_refuses_sizes_the_api_server_does_not_take() {
+        for (var, setting) in [
+            (
+                "RIVERS_WORKSPACE_SHARED_SIZE",
+                "codeLocation.workspace.shared.size",
+            ),
+            (
+                "RIVERS_WORKSPACE_EMPTYDIR_LIMIT",
+                "codeLocation.workspace.sizeLimit",
+            ),
+        ] {
+            for value in ["5GB", "abc", "-1Gi", "0", "2 Gi", "1e"] {
+                match workspace_config(&[(var, value)]) {
+                    Ok(cfg) => panic!("{var}={value} accepted: {cfg:?}"),
+                    Err(e) => assert_eq!(
+                        e.to_string(),
+                        format!(
+                            "{var} ({setting}): expected a Kubernetes quantity more than zero, \
+                             like 10Gi or 500M, got {value:?}"
+                        )
+                    ),
+                }
             }
         }
     }
@@ -3060,6 +3207,7 @@ mod tests {
                 }),
                 fetched_at: None,
                 rollout,
+                apply_failure: None,
                 endpoint: grpc_endpoint("x", "y", 3001),
             };
             git_status(cl, update, "2026-10-03T00:00:00Z".parse().unwrap())
@@ -3724,6 +3872,159 @@ mod tests {
             assert_eq!(pass(&state, LeaderGate::new()).await, None);
         }
 
+        /// What the API server answers, with `code`, for a Deployment whose
+        /// `emptyDir` size it cannot read.
+        fn unreadable_size(code: u16) -> kube_core::Status {
+            kube_core::Status::failure(
+                "Deployment.apps \"x\" is invalid: spec.template.spec.volumes[0].emptyDir.\
+                 sizeLimit: Invalid value: \"5GB\": quantities must match the regular \
+                 expression '^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$'",
+                "Invalid",
+            )
+            .with_code(code)
+        }
+
+        /// `cl` with `workspaceSize: 5GB`, as admitted before the webhook
+        /// checked it.
+        fn sized_5gb(mut cl: CodeLocation) -> CodeLocation {
+            cl.spec.git.as_mut().unwrap().workspace_size = Some(Quantity("5GB".into()));
+            cl
+        }
+
+        fn refuse(state: &ApiState, object: &str, answer: &kube_core::Status) {
+            let mut s = state.lock().unwrap();
+            s.refused.insert(object.to_string(), answer.clone());
+        }
+
+        #[tokio::test]
+        async fn a_refused_deployment_shows_in_status_while_runs_keep_the_serving_tree() {
+            let state = api_with(sized_5gb(git_cl_at('b', serving_status('a'))), rolled_out());
+            let answer = unreadable_size(422);
+            refuse(&state, "deployments/x", &answer);
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            let failure = format!("applying Deployment 'x' failed: {}", answer.message);
+            let available = format!("{failure}; runs use aaaaaaa (pinned)");
+            assert_eq!(status["message"], failure, "{status}");
+            assert_eq!(
+                says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+                ("True", REASON_APPLY_FAILED, available.as_str())
+            );
+            assert_eq!(status["phase"], "Ready");
+            assert_eq!(status["runSource"], run_source_json('a'));
+            assert_eq!(status["resolvedCommit"], commit('a'));
+            assert_eq!(requeue, Action::requeue(TERMINAL_RETRY));
+            // The same refusal in the next passes: nothing new to write, from
+            // either replica.
+            assert_eq!(pass(&state, LeaderGate::leading()).await, None);
+            assert_eq!(pass(&state, LeaderGate::new()).await, None);
+
+            // Once the API server takes the Deployment, the next pass says so.
+            state.lock().unwrap().refused.clear();
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+            assert_eq!(status.get("message"), None, "{status}");
+            assert_eq!(
+                says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+                ("True", REASON_MIN_REPLICAS, "")
+            );
+            assert_eq!(status["runSource"], run_source_json('b'));
+        }
+
+        #[tokio::test]
+        async fn a_refused_first_deployment_fails_the_code_location() {
+            let mut cl = sized_5gb(git_cl_at('a', json!({})));
+            cl.status = None;
+            let state = ApiState::default();
+            state.lock().unwrap().code_locations.insert("x".into(), cl);
+            let answer = unreadable_size(500);
+            refuse(&state, "deployments/x", &answer);
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            let failure = format!("applying Deployment 'x' failed: {}", answer.message);
+            assert_eq!(status["phase"], "Failed", "{status}");
+            assert_eq!(status["message"], failure);
+            assert_eq!(
+                says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+                ("False", REASON_APPLY_FAILED, failure.as_str())
+            );
+            for field in [
+                "grpcEndpoint",
+                "readyReplicas",
+                "runSource",
+                "resolvedCommit",
+            ] {
+                assert_eq!(status.get(field), None, "{field}: {status}");
+            }
+            // A server error may pass: the leader tries again sooner.
+            assert_eq!(requeue, Action::requeue(Duration::from_secs(60)));
+            assert_eq!(pass(&state, LeaderGate::leading()).await, None);
+            assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[tokio::test]
+        async fn each_refused_object_of_a_git_code_location_shows_in_status() {
+            for (workspace, object, action) in [
+                (
+                    shared(),
+                    "persistentvolumeclaims/x-workspace",
+                    "creating PersistentVolumeClaim 'x-workspace'",
+                ),
+                (
+                    shared(),
+                    "configmaps/x-workspace-keep",
+                    "applying ConfigMap 'x-workspace-keep'",
+                ),
+                (
+                    WorkspaceConfig::default(),
+                    "deployments/x",
+                    "applying Deployment 'x'",
+                ),
+                (
+                    WorkspaceConfig::default(),
+                    "services/x-grpc",
+                    "applying Service 'x-grpc'",
+                ),
+            ] {
+                let state = api_with(git_cl_at('b', serving_status('a')), rolled_out());
+                let answer = kube_core::Status::failure(
+                    &format!("{object} is forbidden: denied by the cluster's policy"),
+                    "Forbidden",
+                )
+                .with_code(403);
+                refuse(&state, object, &answer);
+
+                let (requeue, requests) = reconcile_in(
+                    &state,
+                    LeaderGate::leading(),
+                    &resolver(),
+                    workspace,
+                    run_store(Vec::new()),
+                )
+                .await;
+
+                let status = patched_status(&requests).expect("status patch");
+                assert_eq!(
+                    status["message"],
+                    format!("{action} failed: {}", answer.message),
+                    "{object}"
+                );
+                assert_eq!(
+                    says(&status, CONDITION_DEPLOYMENT_AVAILABLE).1,
+                    REASON_APPLY_FAILED,
+                    "{object}"
+                );
+                assert_eq!(requeue, Action::requeue(TERMINAL_RETRY), "{object}");
+            }
+        }
+
         #[test]
         fn build_failure_is_the_newest_failed_sync_of_a_pod_that_runs_the_template() {
             let failed_now = json!({ "state": { "terminated": {
@@ -4154,7 +4455,7 @@ mod tests {
         /// The workspace PVC and keep ConfigMap that the git path made for
         /// `owner`.
         fn git_workspace_of(owner: &CodeLocation) -> (PersistentVolumeClaim, ConfigMap) {
-            let mut pvc = build_workspace_pvc(owner, "20Gi", None);
+            let mut pvc = build_workspace_pvc(owner, &Quantity("20Gi".into()), None);
             pvc.metadata.uid = Some(PVC_UID.into());
             let mut keep = build_keep_config_map(owner, &tree('a').workspace_key());
             keep.metadata.uid = Some(KEEP_UID.into());
