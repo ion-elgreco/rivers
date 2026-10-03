@@ -711,7 +711,7 @@ pub fn worker_execute_step(
                     ops::OutputItem::Materialization {
                         name,
                         value,
-                        metadata,
+                        mut metadata,
                         data_version,
                     } => {
                         // value.is_some() => Output: write IO from the worker
@@ -724,8 +724,9 @@ pub fn worker_execute_step(
                             };
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                            let io_dv = write_output(py, handler, &out_ctx, &value)?;
-                            (io_dv.or(data_version), ResultKind::Output)
+                            let written = write_output(py, handler, &out_ctx, &value)?;
+                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            (written.data_version.or(data_version), ResultKind::Output)
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
@@ -811,7 +812,7 @@ pub fn worker_execute_step(
                     ops::OutputItem::Materialization {
                         name,
                         value,
-                        metadata,
+                        mut metadata,
                         data_version,
                     } => {
                         let (final_dv, kind) = if let Some(value) = value {
@@ -821,8 +822,9 @@ pub fn worker_execute_step(
                                 let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                                 let out_ctx =
                                     Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                                let io_dv = write_output(py, handler, &out_ctx, &value)?;
-                                io_dv.or(data_version)
+                                let written = write_output(py, handler, &out_ctx, &value)?;
+                                ops::merge_metadata(&mut metadata, &written.metadata);
+                                written.data_version.or(data_version)
                             } else {
                                 data_version
                             };

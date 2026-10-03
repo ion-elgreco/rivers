@@ -688,7 +688,11 @@ class OutputContext:
     def add_output_metadata(
         self, metadata: dict[str, str | int | float | bool | None | MetadataValue]
     ) -> None:
-        """Attach metadata about the persisted output (size, path, duration, …)."""
+        """Attach metadata about the persisted output (size, path, duration, …).
+
+        The entries are stored on the materialization. On a key the asset also
+        set, the handler's value is stored.
+        """
         ...
 
     def register_data_version(self, version: str) -> None:

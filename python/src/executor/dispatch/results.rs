@@ -211,7 +211,7 @@ pub(crate) fn process_step_result(
                 ops::OutputItem::Materialization {
                     name,
                     value,
-                    metadata,
+                    mut metadata,
                     data_version,
                 } => {
                     // Single-output (incl. mapped fan-out instances) shares the
@@ -229,7 +229,7 @@ pub(crate) fn process_step_result(
                     // value.is_some() => Output(v): write via IO handler.
                     // value.is_none() => Materialization(...): user-managed.
                     let resolved_dv = if let Some(value) = &value {
-                        let io_dv = ops::handle_step_output(
+                        let written = ops::handle_step_output(
                             py,
                             &name,
                             node,
@@ -239,7 +239,8 @@ pub(crate) fn process_step_result(
                             metadata.clone(),
                             ctx.repo.io_handler_registry,
                         )?;
-                        io_dv.or(data_version)
+                        ops::merge_metadata(&mut metadata, &written.metadata);
+                        written.data_version.or(data_version)
                     } else {
                         data_version
                     };

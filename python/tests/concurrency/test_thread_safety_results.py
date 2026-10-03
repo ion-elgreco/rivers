@@ -111,8 +111,14 @@ def record_results_in_threads(kind):
     repo = rs.CodeRepository(assets=[asset], default_executor=rs.Executor.in_process())
     run = repo.observe if kind == "observation" else repo.materialize
     run_ids, errors = build_while_changing(shared, lambda: run().run_id)
+    # What the default InMemoryIOHandler records on each write.
+    handler_keys = {"storage", "size_bytes"}
     metadata = [
-        {k: next(iter(json.loads(v).values()))["value"] for k, v in event.metadata}
+        {
+            k: next(iter(json.loads(v).values()))["value"]
+            for k, v in event.metadata
+            if k not in handler_keys
+        }
         for run_id in run_ids
         for event in repo.storage.get_events_for_run(run_id)
         if event.event_type in ("Materialization", "Observation")

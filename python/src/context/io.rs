@@ -22,7 +22,7 @@ pub struct PyOutputContext {
     pub partition: Option<PartitionContext>,
     #[pyo3(get)]
     pub type_hint: Option<Py<PyAny>>,
-    _output_metadata: Mutex<HashMap<String, MetadataValue>>,
+    _output_metadata: Mutex<Vec<(String, MetadataValue)>>,
     _data_version: Mutex<Option<String>>,
 }
 
@@ -38,7 +38,7 @@ impl PyOutputContext {
             asset_metadata,
             partition,
             type_hint,
-            _output_metadata: Mutex::new(HashMap::new()),
+            _output_metadata: Mutex::new(Vec::new()),
             _data_version: Mutex::new(None),
         }
     }
@@ -55,9 +55,14 @@ impl PyOutputContext {
             asset_metadata,
             partition,
             type_hint,
-            _output_metadata: Mutex::new(initial.into_iter().collect()),
+            _output_metadata: Mutex::new(initial),
             _data_version: Mutex::new(None),
         }
+    }
+
+    /// The metadata it was built with, overlaid by what the handler added.
+    pub fn drain_output_metadata(&self, py: Python<'_>) -> Vec<(String, MetadataValue)> {
+        std::mem::take(&mut *self._output_metadata.lock_py_attached(py).unwrap())
     }
 }
 
@@ -78,10 +83,14 @@ impl PyOutputContext {
     /// Values can be MetadataValue or raw str/int/float/bool/None (auto-coerced).
     fn add_output_metadata(&self, metadata: Bound<'_, PyDict>) -> PyResult<()> {
         let entries = coerce_metadata_dict(&metadata)?;
-        self._output_metadata
+        let mut stored = self
+            ._output_metadata
             .lock_py_attached(metadata.py())
-            .unwrap()
-            .extend(entries);
+            .unwrap();
+        for (key, value) in entries {
+            stored.retain(|(k, _)| *k != key);
+            stored.push((key, value));
+        }
         Ok(())
     }
 

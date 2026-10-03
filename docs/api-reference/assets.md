@@ -393,7 +393,7 @@ def my_asset() -> rs.Output:
     )
 ```
 
-The IO handler receives the **unwrapped value**, not the `Output` object. If combined with `context.add_output_metadata()`, both are merged — `Output` metadata takes precedence on key conflicts.
+The IO handler receives the **unwrapped value**, not the `Output` object. If combined with `context.add_output_metadata()`, both are merged — `Output` metadata takes precedence on key conflicts. Metadata the IO handler adds in `handle_output` takes precedence over both.
 
 **Parameters:**
 
