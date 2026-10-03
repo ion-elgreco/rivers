@@ -5,7 +5,10 @@
 //! `CancellationToken` for graceful shutdown from `PyCodeRepository.stop_daemon()`.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU8,
+    Ordering::{AcqRel, Acquire},
+};
 
 use jiff::Timestamp;
 use pyo3::PyTypeInfo;
@@ -94,6 +97,14 @@ impl RunBackendKind {
     }
 }
 
+// `AutomationDaemon::state`: IDLE → STARTING → RUNNING; a failed start-up goes
+// back to IDLE. A `stop()` before RUNNING moves it to STOPPED, so the loop
+// never spawns after `stop()`.
+const IDLE: u8 = 0;
+const STARTING: u8 = 1;
+const RUNNING: u8 = 2;
+const STOPPED: u8 = 3;
+
 struct AutomationDaemon {
     repo: Py<PyCodeRepository>,
     storage: Arc<SurrealStorage>,
@@ -103,9 +114,9 @@ struct AutomationDaemon {
     /// `stop()` / `Drop` await this so we don't return until the runtime is
     /// genuinely free of our work.
     done: CancellationToken,
-    /// Set once `start()` has spawned `daemon_main_loop`. `Drop` only waits on
-    /// `done` when started — otherwise the token never fires and the wait hangs.
-    started: AtomicBool,
+    /// RUNNING once `start()` spawns `daemon_main_loop`. `stop()` and `Drop`
+    /// wait on `done` only then — otherwise the token never fires.
+    state: AtomicU8,
     /// Max ticks retained per automation. `None` disables pruning.
     max_ticks_retained: Option<usize>,
     is_memory_storage: bool,
@@ -124,15 +135,44 @@ impl AutomationDaemon {
             storage,
             cancel: crate::shutdown::drain_token().child_token(),
             done: CancellationToken::new(),
-            started: AtomicBool::new(false),
+            state: AtomicU8::new(IDLE),
             max_ticks_retained: Some(100),
             is_memory_storage,
             condition_eval_interval: std::time::Duration::from_secs(30),
         }
     }
 
-    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+    /// Spawns `daemon_main_loop` once; any other call warns and does nothing.
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
         tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: ENTER");
+        if self
+            .state
+            .compare_exchange(IDLE, STARTING, AcqRel, Acquire)
+            .is_ok()
+        {
+            let config = self.loop_config(py).inspect_err(|_| {
+                let _ = self.state.compare_exchange(STARTING, IDLE, AcqRel, Acquire);
+            })?;
+            if self
+                .state
+                .compare_exchange(STARTING, RUNNING, AcqRel, Acquire)
+                .is_ok()
+            {
+                self.spawn(config);
+                tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: EXIT");
+                return Ok(());
+            }
+        }
+        let message = if self.cancel.is_cancelled() {
+            "AutomationDaemon is stopped; start() did nothing"
+        } else {
+            "AutomationDaemon is already started; start() did nothing"
+        };
+        py.import("warnings")?.call_method1("warn", (message,))?;
+        Ok(())
+    }
+
+    fn loop_config(&self, py: Python<'_>) -> PyResult<DaemonLoopConfig> {
         // Wrapped in `Arc` because the eval dispatcher reuses them per subprocess
         // submit (rebuilt as `(name, class, json_data)` triples in the worker).
         let state = self.repo.get().state.get_attached(py);
@@ -214,49 +254,48 @@ impl AutomationDaemon {
                 .map(|c| c.borrow(py).to_core(py))
         };
 
-        let repo = self.repo.clone_ref(py).into();
-        let storage = self.storage.clone();
-        let cancel = self.cancel.clone();
+        Ok(DaemonLoopConfig {
+            schedule_infos: schedules,
+            sensor_infos: sensors,
+            asset_conditions,
+            upstream_partition_keys,
+            repo: Arc::new(self.repo.clone_ref(py)),
+            storage: self.storage.clone(),
+            cancel: self.cancel.clone(),
+            loky_executor,
+            resources,
+            max_ticks_retained: self.max_ticks_retained,
+            is_memory_storage: self.is_memory_storage,
+            condition_eval_interval: self.condition_eval_interval,
+            run_queue_config,
+        })
+    }
 
-        let max_ticks_retained = self.max_ticks_retained;
-        let is_memory_storage = self.is_memory_storage;
-        let condition_eval_interval = self.condition_eval_interval;
-
+    fn spawn(&self, config: DaemonLoopConfig) {
         let done = self.done.clone();
         tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: spawning daemon_main_loop on rt()");
         let handle = rt().spawn(async move {
             tracing::trace!(target: "rivers::dbg::daemon", "daemon_main_loop task: STARTED");
-            daemon_main_loop(DaemonLoopConfig {
-                schedule_infos: schedules,
-                sensor_infos: sensors,
-                asset_conditions,
-                upstream_partition_keys,
-                repo,
-                storage,
-                cancel,
-                loky_executor,
-                resources,
-                max_ticks_retained,
-                is_memory_storage,
-                condition_eval_interval,
-                run_queue_config,
-            })
-            .await;
+            daemon_main_loop(config).await;
             tracing::trace!(target: "rivers::dbg::daemon", "daemon_main_loop task: RETURNED, signaling done");
             // Signal completion *after* every subdaemon has joined inside
             // `daemon_main_loop`. `stop()` awaits this token.
             done.cancel();
         });
         crate::shutdown::register_daemon_handle(handle, self.cancel.clone());
-        self.started.store(true, Relaxed);
-        tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: EXIT");
-
-        Ok(())
     }
 
     fn stop(&self, py: Python<'_>) {
         tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.stop: ENTER, cancelling");
         self.cancel.cancel();
+        if self
+            .state
+            .fetch_update(AcqRel, Acquire, |s| (s != RUNNING).then_some(STOPPED))
+            .is_ok()
+        {
+            tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.stop: no loop to wait for");
+            return;
+        }
         // Block until `daemon_main_loop` has joined every subdaemon.
         // Released GIL because the wait runs on the shared tokio runtime —
         // some subdaemons may need to acquire GIL during their drain.
@@ -559,7 +598,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
     tracing::trace!(target: "rivers::dbg::daemon", "daemon_main_loop: ALL subdaemons drained, returning");
 }
 
-#[pyclass(name = "AutomationDaemon", module = "rivers._core")]
+#[pyclass(name = "AutomationDaemon", module = "rivers._core", frozen)]
 pub struct PyAutomationDaemon {
     inner: AutomationDaemon,
 }
@@ -583,7 +622,7 @@ impl PyAutomationDaemon {
         Ok(Self { inner: daemon })
     }
 
-    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
         self.inner.start(py)
     }
 
@@ -597,9 +636,9 @@ impl Drop for PyAutomationDaemon {
     fn drop(&mut self) {
         self.inner.cancel.cancel();
         // Safety net if dropped without `stop()`: wait for `daemon_main_loop`'s
-        // drain. Skipped if never started (`done` never fires) or finalizing
+        // drain. Skipped if the loop never spawned (`done` never fires) or finalizing
         // (`try_attach` → None) — draining mid-finalize is the race we're closing.
-        if !self.inner.started.load(Relaxed) {
+        if self.inner.state.load(Acquire) != RUNNING {
             return;
         }
         let done = self.inner.done.clone();

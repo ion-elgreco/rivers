@@ -50,11 +50,20 @@ class AutomationDaemon:
         ...
 
     def start(self) -> None:
-        """Spawn the daemon thread; returns immediately."""
+        """Start the daemon's loop in the background; returns immediately.
+
+        A daemon starts once. Another call, from any thread, emits a
+        ``UserWarning`` and does nothing, also after :meth:`stop`. If start-up
+        raises, a later call tries again.
+        """
         ...
 
     def stop(self) -> None:
-        """Signal the daemon to exit and wait for it to drain."""
+        """Signal the daemon to exit and wait for its loop to drain.
+
+        Returns at once if the loop never started. A stopped daemon does not
+        start again: create a new one.
+        """
         ...
 
 class RunQueueConfig:

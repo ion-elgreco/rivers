@@ -132,8 +132,8 @@ At daemon startup, each eval function is classified:
 | Method | Description |
 |--------|-------------|
 | `AutomationDaemon(repo, storage, *, max_ticks_retained=100, condition_eval_interval="30s")` | Create a daemon. `max_ticks_retained` limits stored tick history per automation. `condition_eval_interval` is the interval between automation condition evaluations (human-readable duration, e.g. `"30s"`, `"1m"`). |
-| `start()` | Start evaluation loops for all running schedules and sensors. |
-| `stop()` | Signal all loops to stop and wait for cleanup. |
+| `start()` | Start evaluation loops for all running schedules and sensors. A daemon starts once: another call, from any thread, emits a `UserWarning` and does nothing, also after `stop()`. |
+| `stop()` | Signal all loops to stop and wait for cleanup. A stopped daemon does not start again: create a new one. |
 
 ### `EvalMode`
 
