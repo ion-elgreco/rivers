@@ -26,6 +26,7 @@ use crate::executor::Executor;
 use crate::partitions::PyPartitionKey;
 use crate::repository::PyRunResult;
 use crate::repository::resolved_node::ResolvedNode;
+use crate::storage::DetachOnClose;
 use crate::task::{PyBashTask, PyTask};
 
 #[pyclass(name = "Job", module = "rivers._core")]
@@ -49,7 +50,7 @@ pub struct PyJob {
     /// Storage scoped to the owning code location, set by `CodeRepository`
     /// during resolve. `None` for unresolved jobs. Used by `run_record` (which
     /// short-circuits when this is None) and `execute_run` for materialization.
-    storage: Option<ScopedStorageHandle<SurrealStorage>>,
+    storage: Option<DetachOnClose<ScopedStorageHandle<SurrealStorage>>>,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     /// Repository `retries` registry, copied in by `configure_for_repo` so
     /// named refs on actions resolve at execution time.
@@ -79,7 +80,7 @@ impl PyJob {
     }
 
     pub(crate) fn set_storage(&mut self, storage: ScopedStorageHandle<SurrealStorage>) {
-        self.storage = Some(storage);
+        self.storage = Some(DetachOnClose::new(storage));
     }
 
     pub(crate) fn set_resources(
@@ -637,7 +638,7 @@ impl PyJob {
         }
         let storage = self
             .storage
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
         let registry = self.resolve_io_handler_registry(py)?;
 

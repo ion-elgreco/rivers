@@ -530,7 +530,7 @@ use crate::partitions::{
     PartitionsDefinition, PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange,
     resolve_partitions_def_ref,
 };
-use crate::storage::{PyLaunchedBy, PyStorage, PyStorageType};
+use crate::storage::{DetachOnClose, PyLaunchedBy, PyStorage, PyStorageType};
 use crate::task::{PyBashTask, PyTask};
 
 use self::resolved_node::{ResolvedAsset, ResolvedBashTask, ResolvedNode, ResolvedTask};
@@ -560,7 +560,7 @@ impl PyRunResult {
 pub struct PyRunHandle {
     #[pyo3(get)]
     pub(crate) run_id: String,
-    storage: Arc<SurrealStorage>,
+    storage: DetachOnClose<Arc<SurrealStorage>>,
 }
 
 #[pymethods]
@@ -1540,7 +1540,7 @@ pub(crate) struct ResolvedState {
     pub(crate) jobs_info: HashMap<String, JobSummary>,
     pub(crate) sensors_info: HashMap<String, SensorSummary>,
     pub(crate) schedules_info: HashMap<String, ScheduleSummary>,
-    pub(crate) storage: Arc<SurrealStorage>,
+    pub(crate) storage: DetachOnClose<Arc<SurrealStorage>>,
     pub(crate) storage_type: PyStorageType,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     pub(crate) io_handler_registry: crate::assets::io_handler_registry::IOHandlerRegistry,
@@ -1828,7 +1828,7 @@ impl RepoHandle {
 
         Ok(PyRunHandle {
             run_id: record.run_id,
-            storage,
+            storage: DetachOnClose::new(storage),
         })
     }
 
@@ -3648,7 +3648,7 @@ impl PyCodeRepository {
             jobs_info,
             sensors_info,
             schedules_info,
-            storage: storage_arc,
+            storage: DetachOnClose::new(storage_arc),
             storage_type,
             resources: self
                 .raw_resources
@@ -3822,10 +3822,10 @@ impl PyCodeRepository {
     fn storage(&self) -> PyResult<PyStorage> {
         let state = self.ensure_resolved()?;
         Ok(PyStorage {
-            handle: rivers_core::storage::ScopedStorageHandle::new(
+            handle: DetachOnClose::new(rivers_core::storage::ScopedStorageHandle::new(
                 Arc::clone(&state.storage),
                 rivers_core::storage::CodeLocationContext::new(state.code_location_id.clone()),
-            ),
+            )),
             storage_type: state.storage_type,
         })
     }
@@ -4379,12 +4379,7 @@ impl PyCodeRepository {
     /// Drop the resolved state and the storage it holds; the next call
     /// resolves again. The CLI removes its scratch store after this.
     fn _release_storage(&self, py: Python) {
-        let Some(state) = self.state.replace(py, None) else {
-            return;
-        };
-        let storage = Arc::clone(&state.storage);
-        drop(state);
-        py.detach(move || drop(storage));
+        drop(self.state.replace(py, None));
     }
 
     /// Test helper. Only works when run_queue is configured. `job_name`

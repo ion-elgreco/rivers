@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::automation::PyEvalMode;
 use crate::repository::PyCodeRepository;
 use crate::runtime::rt;
-use crate::storage::{PyStorage, PyStorageType};
+use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 
 mod automation_condition;
 mod automation_entry;
@@ -107,7 +107,7 @@ const STOPPED: u8 = 3;
 
 struct AutomationDaemon {
     repo: Py<PyCodeRepository>,
-    storage: Arc<SurrealStorage>,
+    storage: DetachOnClose<Arc<SurrealStorage>>,
     cancel: CancellationToken,
     /// Cancelled when the spawned `daemon_main_loop` task fully exits
     /// (after every subdaemon has joined and in-flight runs are drained).
@@ -132,7 +132,7 @@ impl AutomationDaemon {
     ) -> Self {
         Self {
             repo,
-            storage,
+            storage: DetachOnClose::new(storage),
             cancel: crate::shutdown::drain_token().child_token(),
             done: CancellationToken::new(),
             state: AtomicU8::new(IDLE),
