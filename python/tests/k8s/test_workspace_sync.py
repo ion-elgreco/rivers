@@ -28,15 +28,30 @@ the error the script found, a failed git fetch with the last lines of git's
 error, or the time budget the build ran past. When ``uv`` fails, the
 termination log stays empty, so kubelet reports the tail of the log, where
 uv's error is (``FallbackToLogsOnError``).
+
+Run and step pods mount a shared tree read-only, so Python cannot write
+bytecode into it. The shared build compiles, with 4 workers, what these pods
+import from the checkout: the project directory, and the directories that
+the venv's ``.pth`` files add from the checkout (editable installs, such as
+the uv workspace members that the project uses). In fallback mode, each pod
+writes to its own tree, and Python writes the bytecode of what it imports,
+so the build compiles nothing.
+
+Once the tree is ready, a pod releases the tree's build lock before it
+deletes old trees or prunes the uv cache, so the pods that wait for the
+same tree start without waiting for these.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import signal
 import sys
 import time
+from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -502,6 +517,80 @@ def test_the_next_prune_deletes_the_tree_a_killed_prune_left(workspace_sync, tmp
     assert _volume(workspace_sync) == [".prune.lock", "tree"]
 
 
+def test_a_pod_waiting_for_the_tree_starts_while_the_builder_prunes_the_uv_cache(
+    workspace_sync,
+):
+    commit = workspace_sync.commit(UV_PROJECT)
+    builder = workspace_sync.start(commit, shared=True, FAKE_UV_HOLD="sync,cache")
+    builder.wait_for("deps mode auto -> uvSync")
+    waiter = workspace_sync.start(commit, shared=True)
+    waiter.wait_for("waiting for the build lock")
+
+    workspace_sync.release("sync")
+
+    assert waiter.exit_code_within(10) == 0, waiter.log()
+    assert "tree became ready while waiting — skipping build" in waiter.log()
+    assert builder.process.poll() is None, builder.log()
+    workspace_sync.release("cache")
+    assert builder.exit_code_within(10) == 0, builder.log()
+    assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
+
+
+# `rm` that, before it deletes a tree that the prune set aside
+# (`.deleting-…`), waits for the test to release "rm".
+_HELD_RM = """\
+import os, sys, time
+from pathlib import Path
+
+if any(Path(arg).name.startswith(".deleting-") for arg in sys.argv[1:]):
+    released = Path(os.environ["FAKE_RELEASED"])
+    while released.is_dir() and not (released / "rm").exists():
+        time.sleep(0.02)
+os.execv(REAL_RM, ["rm", *sys.argv[1:]])
+"""
+
+
+def _holding_tree_deletes(workspace_sync, tmp_path) -> str:
+    """Return a ``PATH`` on which the prune's deletes wait for the release of "rm"."""
+    bin_dir = tmp_path / "held-rm"
+    bin_dir.mkdir()
+    rm = bin_dir / "rm"
+    rm.write_text(f"#!{sys.executable}\nREAL_RM = {shutil.which('rm')!r}\n{_HELD_RM}")
+    rm.chmod(0o755)
+    return f"{bin_dir}{os.pathsep}{workspace_sync.env['PATH']}"
+
+
+# A second pod cannot show this: it could take the prune lock first, and
+# then the pod under test would not delete.
+@pytest.mark.parametrize(
+    "built", [True, False], ids=["pod-that-built-the-tree", "pod-that-waited"]
+)
+def test_the_build_lock_is_free_while_a_pod_deletes_old_trees(
+    workspace_sync, tmp_path, built
+):
+    _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
+    commit = workspace_sync.commit(UV_PROJECT)
+    env = {"PATH": _holding_tree_deletes(workspace_sync, tmp_path), **SERVING_TREE}
+    if built:
+        pod = workspace_sync.start(commit, shared=True, **env)
+    else:
+        # Another pod builds the tree.
+        with workspace_sync.holding_build_lock():
+            pod = workspace_sync.start(commit, shared=True, **env)
+            pod.wait_for("waiting for the build lock")
+            (workspace_sync.tree / ".ready").touch()
+    pod.wait_for(f"prune: removing {EVICTED}")
+
+    assert workspace_sync.build_lock_is_free()
+
+    workspace_sync.release("rm")
+    assert pod.exit_code_within(10) == 0, pod.log()
+    assert _volume(workspace_sync) == [".prune.lock", "tree"]
+    assert workspace_sync.uv_calls() == (
+        [_install(workspace_sync), PRUNE_CACHE] if built else []
+    )
+
+
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])
 @pytest.mark.parametrize("member", ["analytics", "libs/analytics"])
 def test_auto_syncs_a_uv_workspace_member_with_the_root_lock(
@@ -602,6 +691,153 @@ def test_auto_does_not_look_for_a_lock_above_the_repository(workspace_sync):
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> none" in built.stderr
     assert workspace_sync.uv_calls() == []
+
+
+SHARED_LIB = '[project]\nname = "shared"\nversion = "0.1.0"\n'
+MODULE = "X = 1\n"
+
+
+class Layout(NamedTuple):
+    """A repository, and the directories of its checkout that a shared build compiles.
+
+    Attributes:
+        files: Content by path, relative to the repository root.
+        path: The project directory (``RIVERS_GIT_PATH``); empty for a
+            project at the repository root.
+        editable: The directories that ``uv`` installs as editable.
+        compiled: The directories that a shared build compiles, in order.
+    """
+
+    files: dict[str, str]
+    path: str
+    editable: list[str]
+    compiled: list[str]
+
+
+LAYOUTS = [
+    pytest.param(
+        Layout(
+            files={**UV_PROJECT, "pipelines/assets.py": MODULE},
+            path="",
+            editable=[""],
+            compiled=[""],
+        ),
+        id="project-at-the-root",
+    ),
+    pytest.param(
+        Layout(
+            files={
+                "analytics/requirements.txt": "pandas\n",
+                "analytics/pipelines/assets.py": MODULE,
+                "billing/jobs.py": MODULE,
+            },
+            path="analytics",
+            editable=[],
+            compiled=["analytics"],
+        ),
+        id="project-in-a-monorepo",
+    ),
+    pytest.param(
+        Layout(
+            files={
+                **UV_WORKSPACE,
+                "analytics/pyproject.toml": MEMBER,
+                "analytics/src/analytics/assets.py": MODULE,
+                "libs/shared/pyproject.toml": SHARED_LIB,
+                "libs/shared/src/shared/io.py": MODULE,
+                "libs/unused/src/unused/io.py": MODULE,
+            },
+            path="analytics",
+            editable=["analytics/src", "libs/shared/src"],
+            compiled=["analytics", "libs/shared/src"],
+        ),
+        id="uv-workspace-member",
+    ),
+    pytest.param(
+        # A package at the repository root, in flat layout, puts the whole
+        # checkout on sys.path.
+        Layout(
+            files={
+                "pyproject.toml": (
+                    '[project]\nname = "root"\nversion = "0.1.0"\n\n'
+                    '[tool.uv.workspace]\nmembers = ["analytics"]\n'
+                ),
+                "uv.lock": "version = 1\n",
+                "root/io.py": MODULE,
+                "analytics/pyproject.toml": MEMBER,
+                "analytics/pipelines/assets.py": MODULE,
+            },
+            path="analytics",
+            editable=[""],
+            compiled=["analytics", ""],
+        ),
+        id="uv-workspace-root-package",
+    ),
+    pytest.param(
+        Layout(
+            files={
+                "analytics/requirements.txt": "-e ../libs/shared\n",
+                "analytics/pipelines/assets.py": MODULE,
+                "libs/shared/pyproject.toml": SHARED_LIB,
+                "libs/shared/src/shared/io.py": MODULE,
+                "libs/unused/src/unused/io.py": MODULE,
+            },
+            path="analytics",
+            editable=["libs/shared/src"],
+            compiled=["analytics", "libs/shared/src"],
+        ),
+        id="editable-requirement",
+    ),
+]
+
+
+def _build(workspace_sync, tmp_path, layout: Layout, *, shared: bool):
+    """Build the layout's tree; uv also installs ``tmp_path/elsewhere`` editable."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "io.py").write_text(MODULE)
+    src = workspace_sync.tree / "src"
+    editable = [str(src / name) for name in layout.editable] + [str(elsewhere)]
+    env = {"RIVERS_GIT_PATH": layout.path} if layout.path else {}
+    commit = workspace_sync.commit(layout.files)
+    return workspace_sync.run(
+        commit, shared=shared, FAKE_UV_EDITABLE=os.pathsep.join(editable), **env
+    )
+
+
+def _bytecode(path: Path) -> Path:
+    return Path(importlib.util.cache_from_source(str(path)))
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_a_shared_tree_has_the_bytecode_of_what_runs_import_from_the_checkout(
+    workspace_sync, tmp_path, layout
+):
+    built = _build(workspace_sync, tmp_path, layout, shared=True)
+
+    assert built.returncode == 0, built.stderr
+    src = workspace_sync.tree / "src"
+    compiled = [src / name for name in layout.compiled]
+    assert workspace_sync.python3_calls() == [
+        ["-m", "compileall", "-q", "-j", "4", *map(str, compiled)]
+    ]
+    modules = [src / name for name in layout.files if name.endswith(".py")]
+    assert {module: _bytecode(module).exists() for module in modules} == {
+        module: any(module.is_relative_to(directory) for directory in compiled)
+        for module in modules
+    }
+    assert not _bytecode(tmp_path / "elsewhere" / "io.py").exists()
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_a_fallback_tree_gets_no_bytecode_from_the_build(
+    workspace_sync, tmp_path, layout
+):
+    built = _build(workspace_sync, tmp_path, layout, shared=False)
+
+    assert built.returncode == 0, built.stderr
+    assert workspace_sync.python3_calls() == []
+    assert list((workspace_sync.tree / "src").rglob("__pycache__")) == []
 
 
 SSH_URL = "ssh://git@127.0.0.1:1/acme/pipelines.git"

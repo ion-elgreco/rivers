@@ -266,7 +266,13 @@ even a variable that the install uses, such as `UV_INDEX_URL`: after you
 change it, the code-location pods roll out on the same tree. There is no
 way to rebuild a tree on request. To install with the new value, give the
 CodeLocation a new commit, for example an empty commit
-(`git commit --allow-empty`) on its branch.
+(`git commit --allow-empty`) on its branch. Run and step pods cannot write
+Python's compiled files (`__pycache__`) into the tree, so the build
+compiles the files that these pods import from the repository: the files
+of the project directory (`path`), and of editable installs from the
+repository, such as uv workspace members. If your code imports other files
+of the repository, for example through `sys.path`, each process that
+imports them compiles them again.
 
 **Fallback mode** (the default,
 `codeLocation.workspace.shared.enabled=false`): every pod builds its own
@@ -385,6 +391,11 @@ a value that is not a whole number, it deletes no tree, and its init
 container log gives the reason. Before the pod deletes a tree, it renames
 it to `.deleting-<key>-…`. If the pod stops during a deletion, no part of
 the tree stays under its key, and the next pod start deletes the rest.
+The pod deletes old trees, and prunes the uv cache, in its init container
+after its own tree is ready, so its main container starts only after that.
+On NFS or EFS, the deletion of a tree with many files can take minutes.
+Other pods that wait for the same tree do not wait for the deletion or the
+prune.
 
 **Back to image mode**: when you remove `spec.git`, the operator rolls
 the code-location pods out on `spec.image`. It clears `status.runSource`,
