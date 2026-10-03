@@ -7,9 +7,15 @@ Fallback pods install without a cache, so there is nothing to prune.
 Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 ``uv.lock``, else its ``requirements.txt``. A member of a uv workspace has no
 ``uv.lock`` of its own, so ``auto`` uses the lock at the workspace root.
+
+The url's scheme picks the git Secret's keys, as in the operator: ``ssh://``
+urls use ``identity`` and ``known_hosts``, other urls ``username`` and
+``password``.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -181,3 +187,82 @@ def test_auto_does_not_look_for_a_lock_above_the_repository(workspace_sync):
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> none" in built.stderr
     assert workspace_sync.uv_calls() == []
+
+
+SSH_URL = "ssh://git@127.0.0.1:1/acme/pipelines.git"
+
+
+def _git_secret(workspace_sync, *keys: str) -> None:
+    for key in keys:
+        (workspace_sync.creds / key).write_text(f"{key}\n")
+
+
+def test_a_non_ssh_url_ignores_the_ssh_keys_of_the_git_secret(workspace_sync):
+    commit = workspace_sync.commit(UV_PROJECT)
+    _git_secret(workspace_sync, "identity")
+
+    built = workspace_sync.run(commit, shared=False)
+
+    assert built.returncode == 0, built.stderr
+    assert (workspace_sync.tree / ".ready").exists()
+    assert workspace_sync.uv_calls() == [_install(workspace_sync)]
+
+
+@pytest.mark.parametrize(
+    ("keys", "error"),
+    [
+        pytest.param(
+            ["username", "password"],
+            "git Secret has no 'identity' — ssh:// urls need 'identity' and "
+            "'known_hosts'",
+            id="no-identity",
+        ),
+        pytest.param(
+            ["identity", "username", "password"],
+            "git Secret has 'identity' but no 'known_hosts' — refusing SSH without "
+            "host-key pinning",
+            id="no-known-hosts",
+        ),
+    ],
+)
+def test_an_ssh_url_needs_identity_and_known_hosts(workspace_sync, keys, error):
+    commit = workspace_sync.commit(UV_PROJECT)
+    _git_secret(workspace_sync, *keys)
+
+    failed = workspace_sync.run(commit, shared=False, RIVERS_GIT_URL=SSH_URL)
+
+    assert failed.returncode == 1
+    assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
+    assert not (workspace_sync.tree / "src").exists()
+
+
+def test_an_ssh_url_fetches_with_the_identity_and_known_hosts(workspace_sync, tmp_path):
+    commit = workspace_sync.commit(UV_PROJECT)
+    _git_secret(workspace_sync, "identity", "known_hosts", "username", "password")
+    ssh_bin = tmp_path / "ssh-bin"
+    ssh_bin.mkdir()
+    (ssh_bin / "ssh").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" >"$FAKE_SSH_LOG"\nexit 1\n'
+    )
+    (ssh_bin / "ssh").chmod(0o755)
+    ssh_log = tmp_path / "ssh.log"
+
+    workspace_sync.run(
+        commit,
+        shared=False,
+        RIVERS_GIT_URL=SSH_URL,
+        PATH=f"{ssh_bin}{os.pathsep}{workspace_sync.env['PATH']}",
+        FAKE_SSH_LOG=str(ssh_log),
+    )
+
+    creds = workspace_sync.creds
+    assert ssh_log.read_text().splitlines()[:8] == [
+        "-i",
+        f"{creds}/identity",
+        "-o",
+        f"UserKnownHostsFile={creds}/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]

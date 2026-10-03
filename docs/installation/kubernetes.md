@@ -197,16 +197,21 @@ the mode yourself, for example `uvSync` for a workspace member that also
 has a `requirements.txt`. The lockfile should include `rivers` — the
 venv's `rivers` is what runs.
 
-**Credentials Secret keys** (Flux-compatible): `username`/`password` for
-HTTPS (a forge token is a password), or `identity` + `known_hosts` for
-SSH. `identity` must be a private key without a passphrase. `known_hosts`
-is required with `identity` and supports exact and hashed (`|1|`) entries
-only — no `*` wildcards or `@cert-authority` lines; list each host
-explicitly. Each line must be an entry or a comment: the operator refuses
-a `known_hosts` with any other line and does not connect to the host.
-Ed25519, ECDSA and RSA host keys work, not DSA. One key per host is
-enough: the operator asks each host only for the key types that
-`known_hosts` lists for it.
+**Credentials Secret keys** (Flux-compatible): the url's scheme selects
+the keys. `https://` (and `http://`) urls use `username`/`password` (a
+forge token is a password). Without these two keys the fetch is
+anonymous; a Secret with only one of them is an error. `ssh://` urls need
+`identity` + `known_hosts`. The keys of the other scheme are ignored, so
+one Secret with all four keys can serve both kinds of url. `identity`
+must be a private key without a passphrase. `known_hosts` supports exact
+and hashed (`|1|`) entries only — no `*` wildcards or `@cert-authority`
+lines; list each host explicitly. Each line must be an entry or a
+comment: the operator refuses a `known_hosts` with any other line and
+does not connect to the host. Ed25519, ECDSA and RSA host keys work, not
+DSA. One key per host is enough: the operator asks each host only for the
+key types that `known_hosts` lists for it. If `secretRef` names a Secret
+that does not exist, or that the operator may not read, the CodeLocation
+fails with reason `GitAuthFailed`.
 
 **Shared workspace** (recommended where you have RWX storage): set
 `codeLocation.workspace.shared.enabled=true` and the code+venv is built

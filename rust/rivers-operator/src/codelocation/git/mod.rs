@@ -291,9 +291,32 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
     ))
 }
 
+/// How a git url is fetched, by its scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// `https://` or `http://`.
+    Http,
+    /// `ssh://`.
+    Ssh,
+}
+
+impl Transport {
+    pub fn of(url: &str) -> Result<Self, GitError> {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| GitError::Malformed(format!("invalid git url '{url}': {e}")))?;
+        match parsed.scheme() {
+            "http" | "https" => Ok(Transport::Http),
+            "ssh" => Ok(Transport::Ssh),
+            other => Err(GitError::Malformed(format!(
+                "unsupported git url scheme '{other}' (https:// or ssh://)"
+            ))),
+        }
+    }
+}
+
 /// Credential material for a resolve, straight from the CR's Secret. The
 /// SSH transport uses it as contents; nothing is written to disk.
-#[derive(Clone, Default, Hash)]
+#[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub enum GitCredentials {
     #[default]
     Anonymous,
@@ -582,12 +605,8 @@ impl GitResolver {
     }
 
     async fn fetch(&self, req: &GitResolveRequest) -> Result<Vec<u8>, GitError> {
-        let scheme = url::Url::parse(&req.url)
-            .map_err(|e| GitError::Malformed(format!("invalid git url '{}': {e}", req.url)))?
-            .scheme()
-            .to_string();
-        match scheme.as_str() {
-            "http" | "https" => {
+        match Transport::of(&req.url)? {
+            Transport::Http => {
                 let auth = match &req.credentials {
                     GitCredentials::Anonymous => http::GitAuth::Anonymous,
                     GitCredentials::Basic { username, password } => http::GitAuth::Basic {
@@ -596,15 +615,13 @@ impl GitResolver {
                     },
                     GitCredentials::Ssh { .. } => {
                         return Err(GitError::AuthFailed(
-                            "the Secret carries SSH material (identity/known_hosts) but the \
-                             url is http(s) — provide username/password instead"
-                                .to_string(),
+                            "SSH credentials cannot fetch an http(s) url".to_string(),
                         ));
                     }
                 };
                 http::fetch_advertisement(&self.http, &req.url, &auth, self.timeout).await
             }
-            "ssh" => {
+            Transport::Ssh => {
                 let target = ssh::parse_ssh_url(&req.url)?;
                 let GitCredentials::Ssh {
                     private_key_openssh,
@@ -622,9 +639,6 @@ impl GitResolver {
                 };
                 ssh::fetch_advertisement(&target, &auth, self.timeout).await
             }
-            other => Err(GitError::Malformed(format!(
-                "unsupported git url scheme '{other}' (https:// or ssh://)"
-            ))),
         }
     }
 }

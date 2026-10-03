@@ -675,18 +675,39 @@ async fn apply_config_map(
     Ok(())
 }
 
-/// Build [`GitCredentials`] from the CR's Secret. `identity` (+ mandatory
-/// `known_hosts`) selects SSH; `username`+`password` selects basic auth; an
-/// absent secretRef or empty Secret is anonymous.
+/// Build [`GitCredentials`] from the CR's Secret. The url's scheme picks the
+/// keys, like the pod's sync script: `ssh://` needs `identity` + `known_hosts`;
+/// `https://` / `http://` use `username` + `password`, or none for an
+/// anonymous fetch. The other scheme's keys are ignored, so ssh and https
+/// code locations can share one Secret. A Secret that does not exist or
+/// that the operator may not read is an auth failure, not an outage.
 async fn git_credentials(
     git_spec: &rivers_k8s::crd::code_location::GitSource,
     secrets_api: &Api<Secret>,
 ) -> Result<GitCredentials, git::GitError> {
+    let transport = git::Transport::of(&git_spec.url)?;
     let Some(secret_ref) = &git_spec.secret_ref else {
-        return Ok(GitCredentials::Anonymous);
+        return match transport {
+            git::Transport::Http => Ok(GitCredentials::Anonymous),
+            git::Transport::Ssh => Err(git::GitError::AuthFailed(
+                "ssh:// urls need a git Secret (spec.git.secretRef) with `identity` and \
+                 `known_hosts`"
+                    .to_string(),
+            )),
+        };
     };
-    let secret = secrets_api.get(&secret_ref.name).await.map_err(|e| {
-        git::GitError::Unreachable(format!("reading git Secret '{}': {e}", secret_ref.name))
+    let name = &secret_ref.name;
+    let secret = secrets_api.get(name).await.map_err(|e| match e {
+        kube_client::Error::Api(status) if status.code == 404 => {
+            git::GitError::AuthFailed(format!("git Secret '{name}' does not exist"))
+        }
+        kube_client::Error::Api(status) if status.code == 403 => {
+            git::GitError::AuthFailed(format!(
+                "the operator may not read git Secret '{name}': {}",
+                status.message
+            ))
+        }
+        e => git::GitError::Unreachable(format!("reading git Secret '{name}': {e}")),
     })?;
     let data = secret.data.unwrap_or_default();
     let entry = |key: &str| {
@@ -694,26 +715,37 @@ async fn git_credentials(
             .map(|v| String::from_utf8_lossy(&v.0).into_owned())
     };
 
-    if let Some(identity) = entry("identity") {
-        let known_hosts = entry("known_hosts").ok_or_else(|| {
-            git::GitError::KnownHostsUnavailable(format!(
-                "git Secret '{}' has `identity` but no `known_hosts` — refusing SSH without \
-                 host-key pinning",
-                secret_ref.name
-            ))
-        })?;
-        return Ok(GitCredentials::Ssh {
-            private_key_openssh: identity,
-            known_hosts,
-        });
-    }
-    match (entry("username"), entry("password")) {
-        (Some(username), Some(password)) => Ok(GitCredentials::Basic { username, password }),
-        (None, None) => Ok(GitCredentials::Anonymous),
-        _ => Err(git::GitError::AuthFailed(format!(
-            "git Secret '{}' needs both `username` and `password` (or `identity` + `known_hosts`)",
-            secret_ref.name
-        ))),
+    match transport {
+        git::Transport::Ssh => match (entry("identity"), entry("known_hosts")) {
+            (Some(private_key_openssh), Some(known_hosts)) => Ok(GitCredentials::Ssh {
+                private_key_openssh,
+                known_hosts,
+            }),
+            (Some(_), None) => Err(git::GitError::KnownHostsUnavailable(format!(
+                "git Secret '{name}' has `identity` but no `known_hosts` — refusing SSH \
+                 without host-key pinning"
+            ))),
+            (None, known_hosts) => {
+                let missing = match known_hosts {
+                    Some(_) => "`identity`",
+                    None => "`identity` or `known_hosts`",
+                };
+                Err(git::GitError::AuthFailed(format!(
+                    "git Secret '{name}' has no {missing} — ssh:// urls need `identity` and \
+                     `known_hosts`"
+                )))
+            }
+        },
+        git::Transport::Http => match (entry("username"), entry("password")) {
+            (Some(username), Some(password)) => Ok(GitCredentials::Basic { username, password }),
+            (None, None) => Ok(GitCredentials::Anonymous),
+            (Some(_), None) => Err(git::GitError::AuthFailed(format!(
+                "git Secret '{name}' has `username` but no `password`"
+            ))),
+            (None, Some(_)) => Err(git::GitError::AuthFailed(format!(
+                "git Secret '{name}' has `password` but no `username`"
+            ))),
+        },
     }
 }
 
@@ -1968,6 +2000,185 @@ mod tests {
         }
     }
 
+    mod git_secret {
+        use super::*;
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        use k8s_openapi::ByteString;
+
+        const SECRET: &str = "git-creds";
+        const HTTPS: &str = "https://forge.example/acme/pipelines.git";
+        const SSH: &str = "ssh://git@forge.example/acme/pipelines.git";
+        pub(super) const IDENTITY: (&str, &str) = ("identity", "PRIVATE KEY");
+        pub(super) const KNOWN_HOSTS: (&str, &str) =
+            ("known_hosts", "forge.example ssh-ed25519 AAAA");
+        pub(super) const USERNAME: (&str, &str) = ("username", "ci-bot");
+        pub(super) const PASSWORD: (&str, &str) = ("password", "forge-token");
+
+        pub(super) fn secret(keys: &[(&str, &str)]) -> Secret {
+            let data = keys
+                .iter()
+                .map(|(key, value)| (key.to_string(), ByteString(value.as_bytes().to_vec())))
+                .collect();
+            Secret {
+                data: Some(data),
+                ..Default::default()
+            }
+        }
+
+        /// The credentials of a code location on `url`, whose secretRef (if
+        /// `secret_ref`) names [`SECRET`]. A GET of that Secret answers
+        /// `stored`; `None` is a Secret that does not exist.
+        async fn credentials(
+            url: &str,
+            secret_ref: bool,
+            stored: Option<Result<Secret, kube_core::Status>>,
+        ) -> Result<GitCredentials, git::GitError> {
+            let mut state = MockApiState::default();
+            state
+                .secrets
+                .extend(stored.map(|answer| (SECRET.to_string(), answer)));
+            let api = Api::namespaced(mock_client(Arc::new(std::sync::Mutex::new(state))), "y");
+            let source = serde_json::from_value(serde_json::json!({
+                "url": url,
+                "ref": { "branch": "main" },
+                "secretRef": secret_ref.then(|| serde_json::json!({ "name": SECRET })),
+            }))
+            .unwrap();
+            git_credentials(&source, &api).await
+        }
+
+        #[tokio::test]
+        async fn the_url_scheme_picks_the_secret_keys() {
+            let basic = GitCredentials::Basic {
+                username: USERNAME.1.into(),
+                password: PASSWORD.1.into(),
+            };
+            let ssh = GitCredentials::Ssh {
+                private_key_openssh: IDENTITY.1.into(),
+                known_hosts: KNOWN_HOSTS.1.into(),
+            };
+            let shared = [IDENTITY, KNOWN_HOSTS, USERNAME, PASSWORD];
+            let refused = |message: &str| Err(format!("git authentication failed: {message}"));
+            let cases: [(&str, &[(&str, &str)], Result<GitCredentials, String>); 10] = [
+                (HTTPS, &shared, Ok(basic)),
+                (SSH, &shared, Ok(ssh)),
+                (
+                    HTTPS,
+                    &[IDENTITY, KNOWN_HOSTS],
+                    Ok(GitCredentials::Anonymous),
+                ),
+                (HTTPS, &[IDENTITY], Ok(GitCredentials::Anonymous)),
+                (HTTPS, &[], Ok(GitCredentials::Anonymous)),
+                (
+                    HTTPS,
+                    &[IDENTITY, KNOWN_HOSTS, USERNAME],
+                    refused("git Secret 'git-creds' has `username` but no `password`"),
+                ),
+                (
+                    HTTPS,
+                    &[PASSWORD],
+                    refused("git Secret 'git-creds' has `password` but no `username`"),
+                ),
+                (
+                    SSH,
+                    &[USERNAME, PASSWORD],
+                    refused(
+                        "git Secret 'git-creds' has no `identity` or `known_hosts` — ssh:// urls \
+                         need `identity` and `known_hosts`",
+                    ),
+                ),
+                (
+                    SSH,
+                    &[KNOWN_HOSTS, USERNAME, PASSWORD],
+                    refused(
+                        "git Secret 'git-creds' has no `identity` — ssh:// urls need `identity` \
+                         and `known_hosts`",
+                    ),
+                ),
+                (
+                    SSH,
+                    &[IDENTITY, USERNAME, PASSWORD],
+                    Err(
+                        "known_hosts unavailable: git Secret 'git-creds' has `identity` but no \
+                         `known_hosts` — refusing SSH without host-key pinning"
+                            .into(),
+                    ),
+                ),
+            ];
+            for (url, keys, want) in cases {
+                let got = credentials(url, true, Some(Ok(secret(keys)))).await;
+                let keys: Vec<_> = keys.iter().map(|(key, _)| *key).collect();
+                assert_eq!(got.map_err(|e| e.to_string()), want, "{url} with {keys:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn without_a_secret_https_is_anonymous_and_ssh_is_refused() {
+            assert_eq!(
+                credentials(HTTPS, false, None)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Ok(GitCredentials::Anonymous)
+            );
+            assert_eq!(
+                credentials(SSH, false, None)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err("git authentication failed: ssh:// urls need a git Secret \
+                     (spec.git.secretRef) with `identity` and `known_hosts`"
+                    .to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_git_secret_that_is_missing_or_forbidden_is_terminal() {
+            let forbidden = "secrets \"git-creds\" is forbidden: User \
+                             \"system:serviceaccount:rivers:rivers-operator\" cannot get \
+                             resource \"secrets\" in API group \"\" in the namespace \"y\"";
+            let cases = [
+                (
+                    None,
+                    "git authentication failed: git Secret 'git-creds' does not exist".to_string(),
+                ),
+                (
+                    Some(Err(
+                        kube_core::Status::failure(forbidden, "Forbidden").with_code(403)
+                    )),
+                    format!(
+                        "git authentication failed: the operator may not read git Secret \
+                         'git-creds': {forbidden}"
+                    ),
+                ),
+            ];
+            for (stored, message) in cases {
+                let error = credentials(HTTPS, true, stored).await.unwrap_err();
+                assert!(matches!(error, git::GitError::AuthFailed(_)), "{error:?}");
+                assert!(!error.is_transient(), "{error}");
+                assert_eq!(error.to_string(), message);
+            }
+        }
+
+        #[tokio::test]
+        async fn an_api_server_error_reading_the_git_secret_is_transient() {
+            let status =
+                kube_core::Status::failure("etcdserver: request timed out", "InternalError")
+                    .with_code(500);
+
+            let error = credentials(HTTPS, true, Some(Err(status)))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, git::GitError::Unreachable(_)), "{error:?}");
+            assert!(error.is_transient());
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("git host unreachable: reading git Secret 'git-creds': "),
+                "{error}"
+            );
+        }
+    }
+
     mod rollout {
         use super::*;
         use crate::run::test_helpers::{ApiRequest, MockApiState, mock_client};
@@ -2810,6 +3021,52 @@ mod tests {
             assert_eq!(requeue, Action::requeue(Duration::from_secs(60)));
             // The follower leaves the leader's verdict alone.
             assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[tokio::test]
+        async fn https_code_location_fetches_with_the_password_of_a_secret_shared_with_ssh() {
+            use super::git_secret::{IDENTITY, KNOWN_HOSTS, PASSWORD, USERNAME, secret};
+            use base64::Engine as _;
+            use wiremock::matchers::header;
+
+            let forge = MockServer::start().await;
+            let basic = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", USERNAME.1, PASSWORD.1));
+            Mock::given(method("GET"))
+                .and(path(format!("{REPO}/info/refs")))
+                .and(header("authorization", format!("Basic {basic}")))
+                .respond_with(advertisement())
+                .expect(1)
+                .mount(&forge)
+                .await;
+            let cl = make_cl(json!({
+                "git": {
+                    "url": format!("{}{REPO}", forge.uri()),
+                    "ref": { "branch": "main" },
+                    "secretRef": { "name": "git-creds" },
+                },
+                "digest": digest('a'),
+            }));
+            let state = api_with(cl, rolled_out());
+            state.lock().unwrap().secrets.insert(
+                "git-creds".into(),
+                Ok(secret(&[IDENTITY, KNOWN_HOSTS, USERNAME, PASSWORD])),
+            );
+
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            assert_eq!(status["phase"], "Ready", "{status}");
+            assert_eq!(status["resolvedCommit"], commit('a'));
+            assert_eq!(status["resolvedRef"], "refs/heads/main");
+            assert_eq!(
+                source_resolved(&status),
+                ("True", REASON_COMMIT_RESOLVED, commit('a').as_str())
+            );
+            // The tree of the applied Deployment's pod template.
+            assert_eq!(status["runSource"]["git"]["commit"], commit('a'));
+            assert_eq!(status["runSource"]["git"]["secretName"], "git-creds");
         }
     }
 }

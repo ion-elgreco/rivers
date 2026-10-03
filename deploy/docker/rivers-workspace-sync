@@ -30,8 +30,8 @@
 #                     only there does the prune step have siblings to walk
 #   /uv-cache         uv cache, subPath cache/ of the PVC — shared mode
 #                     only; fallback pods install with UV_NO_CACHE
-#   /etc/rivers/git   mounted git Secret: username/password or
-#                     identity + known_hosts
+#   /etc/rivers/git   mounted git Secret: username/password for
+#                     https://, identity + known_hosts for ssh://
 #
 # Ordering invariants (tested by the k3d integration suite):
 #   * .ready is written LAST — a crash mid-build leaves a tree that gets
@@ -67,17 +67,25 @@ die() {
 
 GIT_ARGS=()
 
+# The url's scheme picks the Secret's keys, as in the operator, so one Secret
+# can serve ssh:// and https:// code locations.
 setup_git_auth() {
-    if [ -f "$CREDS_DIR/identity" ]; then
-        [ -f "$CREDS_DIR/known_hosts" ] || die \
-            "git Secret has 'identity' but no 'known_hosts' — refusing SSH without host-key pinning"
-        export GIT_SSH_COMMAND="ssh -i $CREDS_DIR/identity -o UserKnownHostsFile=$CREDS_DIR/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
-    fi
-    if [ -f "$CREDS_DIR/username" ] && [ -f "$CREDS_DIR/password" ]; then
-        local basic
-        basic=$(printf '%s:%s' "$(cat "$CREDS_DIR/username")" "$(cat "$CREDS_DIR/password")" | base64 | tr -d '\n')
-        GIT_ARGS+=(-c "http.extraheader=Authorization: Basic $basic")
-    fi
+    case "$RIVERS_GIT_URL" in
+        ssh://*)
+            [ -f "$CREDS_DIR/identity" ] || die \
+                "git Secret has no 'identity' — ssh:// urls need 'identity' and 'known_hosts'"
+            [ -f "$CREDS_DIR/known_hosts" ] || die \
+                "git Secret has 'identity' but no 'known_hosts' — refusing SSH without host-key pinning"
+            export GIT_SSH_COMMAND="ssh -i $CREDS_DIR/identity -o UserKnownHostsFile=$CREDS_DIR/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+            ;;
+        *)
+            if [ -f "$CREDS_DIR/username" ] && [ -f "$CREDS_DIR/password" ]; then
+                local basic
+                basic=$(printf '%s:%s' "$(cat "$CREDS_DIR/username")" "$(cat "$CREDS_DIR/password")" | base64 | tr -d '\n')
+                GIT_ARGS+=(-c "http.extraheader=Authorization: Basic $basic")
+            fi
+            ;;
+    esac
 }
 
 # ---- build ----------------------------------------------------------------

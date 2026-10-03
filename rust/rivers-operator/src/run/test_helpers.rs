@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Pod, PodStatus};
+use k8s_openapi::api::core::v1::{Pod, PodStatus, Secret};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
@@ -32,6 +32,9 @@ pub struct MockApiState {
     /// An apply replaces only `spec`: the seeded `metadata.generation` and
     /// `status` stand for what the Deployment controller reports.
     pub deployments: BTreeMap<String, Deployment>,
+    /// What a GET of each Secret answers: the Secret, or an API error. A
+    /// Secret not listed is not found.
+    pub secrets: BTreeMap<String, Result<Secret, kube_core::Status>>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -49,6 +52,7 @@ impl Default for MockApiState {
             pods: BTreeMap::new(),
             code_locations,
             deployments: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -92,6 +96,16 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                     } else if let Some(name) = object_name(&path, "deployments") {
                         match s.deployments.get(name) {
                             Some(d) => json_response(200, &serde_json::to_value(d).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
+                    } else if let Some(name) = object_name(&path, "secrets") {
+                        match s.secrets.get(name) {
+                            Some(Ok(secret)) => {
+                                json_response(200, &serde_json::to_value(secret).unwrap())
+                            }
+                            Some(Err(status)) => {
+                                json_response(status.code, &serde_json::to_value(status).unwrap())
+                            }
                             None => json_response(404, &not_found_status()),
                         }
                     } else {
