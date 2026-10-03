@@ -4,6 +4,7 @@
 //! mapping keys from iterable results, bridges Python generators for streaming collect,
 //! and loads fan-out source data via IO handlers for downstream map instances.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -195,11 +196,12 @@ pub(crate) fn collect_mapped_stream(
 }
 
 /// Lazy iterator that loads each mapped result from IO on __next__.
-#[pyclass(module = "rivers._core")]
+/// Threads that share it each get different results.
+#[pyclass(frozen, module = "rivers._core")]
 pub(crate) struct MappedResultsIter {
     mapped_step: String,
     keys: Vec<String>,
-    index: usize,
+    index: AtomicUsize,
     io_handler: Py<PyAny>,
     metadata: Option<HashMap<String, String>>,
     partition: Option<PartitionContext>,
@@ -219,7 +221,7 @@ impl MappedResultsIter {
         Ok(Self {
             mapped_step: mapped_step.to_string(),
             keys,
-            index: 0,
+            index: AtomicUsize::new(0),
             io_handler,
             metadata: mapped_node.metadata(),
             partition,
@@ -233,12 +235,10 @@ impl MappedResultsIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if self.index >= self.keys.len() {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let Some(key) = self.keys.get(self.index.fetch_add(1, Ordering::Relaxed)) else {
             return Err(PyStopIteration::new_err(()));
-        }
-        let key = &self.keys[self.index];
-        self.index += 1;
+        };
         let instance_name = format!("{}__{}", self.mapped_step, key);
         let ctx = Py::new(
             py,

@@ -4,6 +4,7 @@
 //! Reuses existing Rust functions for result extraction, IO handling, etc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -501,11 +502,12 @@ pub fn _reconstruct_partition_context(py: Python, data: Bound<'_, PyDict>) -> Py
 }
 
 /// Lazy iterator for _CollectStreamLoadSpec resolution.
-/// Each __next__ loads one map instance result from IO.
-#[pyclass(module = "rivers._core")]
+/// Each __next__ loads one map instance result from IO; threads that share it
+/// each get different results.
+#[pyclass(frozen, module = "rivers._core")]
 pub struct WorkerCollectStreamIter {
     specs: Vec<Py<PyAny>>, // list of _IOLoadSpec Python objects
-    index: usize,
+    index: AtomicUsize,
 }
 
 #[pymethods]
@@ -514,12 +516,10 @@ impl WorkerCollectStreamIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if self.index >= self.specs.len() {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let Some(spec) = self.specs.get(self.index.fetch_add(1, Ordering::Relaxed)) else {
             return Err(PyStopIteration::new_err(()));
-        }
-        let spec = &self.specs[self.index];
-        self.index += 1;
+        };
         load_from_spec(py, spec)
     }
 }
@@ -603,7 +603,10 @@ pub fn worker_execute_step(
             } else if arg.extract::<PyRef<'_, PyCollectStreamLoadSpec>>().is_ok() {
                 // Streaming collect: return lazy iterator
                 let specs: Vec<Py<PyAny>> = arg.getattr("specs")?.extract()?;
-                let iter = WorkerCollectStreamIter { specs, index: 0 };
+                let iter = WorkerCollectStreamIter {
+                    specs,
+                    index: AtomicUsize::new(0),
+                };
                 Ok(Py::new(py, iter)?.into_any())
             } else {
                 Ok(arg.unbind())
