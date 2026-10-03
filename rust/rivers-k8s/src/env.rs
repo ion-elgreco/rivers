@@ -602,6 +602,7 @@ mod tests {
                 groups: vec![],
                 timeout_seconds: Some(900),
             },
+            runtime_image: "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff".to_string(),
         };
         for volume in [
             WorkspaceVolume::SharedPvc {
@@ -614,7 +615,7 @@ mod tests {
             let pod_env = builder_pod_pieces(&WorkspaceSpec {
                 key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
                 volume: volume.clone(),
-                runtime_image: "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff".to_string(),
+                runtime_image: source.runtime_image.clone(),
                 git_url: source.git.url.clone(),
                 commit: source.git.commit.clone(),
                 git_ref: source.git.r#ref.clone(),
@@ -627,20 +628,7 @@ mod tests {
                 extra_env: vec![],
             })
             .main_env;
-            let vars: Vec<(&str, Option<&str>)> = [
-                ENV_RUN_SOURCE,
-                ENV_WORKSPACE_PVC,
-                ENV_WORKSPACE_EMPTYDIR_LIMIT,
-            ]
-            .into_iter()
-            .map(|name| {
-                let value = pod_env
-                    .iter()
-                    .find(|e| e.name == name)
-                    .and_then(|e| e.value.as_deref());
-                (name, value)
-            })
-            .collect();
+            let vars = workspace_vars(&pod_env);
 
             assert_eq!(
                 with_vars(&vars, detect_git_workspace),
@@ -657,22 +645,23 @@ mod tests {
     #[test]
     fn run_pod_env_hands_its_workspace_volume_to_its_step_jobs() {
         use crate::crd::run::RunSource;
-        use crate::executor::{K8sStepExecutorConfig, build_step_job};
+        use crate::executor::build_step_job;
         use crate::workspace::{
             WorkspaceVolume, consumer_pod_pieces, consumer_spec_from_run_source,
         };
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
         use serde_json::json;
 
+        let image = "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff";
         let source: RunSource = serde_json::from_value(json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
                 "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
             },
             "dependencies": { "mode": "auto" },
+            "runtimeImage": image,
         }))
         .unwrap();
-        let image = "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff";
 
         for (volume, step_volumes) in [
             (
@@ -690,52 +679,14 @@ mod tests {
             ),
         ] {
             // The run executor pod's workspace env, as the operator builds it.
-            let run_pod = consumer_pod_pieces(&consumer_spec_from_run_source(
-                &source,
-                image,
-                volume,
-                vec![],
-            ));
-            let vars: Vec<(&str, Option<&str>)> = [
-                ENV_RUN_SOURCE,
-                ENV_WORKSPACE_PVC,
-                ENV_WORKSPACE_EMPTYDIR_LIMIT,
-            ]
-            .into_iter()
-            .map(|name| {
-                let value = run_pod
-                    .main_env
-                    .iter()
-                    .find(|e| e.name == name)
-                    .and_then(|e| e.value.as_deref());
-                (name, value)
-            })
-            .collect();
+            let run_pod =
+                consumer_pod_pieces(&consumer_spec_from_run_source(&source, volume, vec![]));
 
             // What the in-pod Kubernetes step executor does with that env.
-            let workspace = with_vars(&vars, detect_git_workspace).map(|(source, volume)| {
-                consumer_spec_from_run_source(&source, image, volume, vec![])
+            let config = with_vars(&workspace_vars(&run_pod.main_env), || {
+                step_config(image).with_detected_workspace()
             });
-            let job = build_step_job(
-                &K8sStepExecutorConfig {
-                    worker_image: image.to_string(),
-                    namespace: "rivers".to_string(),
-                    service_account: "rivers-step-worker".to_string(),
-                    worker_cpu: "1".to_string(),
-                    worker_memory: "2Gi".to_string(),
-                    module: "analytics.pipeline".to_string(),
-                    surreal_pod_cfg: SurrealPodConfig::default(),
-                    otel_pod_cfg: OtelPodConfig::default(),
-                    run_id: "run-1".to_string(),
-                    run_cr_name: "run-1".to_string(),
-                    run_cr_uid: "uid-1".to_string(),
-                    code_location_id: "cl-1".to_string(),
-                    extra_env: vec![],
-                    partition_key: None,
-                    workspace,
-                },
-                "parse_document",
-            );
+            let job = build_step_job(&config, "parse_document");
 
             let step_pod = job.spec.unwrap().template.spec.unwrap();
             assert_eq!(
@@ -743,6 +694,121 @@ mod tests {
                 step_volumes
             );
             assert_eq!(step_pod.volumes.unwrap(), run_pod.volumes);
+        }
+    }
+
+    /// The workspace env a pod hands to the pods it launches.
+    fn workspace_vars(env: &[EnvVar]) -> Vec<(&'static str, Option<&str>)> {
+        [
+            ENV_RUN_SOURCE,
+            ENV_WORKSPACE_PVC,
+            ENV_WORKSPACE_EMPTYDIR_LIMIT,
+        ]
+        .into_iter()
+        .map(|name| {
+            let value = env
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref());
+            (name, value)
+        })
+        .collect()
+    }
+
+    fn step_config(worker_image: &str) -> crate::executor::K8sStepExecutorConfig {
+        crate::executor::K8sStepExecutorConfig {
+            worker_image: worker_image.to_string(),
+            namespace: "rivers".to_string(),
+            service_account: "rivers-step-worker".to_string(),
+            worker_cpu: "1".to_string(),
+            worker_memory: "2Gi".to_string(),
+            module: "analytics.pipeline".to_string(),
+            surreal_pod_cfg: SurrealPodConfig::default(),
+            otel_pod_cfg: OtelPodConfig::default(),
+            run_id: "run-1".to_string(),
+            run_cr_name: "run-1".to_string(),
+            run_cr_uid: "uid-1".to_string(),
+            code_location_id: "cl-1".to_string(),
+            extra_env: vec![],
+            partition_key: None,
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn step_jobs_run_their_worker_image_on_the_tree_the_runtime_image_built() {
+        use crate::executor::build_step_job;
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, builder_pod_pieces, workspace_key};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let commit = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+        let runtime = format!(
+            "ghcr.io/acme/rivers-runtime@sha256:{}",
+            "1a2b3c4d".repeat(8)
+        );
+        // Executor.kubernetes(worker_image=...)
+        let worker = format!("ghcr.io/acme/gpu-worker@sha256:{}", "ffee0011".repeat(8));
+
+        for (volume, step_init_images) in [
+            (
+                WorkspaceVolume::SharedPvc {
+                    claim_name: "analytics-workspace".to_string(),
+                },
+                vec![],
+            ),
+            (
+                WorkspaceVolume::EmptyDir {
+                    size_limit: Some(Quantity("5Gi".to_string())),
+                },
+                vec![Some(runtime.clone())],
+            ),
+        ] {
+            let cl_pod = builder_pod_pieces(&WorkspaceSpec {
+                key: workspace_key(commit, &runtime),
+                volume,
+                runtime_image: runtime.clone(),
+                git_url: "https://forge.example/acme/pipelines.git".to_string(),
+                commit: commit.to_string(),
+                git_ref: Some("refs/heads/main".to_string()),
+                path: Some("analytics".to_string()),
+                secret_name: Some("git-creds".to_string()),
+                deps: Default::default(),
+                keep_config_map: None,
+                keep_revisions: None,
+                min_tree_age: None,
+                extra_env: vec![],
+            });
+
+            let config = with_vars(&workspace_vars(&cl_pod.main_env), || {
+                step_config(&worker).with_detected_workspace()
+            });
+            let step_pod = build_step_job(&config, "train")
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap();
+
+            let step = &step_pod.containers[0];
+            assert_eq!(step.image.as_deref(), Some(worker.as_str()));
+            let sub_paths = |mounts: &[k8s_openapi::api::core::v1::VolumeMount]| {
+                mounts
+                    .iter()
+                    .map(|m| m.sub_path.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                sub_paths(step.volume_mounts.as_deref().unwrap_or_default()),
+                sub_paths(&cl_pod.main_mounts),
+                "step Jobs mount the tree the code-location pod built"
+            );
+            let init_images: Vec<_> = step_pod
+                .init_containers
+                .iter()
+                .flatten()
+                .map(|c| c.image.clone())
+                .collect();
+            assert_eq!(init_images, step_init_images);
         }
     }
 

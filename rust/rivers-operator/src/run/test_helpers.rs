@@ -225,6 +225,7 @@ pub fn git_run_source() -> RunSource {
             "ref": "refs/heads/main",
         },
         "dependencies": { "mode": "auto" },
+        "runtimeImage": format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a2b3c4d".repeat(8)),
     }))
     .unwrap()
 }

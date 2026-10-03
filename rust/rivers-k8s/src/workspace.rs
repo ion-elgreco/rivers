@@ -134,17 +134,18 @@ pub fn builder_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
 /// The consumer-side [`WorkspaceSpec`] derived from a Run's stamped
 /// provenance. Shared by the operator (executor pod) and the in-pod
 /// step-Job builder so the two cannot disagree about the tree: same key
-/// computation, same coordinates, no prune surface.
+/// computation, same coordinates, no prune surface. The tree is the one
+/// the source's runtime image built, whatever image the pod's main
+/// container runs.
 pub fn consumer_spec_from_run_source(
-    source: &crate::crd::run::RunSource,
-    runtime_image: &str,
+    source: &RunSource,
     volume: WorkspaceVolume,
     extra_env: Vec<EnvVar>,
 ) -> WorkspaceSpec {
     WorkspaceSpec {
-        key: workspace_key(&source.git.commit, runtime_image),
+        key: source.workspace_key(),
         volume,
-        runtime_image: runtime_image.to_string(),
+        runtime_image: source.runtime_image.clone(),
         git_url: source.git.url.clone(),
         commit: source.git.commit.clone(),
         git_ref: source.git.r#ref.clone(),
@@ -420,6 +421,7 @@ fn run_source(spec: &WorkspaceSpec) -> RunSource {
             secret_name: spec.secret_name.clone(),
         },
         dependencies: spec.deps.clone(),
+        runtime_image: spec.runtime_image.clone(),
     }
 }
 
@@ -565,7 +567,8 @@ mod tests {
                     r#"{"git":{"url":"https://forge.example/acme/pipelines.git","#,
                     r#""commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","#,
                     r#""ref":"refs/heads/main","path":"analytics","secretName":"git-creds"},"#,
-                    r#""dependencies":{"mode":"auto","extras":["dev"],"timeoutSeconds":300}}"#,
+                    r#""dependencies":{"mode":"auto","extras":["dev"],"timeoutSeconds":300},"#,
+                    r#""runtimeImage":"ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff"}"#,
                 ) },
                 { "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" },
             ])

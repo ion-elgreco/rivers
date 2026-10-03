@@ -338,6 +338,7 @@ mod tests {
 
     #[test]
     fn build_cr_stamps_the_pods_own_source() {
+        let runtime = format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a".repeat(32));
         let source = json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
@@ -352,9 +353,10 @@ mod tests {
                 "groups": ["prod"],
                 "timeoutSeconds": 900,
             },
+            "runtimeImage": runtime,
         });
         let config = K8sRunBackendConfig {
-            image: format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a".repeat(32)),
+            image: runtime.clone(),
             source: Some(serde_json::from_value(source.clone()).unwrap()),
             ..test_config()
         };

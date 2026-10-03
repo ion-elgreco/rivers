@@ -20,7 +20,8 @@ use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, CodeLocati
 use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
-use crate::codelocation::DirectoryState;
+use crate::codelocation::reconcile::wanted_image;
+use crate::codelocation::{DirectoryState, ImageRef};
 
 /// Bundle of the kube/cache handles the admission handler reads from. The
 /// `code_locations` API is `Option` so tests can run cache-only; production
@@ -29,14 +30,19 @@ use crate::codelocation::DirectoryState;
 pub(super) struct AdmissionDeps {
     pub directory: Arc<DirectoryState>,
     pub code_locations: Option<Api<CodeLocation>>,
+    /// Default runtime image for git CLs that don't set `spec.image` — the
+    /// operator's `RIVERS_RUNTIME_IMAGE`.
+    pub runtime_image: ImageRef,
 }
 
 impl AdmissionDeps {
+    /// No live `GET`; the chart's default runtime image.
     #[cfg(test)]
     pub fn cache_only(directory: Arc<DirectoryState>) -> Self {
         Self {
             directory,
             code_locations: None,
+            runtime_image: rivers_k8s::defaults::RUNTIME_IMAGE.parse().unwrap(),
         }
     }
 }
@@ -178,9 +184,9 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
     }
 
     // Git-sourced CL: stamp provenance from spec (coordinates) + entry
-    // (pinned commit). The spec cache is populated by the same watcher that
-    // feeds entries, status-independent — a missing spec here means an
-    // image-mode CL, not a race.
+    // (pinned commit and runtime image). The spec cache is populated by the
+    // same watcher that feeds entries, status-independent — a missing spec
+    // here means an image-mode CL, not a race.
     let source = match deps.directory.lookup_spec(ref_ns, ref_name).await {
         Some(spec) if spec.git.is_some() => {
             let git = spec.git.as_ref().expect("checked");
@@ -199,6 +205,7 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
                     secret_name: git.secret_ref.as_ref().map(|s| s.name.clone()),
                 },
                 dependencies: git.dependencies.clone(),
+                runtime_image: entry.image.clone(),
             })
         }
         _ => None,
@@ -215,7 +222,11 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
 /// Escape-hatch provenance: commit, ref, path and dependencies are the
 /// caller's own (e.g. a pod still serving the previous commit), but the url
 /// and Secret must be the CodeLocation's — a fallback-mode run pod mounts
-/// that Secret and sends its credentials to that url.
+/// that Secret and sends its credentials to that url — and so must the
+/// runtime image's repository, since that image runs the init container
+/// that mounts the Secret: the serving tree's (`status.resolvedImage`) or
+/// the one the CL's pods move to (`spec.image`, else the chart default).
+/// Any digest is accepted, as during a rollout.
 async fn check_self_stamped_source(
     source: &RunSource,
     namespace: &str,
@@ -234,9 +245,21 @@ async fn check_self_stamped_source(
         return Err("spec.source.git.url is empty".into());
     }
     validate_git_url("spec.source.git.url", &git.url, allowed_hosts)?;
+    let runtime = source
+        .runtime_image
+        .parse::<ImageRef>()
+        .ok()
+        .filter(|image| image.digest.is_some())
+        .ok_or_else(|| {
+            format!(
+                "spec.source.runtimeImage '{}' is not a digest reference \
+                 (must be of the form 'registry/repo@sha256:...')",
+                source.runtime_image
+            )
+        })?;
 
-    let spec = match lookup_spec_with_fallback(deps, namespace, name).await {
-        Ok(Some(spec)) => spec,
+    let (spec, entry) = match lookup_code_location_with_fallback(deps, namespace, name).await {
+        Ok(Some(found)) => found,
         Ok(None) => {
             return Err(format!(
                 "codeLocation '{name}' not found in namespace '{namespace}'"
@@ -266,6 +289,24 @@ async fn check_self_stamped_source(
              of codeLocation '{namespace}/{name}'",
             show(git.secret_name.as_deref()),
             show(cl_secret),
+        ));
+    }
+    let mut repositories: Vec<String> = entry
+        .and_then(|e| e.image.parse::<ImageRef>().ok())
+        .map(|image| image.repository)
+        .into_iter()
+        .collect();
+    let wanted = wanted_image(&spec, &deps.runtime_image).repository;
+    if !repositories.contains(&wanted) {
+        repositories.push(wanted);
+    }
+    if !repositories.contains(&runtime.repository) {
+        let quoted: Vec<String> = repositories.iter().map(|r| format!("'{r}'")).collect();
+        return Err(format!(
+            "spec.source.runtimeImage '{}' is not in the runtime image repository {} \
+             of codeLocation '{namespace}/{name}'",
+            source.runtime_image,
+            quoted.join(" or "),
         ));
     }
     Ok(())
@@ -524,17 +565,23 @@ async fn lookup_with_fallback(
         .and_then(crate::codelocation::directory::project_entry))
 }
 
-/// The CodeLocation's spec: cache first, then a one-shot live `GET`
-/// ([`live_get`]).
-async fn lookup_spec_with_fallback(
+/// The CodeLocation's spec and, once it has a status, its directory entry:
+/// both from the cache, else both from one live `GET` ([`live_get`]).
+async fn lookup_code_location_with_fallback(
     deps: &AdmissionDeps,
     namespace: &str,
     name: &str,
-) -> anyhow::Result<Option<Arc<CodeLocationSpec>>> {
-    if let Some(spec) = deps.directory.lookup_spec(namespace, name).await {
-        return Ok(Some(spec));
+) -> anyhow::Result<Option<(Arc<CodeLocationSpec>, Option<CodeLocationEntry>)>> {
+    if let (Some(spec), Some(entry)) = (
+        deps.directory.lookup_spec(namespace, name).await,
+        deps.directory.lookup(namespace, name).await,
+    ) {
+        return Ok(Some((spec, Some(entry))));
     }
-    Ok(live_get(deps, name).await?.map(|cl| Arc::new(cl.spec)))
+    Ok(live_get(deps, name).await?.map(|cl| {
+        let entry = crate::codelocation::directory::project_entry(&cl);
+        (Arc::new(cl.spec), entry)
+    }))
 }
 
 /// The live `GET` MUST be a quorum read against etcd — kube's default
@@ -677,6 +724,40 @@ mod tests {
     }
 
     const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+    /// Repository of the chart's default runtime image, which a git CL
+    /// without `spec.image` runs ([`AdmissionDeps::cache_only`]).
+    fn runtime_repository() -> String {
+        rivers_k8s::defaults::RUNTIME_IMAGE
+            .parse::<ImageRef>()
+            .unwrap()
+            .repository
+    }
+
+    /// Runtime image digest `c` — `runtime('a')` is the CL's resolved one.
+    fn runtime(c: char) -> String {
+        format!(
+            "{}@sha256:{}",
+            runtime_repository(),
+            c.to_string().repeat(64)
+        )
+    }
+
+    /// Unrelated to any CL's runtime image.
+    fn gpu_worker() -> String {
+        format!("ghcr.io/acme/gpu-worker@sha256:{}", "f".repeat(64))
+    }
+
+    fn with_runtime_image(image: &str) -> RunSource {
+        RunSource {
+            runtime_image: image.to_string(),
+            ..expected_run_source()
+        }
+    }
+
+    async fn expect_accepted(run: &Run, deps: &AdmissionDeps) {
+        let req = admission_request_create("uid-hatch", "team-data", run);
+        assert_eq!(mutate_run(&req, deps).await, RunOutcome::AcceptedAsIs);
+    }
 
     /// Directory state for a git-sourced CL: entry with a pinned commit AND
     /// the cached spec (the webhook stamps coordinates from both halves).
@@ -685,7 +766,7 @@ mod tests {
         let mut entry = ready_entry(
             ns,
             name,
-            "ghcr.io/rt@sha256:1a2b3c4dff",
+            &runtime('a'),
             "analytics.pipeline",
             "11111111-1111-4111-8111-111111111111",
         );
@@ -710,12 +791,21 @@ mod tests {
         .unwrap()
     }
 
-    /// Only the cached spec of `team-data/analytics` — all the escape hatch reads.
+    /// `team-data/analytics` with `spec`, Ready on runtime image `runtime('a')`.
     async fn spec_directory(spec: serde_json::Value) -> Arc<DirectoryState> {
         let state = Arc::new(DirectoryState::new());
         let spec: CodeLocationSpec = serde_json::from_value(spec).unwrap();
         state
             .upsert_spec("team-data", "analytics", Arc::new(spec))
+            .await;
+        state
+            .upsert(ready_entry(
+                "team-data",
+                "analytics",
+                &runtime('a'),
+                "analytics.pipeline",
+                "11111111-1111-4111-8111-111111111111",
+            ))
             .await;
         state
     }
@@ -745,6 +835,7 @@ mod tests {
                 secret_name: Some("git-creds".to_string()),
             },
             dependencies: serde_json::from_value(serde_json::json!({ "mode": "uvSync" })).unwrap(),
+            runtime_image: runtime('a'),
         }
     }
 
@@ -755,7 +846,12 @@ mod tests {
         let req = admission_request_create("uid-git-1", "team-data", &run);
         match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
             RunOutcome::Mutated { image, source, .. } => {
-                assert_eq!(image, "ghcr.io/rt@sha256:1a2b3c4dff");
+                assert_eq!(image, runtime('a'));
+                // The tree is the commit built with the CL's runtime image.
+                assert_eq!(
+                    serde_json::to_value(&source).unwrap()["runtimeImage"],
+                    runtime('a')
+                );
                 assert_eq!(source, Some(expected_run_source()));
             }
             other => panic!("expected Mutated, got {other:?}"),
@@ -949,16 +1045,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escape_hatch_builds_trees_only_with_the_code_locations_runtime_repository() {
+        // The source's runtime image runs the sync init container, which
+        // mounts the CodeLocation's git Secret in fallback mode.
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+
+        // Another digest of the same repository: a runtime image rollout.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+
+        let other = gpu_worker();
+        assert_eq!(
+            expect_rejected(&self_stamped_run(with_runtime_image(&other)), &deps).await,
+            format!(
+                "spec.source.runtimeImage '{other}' is not in the runtime image repository \
+                 '{}' of codeLocation 'team-data/analytics'",
+                runtime_repository()
+            )
+        );
+        let tagged = format!("{}:0.5.0-py3.12", runtime_repository());
+        assert_eq!(
+            expect_rejected(&self_stamped_run(with_runtime_image(&tagged)), &deps).await,
+            format!(
+                "spec.source.runtimeImage '{tagged}' is not a digest reference \
+                 (must be of the form 'registry/repo@sha256:...')"
+            )
+        );
+    }
+
+    /// A git CL whose pods are up before its first rollout completed: a
+    /// status without `resolvedImage`.
+    async fn before_the_first_rollout() -> AdmissionDeps {
+        let state = git_directory("team-data", "analytics", COMMIT).await;
+        let mut entry = state.lookup("team-data", "analytics").await.unwrap();
+        entry.image = String::new();
+        entry.phase = CodeLocationPhase::Deploying.as_str().to_string();
+        state.upsert(entry).await;
+        AdmissionDeps::cache_only(state)
+    }
+
+    const MIRROR: &str = "harbor.internal/rivers/rivers-runtime";
+
+    /// A git CL whose `spec.image` moved to [`MIRROR`] while runs still get
+    /// the tree built with the chart's default runtime image.
+    async fn while_spec_image_moves_to_the_mirror() -> AdmissionDeps {
+        let mut spec = serde_json::to_value(git_spec()).unwrap();
+        spec["image"] = serde_json::json!(MIRROR);
+        AdmissionDeps::cache_only(spec_directory(spec).await)
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_the_wanted_runtime_repository_before_the_first_rollout() {
+        let deps = before_the_first_rollout().await;
+
+        // No spec.image: the chart's default runtime image.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_both_runtime_repositories_while_spec_image_changes() {
+        let deps = while_spec_image_moves_to_the_mirror().await;
+
+        // Pods still on the previous repository, and those of the new one.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+        let new = format!("{MIRROR}@sha256:{}", "c".repeat(64));
+        expect_accepted(&self_stamped_run(with_runtime_image(&new)), &deps).await;
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_runtime_images_outside_the_runtime_repositories() {
+        let run = self_stamped_run(with_runtime_image(&gpu_worker()));
+        for (deps, repositories) in [
+            (
+                before_the_first_rollout().await,
+                format!("'{}'", runtime_repository()),
+            ),
+            (
+                while_spec_image_moves_to_the_mirror().await,
+                format!("'{}' or '{MIRROR}'", runtime_repository()),
+            ),
+        ] {
+            assert_eq!(
+                expect_rejected(&run, &deps).await,
+                format!(
+                    "spec.source.runtimeImage '{}' is not in the runtime image repository \
+                     {repositories} of codeLocation 'team-data/analytics'",
+                    gpu_worker()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn escape_hatch_reads_codelocation_with_live_get_on_cache_miss() {
         use crate::run::test_helpers::{MockApiState, mock_client};
         let api_state = Arc::new(std::sync::Mutex::new(MockApiState::default()));
-        api_state.lock().unwrap().code_locations.insert(
-            "analytics".to_string(),
-            CodeLocation::new("analytics", git_spec()),
+        let mut cl = CodeLocation::new("analytics", git_spec());
+        cl.metadata.namespace = Some("team-data".to_string());
+        cl.status = Some(
+            serde_json::from_value(serde_json::json!({
+                "phase": "Ready",
+                "resolvedImage": runtime('a'),
+                "resolvedCommit": COMMIT,
+            }))
+            .unwrap(),
         );
+        api_state
+            .lock()
+            .unwrap()
+            .code_locations
+            .insert("analytics".to_string(), cl);
         let deps = AdmissionDeps {
-            directory: Arc::new(DirectoryState::new()),
             code_locations: Some(Api::namespaced(mock_client(api_state.clone()), "team-data")),
+            ..AdmissionDeps::cache_only(Arc::new(DirectoryState::new()))
         };
 
         let mut source = expected_run_source();

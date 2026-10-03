@@ -293,7 +293,7 @@ pub struct CodeLocationStatus {
     /// Fully-qualified digest reference (`repo@sha256:...`) that the
     /// reconciler has pinned. For multi-arch images this is the index digest,
     /// so each node can still descend into per-platform manifests at pull time.
-    /// In git mode, the runtime image of `runSource`'s tree.
+    /// In git mode, `runSource.runtimeImage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_image: Option<String>,
 
@@ -723,6 +723,7 @@ mod tests {
                 "ref": "refs/heads/main",
                 "secretName": "git-creds",
             },
+            "runtimeImage": "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff",
         }))
         .unwrap();
         let status = CodeLocationStatus {

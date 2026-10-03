@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         git: Arc::new(codelocation::git::GitResolver::new(
             std::time::Duration::from_secs(git_timeout),
         )),
-        runtime_image,
+        runtime_image: runtime_image.clone(),
         workspace: workspace_cfg,
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
@@ -175,7 +175,14 @@ async fn main() -> anyhow::Result<()> {
         directory_state.clone(),
         Some(synced.clone()),
     )?;
-    spawn_webhook_server(client.clone(), namespace.clone(), directory_state, synced).await?;
+    spawn_webhook_server(
+        client.clone(),
+        namespace.clone(),
+        directory_state,
+        runtime_image,
+        synced,
+    )
+    .await?;
 
     tracing::info!(%pod_identity, "starting rivers-operator");
 
@@ -271,6 +278,7 @@ async fn spawn_webhook_server(
     client: Client,
     namespace: String,
     directory: Arc<codelocation::DirectoryState>,
+    runtime_image: codelocation::ImageRef,
     synced: webhook::Synced,
 ) -> anyhow::Result<()> {
     if std::env::var(WEBHOOK_DISABLED_ENV).as_deref() == Ok("1") {
@@ -303,6 +311,7 @@ async fn spawn_webhook_server(
             key_path,
             server_directory,
             code_locations_api,
+            runtime_image,
             synced,
         )
         .await

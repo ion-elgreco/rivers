@@ -13,7 +13,7 @@ use crate::codelocation::WorkspaceConfig;
 /// Consumer-side workspace for a git-mode run, or `None` for image mode.
 /// Derived from the Run's stamped `spec.source`, its CodeLocation's spec and
 /// the chart config; the same spec shape the step-Job builder rebuilds
-/// in-pod from `RIVERS_RUN_SOURCE`.
+/// in-pod from `RIVERS_RUN_SOURCE`. `spec.image` runs on that tree.
 fn run_workspace_spec(
     run: &Run,
     workspace_cfg: &WorkspaceConfig,
@@ -22,7 +22,6 @@ fn run_workspace_spec(
     run.spec.source.as_ref().map(|source| {
         workspace::consumer_spec_from_run_source(
             source,
-            &run.spec.image,
             workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
             cl_spec.env.clone(),
         )
@@ -283,21 +282,88 @@ mod tests {
         )
     }
 
+    const RUNTIME: &str = "ghcr.io/acme/rivers-runtime@sha256:\
+                           1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d";
+    const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+
     fn git_run() -> Run {
         let mut run = test_run();
         run.spec.source = Some(
             serde_json::from_value(serde_json::json!({
                 "git": {
                     "url": "https://forge.example/acme/pipelines.git",
-                    "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                    "commit": COMMIT,
                     "ref": "refs/heads/main",
                     "path": "analytics",
                 },
                 "dependencies": { "mode": "uvSync" },
+                "runtimeImage": RUNTIME,
             }))
             .unwrap(),
         );
         run
+    }
+
+    #[test]
+    fn git_run_executor_pod_runs_its_image_on_the_tree_its_runtime_image_built() {
+        // RunBackendConfig.kubernetes(image=...) in a git CodeLocation: the
+        // run carries the code-location pod's source and another image.
+        let image = format!("ghcr.io/acme/gpu-worker@sha256:{}", "ffee0011".repeat(8));
+        let mut run = git_run();
+        run.spec.image = image.clone();
+
+        for (shared_enabled, init_images) in
+            [(true, vec![]), (false, vec![Some(RUNTIME.to_string())])]
+        {
+            let pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &CodeLocationSpec::default(),
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig {
+                    shared_enabled,
+                    ..Default::default()
+                },
+            );
+            let pod_spec = pod.spec.unwrap();
+            let c = &pod_spec.containers[0];
+
+            assert_eq!(c.image.as_deref(), Some(image.as_str()));
+            let sub_paths: Vec<_> = c
+                .volume_mounts
+                .iter()
+                .flatten()
+                .map(|m| m.sub_path.clone())
+                .collect();
+            assert_eq!(
+                sub_paths,
+                vec![Some(workspace::workspace_key(COMMIT, RUNTIME))],
+                "shared_enabled={shared_enabled}"
+            );
+            let inits: Vec<_> = pod_spec
+                .init_containers
+                .iter()
+                .flatten()
+                .map(|c| c.image.clone())
+                .collect();
+            assert_eq!(inits, init_images, "shared_enabled={shared_enabled}");
+            // …and hands the same tree to its step Jobs.
+            let hop = c
+                .env
+                .iter()
+                .flatten()
+                .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)
+                .and_then(|e| e.value.as_deref())
+                .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap());
+            assert_eq!(
+                hop.map(|source| source["runtimeImage"].clone()),
+                Some(serde_json::json!(RUNTIME)),
+                "shared_enabled={shared_enabled}"
+            );
+        }
     }
 
     #[test]

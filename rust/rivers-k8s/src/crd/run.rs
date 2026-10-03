@@ -115,21 +115,32 @@ pub struct RunSpec {
     /// Git provenance for runs against a git-sourced CodeLocation
     /// (RFC-044). Stamped on CREATE by the admission webhook from the CL's
     /// status, or, for a digest-pinned `image`, by the code-location pod
-    /// that launches the run (the commit of its own tree); immutable after;
-    /// absent for image-mode runs. In shared workspace mode nothing
-    /// downstream fetches from these coordinates — they are the run's
-    /// provenance record and the UI's "which commit?".
+    /// that launches the run (its own tree); immutable after; absent for
+    /// image-mode runs. In shared workspace mode nothing downstream fetches
+    /// from these coordinates: the commit and runtime image name the tree
+    /// to mount, the rest is the run's provenance record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RunSource>,
 }
 
-/// Pinned git source of a run.
+/// Pinned git source of a run: the tree its pods run.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSource {
     pub git: GitCoordinates,
     #[serde(default)]
     pub dependencies: crate::crd::code_location::Dependencies,
+    /// Digest-pinned runtime image the tree's venv is built with — the
+    /// CodeLocation's resolved runtime image. It runs the workspace init
+    /// container; `spec.image` runs only the main container.
+    pub runtime_image: String,
+}
+
+impl RunSource {
+    /// Subpath of this tree on the workspace volume.
+    pub fn workspace_key(&self) -> String {
+        crate::workspace::workspace_key(&self.git.commit, &self.runtime_image)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

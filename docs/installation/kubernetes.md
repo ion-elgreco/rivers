@@ -228,10 +228,11 @@ wheels is in the container's `/tmp`, outside this limit.
 After a push, the operator rolls the code-location pods to the new
 commit, but `status.resolvedCommit` moves to it only when every pod runs
 it and is ready. `status.runSource` records that tree's full source (url,
-commit, path, Secret, dependencies) and `status.resolvedImage` its
-runtime image; both move with `resolvedCommit`. Until then runs keep the
-previous commit, and if the new commit fails to build they keep it until
-a later commit rolls out. Meanwhile the CodeLocation stays `Ready`: the git
+commit, path, Secret, dependencies, and the runtime image that built it,
+which is also `status.resolvedImage`); it moves with `resolvedCommit`.
+Until then runs keep the previous commit, and if the new commit fails to
+build they keep it until a later commit rolls out. Meanwhile the
+CodeLocation stays `Ready`: the git
 Deployment never takes an old pod down before its replacement is ready, so
 `spec.replicas` pods stay ready throughout (a rollout needs room for one
 extra pod). A `Run` you create yourself without `image` gets this commit.
@@ -240,6 +241,21 @@ backfills) pins the commit that pod serves, so during a rollout each run
 uses the same tree as the pod that launched it. To wait until a push is
 live:
 `kubectl -n rivers wait rcl/analytics --for=jsonpath='{.status.resolvedCommit}'=<sha>`.
+
+**Other images for run and step pods**: in git mode,
+`RunBackendConfig.kubernetes(image=...)` and
+`Executor.kubernetes(worker_image=...)` replace only the image of the
+main container of run and step pods. These pods still run the tree that
+the runtime image built: the checkout and the venv. The run records that
+image in `spec.source.runtimeImage`, and in fallback mode the init
+container that builds the pod's tree runs it. The main container starts
+`/workspace/venv/bin/rivers`, so its image must have the same Python
+version at the same path as the runtime image: build it `FROM` the
+runtime image. A `Run` you create with a digest `image` and your own
+`spec.source` must set `spec.source.runtimeImage` to a digest in the
+CodeLocation's runtime image repository: that of `spec.image` (or of the
+chart's default runtime image), or, while a change of `spec.image` rolls
+out, that of `status.resolvedImage`. The webhook rejects other images.
 
 **Egress**: in shared mode only the code-location pod needs outbound
 access to the git host and the package index (run/step pods fetch

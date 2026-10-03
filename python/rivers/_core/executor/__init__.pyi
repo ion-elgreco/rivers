@@ -66,6 +66,8 @@ class Executor:
 
         Args:
             worker_image: Container image; defaults to the running image when ``None``.
+                With a git-sourced CodeLocation it runs the code location's tree,
+                so build it ``FROM`` the runtime image.
             max_concurrent_steps: Cap on concurrent step pods.
             namespace: Target namespace.
             service_account: Service account to bind to step pods.

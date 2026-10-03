@@ -993,6 +993,7 @@ mod tests {
                 "secretName": "git-creds",
             },
             "dependencies": { "mode": "uvSync", "extras": ["ml"] },
+            "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dff",
         }))
         .unwrap();
         let fallback = rivers_k8s::workspace::WorkspaceVolume::EmptyDir {

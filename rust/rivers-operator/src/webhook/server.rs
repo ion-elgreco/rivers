@@ -36,7 +36,7 @@ use kube_core::admission::AdmissionReview;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
 
-use crate::codelocation::DirectoryState;
+use crate::codelocation::{DirectoryState, ImageRef};
 use crate::webhook::admission::{
     AdmissionDeps, handle_codelocation_admission, handle_run_admission,
 };
@@ -90,12 +90,14 @@ pub async fn serve(
     key_path: PathBuf,
     directory: Arc<DirectoryState>,
     code_locations: Api<CodeLocation>,
+    runtime_image: ImageRef,
     synced: Synced,
 ) -> Result<()> {
     let state = WebhookState {
         deps: AdmissionDeps {
             directory,
             code_locations: Some(code_locations),
+            runtime_image,
         },
         synced,
     };

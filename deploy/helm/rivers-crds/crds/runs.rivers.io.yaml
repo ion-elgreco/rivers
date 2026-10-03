@@ -148,10 +148,10 @@ spec:
                   Git provenance for runs against a git-sourced CodeLocation
                   (RFC-044). Stamped on CREATE by the admission webhook from the CL's
                   status, or, for a digest-pinned `image`, by the code-location pod
-                  that launches the run (the commit of its own tree); immutable after;
-                  absent for image-mode runs. In shared workspace mode nothing
-                  downstream fetches from these coordinates — they are the run's
-                  provenance record and the UI's "which commit?".
+                  that launches the run (its own tree); immutable after; absent for
+                  image-mode runs. In shared workspace mode nothing downstream fetches
+                  from these coordinates: the commit and runtime image name the tree
+                  to mount, the rest is the run's provenance record.
                 nullable: true
                 properties:
                   dependencies:
@@ -220,8 +220,15 @@ spec:
                     - commit
                     - url
                     type: object
+                  runtimeImage:
+                    description: |-
+                      Digest-pinned runtime image the tree's venv is built with — the
+                      CodeLocation's resolved runtime image. It runs the workspace init
+                      container; `spec.image` runs only the main container.
+                    type: string
                 required:
                 - git
+                - runtimeImage
                 type: object
               surrealEndpoint:
                 default: ws://surrealdb.rivers.svc:8000

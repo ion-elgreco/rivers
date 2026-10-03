@@ -41,6 +41,19 @@ pub struct K8sStepExecutorConfig {
     pub workspace: Option<crate::workspace::WorkspaceSpec>,
 }
 
+impl K8sStepExecutorConfig {
+    /// Git mode (RFC-044): step Jobs mount the tree this pod runs, from the
+    /// `RIVERS_RUN_SOURCE` and workspace volume env the operator stamped on
+    /// it; `worker_image` runs on that tree. Image mode leaves `workspace`
+    /// unset.
+    pub fn with_detected_workspace(mut self) -> Self {
+        self.workspace = crate::env::detect_git_workspace().map(|(source, volume)| {
+            crate::workspace::consumer_spec_from_run_source(&source, volume, self.extra_env.clone())
+        });
+        self
+    }
+}
+
 /// `rivers` entrypoint for a step pod: the image-level binary in image
 /// mode, the workspace venv's in git mode (uniform across deps modes — the
 /// sync script shims it for `none`).
@@ -389,14 +402,10 @@ mod tests {
                 "secretName": "git-creds",
             },
             "dependencies": { "mode": "uvSync" },
+            "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dffff",
         }))
         .unwrap();
-        crate::workspace::consumer_spec_from_run_source(
-            &source,
-            "ghcr.io/rt@sha256:1a2b3c4dffff",
-            volume,
-            vec![],
-        )
+        crate::workspace::consumer_spec_from_run_source(&source, volume, vec![])
     }
 
     #[test]

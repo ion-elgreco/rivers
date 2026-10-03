@@ -432,7 +432,7 @@ spec:
                   Fully-qualified digest reference (`repo@sha256:...`) that the
                   reconciler has pinned. For multi-arch images this is the index digest,
                   so each node can still descend into per-platform manifests at pull time.
-                  In git mode, the runtime image of `runSource`'s tree.
+                  In git mode, `runSource.runtimeImage`.
                 nullable: true
                 type: string
               resolvedRef:
@@ -515,8 +515,15 @@ spec:
                     - commit
                     - url
                     type: object
+                  runtimeImage:
+                    description: |-
+                      Digest-pinned runtime image the tree's venv is built with — the
+                      CodeLocation's resolved runtime image. It runs the workspace init
+                      container; `spec.image` runs only the main container.
+                    type: string
                 required:
                 - git
+                - runtimeImage
                 type: object
               source:
                 description: |-

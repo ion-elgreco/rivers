@@ -364,7 +364,7 @@ async fn reconcile_git(
             let retry = failure
                 .retry_after
                 .unwrap_or_else(|| git_error_reason_retry(&failure.error).1);
-            let serving = cl.status.as_ref().and_then(Tree::serving).is_some();
+            let serving = cl.status.as_ref().is_some_and(|s| s.run_source.is_some());
             if failure.error.is_transient() && serving {
                 // The Deployment keeps the tree it runs until a commit
                 // resolves again.
@@ -496,7 +496,11 @@ async fn apply_git_workspace(
                 tracing::warn!(error = %e, "listing Runs for the keep-set; keeping the CL's own trees only");
                 Vec::new()
             });
-        let serving_key = cl.status.as_ref().and_then(Tree::serving).map(|t| t.key());
+        let serving_key = cl
+            .status
+            .as_ref()
+            .and_then(|s| s.run_source.as_ref())
+            .map(RunSource::workspace_key);
         let keep = workspace_keep_csv(&key, serving_key.as_deref(), &name, &runs);
         let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
         apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
@@ -529,58 +533,32 @@ async fn observe_git_deployment(name: &str, deployments_api: &Api<Deployment>) -
     git_rollout(deployment.as_ref())
 }
 
-/// A git CL's code as its pods run it: the runtime image plus the source the
-/// workspace was built from.
-#[derive(Clone, Debug, PartialEq)]
-struct Tree {
-    image: String,
-    source: RunSource,
-}
-
-impl Tree {
-    /// The tree runs get, per `status`.
-    fn serving(status: &CodeLocationStatus) -> Option<Self> {
-        Some(Self {
-            image: status.resolved_image.clone()?,
-            source: status.run_source.clone()?,
-        })
-    }
-
-    /// The tree `deployment`'s pod template runs: its main container's
-    /// image and `RIVERS_RUN_SOURCE`.
-    fn of_template(deployment: &Deployment) -> Option<Self> {
-        let container = deployment
-            .spec
-            .as_ref()?
-            .template
-            .spec
-            .as_ref()?
-            .containers
-            .iter()
-            .find(|c| c.name == MAIN_CONTAINER)?;
-        let source = container
-            .env
-            .as_ref()?
-            .iter()
-            .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)?
-            .value
-            .as_deref()?;
-        Some(Self {
-            image: container.image.clone()?,
-            source: serde_json::from_str(source).ok()?,
-        })
-    }
-
-    fn key(&self) -> String {
-        workspace::workspace_key(&self.source.git.commit, &self.image)
-    }
+/// The tree `deployment`'s pod template runs: its main container's
+/// `RIVERS_RUN_SOURCE`.
+fn template_source(deployment: &Deployment) -> Option<RunSource> {
+    let source = deployment
+        .spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|c| c.name == MAIN_CONTAINER)?
+        .env
+        .as_ref()?
+        .iter()
+        .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)?
+        .value
+        .as_deref()?;
+    serde_json::from_str(source).ok()
 }
 
 /// What the git Deployment shows: the tree its pod template runs, and how
 /// far that template has rolled out.
 #[derive(Debug, Default)]
 struct GitRollout {
-    template: Option<Tree>,
+    template: Option<RunSource>,
     /// Every pod runs the current template and is ready.
     complete: bool,
     /// `None` when the Deployment or its status could not be read.
@@ -593,7 +571,7 @@ fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
         return GitRollout::default();
     };
     GitRollout {
-        template: Tree::of_template(deployment),
+        template: template_source(deployment),
         complete: rollout_complete(deployment),
         ready_replicas: Some(status.ready_replicas.unwrap_or(0)),
         deadline_exceeded: generation_observed(deployment)
@@ -636,8 +614,8 @@ fn generation_observed(deployment: &Deployment) -> bool {
 /// no status yet) and `Cancelling` included, not just `Running`; a run
 /// waiting on a concurrency pool is precisely the one most likely to sit
 /// through several commits. Keys, not commits: each run's tree is keyed on
-/// the runtime digest *it* pinned. Sorted + deduped so the ConfigMap value is
-/// deterministic and refreshes don't churn.
+/// its source's runtime image, whatever image its pods run. Sorted + deduped
+/// so the ConfigMap value is deterministic and refreshes don't churn.
 fn workspace_keep_csv(
     target_key: &str,
     serving_key: Option<&str>,
@@ -660,10 +638,7 @@ fn workspace_keep_csv(
             continue;
         }
         if let Some(source) = &run.spec.source {
-            keys.insert(workspace::workspace_key(
-                &source.git.commit,
-                &run.spec.image,
-            ));
+            keys.insert(source.workspace_key());
         }
     }
     keys.into_iter().collect::<Vec<_>>().join(",")
@@ -793,13 +768,17 @@ fn source_display(source: &RunSource) -> String {
 
 /// Names the tree being rolled out and the tree runs keep meanwhile; `None`
 /// when the rollout does not change the tree.
-fn rollout_message(target: Option<&Tree>, serving: Option<&Tree>, stuck: bool) -> Option<String> {
+fn rollout_message(
+    target: Option<&RunSource>,
+    serving: Option<&RunSource>,
+    stuck: bool,
+) -> Option<String> {
     let target = target.filter(|t| Some(*t) != serving)?;
-    let with_image = serving.is_some_and(|s| s.image != target.image);
-    let describe = |tree: &Tree| {
-        let source = source_display(&tree.source);
+    let with_image = serving.is_some_and(|s| s.runtime_image != target.runtime_image);
+    let describe = |tree: &RunSource| {
+        let source = source_display(tree);
         if with_image {
-            format!("{source} on {}", tree.image)
+            format!("{source} on {}", tree.runtime_image)
         } else {
             source
         }
@@ -864,7 +843,7 @@ fn git_status(
     let rollout = &update.rollout;
     let serving = match &rollout.template {
         Some(template) if rollout.complete => Some(template.clone()),
-        _ => prior.and_then(Tree::serving),
+        _ => prior.and_then(|s| s.run_source.clone()),
     };
     let desired = cl.spec.replicas;
     let ready =
@@ -893,19 +872,19 @@ fn git_status(
             CodeLocationPhase::Deploying
         }),
         observed_generation: cl.metadata.generation,
-        resolved_image: serving.as_ref().map(|t| t.image.clone()),
+        resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
         grpc_endpoint: Some(update.endpoint),
         last_reconciled: Some(now.to_string()),
         ready_replicas: rollout.ready_replicas,
         message: None,
         conditions: Vec::new(),
-        source: serving.as_ref().map(|t| source_display(&t.source)),
-        resolved_commit: serving.as_ref().map(|t| t.source.git.commit.clone()),
-        resolved_ref: serving.as_ref().and_then(|t| t.source.git.r#ref.clone()),
+        source: serving.as_ref().map(source_display),
+        resolved_commit: serving.as_ref().map(|t| t.git.commit.clone()),
+        resolved_ref: serving.as_ref().and_then(|t| t.git.r#ref.clone()),
         last_fetched_at: update
             .fetched_at
             .or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
-        run_source: serving.map(|t| t.source),
+        run_source: serving,
     };
     match update.resolution {
         Some(resolution) => {
@@ -1087,7 +1066,7 @@ async fn resolve_image(
 /// the CL's own tag / digest, else (git mode) the chart's runtime default,
 /// whose tag and digest give way to `spec.tag` / `spec.digest` when either
 /// is set.
-fn wanted_image(spec: &CodeLocationSpec, runtime_default: &ImageRef) -> ImageRef {
+pub(crate) fn wanted_image(spec: &CodeLocationSpec, runtime_default: &ImageRef) -> ImageRef {
     let digest = spec.digest.clone().filter(|d| !d.is_empty());
     let repository = match &spec.image {
         Some(image) => image.clone(),
@@ -1603,16 +1582,20 @@ mod tests {
     fn keep_set_holds_current_and_non_terminal_runs() {
         use rivers_k8s::crd::run::{Run, RunCrdStatus, RunPhase, RunSpec};
 
+        const RUNTIME: &str =
+            "ghcr.io/rt@sha256:1a2b3c4d00000000000000000000000000000000000000000000000000000000";
+
         fn run_for(cl: &str, commit_char: char, phase: Option<RunPhase>) -> Run {
             let spec: RunSpec = serde_json::from_value(serde_json::json!({
                 "codeLocationRef": { "name": cl },
-                "image": format!("ghcr.io/rt@sha256:{}", "1a2b3c4d000000".to_owned() + &"0".repeat(50)),
+                "image": RUNTIME,
                 "target": "*",
                 "source": {
                     "git": {
                         "url": "https://forge.example/r.git",
                         "commit": commit_char.to_string().repeat(40),
                     },
+                    "runtimeImage": RUNTIME,
                 },
             }))
             .unwrap();
@@ -1639,16 +1622,49 @@ mod tests {
         assert!(entries.contains(&"current-key"));
         // a (Running + statusless dedup), b (Pending — queued runs hold
         // their tree), c (Cancelling).
-        let a_key = workspace::workspace_key(&"a".repeat(40), &runs[0].spec.image);
-        let b_key = workspace::workspace_key(&"b".repeat(40), &runs[1].spec.image);
-        let c_key = workspace::workspace_key(&"c".repeat(40), &runs[2].spec.image);
+        let a_key = workspace::workspace_key(&"a".repeat(40), RUNTIME);
+        let b_key = workspace::workspace_key(&"b".repeat(40), RUNTIME);
+        let c_key = workspace::workspace_key(&"c".repeat(40), RUNTIME);
         assert!(entries.contains(&a_key.as_str()), "{keep}");
         assert!(entries.contains(&b_key.as_str()), "{keep}");
         assert!(entries.contains(&c_key.as_str()), "{keep}");
         // Terminal runs release; other CLs' runs are not ours.
         assert_eq!(entries.len(), 4, "dedup + releases: {keep}");
-        let d_key = workspace::workspace_key(&"d".repeat(40), &runs[3].spec.image);
+        let d_key = workspace::workspace_key(&"d".repeat(40), RUNTIME);
         assert!(!entries.contains(&d_key.as_str()));
+    }
+
+    #[test]
+    fn keep_set_keys_each_run_on_the_runtime_image_of_its_source() {
+        // RunBackendConfig.kubernetes(image=...): the run's pods run another
+        // image on the tree the code location's runtime image built.
+        let runtime = format!(
+            "ghcr.io/acme/rivers-runtime@sha256:{}",
+            "1a2b3c4d".repeat(8)
+        );
+        let run = rivers_k8s::crd::run::Run::new(
+            "run-a",
+            serde_json::from_value(serde_json::json!({
+                "codeLocationRef": { "name": "analytics" },
+                "image": format!("ghcr.io/acme/gpu-worker@sha256:{}", "ffee0011".repeat(8)),
+                "target": "*",
+                "source": {
+                    "git": { "url": "https://forge.example/r.git", "commit": "a".repeat(40) },
+                    "runtimeImage": runtime,
+                },
+            }))
+            .unwrap(),
+        );
+
+        let keep = workspace_keep_csv("current-key", None, "analytics", &[run]);
+
+        assert_eq!(
+            keep,
+            format!(
+                "{},current-key",
+                workspace::workspace_key(&"a".repeat(40), &runtime)
+            )
+        );
     }
 
     #[test]
@@ -1976,7 +1992,11 @@ mod tests {
         }
 
         fn run_source_json(c: char) -> serde_json::Value {
-            json!({ "git": { "url": URL, "commit": commit(c) }, "dependencies": { "mode": "auto" } })
+            json!({
+                "git": { "url": URL, "commit": commit(c) },
+                "dependencies": { "mode": "auto" },
+                "runtimeImage": runtime(c),
+            })
         }
 
         /// Status of a git CL whose every pod runs commit `c` on runtime `c`.
@@ -2120,11 +2140,9 @@ mod tests {
                 .expect("no status patch")
         }
 
-        fn tree(c: char) -> Tree {
-            Tree {
-                image: runtime(c),
-                source: serde_json::from_value(run_source_json(c)).unwrap(),
-            }
+        /// Commit `c` built with runtime digest `c`.
+        fn tree(c: char) -> RunSource {
+            serde_json::from_value(run_source_json(c)).unwrap()
         }
 
         fn rollout(template: char, complete: bool, ready: i32) -> GitRollout {
@@ -2179,7 +2197,7 @@ mod tests {
             assert_eq!(status.resolved_commit, Some(commit('a')));
             assert_eq!(status.resolved_ref, None);
             assert_eq!(status.resolved_image, Some(runtime('a')));
-            assert_eq!(status.run_source, Some(tree('a').source));
+            assert_eq!(status.run_source, Some(tree('a')));
             assert_eq!(status.source.as_deref(), Some("aaaaaaa (pinned)"));
             let message = format!(
                 "rolling out bbbbbbb (pinned) on {}; runs use aaaaaaa (pinned) on {}",
@@ -2203,7 +2221,7 @@ mod tests {
             assert_eq!(status.resolved_commit, Some(commit('b')));
             assert_eq!(status.resolved_ref, None);
             assert_eq!(status.resolved_image, Some(runtime('b')));
-            assert_eq!(status.run_source, Some(tree('b').source));
+            assert_eq!(status.run_source, Some(tree('b')));
             assert_eq!(status.source.as_deref(), Some("bbbbbbb (pinned)"));
             assert_eq!(
                 available(&status),
@@ -2240,8 +2258,8 @@ mod tests {
             // b fails to build: its pod never gets ready, the old pod serves.
             let cl = git_cl_at('b', serving_status('a'));
             let rollout = GitRollout {
-                template: Some(Tree {
-                    image: runtime('a'),
+                template: Some(RunSource {
+                    runtime_image: runtime('a'),
                     ..tree('b')
                 }),
                 deadline_exceeded: true,
@@ -2252,7 +2270,7 @@ mod tests {
 
             assert_eq!(status.phase, Some(CodeLocationPhase::Ready));
             assert_eq!(status.resolved_commit, Some(commit('a')));
-            assert_eq!(status.run_source, Some(tree('a').source));
+            assert_eq!(status.run_source, Some(tree('a')));
             assert_eq!(
                 available(&status),
                 (
@@ -2327,7 +2345,7 @@ mod tests {
         fn rollout_reads_the_tree_from_the_pod_template() {
             let cl = git_cl_at('b', serving_status('a'));
             let pieces = workspace::builder_pod_pieces(&WorkspaceSpec {
-                key: tree('b').key(),
+                key: tree('b').workspace_key(),
                 volume: WorkspaceVolume::EmptyDir { size_limit: None },
                 runtime_image: runtime('b'),
                 git_url: URL.into(),
@@ -2373,11 +2391,51 @@ mod tests {
             assert!(!git_rollout(Some(&d)).deadline_exceeded);
         }
 
+        #[tokio::test]
+        async fn code_location_pods_hand_their_runtime_image_with_their_source() {
+            let state = api_with(git_cl_at('b', serving_status('a')), mid_rollout());
+
+            pass(&state, LeaderGate::leading()).await;
+
+            let template = state.lock().unwrap().deployments["x"]
+                .spec
+                .clone()
+                .and_then(|d| d.template.spec)
+                .unwrap();
+            let main = template
+                .containers
+                .iter()
+                .find(|c| c.name == MAIN_CONTAINER)
+                .unwrap();
+            let source: serde_json::Value = main
+                .env
+                .iter()
+                .flatten()
+                .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)
+                .and_then(|e| e.value.as_deref())
+                .map(|json| serde_json::from_str(json).unwrap())
+                .unwrap();
+            assert_eq!(main.image, Some(runtime('b')));
+            assert_eq!(source["runtimeImage"], runtime('b'), "{source}");
+        }
+
         #[test]
         fn keep_set_holds_the_serving_tree_beside_the_target() {
-            let keep = workspace_keep_csv(&tree('b').key(), Some(&tree('a').key()), "x", &[]);
+            let keep = workspace_keep_csv(
+                &tree('b').workspace_key(),
+                Some(&tree('a').workspace_key()),
+                "x",
+                &[],
+            );
 
-            assert_eq!(keep, format!("{},{}", tree('a').key(), tree('b').key()));
+            assert_eq!(
+                keep,
+                format!(
+                    "{},{}",
+                    tree('a').workspace_key(),
+                    tree('b').workspace_key()
+                )
+            );
         }
 
         #[tokio::test]
