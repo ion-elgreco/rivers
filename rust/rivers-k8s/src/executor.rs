@@ -54,26 +54,6 @@ impl K8sStepExecutorConfig {
     }
 }
 
-/// `rivers` entrypoint for a step pod: the image-level binary in image
-/// mode, the workspace venv's in git mode (uniform across deps modes — the
-/// sync script shims it for `none`).
-fn step_command(config: &K8sStepExecutorConfig) -> String {
-    if config.workspace.is_some() {
-        crate::workspace::VENV_RIVERS_BIN.to_string()
-    } else {
-        "rivers".to_string()
-    }
-}
-
-/// Checkout directory for git-mode step pods — `execute-step` does
-/// `sys.path.insert(0, ".")`, so this is what makes the module importable.
-fn git_step_working_dir(path: Option<&str>) -> String {
-    match path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
-        Some(p) => format!("{}/src/{p}", crate::workspace::WORKSPACE_MOUNT),
-        None => format!("{}/src", crate::workspace::WORKSPACE_MOUNT),
-    }
-}
-
 /// Sanitize a string into a valid K8s label value:
 /// - lowercased
 /// - max 63 characters
@@ -279,11 +259,13 @@ fn build_job_inner(
                         name: "step".to_string(),
                         image: Some(config.worker_image.clone()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(vec![step_command(config)]),
-                        working_dir: config
-                            .workspace
+                        command: Some(workspace_pieces.as_ref().map_or_else(
+                            || vec!["rivers".to_string()],
+                            |p| p.main_command.clone(),
+                        )),
+                        working_dir: workspace_pieces
                             .as_ref()
-                            .map(|w| git_step_working_dir(w.path.as_deref())),
+                            .map(|p| p.main_working_dir.clone()),
                         volume_mounts: workspace_pieces
                             .as_ref()
                             .filter(|p| !p.main_mounts.is_empty())
@@ -416,6 +398,7 @@ mod tests {
                 claim_name: "analytics-workspace".to_string(),
             },
         ));
+        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 
@@ -426,11 +409,10 @@ mod tests {
             "no creds on consumers: {vols}"
         );
         let c = &pod.containers[0];
-        assert_eq!(
-            c.command.as_ref().unwrap(),
-            &vec!["/workspace/venv/bin/rivers".to_string()]
-        );
-        assert_eq!(c.working_dir.as_deref(), Some("/workspace/src/analytics"));
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let env = c.env.as_ref().unwrap();
+        assert!(pieces.main_env.iter().all(|v| env.contains(v)), "{env:?}");
         let mounts = serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap();
         assert_eq!(
             mounts,
@@ -441,18 +423,6 @@ mod tests {
                 "readOnly": true,
             }])
         );
-        let env: std::collections::HashMap<&str, &str> = c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
-            .collect();
-        assert_eq!(env["VIRTUAL_ENV"], "/workspace/venv");
-        assert_eq!(
-            env["RIVERS_GIT_COMMIT"],
-            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8"
-        );
     }
 
     #[test]
@@ -461,6 +431,7 @@ mod tests {
         config.workspace = Some(git_workspace(crate::workspace::WorkspaceVolume::EmptyDir {
             size_limit: None,
         }));
+        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 
@@ -469,10 +440,11 @@ mod tests {
         assert_eq!(inits[0].name, "workspace");
         let vols = serde_json::to_value(pod.volumes.as_ref().unwrap()).unwrap();
         assert!(vols.to_string().contains("git-credentials"), "{vols}");
-        assert_eq!(
-            pod.containers[0].command.as_ref().unwrap(),
-            &vec!["/workspace/venv/bin/rivers".to_string()]
-        );
+        let c = &pod.containers[0];
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let env = c.env.as_ref().unwrap();
+        assert!(pieces.main_env.iter().all(|v| env.contains(v)), "{env:?}");
     }
 
     #[test]

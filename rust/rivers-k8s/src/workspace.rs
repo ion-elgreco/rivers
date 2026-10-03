@@ -1,12 +1,12 @@
 //! Workspace pod-spec pieces for git-sourced CodeLocations (RFC-044).
 //!
-//! This is the ONE builder for workspace mounts, init containers, volumes
-//! and env — consumed by the operator (code-location Deployment, run
-//! executor pod) and by the step-Job builder in [`crate::executor`], which
-//! runs *inside the run pod*. That call-site is why this lives in
-//! `rivers-k8s` rather than the operator crate: the dependency arrow points
-//! operator → rivers-k8s, and a builder in the operator could never be
-//! reached from the step-job path.
+//! This is the ONE builder for workspace mounts, init containers, volumes,
+//! env and the main container's command and working directory — consumed by
+//! the operator (code-location Deployment, run executor pod) and by the
+//! step-Job builder in [`crate::executor`], which runs *inside the run pod*.
+//! That call-site is why this lives in `rivers-k8s` rather than the operator
+//! crate: the dependency arrow points operator → rivers-k8s, and a builder
+//! in the operator could never be reached from the step-job path.
 //!
 //! Two volume modes, one shape: `subPath` mounts keep `/workspace/src` and
 //! `/workspace/venv` byte-identical whether the tree lives on the shared
@@ -43,9 +43,12 @@ pub const WORKSPACES_ROOT_MOUNT: &str = "/workspaces";
 pub const UV_CACHE_MOUNT: &str = "/uv-cache";
 pub const UV_CACHE_SUBPATH: &str = "cache";
 pub const GIT_CREDS_MOUNT: &str = "/etc/rivers/git";
-/// Interpreter entry inside a materialized tree — pod `command` in git mode.
-pub const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
+/// The pod `command` in git mode, whatever the dependencies mode: in mode
+/// `none` the sync script links it to the runtime image's `rivers`.
+const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
 pub const VENV_PATH: &str = "/workspace/venv";
+/// The checkout.
+const SRC_PATH: &str = "/workspace/src";
 pub const SYNC_COMMAND: &str = "rivers-workspace-sync";
 /// The init container that runs [`SYNC_COMMAND`].
 pub const SYNC_CONTAINER: &str = "workspace";
@@ -95,6 +98,19 @@ impl WorkspaceSpec {
     pub fn key(&self) -> String {
         run_source(self).workspace_key()
     }
+
+    /// The project directory: the checkout plus `path`.
+    fn working_dir(&self) -> String {
+        match self
+            .path
+            .as_deref()
+            .map(|p| p.trim_matches('/'))
+            .filter(|p| !p.is_empty())
+        {
+            Some(p) => format!("{SRC_PATH}/{p}"),
+            None => SRC_PATH.to_string(),
+        }
+    }
 }
 
 /// Pod-spec fragments to graft onto a Deployment / Pod / Job template.
@@ -102,6 +118,9 @@ impl WorkspaceSpec {
 pub struct WorkspacePodPieces {
     pub init_containers: Vec<Container>,
     pub volumes: Vec<Volume>,
+    /// The tree's `rivers`, run from the project directory.
+    pub main_command: Vec<String>,
+    pub main_working_dir: String,
     pub main_mounts: Vec<VolumeMount>,
     pub main_env: Vec<EnvVar>,
     pub pod_security_context: PodSecurityContext,
@@ -113,6 +132,8 @@ pub fn builder_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
     WorkspacePodPieces {
         init_containers: vec![sync_init_container(spec, SyncRole::Builder)],
         volumes: volumes(spec, /* read_only_pvc */ false),
+        main_command: vec![VENV_RIVERS_BIN.to_string()],
+        main_working_dir: spec.working_dir(),
         main_mounts: vec![workspace_mount(spec, /* read_only */ false)],
         main_env: main_env(spec),
         pod_security_context: pod_security_context(),
@@ -155,6 +176,8 @@ pub fn consumer_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
         WorkspaceVolume::SharedPvc { .. } => WorkspacePodPieces {
             init_containers: Vec::new(),
             volumes: volumes_without_creds(spec, /* read_only_pvc */ true),
+            main_command: vec![VENV_RIVERS_BIN.to_string()],
+            main_working_dir: spec.working_dir(),
             main_mounts: vec![workspace_mount(spec, /* read_only */ true)],
             main_env: main_env(spec),
             pod_security_context: pod_security_context(),
@@ -162,6 +185,8 @@ pub fn consumer_pod_pieces(spec: &WorkspaceSpec) -> WorkspacePodPieces {
         WorkspaceVolume::EmptyDir { .. } => WorkspacePodPieces {
             init_containers: vec![sync_init_container(spec, SyncRole::Consumer)],
             volumes: volumes(spec, false),
+            main_command: vec![VENV_RIVERS_BIN.to_string()],
+            main_working_dir: spec.working_dir(),
             main_mounts: vec![workspace_mount(spec, false)],
             main_env: main_env(spec),
             pod_security_context: pod_security_context(),
@@ -374,6 +399,9 @@ fn volumes_without_creds(spec: &WorkspaceSpec, read_only_pvc: bool) -> Vec<Volum
 fn main_env(spec: &WorkspaceSpec) -> Vec<EnvVar> {
     let source = serde_json::to_string(&run_source(spec)).expect("RunSource serializes");
     let mut env = vec![
+        // The CLI imports the module from ".", which no longer finds it once
+        // code changes directory, also in the worker processes it starts.
+        env_var("PYTHONPATH", &spec.working_dir()),
         env_var("VIRTUAL_ENV", VENV_PATH),
         // In the pod template ⇒ a new commit rolls the Deployment.
         env_var("RIVERS_GIT_COMMIT", &spec.commit),
@@ -509,6 +537,8 @@ mod tests {
                 { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
             ])
         );
+        assert_eq!(pieces.main_command, ["/workspace/venv/bin/rivers"]);
+        assert_eq!(pieces.main_working_dir, "/workspace/src/analytics");
         assert_eq!(
             serde_json::to_value(&pieces.main_mounts).unwrap(),
             json!([
@@ -518,6 +548,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&pieces.main_env).unwrap(),
             json!([
+                { "name": "PYTHONPATH", "value": "/workspace/src/analytics" },
                 { "name": "VIRTUAL_ENV", "value": "/workspace/venv" },
                 { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
                 { "name": "RIVERS_RUN_SOURCE", "value": concat!(
@@ -725,6 +756,54 @@ mod tests {
                 cache_mounts,
                 "{shape}"
             );
+        }
+    }
+
+    #[test]
+    fn every_pod_shape_runs_the_trees_rivers_from_the_project_directory() {
+        for (shape, pieces) in [
+            ("builder shared", builder_pod_pieces(&spec(shared()))),
+            ("builder fallback", builder_pod_pieces(&spec(fallback()))),
+            ("consumer shared", consumer_pod_pieces(&spec(shared()))),
+            ("consumer fallback", consumer_pod_pieces(&spec(fallback()))),
+        ] {
+            let pythonpath: Vec<_> = pieces
+                .main_env
+                .iter()
+                .filter(|e| e.name == "PYTHONPATH")
+                .map(|e| e.value.as_deref())
+                .collect();
+
+            assert_eq!(
+                pieces.main_command,
+                ["/workspace/venv/bin/rivers"],
+                "{shape}"
+            );
+            assert_eq!(
+                pieces.main_working_dir, "/workspace/src/analytics",
+                "{shape}"
+            );
+            assert_eq!(pythonpath, [Some("/workspace/src/analytics")], "{shape}");
+        }
+    }
+
+    #[test]
+    fn the_project_directory_is_the_checkout_plus_path() {
+        for (path, dir) in [
+            (None, "/workspace/src"),
+            (Some(""), "/workspace/src"),
+            (Some("analytics"), "/workspace/src/analytics"),
+            (
+                Some("services/analytics/"),
+                "/workspace/src/services/analytics",
+            ),
+            (Some("/deep/dir/"), "/workspace/src/deep/dir"),
+        ] {
+            let s = WorkspaceSpec {
+                path: path.map(str::to_string),
+                ..spec(shared())
+            };
+            assert_eq!(s.working_dir(), dir, "{path:?}");
         }
     }
 

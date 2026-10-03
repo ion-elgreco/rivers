@@ -44,8 +44,8 @@ use super::registry::{
 };
 use super::resources::{
     MAIN_CONTAINER, build_deployment, build_git_deployment, build_keep_config_map, build_service,
-    build_workspace_pvc, deployment_name, git_working_dir, grpc_endpoint, keep_config_map_name,
-    labels, service_name, workspace_pvc_name,
+    build_workspace_pvc, deployment_name, grpc_endpoint, keep_config_map_name, labels,
+    service_name, workspace_pvc_name,
 };
 use crate::leader::LeaderGate;
 use crate::metrics;
@@ -856,7 +856,6 @@ async fn apply_git_workspace(
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &pieces,
-        git_working_dir(git_spec.path.as_deref()),
     );
     let service = build_service(cl);
     let (deployed, served) = tokio::join!(
@@ -3402,7 +3401,6 @@ mod tests {
                 &Default::default(),
                 &Default::default(),
                 &pieces,
-                git_working_dir(None),
             );
             d.metadata.generation = Some(2);
             d.status = Some(DeploymentStatus {

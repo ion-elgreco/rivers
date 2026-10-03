@@ -163,17 +163,6 @@ pub fn keep_config_map_name(cr_name: &str) -> String {
     format!("{cr_name}-workspace-keep")
 }
 
-/// `workingDir` for git-mode containers: the checkout (plus `spec.git.path`).
-pub fn git_working_dir(path: Option<&str>) -> String {
-    match path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
-        Some(p) => format!(
-            "{}/{p}",
-            rivers_k8s::workspace::WORKSPACE_MOUNT.to_owned() + "/src"
-        ),
-        None => format!("{}/src", rivers_k8s::workspace::WORKSPACE_MOUNT),
-    }
-}
-
 /// RWX PVC backing a git CL's shared workspace. Owned by the CR so kube
 /// garbage-collects it (and every tree on it) on CL delete.
 pub fn build_workspace_pvc(
@@ -228,8 +217,8 @@ pub fn build_keep_config_map(
 }
 
 /// Git-mode `Deployment`: same envelope as [`build_deployment`], but the
-/// container runs out of the materialized workspace — absolute venv
-/// interpreter, `workingDir` at the checkout, workspace pieces grafted on.
+/// container runs out of the materialized workspace — the workspace pieces
+/// (command, working directory, mounts, env) grafted on.
 pub fn build_git_deployment(
     cl: &CodeLocation,
     resolved_runtime_image: &str,
@@ -237,7 +226,6 @@ pub fn build_git_deployment(
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     pieces: &rivers_k8s::workspace::WorkspacePodPieces,
-    working_dir: String,
 ) -> Deployment {
     let name = deployment_name(&cl.name_any());
     let ns = cl.namespace();
@@ -250,17 +238,10 @@ pub fn build_git_deployment(
         Some(spec.image_pull_secrets.clone())
     };
 
-    // Base env minus user env, then workspace env (PYTHONPATH as the
-    // belt-and-braces for anything that chdirs; VIRTUAL_ENV;
-    // RIVERS_GIT_COMMIT — the rollout trigger; the tree's source + volume,
-    // stamped on the Runs this pod launches), then user env merged last so
-    // it overrides by name.
+    // Base env minus user env, then workspace env (RIVERS_GIT_COMMIT — the
+    // rollout trigger; the tree's source + volume, stamped on the Runs this
+    // pod launches), then user env merged last so it overrides by name.
     let mut env = build_base_env(cl, resolved_runtime_image, surreal_pod_cfg, otel_pod_cfg);
-    env.push(EnvVar {
-        name: "PYTHONPATH".to_string(),
-        value: Some(working_dir.clone()),
-        ..Default::default()
-    });
     env.extend(pieces.main_env.iter().cloned());
     let env = rivers_k8s::env::merge_env(env, cl.spec.env.iter().cloned());
 
@@ -307,14 +288,14 @@ pub fn build_git_deployment(
                         name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_runtime_image.to_string()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(vec![rivers_k8s::workspace::VENV_RIVERS_BIN.to_string()]),
+                        command: Some(pieces.main_command.clone()),
                         args: Some(vec![
                             "serve".to_string(),
                             spec.module.clone(),
                             "--grpc-port".to_string(),
                             spec.grpc_port.to_string(),
                         ]),
-                        working_dir: Some(working_dir),
+                        working_dir: Some(pieces.main_working_dir.clone()),
                         ports: Some(vec![ContainerPort {
                             name: Some("grpc".to_string()),
                             container_port: spec.grpc_port,
@@ -784,19 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn git_working_dir_shapes() {
-        assert_eq!(git_working_dir(None), "/workspace/src");
-        assert_eq!(
-            git_working_dir(Some("analytics")),
-            "/workspace/src/analytics"
-        );
-        assert_eq!(
-            git_working_dir(Some("/deep/dir/")),
-            "/workspace/src/deep/dir"
-        );
-    }
-
-    #[test]
     fn workspace_pvc_matches_golden() {
         let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
         let pvc = build_workspace_pvc(&cl, &Quantity("20Gi".into()), Some("nfs-rwx"));
@@ -847,7 +815,6 @@ mod tests {
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &pieces,
-            git_working_dir(Some("analytics")),
         );
 
         let pod = d.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
@@ -863,11 +830,7 @@ mod tests {
 
         let c = &pod.containers[0];
         assert_eq!(c.image.as_deref(), Some("ghcr.io/rt@sha256:1a2b3c4dff"));
-        // Absolute interpreter path — $(VAR) PATH games do not work in k8s.
-        assert_eq!(
-            c.command.as_ref().unwrap(),
-            &vec!["/workspace/venv/bin/rivers".to_string()]
-        );
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
         assert_eq!(
             c.args.as_ref().unwrap(),
             &vec![
@@ -877,27 +840,21 @@ mod tests {
                 "3001".to_string(),
             ]
         );
-        // workingDir is what makes spec.module importable (serve does
-        // sys.path.insert(0, ".")); PYTHONPATH is the belt-and-braces.
-        assert_eq!(c.working_dir.as_deref(), Some("/workspace/src/analytics"));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
         assert_eq!(
             serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap(),
             serde_json::to_value(&pieces.main_mounts).unwrap()
         );
 
-        let env: std::collections::HashMap<&str, &str> = c
-            .env
-            .as_ref()
-            .unwrap()
+        let all_env = c.env.as_ref().unwrap();
+        assert!(
+            pieces.main_env.iter().all(|v| all_env.contains(v)),
+            "{all_env:?}"
+        );
+        let env: std::collections::HashMap<&str, &str> = all_env
             .iter()
             .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
             .collect();
-        assert_eq!(env["PYTHONPATH"], "/workspace/src/analytics");
-        assert_eq!(env["VIRTUAL_ENV"], "/workspace/venv");
-        assert_eq!(
-            env["RIVERS_GIT_COMMIT"],
-            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8"
-        );
         assert_eq!(env["RIVERS_CODE_LOCATION_NAME"], "analytics");
         assert_eq!(env["RIVERS_MODULE"], "analytics.pipeline");
         assert_eq!(
@@ -916,7 +873,6 @@ mod tests {
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &git_pieces(&cl, shared_volume()),
-            git_working_dir(Some("analytics")),
         );
 
         // maxSurge stays the Kubernetes default (25%, at least one pod).
@@ -957,7 +913,6 @@ mod tests {
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &git_pieces(&cl, volume),
-                git_working_dir(Some("analytics")),
             );
             let pod = d.spec.unwrap().template.spec.unwrap();
 
@@ -1007,7 +962,6 @@ mod tests {
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &git_pieces(&cl, volume),
-                git_working_dir(Some("analytics")),
             );
             let pod = d.spec.unwrap().template.spec.unwrap();
             let env: std::collections::HashMap<String, Option<String>> = pod.containers[0]

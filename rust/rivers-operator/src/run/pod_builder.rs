@@ -51,13 +51,9 @@ pub fn build_executor_pod(
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
-    let workspace_spec = run_workspace_spec(run, workspace_cfg, cl_spec);
-    let pieces = workspace_spec.as_ref().map(workspace::consumer_pod_pieces);
-    let command = if workspace_spec.is_some() {
-        workspace::VENV_RIVERS_BIN.to_string()
-    } else {
-        "rivers".to_string()
-    };
+    let pieces = run_workspace_spec(run, workspace_cfg, cl_spec)
+        .as_ref()
+        .map(workspace::consumer_pod_pieces);
 
     Pod {
         metadata: ObjectMeta {
@@ -97,18 +93,12 @@ pub fn build_executor_pod(
                 name: "executor".to_string(),
                 image: Some(spec.image.clone()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
-                command: Some(vec![command]),
-                working_dir: workspace_spec.as_ref().map(|w| {
-                    match w
-                        .path
-                        .as_deref()
-                        .map(|p| p.trim_matches('/'))
-                        .filter(|p| !p.is_empty())
-                    {
-                        Some(p) => format!("{}/src/{p}", workspace::WORKSPACE_MOUNT),
-                        None => format!("{}/src", workspace::WORKSPACE_MOUNT),
-                    }
-                }),
+                command: Some(
+                    pieces
+                        .as_ref()
+                        .map_or_else(|| vec!["rivers".to_string()], |p| p.main_command.clone()),
+                ),
+                working_dir: pieces.as_ref().map(|p| p.main_working_dir.clone()),
                 volume_mounts: pieces
                     .as_ref()
                     .filter(|p| !p.main_mounts.is_empty())
@@ -383,19 +373,21 @@ mod tests {
             &rivers_k8s::env::OtelPodConfig::default(),
             &shared,
         );
+        let pieces = workspace::consumer_pod_pieces(
+            &run_workspace_spec(&run, &shared, &CodeLocationSpec::default()).unwrap(),
+        );
         let pod_spec = pod.spec.unwrap();
         assert!(pod_spec.init_containers.is_none(), "shared consumer");
         let c = &pod_spec.containers[0];
-        assert_eq!(
-            c.command.as_ref().unwrap(),
-            &vec!["/workspace/venv/bin/rivers".to_string()]
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let all_env = c.env.as_ref().unwrap();
+        assert!(
+            pieces.main_env.iter().all(|v| all_env.contains(v)),
+            "{all_env:?}"
         );
-        assert_eq!(c.working_dir.as_deref(), Some("/workspace/src/analytics"));
 
-        let env: std::collections::HashMap<&str, &str> = c
-            .env
-            .as_ref()
-            .unwrap()
+        let env: std::collections::HashMap<&str, &str> = all_env
             .iter()
             .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
             .collect();
@@ -405,7 +397,6 @@ mod tests {
         let hop: rivers_k8s::crd::run::RunSource =
             serde_json::from_str(env["RIVERS_RUN_SOURCE"]).unwrap();
         assert_eq!(hop, run.spec.source.clone().unwrap());
-        assert_eq!(env["VIRTUAL_ENV"], "/workspace/venv");
 
         let mounts = serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap();
         assert!(mounts.to_string().contains("\"readOnly\":true"), "{mounts}");
@@ -516,6 +507,123 @@ mod tests {
                 .map(|v| v.secret.unwrap().default_mode)
                 .collect();
             assert_eq!(modes, secret_modes, "shared_enabled={shared_enabled}");
+        }
+    }
+
+    /// What a main container runs, from where, and its `PYTHONPATH` entries.
+    fn launch(c: &Container) -> (Option<&[String]>, Option<&str>, Vec<Option<&str>>) {
+        let pythonpath = c
+            .env
+            .iter()
+            .flatten()
+            .filter(|e| e.name == "PYTHONPATH")
+            .map(|e| e.value.as_deref())
+            .collect();
+        (c.command.as_deref(), c.working_dir.as_deref(), pythonpath)
+    }
+
+    #[test]
+    fn code_location_run_and_step_pods_start_the_tree_alike() {
+        use crate::codelocation::resources::build_git_deployment;
+        use rivers_k8s::executor::{K8sStepExecutorConfig, build_step_job};
+
+        let run = git_run();
+        let source = run.spec.source.clone().unwrap();
+        let user_pythonpath = EnvVar {
+            name: "PYTHONPATH".to_string(),
+            value: Some("/opt/team-libs".to_string()),
+            ..Default::default()
+        };
+        for (shared_enabled, user_env) in [
+            (true, vec![]),
+            (false, vec![]),
+            (true, vec![user_pythonpath.clone()]),
+            (false, vec![user_pythonpath]),
+        ] {
+            let shape = format!("shared_enabled={shared_enabled}, spec.env={user_env:?}");
+            let workspace_cfg = WorkspaceConfig {
+                shared_enabled,
+                ..Default::default()
+            };
+            let mut cl = git_code_location(None);
+            cl.spec.git.as_mut().unwrap().path = source.git.path.clone();
+            cl.spec.env = user_env.clone();
+            let volume = workspace_cfg.volume(&cl.name_any(), &cl.spec);
+            let tree = || {
+                workspace::consumer_spec_from_run_source(
+                    &source,
+                    volume.clone(),
+                    cl.spec.env.clone(),
+                )
+            };
+
+            // The code-location pod that built the tree the run is stamped with.
+            let cl_pod = build_git_deployment(
+                &cl,
+                &source.runtime_image,
+                "rivers-code-location",
+                &Default::default(),
+                &Default::default(),
+                &workspace::builder_pod_pieces(&tree()),
+            )
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+            let run_pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &cl.spec,
+                &Default::default(),
+                &Default::default(),
+                &workspace_cfg,
+            )
+            .spec
+            .unwrap();
+            // What the run pod's Kubernetes executor builds from its env.
+            let step_pod = build_step_job(
+                &K8sStepExecutorConfig {
+                    worker_image: run.spec.image.clone(),
+                    namespace: "default".to_string(),
+                    service_account: "rivers-step-worker".to_string(),
+                    worker_cpu: "1".to_string(),
+                    worker_memory: "2Gi".to_string(),
+                    module: run.spec.module.clone(),
+                    surreal_pod_cfg: Default::default(),
+                    otel_pod_cfg: Default::default(),
+                    run_id: "run-123".to_string(),
+                    run_cr_name: run.name_any(),
+                    run_cr_uid: String::new(),
+                    code_location_id: run.spec.code_location_ref.identity.clone(),
+                    extra_env: cl.spec.env.clone(),
+                    partition_key: None,
+                    workspace: Some(tree()),
+                },
+                "train",
+            )
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+            let cl_launch = launch(&cl_pod.containers[0]);
+            assert_eq!(
+                launch(&run_pod.containers[0]),
+                cl_launch,
+                "run pod, {shape}"
+            );
+            assert_eq!(
+                launch(&step_pod.containers[0]),
+                cl_launch,
+                "step pod, {shape}"
+            );
+            // The project directory, unless spec.env sets its own.
+            let pythonpath = user_env.first().map_or(cl_launch.1, |e| e.value.as_deref());
+            assert_eq!(cl_launch.2, vec![pythonpath], "{shape}");
         }
     }
 

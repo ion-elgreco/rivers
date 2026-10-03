@@ -179,7 +179,12 @@ segment, or that has a `.` or empty segment (`./analytics`,
 `services//analytics`): one spelling for each directory, so that each
 directory gets one tree. A `/` at the end is fine. The same applies to
 `spec.source.git.path` of a `Run` that you create with your own
-`spec.source`.
+`spec.source`. Code-location, run and step pods start in the project
+directory, `/workspace/src/<path>`, and have it on `PYTHONPATH`. Thus
+Python finds `module` also after your code changes the working directory,
+for example in workers of `Executor.parallel()` that start after the
+change. A `PYTHONPATH` in `spec.env` replaces this value: to keep this
+behaviour, put the project directory in your value too.
 
 How it composes with `image`: `spec.image` is always *the container the
 pods run*. Omit it in git mode to run the chart's default runtime image
