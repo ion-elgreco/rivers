@@ -60,11 +60,10 @@ gix-packetline = { version = "0.22", features = ["blocking-io"] }
 # pulling OpenSSL in via libssh2. `ring` matches the workspace's rustls
 # provider; `rsa`/`flate2` cover common deploy keys and transport compression.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+# HMAC-SHA1 of hashed (`|1|`) known_hosts entries: russh matches those only
+# in files, and the operator keeps the git Secret in memory.
+ring = "0.17"
 url = "2"
-# The operator writes SSH Secret material to short-lived files for the poll
-# (russh's known_hosts API is file-path only). Backed by a Memory-medium
-# emptyDir at /tmp — the operator's root fs is read-only.
-tempfile = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

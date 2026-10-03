@@ -46,7 +46,7 @@ pub enum GitError {
     #[error("host key rejected: {0}")]
     HostKeyRejected(String),
     /// The `known_hosts` material itself is missing or unusable — distinct
-    /// from "unknown host" so a mis-mounted Secret is diagnosable.
+    /// from "unknown host" so a broken Secret is diagnosable.
     #[error("known_hosts unavailable: {0}")]
     KnownHostsUnavailable(String),
     /// Transport-level failure (connect, timeout, 5xx). Transient.
@@ -277,11 +277,9 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
     ))
 }
 
-/// Credential material for a resolve, straight from the CR's Secret.
-/// SSH material arrives as *contents* (the operator reads the Secret over
-/// the API, it doesn't mount it); the resolver writes it to short-lived
-/// 0600 tempfiles because russh's key/known_hosts APIs are path-based.
-#[derive(Clone, Debug, Default, Hash)]
+/// Credential material for a resolve, straight from the CR's Secret. The
+/// SSH transport uses it as contents; nothing is written to disk.
+#[derive(Clone, Default, Hash)]
 pub enum GitCredentials {
     #[default]
     Anonymous,
@@ -293,6 +291,17 @@ pub enum GitCredentials {
         private_key_openssh: String,
         known_hosts: String,
     },
+}
+
+/// The kind only: the Secret's contents stay out of logs and panics.
+impl std::fmt::Debug for GitCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitCredentials::Anonymous => f.write_str("Anonymous"),
+            GitCredentials::Basic { .. } => f.debug_struct("Basic").finish_non_exhaustive(),
+            GitCredentials::Ssh { .. } => f.debug_struct("Ssh").finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -593,47 +602,16 @@ impl GitResolver {
                             .to_string(),
                     ));
                 };
-                let material = SshTempMaterial::write(private_key_openssh, known_hosts)?;
-                ssh::fetch_advertisement(&target, &material.auth, self.timeout).await
+                let auth = ssh::SshAuth {
+                    private_key: private_key_openssh,
+                    known_hosts,
+                };
+                ssh::fetch_advertisement(&target, &auth, self.timeout).await
             }
             other => Err(GitError::Malformed(format!(
                 "unsupported git url scheme '{other}' (https:// or ssh://)"
             ))),
         }
-    }
-}
-
-/// Secret contents written to 0600 tempfiles for the duration of one fetch.
-/// Backed by the operator's Memory-medium `/tmp` emptyDir (the root fs is
-/// read-only), so key material stays off disk and is unlinked on drop.
-struct SshTempMaterial {
-    _key: tempfile::NamedTempFile,
-    _known_hosts: tempfile::NamedTempFile,
-    auth: ssh::SshAuth,
-}
-
-impl SshTempMaterial {
-    fn write(private_key: &str, known_hosts: &str) -> Result<Self, GitError> {
-        use std::io::Write as _;
-        let scratch = |what: &str, contents: &str| -> Result<tempfile::NamedTempFile, GitError> {
-            let mut f = tempfile::NamedTempFile::new()
-                .map_err(|e| GitError::Unreachable(format!("cannot stage {what} in /tmp: {e}")))?;
-            f.write_all(contents.as_bytes())
-                .and_then(|()| f.flush())
-                .map_err(|e| GitError::Unreachable(format!("cannot stage {what}: {e}")))?;
-            Ok(f)
-        };
-        let key = scratch("ssh identity", private_key)?;
-        let kh = scratch("known_hosts", known_hosts)?;
-        let auth = ssh::SshAuth {
-            private_key_path: key.path().to_path_buf(),
-            known_hosts_path: kh.path().to_path_buf(),
-        };
-        Ok(Self {
-            _key: key,
-            _known_hosts: kh,
-            auth,
-        })
     }
 }
 
@@ -795,6 +773,117 @@ mod resolver_tests {
             matches!(err, GitError::AuthFailed(ref m) if m.contains("identity")),
             "{err}"
         );
+    }
+
+    /// A request to the test git server with the Secret's `identity` and
+    /// `known_hosts` contents.
+    fn ssh_request(port: u16, identity: &str, known_hosts: &str) -> GitResolveRequest {
+        GitResolveRequest {
+            url: format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git"),
+            r#ref: fixtures::branch("main"),
+            credentials: GitCredentials::Ssh {
+                private_key_openssh: identity.to_string(),
+                known_hosts: known_hosts.to_string(),
+            },
+            cache_ttl: TTL,
+        }
+    }
+
+    /// Resolves `req` twice; the status message of a failure must not change
+    /// between attempts.
+    async fn fails_the_same_way_twice(
+        resolver: &GitResolver,
+        req: &GitResolveRequest,
+        case: &str,
+    ) -> GitFailure {
+        let first = resolver.resolve(req).await.unwrap_err();
+        let second = resolver.resolve(req).await.unwrap_err();
+        assert_eq!(first.error.to_string(), second.error.to_string(), "{case}");
+        first
+    }
+
+    #[tokio::test]
+    async fn an_unusable_ssh_key_fails_the_same_way_every_time() {
+        let server = ServerBehaviour::default();
+        let port = test_server::spawn_server(server.clone()).await;
+        let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
+        let resolver = GitResolver::new(TIMEOUT);
+        let cases = [
+            ("passphrase-protected", test_server::PASSPHRASE_KEY),
+            ("not a key", "not a private key\n"),
+            ("truncated", &test_server::CLIENT_KEY[..120]),
+        ];
+
+        let mut messages = Vec::new();
+        for (case, identity) in cases {
+            let req = ssh_request(port, identity, &known_hosts);
+            let failure = fails_the_same_way_twice(&resolver, &req, case).await;
+            assert!(
+                matches!(failure.error, GitError::AuthFailed(_)),
+                "{case}: {}",
+                failure.error
+            );
+            assert_eq!(failure.retry_after, None, "{case}");
+            messages.push(failure.error.to_string());
+        }
+        assert_eq!(
+            messages[0],
+            "git authentication failed: the SSH private key is passphrase-protected — the \
+             git Secret's `identity` must be a key without a passphrase"
+        );
+        assert_eq!(server.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_known_hosts_fails_the_same_way_before_connecting() {
+        let server = ServerBehaviour::default();
+        let port = test_server::spawn_server(server.clone()).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let cases = [
+            ("empty", String::new()),
+            (
+                "comments only",
+                "# 127.0.0.1 SSH-2.0-OpenSSH_9.6\n\n".to_string(),
+            ),
+            (
+                "not known_hosts",
+                "this is not a known_hosts line\n".to_string(),
+            ),
+            (
+                "a broken key",
+                format!("[127.0.0.1]:{port} ssh-ed25519 not-base64\n"),
+            ),
+        ];
+
+        for (case, known_hosts) in cases {
+            let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+            let failure = fails_the_same_way_twice(&resolver, &req, case).await;
+            assert!(
+                matches!(failure.error, GitError::KnownHostsUnavailable(_)),
+                "{case}: {}",
+                failure.error
+            );
+        }
+        assert_eq!(server.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_host_missing_from_known_hosts_is_rejected_before_connecting() {
+        let server = ServerBehaviour::default();
+        let port = test_server::spawn_server(server.clone()).await;
+        let known_hosts = format!("forge.example {}", test_server::HOST_PUB);
+        let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+
+        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "host key rejected: host '127.0.0.1:{port}' is not in known_hosts (exact and \
+                 hashed |1| entries only; wildcards and @cert-authority are unsupported) — add \
+                 this host's key to the git Secret"
+            )
+        );
+        assert_eq!(server.connections(), 0);
     }
 
     #[tokio::test]
@@ -1309,6 +1398,35 @@ mod resolver_tests {
         assert_ne!(no_contents[0], no_contents[1]);
         assert_ne!(no_contents[0], no_contents[2]);
         assert_ne!(no_contents[1], no_contents[2]);
+    }
+
+    #[test]
+    fn credentials_and_requests_print_no_secret() {
+        let secrets: Vec<&str> = [USER, TOKEN, test_server::HOST_PUB]
+            .into_iter()
+            .chain(test_server::CLIENT_KEY.lines())
+            .collect();
+        for (credentials, shown_as) in [
+            (basic(USER, TOKEN), "Basic { .. }"),
+            (ssh_credentials(), "Ssh { .. }"),
+        ] {
+            assert_eq!(format!("{credentials:?}"), shown_as);
+            let req = GitResolveRequest {
+                credentials,
+                ..request(
+                    "https://forge.example/acme/pipelines.git".to_string(),
+                    fixtures::branch("main"),
+                )
+            };
+            let shown = format!("{req:?}");
+            assert!(
+                shown.contains(&format!("credentials: {shown_as}")),
+                "{shown}"
+            );
+            for secret in &secrets {
+                assert!(!shown.contains(secret), "{shown}");
+            }
+        }
     }
 
     /// Which of `reqs` the resolver holds a commit or failure for.

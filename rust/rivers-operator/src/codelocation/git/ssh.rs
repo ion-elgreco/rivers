@@ -1,27 +1,27 @@
 //! SSH transport arm: in-process `git-upload-pack` over russh.
 //!
 //! ```text
-//! connect → publickey auth (key file from the Secret) → open session
+//! decode key + read known_hosts → connect → publickey auth → open session
 //!         → exec "git-upload-pack '<path>'" → buffer stdout → parse
 //! ```
 //!
-//! Host keys are verified against the Secret's `known_hosts` via
-//! [`super::known_hosts`] before authentication — russh's `check_server_key`
-//! default already rejects everything, and the handler here only ever
-//! upgrades that to "accept" on an explicit known_hosts match.
+//! The Secret's key and `known_hosts` are used as contents and both are
+//! checked before connecting. Host keys are verified against the
+//! `known_hosts` entries via [`super::known_hosts`] before authentication —
+//! russh's `check_server_key` default already rejects everything, and the
+//! handler here only ever upgrades that to "accept" on an explicit match.
 //!
 //! The exec command is handed to a shell on the *remote* side, so the repo
 //! path is single-quoted here. This transport is structurally immune to the
 //! local argv-injection class (RUSTSEC-2024-0335 hit gix's spawning
 //! transport) — remote-side quoting is the part that stays ours.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::ChannelMsg;
 use russh::client;
-use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
+use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 
 use super::http::DEFAULT_MAX_ADVERTISEMENT_BYTES;
 use super::{GitError, known_hosts};
@@ -74,21 +74,17 @@ pub(crate) fn shell_quote_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// SSH credential material, as file paths from the mounted Secret.
-#[derive(Clone, Debug)]
-pub struct SshAuth {
-    pub private_key_path: PathBuf,
-    pub known_hosts_path: PathBuf,
+/// SSH credential material: the git Secret's `identity` and `known_hosts`
+/// contents.
+pub struct SshAuth<'a> {
+    pub private_key: &'a str,
+    pub known_hosts: &'a str,
 }
 
-/// Delegates the server-key decision to the `known_hosts` wrapper. The
+/// Delegates the server-key decision to the `known_hosts` entries. The
 /// default `check_server_key` rejects all keys; this only flips to accept
 /// on an explicit match — errors carry the specific rejection.
-struct HostKeyCheck {
-    host: String,
-    port: u16,
-    known_hosts_path: PathBuf,
-}
+struct HostKeyCheck(known_hosts::HostKeys);
 
 impl client::Handler for HostKeyCheck {
     type Error = GitError;
@@ -97,12 +93,7 @@ impl client::Handler for HostKeyCheck {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        known_hosts::verify_host_key(
-            &self.known_hosts_path,
-            &self.host,
-            self.port,
-            server_public_key,
-        )?;
+        self.0.verify(server_public_key)?;
         Ok(true)
     }
 }
@@ -110,7 +101,7 @@ impl client::Handler for HostKeyCheck {
 /// Fetch the ref advertisement over SSH, fully buffered.
 pub async fn fetch_advertisement(
     target: &SshTarget,
-    auth: &SshAuth,
+    auth: &SshAuth<'_>,
     timeout: Duration,
 ) -> Result<Vec<u8>, GitError> {
     fetch_advertisement_with_cap(target, auth, timeout, DEFAULT_MAX_ADVERTISEMENT_BYTES).await
@@ -118,26 +109,27 @@ pub async fn fetch_advertisement(
 
 pub(crate) async fn fetch_advertisement_with_cap(
     target: &SshTarget,
-    auth: &SshAuth,
+    auth: &SshAuth<'_>,
     timeout: Duration,
     cap: usize,
 ) -> Result<Vec<u8>, GitError> {
-    let key = load_secret_key(&auth.private_key_path, None).map_err(|e| {
-        GitError::AuthFailed(format!(
-            "cannot load SSH private key from {}: {e} — check the git Secret's `identity` entry",
-            auth.private_key_path.display()
-        ))
+    let key = decode_secret_key(auth.private_key, None).map_err(|e| {
+        GitError::AuthFailed(match e {
+            russh::keys::Error::KeyIsEncrypted => "the SSH private key is passphrase-protected \
+                 — the git Secret's `identity` must be a key without a passphrase"
+                .to_string(),
+            e => format!(
+                "cannot read the SSH private key: {e} — check the git Secret's `identity` entry"
+            ),
+        })
     })?;
+    let host_keys = known_hosts::HostKeys::new(auth.known_hosts, &target.host, target.port)?;
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(timeout),
         ..Default::default()
     });
-    let handler = HostKeyCheck {
-        host: target.host.clone(),
-        port: target.port,
-        known_hosts_path: auth.known_hosts_path.clone(),
-    };
+    let handler = HostKeyCheck(host_keys);
 
     // `connect` returns `H::Error`, so a host-key rejection from the handler
     // surfaces as our own GitError; transport failures arrive via
@@ -211,6 +203,7 @@ pub(crate) mod test_server {
     use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Fixed ed25519 fixtures generated once with ssh-keygen; the pubkeys
     // pair with the private keys below.
@@ -237,6 +230,16 @@ AAAEAePrUUBrPim4oMVYXt6hNWyccDkZeMfyjXbV/qzxFx6ViXHrGv1EZGzi9tPYZ+mCp6
 mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
 -----END OPENSSH PRIVATE KEY-----
 ";
+    /// An ed25519 key with the passphrase `correct horse battery staple`.
+    pub(crate) const PASSPHRASE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBbt00mIv
+aBxzUvRsrbX0E6AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIENOvlpuGUtF/VWe
+3ixG94ybzOsXvz7652J3V/iHsIQWAAAAkOytbcb2sxfjKZUSdf3OIiWMTjmLkdkSyAxMCu
+NZZvvWzCq6Y8bzBbmq2D7XidJGZQ8aqVD7Sv+dV4+BZyIZmxki7xCruI5lGJA0DgqWlt9V
++D+ZOfsIs/3JtS68VOqQe7+r70XWLN+hB6+RqYMVjHwnk+xMbvggT4GeAZFNhPolT4lvwJ
+Qjm9zYDGIBlKeGwA==
+-----END OPENSSH PRIVATE KEY-----
+";
 
     #[derive(Clone)]
     pub(crate) struct ServerBehaviour {
@@ -245,6 +248,8 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
         pub(crate) exit_status: u32,
         pub(crate) stderr: Option<&'static str>,
         pub(crate) authorized_pub: &'static str,
+        /// The connections the server accepted.
+        pub(crate) connections: Arc<AtomicUsize>,
     }
 
     impl Default for ServerBehaviour {
@@ -255,7 +260,14 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
                 exit_status: 0,
                 stderr: None,
                 authorized_pub: CLIENT_PUB,
+                connections: Arc::default(),
             }
+        }
+    }
+
+    impl ServerBehaviour {
+        pub(crate) fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
         }
     }
 
@@ -266,6 +278,7 @@ mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
     impl server::Server for TestGitServer {
         type Handler = TestSession;
         fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> TestSession {
+            self.behaviour.connections.fetch_add(1, Ordering::SeqCst);
             TestSession {
                 behaviour: self.behaviour.clone(),
             }
@@ -368,30 +381,17 @@ mod tests {
     use super::super::{commit_for_ref, fixtures, parse_advertisement};
     use super::test_server::*;
     use super::*;
-    use std::io::Write as _;
 
-    struct TestAuth {
-        _key: tempfile::NamedTempFile,
-        _kh: tempfile::NamedTempFile,
-        auth: SshAuth,
+    /// A known_hosts pinning `pub_for_host` for the test server's port.
+    fn known_hosts_pinning(port: u16, pub_for_host: &str) -> String {
+        format!("[127.0.0.1]:{port} {pub_for_host}\n")
     }
 
-    /// Client key + a known_hosts pinning `pub_for_host` for this port.
-    fn auth_material(port: u16, pub_for_host: &str) -> TestAuth {
-        let mut key = tempfile::NamedTempFile::new().unwrap();
-        key.write_all(CLIENT_KEY.as_bytes()).unwrap();
-        key.flush().unwrap();
-        let mut kh = tempfile::NamedTempFile::new().unwrap();
-        writeln!(kh, "[127.0.0.1]:{port} {pub_for_host}").unwrap();
-        kh.flush().unwrap();
-        let auth = SshAuth {
-            private_key_path: key.path().to_path_buf(),
-            known_hosts_path: kh.path().to_path_buf(),
-        };
-        TestAuth {
-            _key: key,
-            _kh: kh,
-            auth,
+    /// The client key with `known_hosts`.
+    fn client_auth(known_hosts: &str) -> SshAuth<'_> {
+        SshAuth {
+            private_key: CLIENT_KEY,
+            known_hosts,
         }
     }
 
@@ -400,11 +400,11 @@ mod tests {
     #[tokio::test]
     async fn end_to_end_resolves_branch_over_ssh() {
         let port = spawn_server(ServerBehaviour::default()).await;
-        let material = auth_material(port, HOST_PUB);
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
 
-        let bytes = fetch_advertisement(&target, &material.auth, TIMEOUT)
+        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
             .await
             .unwrap();
         let adv = parse_advertisement(&bytes).unwrap();
@@ -419,11 +419,11 @@ mod tests {
             ..Default::default()
         };
         let port = spawn_server(behaviour).await;
-        let material = auth_material(port, HOST_PUB);
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
 
-        let err = fetch_advertisement(&target, &material.auth, TIMEOUT)
+        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::AuthFailed(_)), "{err}");
@@ -434,11 +434,11 @@ mod tests {
         let port = spawn_server(ServerBehaviour::default()).await;
         // known_hosts pins the *rogue* key for this host — the server
         // presents HOST_PUB, i.e. the MITM shape.
-        let material = auth_material(port, ROGUE_PUB);
+        let known_hosts = known_hosts_pinning(port, ROGUE_PUB);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
 
-        let err = fetch_advertisement(&target, &material.auth, TIMEOUT)
+        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
             .await
             .unwrap_err();
         assert!(
@@ -448,12 +448,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_private_key_is_auth_failed_with_path() {
-        let port = spawn_server(ServerBehaviour::default()).await;
-        let material = auth_material(port, HOST_PUB);
+    async fn undecodable_private_key_is_auth_failed_before_connecting() {
+        let server = ServerBehaviour::default();
+        let port = spawn_server(server.clone()).await;
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
         let auth = SshAuth {
-            private_key_path: PathBuf::from("/not/mounted/identity"),
-            known_hosts_path: material.auth.known_hosts_path.clone(),
+            private_key: "not a private key\n",
+            known_hosts: &known_hosts,
         };
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
@@ -461,10 +462,12 @@ mod tests {
         let err = fetch_advertisement(&target, &auth, TIMEOUT)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, GitError::AuthFailed(ref m) if m.contains("/not/mounted/identity")),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "git authentication failed: cannot read the SSH private key: Could not read key — \
+             check the git Secret's `identity` entry"
         );
+        assert_eq!(server.connections(), 0);
     }
 
     #[tokio::test]
@@ -476,11 +479,11 @@ mod tests {
             ..Default::default()
         };
         let port = spawn_server(behaviour).await;
-        let material = auth_material(port, HOST_PUB);
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
 
-        let err = fetch_advertisement(&target, &material.auth, TIMEOUT)
+        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
             .await
             .unwrap_err();
         assert!(
@@ -492,9 +495,9 @@ mod tests {
 
     #[tokio::test]
     async fn connection_refused_is_unreachable() {
-        let material = auth_material(1, HOST_PUB);
+        let known_hosts = known_hosts_pinning(1, HOST_PUB);
         let target = parse_ssh_url("ssh://git@127.0.0.1:1/r.git").unwrap();
-        let err = fetch_advertisement(&target, &material.auth, Duration::from_secs(3))
+        let err = fetch_advertisement(&target, &client_auth(&known_hosts), Duration::from_secs(3))
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::Unreachable(_)), "{err}");

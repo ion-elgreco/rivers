@@ -184,9 +184,11 @@ include `rivers` — the venv's `rivers` is what runs.
 
 **Credentials Secret keys** (Flux-compatible): `username`/`password` for
 HTTPS (a forge token is a password), or `identity` + `known_hosts` for
-SSH. `known_hosts` is required with `identity` and supports exact and
-hashed (`|1|`) entries only — no `*` wildcards or `@cert-authority`
-lines; list each host explicitly.
+SSH. `identity` must be a private key without a passphrase. `known_hosts`
+is required with `identity` and supports exact and hashed (`|1|`) entries
+only — no `*` wildcards or `@cert-authority` lines; list each host
+explicitly. Each line must be an entry or a comment: the operator refuses
+a `known_hosts` with any other line and does not connect to the host.
 
 **Shared workspace** (recommended where you have RWX storage): set
 `codeLocation.workspace.shared.enabled=true` and the code+venv is built

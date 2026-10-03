@@ -56,3 +56,13 @@ tests:
       - template: templates/ui-deployment.yaml
         hasDocuments:
           count: 0
+
+  - it: mounts nothing writable into the operator (git Secrets stay in memory)
+    asserts:
+      - template: templates/operator-deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].volumeMounts
+          value:
+            - name: webhook-cert
+              mountPath: /etc/webhook-cert
+              readOnly: true
