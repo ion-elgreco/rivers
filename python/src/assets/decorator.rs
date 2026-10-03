@@ -16,6 +16,7 @@ use crate::composition::{
     extract_input_bindings, is_in_composition, observe_invocation,
 };
 use crate::errors::AssetDefinitionError;
+use crate::executor::ops::enumerate_params;
 
 fn ensure_callable(py: Python, func: &Option<Py<PyAny>>) -> PyResult<()> {
     if !func
@@ -1099,15 +1100,8 @@ fn call_graph_fn_in_composition(
     func: &Py<PyAny>,
     graph_name: &str,
 ) -> PyResult<(Vec<InvokedNode>, Vec<String>, Option<String>)> {
-    let annotations = func.getattr(py, "__annotations__")?;
-    let annotations: &Bound<PyDict> = annotations.cast_bound(py)?;
-
     let mut placeholder_args: Vec<Py<PyAny>> = Vec::new();
-    for (k, _v) in annotations.iter() {
-        let param_name: String = k.extract()?;
-        if param_name == "return" {
-            continue;
-        }
+    for (param_name, _) in enumerate_params(py, func)? {
         let placeholder = PyInvokedNodeOutput::new(
             param_name,
             rivers_core::composition::DEFAULT_OUTPUT_NAME.to_string(),

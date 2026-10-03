@@ -710,27 +710,37 @@ impl PyBackfillStatusResult {
     }
 }
 
+/// The parameters that take upstream data, in declaration order: those
+/// `enumerate_params` lists, except the context, `self` and resources.
+fn upstream_params(
+    py: Python,
+    func: &Py<PyAny>,
+    resource_keys: &HashSet<&String>,
+) -> PyResult<Vec<String>> {
+    let mut params = Vec::new();
+    for (name, annotation) in enumerate_params(py, func)? {
+        let is_ctx = annotation
+            .as_ref()
+            .is_some_and(|a| is_context_annotation(py, a));
+        if is_ctx || name == "context" || name == "self" || resource_keys.contains(&name) {
+            continue;
+        }
+        params.push(name);
+    }
+    Ok(params)
+}
+
 fn append_deps(
     py: Python,
     deps: &mut Vec<NodeRef>,
     func: &Py<PyAny>,
     resource_keys: &HashSet<&String>,
 ) -> PyResult<()> {
-    for (name, annotation) in enumerate_params(py, func)? {
-        if name == "return" || name == "self" {
-            continue;
-        }
-        let is_ctx = annotation
-            .as_ref()
-            .is_some_and(|a| is_context_annotation(py, a));
-        if is_ctx || name == "context" {
-            continue;
-        }
-        if resource_keys.contains(&name) {
-            continue;
-        }
-        deps.push(NodeRef::ByName(name));
-    }
+    deps.extend(
+        upstream_params(py, func, resource_keys)?
+            .into_iter()
+            .map(NodeRef::ByName),
+    );
     Ok(())
 }
 
@@ -1188,63 +1198,50 @@ pub(crate) fn build_unresolved_graph(
     }
     let composition_task_names: HashSet<String> = composition_bindings.keys().cloned().collect();
 
+    /// Positional arguments fill the upstream parameters in order; a parameter
+    /// left unbound resolves by name. Every argument is a dependency.
     fn build_remap_from_bindings(
         py: Python,
         bindings: Vec<InputBinding>,
         wraps: &Option<Py<PyAny>>,
+        resource_keys: &HashSet<&String>,
     ) -> PyResult<(Vec<NodeRef>, HashMap<String, String>)> {
         let mut remap = HashMap::new();
         let mut all_deps: Vec<NodeRef> = Vec::new();
-
-        let named: Vec<_> = bindings.iter().filter(|b| b.param_name.is_some()).collect();
-        let positional: Vec<_> = bindings.iter().filter(|b| b.param_name.is_none()).collect();
-
-        let named_params: HashSet<String> = named
-            .iter()
-            .map(|b| b.param_name.clone().unwrap())
-            .collect();
-        for b in &named {
-            let pname = b.param_name.clone().unwrap();
-            remap.insert(pname, b.upstream_node_name.clone());
-            all_deps.push(NodeRef::ByName(b.upstream_node_name.clone()));
+        let mut positional = Vec::new();
+        for b in bindings {
+            match b.param_name {
+                Some(pname) => {
+                    all_deps.push(NodeRef::ByName(b.upstream_node_name.clone()));
+                    remap.insert(pname, b.upstream_node_name);
+                }
+                None => positional.push(b.upstream_node_name),
+            }
         }
 
+        let mut positional = positional.into_iter();
         if let Some(wraps) = wraps {
-            let annotations = get_annotations(py, wraps)?;
-            let mut pos_idx = 0;
-            for (k, v) in annotations.iter() {
-                let pname: String = k.extract()?;
-                if pname == "return" || pname == "self" {
+            for pname in upstream_params(py, wraps, resource_keys)? {
+                if remap.contains_key(&pname) {
                     continue;
                 }
-                // Skip context parameters — they are injected by the executor,
-                // not resolved as upstream dependencies.
-                if is_context_annotation(py, &v) || pname == "context" {
-                    continue;
-                }
-                if named_params.contains(&pname) {
-                    continue;
-                }
-                if pos_idx < positional.len() {
-                    remap.insert(pname, positional[pos_idx].upstream_node_name.clone());
-                    all_deps.push(NodeRef::ByName(
-                        positional[pos_idx].upstream_node_name.clone(),
-                    ));
-                    pos_idx += 1;
-                } else {
-                    // Unbound param: resolve by name (annotation-based)
-                    all_deps.push(NodeRef::ByName(pname));
+                match positional.next() {
+                    Some(upstream) => {
+                        all_deps.push(NodeRef::ByName(upstream.clone()));
+                        remap.insert(pname, upstream);
+                    }
+                    None => all_deps.push(NodeRef::ByName(pname)),
                 }
             }
         }
+        all_deps.extend(positional.map(NodeRef::ByName));
         Ok((all_deps, remap))
     }
 
     for task_py in tasks {
         if let Ok(py_task) = task_py.cast_bound::<PyTask>(py) {
-            let task = py_task.get();
+            let task = &py_task.get().inner;
             let task_name = task
-                .inner
                 .name
                 .clone()
                 .ok_or_else(|| AssetDefinitionError::new_err("Task has no name"))?;
@@ -1257,7 +1254,7 @@ pub(crate) fn build_unresolved_graph(
                     for ns_name in &namespaced_names {
                         let bindings = composition_bindings.remove(ns_name).unwrap_or_default();
                         let (comp_deps, remap) =
-                            build_remap_from_bindings(py, bindings, &task.inner.wraps)?;
+                            build_remap_from_bindings(py, bindings, &task.wraps, resource_keys)?;
                         // Inherit partitions_def and partition mappings from parent graph asset.
                         // Only propagate mapping entries for this task's actual deps.
                         let graph_name = ns_name.split('/').next().unwrap_or("");
@@ -1317,12 +1314,12 @@ pub(crate) fn build_unresolved_graph(
                     false
                 };
 
-            // Bare entries use annotation-based deps which may reference
-            // params that don't exist as graph nodes — skip when this task
-            // is used exclusively inside graph compositions.
+            // Bare entries take deps from parameter names, which may not exist
+            // as graph nodes — skip when this task is used exclusively inside
+            // graph compositions.
             if !has_namespaced {
                 let mut deps = Vec::new();
-                if let Some(ref wraps) = task.inner.wraps {
+                if let Some(ref wraps) = task.wraps {
                     append_deps(py, &mut deps, wraps, resource_keys)?;
                 }
                 unresolved_graph.insert(task_name.clone(), deps);

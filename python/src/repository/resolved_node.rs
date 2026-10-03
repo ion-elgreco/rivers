@@ -103,7 +103,7 @@ pub(crate) struct ResolvedTask {
     /// For tasks inside a graph asset composition: maps parameter names
     /// to upstream node names. E.g., `{"value": "a"}` means the `value`
     /// parameter receives the output of node `a`.
-    /// `None` for standalone tasks (deps resolved from `__annotations__`).
+    /// `None` for standalone tasks (deps resolved by parameter name).
     pub param_remap: Option<HashMap<String, String>>,
     /// Name of the parent graph asset for namespaced composition tasks
     /// (i.e. `ns_name = "{parent_graph_name}/{task_name}"`). `None` for

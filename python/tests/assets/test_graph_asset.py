@@ -1,3 +1,7 @@
+import time
+
+import pytest
+
 import rivers as rs
 
 
@@ -170,7 +174,6 @@ def test_downstream_asset_depends_on_graph_output():
 
 def test_graph_asset_error_propagation():
     """Error in a graph asset's internal task propagates correctly."""
-    import pytest
 
     @rs.Task
     def bad_task() -> int:
@@ -1116,3 +1119,258 @@ def test_graph_asset_composition_order_preserved(storage):
     _assert_order(
         events, "pipe/first_task", "StepStart", "pipe/second_task", "StepStart"
     )
+
+
+# ---------------------------------------------------------------------------
+# Parameters without annotations
+# ---------------------------------------------------------------------------
+
+
+class Label(rs.Resource):
+    prefix: str = "n="
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_positional_arg_fills_unannotated_task_param(executor_env, is_async):
+    """A positional argument fills a task parameter without an annotation,
+    from an asset and from another task."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+
+    @rs.Asset(io_handler=handler)
+    def base() -> int:
+        return 4
+
+    @rs.Asset(io_handler=handler)
+    def other() -> int:
+        return 7
+
+    if is_async:
+
+        @rs.Task
+        async def add_one(x):
+            return x + 1
+
+        @rs.Task
+        async def times_ten(y):
+            return y * 10
+
+    else:
+
+        @rs.Task
+        def add_one(x):
+            return x + 1
+
+        @rs.Task
+        def times_ten(y):
+            return y * 10
+
+    # Two graphs, so each level holds two steps: the parallel executor runs a
+    # lone sync step in-process.
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def left():
+        return times_ten(add_one(base()))
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def right():
+        return times_ten(add_one(other()))
+
+    repo = rs.CodeRepository(
+        assets=[base, other, left, right],
+        tasks=[add_one, times_ten],
+        default_executor=executor,
+    )
+    assert repo.materialize().success
+    names = ["left/add_one", "left", "right/add_one", "right"]
+    assert {name: repo.load_node(name) for name in names} == {
+        "left/add_one": 5,
+        "left": 50,
+        "right/add_one": 8,
+        "right": 80,
+    }
+
+
+@pytest.mark.parametrize("stored", [False, True], ids=["empty_store", "stored_value"])
+@pytest.mark.parametrize("passed", [True, False], ids=["passed", "by_name"])
+def test_task_param_named_after_asset_waits_for_it(
+    executor_env, tmp_path, stored, passed
+):
+    """A task parameter without an annotation, named after an upstream asset,
+    runs after that asset and reads the value of this run, whether the graph
+    body passes the asset or leaves the parameter to resolve by name."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+    source = tmp_path / "orders.txt"
+    source.write_text("1 2 3")
+
+    @rs.Asset(io_handler=handler)
+    def orders() -> list:
+        time.sleep(1)
+        return [int(v) for v in source.read_text().split()]
+
+    @rs.Task
+    def summarize(orders):
+        return sum(orders)
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def report():
+        return summarize(orders()) if passed else summarize()
+
+    repo = rs.CodeRepository(
+        assets=[orders, report], tasks=[summarize], default_executor=executor
+    )
+    if stored:
+        repo.materialize(selection=["orders"])
+    source.write_text("10 20 30")
+    assert repo.materialize().success
+    assert repo.load_node("report") == 60
+
+
+def test_positional_args_fill_params_in_order(executor_env):
+    """Positional arguments fill parameters in declaration order, with or
+    without an annotation."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+
+    @rs.Task
+    def first() -> str:
+        return "left"
+
+    @rs.Task
+    def second() -> int:
+        return 2
+
+    @rs.Task
+    def pair(a, b: int) -> str:
+        return f"{a}-{b}"
+
+    @rs.Task
+    def shout(text: str) -> str:
+        return text.upper()
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def mixed():
+        x = first()
+        shout(x)  # shares the level of `pair`, so `pair` runs in a worker
+        return pair(x, second())
+
+    repo = rs.CodeRepository(
+        assets=[mixed], tasks=[first, second, pair, shout], default_executor=executor
+    )
+    assert repo.materialize().success
+    assert repo.load_node("mixed") == "left-2"
+
+
+def test_api_reference_graph_example(executor_env):
+    """The `etl` / `report` example from the Asset API reference."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+    etl = rs.Asset(group="etl", kinds="table", io_handler=handler)
+
+    @etl
+    def orders():
+        time.sleep(0.5)  # a summarize that does not wait reads no orders
+        return [3, 4, 5]
+
+    @etl
+    def customers():
+        return ["ada", "grace"]
+
+    @rs.Task
+    def summarize(orders):
+        return {"count": len(orders), "total": sum(orders)}
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def report():
+        return summarize(orders())
+
+    repo = rs.CodeRepository(
+        assets=[orders, customers, report],
+        tasks=[summarize],
+        default_executor=executor,
+    )
+    assert repo.materialize().success
+    assert {name: repo.load_node(name) for name in ("customers", "report")} == {
+        "customers": ["ada", "grace"],
+        "report": {"count": 3, "total": 12},
+    }
+
+
+def test_unannotated_graph_param_is_an_input(executor_env):
+    """A graph function parameter without an annotation is an input of the graph."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+
+    @rs.Asset(io_handler=handler)
+    def source() -> int:
+        return 5
+
+    @rs.Task
+    def double(value):
+        return value * 2
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def pipeline(source):
+        return double(source)
+
+    repo = rs.CodeRepository(
+        assets=[source, pipeline], tasks=[double], default_executor=executor
+    )
+    assert repo.materialize().success
+    assert repo.load_node("pipeline") == 10
+
+
+def test_map_fills_unannotated_task_param(executor_env):
+    """`.map()` and `.collect()` fill task parameters without an annotation."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+
+    @rs.Asset(io_handler=handler)
+    def numbers() -> list:
+        return [1, 2, 3]
+
+    @rs.Task
+    def square(n):
+        return n * n
+
+    @rs.Task
+    def total(values):
+        return sum(values)
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def squares():
+        return total(numbers().map(square).collect())
+
+    repo = rs.CodeRepository(
+        assets=[numbers, squares], tasks=[square, total], default_executor=executor
+    )
+    assert repo.materialize().success
+    assert repo.load_node("squares") == 14
+
+
+def test_positional_arg_skips_resource_param(executor_env):
+    """A resource parameter takes no positional argument; the next data
+    parameter does."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+
+    @rs.Task
+    def count() -> int:
+        return 3
+
+    @rs.Task
+    def describe(label: Label, n):
+        return f"{label.prefix}{n}"
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def described():
+        return describe(count())
+
+    repo = rs.CodeRepository(
+        assets=[described],
+        tasks=[count, describe],
+        resources={"label": Label()},
+        default_executor=executor,
+    )
+    assert repo.materialize().success
+    assert repo.load_node("described") == "n=3"
