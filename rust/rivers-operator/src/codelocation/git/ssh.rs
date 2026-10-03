@@ -227,9 +227,8 @@ pub(crate) async fn fetch_advertisement_with_cap(
     })?;
     let host_keys = known_hosts::HostKeys::new(auth.known_hosts, &target.host, target.port)?;
 
-    // No `inactivity_timeout`: a host that keeps sending resets it, and when
-    // it fires, the read ends as if upload-pack had closed (a terminal
-    // error); the deadline below is the one time limit.
+    // No `inactivity_timeout`: a host that keeps sending resets it; the
+    // deadline below is the one time limit.
     let config = Arc::new(client::Config {
         preferred: russh::Preferred {
             key: host_keys.algorithms()?.into(),
@@ -1108,7 +1107,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_keepalives_do_not_hold_the_resolve_open() {
-        // Each keepalive restarts the 2s timeout.
         let server = ServerBehaviour {
             keepalive: Some(Duration::from_secs(1)),
             ..forge()

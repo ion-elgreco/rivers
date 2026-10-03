@@ -9,9 +9,10 @@
 //!      `grpcEndpoint`, `observedGeneration`, `readyReplicas`.
 //!
 //! Registry polling is gated on the leader lease (see [`crate::leader`]): only
-//! the leader issues registry HEADs. Followers still reconcile owned resources
-//! against whatever digest is already in `status.resolvedImage`, so the
-//! backing Deployment doesn't drift while a leader election is in flight.
+//! the leader issues registry HEADs. In image mode, followers still reconcile
+//! owned resources against whatever digest is already in
+//! `status.resolvedImage`, so the backing Deployment doesn't drift while a
+//! leader election is in flight.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -510,10 +511,8 @@ where
     }
 }
 
-/// Git-mode reconcile (RFC-044 phase 1): pin the runtime image digest and
-/// the commit, publish status. **No Deployment yet** — the workspace
-/// materializer is phase 2, so a git CL deliberately never reaches `Ready`
-/// here and the Run admission webhook keeps rejecting runs against it.
+/// Git-mode reconcile: pin the runtime image digest and the ref's commit,
+/// apply the objects that build and serve that tree, and publish status.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_git(
     cl: &CodeLocation,

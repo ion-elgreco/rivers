@@ -1,6 +1,6 @@
 """The release publishes the runtime image that the chart uses by default.
 
-A git CodeLocation without ``spec.image`` runs
+A git CodeLocation without ``spec.image``, ``spec.tag`` or ``spec.digest`` runs
 ``ghcr.io/ion-elgreco/rivers-runtime:<appVersion>-py<pythonVersion>``. The
 release-helm workflow sets ``appVersion`` to the tag without ``v``.
 

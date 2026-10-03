@@ -214,8 +214,7 @@ pub struct GitCoordinates {
     pub r#ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Credentials Secret name — used only by fallback-mode consumers,
-    /// which fetch for themselves.
+    /// Credentials Secret name, mounted by every pod that builds the tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_name: Option<String>,
 }

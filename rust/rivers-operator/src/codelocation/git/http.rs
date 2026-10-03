@@ -7,12 +7,12 @@
 //! ```
 //!
 //! Status mapping: 401/403 are terminal auth failures, 404 means the
-//! repository itself is absent (terminal until the CR changes), 429 — and
-//! 503 with a `Retry-After` — is a rate limit that carries the host's
-//! `Retry-After`, everything else transport-level is transient. Dumb-HTTP
-//! servers (which ignore the `service` parameter and return a plain refs
-//! file) are rejected on content-type rather than producing a confusing
-//! parse error.
+//! repository itself is absent (terminal until the CR or the remote
+//! changes), 429 — and 503 with a `Retry-After` — is a rate limit that
+//! carries the host's `Retry-After`, everything else transport-level is
+//! transient. Dumb-HTTP servers (which ignore the `service` parameter and
+//! return a plain refs file) are rejected on content-type rather than
+//! producing a confusing parse error.
 
 use std::time::Duration;
 

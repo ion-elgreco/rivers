@@ -585,10 +585,9 @@ message CodeLocationEntry {
   // the operator-hosted admission webhook to stamp
   // `Run.spec.codeLocationRef.identity` on CREATE.
   string identity = 8;
-  // Git-sourced CodeLocations (RFC-044): the pinned commit + matched ref
-  // from `status.resolvedCommit` / `status.resolvedRef`. Empty for
-  // image-mode CLs. The admission webhook stamps `Run.spec.source` from
-  // these so in-flight runs stay immune to branch movement.
+  // Git-sourced CodeLocations (RFC-044): `status.resolvedCommit` /
+  // `status.resolvedRef`, the commit and ref of the tree runs get. Empty for
+  // image-mode CLs.
   string resolved_commit = 9;
   string resolved_ref = 10;
 }

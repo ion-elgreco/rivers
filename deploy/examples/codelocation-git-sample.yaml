@@ -2,8 +2,8 @@
 #
 # The operator resolves `git.ref` to a pinned commit and shows it under
 # `kubectl get rcl` as e.g. `main@9f3c1ab`. The pods run the chart's default
-# runtime image unless `spec.image` names one (e.g. a private mirror or a
-# different Python variant).
+# runtime image unless `spec.image` (e.g. a private mirror) or `spec.tag` /
+# `spec.digest` (e.g. a different Python variant) says otherwise.
 apiVersion: rivers.io/v1alpha1
 kind: CodeLocation
 metadata:

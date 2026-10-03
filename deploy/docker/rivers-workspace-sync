@@ -15,6 +15,8 @@
 #   RIVERS_DEPS_EXTRAS             csv → uv sync --extra …
 #   RIVERS_DEPS_GROUPS             csv → uv sync --group …
 #   RIVERS_DEPS_TIMEOUT_SECONDS    fetch+install budget (default 600)
+#
+# Prune env, set only on the shared-mode code-location pod:
 #   RIVERS_WORKSPACE_KEY           key of this pod's own tree, which the
 #                                  prune never removes
 #   RIVERS_WORKSPACE_KEEP          csv of workspace keys the prune must retain
@@ -35,7 +37,7 @@
 #   /etc/rivers/git   mounted git Secret: username/password for
 #                     https://, identity + known_hosts for ssh://
 #
-# Ordering invariants (tested by the k3d integration suite):
+# Ordering invariants:
 #   * .ready is written LAST — a crash mid-build leaves a tree that gets
 #     retried, never one that looks complete;
 #   * the build lock is released as soon as .ready is there, before the
@@ -323,7 +325,7 @@ prune() {
             continue # this pod's own tree
         fi
         case "$keep_csv" in *",$tree,"*)
-            continue # keep-set (current commit + non-terminal runs)
+            continue # keep-set (target, serving and non-terminal runs' trees)
             ;;
         esac
         if [ "$rank" -le "$keep_n" ]; then

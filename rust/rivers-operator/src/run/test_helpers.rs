@@ -333,7 +333,7 @@ pub fn git_code_location(workspace_size: Option<&str>) -> CodeLocation {
     CodeLocation::new("demo", spec)
 }
 
-/// The source the admission webhook stamps on runs of [`git_code_location`].
+/// The source of a run of [`git_code_location`].
 pub fn git_run_source() -> RunSource {
     serde_json::from_value(serde_json::json!({
         "git": {

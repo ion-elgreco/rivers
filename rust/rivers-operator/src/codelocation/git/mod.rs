@@ -74,14 +74,15 @@ pub enum GitError {
         /// The host's `Retry-After`, when it sent a usable one.
         retry_after: Option<std::time::Duration>,
     },
-    /// The response was not a protocol-v0 ref advertisement.
+    /// The response was not a protocol-v0 ref advertisement, or was longer
+    /// than the resolver reads.
     #[error("malformed advertisement: {0}")]
     Malformed(String),
 }
 
 impl GitError {
     /// A failure that passes on its own; every other one stands until the
-    /// CR, the Secret or the remote changes.
+    /// CR, the Secret, the remote or the operator's settings change.
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
@@ -535,7 +536,7 @@ pub struct GitResolveRequest {
     pub cache_ttl: std::time::Duration,
 }
 
-/// The longest wait between fetches of a failing ref: the default poll
+/// The longest backoff between fetches of a failing ref: the default poll
 /// interval, so a host that stays down is asked no more often than a
 /// default code location polls it, and its recovery shows within one poll.
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
@@ -629,7 +630,8 @@ struct CachedRef {
 }
 
 /// A ref as one set of credentials sees it: a code location only gets a
-/// cached commit or failure that its own credentials produced.
+/// cached commit or failure that its own credentials produced (a host pause
+/// holds for all).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RefKey {
     url: String,
@@ -667,10 +669,10 @@ enum CacheEntry {
 /// day are dropped), one fetch at a time per key (resolves that ask while it
 /// runs get its outcome), semver-like tags resolved once, exponential
 /// backoff after transient errors, and a host that asks the operator to wait
-/// gets no fetch, for any ref, until its `Retry-After` ends. Leader gating
-/// is left to the reconciler. Unlike [`super::registry`]'s digest cache, a
-/// ref that backs off does not serve its last result: it fails until a
-/// fetch succeeds.
+/// gets no fetch, for any ref, until its `Retry-After` (at most an hour)
+/// ends. Leader gating is left to the reconciler. Unlike
+/// [`super::registry`]'s digest cache, a ref that backs off does not serve
+/// its last result: it fails until a fetch succeeds.
 pub struct GitResolver {
     http: reqwest::Client,
     timeout: std::time::Duration,

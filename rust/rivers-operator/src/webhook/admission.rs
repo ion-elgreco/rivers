@@ -385,10 +385,10 @@ fn run_response_for(req: &AdmissionRequest<Run>, outcome: RunOutcome) -> Admissi
             identity,
             source,
         } => {
-            // `replace` for fields the admission request always carries
-            // (the existing Phase-4 wiring); `add` for fields that may be
-            // absent from a user's raw apply payload — `add` both creates
-            // and overwrites, while `replace` would fail on a missing path.
+            // `replace` for fields the admission request always carries;
+            // `add` for fields that may be absent from a user's raw apply
+            // payload — `add` both creates and overwrites, while `replace`
+            // would fail on a missing path.
             let mut ops = vec![
                 PatchOperation::Replace(ReplaceOperation {
                     path: PointerBuf::from_tokens(["spec", "image"]),

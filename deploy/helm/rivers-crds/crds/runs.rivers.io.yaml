@@ -211,9 +211,7 @@ spec:
                         nullable: true
                         type: string
                       secretName:
-                        description: |-
-                          Credentials Secret name — used only by fallback-mode consumers,
-                          which fetch for themselves.
+                        description: Credentials Secret name, mounted by every pod that builds the tree.
                         nullable: true
                         type: string
                       url:

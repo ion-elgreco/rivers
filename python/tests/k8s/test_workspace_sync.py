@@ -35,7 +35,7 @@ import from the checkout: the project directory, and the directories that
 the venv's ``.pth`` files add from the checkout (editable installs, such as
 the uv workspace members that the project uses). In fallback mode, each pod
 writes to its own tree, and Python writes the bytecode of what it imports,
-so the build compiles nothing.
+so the build compiles nothing from the checkout.
 
 Once the tree is ready, a pod releases the tree's build lock before it
 deletes old trees or prunes the uv cache, so the pods that wait for the

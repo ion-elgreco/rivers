@@ -3,10 +3,10 @@
 The script runs the way the init container runs it, but against a git remote
 in ``tmp_path`` (a ``file://`` URL), a fake ``uv`` that records its
 arguments, and a ``python3`` that records its arguments before it runs. Each
-run gets a new, empty termination log, as kubelet gives each container start
-one. Hosts without ``flock``, ``timeout`` or GNU ``stat`` (macOS) get
-stand-ins on ``PATH``; Linux CI runs the real tools. macOS runs the script
-with bash 3.2, so it must not use bash-4 syntax.
+``WorkspaceSync.run`` gets a new, empty termination log, as kubelet gives each
+container start one. Hosts without ``flock``, ``timeout`` or GNU ``stat``
+(macOS) get stand-ins on ``PATH``; Linux CI runs the real tools. macOS runs
+the script with bash 3.2, so it must not use bash-4 syntax.
 
 A held step waits until the test releases it (``WorkspaceSync.release``), or
 until the test ends.

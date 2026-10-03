@@ -99,7 +99,7 @@ pub struct CodeLocationSpec {
     /// OCI image repository without tag or digest (e.g. `ghcr.io/acme/pipeline`).
     ///
     /// This is always "the container image the pods run". Without `git` it
-    /// also carries the code (today's behaviour). With `git` set it is the
+    /// also carries the code. With `git` set it is the
     /// *runtime* image and the code comes from the repository; when omitted
     /// in git mode, the operator falls back to the chart-configured default
     /// runtime image.
