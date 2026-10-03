@@ -4,38 +4,36 @@ use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec, ResourceRequir
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube_client::ResourceExt;
+use rivers_k8s::crd::code_location::CodeLocationSpec;
 use rivers_k8s::crd::run::Run;
-use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
+use rivers_k8s::workspace::{self, WorkspaceSpec};
 
 use crate::codelocation::WorkspaceConfig;
-use crate::codelocation::resources::workspace_pvc_name;
 
 /// Consumer-side workspace for a git-mode run, or `None` for image mode.
-/// Derived from the Run's stamped `spec.source` + chart config; the same
-/// spec shape the step-Job builder rebuilds in-pod from `RIVERS_RUN_SOURCE`.
+/// Derived from the Run's stamped `spec.source`, its CodeLocation's spec and
+/// the chart config; the same spec shape the step-Job builder rebuilds
+/// in-pod from `RIVERS_RUN_SOURCE`.
 fn run_workspace_spec(
     run: &Run,
     workspace_cfg: &WorkspaceConfig,
-    cl_env: &[EnvVar],
+    cl_spec: &CodeLocationSpec,
 ) -> Option<WorkspaceSpec> {
     run.spec.source.as_ref().map(|source| {
-        let volume = if workspace_cfg.shared_enabled {
-            WorkspaceVolume::SharedPvc {
-                claim_name: workspace_pvc_name(&run.spec.code_location_ref.name),
-            }
-        } else {
-            WorkspaceVolume::EmptyDir {
-                size_limit: Some(Quantity(workspace_cfg.empty_dir_limit.clone())),
-            }
-        };
-        workspace::consumer_spec_from_run_source(source, &run.spec.image, volume, cl_env.to_vec())
+        workspace::consumer_spec_from_run_source(
+            source,
+            &run.spec.image,
+            workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
+            cl_spec.env.clone(),
+        )
     })
 }
 
 /// `resume = true` flips the `rivers execute` invocation to resume mode
-/// (skip already-completed steps); `cl_env` is the parent
-/// `CodeLocation.spec.env` forwarded onto the pod so `secretKeyRef` /
-/// `configMapKeyRef` / `fieldRef` semantics are preserved.
+/// (skip already-completed steps); `cl_spec` is the owning CodeLocation's
+/// spec: its `env` is forwarded onto the pod so `secretKeyRef` /
+/// `configMapKeyRef` / `fieldRef` semantics are preserved, and in git mode
+/// it sizes the workspace.
 /// `surreal_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
 /// stamped on every rivers pod — sourced from the operator's own env, so the
 /// auth-secret coordinates the run pod re-emits onto step pods stay
@@ -46,7 +44,7 @@ pub fn build_executor_pod(
     pod_name: &str,
     run_id: &str,
     resume: bool,
-    cl_env: &[EnvVar],
+    cl_spec: &CodeLocationSpec,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     workspace_cfg: &WorkspaceConfig,
@@ -54,7 +52,7 @@ pub fn build_executor_pod(
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
-    let workspace_spec = run_workspace_spec(run, workspace_cfg, cl_env);
+    let workspace_spec = run_workspace_spec(run, workspace_cfg, cl_spec);
     let pieces = workspace_spec.as_ref().map(workspace::consumer_pod_pieces);
     let command = if workspace_spec.is_some() {
         workspace::VENV_RIVERS_BIN.to_string()
@@ -187,7 +185,7 @@ pub fn build_executor_pod(
                         env.extend(pieces.main_env.iter().cloned());
                     }
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
-                    rivers_k8s::env::merge_env(env, cl_env.iter().cloned())
+                    rivers_k8s::env::merge_env(env, cl_spec.env.iter().cloned())
                 }),
                 ..Default::default()
             }],
@@ -231,6 +229,7 @@ fn build_execute_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::test_helpers::{emptydir_limits, git_code_location};
     use rivers_k8s::crd::run::{CodeLocationRef, Executor, ResourceSpec, RunSpec};
 
     fn test_run() -> Run {
@@ -274,7 +273,10 @@ mod tests {
             pod_name,
             run_id,
             resume,
-            cl_env,
+            &CodeLocationSpec {
+                env: cl_env.to_vec(),
+                ..Default::default()
+            },
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &WorkspaceConfig::default(),
@@ -310,7 +312,7 @@ mod tests {
             "p",
             "run-123",
             false,
-            &[],
+            &CodeLocationSpec::default(),
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &shared,
@@ -351,7 +353,7 @@ mod tests {
             "p",
             "run-123",
             false,
-            &[],
+            &CodeLocationSpec::default(),
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &WorkspaceConfig::default(), // shared_enabled: false
@@ -370,6 +372,52 @@ mod tests {
     }
 
     #[test]
+    fn git_run_fallback_caps_the_workspace_at_the_code_locations_size() {
+        for (workspace_size, limit) in [(Some("10Gi"), "10Gi"), (None, "2Gi")] {
+            let pod = build_executor_pod(
+                &git_run(),
+                "p",
+                "run-123",
+                false,
+                &git_code_location(workspace_size).spec,
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig::default(), // fallback, sizeLimit 2Gi
+            );
+
+            assert_eq!(
+                emptydir_limits(&pod),
+                (Some(limit.to_string()), Some(limit.to_string())),
+                "workspaceSize {workspace_size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_run_shared_mode_ignores_the_workspace_size() {
+        let pod = build_executor_pod(
+            &git_run(),
+            "p",
+            "run-123",
+            false,
+            &git_code_location(Some("10Gi")).spec,
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &WorkspaceConfig {
+                shared_enabled: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_value(&pod.spec.as_ref().unwrap().volumes).unwrap(),
+            serde_json::json!([{ "name": "workspace", "persistentVolumeClaim": {
+                "claimName": "demo-workspace", "readOnly": true } }])
+        );
+        assert_eq!(emptydir_limits(&pod), (None, None));
+    }
+
+    #[test]
     fn git_run_executor_pod_sets_the_runtime_fs_group() {
         let mut run = git_run();
         run.spec.source.as_mut().unwrap().git.secret_name = Some("git-creds".to_string());
@@ -379,7 +427,7 @@ mod tests {
                 "p",
                 "run-123",
                 false,
-                &[],
+                &CodeLocationSpec::default(),
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &WorkspaceConfig {
@@ -441,7 +489,7 @@ mod tests {
             "test-pod",
             "run-123",
             false,
-            &[],
+            &CodeLocationSpec::default(),
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
@@ -654,7 +702,10 @@ mod tests {
             "test-pod",
             "run-123",
             false,
-            &cl_env,
+            &CodeLocationSpec {
+                env: cl_env,
+                ..Default::default()
+            },
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),

@@ -45,6 +45,7 @@ use super::resources::{
 use crate::leader::LeaderGate;
 use crate::metrics;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use rivers_k8s::crd::run::RunSource;
 use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
 
@@ -108,6 +109,27 @@ impl Default for WorkspaceConfig {
             empty_dir_limit: "2Gi".to_string(),
             keep_revisions: 3,
             min_tree_age: "1h".to_string(),
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    /// Workspace volume for the pods of CodeLocation `cl_name` and of its
+    /// runs: the CL's shared PVC, or an `emptyDir` capped at
+    /// `spec.git.workspaceSize`, else at the chart's `sizeLimit`.
+    pub fn volume(&self, cl_name: &str, cl_spec: &CodeLocationSpec) -> WorkspaceVolume {
+        if self.shared_enabled {
+            return WorkspaceVolume::SharedPvc {
+                claim_name: workspace_pvc_name(cl_name),
+            };
+        }
+        let size_limit = cl_spec
+            .git
+            .as_ref()
+            .and_then(|git| git.workspace_size.clone())
+            .unwrap_or_else(|| Quantity(self.empty_dir_limit.clone()));
+        WorkspaceVolume::EmptyDir {
+            size_limit: Some(size_limit),
         }
     }
 }
@@ -403,24 +425,9 @@ async fn apply_git_workspace(
     let git_spec = cl.spec.git.as_ref().expect("git CL");
     let key = workspace::workspace_key(&resolved.commit, resolved_image);
 
-    let volume = if ctx.workspace.shared_enabled {
-        WorkspaceVolume::SharedPvc {
-            claim_name: workspace_pvc_name(&name),
-        }
-    } else {
-        let limit = git_spec.workspace_size.clone().unwrap_or_else(|| {
-            k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-                ctx.workspace.empty_dir_limit.clone(),
-            )
-        });
-        WorkspaceVolume::EmptyDir {
-            size_limit: Some(limit),
-        }
-    };
-
     let wspec = WorkspaceSpec {
         key: key.clone(),
-        volume,
+        volume: ctx.workspace.volume(&name, &cl.spec),
         runtime_image: resolved_image.to_string(),
         git_url: git_spec.url.clone(),
         commit: resolved.commit.clone(),
@@ -2325,6 +2332,61 @@ mod tests {
             // Same Deployment, the leader's status: a follower that disagreed
             // would patch here, and the two would overwrite each other.
             assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[tokio::test]
+        async fn run_pods_size_their_workspace_like_the_code_location_pods() {
+            use crate::run::test_helpers::emptydir_limits;
+            use k8s_openapi::api::core::v1::Pod;
+            use rivers_k8s::crd::run::Run;
+
+            for workspace_size in [Some("10Gi"), None] {
+                let mut cl = git_cl_at('a', serving_status('a'));
+                cl.spec.git.as_mut().unwrap().workspace_size =
+                    workspace_size.map(|s| Quantity(s.to_string()));
+                let state = api_with(cl.clone(), rolled_out());
+                pass(&state, LeaderGate::leading()).await;
+                let cl_pod = Pod {
+                    spec: state.lock().unwrap().deployments["x"]
+                        .spec
+                        .clone()
+                        .and_then(|d| d.template.spec),
+                    ..Default::default()
+                };
+
+                let run = Run::new(
+                    "r",
+                    serde_json::from_value(json!({
+                        "codeLocationRef": { "name": "x" },
+                        "image": runtime('a'),
+                        "target": "job",
+                        "source": run_source_json('a'),
+                    }))
+                    .unwrap(),
+                );
+                let run_pod = crate::run::pod_builder::build_executor_pod(
+                    &run,
+                    "r-executor",
+                    "run-1",
+                    false,
+                    &cl.spec,
+                    &Default::default(),
+                    &Default::default(),
+                    &WorkspaceConfig::default(),
+                );
+
+                let limit = workspace_size.unwrap_or("2Gi").to_string();
+                assert_eq!(
+                    emptydir_limits(&cl_pod),
+                    (Some(limit.clone()), Some(limit)),
+                    "workspaceSize {workspace_size:?}"
+                );
+                assert_eq!(
+                    emptydir_limits(&run_pod),
+                    emptydir_limits(&cl_pod),
+                    "workspaceSize {workspace_size:?}"
+                );
+            }
         }
 
         #[tokio::test]

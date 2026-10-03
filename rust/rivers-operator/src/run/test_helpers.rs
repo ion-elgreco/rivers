@@ -9,7 +9,7 @@ use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
-use rivers_k8s::crd::run::{Run, RunCrdStatus, RunSpec};
+use rivers_k8s::crd::run::{Run, RunCrdStatus, RunSource, RunSpec};
 
 use super::reconcile::Context;
 use crate::codelocation::DirectoryState;
@@ -199,6 +199,65 @@ fn not_found_status() -> serde_json::Value {
         "reason": "NotFound",
         "code": 404
     })
+}
+
+const GIT_URL: &str = "https://forge.example/acme/pipelines.git";
+
+/// `demo` as a git CodeLocation; `workspace_size` sets `spec.git.workspaceSize`.
+pub fn git_code_location(workspace_size: Option<&str>) -> CodeLocation {
+    let spec = serde_json::from_value(serde_json::json!({
+        "git": {
+            "url": GIT_URL,
+            "ref": { "branch": "main" },
+            "workspaceSize": workspace_size,
+        },
+    }))
+    .unwrap();
+    CodeLocation::new("demo", spec)
+}
+
+/// The source the admission webhook stamps on runs of [`git_code_location`].
+pub fn git_run_source() -> RunSource {
+    serde_json::from_value(serde_json::json!({
+        "git": {
+            "url": GIT_URL,
+            "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+            "ref": "refs/heads/main",
+        },
+        "dependencies": { "mode": "auto" },
+    }))
+    .unwrap()
+}
+
+/// The body of the last pod create request.
+pub fn created_pod(state: &MockApiState) -> Pod {
+    let create = state
+        .requests
+        .iter()
+        .rev()
+        .find(|r| r.method == "POST" && r.path.ends_with("/pods"))
+        .expect("no pod create request");
+    serde_json::from_value(create.body.clone().expect("pod create has no body")).unwrap()
+}
+
+/// A git-mode pod's `emptyDir` cap: on its `workspace` volume, and in the
+/// `RIVERS_WORKSPACE_EMPTYDIR_LIMIT` it hands to the step Jobs it launches.
+pub fn emptydir_limits(pod: &Pod) -> (Option<String>, Option<String>) {
+    let spec = pod.spec.as_ref().expect("pod has a spec");
+    let volume = spec
+        .volumes
+        .iter()
+        .flatten()
+        .find(|v| v.name == rivers_k8s::workspace::WORKSPACE_VOLUME)
+        .and_then(|v| v.empty_dir.as_ref()?.size_limit.as_ref())
+        .map(|q| q.0.clone());
+    let env = spec.containers[0]
+        .env
+        .iter()
+        .flatten()
+        .find(|e| e.name == rivers_k8s::env::ENV_WORKSPACE_EMPTYDIR_LIMIT)
+        .and_then(|e| e.value.clone());
+    (volume, env)
 }
 
 pub fn test_run_spec() -> RunSpec {

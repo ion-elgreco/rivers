@@ -9,7 +9,7 @@ use rivers_k8s::crd::run::{CONDITION_EXECUTOR_RESTARTED, Run, RunPhase};
 
 use super::pod_builder::build_executor_pod;
 use super::reconcile::{
-    Context, Error, apply_outcome_to_status, delete_pod_if_exists, fetch_cl_env, make_condition,
+    Context, Error, apply_outcome_to_status, delete_pod_if_exists, fetch_cl_spec, make_condition,
     patch_status, push_condition, sync_run_status_to_storage,
 };
 
@@ -118,13 +118,13 @@ pub async fn handle_executor_failure(
         let _ = delete_pod_if_exists(pods_api, old_pod).await;
     }
 
-    let cl_env = fetch_cl_env(ctx, run).await?;
+    let cl_spec = fetch_cl_spec(ctx, run).await?;
     let pod = build_executor_pod(
         run,
         &pod_name,
         run_id,
         true,
-        &cl_env,
+        &cl_spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.workspace,
@@ -456,6 +456,36 @@ mod tests {
         let spec = pod.spec.unwrap();
         let args = spec.containers[0].args.as_ref().unwrap();
         assert!(args.contains(&"--resume".to_string()));
+    }
+
+    #[tokio::test]
+    async fn restarted_git_run_pod_keeps_its_code_locations_workspace_size() {
+        let api_state = Arc::new(Mutex::new(MockApiState::default()));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+
+        let storage = memory_storage().await;
+        let ctx = make_context(client, storage.clone());
+        ctx.directory
+            .upsert_spec(
+                "default",
+                "demo",
+                Arc::new(git_code_location(Some("10Gi")).spec),
+            )
+            .await;
+        let mut run = test_run_running("run-1", Some(0));
+        run.spec.source = Some(git_run_source());
+
+        handle_executor_failure(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let pod = created_pod(&api_state.lock().unwrap());
+        assert_eq!(
+            emptydir_limits(&pod),
+            (Some("10Gi".to_string()), Some("10Gi".to_string()))
+        );
     }
 
     #[tokio::test]
