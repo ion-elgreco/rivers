@@ -1,7 +1,6 @@
 //! ScheduleEvaluationContext — passed to schedule evaluation functions.
-use std::sync::OnceLock;
-
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::PyType;
 
 /// Context passed to schedule evaluation functions.
@@ -14,7 +13,7 @@ pub struct PyScheduleEvaluationContext {
     pub schedule_name: String,
     /// Pydantic config instance (set via `ScheduleEvaluationContext[Config]` generic).
     pub config_instance: Option<Py<PyAny>>,
-    _logger: OnceLock<Py<PyAny>>,
+    _logger: PyOnceLock<Py<PyAny>>,
 }
 
 impl PyScheduleEvaluationContext {
@@ -23,7 +22,7 @@ impl PyScheduleEvaluationContext {
             scheduled_execution_time,
             schedule_name,
             config_instance: None,
-            _logger: OnceLock::new(),
+            _logger: PyOnceLock::new(),
         }
     }
 
@@ -52,14 +51,13 @@ impl PyScheduleEvaluationContext {
 
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let logger = self._logger.get_or_init(|| {
-            let logging = py.import("logging").expect("failed to import logging");
+        let logger = self._logger.get_or_try_init(py, || {
+            let logging = py.import("logging")?;
             let name = format!("code-repo.schedules.{}", self.schedule_name);
             logging
                 .call_method1("getLogger", (name,))
-                .expect("failed to get logger")
-                .unbind()
-        });
+                .map(Bound::unbind)
+        })?;
         Ok(logger.bind(py).clone())
     }
 

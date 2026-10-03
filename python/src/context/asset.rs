@@ -1,9 +1,10 @@
 //! AssetExecutionContext — passed to @Asset functions during materialization.
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::errors::PartitionValidationError;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
 use crate::errors::ExecutionError;
@@ -44,7 +45,7 @@ pub struct PyAssetExecutionContext {
     _data_version: Mutex<Option<String>>,
     /// Partition keys marked as failed during a batched backfill run.
     _failed_backfill_partitions: Mutex<HashMap<PyPartitionKey, String>>,
-    _logger: OnceLock<Py<PyAny>>,
+    _logger: PyOnceLock<Py<PyAny>>,
 }
 
 impl PyAssetExecutionContext {
@@ -75,7 +76,7 @@ impl PyAssetExecutionContext {
             _output_metadata: Mutex::new(HashMap::new()),
             _data_version: Mutex::new(None),
             _failed_backfill_partitions: Mutex::new(HashMap::new()),
-            _logger: OnceLock::new(),
+            _logger: PyOnceLock::new(),
         }
     }
 
@@ -237,14 +238,13 @@ impl PyAssetExecutionContext {
     /// Python logger named `code-repo.assets.<asset_name>`, lazily initialized.
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let logger = self._logger.get_or_init(|| {
-            let logging = py.import("logging").expect("failed to import logging");
+        let logger = self._logger.get_or_try_init(py, || {
+            let logging = py.import("logging")?;
             let name = format!("code-repo.assets.{}", self.asset_name);
             logging
                 .call_method1("getLogger", (name,))
-                .expect("failed to get logger")
-                .unbind()
-        });
+                .map(Bound::unbind)
+        })?;
         Ok(logger.bind(py).clone())
     }
 

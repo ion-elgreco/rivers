@@ -4,9 +4,10 @@
 //! the asset's identity, its IO handler as a config bag, and the per-asset
 //! metadata that IO resolution honors.
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
 
 use crate::errors::{ExecutionError, PartitionValidationError};
@@ -36,7 +37,7 @@ pub struct PyActionContext {
     /// annotation; override values come from `run_action(config=...)`.
     #[pyo3(get)]
     pub config: Option<Py<PyAny>>,
-    _logger: OnceLock<Py<PyAny>>,
+    _logger: PyOnceLock<Py<PyAny>>,
     _failed_partitions: Mutex<HashMap<PyPartitionKey, String>>,
 }
 
@@ -59,7 +60,7 @@ impl PyActionContext {
             partition,
             io_handler,
             config,
-            _logger: OnceLock::new(),
+            _logger: PyOnceLock::new(),
             _failed_partitions: Mutex::new(HashMap::new()),
         }
     }
@@ -163,14 +164,13 @@ impl PyActionContext {
     /// Python logger named `code-repo.actions.<asset_name>`, lazily initialized.
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let logger = self._logger.get_or_init(|| {
-            let logging = py.import("logging").expect("failed to import logging");
+        let logger = self._logger.get_or_try_init(py, || {
+            let logging = py.import("logging")?;
             let name = format!("code-repo.actions.{}", self.asset_name);
             logging
                 .call_method1("getLogger", (name,))
-                .expect("failed to get logger")
-                .unbind()
-        });
+                .map(Bound::unbind)
+        })?;
         Ok(logger.bind(py).clone())
     }
 

@@ -4,7 +4,14 @@ The failures these tests catch show up on free-threaded CPython (3.14t), where
 threads run Python and rivers code at the same time.
 """
 
+import gc
+import json
+import logging
+import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -366,3 +373,125 @@ def test_asset_def_setter_while_rivers_runs_python(read):
     assert errors == []
     assert in_eq.is_set()
     assert (results[0], ad.tags) == ({"from_multi": ["a"], "eq": True}[read], ["b"])
+
+
+TESTS_DIR = Path(__file__).resolve().parents[1]
+
+
+def materialize_asset(read_log):
+    @rs.Asset
+    def a(context: rs.AssetExecutionContext) -> int:
+        read_log(context)
+        return 1
+
+    repo = rs.CodeRepository(assets=[a], default_executor=rs.Executor.in_process())
+    repo.materialize()
+
+
+def execute_task(read_log):
+    @rs.Task
+    def t(context: rs.TaskExecutionContext) -> int:
+        read_log(context)
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[],
+        tasks=[t],
+        jobs=[rs.Job(name="j", assets=[t])],
+        default_executor=rs.Executor.in_process(),
+    )
+    repo.get_job("j").execute()
+
+
+def run_asset_action(read_log):
+    def touch(context: rs.ActionContext) -> None:
+        read_log(context)
+
+    @rs.Asset(
+        actions=[rs.AssetAction(name="touch", outcome=rs.Outcome.Unchanged)(touch)]
+    )
+    def a() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[a], default_executor=rs.Executor.in_process())
+    repo.run_action("touch")
+
+
+def evaluate_sensor(read_log):
+    @rs.Sensor
+    def s(context: rs.SensorEvaluationContext):
+        read_log(context)
+        return rs.SkipReason("done")
+
+    rs.CodeRepository(assets=[], sensors=[s]).evaluate_sensor("s")
+
+
+def evaluate_schedule(read_log):
+    @rs.Schedule(cron_schedule="* * * * *", job_name="j")
+    def s(context: rs.ScheduleEvaluationContext):
+        read_log(context)
+        return rs.SkipReason("done")
+
+    rs.CodeRepository(assets=[], schedules=[s]).evaluate_schedule("s")
+
+
+CONTEXT_LOGGERS = {
+    "asset": ("code-repo.assets.a", materialize_asset),
+    "task": ("code-repo.tasks.t", execute_task),
+    "action": ("code-repo.actions.a", run_asset_action),
+    "sensor": ("code-repo.sensors.s", evaluate_sensor),
+    "schedule": ("code-repo.schedules.s", evaluate_schedule),
+}
+
+
+def read_context_log_in_threads(kind):
+    """Child process of ``test_context_log_first_read_in_threads``: all threads
+    read ``context.log`` while the first read sleeps and collects garbage in
+    ``logging.getLogger``."""
+    get_logger = logging.getLogger
+
+    def slow_get_logger(name=None):
+        time.sleep(0.05)
+        gc.collect()
+        return get_logger(name)
+
+    logging.getLogger = slow_get_logger
+    reads = []
+
+    def read_log(context):
+        loggers, errors = run_threads(lambda i: context.log)
+        reads.append(
+            {
+                "errors": errors,
+                "names": [getattr(logger, "name", None) for logger in loggers],
+                "objects": len({id(logger) for logger in loggers}),
+            }
+        )
+
+    CONTEXT_LOGGERS[kind][1](read_log)
+    print(json.dumps(reads))
+
+
+@pytest.mark.parametrize("kind", CONTEXT_LOGGERS)
+def test_context_log_first_read_in_threads(kind, tmp_path):
+    """Threads that wait for the first ``context.log`` read must not block it.
+    A deadlock hangs the child process instead of the test run."""
+    child = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from concurrency.test_thread_safety import read_context_log_in_threads; "
+        "read_context_log_in_threads(sys.argv[2])"
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "-c", child, str(TESTS_DIR), kind],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    name = CONTEXT_LOGGERS[kind][0]
+    assert json.loads(proc.stdout.splitlines()[-1]) == [
+        {"errors": [], "names": [name] * N_THREADS, "objects": 1}
+    ]
