@@ -63,7 +63,7 @@ impl<'py> IntoPyObject<'py> for &PyBashCommand {
 }
 
 /// A task that executes a shell command, exposed to Python as `BashTask`.
-#[pyclass(name = "BashTask", module = "rivers._core")]
+#[pyclass(name = "BashTask", module = "rivers._core", frozen)]
 pub struct PyBashTask {
     pub name: String,
     pub command: PyBashCommand,

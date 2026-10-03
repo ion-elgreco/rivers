@@ -479,14 +479,14 @@ impl PyJob {
                 }
             } else if let Ok(task) = obj.cast_bound::<PyTask>(py) {
                 let task_name = task
-                    .borrow()
+                    .get()
                     .inner
                     .name
                     .clone()
                     .ok_or_else(|| GraphValidationError::new_err("Task has no name"))?;
                 node_names.push(task_name);
             } else if let Ok(bash) = obj.cast_bound::<PyBashTask>(py) {
-                node_names.push(bash.borrow().name.clone());
+                node_names.push(bash.get().name.clone());
             } else if let Ok(t) = obj.bind(py).cast::<pyo3::types::PyType>()
                 && t.is_subclass_of::<PyAsset>()?
             {

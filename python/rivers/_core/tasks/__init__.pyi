@@ -76,7 +76,8 @@ class Task:
     """A Python-callable task wrapped for use in ``@Asset.from_graph``.
 
     Use as a decorator (``@Task`` / ``@Task(name=...)``) or a constructor
-    around an existing function.
+    around an existing function. A ``Task`` without a function is a decorator:
+    each function it decorates becomes a new ``Task`` with the same settings.
     """
 
     @property
@@ -121,7 +122,11 @@ class Task:
         ...
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke the wrapped function (or apply this object as a decorator)."""
+        """Invoke the wrapped function.
+
+        On a ``Task`` without a function, return a new ``Task`` that wraps the
+        given function and keeps this task's settings.
+        """
         ...
 
 class TaskExecutionContext(Generic[ConfigT]):

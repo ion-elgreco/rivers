@@ -436,8 +436,7 @@ impl ResolvedTask {
         input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
         partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
     ) -> PyResult<Self> {
-        let task_ref = inner.borrow(py);
-        let task = &task_ref.inner;
+        let task = &inner.get().inner;
 
         let name = task
             .name
@@ -457,8 +456,6 @@ impl ResolvedTask {
         let partition_mapping = partition_mapping_override
             .or_else(|| task.partition_mapping.as_ref().map(|m| m.0.clone()));
         let io_handler = task.io_handler.as_ref().map(|h| h.clone_ref(py));
-
-        drop(task_ref);
 
         Ok(Self {
             inner,
@@ -509,13 +506,12 @@ impl ResolvedBashTask {
         partitions_def: Option<PartitionsDefinition>,
         partition_mapping_override: Option<HashMap<String, PartitionMapping>>,
     ) -> Self {
-        let bash_ref = inner.borrow(py);
-        let name = bash_ref.name.clone();
-        let tags = bash_ref.tags.clone();
+        let bash = inner.get();
+        let name = bash.name.clone();
+        let tags = bash.tags.clone();
         let partition_mapping = partition_mapping_override
-            .or_else(|| bash_ref.partition_mapping.as_ref().map(|m| m.0.clone()));
-        let io_handler = bash_ref.io_handler.as_ref().map(|h| h.clone_ref(py));
-        drop(bash_ref);
+            .or_else(|| bash.partition_mapping.as_ref().map(|m| m.0.clone()));
+        let io_handler = bash.io_handler.as_ref().map(|h| h.clone_ref(py));
 
         Self {
             inner,
@@ -708,8 +704,7 @@ impl ResolvedNode {
                 }
             }
             ResolvedNode::Task(node) => {
-                let task = node.inner.borrow(py);
-                let func = task.inner.wraps.as_ref().ok_or_else(|| {
+                let func = node.inner.get().inner.wraps.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err("Task has no wrapped function")
                 })?;
                 Ok(func.clone_ref(py))
@@ -745,8 +740,7 @@ impl ResolvedNode {
                 Ok(Some(ann.into_bound(py).cast_into::<PyDict>()?))
             }
             ResolvedNode::Task(node) => {
-                let task = node.inner.borrow(py);
-                let func = task.inner.wraps.as_ref().ok_or_else(|| {
+                let func = node.inner.get().inner.wraps.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err("Task has no wrapped function")
                 })?;
                 let ann = func.getattr(py, "__annotations__")?;
@@ -892,11 +886,10 @@ impl ResolvedNode {
                 asset_output_io_handler(asset.inner(), &node.output_name).is_some()
             }
             ResolvedNode::Task(node) => {
-                node.io_handler_override.is_some()
-                    || node.inner.borrow(py).inner.io_handler.is_some()
+                node.io_handler_override.is_some() || node.inner.get().inner.io_handler.is_some()
             }
             ResolvedNode::BashTask(node) => {
-                node.io_handler_override.is_some() || node.inner.borrow(py).io_handler.is_some()
+                node.io_handler_override.is_some() || node.inner.get().io_handler.is_some()
             }
         }
     }
@@ -906,8 +899,8 @@ impl ResolvedNode {
     pub fn has_definition_io_handler(&self, py: Python) -> bool {
         match self {
             ResolvedNode::Asset(_) => self.has_io_handler(py),
-            ResolvedNode::Task(node) => node.inner.borrow(py).inner.io_handler.is_some(),
-            ResolvedNode::BashTask(node) => node.inner.borrow(py).io_handler.is_some(),
+            ResolvedNode::Task(node) => node.inner.get().inner.io_handler.is_some(),
+            ResolvedNode::BashTask(node) => node.inner.get().io_handler.is_some(),
         }
     }
 

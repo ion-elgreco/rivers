@@ -1240,7 +1240,7 @@ pub(crate) fn build_unresolved_graph(
 
     for task_py in tasks {
         if let Ok(py_task) = task_py.cast_bound::<PyTask>(py) {
-            let task = py_task.borrow();
+            let task = py_task.get();
             let task_name = task
                 .inner
                 .name
@@ -1315,18 +1315,14 @@ pub(crate) fn build_unresolved_graph(
                     false
                 };
 
-            drop(task);
-
             // Bare entries use annotation-based deps which may reference
             // params that don't exist as graph nodes — skip when this task
             // is used exclusively inside graph compositions.
             if !has_namespaced {
                 let mut deps = Vec::new();
-                let task = py_task.borrow();
                 if let Some(ref wraps) = task.inner.wraps {
                     append_deps(py, &mut deps, wraps, resource_keys)?;
                 }
-                drop(task);
                 unresolved_graph.insert(task_name.clone(), deps);
                 node_map.insert(
                     task_name,
@@ -1344,9 +1340,7 @@ pub(crate) fn build_unresolved_graph(
                 );
             }
         } else if let Ok(py_bash) = task_py.cast_bound::<PyBashTask>(py) {
-            let bash = py_bash.borrow();
-            let task_name = bash.name.clone();
-            drop(bash);
+            let task_name = py_bash.get().name.clone();
 
             let bash_ref: Py<PyBashTask> = py_bash.clone().unbind();
 
@@ -3303,11 +3297,11 @@ impl PyCodeRepository {
                     a.retry = Self::resolve_retry_ref(r, &self.raw_retries, "asset", &a.name)?;
                 }
                 ResolvedNode::Task(t) => {
-                    let r = t.inner.borrow(py).inner.retry.clone();
+                    let r = t.inner.get().inner.retry.clone();
                     t.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &t.name)?;
                 }
                 ResolvedNode::BashTask(b) => {
-                    let r = b.inner.borrow(py).retry.clone();
+                    let r = b.inner.get().retry.clone();
                     b.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &b.name)?;
                 }
             }

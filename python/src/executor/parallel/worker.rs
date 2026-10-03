@@ -145,7 +145,7 @@ pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
     }
     if let Ok(task) = obj.bind(py).cast::<PyTask>() {
         return task
-            .borrow()
+            .get()
             .inner
             .io_handler
             .as_ref()
