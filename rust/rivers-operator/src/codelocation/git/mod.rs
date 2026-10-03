@@ -159,6 +159,10 @@ impl Advertisement {
 pub struct ResolvedRef {
     pub commit: String,
     pub ref_name: Option<String>,
+    /// When the resolver fetched this answer from the git host; a cached
+    /// answer keeps the time of its fetch. `None` for a pinned commit, which
+    /// is never fetched, and from [`commit_for_ref`] alone.
+    pub fetched_at: Option<jiff::Timestamp>,
 }
 
 /// Reads a protocol-v0 ref advertisement as it arrives and keeps only the
@@ -346,6 +350,7 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
         return Ok(ResolvedRef {
             commit: commit.to_string(),
             ref_name: None,
+            fetched_at: None,
         });
     }
     let Some((name, answers)) = advertised_names(wanted) else {
@@ -357,6 +362,7 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
         Some(commit) => Ok(ResolvedRef {
             commit,
             ref_name: Some(name),
+            fetched_at: None,
         }),
         None => Err(GitError::RefNotFound(format!("{name} is not advertised"))),
     }
@@ -709,6 +715,7 @@ impl GitResolver {
             return Ok(ResolvedRef {
                 commit: commit.to_string(),
                 ref_name: None,
+                fetched_at: None,
             });
         }
 
@@ -811,7 +818,11 @@ impl GitResolver {
     }
 
     async fn fetch_commit(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitError> {
-        commit_for_ref(&self.fetch(req).await?, &req.r#ref)
+        let resolved = commit_for_ref(&self.fetch(req).await?, &req.r#ref)?;
+        Ok(ResolvedRef {
+            fetched_at: Some(jiff::Timestamp::now()),
+            ..resolved
+        })
     }
 
     /// The refs of `req`'s repository that answer its ref.
@@ -939,6 +950,42 @@ mod resolver_tests {
         assert_eq!(first, second);
         assert_eq!(first.commit, fixtures::oid('a'));
         // MockServer verifies expect(1) on drop — a second HTTP hit fails.
+    }
+
+    #[tokio::test]
+    async fn an_answer_says_when_the_git_host_gave_it() {
+        let server = mock_git_server(2).await;
+        let resolver = resolver();
+        let main = main_of(&server);
+        let now = Instant::now();
+
+        let before = jiff::Timestamp::now();
+        let fetched = resolver.resolve_at(&main, now).await.unwrap();
+        let fetched_at = fetched.fetched_at.expect("the time of the fetch");
+        assert!(before <= fetched_at && fetched_at <= jiff::Timestamp::now());
+
+        // The cache answers with the time of the fetch it holds.
+        let cached = resolver
+            .resolve_at(&main, now + TTL - Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(cached, fetched);
+
+        let refetched = resolver.resolve_at(&main, now + TTL).await.unwrap();
+        assert!(
+            refetched.fetched_at.is_some_and(|at| at > fetched_at),
+            "{refetched:?}"
+        );
+        assert_eq!(polls(&server).await, 2);
+
+        let pinned = request(
+            main.url.clone(),
+            GitRef {
+                commit: Some(fixtures::oid('9')),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolver.resolve(&pinned).await.unwrap().fetched_at, None);
     }
 
     #[tokio::test]
@@ -1506,11 +1553,13 @@ mod resolver_tests {
         let outcomes = resolve_together(&resolver(), &[&req; 5], Instant::now()).await;
 
         assert_eq!(polls(&server).await, 1);
+        let resolved: Vec<ResolvedRef> = outcomes.into_iter().map(Result::unwrap).collect();
         let main = ResolvedRef {
             commit: fixtures::oid('a'),
             ref_name: Some("refs/heads/main".to_string()),
+            fetched_at: resolved[0].fetched_at,
         };
-        let resolved: Vec<ResolvedRef> = outcomes.into_iter().map(Result::unwrap).collect();
+        assert!(main.fetched_at.is_some());
         assert_eq!(resolved, vec![main; 5]);
     }
 
@@ -1638,6 +1687,7 @@ mod resolver_tests {
             ResolvedRef {
                 commit: fixtures::oid('a'),
                 ref_name: Some("refs/heads/main".to_string()),
+                fetched_at: resolved.fetched_at,
             }
         );
         // The tag and its peel come after the pull requests.
@@ -1647,6 +1697,7 @@ mod resolver_tests {
             ResolvedRef {
                 commit: fixtures::oid('d'),
                 ref_name: Some("refs/tags/v1.0.0".to_string()),
+                fetched_at: resolved.fetched_at,
             }
         );
     }
@@ -1671,6 +1722,7 @@ mod resolver_tests {
             ResolvedRef {
                 commit: fixtures::oid('d'),
                 ref_name: Some("refs/tags/v1.0.0".to_string()),
+                fetched_at: resolved.fetched_at,
             }
         );
     }

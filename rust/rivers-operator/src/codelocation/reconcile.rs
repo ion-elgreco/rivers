@@ -262,14 +262,12 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
                 (resolved_image, reason, refresh_after, immutable)
             }
             ImageOutcome::AwaitingLeader => {
-                patch_waiting_status(&code_locations_api, &name, generation, cl.as_ref()).await?;
+                patch_unresolved(&code_locations_api, &cl, Unresolved::AwaitingLeader).await?;
                 return Ok(Action::requeue(FOLLOWER_WAIT));
             }
             ImageOutcome::Error(err) => {
-                let retry = err.retry_after();
-                patch_error_status(&code_locations_api, &name, generation, cl.as_ref(), &err)
-                    .await?;
-                return Ok(Action::requeue(retry));
+                patch_unresolved(&code_locations_api, &cl, Unresolved::Image(&err)).await?;
+                return Ok(Action::requeue(err.retry_after()));
             }
         };
 
@@ -284,8 +282,8 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     let service = build_service(&cl);
 
     tokio::try_join!(
-        apply_deployment(&deployments_api, &deployment),
-        apply_service(&services_api, &service),
+        apply(&deployments_api, &deployment),
+        apply(&services_api, &service),
     )?;
 
     let dep_status = deployments_api
@@ -304,6 +302,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     let now_rfc3339 = jiff::Timestamp::now().to_string();
 
     let prior_status = cl.status.as_ref();
+    // No git fields: the pods run the image.
     let mut status = CodeLocationStatus {
         phase: Some(phase.clone()),
         observed_generation: generation,
@@ -311,14 +310,9 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         grpc_endpoint: Some(endpoint),
         last_reconciled: Some(now_rfc3339.clone()),
         ready_replicas,
-        message: None,
-        conditions: Vec::new(),
         // Image mode: the pinned digest ref doubles as the Source column.
         source: Some(resolved_image.clone()),
-        resolved_commit: None,
-        resolved_ref: None,
-        last_fetched_at: None,
-        run_source: None,
+        ..Default::default()
     };
     push_condition(
         &mut status,
@@ -355,10 +349,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
             .conditions
             .extend(kept_conditions(prior_status, &[CONDITION_WORKSPACE_KEPT]));
     }
-
-    if !status_substantively_equal(prior_status, &status) {
-        patch_status(&code_locations_api, &name, &status).await?;
-    }
+    patch_status(&code_locations_api, &cl, &status).await?;
 
     let requeue = if !matches!(phase, CodeLocationPhase::Ready) {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
@@ -534,14 +525,11 @@ async fn reconcile_git(
     services_api: &Api<Service>,
 ) -> Result<Action, Error> {
     let name = cl.name_any();
-    let generation = cl.metadata.generation;
     let git_spec = cl
         .spec
         .git
         .as_ref()
         .expect("reconcile_git dispatched for a non-git CodeLocation");
-    let endpoint = grpc_endpoint(&name, namespace, cl.spec.grpc_port);
-    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
 
     // Followers neither resolve nor apply: they refresh what the Deployment
     // shows and keep the leader's resolution conditions, so both replicas
@@ -567,17 +555,9 @@ async fn reconcile_git(
                     .any(|c| c.r#type == CONDITION_SOURCE_RESOLVED)
         });
         if published {
-            let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
-            let update = GitStatusUpdate {
-                resolution: None,
-                fetched_at: None,
-                rollout,
-                apply_failure: None,
-                endpoint,
-            };
-            patch_git_status(code_locations_api, &name, cl, update).await?;
+            patch_git_status(cl, ctx, namespace, None, None).await?;
         } else {
-            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+            patch_unresolved(code_locations_api, cl, Unresolved::AwaitingLeader).await?;
         }
         return Ok(Action::requeue(FOLLOWER_WAIT));
     }
@@ -598,7 +578,7 @@ async fn reconcile_git(
                 (resolved_image, reason, refresh_after, immutable)
             }
             ImageOutcome::AwaitingLeader => {
-                patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+                patch_unresolved(code_locations_api, cl, Unresolved::AwaitingLeader).await?;
                 return Ok(Action::requeue(FOLLOWER_WAIT));
             }
             ImageOutcome::Error(err) => {
@@ -606,16 +586,10 @@ async fn reconcile_git(
                 if err.is_transient() && serving {
                     // The Deployment keeps the tree it runs until the
                     // registry answers again.
-                    let update = GitStatusUpdate {
-                        resolution: Some(GitResolution::ImageFailed(err)),
-                        fetched_at: None,
-                        rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
-                        apply_failure: None,
-                        endpoint,
-                    };
-                    patch_git_status(code_locations_api, &name, cl, update).await?;
+                    let resolution = GitResolution::ImageFailed(err);
+                    patch_git_status(cl, ctx, namespace, Some(resolution), None).await?;
                 } else {
-                    patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
+                    patch_unresolved(code_locations_api, cl, Unresolved::Image(&err)).await?;
                 }
                 return Ok(Action::requeue(retry));
             }
@@ -643,20 +617,14 @@ async fn reconcile_git(
             if failure.error.is_transient() && serving {
                 // The Deployment keeps the tree it runs until a commit
                 // resolves again.
-                let update = GitStatusUpdate {
-                    resolution: Some(GitResolution::ImageResolved {
-                        image: resolved_image,
-                        image_reason,
-                        source: Err(failure),
-                    }),
-                    fetched_at: None,
-                    rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
-                    apply_failure: None,
-                    endpoint,
+                let resolution = GitResolution::ImageResolved {
+                    image: resolved_image,
+                    image_reason,
+                    source: Err(failure),
                 };
-                patch_git_status(code_locations_api, &name, cl, update).await?;
+                patch_git_status(cl, ctx, namespace, Some(resolution), None).await?;
             } else {
-                patch_git_error(code_locations_api, &name, generation, cl, &failure).await?;
+                patch_unresolved(code_locations_api, cl, Unresolved::Source(&failure)).await?;
             }
             return Ok(Action::requeue(retry));
         }
@@ -683,24 +651,17 @@ async fn reconcile_git(
         }
         Applied::Refused(failure) => Some(failure),
     };
-    let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
-    let rolling_out = !rollout.complete;
-    let update = GitStatusUpdate {
-        resolution: Some(GitResolution::ImageResolved {
-            image: resolved_image,
-            image_reason,
-            source: Ok(resolved),
-        }),
-        fetched_at: Some(jiff::Timestamp::now().to_string()),
-        rollout,
-        apply_failure: refusal.as_ref().map(|failure| failure.message.clone()),
-        endpoint,
+    let resolution = GitResolution::ImageResolved {
+        image: resolved_image,
+        image_reason,
+        source: Ok(resolved),
     };
-    let phase = patch_git_status(code_locations_api, &name, cl, update).await?;
+    let apply_failure = refusal.as_ref().map(|failure| failure.message.clone());
+    let settled = patch_git_status(cl, ctx, namespace, Some(resolution), apply_failure).await?;
 
     let requeue = if let Some(failure) = refusal {
         Action::requeue(failure.retry)
-    } else if rolling_out || !matches!(phase, CodeLocationPhase::Ready) {
+    } else if !settled {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
     } else {
         git_requeue(&git_spec.r#ref, poll, refresh_after, immutable)
@@ -848,7 +809,7 @@ async fn apply_git_workspace(
                 runs.iter().map(Arc::as_ref),
             );
             let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-            if let Err(e) = apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await {
+            if let Err(e) = apply(&cm_api, &build_keep_config_map(cl, &keep)).await {
                 let keep_name = keep_config_map_name(&name);
                 return refused(&format!("applying ConfigMap '{keep_name}'"), e);
             }
@@ -867,8 +828,8 @@ async fn apply_git_workspace(
     );
     let service = build_service(cl);
     let (deployed, served) = tokio::join!(
-        apply_deployment(deployments_api, &deployment),
-        apply_service(services_api, &service),
+        apply(deployments_api, &deployment),
+        apply(services_api, &service),
     );
     if let Err(e) = deployed {
         return refused(
@@ -1089,20 +1050,6 @@ async fn ensure_workspace_pvc(
     }
 }
 
-async fn apply_config_map(
-    api: &Api<ConfigMap>,
-    desired: &ConfigMap,
-) -> Result<(), kube_client::Error> {
-    let name = desired.metadata.name.as_deref().unwrap_or_default();
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(desired),
-    )
-    .await?;
-    Ok(())
-}
-
 /// Build [`GitCredentials`] from the CR's Secret. The url's scheme picks the
 /// keys, like the pod's sync script: `ssh://` needs `identity` + `known_hosts`;
 /// `https://` / `http://` use `username` + `password`, or none for an
@@ -1282,7 +1229,6 @@ fn build_failure_message(target: &RunSource, failed: &ContainerStateTerminated) 
 struct GitStatusUpdate {
     /// `None` on followers: resolution is the leader's.
     resolution: Option<GitResolution>,
-    fetched_at: Option<String>,
     rollout: GitRollout,
     /// The leader's apply of this pass: the object the API server refused,
     /// and its answer ([`ApplyFailure::message`]).
@@ -1304,19 +1250,31 @@ enum GitResolution {
     ImageFailed(ImageError),
 }
 
-/// Publish a git CL's status; returns the phase it published.
+/// Publish git CL `cl`'s status for what its Deployment shows now and for
+/// the leader's `resolution` and `apply_failure` of this pass. Returns
+/// whether `cl` is Ready with every pod on the current template.
 async fn patch_git_status(
-    code_locations_api: &Api<CodeLocation>,
-    name: &str,
     cl: &CodeLocation,
-    update: GitStatusUpdate,
-) -> Result<CodeLocationPhase, kube_client::Error> {
+    ctx: &Context,
+    namespace: &str,
+    resolution: Option<GitResolution>,
+    apply_failure: Option<String>,
+) -> Result<bool, kube_client::Error> {
+    let name = cl.name_any();
+    let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let rollout = observe_git_deployment(&name, &deployments_api, &pods_api).await;
+    let complete = rollout.complete;
+    let update = GitStatusUpdate {
+        resolution,
+        rollout,
+        apply_failure,
+        endpoint: grpc_endpoint(&name, namespace, cl.spec.grpc_port),
+    };
     let status = git_status(cl, update, jiff::Timestamp::now());
-    let phase = status.phase.clone().unwrap_or(CodeLocationPhase::Deploying);
-    if !status_substantively_equal(cl.status.as_ref(), &status) {
-        patch_status(code_locations_api, name, &status).await?;
-    }
-    Ok(phase)
+    let code_locations_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), namespace);
+    patch_status(&code_locations_api, cl, &status).await?;
+    Ok(complete && status.phase == Some(CodeLocationPhase::Ready))
 }
 
 /// Git-mode status. Runs get the serving tree: the pod template's once every
@@ -1377,28 +1335,22 @@ fn git_status(
         };
         (reason, message)
     };
+    let phase = if ready {
+        CodeLocationPhase::Ready
+    } else if failed {
+        CodeLocationPhase::Failed
+    } else {
+        CodeLocationPhase::Deploying
+    };
     let mut status = CodeLocationStatus {
-        phase: Some(if ready {
-            CodeLocationPhase::Ready
-        } else if failed {
-            CodeLocationPhase::Failed
-        } else {
-            CodeLocationPhase::Deploying
-        }),
-        observed_generation: cl.metadata.generation,
         resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
         grpc_endpoint: (!failed).then_some(update.endpoint),
-        last_reconciled: Some(now.to_string()),
         ready_replicas: rollout.ready_replicas.filter(|_| !failed),
-        message: None,
-        conditions: Vec::new(),
         source: serving.as_ref().map(source_display),
         resolved_commit: serving.as_ref().map(|t| t.git.commit.clone()),
         resolved_ref: serving.as_ref().and_then(|t| t.git.r#ref.clone()),
-        last_fetched_at: update
-            .fetched_at
-            .or_else(|| prior.and_then(|s| s.last_fetched_at.clone())),
         run_source: serving,
+        ..next_status(cl, phase, now)
     };
     match update.resolution {
         Some(GitResolution::ImageResolved {
@@ -1407,10 +1359,14 @@ fn git_status(
             source,
         }) => {
             let (source_status, source_reason, source_message) = match source {
-                Ok(resolved) if resolved.ref_name.is_none() => {
-                    ("True", REASON_COMMIT_PINNED, resolved.commit)
+                Ok(resolved) => {
+                    status.last_fetched_at = resolved.fetched_at.map(|at| later_fetch(prior, at));
+                    let reason = match resolved.ref_name {
+                        None => REASON_COMMIT_PINNED,
+                        Some(_) => REASON_COMMIT_RESOLVED,
+                    };
+                    ("True", reason, resolved.commit)
                 }
-                Ok(resolved) => ("True", REASON_COMMIT_RESOLVED, resolved.commit),
                 Err(failure) => {
                     let (reason, message) = source_failure(&failure, at);
                     ("False", reason, message)
@@ -1479,6 +1435,21 @@ fn git_status(
     status
 }
 
+/// `lastFetchedAt` for a fetch at `at`: never before `prior`'s. A replica that
+/// leads after another can answer from an older fetch in its cache, and two
+/// replicas that both act as leader would else undo each other's write on
+/// every pass.
+fn later_fetch(prior: Option<&CodeLocationStatus>, at: jiff::Timestamp) -> String {
+    prior
+        .and_then(|s| s.last_fetched_at.clone())
+        .filter(|known| {
+            known
+                .parse::<jiff::Timestamp>()
+                .is_ok_and(|known| known >= at)
+        })
+        .unwrap_or_else(|| at.to_string())
+}
+
 /// `prior`'s conditions of the `kinds` this pass did not resolve again.
 fn kept_conditions<'a>(
     prior: Option<&'a CodeLocationStatus>,
@@ -1489,47 +1460,6 @@ fn kept_conditions<'a>(
         .flat_map(|s| &s.conditions)
         .filter(move |c| kinds.contains(&c.r#type.as_str()))
         .cloned()
-}
-
-async fn patch_git_error(
-    code_locations_api: &Api<CodeLocation>,
-    name: &str,
-    generation: Option<i64>,
-    cl: &CodeLocation,
-    failure: &git::GitFailure,
-) -> Result<(), kube_client::Error> {
-    let at = jiff::Timestamp::now();
-    let (reason, message) = source_failure(failure, at);
-    let now = at.to_string();
-    let prior = cl.status.as_ref();
-    let mut status = CodeLocationStatus {
-        phase: Some(CodeLocationPhase::Failed),
-        observed_generation: generation,
-        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
-        grpc_endpoint: None,
-        last_reconciled: Some(now.clone()),
-        ready_replicas: None,
-        message: Some(message.clone()),
-        conditions: Vec::new(),
-        source: prior.and_then(|s| s.source.clone()),
-        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
-        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
-        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
-        run_source: prior.and_then(|s| s.run_source.clone()),
-    };
-    push_condition(
-        &mut status,
-        prior,
-        CONDITION_SOURCE_RESOLVED,
-        "False",
-        reason,
-        Some(message),
-        &now,
-    );
-    if !status_substantively_equal(prior, &status) {
-        patch_status(code_locations_api, name, &status).await?;
-    }
-    Ok(())
 }
 
 /// Controller-runtime error policy: log the failure and requeue after 30s.
@@ -1814,55 +1744,23 @@ fn has_progress_deadline_exceeded(d: &k8s_openapi::api::apps::v1::DeploymentStat
         .unwrap_or(false)
 }
 
-async fn apply_deployment(
-    api: &Api<Deployment>,
-    desired: &Deployment,
-) -> Result<(), kube_client::Error> {
-    let name = desired.metadata.name.as_deref().unwrap_or_default();
+/// Server-side apply `desired`, taking over the fields it sets from any other
+/// field manager.
+async fn apply<K>(api: &Api<K>, desired: &K) -> Result<(), kube_client::Error>
+where
+    K: kube_client::Resource
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
     api.patch(
-        name,
+        &desired.name_any(),
         &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(desired),
     )
     .await?;
     Ok(())
-}
-
-async fn apply_service(api: &Api<Service>, desired: &Service) -> Result<(), kube_client::Error> {
-    let name = desired.metadata.name.as_deref().unwrap_or_default();
-    // Services have immutable fields (ClusterIP) that Apply tolerates as long
-    // as the desired value matches what's already there — we let the server
-    // reconcile.
-    let _ = service_name(name); // use the import; keeps the helper exercised.
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(desired),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Whether the computed status matches the prior status on everything that
-/// actually carries meaning for API consumers. `last_reconciled` changes on
-/// every pass and is deliberately excluded — if nothing *else* moved, we
-/// skip the patch entirely so followers/watchers aren't woken up for no reason.
-fn status_substantively_equal(
-    prior: Option<&CodeLocationStatus>,
-    new: &CodeLocationStatus,
-) -> bool {
-    let Some(prior) = prior else { return false };
-    prior.phase == new.phase
-        && prior.observed_generation == new.observed_generation
-        && prior.resolved_image == new.resolved_image
-        && prior.grpc_endpoint == new.grpc_endpoint
-        && prior.ready_replicas == new.ready_replicas
-        && prior.message == new.message
-        && prior.conditions == new.conditions
-        && prior.source == new.source
-        && prior.resolved_commit == new.resolved_commit
-        && prior.resolved_ref == new.resolved_ref
-        && prior.run_source == new.run_source
 }
 
 /// Append a condition, preserving `last_transition_time` from the prior
@@ -1890,11 +1788,27 @@ fn push_condition(
     });
 }
 
+/// Write `status` as `cl`'s status, unless every field but `lastReconciled`
+/// is as the prior status has it: such a write would wake watchers for
+/// nothing. A write starts another pass at once, so no field may change in
+/// a pass that finds nothing new, else the passes never stop:
+/// `lastFetchedAt` is the time of the fetch that the resolver's cache
+/// answers the next pass with.
 async fn patch_status(
     code_locations_api: &Api<CodeLocation>,
-    name: &str,
+    cl: &CodeLocation,
     status: &CodeLocationStatus,
 ) -> Result<(), kube_client::Error> {
+    let unchanged = cl.status.as_ref().is_some_and(|prior| {
+        *status
+            == CodeLocationStatus {
+                last_reconciled: status.last_reconciled.clone(),
+                ..prior.clone()
+            }
+    });
+    if unchanged {
+        return Ok(());
+    }
     let body = serde_json::json!({
         "apiVersion": "rivers.io/v1alpha1",
         "kind": "CodeLocation",
@@ -1902,7 +1816,7 @@ async fn patch_status(
     });
     code_locations_api
         .patch_status(
-            name,
+            &cl.name_any(),
             &PatchParams::apply(FIELD_MANAGER).force(),
             &Patch::Apply(&body),
         )
@@ -1910,77 +1824,84 @@ async fn patch_status(
     Ok(())
 }
 
-async fn patch_waiting_status(
-    code_locations_api: &Api<CodeLocation>,
-    name: &str,
-    generation: Option<i64>,
-    cl: &CodeLocation,
-) -> Result<(), kube_client::Error> {
-    let now = jiff::Timestamp::now().to_string();
-    let prior = cl.status.as_ref();
-    let mut status = CodeLocationStatus {
-        phase: Some(CodeLocationPhase::Pending),
-        observed_generation: generation,
-        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
+/// `cl`'s status for a pass at `at` in `phase`. It keeps what the prior
+/// status says the pods run (`resolvedImage`, `source` and the git fields)
+/// until the pass sets these; the pass sets the other fields anew.
+fn next_status(cl: &CodeLocation, phase: CodeLocationPhase, at: &str) -> CodeLocationStatus {
+    CodeLocationStatus {
+        phase: Some(phase),
+        observed_generation: cl.metadata.generation,
+        last_reconciled: Some(at.to_string()),
         grpc_endpoint: None,
-        last_reconciled: Some(now.clone()),
         ready_replicas: None,
-        message: Some("awaiting leader replica".into()),
+        message: None,
         conditions: Vec::new(),
-        source: prior.and_then(|s| s.source.clone()),
-        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
-        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
-        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
-        run_source: prior.and_then(|s| s.run_source.clone()),
-    };
-    push_condition(
-        &mut status,
-        prior,
-        CONDITION_IMAGE_RESOLVED,
-        "Unknown",
-        REASON_AWAITING_LEADER,
-        Some("follower replica — leader will resolve digest".into()),
-        &now,
-    );
-    if status_substantively_equal(prior, &status) {
-        return Ok(());
+        ..cl.status.clone().unwrap_or_default()
     }
-    patch_status(code_locations_api, name, &status).await
 }
 
-async fn patch_error_status(
-    code_locations_api: &Api<CodeLocation>,
-    name: &str,
-    generation: Option<i64>,
+/// Why a pass resolved nothing for the pods to run.
+enum Unresolved<'a> {
+    /// A follower, before the leader has resolved the image.
+    AwaitingLeader,
+    Image(&'a ImageError),
+    Source(&'a git::GitFailure),
+}
+
+/// The status of a pass that resolved nothing for the pods to run. They
+/// still run what the prior status says, so that stays: also a git status
+/// after a switch to image mode, which only the leader's first image pass
+/// replaces. In image mode, a kept git workspace stays named until it is
+/// gone.
+fn unresolved_status(
     cl: &CodeLocation,
-    err: &ImageError,
-) -> Result<(), kube_client::Error> {
-    let now = jiff::Timestamp::now().to_string();
+    why: Unresolved<'_>,
+    at: jiff::Timestamp,
+) -> CodeLocationStatus {
+    let (phase, message, condition) = match why {
+        Unresolved::AwaitingLeader => (
+            CodeLocationPhase::Pending,
+            "awaiting leader replica".to_string(),
+            (
+                CONDITION_IMAGE_RESOLVED,
+                "Unknown",
+                REASON_AWAITING_LEADER,
+                "follower replica — leader will resolve digest".to_string(),
+            ),
+        ),
+        Unresolved::Image(err) => (
+            CodeLocationPhase::Failed,
+            err.message(),
+            (
+                CONDITION_IMAGE_RESOLVED,
+                "False",
+                err.reason(),
+                err.message(),
+            ),
+        ),
+        Unresolved::Source(failure) => {
+            let (reason, message) = source_failure(failure, at);
+            (
+                CodeLocationPhase::Failed,
+                message.clone(),
+                (CONDITION_SOURCE_RESOLVED, "False", reason, message),
+            )
+        }
+    };
+    let (kind, condition_status, reason, condition_message) = condition;
+    let now = at.to_string();
     let prior = cl.status.as_ref();
-    // Only the leader's first image pass replaces a git status (git fields
-    // and runtime image); a kept git workspace stays named until it is gone.
     let mut status = CodeLocationStatus {
-        phase: Some(CodeLocationPhase::Failed),
-        observed_generation: generation,
-        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
-        grpc_endpoint: None,
-        last_reconciled: Some(now.clone()),
-        ready_replicas: None,
-        message: Some(err.message()),
-        conditions: Vec::new(),
-        source: prior.and_then(|s| s.source.clone()),
-        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
-        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
-        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
-        run_source: prior.and_then(|s| s.run_source.clone()),
+        message: Some(message),
+        ..next_status(cl, phase, &now)
     };
     push_condition(
         &mut status,
         prior,
-        CONDITION_IMAGE_RESOLVED,
-        "False",
-        err.reason(),
-        Some(err.message()),
+        kind,
+        condition_status,
+        reason,
+        Some(condition_message),
         &now,
     );
     if !cl.spec.is_git() {
@@ -1988,10 +1909,16 @@ async fn patch_error_status(
             .conditions
             .extend(kept_conditions(prior, &[CONDITION_WORKSPACE_KEPT]));
     }
-    if status_substantively_equal(prior, &status) {
-        return Ok(());
-    }
-    patch_status(code_locations_api, name, &status).await
+    status
+}
+
+async fn patch_unresolved(
+    code_locations_api: &Api<CodeLocation>,
+    cl: &CodeLocation,
+    why: Unresolved<'_>,
+) -> Result<(), kube_client::Error> {
+    let status = unresolved_status(cl, why, jiff::Timestamp::now());
+    patch_status(code_locations_api, cl, &status).await
 }
 
 /// Apply jittered poll cadence: `interval + rand(0, interval/4)`.
@@ -3210,9 +3137,9 @@ mod tests {
                     source: Ok(git::ResolvedRef {
                         commit: commit(target),
                         ref_name: None,
+                        fetched_at: None,
                     }),
                 }),
-                fetched_at: None,
                 rollout,
                 apply_failure: None,
                 endpoint: grpc_endpoint("x", "y", 3001),
@@ -5128,6 +5055,89 @@ mod tests {
                 .clone();
             assert_eq!(source_resolved(&stored), source_resolved(&stale));
             assert_eq!(source_resolved(&stored).0, "False");
+        }
+
+        /// The `lastFetchedAt` of `status`.
+        fn fetched_at(status: &serde_json::Value) -> jiff::Timestamp {
+            status["lastFetchedAt"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no lastFetchedAt: {status}"))
+                .parse()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_new_fetch_of_the_ref_shows_in_status_and_a_cached_answer_writes_nothing() {
+            let forge = forge(vec![advertisement()]).await;
+            let state = api_with(branch_cl(&forge), rolled_out());
+            let first = pass(&state, LeaderGate::leading())
+                .await
+                .expect("rollout of main");
+            assert_eq!(first["phase"], "Ready", "{first}");
+
+            // The cached commit has expired: the leader fetches main again,
+            // and it is still commit a.
+            let git = resolver();
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &git).await;
+
+            let refetched = patched_status(&requests).expect("status patch");
+            assert_eq!(forge.received_requests().await.unwrap().len(), 2);
+            assert!(fetched_at(&refetched) > fetched_at(&first), "{refetched}");
+            let mut rest = refetched.clone();
+            for field in ["lastFetchedAt", "lastReconciled"] {
+                rest[field] = first[field].clone();
+            }
+            assert_eq!(rest, first);
+
+            // The pass that this status write starts: the cache answers, with
+            // the same fetch.
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &git).await;
+
+            assert_eq!(patched_status(&requests), None);
+            assert_eq!(forge.received_requests().await.unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_replica_with_an_older_fetch_does_not_move_last_fetched_at_back() {
+            let forge = forge(vec![advertisement()]).await;
+            let state = api_with(branch_cl(&forge), rolled_out());
+            let older = resolver();
+            reconcile_with(&state, LeaderGate::leading(), &older).await;
+            let first = stored_status(&state);
+            let newer = resolver();
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &newer).await;
+            let second = patched_status(&requests).expect("status patch");
+            assert!(fetched_at(&second) > fetched_at(&first), "{second}");
+
+            // Another replica that also acts as leader: its cache still holds
+            // the first fetch.
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &older).await;
+
+            assert_eq!(patched_status(&requests), None);
+            assert_eq!(
+                stored_status(&state)["lastFetchedAt"],
+                second["lastFetchedAt"]
+            );
+            assert_eq!(forge.received_requests().await.unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_pinned_commit_has_no_fetch_time() {
+            // Never reconciled, or pinned after main (commit a) was fetched.
+            for prior in [None, Some(git_era_status())] {
+                let mut cl = git_cl_at('a', json!({}));
+                cl.status = prior.map(|prior| serde_json::from_value(prior).unwrap());
+                let case = format!("{:?}", cl.status);
+                let state = api_with(cl, rolled_out());
+
+                let status = pass(&state, LeaderGate::leading())
+                    .await
+                    .expect("status patch");
+
+                assert_eq!(status["resolvedCommit"], commit('a'), "{case}");
+                assert_eq!(status.get("lastFetchedAt"), None, "{case}: {status}");
+                assert_eq!(pass(&state, LeaderGate::leading()).await, None, "{case}");
+            }
         }
 
         #[tokio::test]

@@ -334,7 +334,7 @@ impl DependencyMode {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeLocationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,6 +382,8 @@ pub struct CodeLocationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ref: Option<String>,
 
+    /// git mode: when the operator last fetched `spec.git.ref` from the git
+    /// host. Absent for a pinned commit, which it never fetches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fetched_at: Option<String>,
 

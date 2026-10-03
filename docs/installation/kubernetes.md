@@ -420,6 +420,12 @@ name. If you add `spec.git` again before the PVC is deleted, the pods use
 it again. If the PVC is being deleted, the operator waits until it is
 gone, and then creates a new one.
 
+**New commits**: the operator fetches the branch or tag from the git host
+about every `pollInterval` (default `5m`, at least `1m`), and a semver-like
+tag, such as `v1.2.3`, only once. `status.lastFetchedAt` is the time of the
+last fetch. CodeLocations with the same url, ref and credentials share their
+fetches. A pinned commit is never fetched and has no `lastFetchedAt`.
+
 **Which commit a run uses**: runs get the last *fully rolled-out* commit.
 After a push, the operator rolls the code-location pods to the new
 commit, but `status.resolvedCommit` moves to it only when every pod runs
