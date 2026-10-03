@@ -19,12 +19,10 @@ fn run_workspace_spec(
     workspace_cfg: &WorkspaceConfig,
     cl_spec: &CodeLocationSpec,
 ) -> Option<WorkspaceSpec> {
-    run.spec.source.as_ref().map(|source| {
-        workspace::consumer_spec_from_run_source(
-            source,
-            workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
-            cl_spec.env.clone(),
-        )
+    run.spec.source.as_ref().map(|source| WorkspaceSpec {
+        source: source.clone(),
+        volume: workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
+        extra_env: cl_spec.env.clone(),
     })
 }
 
@@ -549,12 +547,10 @@ mod tests {
             cl.spec.git.as_mut().unwrap().path = source.git.path.clone();
             cl.spec.env = user_env.clone();
             let volume = workspace_cfg.volume(&cl.name_any(), &cl.spec);
-            let tree = || {
-                workspace::consumer_spec_from_run_source(
-                    &source,
-                    volume.clone(),
-                    cl.spec.env.clone(),
-                )
+            let tree = || WorkspaceSpec {
+                source: source.clone(),
+                volume: volume.clone(),
+                extra_env: cl.spec.env.clone(),
             };
 
             // The code-location pod that built the tree the run is stamped with.
@@ -564,7 +560,10 @@ mod tests {
                 "rivers-code-location",
                 &Default::default(),
                 &Default::default(),
-                Some(&workspace::builder_pod_pieces(&tree())),
+                Some(&workspace::builder_pod_pieces(
+                    &tree(),
+                    &workspace_cfg.prune(&cl.name_any()),
+                )),
             )
             .spec
             .unwrap()

@@ -703,30 +703,30 @@ mod tests {
         }
     }
 
-    /// The pieces the reconciler builds: only the shared PVC has a keep-set.
+    /// The pieces the reconciler builds under the chart's default floors.
     fn git_pieces(
         cl: &CodeLocation,
         volume: rivers_k8s::workspace::WorkspaceVolume,
     ) -> rivers_k8s::workspace::WorkspacePodPieces {
         let git = cl.spec.git.as_ref().unwrap();
-        let shared = matches!(
-            volume,
-            rivers_k8s::workspace::WorkspaceVolume::SharedPvc { .. }
-        );
-        rivers_k8s::workspace::builder_pod_pieces(&rivers_k8s::workspace::WorkspaceSpec {
-            volume,
-            runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
-            git_url: git.url.clone(),
-            commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
-            git_ref: Some("refs/heads/main".to_string()),
-            path: git.path.clone(),
-            secret_name: Some("git-creds".to_string()),
-            deps: git.dependencies.clone(),
-            keep_config_map: shared.then(|| keep_config_map_name("analytics")),
-            keep_revisions: Some(3),
-            min_tree_age: Some(std::time::Duration::from_secs(3600)),
-            extra_env: cl.spec.env.clone(),
-        })
+        rivers_k8s::workspace::builder_pod_pieces(
+            &rivers_k8s::workspace::WorkspaceSpec {
+                source: rivers_k8s::crd::run::RunSource {
+                    git: rivers_k8s::crd::run::GitCoordinates {
+                        url: git.url.clone(),
+                        commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
+                        r#ref: Some("refs/heads/main".to_string()),
+                        path: git.path.clone(),
+                        secret_name: Some("git-creds".to_string()),
+                    },
+                    dependencies: git.dependencies.clone(),
+                    runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
+                },
+                volume,
+                extra_env: cl.spec.env.clone(),
+            },
+            &crate::codelocation::WorkspaceConfig::default().prune("analytics"),
+        )
     }
 
     /// Subpath and `RIVERS_RUN_SOURCE` of the tree [`git_pieces`] builds.
@@ -891,9 +891,6 @@ mod tests {
                 { "name": "UV_NO_CACHE", "value": "1" },
                 { "name": "UV_LINK_MODE", "value": "copy" },
                 { "name": "UV_COMPILE_BYTECODE", "value": "1" },
-                { "name": "RIVERS_WORKSPACE_KEY", "value": TREE_KEY },
-                { "name": "RIVERS_WORKSPACE_KEEP_REVISIONS", "value": "3" },
-                { "name": "RIVERS_WORKSPACE_MIN_AGE_SECONDS", "value": "3600" },
             ],
             "volumeMounts": [
                 { "name": "workspace", "mountPath": "/workspace", "subPath": TREE_KEY },

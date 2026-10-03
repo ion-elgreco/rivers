@@ -48,7 +48,11 @@ impl K8sStepExecutorConfig {
     /// unset.
     pub fn with_detected_workspace(mut self) -> Self {
         self.workspace = crate::env::detect_git_workspace().map(|(source, volume)| {
-            crate::workspace::consumer_spec_from_run_source(&source, volume, self.extra_env.clone())
+            crate::workspace::WorkspaceSpec {
+                source,
+                volume,
+                extra_env: self.extra_env.clone(),
+            }
         });
         self
     }
@@ -387,7 +391,11 @@ mod tests {
             "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dffff",
         }))
         .unwrap();
-        crate::workspace::consumer_spec_from_run_source(&source, volume, vec![])
+        crate::workspace::WorkspaceSpec {
+            source,
+            volume,
+            extra_env: vec![],
+        }
     }
 
     #[test]

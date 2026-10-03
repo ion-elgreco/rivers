@@ -612,20 +612,14 @@ mod tests {
                 size_limit: Some(Quantity("5Gi".to_string())),
             },
         ] {
-            let pod_env = builder_pod_pieces(&WorkspaceSpec {
-                volume: volume.clone(),
-                runtime_image: source.runtime_image.clone(),
-                git_url: source.git.url.clone(),
-                commit: source.git.commit.clone(),
-                git_ref: source.git.r#ref.clone(),
-                path: source.git.path.clone(),
-                secret_name: source.git.secret_name.clone(),
-                deps: source.dependencies.clone(),
-                keep_config_map: Some("analytics-workspace-keep".to_string()),
-                keep_revisions: Some(3),
-                min_tree_age: Some(std::time::Duration::from_secs(3600)),
-                extra_env: vec![],
-            })
+            let pod_env = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: source.clone(),
+                    volume: volume.clone(),
+                    extra_env: vec![],
+                },
+                &prune(),
+            )
             .main_env;
             let vars = workspace_vars(&pod_env);
 
@@ -645,9 +639,7 @@ mod tests {
     fn run_pod_env_hands_its_workspace_volume_to_its_step_jobs() {
         use crate::crd::run::RunSource;
         use crate::executor::build_step_job;
-        use crate::workspace::{
-            WorkspaceVolume, consumer_pod_pieces, consumer_spec_from_run_source,
-        };
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, consumer_pod_pieces};
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
         use serde_json::json;
 
@@ -678,8 +670,11 @@ mod tests {
             ),
         ] {
             // The run executor pod's workspace env, as the operator builds it.
-            let run_pod =
-                consumer_pod_pieces(&consumer_spec_from_run_source(&source, volume, vec![]));
+            let run_pod = consumer_pod_pieces(&WorkspaceSpec {
+                source: source.clone(),
+                volume,
+                extra_env: vec![],
+            });
 
             // What the in-pod Kubernetes step executor does with that env.
             let config = with_vars(&workspace_vars(&run_pod.main_env), || {
@@ -693,6 +688,15 @@ mod tests {
                 step_volumes
             );
             assert_eq!(step_pod.volumes.unwrap(), run_pod.volumes);
+        }
+    }
+
+    /// The code-location pod's prune under the chart's default floors.
+    fn prune() -> crate::workspace::Prune {
+        crate::workspace::Prune {
+            keep_config_map: "analytics-workspace-keep".to_string(),
+            keep_revisions: 3,
+            min_tree_age: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -740,7 +744,6 @@ mod tests {
         use crate::executor::build_step_job;
         use crate::workspace::{
             WorkspaceSpec, WorkspaceVolume, builder_pod_pieces, consumer_pod_pieces,
-            consumer_spec_from_run_source,
         };
         use k8s_openapi::api::core::v1::VolumeMount;
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -772,25 +775,22 @@ mod tests {
                 size_limit: Some(Quantity("5Gi".to_string())),
             },
         ] {
-            let cl_pod = builder_pod_pieces(&WorkspaceSpec {
-                volume: volume.clone(),
-                runtime_image: source.runtime_image.clone(),
-                git_url: source.git.url.clone(),
-                commit: source.git.commit.clone(),
-                git_ref: source.git.r#ref.clone(),
-                path: source.git.path.clone(),
-                secret_name: source.git.secret_name.clone(),
-                deps: source.dependencies.clone(),
-                keep_config_map: Some("analytics-workspace-keep".to_string()),
-                keep_revisions: Some(3),
-                min_tree_age: Some(std::time::Duration::from_secs(3600)),
-                extra_env: vec![],
-            });
+            let cl_pod = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: source.clone(),
+                    volume: volume.clone(),
+                    extra_env: vec![],
+                },
+                &prune(),
+            );
             // A run that the code-location pod launches carries its source.
             let run_source = with_vars(&workspace_vars(&cl_pod.main_env), detect_run_source)
                 .expect("the code-location pod hands on its source");
-            let run_pod =
-                consumer_pod_pieces(&consumer_spec_from_run_source(&run_source, volume, vec![]));
+            let run_pod = consumer_pod_pieces(&WorkspaceSpec {
+                source: run_source,
+                volume,
+                extra_env: vec![],
+            });
             let config = with_vars(&workspace_vars(&run_pod.main_env), || {
                 step_config("ghcr.io/acme/rivers-runtime:0.5.0").with_detected_workspace()
             });
@@ -813,6 +813,7 @@ mod tests {
 
     #[test]
     fn step_jobs_run_their_worker_image_on_the_tree_the_runtime_image_built() {
+        use crate::crd::run::{GitCoordinates, RunSource};
         use crate::executor::build_step_job;
         use crate::workspace::{WorkspaceSpec, WorkspaceVolume, builder_pod_pieces};
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -839,20 +840,24 @@ mod tests {
                 vec![Some(runtime.clone())],
             ),
         ] {
-            let cl_pod = builder_pod_pieces(&WorkspaceSpec {
-                volume,
-                runtime_image: runtime.clone(),
-                git_url: "https://forge.example/acme/pipelines.git".to_string(),
-                commit: commit.to_string(),
-                git_ref: Some("refs/heads/main".to_string()),
-                path: Some("analytics".to_string()),
-                secret_name: Some("git-creds".to_string()),
-                deps: Default::default(),
-                keep_config_map: None,
-                keep_revisions: None,
-                min_tree_age: None,
-                extra_env: vec![],
-            });
+            let cl_pod = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: RunSource {
+                        git: GitCoordinates {
+                            url: "https://forge.example/acme/pipelines.git".to_string(),
+                            commit: commit.to_string(),
+                            r#ref: Some("refs/heads/main".to_string()),
+                            path: Some("analytics".to_string()),
+                            secret_name: Some("git-creds".to_string()),
+                        },
+                        dependencies: Default::default(),
+                        runtime_image: runtime.clone(),
+                    },
+                    volume,
+                    extra_env: vec![],
+                },
+                &prune(),
+            );
 
             let config = with_vars(&workspace_vars(&cl_pod.main_env), || {
                 step_config(&worker).with_detected_workspace()

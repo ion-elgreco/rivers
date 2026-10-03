@@ -52,8 +52,8 @@ use k8s_openapi::api::core::v1::{
     ConfigMap, ContainerStateTerminated, PersistentVolumeClaim, Pod, PodSpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use rivers_k8s::crd::run::{Run, RunSource};
-use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
+use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource};
+use rivers_k8s::workspace::{self, Prune, WorkspaceSpec, WorkspaceVolume};
 
 /// Default registry-refresh interval when the CR does not override it.
 const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
@@ -193,6 +193,16 @@ impl WorkspaceConfig {
             .unwrap_or_else(|| self.empty_dir_limit.clone());
         WorkspaceVolume::EmptyDir {
             size_limit: Some(size_limit),
+        }
+    }
+
+    /// What the code-location pods of `cl_name` keep when they prune its
+    /// shared PVC.
+    pub fn prune(&self, cl_name: &str) -> Prune {
+        Prune {
+            keep_config_map: keep_config_map_name(cl_name),
+            keep_revisions: self.keep_revisions,
+            min_tree_age: self.min_tree_age,
         }
     }
 }
@@ -784,23 +794,21 @@ async fn apply_git_workspace(
     let name = cl.name_any();
     let git_spec = cl.spec.git.as_ref().expect("git CL");
     let wspec = WorkspaceSpec {
+        source: RunSource {
+            git: GitCoordinates {
+                url: git_spec.url.clone(),
+                commit: resolved.commit.clone(),
+                r#ref: resolved.ref_name.clone(),
+                path: git_spec.path.clone(),
+                secret_name: git_spec.secret_ref.as_ref().map(|s| s.name.clone()),
+            },
+            dependencies: git_spec.dependencies.clone(),
+            runtime_image: resolved_image.to_string(),
+        },
         volume: ctx.workspace.volume(&name, &cl.spec),
-        runtime_image: resolved_image.to_string(),
-        git_url: git_spec.url.clone(),
-        commit: resolved.commit.clone(),
-        git_ref: resolved.ref_name.clone(),
-        path: git_spec.path.clone(),
-        secret_name: git_spec.secret_ref.as_ref().map(|s| s.name.clone()),
-        deps: git_spec.dependencies.clone(),
-        keep_config_map: ctx
-            .workspace
-            .shared_enabled
-            .then(|| keep_config_map_name(&name)),
-        keep_revisions: Some(ctx.workspace.keep_revisions),
-        min_tree_age: Some(ctx.workspace.min_tree_age),
         extra_env: cl.spec.env.clone(),
     };
-    let pieces = workspace::builder_pod_pieces(&wspec);
+    let pieces = workspace::builder_pod_pieces(&wspec, &ctx.workspace.prune(&name));
 
     if ctx.workspace.shared_enabled {
         let pvc_size = git_spec
@@ -833,7 +841,7 @@ async fn apply_git_workspace(
                 .map(RunSource::workspace_key);
             let runs = ctx.runs.state();
             let keep = workspace_keep_csv(
-                &wspec.key(),
+                &wspec.source.workspace_key(),
                 serving_key.as_deref(),
                 namespace,
                 &name,
@@ -3380,20 +3388,14 @@ mod tests {
         #[test]
         fn rollout_reads_the_tree_from_the_pod_template() {
             let cl = git_cl_at('b', serving_status('a'));
-            let pieces = workspace::builder_pod_pieces(&WorkspaceSpec {
-                volume: WorkspaceVolume::EmptyDir { size_limit: None },
-                runtime_image: runtime('b'),
-                git_url: URL.into(),
-                commit: commit('b'),
-                git_ref: None,
-                path: None,
-                secret_name: None,
-                deps: Default::default(),
-                keep_config_map: None,
-                keep_revisions: None,
-                min_tree_age: None,
-                extra_env: Vec::new(),
-            });
+            let pieces = workspace::builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: tree('b'),
+                    volume: WorkspaceVolume::EmptyDir { size_limit: None },
+                    extra_env: Vec::new(),
+                },
+                &WorkspaceConfig::default().prune("x"),
+            );
             let mut d = build_deployment(
                 &cl,
                 &runtime('b'),
@@ -3720,6 +3722,57 @@ mod tests {
                     "{chart:?}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn fallback_pods_ignore_the_chart_floors() {
+            let mut prune_env = Vec::new();
+            let mut templates = Vec::new();
+            for chart in [
+                vec![],
+                vec![
+                    ("RIVERS_WORKSPACE_KEEP_REVISIONS", "5"),
+                    ("RIVERS_WORKSPACE_MIN_AGE", "90m"),
+                ],
+            ] {
+                let state = api_with(git_cl_at('a', serving_status('a')), rolled_out());
+
+                reconcile_in(
+                    &state,
+                    LeaderGate::leading(),
+                    &resolver(),
+                    workspace_config(&chart).unwrap(),
+                    run_store(Vec::new()),
+                )
+                .await;
+
+                let template = state.lock().unwrap().deployments["x"]
+                    .spec
+                    .clone()
+                    .unwrap()
+                    .template;
+                let sync = &template
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .init_containers
+                    .as_ref()
+                    .unwrap()[0];
+                prune_env.push(
+                    sync.env
+                        .iter()
+                        .flatten()
+                        .filter(|e| e.name.starts_with("RIVERS_WORKSPACE_"))
+                        .map(|e| (e.name.clone(), e.value.clone()))
+                        .collect::<Vec<_>>(),
+                );
+                templates.push(template);
+            }
+
+            // An emptyDir holds no other tree to prune.
+            assert_eq!(prune_env, [vec![], vec![]]);
+            // So a change of the floors rolls no fallback Deployment.
+            assert_eq!(templates[0], templates[1]);
         }
 
         #[tokio::test]
