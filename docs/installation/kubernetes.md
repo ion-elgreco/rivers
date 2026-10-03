@@ -164,6 +164,14 @@ kubectl -n rivers get rcl
 # analytics   Ready   main@9f3c1ab   1/1        45s
 ```
 
+**Pinning a commit**: `ref.commit` takes the full 40-character SHA in
+lowercase, as `git rev-parse` prints it. The same applies to
+`spec.source.git.commit` of a `Run` that you create with your own
+`spec.source`. The API server and the webhook reject a short or uppercase
+SHA. A CodeLocation that has one all the same (for example, one created
+before these checks) fails with reason `InvalidRef`, and the operator
+does not deploy it.
+
 How it composes with `image`: `spec.image` is always *the container the
 pods run*. Omit it in git mode to run the chart's default runtime image
 (`codeLocation.runtime.*`, by default
@@ -276,7 +284,7 @@ accordingly. The operator's requests to git hosts and registries carry
 `User-Agent: rivers-operator/<version>`, for firewalls that filter on it.
 
 **When things fail**, `kubectl describe rcl analytics` carries the
-answer: `RefNotFound` / `GitAuthFailed` / `GitHostKeyRejected` /
+answer: `RefNotFound` / `InvalidRef` / `GitAuthFailed` / `GitHostKeyRejected` /
 `GitMalformedResponse` on the `SourceResolved` condition for resolution
 problems, and a failed install surfaces `uv`'s error tail in
 `status.message`. A resolution problem sets the phase to `Failed`, and

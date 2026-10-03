@@ -24,7 +24,7 @@ pub mod ssh;
 
 use gix_packetline::PacketLineRef;
 use gix_packetline::blocking_io::StreamingPeekableIter;
-use rivers_k8s::crd::code_location::GitRef;
+use rivers_k8s::crd::code_location::{GitRef, is_commit_sha};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const HTTP_SERVICE_PREAMBLE: &[u8] = b"# service=";
@@ -37,6 +37,12 @@ pub enum GitError {
     /// remote changes.
     #[error("ref not found: {0}")]
     RefNotFound(String),
+    /// `spec.git.ref` breaks the CRD's rules, e.g. a pinned commit that is
+    /// not a full lowercase SHA. The admission webhook and the CRD schema
+    /// refuse such a ref, so only a CodeLocation they did not check gets
+    /// here. Terminal until the CR changes.
+    #[error("invalid git ref: {0}")]
+    InvalidRef(String),
     /// Credentials rejected (or unusable — e.g. an unreadable private key,
     /// or an ssh url without a user). Terminal until the Secret or the CR
     /// changes.
@@ -233,8 +239,10 @@ fn parse_ref_line(line: &[u8]) -> Result<Option<AdvertisedRef>, GitError> {
     let (oid, name) = text
         .split_once(' ')
         .ok_or_else(|| GitError::Malformed(format!("expected '<oid> <ref>', got '{text}'")))?;
-    if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(GitError::Malformed(format!("'{oid}' is not a 40-hex oid")));
+    if !is_commit_sha(oid) {
+        return Err(GitError::Malformed(format!(
+            "'{oid}' is not a lowercase 40-hex oid"
+        )));
     }
     if name.is_empty() {
         return Err(GitError::Malformed("empty ref name".to_string()));
@@ -476,6 +484,9 @@ impl GitResolver {
         if Transport::of(&req.url)? == Transport::Ssh {
             ssh::parse_ssh_url(&req.url)?;
         }
+        // The pods take a pinned commit as written, and the webhook may not
+        // have checked this CR.
+        req.r#ref.validate().map_err(GitError::InvalidRef)?;
         // Pinned commit: no lookup, no cache, no network.
         if let Some(commit) = req.r#ref.commit.as_deref().filter(|c| !c.is_empty()) {
             return Ok(ResolvedRef {
@@ -771,6 +782,29 @@ mod resolver_tests {
         let resolved = resolver.resolve(&req).await.unwrap();
         assert_eq!(resolved.commit, fixtures::oid('9'));
         assert_eq!(resolved.ref_name, None);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_uppercase_commit_fails_for_good_without_a_fetch() {
+        let server = mock_git_server(0).await;
+        let commit = fixtures::oid('a').to_ascii_uppercase();
+        let pinned = GitRef {
+            commit: Some(commit.clone()),
+            ..Default::default()
+        };
+        let req = request(format!("{}/acme/pipelines.git", server.uri()), pinned);
+
+        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "invalid git ref: git.ref.commit '{commit}' has uppercase letters — use the \
+                 lowercase SHA '{}'",
+                fixtures::oid('a')
+            )
+        );
+        assert!(!failure.error.is_transient());
+        assert_eq!(failure.retry_after, None);
     }
 
     #[tokio::test]
@@ -1777,6 +1811,16 @@ mod tests {
             parse_advertisement(&v),
             Err(GitError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn an_uppercase_oid_is_malformed() {
+        let upper = oid('a').to_ascii_uppercase();
+        let v = body(&[format!("{upper} refs/heads/main\n")]);
+        assert_eq!(
+            parse_advertisement(&v).unwrap_err().to_string(),
+            format!("malformed advertisement: '{upper}' is not a lowercase 40-hex oid")
+        );
     }
 
     #[test]

@@ -16,7 +16,9 @@ use kube_client::Api;
 use kube_core::DynamicObject;
 use kube_core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview, Operation};
 use rivers_api::CodeLocationEntry;
-use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, CodeLocationSpec};
+use rivers_k8s::crd::code_location::{
+    CodeLocation, CodeLocationPhase, CodeLocationSpec, validate_commit,
+};
 use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
@@ -236,12 +238,7 @@ async fn check_self_stamped_source(
     allowed_hosts: &[String],
 ) -> Result<(), String> {
     let git = &source.git;
-    if git.commit.len() != 40 || !git.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "spec.source.git.commit '{}' is not a full 40-hex commit SHA",
-            git.commit
-        ));
-    }
+    validate_commit("spec.source.git.commit", &git.commit)?;
     if git.url.is_empty() {
         return Err("spec.source.git.url is empty".into());
     }
@@ -924,6 +921,17 @@ mod tests {
             mutate_run(&req, &AdmissionDeps::cache_only(state)).await,
             RunOutcome::Rejected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_an_uppercase_commit() {
+        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let mut source = expected_run_source();
+        source.git.commit = UPPERCASE_COMMIT.to_string();
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source), &deps).await,
+            uppercase_commit_rejection("spec.source.git.commit")
+        );
     }
 
     #[tokio::test]
@@ -1734,6 +1742,60 @@ mod tests {
         assert_eq!(
             cl_update(&new, &old),
             CodeLocationOutcome::Rejected("one of spec.image or spec.git must be set".to_string())
+        );
+    }
+
+    const UPPERCASE_COMMIT: &str = "9F3C1AB8D2E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8";
+
+    /// The rejection of [`UPPERCASE_COMMIT`] in `field`.
+    fn uppercase_commit_rejection(field: &str) -> String {
+        format!(
+            "{field} '{UPPERCASE_COMMIT}' has uppercase letters — use the lowercase SHA '{COMMIT}'"
+        )
+    }
+
+    fn pinned_cl(commit: &str) -> CodeLocation {
+        build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "commit": commit }
+        }))
+    }
+
+    #[test]
+    fn cl_create_rejects_an_uppercase_commit() {
+        let create = |commit: &str| {
+            mutate_codelocation(&cl_admission_request_create(
+                "uid-cl-commit",
+                "team-data",
+                &pinned_cl(commit),
+            ))
+        };
+        assert_eq!(
+            create(UPPERCASE_COMMIT),
+            CodeLocationOutcome::Rejected(uppercase_commit_rejection("git.ref.commit"))
+        );
+        assert!(matches!(
+            create(COMMIT),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_rejects_a_change_to_an_uppercase_commit() {
+        let old = pinned_cl(COMMIT);
+        let new = pinned_cl(UPPERCASE_COMMIT);
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(uppercase_commit_rejection("git.ref.commit"))
+        );
+
+        // One admitted before this rule keeps taking updates that leave its
+        // source alone; the operator fails it instead.
+        let mut labelled = new.clone();
+        labelled.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(
+            cl_update(&labelled, &new),
+            CodeLocationOutcome::UpdateAllowed
         );
     }
 

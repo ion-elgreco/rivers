@@ -27,7 +27,7 @@ use rivers_k8s::crd::code_location::{
     IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
     REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
     REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED,
-    REASON_GIT_UNREACHABLE, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
+    REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
     REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR,
     REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
 };
@@ -758,6 +758,7 @@ async fn git_credentials(
 fn git_error_reason_retry(err: &git::GitError) -> (&'static str, Duration) {
     match err {
         git::GitError::RefNotFound(_) => (REASON_REF_NOT_FOUND, TERMINAL_RETRY),
+        git::GitError::InvalidRef(_) => (REASON_INVALID_REF, TERMINAL_RETRY),
         git::GitError::AuthFailed(_) => (REASON_GIT_AUTH_FAILED, TERMINAL_RETRY),
         git::GitError::HostKeyRejected(_) | git::GitError::KnownHostsUnavailable(_) => {
             (REASON_GIT_HOST_KEY_REJECTED, TERMINAL_RETRY)
@@ -1708,6 +1709,11 @@ mod tests {
             (
                 GitError::RefNotFound("x".into()),
                 REASON_REF_NOT_FOUND,
+                TERMINAL_RETRY,
+            ),
+            (
+                GitError::InvalidRef("x".into()),
+                REASON_INVALID_REF,
                 TERMINAL_RETRY,
             ),
             (
@@ -3080,6 +3086,49 @@ mod tests {
             assert_eq!(requeue, Action::requeue(Duration::from_secs(60)));
             // The follower leaves the leader's verdict alone.
             assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[tokio::test]
+        async fn a_pinned_uppercase_commit_fails_before_any_deployment() {
+            // Created before the webhook and the CRD schema refused one.
+            let upper = commit('a').to_ascii_uppercase();
+            let state = ApiState::default();
+            state.lock().unwrap().code_locations.insert(
+                "x".into(),
+                make_cl(json!({
+                    "git": { "url": URL, "ref": { "commit": upper } },
+                    "digest": digest('a'),
+                })),
+            );
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            let error = format!(
+                "invalid git ref: git.ref.commit '{upper}' has uppercase letters — use the \
+                 lowercase SHA '{}'",
+                commit('a')
+            );
+            assert_eq!(status["phase"], "Failed", "{status}");
+            assert_eq!(status["message"], error);
+            assert_eq!(
+                source_resolved(&status),
+                ("False", REASON_INVALID_REF, error.as_str())
+            );
+            let writes: Vec<_> = requests
+                .iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| (r.method.as_str(), r.path.as_str()))
+                .collect();
+            assert_eq!(
+                writes,
+                [(
+                    "PATCH",
+                    "/apis/rivers.io/v1alpha1/namespaces/y/codelocations/x/status"
+                )]
+            );
+            assert_eq!(requeue, Action::requeue(TERMINAL_RETRY));
         }
 
         #[tokio::test]

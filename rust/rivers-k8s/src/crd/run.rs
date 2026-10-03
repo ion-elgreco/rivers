@@ -147,7 +147,8 @@ impl RunSource {
 #[serde(rename_all = "camelCase")]
 pub struct GitCoordinates {
     pub url: String,
-    /// Full 40-hex commit — the pin.
+    /// Full commit SHA in lowercase — the pin.
+    #[schemars(regex(pattern = crate::crd::code_location::COMMIT_SHA_PATTERN))]
     pub commit: String,
     /// Matched ref (`refs/heads/main`) — fetch fallback + display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +328,15 @@ fn default_run_memory() -> String {
 mod tests {
     use super::*;
     use crate::defaults;
+
+    #[test]
+    fn crd_schema_pins_the_source_commit_to_the_lowercase_sha() {
+        use kube_client::CustomResourceExt;
+        let crd = serde_json::to_value(Run::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let commit = &spec["properties"]["source"]["properties"]["git"]["properties"]["commit"];
+        assert_eq!(commit["pattern"], "^[0-9a-f]{40}$", "{commit}");
+    }
 
     #[test]
     fn minimal_spec_gets_all_defaults() {

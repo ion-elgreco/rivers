@@ -220,8 +220,11 @@ spec:
                         nullable: true
                         type: string
                       commit:
-                        description: 'Full 40-hex commit. Pinned: no polling, no network at reconcile time.'
+                        description: |-
+                          Full commit SHA in lowercase, as `git rev-parse` prints it. Pinned:
+                          no polling, no network at reconcile time.
                         nullable: true
+                        pattern: ^[0-9a-f]{40}$
                         type: string
                       tag:
                         nullable: true
@@ -496,7 +499,8 @@ spec:
                   git:
                     properties:
                       commit:
-                        description: Full 40-hex commit — the pin.
+                        description: Full commit SHA in lowercase — the pin.
+                        pattern: ^[0-9a-f]{40}$
                         type: string
                       path:
                         nullable: true

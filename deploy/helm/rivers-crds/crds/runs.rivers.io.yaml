@@ -199,7 +199,8 @@ spec:
                   git:
                     properties:
                       commit:
-                        description: Full 40-hex commit — the pin.
+                        description: Full commit SHA in lowercase — the pin.
+                        pattern: ^[0-9a-f]{40}$
                         type: string
                       path:
                         nullable: true

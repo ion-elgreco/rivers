@@ -38,6 +38,7 @@ pub const REASON_AWAITING_LEADER: &str = "AwaitingLeader";
 pub const REASON_COMMIT_RESOLVED: &str = "CommitResolved";
 pub const REASON_COMMIT_PINNED: &str = "CommitPinned";
 pub const REASON_REF_NOT_FOUND: &str = "RefNotFound";
+pub const REASON_INVALID_REF: &str = "InvalidRef";
 pub const REASON_GIT_AUTH_FAILED: &str = "GitAuthFailed";
 pub const REASON_GIT_UNREACHABLE: &str = "GitUnreachable";
 pub const REASON_GIT_RATE_LIMITED: &str = "GitRateLimited";
@@ -206,13 +207,42 @@ pub struct GitRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 
-    /// Full 40-hex commit. Pinned: no polling, no network at reconcile time.
+    /// Full commit SHA in lowercase, as `git rev-parse` prints it. Pinned:
+    /// no polling, no network at reconcile time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = COMMIT_SHA_PATTERN))]
     pub commit: Option<String>,
 }
 
+/// Schema `pattern` of a commit SHA: see [`is_commit_sha`].
+pub const COMMIT_SHA_PATTERN: &str = "^[0-9a-f]{40}$";
+
+/// A full commit SHA as git prints it: 40 lowercase hex characters. The
+/// workspace pods compare a pinned commit with `git rev-parse HEAD` as text.
+pub fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// [`is_commit_sha`] for the commit in `field`; the message gives the
+/// lowercase form of an uppercase SHA.
+pub fn validate_commit(field: &str, commit: &str) -> Result<(), String> {
+    if is_commit_sha(commit) {
+        return Ok(());
+    }
+    let lowercase = commit.to_ascii_lowercase();
+    if is_commit_sha(&lowercase) {
+        return Err(format!(
+            "{field} '{commit}' has uppercase letters — use the lowercase SHA '{lowercase}'"
+        ));
+    }
+    Err(format!(
+        "{field} '{commit}' is not a full 40-hex commit SHA"
+    ))
+}
+
 impl GitRef {
-    /// Exactly one non-empty field, and `commit` must be a full 40-hex SHA.
+    /// Exactly one non-empty field, and `commit` must be a full lowercase
+    /// SHA.
     pub fn validate(&self) -> Result<(), String> {
         let set = [
             self.branch.as_deref(),
@@ -229,11 +259,7 @@ impl GitRef {
             ));
         }
         if let Some(commit) = self.commit.as_deref().filter(|s| !s.is_empty()) {
-            if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "git.ref.commit '{commit}' is not a full 40-hex commit SHA"
-                ));
-            }
+            validate_commit("git.ref.commit", commit)?;
         }
         Ok(())
     }
@@ -668,6 +694,40 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn git_ref_commit_must_be_the_lowercase_sha() {
+        let pinned = |commit: &str| GitRef {
+            commit: Some(commit.to_string()),
+            ..Default::default()
+        };
+        let sha = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+        assert_eq!(pinned(sha).validate(), Ok(()));
+        for commit in [
+            "9F3C1AB8D2E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8",
+            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6F7A8",
+        ] {
+            assert_eq!(
+                pinned(commit).validate(),
+                Err(format!(
+                    "git.ref.commit '{commit}' has uppercase letters — use the lowercase SHA '{sha}'"
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn crd_schema_pins_commits_to_the_lowercase_sha() {
+        let crd = serde_json::to_value(CodeLocation::crd()).unwrap();
+        let props = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
+        let pinned =
+            &props["spec"]["properties"]["git"]["properties"]["ref"]["properties"]["commit"];
+        let serving = &props["status"]["properties"]["runSource"]["properties"]["git"]["properties"]
+            ["commit"];
+        for commit in [pinned, serving] {
+            assert_eq!(commit["pattern"], "^[0-9a-f]{40}$", "{commit}");
+        }
     }
 
     #[test]
