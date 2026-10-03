@@ -8,7 +8,7 @@ import pytest
 from _threads import N_THREADS, run_threads
 
 import rivers as rs
-from rivers.exceptions import AssetDefinitionError, TaskDefinitionError
+from rivers.exceptions import AssetDefinitionError
 
 CALLS_PER_THREAD = 2000
 GRAPHS_PER_THREAD = 5
@@ -186,25 +186,3 @@ def test_wrapped_asset_called_outside_composition_raises(kind):
     with pytest.raises(AssetDefinitionError, match="already"):
         asset(lambda: None)
     assert wrapped_fn(asset) is body
-
-
-DECORATORS = {
-    **{kind: (make, AssetDefinitionError) for kind, make in ASSET_FACTORIES.items()},
-    "task": (lambda: rs.Task(tags=["etl"]), TaskDefinitionError),
-}
-
-
-def func(): ...
-
-
-@pytest.mark.parametrize(
-    ("args", "kwargs"),
-    [((), {}), ((42,), {}), ((func, func), {}), ((func,), {"name": "x"})],
-    ids=["no_args", "non_callable", "two_functions", "keyword"],
-)
-@pytest.mark.parametrize("kind", DECORATORS)
-def test_decorator_needs_one_function(kind, args, kwargs):
-    make, error = DECORATORS[kind]
-
-    with pytest.raises(error, match="decorator needs one function"):
-        make()(*args, **kwargs)

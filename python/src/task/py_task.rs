@@ -2,7 +2,9 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::assets::decorator::{decorated_fn, is_coroutine_function, name_or_fn_name};
+use crate::assets::decorator::{
+    decorated_fn, ensure_callable, is_coroutine_function, name_or_fn_name,
+};
 use crate::assets::io_handler::IOHandler;
 use crate::composition::{
     InvokedNodeType, PyInvokedNodeOutput, extract_input_bindings, is_in_composition,
@@ -11,6 +13,12 @@ use crate::composition::{
 use crate::errors::TaskDefinitionError;
 use crate::partitions::PartitionsDefRef;
 use crate::partitions::mapping::PartitionMappingDict;
+
+fn needs_one_function() -> PyErr {
+    TaskDefinitionError::new_err(
+        "the Task decorator needs one function, e.g. `@rs.Task(tags=...)` on a def",
+    )
+}
 
 pub struct Task {
     pub wraps: Option<Py<PyAny>>,
@@ -72,7 +80,8 @@ impl PyTask {
         io_handler: Option<IOHandler>,
         retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let task_name = name_or_fn_name(py, name, &wraps);
+        ensure_callable(py, &wraps, needs_one_function)?;
+        let task_name = name_or_fn_name(py, name, &wraps)?;
 
         let is_async = is_coroutine_function(py, &wraps);
         Ok(Self {
@@ -98,11 +107,7 @@ impl PyTask {
         let py = slf.py();
         let task = &slf.get().inner;
         let Some(func) = &task.wraps else {
-            let func = decorated_fn(args, kwargs).ok_or_else(|| {
-                TaskDefinitionError::new_err(
-                    "the Task decorator needs one function, e.g. `@rs.Task(tags=...)` on a def",
-                )
-            })?;
+            let func = decorated_fn(args, kwargs).ok_or_else(needs_one_function)?;
             let inner = task.wrapping(py, func)?;
             return Ok(Py::new(py, Self { inner })?.into_any());
         };

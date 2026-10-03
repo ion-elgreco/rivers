@@ -18,17 +18,18 @@ use crate::composition::{
 use crate::errors::AssetDefinitionError;
 use crate::executor::ops::enumerate_params;
 
-fn ensure_callable(py: Python, func: &Option<Py<PyAny>>) -> PyResult<()> {
-    if !func
-        .as_ref()
-        .map(|f| f.getattr(py, "__call__").is_ok())
-        .unwrap_or(true)
-    {
-        return Err(AssetDefinitionError::new_err(
-            "Non callable function provided as input",
-        ));
+fn needs_one_function() -> PyErr {
+    AssetDefinitionError::new_err(
+        "the Asset decorator needs one function, e.g. `@rs.Asset(group=...)` on a def",
+    )
+}
+
+/// Raise `err()` when `func` is set but not callable.
+pub fn ensure_callable(py: Python, func: &Option<Py<PyAny>>, err: fn() -> PyErr) -> PyResult<()> {
+    match func {
+        Some(f) if !f.bind(py).is_callable() => Err(err()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// The function in a decorator call: one callable positional argument and
@@ -284,11 +285,11 @@ pub fn name_or_fn_name(
     py: Python,
     name: Option<String>,
     func: &Option<Py<PyAny>>,
-) -> Option<String> {
-    name.or_else(|| {
-        func.as_ref()
-            .map(|f| f.getattr(py, "__name__").unwrap().to_string())
-    })
+) -> PyResult<Option<String>> {
+    match (name, func) {
+        (None, Some(f)) => Ok(Some(f.getattr(py, "__name__")?.to_string())),
+        (name, _) => Ok(name),
+    }
 }
 pub fn is_coroutine_function(py: Python, func: &Option<Py<PyAny>>) -> bool {
     func.as_ref().is_some_and(|f| {
@@ -1200,11 +1201,11 @@ impl PyAsset {
         let actions = actions.unwrap_or_default();
         let py = cls.py();
 
-        ensure_callable(cls.py(), &wraps)?;
+        ensure_callable(py, &wraps, needs_one_function)?;
 
         let handler = io_handler;
 
-        name = name_or_fn_name(py, name, &wraps);
+        name = name_or_fn_name(py, name, &wraps)?;
         validate_actions(&actions, name.as_deref().unwrap_or("<asset>"))?;
 
         let pool = normalize_pool(pool, pool_slots)?;
@@ -1296,9 +1297,9 @@ impl PyAsset {
         let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let kinds = kinds.unwrap_or_default();
 
-        ensure_callable(py, &wraps)?;
+        ensure_callable(py, &wraps, needs_one_function)?;
 
-        name = name_or_fn_name(py, name, &wraps);
+        name = name_or_fn_name(py, name, &wraps)?;
         validate_actions(&actions, name.as_deref().unwrap_or("<multi asset>"))?;
 
         let mut pd = process_deps(py, &top_level_deps);
@@ -1450,7 +1451,9 @@ impl PyAsset {
         let py = cls.py();
         let handler = io_handler;
 
-        name = name_or_fn_name(py, name, &wraps);
+        ensure_callable(py, &wraps, needs_one_function)?;
+
+        name = name_or_fn_name(py, name, &wraps)?;
         validate_actions(&actions, name.as_deref().unwrap_or("<graph asset>"))?;
 
         let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
@@ -1529,11 +1532,13 @@ impl PyAsset {
     ) -> PyResult<Py<PyAny>> {
         let py = _cls.py();
 
+        ensure_callable(py, &wraps, needs_one_function)?;
+
         let handler = io_handler.ok_or_else(|| {
             AssetDefinitionError::new_err("External assets require an io_handler")
         })?;
 
-        let asset_name = name_or_fn_name(py, name, &wraps);
+        let asset_name = name_or_fn_name(py, name, &wraps)?;
 
         let is_async_observe = is_coroutine_function(py, &wraps);
         let py_asset = Asset::External(ExternalAsset {
@@ -1566,11 +1571,7 @@ impl PyAsset {
         let py = slf.py();
         let asset = slf.get().inner();
         if asset.func().is_none() {
-            let func = decorated_fn(args, kwargs).ok_or_else(|| {
-                AssetDefinitionError::new_err(
-                    "the Asset decorator needs one function, e.g. `@rs.Asset(group=...)` on a def",
-                )
-            })?;
+            let func = decorated_fn(args, kwargs).ok_or_else(needs_one_function)?;
             return Self::new_object(py, asset.wrapping(py, func)?);
         }
         let name = asset
