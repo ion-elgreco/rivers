@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! decode key + read known_hosts → connect → publickey auth → open session
-//!         → exec "git-upload-pack '<path>'" → buffer stdout up to the
-//!           advertisement's flush-pkt → send a flush-pkt + EOF → parse
+//!         → exec "git-upload-pack '<path>'" → match stdout as it arrives,
+//!           up to the advertisement's flush-pkt → send a flush-pkt + EOF
 //! ```
 //!
 //! One deadline, the operator's git timeout, covers every step from
@@ -23,14 +23,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gix_packetline::PacketLineRef;
-use gix_packetline::decode::{Stream, streaming};
+use rivers_k8s::crd::code_location::GitRef;
 use russh::ChannelMsg;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 
 use super::http::DEFAULT_MAX_ADVERTISEMENT_BYTES;
-use super::{GitError, known_hosts};
+use super::{Advertisement, GitError, RefMatcher, known_hosts};
 
 /// How long upload-pack gets to exit once it has the client's flush-pkt,
 /// if the fetch's timeout leaves that long.
@@ -189,23 +188,33 @@ impl client::Handler for HostKeyCheck {
     }
 }
 
-/// Fetch the ref advertisement over SSH, fully buffered. `timeout` bounds
+/// Fetch the ref advertisement over SSH and keep the refs that answer
+/// `wanted`, reading upload-pack's output as it arrives. `timeout` bounds
 /// the whole fetch: a host that does not finish in time is
 /// [`GitError::Unreachable`], with the stage it did not finish.
 pub async fn fetch_advertisement(
     target: &SshTarget,
     auth: &SshAuth<'_>,
+    wanted: &GitRef,
     timeout: Duration,
-) -> Result<Vec<u8>, GitError> {
-    fetch_advertisement_with_cap(target, auth, timeout, DEFAULT_MAX_ADVERTISEMENT_BYTES).await
+) -> Result<Advertisement, GitError> {
+    fetch_advertisement_with_cap(
+        target,
+        auth,
+        wanted,
+        timeout,
+        DEFAULT_MAX_ADVERTISEMENT_BYTES,
+    )
+    .await
 }
 
 pub(crate) async fn fetch_advertisement_with_cap(
     target: &SshTarget,
     auth: &SshAuth<'_>,
+    wanted: &GitRef,
     timeout: Duration,
     cap: usize,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<Advertisement, GitError> {
     let key = decode_secret_key(auth.private_key, None).map_err(|e| {
         GitError::AuthFailed(match e {
             russh::keys::Error::KeyIsEncrypted => "the SSH private key is passphrase-protected \
@@ -263,7 +272,7 @@ pub(crate) async fn fetch_advertisement_with_cap(
         channel.exec(true, command).await?;
 
         stage = Stage::Refs;
-        let output = Output::read(&mut channel, cap).await?;
+        let output = Output::read(&mut channel, RefMatcher::new(wanted), cap).await?;
         Ok::<_, GitError>((handle, channel, output))
     })
     .await;
@@ -334,7 +343,8 @@ impl Stage {
 /// What upload-pack wrote until its advertisement's flush-pkt, or until it
 /// closed the channel.
 struct Output {
-    stdout: Vec<u8>,
+    /// The advertisement's lines that answer the request.
+    refs: RefMatcher,
     /// The last [`MAX_STDERR_BYTES`] of stderr; `stderr_cut` if more came.
     stderr: Vec<u8>,
     stderr_cut: bool,
@@ -343,25 +353,29 @@ struct Output {
 }
 
 impl Output {
-    async fn read(channel: &mut russh::Channel<client::Msg>, cap: usize) -> Result<Self, GitError> {
+    async fn read(
+        channel: &mut russh::Channel<client::Msg>,
+        refs: RefMatcher,
+        cap: usize,
+    ) -> Result<Self, GitError> {
         let mut output = Output {
-            stdout: Vec::new(),
+            refs,
             stderr: Vec::new(),
             stderr_cut: false,
             exit_status: None,
             advertised: false,
         };
-        let mut scanned = 0;
+        let mut read = 0;
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
-                    output.stdout.extend_from_slice(&data);
-                    if output.stdout.len() > cap {
+                    read += data.len();
+                    if read > cap {
                         return Err(GitError::Malformed(format!(
                             "advertisement exceeds {cap} bytes"
                         )));
                     }
-                    output.advertised = reaches_flush(&output.stdout, &mut scanned)?;
+                    output.advertised = output.refs.feed(&data)?;
                     if output.advertised {
                         break;
                     }
@@ -384,12 +398,12 @@ impl Output {
         }
     }
 
-    fn into_advertisement(self, target: &SshTarget) -> Result<Vec<u8>, GitError> {
+    fn into_advertisement(self, target: &SshTarget) -> Result<Advertisement, GitError> {
         match self.exit_status {
             // As for `git ls-remote`: once the refs are in, how upload-pack
             // exits does not matter.
-            _ if self.advertised => Ok(self.stdout),
-            Some(0) => Ok(self.stdout),
+            _ if self.advertised => self.refs.finish(),
+            Some(0) => self.refs.finish(),
             // The connection or the channel ended mid-read.
             None => {
                 let stderr = self.stderr_text();
@@ -418,26 +432,6 @@ impl Output {
             format!("…{stderr}")
         } else {
             stderr.to_string()
-        }
-    }
-}
-
-/// Advances `scanned` past the whole pkt-lines in `stdout`; true once it
-/// passes a flush-pkt — over ssh, the end of the advertisement.
-fn reaches_flush(stdout: &[u8], scanned: &mut usize) -> Result<bool, GitError> {
-    loop {
-        match streaming(&stdout[*scanned..]) {
-            Ok(Stream::Complete {
-                line,
-                bytes_consumed,
-            }) => {
-                *scanned += bytes_consumed;
-                if matches!(line, PacketLineRef::Flush) {
-                    return Ok(true);
-                }
-            }
-            Ok(Stream::Incomplete { .. }) => return Ok(false),
-            Err(e) => return Err(GitError::Malformed(e.to_string())),
         }
     }
 }
@@ -858,7 +852,7 @@ Qjm9zYDGIBlKeGwA==
 
 #[cfg(test)]
 mod tests {
-    use super::super::{commit_for_ref, fixtures, parse_advertisement};
+    use super::super::{commit_for_ref, fixtures};
     use super::test_server::*;
     use super::*;
 
@@ -921,19 +915,26 @@ mod tests {
         timeout: Duration,
     ) -> Result<String, GitError> {
         let known_hosts = known_hosts_pinning(port, pinned);
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
+        let target = test_target(port);
         let auth = client_auth(&known_hosts);
-        let fetch = fetch_advertisement(&target, &auth, timeout);
+        let main = fixtures::branch("main");
+        let fetch = fetch_advertisement(&target, &auth, &main, timeout);
         tokio::time::timeout(Duration::from_secs(5), fetch)
             .await
             .expect("the resolve did not end within 5s")
-            .map(|bytes| {
-                let adv = parse_advertisement(&bytes).unwrap();
-                commit_for_ref(&adv, &fixtures::branch("main"))
-                    .unwrap()
-                    .commit
-            })
+            .map(|adv| main_commit(&adv))
+    }
+
+    /// The test server's `acme/pipelines` repository on `port`.
+    fn test_target(port: u16) -> SshTarget {
+        parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap()
+    }
+
+    /// The commit `adv` resolves `main` to.
+    fn main_commit(adv: &Advertisement) -> String {
+        commit_for_ref(adv, &fixtures::branch("main"))
+            .unwrap()
+            .commit
     }
 
     /// The timeout of the tests that run into it.
@@ -1127,19 +1128,44 @@ mod tests {
         assert_eq!(commit.unwrap(), fixtures::oid('a'));
     }
 
-    #[test]
-    fn the_advertisement_ends_at_its_flush_pkt_however_stdout_is_split() {
-        let adv = fixtures::ssh_adv();
-        let mut stdout = Vec::new();
-        let mut scanned = 0;
-        let mut ends = Vec::new();
-        for &byte in &adv {
-            stdout.push(byte);
-            if reaches_flush(&stdout, &mut scanned).unwrap() {
-                ends.push(stdout.len());
-            }
-        }
-        assert_eq!(ends, [adv.len()]);
+    #[tokio::test]
+    async fn an_advertisement_over_the_cap_is_malformed() {
+        // A well-formed advertisement: the cap counts the bytes read, not
+        // the bytes the resolver keeps.
+        let server = ServerBehaviour {
+            advertisement: fixtures::body(&fixtures::lines_with_pulls(1_000)),
+            ..forge()
+        };
+        let port = spawn_server(server).await;
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
+        let (target, auth) = (test_target(port), client_auth(&known_hosts));
+        let main = fixtures::branch("main");
+
+        let fetch = fetch_advertisement_with_cap(&target, &auth, &main, TIMEOUT, 16 * 1024);
+
+        assert_eq!(
+            fetch.await.unwrap_err().to_string(),
+            "malformed advertisement: advertisement exceeds 16384 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_pack_that_exits_before_the_flush_pkt_is_malformed() {
+        let mut advertisement = fixtures::ssh_adv();
+        advertisement.truncate(advertisement.len() - fixtures::flush().len());
+        let server = ServerBehaviour {
+            advertisement,
+            after_advertisement: AfterAdvertisement::Exit(0),
+            ..forge()
+        };
+
+        let (_, commit) = resolve_main_pinning(&server, HOST_PUB).await;
+
+        assert_eq!(
+            commit.unwrap_err().to_string(),
+            "malformed advertisement: advertisement not terminated by a flush-pkt (truncated \
+             response?)"
+        );
     }
 
     #[tokio::test]
@@ -1227,15 +1253,19 @@ mod tests {
     async fn end_to_end_resolves_branch_over_ssh() {
         let port = spawn_server(ServerBehaviour::default()).await;
         let known_hosts = known_hosts_pinning(port, HOST_PUB);
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
+        let main = fixtures::branch("main");
 
-        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
-            .await
-            .unwrap();
-        let adv = parse_advertisement(&bytes).unwrap();
-        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
+        let adv = fetch_advertisement(
+            &test_target(port),
+            &client_auth(&known_hosts),
+            &main,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let resolved = commit_for_ref(&adv, &main).unwrap();
         assert_eq!(resolved.commit, fixtures::oid('a'));
+        assert_eq!(resolved.ref_name.as_deref(), Some("refs/heads/main"));
     }
 
     #[tokio::test]
@@ -1249,13 +1279,12 @@ mod tests {
         let known_hosts = known_hosts_pinning(port, HOST_PUB);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/~svc/pipelines.git")).unwrap();
+        let main = fixtures::branch("main");
 
-        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT).await;
+        let adv = fetch_advertisement(&target, &client_auth(&known_hosts), &main, TIMEOUT).await;
 
         assert_eq!(server.commands(), [command]);
-        let adv = parse_advertisement(&bytes.unwrap()).unwrap();
-        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
-        assert_eq!(resolved.commit, fixtures::oid('a'));
+        assert_eq!(main_commit(&adv.unwrap()), fixtures::oid('a'));
     }
 
     #[tokio::test]
@@ -1265,13 +1294,7 @@ mod tests {
             ..Default::default()
         };
         let port = spawn_server(behaviour).await;
-        let known_hosts = known_hosts_pinning(port, HOST_PUB);
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
-
-        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = resolve_main_at(port, HOST_PUB, TIMEOUT).await.unwrap_err();
         assert!(matches!(err, GitError::AuthFailed(_)), "{err}");
     }
 
@@ -1280,13 +1303,7 @@ mod tests {
         let port = spawn_server(ServerBehaviour::default()).await;
         // known_hosts pins the *rogue* key for this host — the server
         // presents HOST_PUB, i.e. the MITM shape.
-        let known_hosts = known_hosts_pinning(port, ROGUE_PUB);
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
-
-        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = resolve_main_at(port, ROGUE_PUB, TIMEOUT).await.unwrap_err();
         assert!(
             matches!(err, GitError::HostKeyRejected(ref m) if m.contains("CHANGED")),
             "{err}"
@@ -1302,10 +1319,9 @@ mod tests {
             private_key: "not a private key\n",
             known_hosts: &known_hosts,
         };
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
+        let main = fixtures::branch("main");
 
-        let err = fetch_advertisement(&target, &auth, TIMEOUT)
+        let err = fetch_advertisement(&test_target(port), &auth, &main, TIMEOUT)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1327,13 +1343,7 @@ mod tests {
             ..Default::default()
         };
         let port = spawn_server(behaviour).await;
-        let known_hosts = known_hosts_pinning(port, HOST_PUB);
-        let target =
-            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
-
-        let err = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = resolve_main_at(port, HOST_PUB, TIMEOUT).await.unwrap_err();
         assert!(
             matches!(err, GitError::RefNotFound(ref m)
                 if m.contains("exit 128") && m.contains("does not appear")),
@@ -1345,7 +1355,9 @@ mod tests {
     async fn connection_refused_is_unreachable() {
         let known_hosts = known_hosts_pinning(1, HOST_PUB);
         let target = parse_ssh_url("ssh://git@127.0.0.1:1/r.git").unwrap();
-        let err = fetch_advertisement(&target, &client_auth(&known_hosts), Duration::from_secs(3))
+        let main = fixtures::branch("main");
+        let auth = client_auth(&known_hosts);
+        let err = fetch_advertisement(&target, &auth, &main, Duration::from_secs(3))
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::Unreachable(_)), "{err}");
@@ -1400,14 +1412,13 @@ mod tests {
         let known_hosts = format!("[::1]:{port} {HOST_PUB}\n");
         let target =
             parse_ssh_url(&format!("ssh://git@[0:0::1]:{port}/acme/pipelines.git")).unwrap();
+        let main = fixtures::branch("main");
 
-        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
+        let adv = fetch_advertisement(&target, &client_auth(&known_hosts), &main, TIMEOUT)
             .await
             .unwrap();
 
-        let adv = parse_advertisement(&bytes).unwrap();
-        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
-        assert_eq!(resolved.commit, fixtures::oid('a'));
+        assert_eq!(main_commit(&adv), fixtures::oid('a'));
     }
 
     #[test]

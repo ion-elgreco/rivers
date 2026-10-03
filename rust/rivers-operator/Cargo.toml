@@ -52,9 +52,9 @@ json-patch = "4"
 jsonptr = "0.7"
 mimalloc = "0.1"
 # git ref→commit resolution (RFC-044): pkt-line framing for the v0 ref
-# advertisement, parsed from a buffered byte slice — same parser for the
-# HTTPS and SSH transports.
-gix-packetline = { version = "0.22", features = ["blocking-io"] }
+# advertisement, decoded as it arrives — same matcher for the HTTPS and SSH
+# transports.
+gix-packetline = "0.22"
 # In-process SSH for `git-upload-pack` polling — the only transport shape
 # that works in the distroless operator image (no ssh binary) without
 # pulling OpenSSL in via libssh2. `ring` matches the workspace's rustls

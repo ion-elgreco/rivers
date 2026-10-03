@@ -1,5 +1,6 @@
 //! Smart-HTTP transport arm: fetch the ref advertisement over the
-//! resolver's rustls `reqwest` client. One GET, buffered body, no negotiation:
+//! resolver's rustls `reqwest` client. One GET, the body read as it arrives,
+//! no negotiation:
 //!
 //! ```text
 //! GET <repo-url>/info/refs?service=git-upload-pack
@@ -17,13 +18,15 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
+use rivers_k8s::crd::code_location::GitRef;
 
-use super::GitError;
+use super::{Advertisement, GitError, RefMatcher};
 use crate::codelocation::registry::parse_retry_after;
 
-/// Ceiling for a buffered advertisement. Protocol v0 lists every ref, so a
-/// pathological repo could answer with a huge body; past this size the CR is
-/// a v2 `ls-refs` candidate (deferred), not something to buffer blindly.
+/// The most advertisement bytes a resolve reads. Protocol v0 lists every
+/// ref, so a repo with very many refs answers with a huge body; the resolver
+/// keeps only the lines it needs, but still reads them all. Past this size
+/// the CR is a v2 `ls-refs` candidate (deferred).
 pub const DEFAULT_MAX_ADVERTISEMENT_BYTES: usize = 32 * 1024 * 1024;
 
 const ADVERTISEMENT_CONTENT_TYPE: &str = "application/x-git-upload-pack-advertisement";
@@ -40,18 +43,20 @@ pub enum GitAuth {
     },
 }
 
-/// GET the smart-HTTP ref advertisement, fully buffered. The returned bytes
-/// still carry the `# service=` preamble — `parse_advertisement` strips it.
+/// GET the smart-HTTP ref advertisement and keep the refs that answer
+/// `wanted`, reading the body as it arrives.
 pub async fn fetch_advertisement(
     client: &reqwest::Client,
     repo_url: &str,
     auth: &GitAuth,
+    wanted: &GitRef,
     timeout: Duration,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<Advertisement, GitError> {
     fetch_advertisement_with_cap(
         client,
         repo_url,
         auth,
+        wanted,
         timeout,
         DEFAULT_MAX_ADVERTISEMENT_BYTES,
     )
@@ -62,9 +67,10 @@ pub(crate) async fn fetch_advertisement_with_cap(
     client: &reqwest::Client,
     repo_url: &str,
     auth: &GitAuth,
+    wanted: &GitRef,
     timeout: Duration,
     cap: usize,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<Advertisement, GitError> {
     // Credentials come from the git Secret only, as in the pods; the url's
     // user would go out as a second `Authorization` header.
     let mut repo = super::parse_url(repo_url)?;
@@ -127,26 +133,30 @@ pub(crate) async fn fetch_advertisement_with_cap(
     }
 
     let mut response = response;
-    let mut body = Vec::new();
+    let mut refs = RefMatcher::new(wanted);
+    let mut read = 0;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| GitError::Unreachable(e.to_string()))?
     {
-        body.extend_from_slice(&chunk);
-        if body.len() > cap {
+        read += chunk.len();
+        if read > cap {
             return Err(GitError::Malformed(format!(
                 "advertisement exceeds {cap} bytes"
             )));
         }
+        if refs.feed(&chunk)? {
+            break;
+        }
     }
-    Ok(body)
+    refs.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::fixtures;
-    use super::super::{GitError, commit_for_ref, parse_advertisement};
+    use super::super::{GitError, commit_for_ref};
     use super::*;
     use base64::Engine as _;
     use std::time::Duration;
@@ -165,6 +175,19 @@ mod tests {
             .set_body_bytes(fixtures::http_adv())
     }
 
+    /// Fetch the refs of `repo` that answer `main`, anonymously.
+    async fn fetch_main(repo: &str) -> Result<Advertisement, GitError> {
+        let main = fixtures::branch("main");
+        fetch_advertisement(&client(), repo, &GitAuth::Anonymous, &main, TIMEOUT).await
+    }
+
+    /// The commit `adv` resolves `main` to.
+    fn main_commit(adv: &Advertisement) -> String {
+        commit_for_ref(adv, &fixtures::branch("main"))
+            .unwrap()
+            .commit
+    }
+
     #[tokio::test]
     async fn fetches_and_resolves_a_branch_end_to_end() {
         let server = MockServer::start().await;
@@ -176,10 +199,7 @@ mod tests {
             .await;
 
         let repo = format!("{}/acme/pipelines.git", server.uri());
-        let bytes = fetch_advertisement(&client(), &repo, &GitAuth::Anonymous, TIMEOUT)
-            .await
-            .unwrap();
-        let adv = parse_advertisement(&bytes).unwrap();
+        let adv = fetch_main(&repo).await.unwrap();
         let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
         assert_eq!(resolved.commit, fixtures::oid('a'));
         assert_eq!(resolved.ref_name.as_deref(), Some("refs/heads/main"));
@@ -207,10 +227,11 @@ mod tests {
             username: "bot".to_string(),
             password: "s3cret".to_string(),
         };
-        let bytes = fetch_advertisement(&client(), &repo, &auth, TIMEOUT)
+        let main = fixtures::branch("main");
+        let adv = fetch_advertisement(&client(), &repo, &auth, &main, TIMEOUT)
             .await
             .unwrap();
-        assert!(!bytes.is_empty());
+        assert_eq!(main_commit(&adv), fixtures::oid('a'));
     }
 
     #[tokio::test]
@@ -221,14 +242,9 @@ mod tests {
                 .respond_with(ResponseTemplate::new(status))
                 .mount(&server)
                 .await;
-            let err = fetch_advertisement(
-                &client(),
-                &format!("{}/r.git", server.uri()),
-                &GitAuth::Anonymous,
-                TIMEOUT,
-            )
-            .await
-            .unwrap_err();
+            let err = fetch_main(&format!("{}/r.git", server.uri()))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, GitError::AuthFailed(_)),
                 "HTTP {status}: {err}"
@@ -243,14 +259,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
-        let err = fetch_advertisement(
-            &client(),
-            &format!("{}/gone.git", server.uri()),
-            &GitAuth::Anonymous,
-            TIMEOUT,
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_main(&format!("{}/gone.git", server.uri()))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, GitError::RefNotFound(ref m) if m.contains("404")),
             "{err}"
@@ -264,14 +275,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let err = fetch_advertisement(
-            &client(),
-            &format!("{}/r.git", server.uri()),
-            &GitAuth::Anonymous,
-            TIMEOUT,
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_main(&format!("{}/r.git", server.uri()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, GitError::Unreachable(_)), "{err}");
     }
 
@@ -298,9 +304,7 @@ mod tests {
                 .await;
             for userinfo in ["bot@", "bot:ghp_S3cr3t@"] {
                 let repo = format!("http://{userinfo}{}/r.git", server.address());
-                let err = fetch_advertisement(&client(), &repo, &GitAuth::Anonymous, TIMEOUT)
-                    .await
-                    .unwrap_err();
+                let err = fetch_main(&repo).await.unwrap_err();
 
                 let url = format!(
                     "http://{}/r.git/info/refs?service=git-upload-pack",
@@ -328,11 +332,12 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode("ci-bot:ghp_S3cr3t")
         );
 
+        let main = fixtures::branch("main");
         for (case, auth, sent) in [
             ("no Secret", GitAuth::Anonymous, vec![]),
             ("a Secret", secret, vec![from_secret]),
         ] {
-            fetch_advertisement(&client(), &repo, &auth, TIMEOUT)
+            fetch_advertisement(&client(), &repo, &auth, &main, TIMEOUT)
                 .await
                 .unwrap();
             let requests = server.received_requests().await.unwrap();
@@ -353,14 +358,7 @@ mod tests {
         // Port 1 needs root to bind, so nothing listens there — unlike
         // "drop a MockServer and reuse its port", which races against a
         // concurrent test's server grabbing the freed port.
-        let err = fetch_advertisement(
-            &client(),
-            "http://127.0.0.1:1/r.git",
-            &GitAuth::Anonymous,
-            TIMEOUT,
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_main("http://127.0.0.1:1/r.git").await.unwrap_err();
         assert!(matches!(err, GitError::Unreachable(_)), "{err}");
     }
 
@@ -375,14 +373,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let err = fetch_advertisement(
-            &client(),
-            &format!("{}/r.git", server.uri()),
-            &GitAuth::Anonymous,
-            TIMEOUT,
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_main(&format!("{}/r.git", server.uri()))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, GitError::Malformed(ref m) if m.contains("smart")),
             "{err}"
@@ -391,12 +384,14 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_advertisement_is_rejected() {
+        // A well-formed advertisement: the cap counts the bytes read, not
+        // the bytes the resolver keeps.
+        let pulls = fixtures::lines_with_pulls(1_000);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", ADVERTISEMENT_CONTENT_TYPE)
-                    .set_body_bytes(vec![0u8; 256]),
+                advertisement_response()
+                    .set_body_bytes(fixtures::over_http(fixtures::body(&pulls))),
             )
             .mount(&server)
             .await;
@@ -404,14 +399,34 @@ mod tests {
             &client(),
             &format!("{}/r.git", server.uri()),
             &GitAuth::Anonymous,
+            &fixtures::branch("main"),
             TIMEOUT,
-            64,
+            16 * 1024,
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(err, GitError::Malformed(ref m) if m.contains("exceeds")),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "malformed advertisement: advertisement exceeds 16384 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_advertisement_cut_before_its_flush_pkt_is_malformed() {
+        let mut cut = fixtures::http_adv();
+        cut.truncate(cut.len() - fixtures::flush().len());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(advertisement_response().set_body_bytes(cut))
+            .mount(&server)
+            .await;
+        let err = fetch_main(&format!("{}/r.git", server.uri()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "malformed advertisement: advertisement not terminated by a flush-pkt (truncated \
+             response?)"
         );
     }
 }
