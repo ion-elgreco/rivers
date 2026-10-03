@@ -261,18 +261,70 @@ once on a per-CL PVC, then mounted read-only by every run and step pod —
 a wide fan-out starts as fast as image mode. Each tree is for one commit,
 one runtime image, one `path` and one `dependencies` setting
 (`timeoutSeconds` excluded). If you change one of these, the
-code-location pod builds a new tree. Without RWX storage every pod builds
-its own tree; that's fine for `executor: parallel` but slow for wide
-`executor: kubernetes` fan-outs.
+code-location pod builds a new tree. `spec.env` is not part of a tree,
+even a variable that the install uses, such as `UV_INDEX_URL`: after you
+change it, the code-location pods roll out on the same tree. There is no
+way to rebuild a tree on request. To install with the new value, give the
+CodeLocation a new commit, for example an empty commit
+(`git commit --allow-empty`) on its branch. Without RWX storage every pod
+builds its own tree; that's fine for `executor: parallel` but slow for
+wide `executor: kubernetes` fan-outs.
+
+**Writing files**: in shared mode, the tree is read-only in run and step
+pods, so that no run can change the code or the venv that other runs and
+the code-location pods use. Only the code-location pods, which build the
+tree, can write to it. Run and step pods start in the project directory,
+`/workspace/src/<path>`, so code that writes to a relative path fails
+there: `open("scratch.csv", "w")` raises
+`OSError: [Errno 30] Read-only file system`, and
+`df.write_parquet("out.parquet")`, `sqlite3.connect("cache.db")` or an
+IO handler with a relative path, such as
+`DeltaIOHandler(table_uri="lake")`, fail too. The same code can work in
+fallback mode, where each pod writes to its own tree (the writes count
+against the `emptyDir` limit), and in image mode, where the working
+directory is the image's `WORKDIR`. Write to other places instead:
+
+- For scratch files, use `tempfile`, or an absolute path outside
+  `/workspace`, for example in `/tmp`. The container's `/tmp` is writable
+  unless a policy of your cluster sets `readOnlyRootFilesystem`, and its
+  files go away with the pod.
+- For data that later steps or runs read, give IO handlers an
+  object-store location, such as
+  `DeltaIOHandler(table_uri="s3://acme-lake/analytics")`. A local path
+  lives only as long as its pod, and steps can run in other pods.
+
+**Volume permissions**: the runtime image runs as user and group 65532,
+and every git-mode pod sets `fsGroup: 65532`, so that this user can read
+the git Secret and write the tree. In shared mode, group 65532 must also
+be able to write to the RWX volume, but not every storage driver applies
+`fsGroup` to it: a CSI driver with the default `fsGroupPolicy`,
+`ReadWriteOnceWithFSType`, skips RWX volumes, and in-tree `nfs` volumes
+ignore `fsGroup`. On such storage, give the volume's root directory group
+65532 and mode `2775` (setgid), or make it writable for all users. Else
+the code-location pod's build fails with `Permission denied`. On
+OpenShift, the default `restricted-v2` SCC rejects pods with this fixed
+`fsGroup`, as it rejects the chart's operator and UI pods, which set a
+fixed user and group too.
+
+**File locks**: in shared mode, the code-location pods lock files on the
+RWX volume (`flock`), so that two pods do not build the same tree or
+delete old trees at the same time, and uv does not prune its cache while
+another pod installs. These locks must work across nodes. If your storage
+keeps them on one node, two pods on different nodes can build the same
+tree at the same time and break it.
 
 **uv cache**: in shared mode, uv's cache is on the PVC (`cache/`). After
 each successful build, the code-location pod runs `uv cache prune --ci`:
 only the wheels that uv built from source stay, and pre-built wheels
-download again on the next build. In fallback mode, pods install with
-`UV_NO_CACHE=1` and keep no cache. The `emptyDir` limit
-(`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`) must hold
-the checkout and the venv. During an install, uv's temporary copy of the
-wheels is in the container's `/tmp`, outside this limit.
+download again on the next build. If you build your own runtime image, it
+needs uv 0.8.19 or later: an older `uv cache prune` does not wait for the
+installs of other pods, and can delete files that they use. In fallback
+mode, pods install with `UV_NO_CACHE=1` and keep no cache. The `emptyDir`
+limit (`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`)
+must hold the checkout and the venv. During an install, uv's temporary
+copy of the wheels is in the container's `/tmp`, outside this limit, so
+`/tmp` must be writable: a policy that sets `readOnlyRootFilesystem` on
+the pods makes these installs fail.
 
 **Workspace size**: `spec.git.workspaceSize` and the chart's
 `codeLocation.workspace.shared.size` and `codeLocation.workspace.sizeLimit`
