@@ -12,6 +12,7 @@ import threading
 import time
 
 import obstore.store
+import pytest
 from _threads import run_in_child, run_threads
 
 import rivers as rs
@@ -68,6 +69,69 @@ def test_first_materialize_in_threads_resolves_once(tmp_path):
         "success": [True] * N_RUNS,
         "value": 7,
     }
+
+
+REPOSITORY_CALLS = {
+    "storage": lambda repo: repo.storage,
+    "load_node": lambda repo: repo.load_node("a"),
+    "materialize": lambda repo: repo.materialize(["a"]),
+    "resolve": lambda repo: repo.resolve(),
+}
+
+
+def use_repository_in_setup(call):
+    """Child process of ``test_setup_that_uses_its_repository_raises``."""
+    setups = []
+
+    class UsesRepository(rs.Resource):
+        def setup(self):
+            setups.append(call)
+            if len(setups) == 1:
+                REPOSITORY_CALLS[call](repo)
+
+    @rs.Asset
+    def a(res: UsesRepository) -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[a],
+        resources={"res": UsesRepository()},
+        default_executor=rs.Executor.in_process(),
+    )
+    error = None
+    try:
+        repo.materialize(["a"])
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+    again = repo.materialize(["a"])
+    print(
+        json.dumps(
+            {
+                "error": error,
+                "again": [again.success, repo.storage.get_run(again.run_id).status],
+                "setups": len(setups),
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("call", REPOSITORY_CALLS)
+def test_setup_that_uses_its_repository_raises(tmp_path, call):
+    """A resource's ``setup()`` that uses its repository during the first
+    resolve gets an error instead of waiting for the resolve it runs in; the
+    next call resolves again."""
+    proc = run_in_child(
+        "concurrency.test_thread_safety_repository:use_repository_in_setup",
+        call,
+        cwd=tmp_path,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.splitlines()[-1])
+    assert result.pop("error").startswith(
+        "ExecutionError: CodeRepository is still resolving"
+    )
+    assert result == {"again": [True, "Success"], "setups": 2}
 
 
 def release_storage_during_run():

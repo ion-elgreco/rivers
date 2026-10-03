@@ -6,7 +6,8 @@
 pub mod resolved_node;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::thread::ThreadId;
 
 use pyo3::prelude::*;
 use pyo3::sync::{MutexExt, RwLockExt};
@@ -2556,6 +2557,53 @@ async fn create_materialization_run(
     Ok(())
 }
 
+/// Serializes the first resolve, so concurrent first callers resolve once.
+/// A call from the resolving thread itself, made by code the resolve runs
+/// such as a resource's `setup()`, gets an error: it would wait for itself.
+#[derive(Default)]
+struct ResolveLock {
+    mutex: Mutex<()>,
+    owner: Mutex<Option<ThreadId>>,
+}
+
+impl ResolveLock {
+    fn lock(&self, py: Python<'_>) -> PyResult<ResolveGuard<'_>> {
+        let current = std::thread::current().id();
+        if *self.owner() == Some(current) {
+            return Err(ExecutionError::new_err(
+                "CodeRepository is still resolving — do not use it from code that runs \
+                 during resolve, such as a resource's setup()",
+            ));
+        }
+        let guard = self
+            .mutex
+            .lock_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
+        *self.owner() = Some(current);
+        Ok(ResolveGuard {
+            lock: self,
+            _guard: guard,
+        })
+    }
+
+    fn owner(&self) -> MutexGuard<'_, Option<ThreadId>> {
+        self.owner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Clears the owner before it releases the lock, also when the resolve
+/// fails or panics.
+struct ResolveGuard<'a> {
+    lock: &'a ResolveLock,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl Drop for ResolveGuard<'_> {
+    fn drop(&mut self) {
+        *self.lock.owner() = None;
+    }
+}
+
 #[pyclass(name = "CodeRepository", frozen, module = "rivers._core")]
 pub struct PyCodeRepository {
     raw_assets: Vec<Py<PyAsset>>,
@@ -2576,8 +2624,7 @@ pub struct PyCodeRepository {
     pub(crate) run_backend_config: Option<Py<crate::concurrency::PyRunBackendConfig>>,
     pool_limits: Option<HashMap<String, i32>>,
     pub(crate) state: SharedState,
-    /// Serializes the first resolve, so concurrent first callers resolve once.
-    resolve_lock: Mutex<()>,
+    resolve_lock: ResolveLock,
     backfill_cancel_flags:
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Worker threads for this location's runs, shared into the daemon and gRPC
@@ -3435,10 +3482,7 @@ impl PyCodeRepository {
         if let Some(state) = self.state.get_attached(py) {
             return Ok(state);
         }
-        let _resolving = self
-            .resolve_lock
-            .lock_py_attached(py)
-            .unwrap_or_else(PoisonError::into_inner);
+        let _resolving = self.resolve_lock.lock(py)?;
         if let Some(state) = self.state.get_attached(py) {
             return Ok(state);
         }
@@ -3718,7 +3762,7 @@ impl PyCodeRepository {
             run_backend_config: run_backend,
             pool_limits,
             state: SharedState::default(),
-            resolve_lock: Mutex::new(()),
+            resolve_lock: ResolveLock::default(),
             backfill_cancel_flags: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gil_threads: crate::gil_threads::GilThreads::new(),
         })
