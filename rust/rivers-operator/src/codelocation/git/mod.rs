@@ -52,6 +52,15 @@ pub enum GitError {
     /// Transport-level failure (connect, timeout, 5xx). Transient.
     #[error("git host unreachable: {0}")]
     Unreachable(String),
+    /// The host asked the operator to wait: HTTP 429, or 503 with a
+    /// `Retry-After`. Transient; no ref on that host is fetched until the
+    /// wait ends.
+    #[error("rate-limited by the git host: {message}")]
+    RateLimited {
+        message: String,
+        /// The host's `Retry-After`, when it sent a usable one.
+        retry_after: Option<std::time::Duration>,
+    },
     /// The response was not a protocol-v0 ref advertisement.
     #[error("malformed advertisement: {0}")]
     Malformed(String),
@@ -61,7 +70,10 @@ impl GitError {
     /// A failure that passes on its own; every other one stands until the
     /// CR, the Secret or the remote changes.
     pub fn is_transient(&self) -> bool {
-        matches!(self, GitError::Unreachable(_))
+        matches!(
+            self,
+            GitError::Unreachable(_) | GitError::RateLimited { .. }
+        )
     }
 }
 
@@ -300,6 +312,22 @@ pub struct GitResolveRequest {
 /// default code location polls it, and its recovery shows within one poll.
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The longest `Retry-After` honoured, so a far-off or garbled value does
+/// not stop a host's code locations for days.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Default)]
+struct Cache {
+    refs: std::collections::HashMap<(String, String), CacheEntry>,
+    /// Hosts that asked the operator to wait, by [`host_of`].
+    paused_hosts: std::collections::HashMap<String, HostPause>,
+}
+
+struct HostPause {
+    until: std::time::Instant,
+    error: GitError,
+}
+
 enum CacheEntry {
     Resolved {
         resolved: ResolvedRef,
@@ -315,23 +343,28 @@ enum CacheEntry {
     },
 }
 
-/// Ref→commit resolver with the same posture as [`super::registry`]'s
-/// digest resolver: cross-CR cache keyed on `(url, ref)`, immutable-tag
-/// short-circuit, exponential backoff after transient errors, leader gating
-/// left to the reconciler. Unlike the registry's, a ref that backs off does
-/// not serve its last result: it fails until a fetch succeeds.
+/// Ref→commit resolver: cross-CR cache keyed on `(url, ref)`, semver-like
+/// tags resolved once, exponential backoff after transient errors, and a
+/// host that asks the operator to wait gets no fetch, for any ref, until
+/// its `Retry-After` ends. Leader gating is left to the reconciler. Unlike
+/// [`super::registry`]'s digest cache, a ref that backs off does not serve
+/// its last result: it fails until a fetch succeeds.
 pub struct GitResolver {
     http: reqwest::Client,
     timeout: std::time::Duration,
-    cache: tokio::sync::Mutex<std::collections::HashMap<(String, String), CacheEntry>>,
+    cache: tokio::sync::Mutex<Cache>,
 }
 
 impl GitResolver {
     pub fn new(timeout: std::time::Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent(super::USER_AGENT)
+            .build()
+            .expect("reqwest client builds with default TLS");
         Self {
-            http: reqwest::Client::new(),
+            http,
             timeout,
-            cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            cache: Default::default(),
         }
     }
 
@@ -354,23 +387,35 @@ impl GitResolver {
         }
 
         let cache_key = (req.url.clone(), ref_cache_key(&req.r#ref)?);
-        match self.cache.lock().await.get(&cache_key) {
-            Some(CacheEntry::Resolved {
-                resolved,
-                expires_at,
-                immutable,
-            }) if *immutable || *expires_at > now => return Ok(resolved.clone()),
-            Some(CacheEntry::Failing {
-                error,
-                next_attempt_after,
-                ..
-            }) if now < *next_attempt_after => {
+        let host = host_of(&req.url);
+        {
+            let cache = self.cache.lock().await;
+            match cache.refs.get(&cache_key) {
+                Some(CacheEntry::Resolved {
+                    resolved,
+                    expires_at,
+                    immutable,
+                }) if *immutable || *expires_at > now => return Ok(resolved.clone()),
+                Some(CacheEntry::Failing {
+                    error,
+                    next_attempt_after,
+                    ..
+                }) if now < *next_attempt_after => {
+                    return Err(GitFailure {
+                        error: error.clone(),
+                        retry_after: Some(*next_attempt_after - now),
+                    });
+                }
+                _ => {}
+            }
+            if let Some(pause) = host.as_ref().and_then(|h| cache.paused_hosts.get(h))
+                && now < pause.until
+            {
                 return Err(GitFailure {
-                    error: error.clone(),
-                    retry_after: Some(*next_attempt_after - now),
+                    error: pause.error.clone(),
+                    retry_after: Some(pause.until - now),
                 });
             }
-            _ => {}
         }
 
         let outcome = self.fetch_commit(req).await;
@@ -382,7 +427,7 @@ impl GitResolver {
                     .tag
                     .as_deref()
                     .is_some_and(super::registry::looks_immutable);
-                cache.insert(
+                cache.refs.insert(
                     cache_key,
                     CacheEntry::Resolved {
                         resolved: resolved.clone(),
@@ -393,7 +438,7 @@ impl GitResolver {
                 Ok(resolved)
             }
             Err(error) if error.is_transient() => {
-                let consecutive_errors = match cache.get(&cache_key) {
+                let consecutive_errors = match cache.refs.get(&cache_key) {
                     // A concurrent resolve of this ref failed first and
                     // counted this attempt.
                     Some(CacheEntry::Failing {
@@ -411,22 +456,38 @@ impl GitResolver {
                     }) => consecutive_errors.saturating_add(1),
                     _ => 1,
                 };
-                let backoff = super::registry::exponential_backoff(consecutive_errors, MAX_BACKOFF);
-                cache.insert(
+                let mut wait =
+                    super::registry::exponential_backoff(consecutive_errors, MAX_BACKOFF);
+                if let GitError::RateLimited { retry_after, .. } = &error {
+                    wait = wait.max(retry_after.unwrap_or_default().min(MAX_RETRY_AFTER));
+                    if let Some(host) = host
+                        && cache
+                            .paused_hosts
+                            .get(&host)
+                            .is_none_or(|pause| pause.until < now + wait)
+                    {
+                        let pause = HostPause {
+                            until: now + wait,
+                            error: error.clone(),
+                        };
+                        cache.paused_hosts.insert(host, pause);
+                    }
+                }
+                cache.refs.insert(
                     cache_key,
                     CacheEntry::Failing {
                         error: error.clone(),
                         consecutive_errors,
-                        next_attempt_after: now + backoff,
+                        next_attempt_after: now + wait,
                     },
                 );
                 Err(GitFailure {
                     error,
-                    retry_after: Some(backoff),
+                    retry_after: Some(wait),
                 })
             }
             Err(error) => {
-                cache.remove(&cache_key);
+                cache.refs.remove(&cache_key);
                 Err(error.into())
             }
         }
@@ -514,6 +575,16 @@ impl SshTempMaterial {
             auth,
         })
     }
+}
+
+/// `host[:port]` of a git url: what a rate limit pauses.
+fn host_of(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 /// Stable cache-key fragment for a ref selector. Pinned commits never reach
@@ -828,6 +899,153 @@ mod resolver_tests {
         assert_eq!(auth.retry_after, None);
         let next = resolver.resolve_at(&req, answered_at).await.unwrap_err();
         assert_eq!(next.retry_after, Some(Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_operator_user_agent() {
+        let server = mock_git_server(1).await;
+        let resolver = GitResolver::new(TIMEOUT);
+
+        resolver.resolve(&main_of(&server)).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let agent = requests[0]
+            .headers
+            .get("user-agent")
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(
+            agent,
+            Some(concat!("rivers-operator/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    fn rate_limited(server: &MockServer, status: &str) -> String {
+        format!(
+            "rate-limited by the git host: HTTP {status} from {}",
+            server.address()
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_after_pauses_every_ref_on_the_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "900"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(adv_response())
+            .mount(&server)
+            .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let main = main_of(&server);
+        let other = request(
+            format!("{}/acme/other.git", server.uri()),
+            fixtures::branch("dev"),
+        );
+        let start = Instant::now();
+
+        let throttled = resolver.resolve_at(&main, start).await.unwrap_err();
+        assert_eq!(throttled.retry_after, Some(Duration::from_secs(900)));
+        assert_eq!(
+            throttled.error.to_string(),
+            rate_limited(&server, "429 Too Many Requests")
+        );
+
+        // Neither ref on the host is fetched before the 900s are up.
+        let almost = start + Duration::from_secs(899);
+        for req in [&other, &main] {
+            let waiting = resolver.resolve_at(req, almost).await.unwrap_err();
+            assert_eq!(
+                waiting.retry_after,
+                Some(Duration::from_secs(1)),
+                "{}",
+                req.url
+            );
+            assert_eq!(waiting.error.to_string(), throttled.error.to_string());
+        }
+        assert_eq!(polls(&server).await, 1);
+
+        let after = start + Duration::from_secs(900);
+        let resolved = resolver.resolve_at(&other, after).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('b'));
+        let resolved = resolver.resolve_at(&main, after).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_without_retry_after_backs_the_host_off_exponentially() {
+        let server = git_server(vec![
+            (ResponseTemplate::new(429), Some(2)),
+            (adv_response(), None),
+        ])
+        .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let main = main_of(&server);
+        let dev = request(main.url.clone(), fixtures::branch("dev"));
+        let start = Instant::now();
+
+        let first = resolver.resolve_at(&main, start).await.unwrap_err();
+        assert_eq!(first.retry_after, Some(Duration::from_secs(60)));
+        // The other ref on the host waits out the same backoff.
+        let waiting = resolver
+            .resolve_at(&dev, start + Duration::from_secs(59))
+            .await
+            .unwrap_err();
+        assert_eq!(waiting.retry_after, Some(Duration::from_secs(1)));
+        assert_eq!(
+            waiting.error.to_string(),
+            rate_limited(&server, "429 Too Many Requests")
+        );
+        let second = resolver
+            .resolve_at(&main, start + Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(second.retry_after, Some(Duration::from_secs(120)));
+        assert_eq!(polls(&server).await, 2);
+
+        let resolved = resolver
+            .resolve_at(&dev, start + Duration::from_secs(180))
+            .await
+            .unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('b'));
+    }
+
+    #[tokio::test]
+    async fn retry_after_sets_how_long_the_host_waits() {
+        let in_15_minutes = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(&(jiff::Timestamp::now() + Duration::from_secs(900)))
+            .unwrap();
+        let secs = Duration::from_secs;
+        let cases = [
+            // (status, Retry-After, shortest wait, longest wait)
+            (429, in_15_minutes.as_str(), secs(890), secs(900)),
+            (503, "900", secs(900), secs(900)),
+            // An hour at most.
+            (429, "86400", secs(3600), secs(3600)),
+            // Never sooner than the backoff without one.
+            (429, "5", secs(60), secs(60)),
+            (429, "soon", secs(60), secs(60)),
+        ];
+        for (status, retry_after, shortest, longest) in cases {
+            let response = ResponseTemplate::new(status).insert_header("retry-after", retry_after);
+            let server = git_server(vec![(response, None)]).await;
+            let failure = GitResolver::new(TIMEOUT)
+                .resolve_at(&main_of(&server), Instant::now())
+                .await
+                .unwrap_err();
+
+            let case = format!("HTTP {status}, Retry-After {retry_after}");
+            let wait = failure.retry_after.expect(&case);
+            assert!((shortest..=longest).contains(&wait), "{case}: {wait:?}");
+            let reason = reqwest::StatusCode::from_u16(status).unwrap().to_string();
+            assert_eq!(
+                failure.error.to_string(),
+                rate_limited(&server, &reason),
+                "{case}"
+            );
+        }
     }
 }
 

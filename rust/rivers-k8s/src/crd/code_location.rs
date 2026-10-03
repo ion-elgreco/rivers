@@ -40,7 +40,9 @@ pub const REASON_COMMIT_PINNED: &str = "CommitPinned";
 pub const REASON_REF_NOT_FOUND: &str = "RefNotFound";
 pub const REASON_GIT_AUTH_FAILED: &str = "GitAuthFailed";
 pub const REASON_GIT_UNREACHABLE: &str = "GitUnreachable";
+pub const REASON_GIT_RATE_LIMITED: &str = "GitRateLimited";
 pub const REASON_GIT_HOST_KEY_REJECTED: &str = "GitHostKeyRejected";
+pub const REASON_GIT_MALFORMED_RESPONSE: &str = "GitMalformedResponse";
 
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(

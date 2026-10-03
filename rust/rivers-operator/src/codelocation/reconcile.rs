@@ -26,9 +26,10 @@ use rivers_k8s::crd::code_location::{
     CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationSpec, CodeLocationStatus,
     IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
     REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
-    REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_UNREACHABLE, REASON_MIN_REPLICAS,
-    REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED,
-    REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
+    REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED,
+    REASON_GIT_UNREACHABLE, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
+    REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR,
+    REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
 };
 
 use super::git::{self, GitCredentials, GitResolveRequest};
@@ -69,8 +70,8 @@ pub struct Context {
     pub client: kube_client::Client,
     pub namespace: String,
     pub registry: Arc<RegistryClient>,
-    /// Ref→commit resolver for git-sourced CodeLocations (RFC-044). Same
-    /// caching/backoff posture as `registry`, same leader gating here.
+    /// Ref→commit resolver for git-sourced CodeLocations (RFC-044). Only
+    /// the leader calls it, as with `registry`.
     pub git: Arc<super::git::GitResolver>,
     /// Default runtime image for git CLs that don't set `spec.image`.
     /// Chart-configured via `RIVERS_RUNTIME_IMAGE`.
@@ -371,7 +372,7 @@ async fn reconcile_git(
                     resolution: Some(GitResolution {
                         image: resolved_image,
                         image_reason,
-                        source: Err(failure.error),
+                        source: Err(failure),
                     }),
                     fetched_at: None,
                     rollout: observe_git_deployment(&name, deployments_api).await,
@@ -379,7 +380,7 @@ async fn reconcile_git(
                 };
                 patch_git_status(code_locations_api, &name, cl, update).await?;
             } else {
-                patch_git_error(code_locations_api, &name, generation, cl, &failure.error).await?;
+                patch_git_error(code_locations_api, &name, generation, cl, &failure).await?;
             }
             return Ok(Action::requeue(retry));
         }
@@ -753,8 +754,26 @@ fn git_error_reason_retry(err: &git::GitError) -> (&'static str, Duration) {
             (REASON_GIT_HOST_KEY_REJECTED, TERMINAL_RETRY)
         }
         git::GitError::Unreachable(_) => (REASON_GIT_UNREACHABLE, Duration::from_secs(60)),
-        git::GitError::Malformed(_) => (REASON_GIT_UNREACHABLE, TERMINAL_RETRY),
+        git::GitError::RateLimited { .. } => (REASON_GIT_RATE_LIMITED, Duration::from_secs(60)),
+        git::GitError::Malformed(_) => (REASON_GIT_MALFORMED_RESPONSE, TERMINAL_RETRY),
     }
+}
+
+/// `SourceResolved` reason and message for a resolve that produced no
+/// commit; a rate limit says when the operator asks the host again.
+fn source_failure(failure: &git::GitFailure, now: jiff::Timestamp) -> (&'static str, String) {
+    let (reason, _) = git_error_reason_retry(&failure.error);
+    let message = match (&failure.error, failure.retry_after) {
+        (git::GitError::RateLimited { .. }, Some(wait)) => {
+            let at = now
+                .checked_add(wait)
+                .and_then(|at| at.round(jiff::Unit::Second))
+                .unwrap_or(now);
+            format!("{}; the operator asks again at {at}", failure.error)
+        }
+        _ => failure.error.to_string(),
+    };
+    (reason, message)
 }
 
 /// `main@9f3c1ab` for a branch or tag, `9f3c1ab (pinned)` for a pinned commit.
@@ -811,9 +830,9 @@ struct GitStatusUpdate {
 struct GitResolution {
     image: String,
     image_reason: &'static str,
-    /// The ref's commit, or the transient error that left the serving tree
-    /// in place.
-    source: Result<git::ResolvedRef, git::GitError>,
+    /// The ref's commit, or the transient failure that left the serving
+    /// tree in place.
+    source: Result<git::ResolvedRef, git::GitFailure>,
 }
 
 /// Publish a git CL's status; returns the phase it published.
@@ -823,7 +842,7 @@ async fn patch_git_status(
     cl: &CodeLocation,
     update: GitStatusUpdate,
 ) -> Result<CodeLocationPhase, kube_client::Error> {
-    let status = git_status(cl, update, &jiff::Timestamp::now().to_string());
+    let status = git_status(cl, update, jiff::Timestamp::now());
     let phase = status.phase.clone().unwrap_or(CodeLocationPhase::Deploying);
     if !status_substantively_equal(cl.status.as_ref(), &status) {
         patch_status(code_locations_api, name, &status).await?;
@@ -835,7 +854,12 @@ async fn patch_git_status(
 /// pod runs it and is ready, until then the prior status's — a commit that
 /// is still building, or fails to build, never reaches a run. A rollout in
 /// progress or stuck shows on `DeploymentAvailable`, not in the phase.
-fn git_status(cl: &CodeLocation, update: GitStatusUpdate, now: &str) -> CodeLocationStatus {
+fn git_status(
+    cl: &CodeLocation,
+    update: GitStatusUpdate,
+    at: jiff::Timestamp,
+) -> CodeLocationStatus {
+    let now = &at.to_string();
     let prior = cl.status.as_ref();
     let rollout = &update.rollout;
     let serving = match &rollout.template {
@@ -890,7 +914,10 @@ fn git_status(cl: &CodeLocation, update: GitStatusUpdate, now: &str) -> CodeLoca
                     ("True", REASON_COMMIT_PINNED, resolved.commit)
                 }
                 Ok(resolved) => ("True", REASON_COMMIT_RESOLVED, resolved.commit),
-                Err(err) => ("False", git_error_reason_retry(&err).0, err.to_string()),
+                Err(failure) => {
+                    let (reason, message) = source_failure(&failure, at);
+                    ("False", reason, message)
+                }
             };
             push_condition(
                 &mut status,
@@ -944,10 +971,11 @@ async fn patch_git_error(
     name: &str,
     generation: Option<i64>,
     cl: &CodeLocation,
-    err: &git::GitError,
+    failure: &git::GitFailure,
 ) -> Result<(), kube_client::Error> {
-    let (reason, _) = git_error_reason_retry(err);
-    let now = jiff::Timestamp::now().to_string();
+    let at = jiff::Timestamp::now();
+    let (reason, message) = source_failure(failure, at);
+    let now = at.to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Failed),
@@ -956,7 +984,7 @@ async fn patch_git_error(
         grpc_endpoint: None,
         last_reconciled: Some(now.clone()),
         ready_replicas: None,
-        message: Some(err.to_string()),
+        message: Some(message.clone()),
         conditions: Vec::new(),
         source: prior.and_then(|s| s.source.clone()),
         resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
@@ -970,7 +998,7 @@ async fn patch_git_error(
         CONDITION_SOURCE_RESOLVED,
         "False",
         reason,
-        Some(err.to_string()),
+        Some(message),
         &now,
     );
     if !status_substantively_equal(prior, &status) {
@@ -1653,8 +1681,16 @@ mod tests {
                 Duration::from_secs(60),
             ),
             (
+                GitError::RateLimited {
+                    message: "x".into(),
+                    retry_after: None,
+                },
+                REASON_GIT_RATE_LIMITED,
+                Duration::from_secs(60),
+            ),
+            (
                 GitError::Malformed("x".into()),
-                REASON_GIT_UNREACHABLE,
+                REASON_GIT_MALFORMED_RESPONSE,
                 TERMINAL_RETRY,
             ),
         ];
@@ -2119,7 +2155,7 @@ mod tests {
                 rollout,
                 endpoint: grpc_endpoint("x", "y", 3001),
             };
-            git_status(cl, update, "2026-10-03T00:00:00Z")
+            git_status(cl, update, "2026-10-03T00:00:00Z".parse().unwrap())
         }
 
         fn available(status: &CodeLocationStatus) -> (&str, Option<&str>, Option<&str>) {
@@ -2590,6 +2626,54 @@ mod tests {
                 .collect();
             assert!(applies.is_empty(), "{applies:?}");
             assert_eq!(outage.requeue, Action::requeue(Duration::from_secs(60)));
+        }
+
+        #[tokio::test]
+        async fn rate_limited_git_host_keeps_the_serving_tree_ready_and_says_when_it_asks_again() {
+            let before = jiff::Timestamp::now();
+            let outage = outage(vec![
+                ResponseTemplate::new(429).insert_header("retry-after", "900"),
+            ])
+            .await;
+            let after = jiff::Timestamp::now();
+            let status = patched_status(&outage.requests).expect("status patch");
+
+            assert_eq!(status["phase"], "Ready", "{status}");
+            for field in [
+                "grpcEndpoint",
+                "runSource",
+                "resolvedCommit",
+                "resolvedRef",
+                "resolvedImage",
+                "source",
+            ] {
+                assert_eq!(status[field], outage.serving[field], "{field}");
+            }
+            let (condition_status, reason, message) = source_resolved(&status);
+            assert_eq!(
+                (condition_status, reason),
+                ("False", REASON_GIT_RATE_LIMITED),
+                "{status}"
+            );
+            assert_eq!(status["message"], message);
+            let (error, asks_again_at) = message
+                .split_once("; the operator asks again at ")
+                .unwrap_or_else(|| panic!("no retry time: {message}"));
+            assert_eq!(
+                error,
+                format!(
+                    "rate-limited by the git host: HTTP 429 Too Many Requests from {}",
+                    outage.forge.address()
+                )
+            );
+            let asks_again_at: jiff::Timestamp = asks_again_at.parse().unwrap();
+            let wait = jiff::SignedDuration::from_secs(900);
+            let second = jiff::SignedDuration::from_secs(1);
+            assert!(
+                before + wait - second <= asks_again_at && asks_again_at <= after + wait + second,
+                "{asks_again_at} is not 900s after {before}..{after}"
+            );
+            assert_eq!(outage.requeue, Action::requeue(Duration::from_secs(900)));
         }
 
         #[tokio::test]

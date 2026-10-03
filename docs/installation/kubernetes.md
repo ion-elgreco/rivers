@@ -224,23 +224,30 @@ live:
 **Egress**: in shared mode only the code-location pod needs outbound
 access to the git host and the package index (run/step pods fetch
 nothing); in fallback mode every pod does. Adjust NetworkPolicies
-accordingly.
+accordingly. The operator's requests to git hosts and registries carry
+`User-Agent: rivers-operator/<version>`, for firewalls that filter on it.
 
 **When things fail**, `kubectl describe rcl analytics` carries the
-answer: `RefNotFound` / `GitAuthFailed` / `GitHostKeyRejected` on the
-`SourceResolved` condition for resolution problems, and a failed install
-surfaces `uv`'s error tail in `status.message`. A resolution problem sets
-the phase to `Failed`, and new runs are rejected until you fix it. A git
-host that does not answer (connection error, timeout, HTTP 5xx) does not
-take the CodeLocation down: it stays `Ready` on the commit it serves,
-with `SourceResolved` `False`, reason `GitUnreachable`, and the error,
-also in `status.message`. In shared mode, runs keep using that commit's
-tree. In fallback mode, each run pod fetches the commit itself, so a run
-that starts while the host is down fails. The operator asks the host
-again after 1, 2 and 4 minutes, then every 5 minutes, and picks up new
-commits when the host answers. Before the first commit has rolled out
-there is nothing to serve, and the CodeLocation is `Failed` until the
-host answers.
+answer: `RefNotFound` / `GitAuthFailed` / `GitHostKeyRejected` /
+`GitMalformedResponse` on the `SourceResolved` condition for resolution
+problems, and a failed install surfaces `uv`'s error tail in
+`status.message`. A resolution problem sets the phase to `Failed`, and
+new runs are rejected until you fix it. A git host that does not answer
+(connection error, timeout, HTTP 5xx) does not take the CodeLocation
+down: it stays `Ready` on the commit it serves, with `SourceResolved`
+`False`, reason `GitUnreachable`, and the error, also in
+`status.message`. In shared mode, runs keep using that commit's tree. In
+fallback mode, each run pod fetches the commit itself, so a run that
+starts while the host is down fails. The operator asks the host again
+after 1, 2 and 4 minutes, then every 5 minutes, and picks up new commits
+when the host answers. A host that rate-limits the operator (HTTP 429,
+or 503 with `Retry-After`) has the same result, with reason
+`GitRateLimited`. The operator then sends no request to that host, for
+any CodeLocation, until the host's `Retry-After` time is over: at most
+one hour, and not sooner than the steps above. The message gives the
+time of the next request. Before the first commit has rolled out there
+is nothing to serve, and the CodeLocation is `Failed` until the host
+answers.
 
 A rollout shows on the `DeploymentAvailable` condition: reason
 `RollingOut` while it runs, or `ProgressDeadlineExceeded` when it is

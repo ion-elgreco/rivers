@@ -1,16 +1,17 @@
-//! Smart-HTTP transport arm: fetch the ref advertisement over the operator's
-//! existing rustls `reqwest` client. One GET, buffered body, no negotiation:
+//! Smart-HTTP transport arm: fetch the ref advertisement over the
+//! resolver's rustls `reqwest` client. One GET, buffered body, no negotiation:
 //!
 //! ```text
 //! GET <repo-url>/info/refs?service=git-upload-pack
 //! ```
 //!
-//! Status mapping mirrors the registry client's philosophy: 401/403 are
-//! terminal auth failures, 404 means the repository itself is absent
-//! (terminal until the CR changes), everything else transport-level is
-//! transient. Dumb-HTTP servers (which ignore the `service` parameter and
-//! return a plain refs file) are rejected on content-type rather than
-//! producing a confusing parse error.
+//! Status mapping: 401/403 are terminal auth failures, 404 means the
+//! repository itself is absent (terminal until the CR changes), 429 — and
+//! 503 with a `Retry-After` — is a rate limit that carries the host's
+//! `Retry-After`, everything else transport-level is transient. Dumb-HTTP
+//! servers (which ignore the `service` parameter and return a plain refs
+//! file) are rejected on content-type rather than producing a confusing
+//! parse error.
 
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
 
 use super::GitError;
+use crate::codelocation::registry::parse_retry_after;
 
 /// Ceiling for a buffered advertisement. Protocol v0 lists every ref, so a
 /// pathological repo could answer with a huge body; past this size the CR is
@@ -91,6 +93,18 @@ pub(crate) async fn fetch_advertisement_with_cap(
             )));
         }
         s => {
+            let retry_after = parse_retry_after(response.headers());
+            if s == StatusCode::TOO_MANY_REQUESTS
+                || (s == StatusCode::SERVICE_UNAVAILABLE && retry_after.is_some())
+            {
+                return Err(GitError::RateLimited {
+                    message: format!(
+                        "HTTP {s} from {}",
+                        super::host_of(repo_url).unwrap_or_default()
+                    ),
+                    retry_after,
+                });
+            }
             return Err(GitError::Unreachable(format!("HTTP {s} from {url}")));
         }
     }

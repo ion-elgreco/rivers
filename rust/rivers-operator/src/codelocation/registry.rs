@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, WWW_AUTHENTICATE,
+    ACCEPT, AUTHORIZATION, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER,
+    WWW_AUTHENTICATE,
 };
 use reqwest::{Method, StatusCode};
 use thiserror::Error;
@@ -159,7 +160,7 @@ impl RegistryClient {
     /// passes the value parsed from `RIVERS_ALLOW_INSECURE_REGISTRY`.
     pub fn with_insecure(allow_insecure: bool) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("rivers-operator/", env!("CARGO_PKG_VERSION")))
+            .user_agent(super::USER_AGENT)
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builds with default TLS");
@@ -494,13 +495,20 @@ fn interpret_response(response: reqwest::Response) -> Result<HeadOutcome, Regist
     Ok(HeadOutcome::Fresh { digest, etag })
 }
 
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get("retry-after")?.to_str().ok()?;
-    if let Ok(secs) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    // HTTP-date format — we don't bother parsing it; fall back to the default.
-    None
+/// `Retry-After` as a wait: delta-seconds, or an HTTP-date from now. `None`
+/// when absent, unreadable, or asking for no wait.
+pub(super) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let wait = match raw.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => {
+            let at = jiff::fmt::rfc2822::DateTimeParser::new()
+                .parse_timestamp(raw)
+                .ok()?;
+            Duration::try_from(at.duration_since(jiff::Timestamp::now())).ok()?
+        }
+    };
+    (!wait.is_zero()).then_some(wait)
 }
 
 fn base_accept_headers() -> HeaderMap {
@@ -788,6 +796,37 @@ mod tests {
         assert_eq!(exponential_backoff(3, cap), Duration::from_secs(240));
         // Ramps up to 1h and then stays there.
         assert_eq!(exponential_backoff(20, cap), cap);
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        let headers = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        let in_secs = |secs: i64| {
+            jiff::fmt::rfc2822::DateTimePrinter::new()
+                .timestamp_to_rfc9110_string(
+                    &(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(secs)),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(
+            parse_retry_after(&headers("120")),
+            Some(Duration::from_secs(120))
+        );
+        let date = parse_retry_after(&headers(&in_secs(900))).expect("an HTTP-date");
+        assert!(
+            (Duration::from_secs(898)..=Duration::from_secs(900)).contains(&date),
+            "{date:?}"
+        );
+        // No wait asked for, or nothing readable: the caller's default applies.
+        for value in ["0", &in_secs(-60), "soon", ""] {
+            assert_eq!(parse_retry_after(&headers(value)), None, "{value:?}");
+        }
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
     }
 
     #[test]
