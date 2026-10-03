@@ -47,13 +47,13 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
   # Git-sourced CodeLocations (RFC-044): the owned workspace PVC and the
-  # keep-set ConfigMap.
+  # keep-set ConfigMap, deleted when the CodeLocation goes back to image mode.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]

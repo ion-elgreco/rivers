@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, PodStatus, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, PodStatus, Secret};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
@@ -37,8 +37,12 @@ pub struct MockApiState {
     /// What a GET of each Secret answers: the Secret, or an API error. A
     /// Secret not listed is not found.
     pub secrets: BTreeMap<String, Result<Secret, kube_core::Status>>,
-    /// The ConfigMaps applied, by name.
+    /// The ConfigMaps, by name: an apply replaces one, a GET answers it, a
+    /// DELETE removes it.
     pub config_maps: BTreeMap<String, ConfigMap>,
+    /// The PVCs, by name: a create adds one, a GET answers it, a DELETE
+    /// removes it.
+    pub pvcs: BTreeMap<String, PersistentVolumeClaim>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -58,6 +62,7 @@ impl Default for MockApiState {
             deployments: BTreeMap::new(),
             secrets: BTreeMap::new(),
             config_maps: BTreeMap::new(),
+            pvcs: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -116,9 +121,29 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                             }
                             None => json_response(404, &not_found_status()),
                         }
+                    } else if let Some(name) = object_name(&path, "persistentvolumeclaims") {
+                        match s.pvcs.get(name) {
+                            Some(pvc) => json_response(200, &serde_json::to_value(pvc).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
+                    } else if let Some(name) = object_name(&path, "configmaps") {
+                        match s.config_maps.get(name) {
+                            Some(cm) => json_response(200, &serde_json::to_value(cm).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
                     } else {
                         json_response(200, &serde_json::json!({}))
                     }
+                }
+                "POST" if path.ends_with("/persistentvolumeclaims") => {
+                    let pvc: PersistentVolumeClaim = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok())
+                        .unwrap_or_default();
+                    let response = json_response(201, &serde_json::to_value(&pvc).unwrap());
+                    s.pvcs
+                        .insert(pvc.metadata.name.clone().unwrap_or_default(), pvc);
+                    response
                 }
                 "POST" => {
                     let body = body_bytes.map(|b| b.to_vec()).unwrap_or_default();
@@ -132,6 +157,10 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                     if path.contains("/pods/") {
                         let pod_name = path.rsplit('/').next().unwrap_or("");
                         s.pods.remove(pod_name);
+                    } else if let Some(name) = object_name(&path, "persistentvolumeclaims") {
+                        s.pvcs.remove(name);
+                    } else if let Some(name) = object_name(&path, "configmaps") {
+                        s.config_maps.remove(name);
                     }
                     json_response(
                         200,

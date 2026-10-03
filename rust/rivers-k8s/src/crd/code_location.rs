@@ -21,6 +21,8 @@ pub const IMMUTABLE_TAG_ANNOTATION: &str = "rivers.io/tag-immutable";
 pub const CONDITION_IMAGE_RESOLVED: &str = "ImageResolved";
 pub const CONDITION_SOURCE_RESOLVED: &str = "SourceResolved";
 pub const CONDITION_DEPLOYMENT_AVAILABLE: &str = "DeploymentAvailable";
+/// Image mode: the workspace PVC of an earlier git source stays.
+pub const CONDITION_WORKSPACE_KEPT: &str = "WorkspaceKept";
 
 pub const REASON_DIGEST_RESOLVED: &str = "DigestResolved";
 pub const REASON_DIGEST_PINNED: &str = "DigestPinned";
@@ -45,6 +47,8 @@ pub const REASON_GIT_UNREACHABLE: &str = "GitUnreachable";
 pub const REASON_GIT_RATE_LIMITED: &str = "GitRateLimited";
 pub const REASON_GIT_HOST_KEY_REJECTED: &str = "GitHostKeyRejected";
 pub const REASON_GIT_MALFORMED_RESPONSE: &str = "GitMalformedResponse";
+pub const REASON_RUNS_USE_WORKSPACE: &str = "RunsUseWorkspace";
+pub const REASON_RUNS_NOT_LISTED: &str = "RunsNotListed";
 
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(

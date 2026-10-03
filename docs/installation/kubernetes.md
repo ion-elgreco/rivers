@@ -281,6 +281,24 @@ container log gives the reason. Before the pod deletes a tree, it renames
 it to `.deleting-<key>-…`. If the pod stops during a deletion, no part of
 the tree stays under its key, and the next pod start deletes the rest.
 
+**Back to image mode**: when you remove `spec.git`, the operator rolls
+the code-location pods out on `spec.image`. It clears `status.runSource`,
+`resolvedCommit`, `resolvedRef` and `lastFetchedAt`, and new runs get the
+image. If the operator cannot resolve `spec.image`, the CodeLocation is
+`Failed` but keeps these fields, because its pods still run the git
+source. In shared mode, the operator then deletes the workspace PVC and its
+keep ConfigMap, but only when no pod can mount the PVC: every
+code-location pod runs the image, and no `Run` of the CodeLocation has a
+git `spec.source`. A finished run counts too. Its pods stay until you
+delete the `Run`, and Kubernetes does not delete a PVC that a pod mounts.
+Until then, the `WorkspaceKept` condition gives the reason. With reason
+`RunsUseWorkspace`, it names the runs: delete the finished ones to free
+the PVC. The operator checks again every minute. It deletes only a PVC
+and a ConfigMap that the CodeLocation owns, not others with the same
+name. If you add `spec.git` again before the PVC is deleted, the pods use
+it again. If the PVC is being deleted, the operator waits until it is
+gone, and then creates a new one.
+
 **Which commit a run uses**: runs get the last *fully rolled-out* commit.
 After a push, the operator rolls the code-location pods to the new
 commit, but `status.resolvedCommit` moves to it only when every pod runs

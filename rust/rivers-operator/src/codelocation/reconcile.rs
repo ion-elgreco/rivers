@@ -20,19 +20,19 @@ use futures_util::FutureExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube_client::ResourceExt;
-use kube_client::api::{Api, ListParams, Patch, PatchParams};
+use kube_client::api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube_runtime::controller::Action;
 use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
-    CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationSpec, CodeLocationStatus,
-    GitRef, IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER,
-    REASON_COMMIT_PINNED, REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED,
-    REASON_GIT_AUTH_FAILED, REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE,
-    REASON_GIT_RATE_LIMITED, REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_INVALID_URL,
-    REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE,
-    REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT,
-    REASON_TAG_NOT_FOUND,
+    CONDITION_WORKSPACE_KEPT, CodeLocation, CodeLocationCondition, CodeLocationPhase,
+    CodeLocationSpec, CodeLocationStatus, GitRef, IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED,
+    REASON_AWAITING_LEADER, REASON_COMMIT_PINNED, REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED,
+    REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED, REASON_GIT_HOST_KEY_REJECTED,
+    REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED, REASON_GIT_UNREACHABLE,
+    REASON_INVALID_REF, REASON_INVALID_URL, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
+    REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR,
+    REASON_ROLLING_OUT, REASON_RUNS_NOT_LISTED, REASON_RUNS_USE_WORKSPACE, REASON_TAG_NOT_FOUND,
 };
 
 use super::git::{self, GitCredentials, GitResolveRequest};
@@ -68,6 +68,9 @@ const FOLLOWER_WAIT: Duration = Duration::from_secs(30);
 const TERMINAL_RETRY: Duration = Duration::from_secs(300);
 /// Short follow-up requeue when the Deployment is rolling out.
 const DEPLOYMENT_ROLLOUT_POLL: Duration = Duration::from_secs(10);
+/// How often image mode looks again at a workspace PVC that it keeps for an
+/// earlier git source: no event wakes it when a run is deleted.
+const WORKSPACE_RECHECK: Duration = Duration::from_secs(60);
 /// Field manager used for all server-side applies.
 const FIELD_MANAGER: &str = "rivers-operator-code-location";
 
@@ -213,6 +216,13 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         .await;
     }
 
+    let leader = ctx.leader.is_leader();
+    if !leader && cl.status.as_ref().is_some_and(is_git_status) {
+        // Its resolvedImage is the git runtime image, and the leader's
+        // first image pass decides about the git workspace.
+        return Ok(Action::requeue(FOLLOWER_WAIT));
+    }
+
     let timer = Instant::now();
     let (resolved_image, image_reason, refresh_after, immutable) =
         match resolve_image(&cl, &ctx, &secrets_api).await {
@@ -257,6 +267,11 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         .ok();
     let (phase, ready_replicas, deployment_reason, deployment_ok) =
         evaluate_deployment_phase(&cl, dep_status.as_ref());
+    let workspace_kept = if leader {
+        remove_git_workspace(&cl, &ctx, &namespace, dep_status.as_ref()).await?
+    } else {
+        None
+    };
 
     let endpoint = grpc_endpoint(&name, &namespace, cl.spec.grpc_port);
     let now_rfc3339 = jiff::Timestamp::now().to_string();
@@ -272,11 +287,10 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         message: None,
         conditions: Vec::new(),
         // Image mode: the pinned digest ref doubles as the Source column.
-        // Git-mode display (`main@9f3c1ab`) arrives with resolve_source().
         source: Some(resolved_image.clone()),
-        resolved_commit: prior_status.and_then(|s| s.resolved_commit.clone()),
-        resolved_ref: prior_status.and_then(|s| s.resolved_ref.clone()),
-        last_fetched_at: prior_status.and_then(|s| s.last_fetched_at.clone()),
+        resolved_commit: None,
+        resolved_ref: None,
+        last_fetched_at: None,
         run_source: None,
     };
     push_condition(
@@ -297,20 +311,185 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         None,
         &now_rfc3339,
     );
+    if leader {
+        if let Some((reason, message)) = &workspace_kept {
+            push_condition(
+                &mut status,
+                prior_status,
+                CONDITION_WORKSPACE_KEPT,
+                "True",
+                reason,
+                Some(message.clone()),
+                &now_rfc3339,
+            );
+        }
+    } else {
+        status
+            .conditions
+            .extend(kept_conditions(prior_status, &[CONDITION_WORKSPACE_KEPT]));
+    }
 
     if !status_substantively_equal(prior_status, &status) {
         patch_status(&code_locations_api, &name, &status).await?;
     }
 
-    let requeue = if matches!(phase, CodeLocationPhase::Ready) && immutable {
+    let requeue = if !matches!(phase, CodeLocationPhase::Ready) {
+        Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
+    } else if workspace_kept.is_some() {
+        Action::requeue(WORKSPACE_RECHECK)
+    } else if immutable {
         // Immutable + Ready → rely on CR/Deployment change events.
         Action::await_change()
-    } else if !matches!(phase, CodeLocationPhase::Ready) {
-        Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
     } else {
         Action::requeue(jitter(refresh_after))
     };
     Ok(requeue)
+}
+
+/// Image mode: delete the workspace PVC and keep ConfigMap that the code
+/// location owns from an earlier git source, once no pod can mount the PVC.
+/// Kubernetes deletes a PVC only when no pod mounts it, and the pods of a
+/// run stay until the run is deleted, so the PVC stays for as long as
+/// [`git_workspace_kept`] says. The keep ConfigMap stays with it: a return
+/// to git before the run store syncs prunes the PVC by that keep-set.
+/// Looks only while the status can still name such a workspace (a git
+/// status, or `WorkspaceKept`); image mode keeps both until it is gone.
+/// Returns why they stay, or `None` once nothing is left to delete.
+async fn remove_git_workspace(
+    cl: &CodeLocation,
+    ctx: &Context,
+    namespace: &str,
+    deployment: Option<&Deployment>,
+) -> Result<Option<(&'static str, String)>, kube_client::Error> {
+    let Some(owner) = cl.metadata.uid.as_deref() else {
+        return Ok(None);
+    };
+    let may_be_left = cl.status.as_ref().is_some_and(|status| {
+        is_git_status(status)
+            || status
+                .conditions
+                .iter()
+                .any(|c| c.r#type == CONDITION_WORKSPACE_KEPT)
+    });
+    if !may_be_left {
+        return Ok(None);
+    }
+    let name = cl.name_any();
+    let (claim, keep_name) = (workspace_pvc_name(&name), keep_config_map_name(&name));
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+    let (pvc, keep) = tokio::try_join!(pvc_api.get_opt(&claim), cm_api.get_opt(&keep_name))?;
+    let pvc = pvc.filter(|pvc| owned_by(pvc, owner) && pvc.metadata.deletion_timestamp.is_none());
+    if pvc.is_some()
+        && let Some(kept) = git_workspace_kept(cl, ctx, namespace, deployment, &claim)
+    {
+        return Ok(Some(kept));
+    }
+    if let Some(keep) = keep.filter(|keep| owned_by(keep, owner)) {
+        delete_exactly(&cm_api, &keep).await?;
+    }
+    if let Some(pvc) = pvc {
+        delete_exactly(&pvc_api, &pvc).await?;
+    }
+    Ok(None)
+}
+
+/// Why the git workspace PVC `claim` of image-mode `cl` must stay, if it
+/// must: the status still gives runs the git source, a code-location pod of
+/// the git source is left, the run store has not synced, or runs of `cl`
+/// with a git source exist — finished ones too, as their pods mount it.
+fn git_workspace_kept(
+    cl: &CodeLocation,
+    ctx: &Context,
+    namespace: &str,
+    deployment: Option<&Deployment>,
+    claim: &str,
+) -> Option<(&'static str, String)> {
+    let stays = format!("PVC '{claim}' of the git source stays");
+    let git_serves = cl.status.as_ref().is_some_and(|s| s.run_source.is_some());
+    if git_serves || !deployment.is_some_and(no_old_pods) {
+        return Some((
+            REASON_ROLLING_OUT,
+            format!("{stays} until every code-location pod runs the image"),
+        ));
+    }
+    if !matches!(ctx.runs.wait_until_ready().now_or_never(), Some(Ok(()))) {
+        return Some((
+            REASON_RUNS_NOT_LISTED,
+            format!("{stays} until the operator has listed the runs"),
+        ));
+    }
+    let cl_name = cl.name_any();
+    let mut runs: Vec<String> = ctx
+        .runs
+        .state()
+        .iter()
+        .filter(|run| is_run_of(run, namespace, &cl_name) && run.spec.source.is_some())
+        .map(|run| run.name_any())
+        .collect();
+    if runs.is_empty() {
+        return None;
+    }
+    runs.sort();
+    Some((
+        REASON_RUNS_USE_WORKSPACE,
+        format!(
+            "{stays} while the pods of these runs mount it: {}",
+            brief_list(&runs)
+        ),
+    ))
+}
+
+/// A status of the git source, not yet replaced by the leader's first image
+/// pass after a switch to image mode.
+fn is_git_status(status: &CodeLocationStatus) -> bool {
+    status.run_source.is_some()
+        || status.resolved_commit.is_some()
+        || status.resolved_ref.is_some()
+        || status.last_fetched_at.is_some()
+        || status
+            .conditions
+            .iter()
+            .any(|c| c.r#type == CONDITION_SOURCE_RESOLVED)
+}
+
+/// The first five of `names`, then how many more.
+fn brief_list(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let shown = names[..names.len().min(SHOWN)].join(", ");
+    match names.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// The git path makes the code location with `uid` the owner of its
+/// workspace PVC and keep ConfigMap.
+fn owned_by(object: &impl kube_client::Resource, uid: &str) -> bool {
+    object
+        .owner_references()
+        .iter()
+        .any(|owner| owner.uid == uid)
+}
+
+/// Delete `object`, but not an object that has taken its name since it was
+/// read.
+async fn delete_exactly<K>(api: &Api<K>, object: &K) -> Result<(), kube_client::Error>
+where
+    K: kube_client::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: object.uid(),
+            resource_version: None,
+        }),
+        ..DeleteParams::default()
+    };
+    match api.delete(&object.name_any(), &params).await {
+        Ok(_) => Ok(()),
+        Err(kube_client::Error::Api(status)) if status.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Git-mode reconcile (RFC-044 phase 1): pin the runtime image digest and
@@ -445,7 +624,7 @@ async fn reconcile_git(
         }
     };
 
-    apply_git_workspace(
+    let applied = apply_git_workspace(
         cl,
         ctx,
         namespace,
@@ -455,6 +634,13 @@ async fn reconcile_git(
         &resolved,
     )
     .await?;
+    if !applied {
+        tracing::info!(
+            code_location = %name,
+            "the workspace PVC is being deleted; the rollout waits until it is gone"
+        );
+        return Ok(Action::requeue(DEPLOYMENT_ROLLOUT_POLL));
+    }
     let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
     let rolling_out = !rollout.complete;
     let update = GitStatusUpdate {
@@ -507,7 +693,8 @@ fn git_requeue(
 
 /// Apply the git CL's owned resources: (shared mode) the workspace PVC and
 /// keep ConfigMap, then the Deployment + Service running out of the
-/// materialized tree.
+/// materialized tree. `false`, with nothing applied, while the workspace
+/// PVC is being deleted.
 async fn apply_git_workspace(
     cl: &CodeLocation,
     ctx: &Context,
@@ -516,7 +703,7 @@ async fn apply_git_workspace(
     services_api: &Api<Service>,
     resolved_image: &str,
     resolved: &git::ResolvedRef,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let name = cl.name_any();
     let git_spec = cl.spec.git.as_ref().expect("git CL");
     let wspec = WorkspaceSpec {
@@ -545,11 +732,14 @@ async fn apply_git_workspace(
             .map(|q| q.0.clone())
             .unwrap_or_else(|| ctx.workspace.shared_size.clone());
         let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
-        ensure_workspace_pvc(
+        let usable = ensure_workspace_pvc(
             &pvc_api,
             build_workspace_pvc(cl, &pvc_size, ctx.workspace.storage_class.as_deref()),
         )
         .await?;
+        if !usable {
+            return Ok(false);
+        }
         // Keep-set: the tree being rolled out, the tree runs get until that
         // rollout finishes, and every non-terminal run's tree, from the run
         // controller's store. A store that lags the API server is covered by
@@ -593,7 +783,7 @@ async fn apply_git_workspace(
         apply_deployment(deployments_api, &deployment),
         apply_service(services_api, &service),
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// Read the git Deployment and, until its rollout is complete, its pods,
@@ -714,11 +904,19 @@ fn rollout_complete(deployment: &Deployment) -> bool {
     let desired = spec.replicas.unwrap_or(1);
     let all = |count: Option<i32>| count.unwrap_or(0) >= desired;
     desired > 0
-        && generation_observed(deployment)
+        && no_old_pods(deployment)
         && all(status.updated_replicas)
         && all(status.ready_replicas)
         && all(status.available_replicas)
-        && status.replicas.unwrap_or(0) == status.updated_replicas.unwrap_or(0)
+}
+
+/// The Deployment controller has seen the current template, and every pod
+/// it counts runs it.
+fn no_old_pods(deployment: &Deployment) -> bool {
+    deployment.status.as_ref().is_some_and(|status| {
+        generation_observed(deployment)
+            && status.replicas.unwrap_or(0) == status.updated_replicas.unwrap_or(0)
+    })
 }
 
 /// The Deployment controller has seen the current template; until then the
@@ -754,9 +952,7 @@ fn workspace_keep_csv<'a>(
     keys.insert(target_key.to_string());
     keys.extend(serving_key.map(str::to_string));
     for run in runs {
-        if run.metadata.namespace.as_deref() != Some(namespace)
-            || run.spec.code_location_ref.name != cl_name
-        {
+        if !is_run_of(run, namespace, cl_name) {
             continue;
         }
         let terminal = run
@@ -774,20 +970,26 @@ fn workspace_keep_csv<'a>(
     keys.into_iter().collect::<Vec<_>>().join(",")
 }
 
+fn is_run_of(run: &Run, namespace: &str, cl_name: &str) -> bool {
+    run.metadata.namespace.as_deref() == Some(namespace)
+        && run.spec.code_location_ref.name == cl_name
+}
+
 /// PVC specs are largely immutable — create when absent, otherwise leave
 /// the existing claim alone (a size change would need manual expansion).
+/// `false` while a claim of that name is being deleted: no new pod can
+/// mount it, so the caller waits until it is gone and then creates one.
 async fn ensure_workspace_pvc(
     api: &Api<PersistentVolumeClaim>,
     pvc: PersistentVolumeClaim,
-) -> Result<(), kube_client::Error> {
+) -> Result<bool, kube_client::Error> {
     let name = pvc.metadata.name.clone().unwrap_or_default();
-    match api.get(&name).await {
-        Ok(_) => Ok(()),
-        Err(kube_client::Error::Api(ae)) if ae.code == 404 => api
+    match api.get_opt(&name).await? {
+        Some(existing) => Ok(existing.metadata.deletion_timestamp.is_none()),
+        None => api
             .create(&kube_client::api::PostParams::default(), &pvc)
             .await
-            .map(|_| ()),
-        Err(e) => Err(e),
+            .map(|_| true),
     }
 }
 
@@ -1644,6 +1846,8 @@ async fn patch_error_status(
 ) -> Result<(), kube_client::Error> {
     let now = jiff::Timestamp::now().to_string();
     let prior = cl.status.as_ref();
+    // Only the leader's first image pass replaces a git status (git fields
+    // and runtime image); a kept git workspace stays named until it is gone.
     let mut status = CodeLocationStatus {
         phase: Some(CodeLocationPhase::Failed),
         observed_generation: generation,
@@ -1668,6 +1872,11 @@ async fn patch_error_status(
         Some(err.message()),
         &now,
     );
+    if !cl.spec.is_git() {
+        status
+            .conditions
+            .extend(kept_conditions(prior, &[CONDITION_WORKSPACE_KEPT]));
+    }
     if status_substantively_equal(prior, &status) {
         return Ok(());
     }
@@ -3673,6 +3882,647 @@ mod tests {
                 condition(&status, CONDITION_DEPLOYMENT_AVAILABLE)["reason"],
                 REASON_MIN_REPLICAS
             );
+        }
+
+        const PIPELINE: &str = "ghcr.io/acme/pipeline";
+
+        /// What code location x published while main (commit a) served it
+        /// from git.
+        fn git_era_status() -> serde_json::Value {
+            let mut status = serving_status('a');
+            status["runSource"]["git"]["ref"] = json!("refs/heads/main");
+            status["resolvedRef"] = json!("refs/heads/main");
+            status["lastFetchedAt"] = json!("2026-10-02T00:00:00Z");
+            status["source"] = json!(format!("main@{}", &commit('a')[..7]));
+            status
+        }
+
+        /// What image mode publishes for [`image_cl`] once its pods run the
+        /// image.
+        fn image_status() -> serde_json::Value {
+            let image = format!("{PIPELINE}@{}", digest('i'));
+            let since = "2026-10-02T00:00:00Z";
+            json!({
+                "phase": "Ready",
+                "observedGeneration": 1,
+                "resolvedImage": image,
+                "grpcEndpoint": grpc_endpoint("x", "y", 3001),
+                "readyReplicas": 1,
+                "source": image,
+                "conditions": [
+                    {
+                        "type": CONDITION_IMAGE_RESOLVED,
+                        "status": "True",
+                        "lastTransitionTime": since,
+                        "reason": REASON_DIGEST_PINNED,
+                        "message": image,
+                    },
+                    {
+                        "type": CONDITION_DEPLOYMENT_AVAILABLE,
+                        "status": "True",
+                        "lastTransitionTime": since,
+                        "reason": REASON_MIN_REPLICAS,
+                    },
+                ],
+            })
+        }
+
+        /// Code location x in image mode, on digest i of [`PIPELINE`], with
+        /// `prior` as its status.
+        fn image_cl(prior: serde_json::Value) -> CodeLocation {
+            let mut cl = make_cl(json!({ "image": PIPELINE, "digest": digest('i') }));
+            cl.status = Some(serde_json::from_value(prior).unwrap());
+            cl
+        }
+
+        const GIT_FIELDS: [&str; 4] = [
+            "resolvedCommit",
+            "resolvedRef",
+            "lastFetchedAt",
+            "runSource",
+        ];
+
+        #[tokio::test]
+        async fn image_mode_publishes_no_git_fields_after_a_switch_from_git() {
+            let state = api_with(image_cl(git_era_status()), rolled_out());
+
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            assert_eq!(status["phase"], "Ready", "{status}");
+            assert_eq!(
+                status["resolvedImage"],
+                format!("{PIPELINE}@{}", digest('i'))
+            );
+            for field in GIT_FIELDS {
+                assert_eq!(status.get(field), None, "{field} in {status}");
+            }
+        }
+
+        /// Code location x in image mode on `acme/runtime:latest` of
+        /// `registry`, with `prior` as its status.
+        fn image_cl_on(registry: &MockServer, prior: serde_json::Value) -> CodeLocation {
+            let mut cl = make_cl(json!({
+                "image": format!("{}/acme/runtime", registry.address()),
+                "tag": "latest",
+            }));
+            cl.status = Some(serde_json::from_value(prior).unwrap());
+            cl
+        }
+
+        /// The requests of `requests` that write.
+        fn writes(requests: &[ApiRequest]) -> Vec<(&str, &str)> {
+            requests
+                .iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| (r.method.as_str(), r.path.as_str()))
+                .collect()
+        }
+
+        fn main_image(state: &ApiState) -> Option<String> {
+            state.lock().unwrap().deployments["x"]
+                .spec
+                .clone()
+                .and_then(|d| d.template.spec)
+                .map(|pod| pod.containers[0].image.clone())?
+        }
+
+        #[tokio::test]
+        async fn a_follower_leaves_the_switch_from_git_to_the_leader() {
+            let registry = registry(vec![manifest('i')]).await;
+            // The git status's resolvedImage is the runtime image, on a tag
+            // or with spec.digest pinned.
+            for cl in [
+                image_cl_on(&registry, git_era_status()),
+                image_cl(git_era_status()),
+            ] {
+                let spec = serde_json::to_string(&cl.spec).unwrap();
+                let state = api_with(cl, rolled_out());
+
+                let (requeue, requests) =
+                    reconcile_with(&state, LeaderGate::new(), &resolver()).await;
+
+                assert_eq!(writes(&requests), [], "{spec}");
+                assert_eq!(main_image(&state), None, "{spec}");
+                assert_eq!(requeue, Action::requeue(FOLLOWER_WAIT), "{spec}");
+            }
+
+            let state = api_with(image_cl_on(&registry, git_era_status()), rolled_out());
+            let image = format!("{}/acme/runtime@{}", registry.address(), digest('i'));
+            let leader = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+            assert_eq!(leader["resolvedImage"], image);
+
+            // Then the follower refreshes as usual: it applies the leader's
+            // image and has nothing new to publish.
+            let (_, requests) = reconcile_with(&state, LeaderGate::new(), &resolver()).await;
+
+            assert!(
+                writes(&requests).contains(&("PATCH", "/apis/apps/v1/namespaces/y/deployments/x")),
+                "{requests:?}"
+            );
+            assert_eq!(main_image(&state), Some(image));
+            assert_eq!(patched_status(&requests), None);
+        }
+
+        #[tokio::test]
+        async fn a_switch_to_image_mode_that_cannot_resolve_its_image_keeps_the_git_status() {
+            let registry = registry(vec![ResponseTemplate::new(404)]).await;
+            let state = api_with(image_cl_on(&registry, git_era_status()), rolled_out());
+
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let failed = patched_status(&requests).expect("status patch");
+            assert_eq!(failed["phase"], "Failed", "{failed}");
+            assert_eq!(
+                says(&failed, CONDITION_IMAGE_RESOLVED).1,
+                REASON_TAG_NOT_FOUND
+            );
+            // The pods still run the git source: its status stays until an
+            // image pass replaces it.
+            let git = git_era_status();
+            for field in GIT_FIELDS.into_iter().chain(["resolvedImage"]) {
+                assert_eq!(failed[field], git[field], "{field}");
+            }
+            assert_eq!(
+                writes(&requests),
+                [(
+                    "PATCH",
+                    "/apis/rivers.io/v1alpha1/namespaces/y/codelocations/x/status"
+                )]
+            );
+            assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        /// [`image_status`] after a pass that kept x's git workspace.
+        fn image_status_keeping_the_workspace() -> serde_json::Value {
+            let mut status = image_status();
+            status["conditions"].as_array_mut().unwrap().push(json!({
+                "type": CONDITION_WORKSPACE_KEPT,
+                "status": "True",
+                "lastTransitionTime": "2026-10-02T00:00:00Z",
+                "reason": REASON_ROLLING_OUT,
+                "message": "PVC 'x-workspace' of the git source stays until every code-location \
+                            pod runs the image",
+            }));
+            status
+        }
+
+        /// The status `state` holds for x.
+        fn stored_status(state: &ApiState) -> serde_json::Value {
+            serde_json::to_value(&state.lock().unwrap().code_locations["x"]).unwrap()["status"]
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn a_registry_error_keeps_the_kept_workspace_in_status() {
+            let registry = registry(vec![ResponseTemplate::new(503), manifest('i')]).await;
+            let cl = image_cl_on(&registry, image_status_keeping_the_workspace());
+            let state = api_with(cl.clone(), rolled_out());
+            add_git_workspace(&state, &cl);
+
+            let failed = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            assert_eq!(failed["phase"], "Failed", "{failed}");
+            assert_eq!(
+                workspace_kept(&failed),
+                workspace_kept(&image_status_keeping_the_workspace())
+            );
+            assert_eq!(git_workspace_in(&state), (true, true));
+
+            // The registry answers again: the cleanup goes on.
+            let (_, requests) = reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(Vec::new()),
+            )
+            .await;
+
+            assert_eq!(
+                deleted(&requests),
+                [(KEEP_PATH, Some(KEEP_UID)), (PVC_PATH, Some(PVC_UID))]
+            );
+            assert_eq!(workspace_kept(&stored_status(&state)), None);
+        }
+
+        #[tokio::test]
+        async fn the_leader_looks_for_a_git_workspace_only_after_a_git_source() {
+            let looks = vec![("GET", KEEP_PATH), ("GET", PVC_PATH)];
+            let cases = [
+                ("never reconciled", None, vec![]),
+                ("an image status", Some(image_status()), vec![]),
+                ("a git status", Some(git_era_status()), looks.clone()),
+                // Also after an operator restart: the condition stays until
+                // the workspace is gone.
+                (
+                    "a kept workspace",
+                    Some(image_status_keeping_the_workspace()),
+                    looks,
+                ),
+            ];
+            for (case, prior, expected) in cases {
+                let mut cl = make_cl(json!({ "image": PIPELINE, "digest": digest('i') }));
+                cl.status = prior.map(|prior| serde_json::from_value(prior).unwrap());
+                let state = api_with(cl, rolled_out());
+
+                let (_, requests) =
+                    reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+                let mut seen: Vec<_> = requests
+                    .iter()
+                    .filter(|r| {
+                        r.path.contains("/persistentvolumeclaims") || r.path.contains("/configmaps")
+                    })
+                    .map(|r| (r.method.as_str(), r.path.as_str()))
+                    .collect();
+                seen.sort();
+                assert_eq!(seen, expected, "{case}");
+                // Nothing of the git workspace is left: nothing to keep.
+                assert_eq!(workspace_kept(&stored_status(&state)), None, "{case}");
+            }
+        }
+
+        const PVC_UID: &str = "pvc-uid";
+        const KEEP_UID: &str = "keep-uid";
+
+        /// The workspace PVC and keep ConfigMap that the git path made for
+        /// `owner`.
+        fn git_workspace_of(owner: &CodeLocation) -> (PersistentVolumeClaim, ConfigMap) {
+            let mut pvc = build_workspace_pvc(owner, "20Gi", None);
+            pvc.metadata.uid = Some(PVC_UID.into());
+            let mut keep = build_keep_config_map(owner, &tree('a').workspace_key());
+            keep.metadata.uid = Some(KEEP_UID.into());
+            (pvc, keep)
+        }
+
+        fn add_git_workspace(state: &ApiState, owner: &CodeLocation) {
+            let (pvc, keep) = git_workspace_of(owner);
+            let mut s = state.lock().unwrap();
+            s.pvcs.insert(workspace_pvc_name("x"), pvc);
+            s.config_maps.insert(keep_config_map_name("x"), keep);
+        }
+
+        /// The objects `requests` deleted, with the uid each DELETE required.
+        fn deleted(requests: &[ApiRequest]) -> Vec<(&str, Option<&str>)> {
+            let mut deleted: Vec<_> = requests
+                .iter()
+                .filter(|r| r.method == "DELETE")
+                .map(|r| {
+                    let uid = r
+                        .body
+                        .as_ref()
+                        .and_then(|b| b["preconditions"]["uid"].as_str());
+                    (r.path.as_str(), uid)
+                })
+                .collect();
+            deleted.sort();
+            deleted
+        }
+
+        const PVC_PATH: &str = "/api/v1/namespaces/y/persistentvolumeclaims/x-workspace";
+        const KEEP_PATH: &str = "/api/v1/namespaces/y/configmaps/x-workspace-keep";
+
+        /// Whether `state` still holds x's workspace PVC and keep ConfigMap.
+        fn git_workspace_in(state: &ApiState) -> (bool, bool) {
+            let s = state.lock().unwrap();
+            (
+                s.pvcs.contains_key(&workspace_pvc_name("x")),
+                s.config_maps.contains_key(&keep_config_map_name("x")),
+            )
+        }
+
+        /// The status, reason and message of `status`'s `WorkspaceKept`
+        /// condition, if it has one.
+        fn workspace_kept(status: &serde_json::Value) -> Option<(&str, &str, &str)> {
+            status["conditions"]
+                .as_array()?
+                .iter()
+                .any(|c| c["type"] == CONDITION_WORKSPACE_KEPT)
+                .then(|| says(status, CONDITION_WORKSPACE_KEPT))
+        }
+
+        /// A run of x that runs `image` without a git source.
+        fn image_run(name: &str, phase: RunPhase) -> Run {
+            let mut run = Run::new(
+                name,
+                serde_json::from_value(json!({
+                    "codeLocationRef": { "name": "x" },
+                    "image": format!("{PIPELINE}@{}", digest('i')),
+                    "target": "*",
+                }))
+                .unwrap(),
+            );
+            run.metadata.namespace = Some("y".into());
+            run.status = Some(rivers_k8s::crd::run::RunCrdStatus {
+                phase: Some(phase),
+                ..Default::default()
+            });
+            run
+        }
+
+        #[tokio::test]
+        async fn leaving_git_deletes_the_workspace_once_no_pod_can_mount_it() {
+            let cl = image_cl(git_era_status());
+            let state = api_with(cl.clone(), rolled_out());
+            add_git_workspace(&state, &cl);
+            let mut other_namespace = run_for("x", 'f', Some(RunPhase::Running));
+            other_namespace.metadata.namespace = Some("z".into());
+            // None of these runs mounts x's workspace.
+            let runs = || {
+                run_store(vec![
+                    image_run("image-run", RunPhase::Running),
+                    run_for("other", 'e', Some(RunPhase::Running)),
+                    other_namespace.clone(),
+                ])
+            };
+
+            // The pass that leaves git: until this status is out, the
+            // webhook still gives new runs the git source.
+            let (_, leaving) =
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared(), runs()).await;
+            assert_eq!(deleted(&leaving), []);
+            let status = patched_status(&leaving).expect("status patch");
+            assert_eq!(
+                workspace_kept(&status),
+                Some((
+                    "True",
+                    REASON_ROLLING_OUT,
+                    "PVC 'x-workspace' of the git source stays until every code-location \
+                     pod runs the image"
+                ))
+            );
+
+            let (requeue, requests) =
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared(), runs()).await;
+
+            assert_eq!(
+                deleted(&requests),
+                [(KEEP_PATH, Some(KEEP_UID)), (PVC_PATH, Some(PVC_UID))]
+            );
+            assert_eq!(git_workspace_in(&state), (false, false));
+            let status = patched_status(&requests).expect("status patch");
+            assert_eq!(workspace_kept(&status), None, "{status}");
+            assert_eq!(status["phase"], "Ready");
+            // Ready on a pinned digest, with nothing left to delete.
+            assert_eq!(requeue, Action::await_change());
+        }
+
+        #[tokio::test]
+        async fn the_workspace_stays_while_a_pod_may_mount_it_and_the_status_says_why() {
+            let git_run = |c: char, phase: Option<RunPhase>| run_for("x", c, phase);
+            let runs_use_it = |names: &str| {
+                format!(
+                    "PVC 'x-workspace' of the git source stays while the pods of these runs \
+                     mount it: {names}"
+                )
+            };
+            let (listing, _writer) = listing_run_store(Vec::new());
+            let cases = [
+                (
+                    "a pod of the git source runs",
+                    mid_rollout(),
+                    run_store(Vec::new()),
+                    REASON_ROLLING_OUT,
+                    "PVC 'x-workspace' of the git source stays until every code-location pod \
+                     runs the image"
+                        .to_string(),
+                ),
+                (
+                    "the run store has not synced",
+                    rolled_out(),
+                    listing,
+                    REASON_RUNS_NOT_LISTED,
+                    "PVC 'x-workspace' of the git source stays until the operator has listed \
+                     the runs"
+                        .to_string(),
+                ),
+                (
+                    "a queued run",
+                    rolled_out(),
+                    run_store(vec![git_run('b', None)]),
+                    REASON_RUNS_USE_WORKSPACE,
+                    runs_use_it("run-b"),
+                ),
+                (
+                    "a pending and a running run",
+                    rolled_out(),
+                    run_store(vec![
+                        git_run('c', Some(RunPhase::Running)),
+                        git_run('b', Some(RunPhase::Pending)),
+                        image_run("image-run", RunPhase::Running),
+                    ]),
+                    REASON_RUNS_USE_WORKSPACE,
+                    runs_use_it("run-b, run-c"),
+                ),
+                (
+                    "a finished run, whose pod stays until the run is deleted",
+                    rolled_out(),
+                    run_store(vec![git_run('d', Some(RunPhase::Succeeded))]),
+                    REASON_RUNS_USE_WORKSPACE,
+                    runs_use_it("run-d"),
+                ),
+                (
+                    "many runs",
+                    rolled_out(),
+                    run_store(
+                        "abcdefg"
+                            .chars()
+                            .map(|c| git_run(c, Some(RunPhase::Failed)))
+                            .collect(),
+                    ),
+                    REASON_RUNS_USE_WORKSPACE,
+                    runs_use_it("run-a, run-b, run-c, run-d, run-e and 2 more"),
+                ),
+            ];
+
+            for (case, observed, runs, reason, message) in cases {
+                let cl = image_cl(image_status_keeping_the_workspace());
+                let state = api_with(cl.clone(), observed);
+                add_git_workspace(&state, &cl);
+
+                let (requeue, requests) =
+                    reconcile_in(&state, LeaderGate::leading(), &resolver(), shared(), runs).await;
+
+                assert_eq!(deleted(&requests), [], "{case}");
+                assert_eq!(git_workspace_in(&state), (true, true), "{case}");
+                assert_eq!(
+                    workspace_kept(&stored_status(&state)),
+                    Some(("True", reason, message.as_str())),
+                    "{case}"
+                );
+                assert_eq!(requeue, Action::requeue(WORKSPACE_RECHECK), "{case}");
+                // The follower shows what the leader found.
+                assert_eq!(pass(&state, LeaderGate::new()).await, None, "{case}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_workspace_goes_once_the_last_run_of_the_git_source_is_deleted() {
+            let cl = image_cl(image_status_keeping_the_workspace());
+            let state = api_with(cl.clone(), rolled_out());
+            add_git_workspace(&state, &cl);
+            let finished = run_for("x", 'd', Some(RunPhase::Succeeded));
+            reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(vec![finished]),
+            )
+            .await;
+            assert_eq!(git_workspace_in(&state), (true, true));
+
+            let (requeue, requests) = reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(Vec::new()),
+            )
+            .await;
+
+            assert_eq!(
+                deleted(&requests),
+                [(KEEP_PATH, Some(KEEP_UID)), (PVC_PATH, Some(PVC_UID))]
+            );
+            assert_eq!(git_workspace_in(&state), (false, false));
+            let status = patched_status(&requests).expect("status patch");
+            assert_eq!(workspace_kept(&status), None, "{status}");
+            assert_eq!(requeue, Action::await_change());
+        }
+
+        #[tokio::test]
+        async fn only_the_code_locations_own_workspace_is_deleted() {
+            // (owner uid of the PVC and ConfigMap named like x's, deleted)
+            let cases = [
+                (Some("u"), true),
+                (Some("uid-of-an-earlier-x"), false),
+                (None, false),
+            ];
+            for (owner_uid, deletes) in cases {
+                let cl = image_cl(image_status_keeping_the_workspace());
+                assert_eq!(cl.metadata.uid.as_deref(), Some("u"));
+                let state = api_with(cl.clone(), rolled_out());
+                let mut owner = cl.clone();
+                owner.metadata.uid = owner_uid.map(str::to_string);
+                let (mut pvc, mut keep) = git_workspace_of(&owner);
+                if owner_uid.is_none() {
+                    pvc.metadata.owner_references = None;
+                    keep.metadata.owner_references = None;
+                }
+                {
+                    let mut s = state.lock().unwrap();
+                    s.pvcs.insert(workspace_pvc_name("x"), pvc.clone());
+                    s.config_maps
+                        .insert(keep_config_map_name("x"), keep.clone());
+                }
+
+                let (requeue, requests) = reconcile_in(
+                    &state,
+                    LeaderGate::leading(),
+                    &resolver(),
+                    shared(),
+                    run_store(Vec::new()),
+                )
+                .await;
+
+                let case = format!("owner {owner_uid:?}");
+                // Nothing of the code location's own is left to keep.
+                assert_eq!(workspace_kept(&stored_status(&state)), None, "{case}");
+                let s = state.lock().unwrap();
+                if deletes {
+                    assert_eq!(
+                        deleted(&requests),
+                        [(KEEP_PATH, Some(KEEP_UID)), (PVC_PATH, Some(PVC_UID))],
+                        "{case}"
+                    );
+                    assert!(s.pvcs.is_empty(), "{case}");
+                    assert!(s.config_maps.is_empty(), "{case}");
+                } else {
+                    assert_eq!(deleted(&requests), [], "{case}");
+                    assert_eq!(s.pvcs.get(&workspace_pvc_name("x")), Some(&pvc), "{case}");
+                    assert_eq!(
+                        s.config_maps.get(&keep_config_map_name("x")),
+                        Some(&keep),
+                        "{case}"
+                    );
+                }
+                assert_eq!(requeue, Action::await_change(), "{case}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_git_rollout_waits_until_the_old_workspace_pvc_is_gone() {
+            // Back to git while the PVC of the earlier git source is being
+            // deleted: a pod cannot mount it.
+            let cl = git_cl_at('a', image_status());
+            let state = api_with(cl.clone(), rolled_out());
+            let (mut pvc, _) = git_workspace_of(&cl);
+            pvc.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    "2026-10-03T00:00:00Z".parse().unwrap(),
+                ));
+            pvc.metadata.finalizers = Some(vec!["kubernetes.io/pvc-protection".into()]);
+            state
+                .lock()
+                .unwrap()
+                .pvcs
+                .insert(workspace_pvc_name("x"), pvc);
+
+            let (requeue, requests) = reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(Vec::new()),
+            )
+            .await;
+
+            let writes: Vec<_> = requests
+                .iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| (r.method.as_str(), r.path.as_str()))
+                .collect();
+            assert_eq!(writes, []);
+            assert_eq!(state.lock().unwrap().deployments["x"].spec, None);
+            assert_eq!(requeue, Action::requeue(DEPLOYMENT_ROLLOUT_POLL));
+
+            // Kubernetes deletes it once no pod mounts it.
+            state.lock().unwrap().pvcs.clear();
+            let (_, requests) = reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(Vec::new()),
+            )
+            .await;
+
+            let s = state.lock().unwrap();
+            let created = requests
+                .iter()
+                .find(|r| r.method == "POST" && r.path.ends_with("/persistentvolumeclaims"))
+                .and_then(|r| r.body.clone())
+                .expect("a new workspace PVC");
+            assert_eq!(created["metadata"]["name"], "x-workspace");
+            assert_eq!(created["metadata"].get("deletionTimestamp"), None);
+            let claims: Vec<_> = s.deployments["x"]
+                .spec
+                .clone()
+                .and_then(|d| d.template.spec)
+                .unwrap()
+                .volumes
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.persistent_volume_claim.map(|c| c.claim_name))
+                .collect();
+            assert_eq!(claims, ["x-workspace"]);
         }
 
         const REPO: &str = "/acme/pipelines.git";
