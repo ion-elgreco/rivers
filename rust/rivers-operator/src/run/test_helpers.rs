@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Pod, PodStatus, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, PodStatus, Secret};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
@@ -35,6 +35,10 @@ pub struct MockApiState {
     /// What a GET of each Secret answers: the Secret, or an API error. A
     /// Secret not listed is not found.
     pub secrets: BTreeMap<String, Result<Secret, kube_core::Status>>,
+    /// What a LIST of Runs answers.
+    pub runs: Vec<Run>,
+    /// The ConfigMaps applied, by name.
+    pub config_maps: BTreeMap<String, ConfigMap>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -53,6 +57,8 @@ impl Default for MockApiState {
             code_locations,
             deployments: BTreeMap::new(),
             secrets: BTreeMap::new(),
+            runs: Vec::new(),
+            config_maps: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -108,6 +114,16 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                             }
                             None => json_response(404, &not_found_status()),
                         }
+                    } else if path.ends_with("/runs") {
+                        json_response(
+                            200,
+                            &serde_json::json!({
+                                "apiVersion": "rivers.io/v1alpha1",
+                                "kind": "RunList",
+                                "metadata": {},
+                                "items": s.runs,
+                            }),
+                        )
                     } else {
                         json_response(200, &serde_json::json!({}))
                     }
@@ -146,6 +162,16 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                         stored.spec = applied.spec;
                     }
                     json_response(200, &serde_json::to_value(&*stored).unwrap())
+                }
+                "PATCH" if object_name(&path, "configmaps").is_some() => {
+                    let name = object_name(&path, "configmaps").unwrap();
+                    let applied: ConfigMap = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok())
+                        .unwrap_or_default();
+                    let response = json_response(200, &serde_json::to_value(&applied).unwrap());
+                    s.config_maps.insert(name.to_string(), applied);
+                    response
                 }
                 "PATCH" if path.contains("/services/") => {
                     json_response(200, body_json.as_ref().unwrap_or(&serde_json::json!({})))

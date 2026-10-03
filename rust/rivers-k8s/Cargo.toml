@@ -25,6 +25,9 @@ rivers-core = { path = "../rivers-core" }
 anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
+# Workspace keys: a fixed hash, so that the operator and the run pods (maybe
+# another rivers version) agree. Already in the build through SurrealDB.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

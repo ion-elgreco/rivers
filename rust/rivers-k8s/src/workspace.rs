@@ -31,7 +31,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use crate::crd::code_location::{Dependencies, DependencyMode};
+use crate::crd::code_location::Dependencies;
 use crate::crd::run::{GitCoordinates, RunSource};
 
 pub const WORKSPACE_VOLUME: &str = "workspace";
@@ -49,28 +49,6 @@ pub const KEEP_CONFIG_MAP_KEY: &str = "keep";
 /// GID of the runtime image's `USER` (deploy/docker/Dockerfile.runtime).
 pub const RUNTIME_GID: i64 = 65532;
 
-/// `<commit[..12]>-<digest[..8]>`: the tree is keyed on *both* the code and
-/// the interpreter it was built against — a chart upgrade that moves the
-/// runtime image must not reuse the old venv.
-pub fn workspace_key(commit: &str, runtime_image_ref: &str) -> String {
-    let commit12: String = commit.chars().take(12).collect();
-    let digest8: String = match runtime_image_ref.split_once("@sha256:") {
-        Some((_, hex)) => hex.chars().take(8).collect(),
-        // Undigested refs shouldn't reach here (the operator pins digests);
-        // key on the sanitized ref tail so the shape stays stable anyway.
-        None => {
-            let tail: String = runtime_image_ref
-                .chars()
-                .rev()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(8)
-                .collect();
-            format!("{:0>8}", tail.chars().rev().collect::<String>())
-        }
-    };
-    format!("{commit12}-{digest8}")
-}
-
 /// Where the workspace volume lives.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspaceVolume {
@@ -83,8 +61,6 @@ pub enum WorkspaceVolume {
 /// Everything needed to mount (and, for builders, materialize) a workspace.
 #[derive(Clone, Debug)]
 pub struct WorkspaceSpec {
-    /// [`workspace_key`] — the subPath of this tree on the volume.
-    pub key: String,
     pub volume: WorkspaceVolume,
     /// Digest-pinned runtime image; also the init container's image.
     pub runtime_image: String,
@@ -107,6 +83,14 @@ pub struct WorkspaceSpec {
     /// The CL's `spec.env`, applied to the init container too (RFC-036
     /// extended: `UV_INDEX_URL` & co. are needed at install time).
     pub extra_env: Vec<EnvVar>,
+}
+
+impl WorkspaceSpec {
+    /// Subpath of this tree on the volume: the [`RunSource::workspace_key`]
+    /// of the source its pods carry in `RIVERS_RUN_SOURCE`.
+    pub fn key(&self) -> String {
+        run_source(self).workspace_key()
+    }
 }
 
 /// Pod-spec fragments to graft onto a Deployment / Pod / Job template.
@@ -143,7 +127,6 @@ pub fn consumer_spec_from_run_source(
     extra_env: Vec<EnvVar>,
 ) -> WorkspaceSpec {
     WorkspaceSpec {
-        key: source.workspace_key(),
         volume,
         runtime_image: source.runtime_image.clone(),
         git_url: source.git.url.clone(),
@@ -201,7 +184,7 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
     if let Some(p) = &spec.path {
         env.push(env_var("RIVERS_GIT_PATH", p));
     }
-    env.push(env_var("RIVERS_DEPS_MODE", deps_mode_name(spec.deps.mode)));
+    env.push(env_var("RIVERS_DEPS_MODE", spec.deps.mode.as_str()));
     if !spec.deps.files.is_empty() {
         env.push(env_var("RIVERS_DEPS_FILES", &spec.deps.files.join(",")));
     }
@@ -323,22 +306,11 @@ fn env_var(name: &str, value: &str) -> EnvVar {
     }
 }
 
-/// serde name of the mode (`auto` / `uvSync` / …) — the script speaks the
-/// CRD's vocabulary.
-fn deps_mode_name(mode: DependencyMode) -> &'static str {
-    match mode {
-        DependencyMode::Auto => "auto",
-        DependencyMode::UvSync => "uvSync",
-        DependencyMode::Requirements => "requirements",
-        DependencyMode::None => "none",
-    }
-}
-
 fn workspace_mount(spec: &WorkspaceSpec, read_only: bool) -> VolumeMount {
     VolumeMount {
         name: WORKSPACE_VOLUME.to_string(),
         mount_path: WORKSPACE_MOUNT.to_string(),
-        sub_path: Some(spec.key.clone()),
+        sub_path: Some(spec.key()),
         read_only: if read_only { Some(true) } else { None },
         ..Default::default()
     }
@@ -428,6 +400,7 @@ fn run_source(spec: &WorkspaceSpec) -> RunSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::code_location::DependencyMode;
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use serde_json::json;
 
@@ -443,7 +416,6 @@ mod tests {
 
     fn spec(volume: WorkspaceVolume) -> WorkspaceSpec {
         WorkspaceSpec {
-            key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
             volume,
             runtime_image: "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff".to_string(),
             git_url: "https://forge.example/acme/pipelines.git".to_string(),
@@ -473,31 +445,6 @@ mod tests {
         WorkspaceVolume::EmptyDir {
             size_limit: Some(Quantity("2Gi".to_string())),
         }
-    }
-
-    #[test]
-    fn workspace_key_is_commit12_dash_digest8() {
-        let key = workspace_key(
-            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
-            "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffffeeee00001111222233334444555566667777",
-        );
-        assert_eq!(key, "9f3c1ab8d2e4-1a2b3c4d");
-        // A different runtime digest must produce a different key — the venv
-        // was built against a different interpreter.
-        let other = workspace_key(
-            "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
-            "ghcr.io/acme/rivers-runtime@sha256:ffffffffaaaa000011112222333344445555666677778888",
-        );
-        assert_ne!(key, other);
-    }
-
-    #[test]
-    fn workspace_key_survives_undigested_ref() {
-        // Shouldn't occur (the operator pins digests), but the key must not
-        // panic or collide with digested forms.
-        let key = workspace_key("9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8", "runtime:latest");
-        assert!(key.starts_with("9f3c1ab8d2e4-"));
-        assert_eq!(key.len(), "9f3c1ab8d2e4-".len() + 8);
     }
 
     #[test]
@@ -538,7 +485,7 @@ mod tests {
                     { "name": "UV_INDEX_URL", "value": "https://pypi.internal/simple" },
                 ],
                 "volumeMounts": [
-                    { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
+                    { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d-03a30844" },
                     { "name": "workspace", "mountPath": "/uv-cache", "subPath": "cache" },
                     { "name": "workspace", "mountPath": "/workspaces" },
                     { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
@@ -555,7 +502,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&pieces.main_mounts).unwrap(),
             json!([
-                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
+                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d-03a30844" },
             ])
         );
         assert_eq!(
@@ -608,7 +555,7 @@ mod tests {
         assert_eq!(
             fb_mounts,
             json!([
-                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
+                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d-03a30844" },
                 { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
             ])
         );
@@ -652,7 +599,7 @@ mod tests {
             serde_json::to_value(&pieces.main_mounts).unwrap(),
             json!([
                 { "name": "workspace", "mountPath": "/workspace",
-                  "subPath": "9f3c1ab8d2e4-1a2b3c4d", "readOnly": true },
+                  "subPath": "9f3c1ab8d2e4-1a2b3c4d-03a30844", "readOnly": true },
             ])
         );
         assert_eq!(
@@ -692,7 +639,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&pieces.main_mounts).unwrap(),
             json!([
-                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
+                { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d-03a30844" },
             ])
         );
     }

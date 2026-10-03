@@ -308,6 +308,19 @@ pub enum DependencyMode {
     None,
 }
 
+impl DependencyMode {
+    /// The serde name (`auto` / `uvSync` / …): the sync script and the
+    /// workspace key speak the CRD's vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DependencyMode::Auto => "auto",
+            DependencyMode::UvSync => "uvSync",
+            DependencyMode::Requirements => "requirements",
+            DependencyMode::None => "none",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeLocationStatus {

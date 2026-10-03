@@ -771,7 +771,6 @@ mod tests {
     ) -> rivers_k8s::workspace::WorkspacePodPieces {
         let git = cl.spec.git.as_ref().unwrap();
         rivers_k8s::workspace::builder_pod_pieces(&rivers_k8s::workspace::WorkspaceSpec {
-            key: "9f3c1ab8d2e4-1a2b3c4d".to_string(),
             volume,
             runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
             git_url: git.url.clone(),

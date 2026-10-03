@@ -446,10 +446,7 @@ async fn apply_git_workspace(
 ) -> Result<(), Error> {
     let name = cl.name_any();
     let git_spec = cl.spec.git.as_ref().expect("git CL");
-    let key = workspace::workspace_key(&resolved.commit, resolved_image);
-
     let wspec = WorkspaceSpec {
-        key: key.clone(),
         volume: ctx.workspace.volume(&name, &cl.spec),
         runtime_image: resolved_image.to_string(),
         git_url: git_spec.url.clone(),
@@ -501,7 +498,7 @@ async fn apply_git_workspace(
             .as_ref()
             .and_then(|s| s.run_source.as_ref())
             .map(RunSource::workspace_key);
-        let keep = workspace_keep_csv(&key, serving_key.as_deref(), &name, &runs);
+        let keep = workspace_keep_csv(&wspec.key(), serving_key.as_deref(), &name, &runs);
         let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
         apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
     }
@@ -1620,18 +1617,23 @@ mod tests {
         const RUNTIME: &str =
             "ghcr.io/rt@sha256:1a2b3c4d00000000000000000000000000000000000000000000000000000000";
 
+        fn source_at(commit_char: char) -> RunSource {
+            serde_json::from_value(serde_json::json!({
+                "git": {
+                    "url": "https://forge.example/r.git",
+                    "commit": commit_char.to_string().repeat(40),
+                },
+                "runtimeImage": RUNTIME,
+            }))
+            .unwrap()
+        }
+
         fn run_for(cl: &str, commit_char: char, phase: Option<RunPhase>) -> Run {
             let spec: RunSpec = serde_json::from_value(serde_json::json!({
                 "codeLocationRef": { "name": cl },
                 "image": RUNTIME,
                 "target": "*",
-                "source": {
-                    "git": {
-                        "url": "https://forge.example/r.git",
-                        "commit": commit_char.to_string().repeat(40),
-                    },
-                    "runtimeImage": RUNTIME,
-                },
+                "source": source_at(commit_char),
             }))
             .unwrap();
             let mut run = Run::new(&format!("run-{commit_char}"), spec);
@@ -1657,15 +1659,15 @@ mod tests {
         assert!(entries.contains(&"current-key"));
         // a (Running + statusless dedup), b (Pending — queued runs hold
         // their tree), c (Cancelling).
-        let a_key = workspace::workspace_key(&"a".repeat(40), RUNTIME);
-        let b_key = workspace::workspace_key(&"b".repeat(40), RUNTIME);
-        let c_key = workspace::workspace_key(&"c".repeat(40), RUNTIME);
+        let a_key = source_at('a').workspace_key();
+        let b_key = source_at('b').workspace_key();
+        let c_key = source_at('c').workspace_key();
         assert!(entries.contains(&a_key.as_str()), "{keep}");
         assert!(entries.contains(&b_key.as_str()), "{keep}");
         assert!(entries.contains(&c_key.as_str()), "{keep}");
         // Terminal runs release; other CLs' runs are not ours.
         assert_eq!(entries.len(), 4, "dedup + releases: {keep}");
-        let d_key = workspace::workspace_key(&"d".repeat(40), RUNTIME);
+        let d_key = source_at('d').workspace_key();
         assert!(!entries.contains(&d_key.as_str()));
     }
 
@@ -1691,15 +1693,12 @@ mod tests {
             .unwrap(),
         );
 
+        let run_key = run.spec.source.as_ref().unwrap().workspace_key();
+
         let keep = workspace_keep_csv("current-key", None, "analytics", &[run]);
 
-        assert_eq!(
-            keep,
-            format!(
-                "{},current-key",
-                workspace::workspace_key(&"a".repeat(40), &runtime)
-            )
-        );
+        assert!(run_key.contains("-1a2b3c4d-"), "{run_key}");
+        assert_eq!(keep, format!("{run_key},current-key"));
     }
 
     #[test]
@@ -2375,6 +2374,16 @@ mod tests {
             leader: LeaderGate,
             git: &Arc<git::GitResolver>,
         ) -> (Action, Vec<ApiRequest>) {
+            reconcile_in(state, leader, git, WorkspaceConfig::default()).await
+        }
+
+        /// [`reconcile_with`] under the chart's `workspace` settings.
+        async fn reconcile_in(
+            state: &ApiState,
+            leader: LeaderGate,
+            git: &Arc<git::GitResolver>,
+            workspace: WorkspaceConfig,
+        ) -> (Action, Vec<ApiRequest>) {
             let (cl, seen) = {
                 let s = state.lock().unwrap();
                 (s.code_locations["x"].clone(), s.requests.len())
@@ -2387,7 +2396,7 @@ mod tests {
                 runtime_image: format!("{RUNTIME}:0.5.0-py3.12").parse().unwrap(),
                 leader: Arc::new(leader),
                 code_location_service_account: "rivers-code-location".into(),
-                workspace: WorkspaceConfig::default(),
+                workspace,
                 surreal_pod_cfg: Default::default(),
                 otel_pod_cfg: Default::default(),
             };
@@ -2621,7 +2630,6 @@ mod tests {
         fn rollout_reads_the_tree_from_the_pod_template() {
             let cl = git_cl_at('b', serving_status('a'));
             let pieces = workspace::builder_pod_pieces(&WorkspaceSpec {
-                key: tree('b').workspace_key(),
                 volume: WorkspaceVolume::EmptyDir { size_limit: None },
                 runtime_image: runtime('b'),
                 git_url: URL.into(),
@@ -2711,6 +2719,77 @@ mod tests {
                     tree('a').workspace_key(),
                     tree('b').workspace_key()
                 )
+            );
+        }
+
+        #[tokio::test]
+        async fn new_dependencies_at_the_same_commit_get_and_keep_their_own_tree() {
+            // Tree a with the gpu extra serves; the user adds a group, with
+            // no new commit or runtime image.
+            let mut serving = serving_status('a');
+            serving["runSource"]["dependencies"]["extras"] = json!(["gpu"]);
+            let mut cl = git_cl_at('a', serving.clone());
+            let deps = &mut cl.spec.git.as_mut().unwrap().dependencies;
+            deps.extras = vec!["gpu".into()];
+            deps.groups = vec!["test".into()];
+            let state = api_with(cl, mid_rollout());
+            // Admitted before the gpu extra: it still runs on plain tree a.
+            state.lock().unwrap().runs = vec![rivers_k8s::crd::run::Run::new(
+                "r",
+                serde_json::from_value(json!({
+                    "codeLocationRef": { "name": "x" },
+                    "image": runtime('a'),
+                    "target": "job",
+                    "source": run_source_json('a'),
+                }))
+                .unwrap(),
+            )];
+            let shared = WorkspaceConfig {
+                shared_enabled: true,
+                ..Default::default()
+            };
+
+            reconcile_in(&state, LeaderGate::leading(), &resolver(), shared).await;
+
+            let s = state.lock().unwrap();
+            let target = template_source(&s.deployments["x"]).unwrap();
+            assert_eq!(target.dependencies.groups, ["test"]);
+            let pod = s.deployments["x"]
+                .spec
+                .clone()
+                .unwrap()
+                .template
+                .spec
+                .unwrap();
+            let sub_paths: Vec<_> = pod
+                .init_containers
+                .iter()
+                .flatten()
+                .chain(&pod.containers)
+                .flat_map(|c| c.volume_mounts.iter().flatten())
+                .filter(|m| m.mount_path == workspace::WORKSPACE_MOUNT)
+                .map(|m| m.sub_path.clone())
+                .collect();
+            let target_key = target.workspace_key();
+            assert_eq!(
+                sub_paths,
+                [Some(target_key.clone()), Some(target_key.clone())]
+            );
+            let serving_tree: RunSource =
+                serde_json::from_value(serving["runSource"].clone()).unwrap();
+            let mut trees = [
+                tree('a').workspace_key(),
+                serving_tree.workspace_key(),
+                target_key,
+            ];
+            trees.sort();
+            assert_eq!(
+                s.config_maps[&keep_config_map_name("x")]
+                    .data
+                    .as_ref()
+                    .unwrap()["keep"],
+                trees.join(","),
+                "one tree per dependency setting"
             );
         }
 

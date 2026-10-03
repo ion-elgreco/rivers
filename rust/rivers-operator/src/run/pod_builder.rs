@@ -340,7 +340,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 sub_paths,
-                vec![Some(workspace::workspace_key(COMMIT, RUNTIME))],
+                vec![Some(run.spec.source.as_ref().unwrap().workspace_key())],
                 "shared_enabled={shared_enabled}"
             );
             let inits: Vec<_> = pod_spec

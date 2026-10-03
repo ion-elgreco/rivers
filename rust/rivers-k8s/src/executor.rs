@@ -437,7 +437,7 @@ mod tests {
             serde_json::json!([{
                 "name": "workspace",
                 "mountPath": "/workspace",
-                "subPath": "9f3c1ab8d2e4-1a2b3c4d",
+                "subPath": "9f3c1ab8d2e4-1a2b3c4d-f2180cfa",
                 "readOnly": true,
             }])
         );

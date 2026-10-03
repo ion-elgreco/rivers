@@ -6855,6 +6855,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]

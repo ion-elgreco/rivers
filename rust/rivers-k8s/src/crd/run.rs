@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use kube_derive::CustomResource;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const CANCEL_ANNOTATION: &str = "rivers.io/cancel-requested";
 
@@ -117,8 +120,9 @@ pub struct RunSpec {
     /// status, or, for a digest-pinned `image`, by the code-location pod
     /// that launches the run (its own tree); immutable after; absent for
     /// image-mode runs. In shared workspace mode nothing downstream fetches
-    /// from these coordinates: the commit and runtime image name the tree
-    /// to mount, the rest is the run's provenance record.
+    /// from these coordinates: the commit, runtime image, path and
+    /// dependencies name the tree to mount, the rest is the run's
+    /// provenance record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RunSource>,
 }
@@ -137,9 +141,64 @@ pub struct RunSource {
 }
 
 impl RunSource {
-    /// Subpath of this tree on the workspace volume.
+    /// Subpath of this tree on the workspace volume:
+    /// `<commit[..12]>-<runtime digest[..8]>-<settings[..8]>`. The tree is the
+    /// checkout plus the venv that the runtime image's interpreter built from
+    /// the project at `path` with `dependencies`, so each of these gets its
+    /// own tree. The url, ref, Secret and install timeout change nothing in it.
     pub fn workspace_key(&self) -> String {
-        crate::workspace::workspace_key(&self.git.commit, &self.runtime_image)
+        let commit12: String = self.git.commit.chars().take(12).collect();
+        format!(
+            "{commit12}-{}-{}",
+            digest8(&self.runtime_image),
+            self.settings_hash()
+        )
+    }
+
+    /// First 8 hex of the SHA-256 of the JSON array `[path, mode, files,
+    /// extras, groups]`: `path` without leading or trailing `/`, extras and
+    /// groups sorted without repeats (uv installs their union), files in
+    /// their order. Run pods compute it again for their step Jobs with the
+    /// rivers in their venv, maybe another version than the operator's: the
+    /// encoding must not change.
+    fn settings_hash(&self) -> String {
+        fn set(items: &[String]) -> BTreeSet<&str> {
+            items.iter().map(String::as_str).collect()
+        }
+        let deps = &self.dependencies;
+        let settings = serde_json::to_vec(&(
+            self.git
+                .path
+                .as_deref()
+                .unwrap_or_default()
+                .trim_matches('/'),
+            deps.mode.as_str(),
+            &deps.files,
+            set(&deps.extras),
+            set(&deps.groups),
+        ))
+        .expect("strings serialize");
+        Sha256::digest(settings)[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+/// First 8 hex of the image's digest. The operator pins digests; an
+/// undigested ref keys on its sanitized tail so the shape stays the same.
+fn digest8(image: &str) -> String {
+    match image.split_once("@sha256:") {
+        Some((_, hex)) => hex.chars().take(8).collect(),
+        None => {
+            let tail: String = image
+                .chars()
+                .rev()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(8)
+                .collect();
+            format!("{:0>8}", tail.chars().rev().collect::<String>())
+        }
     }
 }
 
@@ -482,5 +541,96 @@ mod tests {
         let spec: RunSpec = serde_json::from_value(json).unwrap();
         assert_eq!(spec.image, "");
         assert_eq!(spec.code_location_ref.name, "analytics");
+    }
+
+    fn source() -> RunSource {
+        serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "path": "/analytics/",
+                "secretName": "git-creds",
+            },
+            "dependencies": {
+                "mode": "auto",
+                "files": ["requirements/base.txt", "requirements/prod.txt"],
+                "extras": ["gpu", "dev"],
+                "groups": ["test", "lint"],
+                "timeoutSeconds": 600,
+            },
+            "runtimeImage": format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a2b3c4d".repeat(8)),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn workspace_key_is_pinned() {
+        // Run pods compute the key again with the rivers version their venv
+        // locks. The third part is the first 8 hex of the SHA-256 of
+        // `["analytics","auto",["requirements/base.txt","requirements/prod.txt"],["dev","gpu"],["lint","test"]]`.
+        assert_eq!(source().workspace_key(), "9f3c1ab8d2e4-1a2b3c4d-37c771fd");
+    }
+
+    #[test]
+    fn workspace_key_keeps_its_shape_for_an_undigested_runtime_image() {
+        let mut s = source();
+        s.runtime_image = "runtime:latest".into();
+        assert_eq!(s.workspace_key(), "9f3c1ab8d2e4-melatest-37c771fd");
+    }
+
+    type Edit = fn(&mut RunSource);
+
+    fn key_after(edit: Edit) -> String {
+        let mut s = source();
+        edit(&mut s);
+        s.workspace_key()
+    }
+
+    #[test]
+    fn workspace_key_changes_with_what_the_tree_holds() {
+        use crate::crd::code_location::DependencyMode;
+        let new_tree: &[(&str, Edit)] = &[
+            ("commit", |s| s.git.commit = "0".repeat(40)),
+            ("runtime image", |s| {
+                s.runtime_image = format!("ghcr.io/acme/rivers-runtime@sha256:{}", "f".repeat(64))
+            }),
+            ("path", |s| s.git.path = Some("marketing".into())),
+            ("no path", |s| s.git.path = None),
+            ("mode", |s| s.dependencies.mode = DependencyMode::UvSync),
+            ("files", |s| s.dependencies.files.truncate(1)),
+            // `uv pip install -r a -r b` reads the files in turn.
+            ("files reordered", |s| s.dependencies.files.reverse()),
+            ("extras", |s| s.dependencies.extras.truncate(1)),
+            ("groups", |s| s.dependencies.groups.truncate(1)),
+        ];
+        for (case, edit) in new_tree {
+            assert_ne!(key_after(*edit), source().workspace_key(), "{case}");
+        }
+    }
+
+    #[test]
+    fn workspace_key_ignores_what_does_not_change_the_tree() {
+        let same_tree: &[(&str, Edit)] = &[
+            // uv installs the union of the extras and of the groups.
+            ("extras reordered", |s| s.dependencies.extras.reverse()),
+            ("extras repeated", |s| {
+                s.dependencies.extras.push("gpu".into())
+            }),
+            ("groups reordered", |s| s.dependencies.groups.reverse()),
+            ("path slashes", |s| s.git.path = Some("analytics".into())),
+            ("timeout", |s| s.dependencies.timeout_seconds = None),
+            ("ref", |s| s.git.r#ref = Some("refs/tags/v1.2.0".into())),
+            ("url", |s| {
+                s.git.url = "ssh://git@forge.example/acme/pipelines.git".into()
+            }),
+            ("secret", |s| s.git.secret_name = None),
+        ];
+        for (case, edit) in same_tree {
+            assert_eq!(key_after(*edit), source().workspace_key(), "{case}");
+        }
+        let no_path = key_after(|s| s.git.path = None);
+        assert_eq!(key_after(|s| s.git.path = Some(String::new())), no_path);
+        assert_eq!(key_after(|s| s.git.path = Some("/".into())), no_path);
     }
 }

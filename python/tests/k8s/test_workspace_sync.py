@@ -2,7 +2,9 @@
 
 Shared mode keeps one uv cache on the PVC. After each successful build the
 script prunes it to the wheels built from source (``uv cache prune --ci``).
-Fallback pods install without a cache, so there is nothing to prune.
+Fallback pods install without a cache, so there is nothing to prune. Past
+the recency and age floors, the tree prune keeps a tree only when its whole
+name is in the keep-set.
 
 Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 ``uv.lock``, else its ``requirements.txt``. A member of a uv workspace has no
@@ -85,6 +87,30 @@ def test_failed_uv_cache_prune_keeps_the_built_tree(workspace_sync):
     assert "uv cache prune failed (non-fatal)" in built.stderr
     assert (workspace_sync.tree / ".ready").exists()
     assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
+
+
+def test_prune_keeps_only_the_trees_whose_whole_key_is_kept(workspace_sync):
+    # The same commit and runtime image, other dependency settings.
+    kept = "9f3c1ab8d2e4-1a2b3c4d-37c771fd"
+    stale = "9f3c1ab8d2e4-1a2b3c4d-03a30844"
+    for name in (kept, stale, "cache"):
+        (workspace_sync.volume / name).mkdir()
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    built = workspace_sync.run(
+        commit,
+        shared=True,
+        RIVERS_WORKSPACE_KEEP=f"tree,{kept}",
+        RIVERS_WORKSPACE_KEEP_REVISIONS="0",
+        RIVERS_WORKSPACE_MIN_AGE="0s",
+    )
+
+    assert built.returncode == 0, built.stderr
+    assert f"prune: removing {stale}" in built.stderr
+    left = sorted(
+        p.name for p in workspace_sync.volume.iterdir() if not p.name.startswith(".")
+    )
+    assert left == [kept, "cache", "tree"]
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])

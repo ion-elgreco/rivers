@@ -150,8 +150,9 @@ spec:
                   status, or, for a digest-pinned `image`, by the code-location pod
                   that launches the run (its own tree); immutable after; absent for
                   image-mode runs. In shared workspace mode nothing downstream fetches
-                  from these coordinates: the commit and runtime image name the tree
-                  to mount, the rest is the run's provenance record.
+                  from these coordinates: the commit, runtime image, path and
+                  dependencies name the tree to mount, the rest is the run's
+                  provenance record.
                 nullable: true
                 properties:
                   dependencies:

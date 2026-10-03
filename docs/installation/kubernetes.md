@@ -230,10 +230,13 @@ fails with reason `GitAuthFailed`.
 
 **Shared workspace** (recommended where you have RWX storage): set
 `codeLocation.workspace.shared.enabled=true` and the code+venv is built
-once per commit on a per-CL PVC, then mounted read-only by every run and
-step pod — a wide fan-out starts as fast as image mode. Without RWX
-storage every pod builds its own tree; that's fine for
-`executor: parallel` but slow for wide `executor: kubernetes` fan-outs.
+once on a per-CL PVC, then mounted read-only by every run and step pod —
+a wide fan-out starts as fast as image mode. Each tree is for one commit,
+one runtime image, one `path` and one `dependencies` setting
+(`timeoutSeconds` excluded). If you change one of these, the
+code-location pod builds a new tree. Without RWX storage every pod builds
+its own tree; that's fine for `executor: parallel` but slow for wide
+`executor: kubernetes` fan-outs.
 
 **uv cache**: in shared mode, uv's cache is on the PVC (`cache/`). After
 each successful build, the code-location pod runs `uv cache prune --ci`:
