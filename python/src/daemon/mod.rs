@@ -34,7 +34,10 @@ mod types;
 
 pub use subprocess_eval::{eval_schedule_in_subprocess, eval_sensor_in_subprocess};
 
-use automation_condition::{ConditionEvalLoopConfig, build_condition_engine, condition_eval_loop};
+use automation_condition::{
+    ConditionEvalLoopConfig, build_condition_engine, condition_eval_loop, extract_asset_conditions,
+    extract_upstream_partition_keys,
+};
 use automation_entry::AutomationEntry;
 use batch_writer::{spawn_condition_eval_writer, spawn_tick_writer};
 pub(crate) use dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
@@ -132,10 +135,9 @@ impl AutomationDaemon {
         tracing::trace!(target: "rivers::dbg::daemon", "AutomationDaemon.start: ENTER");
         // Wrapped in `Arc` because the eval dispatcher reuses them per subprocess
         // submit (rebuilt as `(name, class, json_data)` triples in the worker).
+        let state = self.repo.get().state.get_attached(py);
         let resources: Arc<HashMap<String, Py<PyAny>>> = Arc::new({
-            let repo_ref = self.repo.get();
-            let guard = repo_ref.state.read().unwrap();
-            guard
+            state
                 .as_ref()
                 .map(|s| {
                     s.resources
@@ -148,11 +150,13 @@ impl AutomationDaemon {
 
         let (schedules, sensors) = self.extract_automation_info(py, resources.as_ref());
 
-        let (asset_conditions, upstream_partition_keys) = {
-            let repo_ref = self.repo.get();
-            let conditions = repo_ref.extract_asset_conditions();
-            let upstream_pks = repo_ref.extract_upstream_partition_keys(&conditions);
-            (conditions, upstream_pks)
+        let (asset_conditions, upstream_partition_keys) = match &state {
+            Some(state) => {
+                let conditions = extract_asset_conditions(state);
+                let upstream_pks = extract_upstream_partition_keys(state, &conditions);
+                (conditions, upstream_pks)
+            }
+            None => (Vec::new(), HashMap::new()),
         };
 
         if !asset_conditions.is_empty() {
@@ -384,9 +388,9 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         let repo_ref = repo.get();
         let handle = repo_ref.handle();
         let gil_threads = repo_ref.gil_threads.clone();
-        let state = repo_ref.state.read().unwrap();
-        let s = state
-            .as_ref()
+        let s = repo_ref
+            .state
+            .get()
             .expect("daemon spawned only after CodeRepository::resolve");
         (
             s.run_backend.clone(),
