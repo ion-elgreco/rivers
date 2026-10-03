@@ -7,12 +7,15 @@ them locally; when disabled (e.g. in K8s step pods) the parent streams are
 silenced and only the buffered text is shipped back through the run event log.
 """
 
+import collections
 import contextvars
 import sys
 import threading
 
 _capture = contextvars.ContextVar("_step_capture", default=None)
 _get = _capture.get
+# Takes the place of a finished step's buffers: holds nothing.
+_SINK = collections.deque(maxlen=0)
 
 
 class _Writer:
@@ -76,6 +79,9 @@ class StepCapture:
     def finish(self):
         """Stop capturing and return ``(stdout, stderr)``.
 
+        Threads that inherited the step's context can still write after this
+        call. Those writes are not kept.
+
         Returns:
             A two-tuple of strings holding everything the step wrote. Output is
             never dropped: a step that logs more than expected is a thing to
@@ -90,10 +96,9 @@ class StepCapture:
         return (out, err)
 
     def _join(self, idx):
-        """Concatenate buffer ``idx`` and clear it."""
-        r = "".join(self._bufs[idx])
-        self._bufs[idx].clear()
-        return r
+        """Concatenate buffer ``idx`` and drop later writes to it."""
+        buf, self._bufs[idx] = self._bufs[idx], _SINK
+        return "".join(buf)
 
 
 _installed = False
