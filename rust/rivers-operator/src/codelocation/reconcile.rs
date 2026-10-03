@@ -517,26 +517,28 @@ async fn apply_git_workspace(
         // rollout finishes, and every non-terminal run's tree. One LIST per
         // reconcile is fine at reconcile cadence; a stale snapshot is covered
         // by keepRevisions + minTreeAge (see the RFC's prune soundness
-        // argument). The ConfigMap indirection means this refresh never
-        // rolls the Deployment.
+        // argument). A failed LIST leaves the keep-set in force: one built
+        // without the Runs would drop their trees. The ConfigMap indirection
+        // means this refresh never rolls the Deployment.
         let runs_api: Api<rivers_k8s::crd::run::Run> =
             Api::namespaced(ctx.client.clone(), namespace);
-        let runs = runs_api
-            .list(&Default::default())
-            .await
-            .map(|l| l.items)
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "listing Runs for the keep-set; keeping the CL's own trees only");
-                Vec::new()
-            });
-        let serving_key = cl
-            .status
-            .as_ref()
-            .and_then(|s| s.run_source.as_ref())
-            .map(RunSource::workspace_key);
-        let keep = workspace_keep_csv(&wspec.key(), serving_key.as_deref(), &name, &runs);
-        let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-        apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
+        match runs_api.list(&Default::default()).await {
+            Ok(runs) => {
+                let serving_key = cl
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.run_source.as_ref())
+                    .map(RunSource::workspace_key);
+                let keep =
+                    workspace_keep_csv(&wspec.key(), serving_key.as_deref(), &name, &runs.items);
+                let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+                apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "listing Runs for the keep-set; the keep-set in force stays"
+            ),
+        }
     }
 
     let deployment = build_git_deployment(
@@ -2849,7 +2851,7 @@ mod tests {
             deps.groups = vec!["test".into()];
             let state = api_with(cl, mid_rollout());
             // Admitted before the gpu extra: it still runs on plain tree a.
-            state.lock().unwrap().runs = vec![rivers_k8s::crd::run::Run::new(
+            state.lock().unwrap().runs = Ok(vec![rivers_k8s::crd::run::Run::new(
                 "r",
                 serde_json::from_value(json!({
                     "codeLocationRef": { "name": "x" },
@@ -2858,7 +2860,7 @@ mod tests {
                     "source": run_source_json('a'),
                 }))
                 .unwrap(),
-            )];
+            )]);
             let shared = WorkspaceConfig {
                 shared_enabled: true,
                 ..Default::default()
@@ -2905,6 +2907,94 @@ mod tests {
                     .unwrap()["keep"],
                 trees.join(","),
                 "one tree per dependency setting"
+            );
+        }
+
+        fn shared() -> WorkspaceConfig {
+            WorkspaceConfig {
+                shared_enabled: true,
+                ..Default::default()
+            }
+        }
+
+        /// The keep ConfigMap's value for `keys`.
+        fn keep_value(mut keys: Vec<String>) -> String {
+            keys.sort();
+            keys.join(",")
+        }
+
+        fn keep_in(state: &ApiState) -> String {
+            state.lock().unwrap().config_maps[&keep_config_map_name("x")]
+                .data
+                .as_ref()
+                .unwrap()["keep"]
+                .clone()
+        }
+
+        /// Commit b rolls out while tree a serves and a long run still uses
+        /// tree c, outside the floors. The keep-set in force is from a pass
+        /// before commit b.
+        fn rolling_out_beside_a_long_run() -> ApiState {
+            let cl = git_cl_at('b', serving_status('a'));
+            let in_force = keep_value(vec![
+                tree('a').workspace_key(),
+                source_at('c').workspace_key(),
+            ]);
+            let state = api_with(cl.clone(), mid_rollout());
+            {
+                let mut s = state.lock().unwrap();
+                s.config_maps.insert(
+                    keep_config_map_name("x"),
+                    build_keep_config_map(&cl, &in_force),
+                );
+                s.runs = Ok(vec![run_for("x", 'c', Some(RunPhase::Running))]);
+            }
+            state
+        }
+
+        #[tokio::test]
+        async fn failed_runs_list_leaves_the_keep_set_in_force() {
+            let state = rolling_out_beside_a_long_run();
+            let in_force = keep_in(&state);
+            state.lock().unwrap().runs = Err(kube_core::Status::failure(
+                "the server has received too many requests and has asked us to try again later",
+                "TooManyRequests",
+            )
+            .with_code(429));
+
+            let (_, requests) =
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared()).await;
+
+            let keep_requests: Vec<_> = requests
+                .iter()
+                .filter(|r| r.path.contains("/configmaps/"))
+                .collect();
+            assert!(keep_requests.is_empty(), "{keep_requests:?}");
+            assert_eq!(keep_in(&state), in_force);
+            // The rest of the pass goes on: b rolls out, runs stay on a.
+            assert_eq!(
+                template_source(&state.lock().unwrap().deployments["x"]),
+                Some(tree('b'))
+            );
+            assert_eq!(
+                patched_status(&requests).expect("status patch")["runSource"],
+                run_source_json('a')
+            );
+        }
+
+        #[tokio::test]
+        async fn listed_runs_keep_their_trees_beside_the_code_location_trees() {
+            let state = rolling_out_beside_a_long_run();
+
+            reconcile_in(&state, LeaderGate::leading(), &resolver(), shared()).await;
+
+            assert_eq!(
+                keep_in(&state),
+                keep_value(vec![
+                    tree('a').workspace_key(),
+                    tree('b').workspace_key(),
+                    source_at('c').workspace_key(),
+                ])
             );
         }
 
