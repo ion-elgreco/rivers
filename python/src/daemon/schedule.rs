@@ -9,7 +9,7 @@ use crate::automation::schedule::PyScheduleStatus;
 use crate::repository::PyCodeRepository;
 
 use super::{
-    BoxedPyFuture, GIL_SEMAPHORE, PrecomputedArgs, ResolvedEvalMode, RunRequestData, TickOutcome,
+    BoxedPyFuture, PY_EVAL_PERMITS, PrecomputedArgs, ResolvedEvalMode, RunRequestData, TickOutcome,
     assemble_call_args, extract_tick_outcome_from_parts, precompute_args, resolve_eval_mode,
 };
 
@@ -114,7 +114,7 @@ pub(super) async fn evaluate_schedule_sync(
     let job_name = job_name.to_string();
     let tags = tags.clone();
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<TickOutcome, String> {
             let ctx = Py::new(
@@ -167,7 +167,7 @@ pub(super) async fn evaluate_schedule_async(
     let exec_time = execution_time.to_string();
     let job_name = job_name.to_string();
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     let rust_future = tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<BoxedPyFuture, String> {
             let ctx = Py::new(
@@ -198,7 +198,7 @@ pub(super) async fn evaluate_schedule_async(
 
     let py_result = rust_future.await.map_err(|e| e.to_string())?;
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<TickOutcome, String> {
             let parsed = parse_schedule_result(py, &py_result, &job_name, &None)

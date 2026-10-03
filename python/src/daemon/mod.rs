@@ -57,9 +57,9 @@ pub(crate) use parse::{
     assemble_call_args, extract_sensor_outcome_from_parts, extract_tick_outcome_from_parts,
 };
 pub(crate) use types::{
-    BackfillRequestData, BoxedPyFuture, ConditionEvalWriteMsg, GIL_SEMAPHORE,
-    MaterializationRequestData, PrecomputedArgs, ResolvedEvalMode, RunRequestData, RunRerunRequest,
-    RunType, SensorOutcome, TickOutcome, TickWriteMsg,
+    BackfillRequestData, BoxedPyFuture, ConditionEvalWriteMsg, MaterializationRequestData,
+    PY_EVAL_PERMITS, PrecomputedArgs, ResolvedEvalMode, RunRequestData, RunRerunRequest, RunType,
+    SensorOutcome, TickOutcome, TickWriteMsg,
 };
 
 // RunBackend uses RPITIT so isn't object-safe; enum dispatch instead.

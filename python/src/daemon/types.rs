@@ -8,11 +8,11 @@ use jiff::Timestamp;
 use pyo3::prelude::*;
 use rivers_core::storage::{ConditionEvalRecord, TickRecord};
 
-/// Limits concurrent `spawn_blocking` threads waiting for the GIL — prevents
-/// thundering-herd (~8MB stack per blocked thread). Gates ALL GIL interactions:
-/// sync evals, async Phase 1/3, and subprocess submit/parse. See
+/// Caps how many sensor and schedule evaluations run Python at once (sync
+/// evals, async Phase 1/3, subprocess submit/parse), so blocked
+/// `spawn_blocking` threads (~8MB stack each) do not pile up. See
 /// [`crate::runtime`] for the broader spawn-primitive guide.
-pub(crate) static GIL_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
+pub(crate) static PY_EVAL_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 #[derive(Clone, Debug)]
