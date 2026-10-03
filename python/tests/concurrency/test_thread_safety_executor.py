@@ -1,11 +1,15 @@
-"""Thread-safety of step inputs that a step shares between its own threads."""
+"""Thread-safety of steps: inputs a step shares between its own threads, and
+the other threads of the process while a step waits for a command."""
 
 import gc
+import json
+import threading
 import time
+from pathlib import Path
 
 import obstore.store
 import pytest
-from _threads import N_THREADS, run_threads
+from _threads import N_THREADS, run_in_child, run_threads
 
 import rivers as rs
 
@@ -93,3 +97,56 @@ def test_collect_stream_shared_between_threads(executor, consumer, tmp_path):
         expected,
         expected,
     ]
+
+
+WAIT_FOR_FLAG = (
+    "touch started; for i in $(seq 100); do"
+    " [ -f flag ] && echo seen && exit 0; sleep 0.05; done;"
+    " echo 'no flag' >&2; exit 1"
+)
+
+
+def bash_command_beside_python_thread(how):
+    """Child process of ``test_bash_command_lets_other_threads_run``."""
+    task = rs.BashTask(name="wait_for_flag", command=WAIT_FOR_FLAG)
+    done = threading.Event()
+
+    def run_command():
+        try:
+            if how == "call":
+                return task()
+            repo = rs.CodeRepository(
+                assets=[], tasks=[task], default_executor=EXECUTORS[how]()
+            )
+            repo.materialize()
+            return repo.load_node("wait_for_flag")
+        finally:
+            done.set()
+
+    def raise_flag():
+        while not Path("started").exists():
+            if done.wait(0.01):
+                return
+        gc.collect()
+        Path("flag").touch()
+
+    results, errors = run_threads(lambda i: (run_command, raise_flag)[i](), n=2)
+    print(json.dumps({"errors": errors, "output": results[0]}))
+
+
+@pytest.mark.parametrize("how", ["call", *EXECUTORS])
+def test_bash_command_lets_other_threads_run(how, tmp_path):
+    """Another Python thread runs, and collects garbage, while a ``BashTask``
+    waits for its command: the command ends only when that thread writes the
+    flag file."""
+    proc = run_in_child(
+        "concurrency.test_thread_safety_executor:bash_command_beside_python_thread",
+        how,
+        cwd=tmp_path,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.splitlines()[-1]) == {
+        "errors": [],
+        "output": "seen",
+    }
