@@ -10,8 +10,9 @@
 //!
 //! Two volume modes, one shape: `subPath` mounts keep `/workspace/src` and
 //! `/workspace/venv` byte-identical whether the tree lives on the shared
-//! RWX PVC or in a per-pod `emptyDir`. What varies is the `volumes:` stanza
-//! and which pods carry an init container:
+//! RWX PVC or in a per-pod `emptyDir`. What varies is the `volumes:` stanza,
+//! the uv cache (only the shared PVC keeps one) and which pods carry an init
+//! container:
 //!
 //! * **builder** (the code-location pod) — always runs
 //!   `rivers-workspace-sync`; in shared mode it additionally mounts the PVC
@@ -213,7 +214,14 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
         env.push(env_var("RIVERS_DEPS_TIMEOUT_SECONDS", &t.to_string()));
     }
     env.push(env_var("UV_PROJECT_ENVIRONMENT", VENV_PATH));
-    env.push(env_var("UV_CACHE_DIR", UV_CACHE_MOUNT));
+    let shared = matches!(spec.volume, WorkspaceVolume::SharedPvc { .. });
+    // A fallback pod's cache is never reused, and it would hold a second copy
+    // of the venv inside the size-limited emptyDir.
+    env.push(if shared {
+        env_var("UV_CACHE_DIR", UV_CACHE_MOUNT)
+    } else {
+        env_var("UV_NO_CACHE", "1")
+    });
     env.push(env_var("UV_LINK_MODE", "copy"));
     env.push(env_var("UV_COMPILE_BYTECODE", "1"));
 
@@ -244,18 +252,18 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
     }
     let env = crate::env::merge_env(env, spec.extra_env.iter().cloned());
 
-    let mut mounts = vec![
-        workspace_mount(spec, false),
-        VolumeMount {
+    let mut mounts = vec![workspace_mount(spec, false)];
+    if shared {
+        mounts.push(VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
             mount_path: UV_CACHE_MOUNT.to_string(),
             sub_path: Some(UV_CACHE_SUBPATH.to_string()),
             ..Default::default()
-        },
-    ];
+        });
+    }
     // The prune step needs to see sibling trees — volume root, builder only,
     // and only where siblings exist (the shared PVC).
-    if role == SyncRole::Builder && matches!(spec.volume, WorkspaceVolume::SharedPvc { .. }) {
+    if role == SyncRole::Builder && shared {
         mounts.push(VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
             mount_path: WORKSPACES_ROOT_MOUNT.to_string(),
@@ -577,16 +585,27 @@ mod tests {
                 { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
             ])
         );
-        // No /workspaces root mount (nothing to prune), otherwise identical.
+        // No uv cache and no /workspaces root mount, otherwise identical.
         let fb_init = &fb.init_containers[0];
         let sh_init = &shared_pieces.init_containers[0];
-        assert_eq!(fb_init.env, sh_init.env, "init env identical across modes");
+        let without_cache = |c: &Container| -> Vec<EnvVar> {
+            c.env
+                .iter()
+                .flatten()
+                .filter(|e| !matches!(e.name.as_str(), "UV_CACHE_DIR" | "UV_NO_CACHE"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            without_cache(fb_init),
+            without_cache(sh_init),
+            "init env identical across modes apart from the uv cache"
+        );
         let fb_mounts = serde_json::to_value(fb_init.volume_mounts.as_ref().unwrap()).unwrap();
         assert_eq!(
             fb_mounts,
             json!([
                 { "name": "workspace", "mountPath": "/workspace", "subPath": "9f3c1ab8d2e4-1a2b3c4d" },
-                { "name": "workspace", "mountPath": "/uv-cache", "subPath": "cache" },
                 { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
             ])
         );
@@ -676,6 +695,53 @@ mod tests {
     }
 
     #[test]
+    fn only_the_shared_builder_keeps_a_uv_cache() {
+        for (shape, pieces, cache_env, cache_mounts) in [
+            (
+                "builder shared",
+                builder_pod_pieces(&spec(shared())),
+                json!([{ "name": "UV_CACHE_DIR", "value": "/uv-cache" }]),
+                json!([{ "name": "workspace", "mountPath": "/uv-cache", "subPath": "cache" }]),
+            ),
+            (
+                "builder fallback",
+                builder_pod_pieces(&spec(fallback())),
+                json!([{ "name": "UV_NO_CACHE", "value": "1" }]),
+                json!([]),
+            ),
+            (
+                "consumer fallback",
+                consumer_pod_pieces(&spec(fallback())),
+                json!([{ "name": "UV_NO_CACHE", "value": "1" }]),
+                json!([]),
+            ),
+        ] {
+            let init = &pieces.init_containers[0];
+            let env: Vec<_> = init
+                .env
+                .iter()
+                .flatten()
+                .filter(|e| matches!(e.name.as_str(), "UV_CACHE_DIR" | "UV_NO_CACHE"))
+                .collect();
+            assert_eq!(serde_json::to_value(&env).unwrap(), cache_env, "{shape}");
+            let mounts: Vec<_> = init
+                .volume_mounts
+                .iter()
+                .flatten()
+                .filter(|m| {
+                    m.mount_path == UV_CACHE_MOUNT
+                        || m.sub_path.as_deref() == Some(UV_CACHE_SUBPATH)
+                })
+                .collect();
+            assert_eq!(
+                serde_json::to_value(&mounts).unwrap(),
+                cache_mounts,
+                "{shape}"
+            );
+        }
+    }
+
+    #[test]
     fn every_pod_shape_sets_the_runtime_fs_group() {
         for (shape, pieces) in [
             ("builder shared", builder_pod_pieces(&spec(shared()))),
@@ -695,8 +761,8 @@ mod tests {
     fn user_env_replaces_same_named_sync_env() {
         let mut s = spec(shared());
         s.extra_env.push(EnvVar {
-            name: "UV_CACHE_DIR".to_string(),
-            value: Some("/custom-cache".to_string()),
+            name: "UV_COMPILE_BYTECODE".to_string(),
+            value: Some("0".to_string()),
             ..Default::default()
         });
         let fb = WorkspaceSpec {
@@ -709,13 +775,13 @@ mod tests {
             ("consumer fallback", consumer_pod_pieces(&fb)),
         ] {
             let env = pieces.init_containers[0].env.as_ref().unwrap();
-            let cache: Vec<_> = env
+            let compile: Vec<_> = env
                 .iter()
-                .filter(|e| e.name == "UV_CACHE_DIR")
+                .filter(|e| e.name == "UV_COMPILE_BYTECODE")
                 .map(|e| e.value.as_deref())
                 .collect();
             // Server-side apply rejects duplicate names in a container's env.
-            assert_eq!(cache, vec![Some("/custom-cache")], "{shape}");
+            assert_eq!(compile, vec![Some("0")], "{shape}");
         }
     }
 

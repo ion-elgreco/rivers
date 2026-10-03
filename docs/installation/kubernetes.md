@@ -195,6 +195,15 @@ step pod — a wide fan-out starts as fast as image mode. Without RWX
 storage every pod builds its own tree; that's fine for
 `executor: parallel` but slow for wide `executor: kubernetes` fan-outs.
 
+**uv cache**: in shared mode, uv's cache is on the PVC (`cache/`). After
+each successful build, the code-location pod runs `uv cache prune --ci`:
+only the wheels that uv built from source stay, and pre-built wheels
+download again on the next build. In fallback mode, pods install with
+`UV_NO_CACHE=1` and keep no cache. The `emptyDir` limit
+(`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`) must hold
+the checkout and the venv. During an install, uv's temporary copy of the
+wheels is in the container's `/tmp`, outside this limit.
+
 **Which commit a run uses**: runs get the last *fully rolled-out* commit.
 After a push, the operator rolls the code-location pods to the new
 commit, but `status.resolvedCommit` moves to it only when every pod runs

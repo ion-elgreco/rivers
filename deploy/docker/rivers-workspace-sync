@@ -23,6 +23,8 @@
 #   /workspace        this tree (subPath mount): src/ venv/ .ready .lock
 #   /workspaces       PVC root — present only on the code-location pod,
 #                     only there does the prune step have siblings to walk
+#   /uv-cache         uv cache, subPath cache/ of the PVC — shared mode
+#                     only; fallback pods install with UV_NO_CACHE
 #   /etc/rivers/git   mounted git Secret: username/password or
 #                     identity + known_hosts
 #
@@ -31,6 +33,7 @@
 #     retried, never one that looks complete;
 #   * the prune runs on EVERY invocation, including the .ready
 #     short-circuit — reclamation triggers on pod starts, not commits;
+#   * the uv cache is pruned only after a build, the one step that fills it;
 #   * prune failures are non-fatal — a full volume must not block the tree
 #     that was just built successfully.
 
@@ -261,3 +264,9 @@ fi
 : >"$READY" # written LAST — the only "this tree is usable" signal
 log "workspace ready"
 prune || log "prune failed (non-fatal)"
+# Shared mode only: fallback pods install with UV_NO_CACHE. `--ci` keeps just
+# the wheels uv built from source. uv >= 0.8.19 locks its cache, so this waits
+# for other pods' installs instead of removing files under them.
+if [ -d "$WORKSPACES_ROOT" ]; then
+    uv cache prune --ci || log "uv cache prune failed (non-fatal)"
+fi
