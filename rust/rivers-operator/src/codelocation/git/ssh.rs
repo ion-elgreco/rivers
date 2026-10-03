@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! decode key + read known_hosts → connect → publickey auth → open session
-//!         → exec "git-upload-pack '<path>'" → buffer stdout → parse
+//!         → exec "git-upload-pack '<path>'" → buffer stdout up to the
+//!           advertisement's flush-pkt → send a flush-pkt + EOF → parse
 //! ```
 //!
 //! The Secret's key and `known_hosts` are used as contents and both are
@@ -19,12 +20,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gix_packetline::PacketLineRef;
+use gix_packetline::decode::{Stream, streaming};
 use russh::ChannelMsg;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 
 use super::http::DEFAULT_MAX_ADVERTISEMENT_BYTES;
 use super::{GitError, known_hosts};
+
+/// How long upload-pack gets to exit once it has the client's flush-pkt.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// `ssh://user@host[:port]/path`, decomposed. Only the `ssh://` URL form
 /// is accepted — scp-like `git@host:path` strings are rejected at admission
@@ -214,8 +220,10 @@ pub(crate) async fn fetch_advertisement_with_cap(
     channel.exec(true, command).await?;
 
     let mut body = Vec::new();
+    let mut scanned = 0;
     let mut stderr = Vec::new();
     let mut exit_status = None;
+    let mut advertised = false;
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
@@ -225,6 +233,10 @@ pub(crate) async fn fetch_advertisement_with_cap(
                         "advertisement exceeds {cap} bytes"
                     )));
                 }
+                advertised = reaches_flush(&body, &mut scanned)?;
+                if advertised {
+                    break;
+                }
             }
             // ext 1 == SSH_EXTENDED_DATA_STDERR — upload-pack's error text.
             ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
@@ -232,11 +244,17 @@ pub(crate) async fn fetch_advertisement_with_cap(
             _ => {}
         }
     }
+    if advertised {
+        let _ = tokio::time::timeout(EXIT_GRACE, want_nothing(&mut channel)).await;
+    }
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
 
     match exit_status {
+        // As for `git ls-remote`: once the refs are in, how upload-pack
+        // exits does not matter.
+        _ if advertised => Ok(body),
         Some(0) => Ok(body),
         // Some servers close without sending an exit-status; the parser's
         // flush-required strictness catches a truncated body.
@@ -253,6 +271,40 @@ pub(crate) async fn fetch_advertisement_with_cap(
     }
 }
 
+/// Advances `scanned` past the whole pkt-lines in `stdout`; true once it
+/// passes a flush-pkt — over ssh, the end of the advertisement.
+fn reaches_flush(stdout: &[u8], scanned: &mut usize) -> Result<bool, GitError> {
+    loop {
+        match streaming(&stdout[*scanned..]) {
+            Ok(Stream::Complete {
+                line,
+                bytes_consumed,
+            }) => {
+                *scanned += bytes_consumed;
+                if matches!(line, PacketLineRef::Flush) {
+                    return Ok(true);
+                }
+            }
+            Ok(Stream::Incomplete { .. }) => return Ok(false),
+            Err(e) => return Err(GitError::Malformed(e.to_string())),
+        }
+    }
+}
+
+/// After the advertisement upload-pack waits for the client's wants. A
+/// flush-pkt in their place asks for nothing and it exits 0; an EOF alone
+/// makes it exit 128. Returns once it has exited.
+async fn want_nothing(channel: &mut russh::Channel<client::Msg>) {
+    if channel.data_bytes(&b"0000"[..]).await.is_err() || channel.eof().await.is_err() {
+        return;
+    }
+    while let Some(msg) = channel.wait().await {
+        if matches!(msg, ChannelMsg::ExitStatus { .. }) {
+            return;
+        }
+    }
+}
+
 /// In-process russh git server for tests — shared with the resolver tests in
 /// `super::mod`, which is why it lives outside the `tests` module.
 #[cfg(test)]
@@ -263,6 +315,7 @@ pub(crate) mod test_server {
     use russh::{Channel, ChannelId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     // Fixed ed25519 fixtures generated once with ssh-keygen; the pubkeys
     // pair with the private keys below.
@@ -340,19 +393,34 @@ Qjm9zYDGIBlKeGwA==
 -----END OPENSSH PRIVATE KEY-----
 ";
 
+    /// What the server does once the advertisement is out.
+    #[derive(Clone, Copy)]
+    pub(crate) enum AfterAdvertisement {
+        /// Waits for the client's request, as git-upload-pack does: a
+        /// flush-pkt ends it with exit 0, an EOF before one with exit 128.
+        AwaitRequest,
+        /// Exits with this status and closes the channel at once.
+        Exit(u32),
+    }
+
     #[derive(Clone)]
     pub(crate) struct ServerBehaviour {
         pub(crate) advertisement: Vec<u8>,
         pub(crate) expected_command: String,
-        pub(crate) exit_status: u32,
+        pub(crate) after_advertisement: AfterAdvertisement,
         pub(crate) stderr: Option<&'static str>,
         pub(crate) authorized_pub: &'static str,
         /// The host keys the server can present.
         pub(crate) host_keys: Vec<&'static str>,
+        /// How often the server sends an SSH keepalive while the client is
+        /// silent.
+        pub(crate) keepalive: Option<Duration>,
         /// The connections the server accepted.
         pub(crate) connections: Arc<AtomicUsize>,
         /// The commands clients asked to exec, in order.
         pub(crate) commands: Arc<Mutex<Vec<String>>>,
+        /// What clients wrote to upload-pack's stdin.
+        pub(crate) received: Arc<Mutex<Vec<u8>>>,
     }
 
     impl Default for ServerBehaviour {
@@ -360,12 +428,14 @@ Qjm9zYDGIBlKeGwA==
             Self {
                 advertisement: fixtures::ssh_adv(),
                 expected_command: "git-upload-pack '/acme/pipelines.git'".to_string(),
-                exit_status: 0,
+                after_advertisement: AfterAdvertisement::AwaitRequest,
                 stderr: None,
                 authorized_pub: CLIENT_PUB,
                 host_keys: vec![HOST_KEY],
+                keepalive: None,
                 connections: Arc::default(),
                 commands: Arc::default(),
+                received: Arc::default(),
             }
         }
     }
@@ -377,6 +447,10 @@ Qjm9zYDGIBlKeGwA==
 
         pub(crate) fn commands(&self) -> Vec<String> {
             self.commands.lock().unwrap().clone()
+        }
+
+        pub(crate) fn received(&self) -> Vec<u8> {
+            self.received.lock().unwrap().clone()
         }
     }
 
@@ -390,12 +464,31 @@ Qjm9zYDGIBlKeGwA==
             self.behaviour.connections.fetch_add(1, Ordering::SeqCst);
             TestSession {
                 behaviour: self.behaviour.clone(),
+                request: Vec::new(),
+                exited: false,
             }
         }
     }
 
     struct TestSession {
         behaviour: ServerBehaviour,
+        /// What this session's client wrote to upload-pack's stdin.
+        request: Vec<u8>,
+        exited: bool,
+    }
+
+    impl TestSession {
+        fn exit(
+            &mut self,
+            channel: ChannelId,
+            status: u32,
+            session: &mut Session,
+        ) -> Result<(), russh::Error> {
+            self.exited = true;
+            session.exit_status_request(channel, status)?;
+            session.eof(channel)?;
+            session.close(channel)
+        }
     }
 
     impl server::Handler for TestSession {
@@ -446,17 +539,7 @@ Qjm9zYDGIBlKeGwA==
                 .push(String::from_utf8_lossy(data).into_owned());
             // Exact byte match — this is also what proves the client's
             // shell-quoting reached the wire literally.
-            if data == self.behaviour.expected_command.as_bytes() {
-                session.channel_success(channel)?;
-                session.data(
-                    channel,
-                    bytes::Bytes::from(self.behaviour.advertisement.clone()),
-                )?;
-                if let Some(err) = self.behaviour.stderr {
-                    session.extended_data(channel, 1, bytes::Bytes::from_static(err.as_bytes()))?;
-                }
-                session.exit_status_request(channel, self.behaviour.exit_status)?;
-            } else {
+            if data != self.behaviour.expected_command.as_bytes() {
                 session.channel_failure(channel)?;
                 session.extended_data(
                     channel,
@@ -466,11 +549,54 @@ Qjm9zYDGIBlKeGwA==
                         String::from_utf8_lossy(data)
                     )),
                 )?;
-                session.exit_status_request(channel, 127)?;
+                return self.exit(channel, 127, session);
             }
-            session.eof(channel)?;
-            session.close(channel)?;
+            session.channel_success(channel)?;
+            session.data(
+                channel,
+                bytes::Bytes::from(self.behaviour.advertisement.clone()),
+            )?;
+            if let Some(err) = self.behaviour.stderr {
+                session.extended_data(channel, 1, bytes::Bytes::from_static(err.as_bytes()))?;
+            }
+            match self.behaviour.after_advertisement {
+                AfterAdvertisement::AwaitRequest => Ok(()),
+                AfterAdvertisement::Exit(status) => self.exit(channel, status, session),
+            }
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.behaviour
+                .received
+                .lock()
+                .unwrap()
+                .extend_from_slice(data);
+            self.request.extend_from_slice(data);
+            if !self.exited && self.request.starts_with(b"0000") {
+                return self.exit(channel, 0, session);
+            }
             Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if self.exited {
+                return Ok(());
+            }
+            session.extended_data(
+                channel,
+                1,
+                bytes::Bytes::from_static(b"fatal: the remote end hung up unexpectedly\n"),
+            )?;
+            self.exit(channel, 128, session)
         }
     }
 
@@ -484,6 +610,7 @@ Qjm9zYDGIBlKeGwA==
                 .iter()
                 .map(|key| decode_secret_key(key, None).unwrap())
                 .collect(),
+            keepalive_interval: behaviour.keepalive,
             ..Default::default()
         });
         tokio::spawn(async move {
@@ -528,18 +655,35 @@ mod tests {
         }
     }
 
+    /// The operator's default `RIVERS_GIT_TIMEOUT_SECONDS`.
+    const OPERATOR_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Spawn `server` and resolve `main` with a `known_hosts` that pins only
-    /// `pinned` for it. Returns the server's port and the commit.
+    /// `pinned` for it, with the operator's default timeout. Returns the
+    /// server's port and the commit.
     async fn resolve_main_pinning(
         server: &ServerBehaviour,
         pinned: &str,
+    ) -> (u16, Result<String, GitError>) {
+        resolve_main(server, pinned, OPERATOR_TIMEOUT).await
+    }
+
+    /// [`resolve_main_pinning`] with `timeout`; the resolve must end within
+    /// 5s.
+    async fn resolve_main(
+        server: &ServerBehaviour,
+        pinned: &str,
+        timeout: Duration,
     ) -> (u16, Result<String, GitError>) {
         let port = spawn_server(server.clone()).await;
         let known_hosts = known_hosts_pinning(port, pinned);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
-        let commit = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
+        let auth = client_auth(&known_hosts);
+        let fetch = fetch_advertisement(&target, &auth, timeout);
+        let commit = tokio::time::timeout(Duration::from_secs(5), fetch)
             .await
+            .expect("the resolve did not end within 5s")
             .map(|bytes| {
                 let adv = parse_advertisement(&bytes).unwrap();
                 commit_for_ref(&adv, &fixtures::branch("main"))
@@ -547,6 +691,69 @@ mod tests {
                     .commit
             });
         (port, commit)
+    }
+
+    #[tokio::test]
+    async fn the_resolve_asks_upload_pack_for_nothing_and_ends_without_waiting_for_it() {
+        let server = forge();
+        let (_, commit) = resolve_main_pinning(&server, HOST_PUB).await;
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+        assert_eq!(server.received(), b"0000");
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_keepalives_do_not_hold_the_resolve_open() {
+        // Each keepalive restarts the 2s timeout.
+        let server = ServerBehaviour {
+            keepalive: Some(Duration::from_secs(1)),
+            ..forge()
+        };
+        let (_, commit) = resolve_main(&server, HOST_PUB, Duration::from_secs(2)).await;
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+        assert_eq!(server.received(), b"0000");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_closes_after_the_advertisement_still_resolves() {
+        let server = ServerBehaviour {
+            after_advertisement: AfterAdvertisement::Exit(0),
+            ..forge()
+        };
+        let (_, commit) = resolve_main_pinning(&server, HOST_PUB).await;
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+    }
+
+    #[test]
+    fn the_advertisement_ends_at_its_flush_pkt_however_stdout_is_split() {
+        let adv = fixtures::ssh_adv();
+        let mut stdout = Vec::new();
+        let mut scanned = 0;
+        let mut ends = Vec::new();
+        for &byte in &adv {
+            stdout.push(byte);
+            if reaches_flush(&stdout, &mut scanned).unwrap() {
+                ends.push(stdout.len());
+            }
+        }
+        assert_eq!(ends, [adv.len()]);
+    }
+
+    #[tokio::test]
+    async fn text_before_the_advertisement_fails_without_waiting_for_the_server() {
+        // A login shell that prints a greeting on stdout.
+        let mut advertisement = b"Welcome to the forge!\n".to_vec();
+        advertisement.extend(fixtures::ssh_adv());
+        let server = ServerBehaviour {
+            advertisement,
+            ..forge()
+        };
+        let (_, commit) = resolve_main_pinning(&server, HOST_PUB).await;
+        let err = commit.unwrap_err();
+        assert!(
+            matches!(err, GitError::Malformed(ref m) if m.contains("line length")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -710,7 +917,7 @@ mod tests {
     async fn nonzero_exit_surfaces_stderr() {
         let behaviour = ServerBehaviour {
             advertisement: Vec::new(),
-            exit_status: 128,
+            after_advertisement: AfterAdvertisement::Exit(128),
             stderr: Some("fatal: '/acme/pipelines.git' does not appear to be a git repository"),
             ..Default::default()
         };
