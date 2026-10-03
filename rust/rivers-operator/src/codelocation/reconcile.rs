@@ -26,12 +26,13 @@ use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
     CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationSpec, CodeLocationStatus,
-    IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER, REASON_COMMIT_PINNED,
-    REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED, REASON_GIT_AUTH_FAILED,
-    REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE, REASON_GIT_RATE_LIMITED,
-    REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_INVALID_URL, REASON_MIN_REPLICAS,
-    REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE, REASON_RATE_LIMITED,
-    REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT, REASON_TAG_NOT_FOUND,
+    GitRef, IMMUTABLE_TAG_ANNOTATION, REASON_AUTH_FAILED, REASON_AWAITING_LEADER,
+    REASON_COMMIT_PINNED, REASON_COMMIT_RESOLVED, REASON_DIGEST_PINNED, REASON_DIGEST_RESOLVED,
+    REASON_GIT_AUTH_FAILED, REASON_GIT_HOST_KEY_REJECTED, REASON_GIT_MALFORMED_RESPONSE,
+    REASON_GIT_RATE_LIMITED, REASON_GIT_UNREACHABLE, REASON_INVALID_REF, REASON_INVALID_URL,
+    REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS, REASON_PROGRESS_DEADLINE,
+    REASON_RATE_LIMITED, REASON_REF_NOT_FOUND, REASON_REGISTRY_ERROR, REASON_ROLLING_OUT,
+    REASON_TAG_NOT_FOUND,
 };
 
 use super::git::{self, GitCredentials, GitResolveRequest};
@@ -366,27 +367,43 @@ async fn reconcile_git(
         return Ok(Action::requeue(FOLLOWER_WAIT));
     }
 
+    let serving = cl.status.as_ref().is_some_and(|s| s.run_source.is_some());
+
     // Runtime image first, through the same registry pipeline as image mode.
     let timer = Instant::now();
-    let (resolved_image, image_reason) = match resolve_image(cl, ctx, secrets_api).await {
-        ImageOutcome::Resolved {
-            resolved_image,
-            reason,
-            ..
-        } => {
-            metrics::observe_resolution_seconds(timer.elapsed().as_secs_f64());
-            (resolved_image, reason)
-        }
-        ImageOutcome::AwaitingLeader => {
-            patch_waiting_status(code_locations_api, &name, generation, cl).await?;
-            return Ok(Action::requeue(FOLLOWER_WAIT));
-        }
-        ImageOutcome::Error(err) => {
-            let retry = err.retry_after();
-            patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
-            return Ok(Action::requeue(retry));
-        }
-    };
+    let (resolved_image, image_reason, refresh_after, immutable) =
+        match resolve_image(cl, ctx, secrets_api).await {
+            ImageOutcome::Resolved {
+                resolved_image,
+                reason,
+                refresh_after,
+                immutable,
+            } => {
+                metrics::observe_resolution_seconds(timer.elapsed().as_secs_f64());
+                (resolved_image, reason, refresh_after, immutable)
+            }
+            ImageOutcome::AwaitingLeader => {
+                patch_waiting_status(code_locations_api, &name, generation, cl).await?;
+                return Ok(Action::requeue(FOLLOWER_WAIT));
+            }
+            ImageOutcome::Error(err) => {
+                let retry = err.retry_after();
+                if err.is_transient() && serving {
+                    // The Deployment keeps the tree it runs until the
+                    // registry answers again.
+                    let update = GitStatusUpdate {
+                        resolution: Some(GitResolution::ImageFailed(err)),
+                        fetched_at: None,
+                        rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
+                        endpoint,
+                    };
+                    patch_git_status(code_locations_api, &name, cl, update).await?;
+                } else {
+                    patch_error_status(code_locations_api, &name, generation, cl, &err).await?;
+                }
+                return Ok(Action::requeue(retry));
+            }
+        };
 
     let poll = parse_refresh_interval(git_spec.poll_interval.as_deref());
     let resolution = match git_credentials(git_spec, secrets_api).await {
@@ -407,12 +424,11 @@ async fn reconcile_git(
             let retry = failure
                 .retry_after
                 .unwrap_or_else(|| git_error_reason_retry(&failure.error).1);
-            let serving = cl.status.as_ref().is_some_and(|s| s.run_source.is_some());
             if failure.error.is_transient() && serving {
                 // The Deployment keeps the tree it runs until a commit
                 // resolves again.
                 let update = GitStatusUpdate {
-                    resolution: Some(GitResolution {
+                    resolution: Some(GitResolution::ImageResolved {
                         image: resolved_image,
                         image_reason,
                         source: Err(failure),
@@ -442,7 +458,7 @@ async fn reconcile_git(
     let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
     let rolling_out = !rollout.complete;
     let update = GitStatusUpdate {
-        resolution: Some(GitResolution {
+        resolution: Some(GitResolution::ImageResolved {
             image: resolved_image,
             image_reason,
             source: Ok(resolved),
@@ -453,26 +469,40 @@ async fn reconcile_git(
     };
     let phase = patch_git_status(code_locations_api, &name, cl, update).await?;
 
-    let pinned = git_spec
-        .r#ref
-        .commit
-        .as_deref()
-        .is_some_and(|c| !c.is_empty());
-    let immutable_tag = git_spec
-        .r#ref
-        .tag
-        .as_deref()
-        .is_some_and(super::registry::looks_immutable);
     let requeue = if rolling_out || !matches!(phase, CodeLocationPhase::Ready) {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
-    } else if pinned {
-        Action::await_change()
-    } else if immutable_tag {
-        Action::requeue(jitter(Duration::from_secs(3600)))
     } else {
-        Action::requeue(jitter(poll))
+        git_requeue(&git_spec.r#ref, poll, refresh_after, immutable)
     };
     Ok(requeue)
+}
+
+/// When a Ready git code location whose rollout is complete is reconciled
+/// again: after the sooner of the ref's poll and the runtime image's
+/// refresh. A pinned commit has no poll; an `image_immutable` image (a
+/// digest, or an immutable tag once resolved) no refresh, as in image mode.
+fn git_requeue(
+    git_ref: &GitRef,
+    poll: Duration,
+    image_refresh: Duration,
+    image_immutable: bool,
+) -> Action {
+    let ref_poll = if git_ref.commit.as_deref().is_some_and(|c| !c.is_empty()) {
+        None
+    } else if git_ref
+        .tag
+        .as_deref()
+        .is_some_and(super::registry::looks_immutable)
+    {
+        Some(Duration::from_secs(3600))
+    } else {
+        Some(poll)
+    };
+    let image_refresh = (!image_immutable).then_some(image_refresh);
+    match ref_poll.into_iter().chain(image_refresh).min() {
+        Some(after) => Action::requeue(jitter(after)),
+        None => Action::await_change(),
+    }
 }
 
 /// Apply the git CL's owned resources: (shared mode) the workspace PVC and
@@ -960,12 +990,17 @@ struct GitStatusUpdate {
 }
 
 /// The leader's runtime-image and ref resolution of this pass.
-struct GitResolution {
-    image: String,
-    image_reason: &'static str,
-    /// The ref's commit, or the transient failure that left the serving
-    /// tree in place.
-    source: Result<git::ResolvedRef, git::GitFailure>,
+enum GitResolution {
+    ImageResolved {
+        image: String,
+        image_reason: &'static str,
+        /// The ref's commit, or the transient failure that left the serving
+        /// tree in place.
+        source: Result<git::ResolvedRef, git::GitFailure>,
+    },
+    /// A transient registry error left the serving tree in place before
+    /// the ref was resolved.
+    ImageFailed(ImageError),
 }
 
 /// Publish a git CL's status; returns the phase it published.
@@ -1054,8 +1089,12 @@ fn git_status(
         run_source: serving,
     };
     match update.resolution {
-        Some(resolution) => {
-            let (source_status, source_reason, source_message) = match resolution.source {
+        Some(GitResolution::ImageResolved {
+            image,
+            image_reason,
+            source,
+        }) => {
+            let (source_status, source_reason, source_message) = match source {
                 Ok(resolved) if resolved.ref_name.is_none() => {
                     ("True", REASON_COMMIT_PINNED, resolved.commit)
                 }
@@ -1070,8 +1109,8 @@ fn git_status(
                 prior,
                 CONDITION_IMAGE_RESOLVED,
                 "True",
-                resolution.image_reason,
-                Some(resolution.image),
+                image_reason,
+                Some(image),
                 now,
             );
             push_condition(
@@ -1084,15 +1123,24 @@ fn git_status(
                 now,
             );
         }
-        None => status.conditions.extend(
-            prior
-                .iter()
-                .flat_map(|s| &s.conditions)
-                .filter(|c| {
-                    c.r#type == CONDITION_IMAGE_RESOLVED || c.r#type == CONDITION_SOURCE_RESOLVED
-                })
-                .cloned(),
-        ),
+        Some(GitResolution::ImageFailed(err)) => {
+            push_condition(
+                &mut status,
+                prior,
+                CONDITION_IMAGE_RESOLVED,
+                "False",
+                err.reason(),
+                Some(err.message()),
+                now,
+            );
+            status
+                .conditions
+                .extend(kept_conditions(prior, &[CONDITION_SOURCE_RESOLVED]));
+        }
+        None => status.conditions.extend(kept_conditions(
+            prior,
+            &[CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED],
+        )),
     }
     push_condition(
         &mut status,
@@ -1104,15 +1152,30 @@ fn git_status(
         now,
     );
     // A resolution error first: until it clears, no commit that fixes the
-    // build reaches the pods. From the condition, so followers that copy it
-    // publish the same.
+    // build reaches the pods. From the conditions, so followers that copy
+    // them publish the same.
     status.message = status
         .conditions
         .iter()
-        .find(|c| c.r#type == CONDITION_SOURCE_RESOLVED && c.status == "False")
+        .find(|c| {
+            c.status == "False"
+                && (c.r#type == CONDITION_IMAGE_RESOLVED || c.r#type == CONDITION_SOURCE_RESOLVED)
+        })
         .and_then(|c| c.message.clone())
         .or(build_failure);
     status
+}
+
+/// `prior`'s conditions of the `kinds` this pass did not resolve again.
+fn kept_conditions<'a>(
+    prior: Option<&'a CodeLocationStatus>,
+    kinds: &'a [&'a str],
+) -> impl Iterator<Item = CodeLocationCondition> + 'a {
+    prior
+        .into_iter()
+        .flat_map(|s| &s.conditions)
+        .filter(move |c| kinds.contains(&c.r#type.as_str()))
+        .cloned()
 }
 
 async fn patch_git_error(
@@ -1215,6 +1278,11 @@ impl ImageError {
             ImageError::NotFound | ImageError::AuthFailed => TERMINAL_RETRY,
             ImageError::Transient(_) => Duration::from_secs(60),
         }
+    }
+
+    /// The registry was down or rate-limited: a later try may succeed.
+    fn is_transient(&self) -> bool {
+        matches!(self, ImageError::Transient(_) | ImageError::RateLimited(_))
     }
 }
 
@@ -1747,6 +1815,72 @@ mod tests {
             assert!(j >= base);
             assert!(j <= base + Duration::from_secs(15));
         }
+    }
+
+    /// `action`'s requeue delay, which `Action` shows only in its `Debug`.
+    fn requeue_after(action: &Action) -> Option<Duration> {
+        if *action == Action::await_change() {
+            return None;
+        }
+        let debug = format!("{action:?}");
+        let secs = debug
+            .strip_prefix("Action { requeue_after: Some(")
+            .and_then(|rest| rest.strip_suffix("s) }"))
+            .unwrap_or_else(|| panic!("no requeue delay in {debug}"));
+        Some(Duration::from_secs_f64(secs.parse().unwrap()))
+    }
+
+    /// The delays [`jitter`] makes of `interval`.
+    fn jittered(interval: Duration) -> std::ops::RangeInclusive<Duration> {
+        interval..=interval + interval / 4
+    }
+
+    #[test]
+    fn ready_git_code_location_requeues_at_the_sooner_of_ref_poll_and_image_refresh() {
+        let minutes = |m: u64| Duration::from_secs(60 * m);
+        let (two, five, ten, hour) = (minutes(2), minutes(5), minutes(10), minutes(60));
+        let git_ref = |field: &str, value: &str| -> GitRef {
+            serde_json::from_value(serde_json::json!({ field: value })).unwrap()
+        };
+        let pinned = git_ref("commit", &"a".repeat(40));
+        let semver_tag = git_ref("tag", "v1.2.3");
+        let other_tag = git_ref("tag", "nightly");
+        let branch = git_ref("branch", "main");
+        // The runtime image as resolve_image_ref answers it, (refresh_after,
+        // immutable), with digestRefreshInterval 5m.
+        let images = [
+            ("digest", (hour, true)),
+            ("immutable tag", (five, true)),
+            ("mutable tag", (five, false)),
+        ];
+        // The requeue with each of `images`, by ref and pollInterval.
+        let table = [
+            (&pinned, two, [None, None, Some(five)]),
+            (&semver_tag, two, [Some(hour), Some(hour), Some(five)]),
+            (&branch, two, [Some(two), Some(two), Some(two)]),
+            (&branch, ten, [Some(ten), Some(ten), Some(five)]),
+            (&other_tag, ten, [Some(ten), Some(ten), Some(five)]),
+        ];
+
+        let mut wrong = Vec::new();
+        for (git_ref, poll, wants) in table {
+            for ((image, (refresh_after, immutable)), want) in images.into_iter().zip(wants) {
+                let got = requeue_after(&git_requeue(git_ref, poll, refresh_after, immutable));
+                let right = match want {
+                    None => got.is_none(),
+                    Some(want) => got.is_some_and(|got| jittered(want).contains(&got)),
+                };
+                if !right {
+                    let git_ref = serde_json::to_string(git_ref).unwrap();
+                    wrong.push(format!(
+                        "{git_ref} polled every {poll:?}, {image}: requeue after {got:?}, \
+                         want {want:?} + jitter"
+                    ));
+                }
+            }
+        }
+
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
@@ -2707,7 +2841,7 @@ mod tests {
             rollout: GitRollout,
         ) -> CodeLocationStatus {
             let update = GitStatusUpdate {
-                resolution: Some(GitResolution {
+                resolution: Some(GitResolution::ImageResolved {
                     image: runtime(target),
                     image_reason: REASON_DIGEST_PINNED,
                     source: Ok(git::ResolvedRef {
@@ -3543,14 +3677,14 @@ mod tests {
 
         const REPO: &str = "/acme/pipelines.git";
 
-        /// A git host answering ref polls with `responses` in turn, the last
-        /// one from then on.
-        async fn forge(responses: Vec<ResponseTemplate>) -> MockServer {
+        /// A server answering `verb` requests for `at` with `responses` in
+        /// turn, the last one from then on.
+        async fn answering(verb: &str, at: &str, responses: Vec<ResponseTemplate>) -> MockServer {
             let server = MockServer::start().await;
             let last = responses.len() - 1;
             for (i, response) in responses.into_iter().enumerate() {
-                let mock = Mock::given(method("GET"))
-                    .and(path(format!("{REPO}/info/refs")))
+                let mock = Mock::given(method(verb))
+                    .and(path(at))
                     .respond_with(response);
                 let mock = if i < last {
                     mock.up_to_n_times(1)
@@ -3560,6 +3694,12 @@ mod tests {
                 mock.mount(&server).await;
             }
             server
+        }
+
+        /// A git host answering ref polls with `responses` in turn, the last
+        /// one from then on.
+        async fn forge(responses: Vec<ResponseTemplate>) -> MockServer {
+            answering("GET", &format!("{REPO}/info/refs"), responses).await
         }
 
         /// The ref advertisement: `refs/heads/main` is commit `a`.
@@ -3627,10 +3767,15 @@ mod tests {
             }
         }
 
-        fn source_resolved(status: &serde_json::Value) -> (&str, &str, &str) {
-            let c = condition(status, CONDITION_SOURCE_RESOLVED);
+        /// The status, reason and message of condition `kind`.
+        fn says<'a>(status: &'a serde_json::Value, kind: &str) -> (&'a str, &'a str, &'a str) {
+            let c = condition(status, kind);
             let field = |name: &str| c[name].as_str().unwrap_or_default();
             (field("status"), field("reason"), field("message"))
+        }
+
+        fn source_resolved(status: &serde_json::Value) -> (&str, &str, &str) {
+            says(status, CONDITION_SOURCE_RESOLVED)
         }
 
         #[tokio::test]
@@ -4025,6 +4170,196 @@ mod tests {
                 template_source(&deployment).map(|source| source.git.commit),
                 Some(commit('a'))
             );
+        }
+
+        /// A registry answering HEADs of `acme/runtime:latest` with
+        /// `responses` in turn, the last one from then on.
+        async fn registry(responses: Vec<ResponseTemplate>) -> MockServer {
+            answering("HEAD", "/v2/acme/runtime/manifests/latest", responses).await
+        }
+
+        /// The registry's answer: `latest` is digest `c`.
+        fn manifest(c: char) -> ResponseTemplate {
+            ResponseTemplate::new(200).insert_header("docker-content-digest", digest(c))
+        }
+
+        /// Git CL pinned to commit a on `acme/runtime:latest` of `registry`,
+        /// refreshed every 5m.
+        fn latest_runtime_cl(registry: &MockServer) -> CodeLocation {
+            make_cl(json!({
+                "git": { "url": URL, "ref": { "commit": commit('a') } },
+                "image": format!("{}/acme/runtime", registry.address()),
+                "tag": "latest",
+                "digestRefreshInterval": "5m",
+            }))
+        }
+
+        #[tokio::test]
+        async fn pinned_commit_on_a_mutable_runtime_tag_requeues_after_digest_refresh_interval() {
+            let registry = registry(vec![manifest('b')]).await;
+            let state = api_with(latest_runtime_cl(&registry), rolled_out());
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            assert_eq!(status["phase"], "Ready", "{status}");
+            assert_eq!(status["resolvedCommit"], commit('a'));
+            assert_eq!(
+                status["resolvedImage"],
+                format!("{}/acme/runtime@{}", registry.address(), digest('b'))
+            );
+            assert_eq!(registry.received_requests().await.unwrap().len(), 1);
+            let refresh = Duration::from_secs(300);
+            let after = requeue_after(&requeue);
+            assert!(
+                after.is_some_and(|after| jittered(refresh).contains(&after)),
+                "requeue after {after:?}, want {refresh:?} plus up to a quarter"
+            );
+        }
+
+        /// The leader's first pass after the registry started answering
+        /// with `responses`: before that, digest b of `latest` rolled out
+        /// with commit a.
+        struct RegistryOutage {
+            state: ApiState,
+            /// The status before the outage.
+            serving: serde_json::Value,
+            requeue: Action,
+            requests: Vec<ApiRequest>,
+        }
+
+        async fn registry_outage(responses: Vec<ResponseTemplate>) -> RegistryOutage {
+            let mut answers = vec![manifest('b')];
+            answers.extend(responses);
+            let registry = registry(answers).await;
+            let state = api_with(latest_runtime_cl(&registry), rolled_out());
+            let serving = pass(&state, LeaderGate::leading())
+                .await
+                .expect("rollout of digest b");
+            assert_eq!(serving["phase"], "Ready", "{serving}");
+            assert_eq!(says(&serving, CONDITION_IMAGE_RESOLVED).0, "True");
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+            RegistryOutage {
+                state,
+                serving,
+                requeue,
+                requests,
+            }
+        }
+
+        #[tokio::test]
+        async fn transient_registry_error_keeps_the_serving_tree_ready() {
+            let cases = [
+                (
+                    ResponseTemplate::new(503),
+                    REASON_REGISTRY_ERROR,
+                    "status 503 Service Unavailable",
+                    Duration::from_secs(60),
+                ),
+                (
+                    ResponseTemplate::new(429).insert_header("retry-after", "900"),
+                    REASON_RATE_LIMITED,
+                    "registry rate-limited; retrying in 900s",
+                    Duration::from_secs(900),
+                ),
+            ];
+            for (answer, reason, error, retry) in cases {
+                let outage = registry_outage(vec![answer]).await;
+                let status = patched_status(&outage.requests).expect("status patch");
+
+                assert_eq!(status["phase"], "Ready", "{status}");
+                for field in [
+                    "grpcEndpoint",
+                    "readyReplicas",
+                    "runSource",
+                    "resolvedCommit",
+                    "resolvedImage",
+                    "source",
+                ] {
+                    assert_eq!(status[field], outage.serving[field], "{reason}: {field}");
+                }
+                assert_eq!(
+                    says(&status, CONDITION_IMAGE_RESOLVED),
+                    ("False", reason, error)
+                );
+                assert_eq!(status["message"], error);
+                assert_eq!(
+                    condition(&status, CONDITION_SOURCE_RESOLVED),
+                    condition(&outage.serving, CONDITION_SOURCE_RESOLVED)
+                );
+                assert_eq!(
+                    condition(&status, CONDITION_DEPLOYMENT_AVAILABLE)["reason"],
+                    REASON_MIN_REPLICAS
+                );
+                // The Deployment keeps the tree it runs.
+                let applies: Vec<_> = outage
+                    .requests
+                    .iter()
+                    .filter(|r| r.method == "PATCH" && r.path.contains("/deployments/"))
+                    .collect();
+                assert!(applies.is_empty(), "{reason}: {applies:?}");
+                assert_eq!(outage.requeue, Action::requeue(retry), "{reason}");
+                assert_eq!(
+                    pass(&outage.state, LeaderGate::new()).await,
+                    None,
+                    "{reason}: the follower disagrees"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_tag_or_failed_registry_login_still_fails_a_serving_code_location() {
+            for (code, reason) in [(404, REASON_TAG_NOT_FOUND), (401, REASON_AUTH_FAILED)] {
+                let outage = registry_outage(vec![ResponseTemplate::new(code)]).await;
+                let failed = patched_status(&outage.requests).expect("status patch");
+
+                assert_eq!(failed["phase"], "Failed", "{failed}");
+                assert_eq!(failed.get("grpcEndpoint"), None, "{failed}");
+                assert_eq!(
+                    says(&failed, CONDITION_IMAGE_RESOLVED).1,
+                    reason,
+                    "{failed}"
+                );
+                assert_eq!(
+                    outage.requeue,
+                    Action::requeue(TERMINAL_RETRY),
+                    "HTTP {code}"
+                );
+                assert_eq!(
+                    pass(&outage.state, LeaderGate::new()).await,
+                    None,
+                    "HTTP {code}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn registry_outage_fails_a_git_code_location_with_nothing_to_serve() {
+            let registry = registry(vec![ResponseTemplate::new(503)]).await;
+            let state = ApiState::default();
+            state
+                .lock()
+                .unwrap()
+                .code_locations
+                .insert("x".into(), latest_runtime_cl(&registry));
+
+            let (requeue, requests) =
+                reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let status = patched_status(&requests).expect("status patch");
+            assert_eq!(status["phase"], "Failed", "{status}");
+            assert_eq!(
+                says(&status, CONDITION_IMAGE_RESOLVED),
+                (
+                    "False",
+                    REASON_REGISTRY_ERROR,
+                    "status 503 Service Unavailable"
+                )
+            );
+            assert_eq!(requeue, Action::requeue(Duration::from_secs(60)));
         }
     }
 }

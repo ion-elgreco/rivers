@@ -183,7 +183,10 @@ image's tag or digest, e.g. `tag: 0.5.0-py3.11` for another interpreter.
 Set `spec.image` to use a private mirror
 (`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`); as
 in image mode, it then resolves `spec.tag` (default `latest`) or
-`spec.digest`.
+`spec.digest`. The operator resolves the runtime image's tag again every
+`digestRefreshInterval` (default `5m`), as in image mode, and rolls the
+pods out on a new digest. It does this also when `ref.commit` pins the
+code. It resolves a semver-like tag, such as `0.5.0-py3.11`, only once.
 
 **Dependencies** come from the repo itself. With `dependencies.mode: auto`
 (the default), the init container looks in the project directory (`path`):
@@ -366,6 +369,15 @@ one hour, and not sooner than the steps above. The message gives the
 time of the next request. Before the first commit has rolled out there
 is nothing to serve, and the CodeLocation is `Failed` until the host
 answers.
+
+The registry of the runtime image works the same way. If it does not
+answer (connection error or HTTP 5xx) or rate-limits the operator (HTTP
+429), a CodeLocation that serves a commit stays `Ready` on it, with
+`ImageResolved` `False`, reason `RegistryError` or `RateLimited`, and the
+error, also in `status.message`. The operator asks the registry again
+later, for a 429 when its `Retry-After` time is over. A tag that the
+registry does not have (`TagNotFound`) or a registry login that fails
+(`AuthenticationFailed`) sets the phase to `Failed`.
 
 A rollout shows on the `DeploymentAvailable` condition: reason
 `RollingOut` while it runs, or `ProgressDeadlineExceeded` when it is
