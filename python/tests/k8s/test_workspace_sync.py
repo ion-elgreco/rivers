@@ -16,12 +16,18 @@ Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 
 The url's scheme picks the git Secret's keys, as in the operator: ``ssh://``
 urls use ``identity`` and ``known_hosts``, other urls ``username`` and
-``password``.
+``password``. A key that the url needs and the pod cannot read stops the
+build before the fetch.
+
+The script fetches the commit by its SHA, so a branch that moves on does not
+change the tree. When that fetch fails, it fetches the branch or tag
+(``RIVERS_GIT_REF``) and verifies the commit. A pinned commit has no ref.
 
 A failed build gives kubelet the most specific termination message there is:
-the error the script found, or the time budget the build ran past. When
-``uv`` or ``git`` fails, the termination log stays empty, so kubelet reports
-the tail of the log, where their error is (``FallbackToLogsOnError``).
+the error the script found, a failed git fetch with the last lines of git's
+error, or the time budget the build ran past. When ``uv`` fails, the
+termination log stays empty, so kubelet reports the tail of the log, where
+uv's error is (``FallbackToLogsOnError``).
 """
 
 from __future__ import annotations
@@ -154,20 +160,102 @@ def test_a_failed_install_leaves_the_log_tail_to_kubelet(
     assert not (workspace_sync.tree / ".ready").exists()
 
 
-def test_a_failed_fetch_leaves_the_log_tail_to_kubelet(workspace_sync):
+MISSING_COMMIT = "f" * 40
+
+
+def test_a_pinned_commit_the_remote_lacks_fails_with_the_git_error(workspace_sync):
     workspace_sync.commit(UV_PROJECT)
 
-    # The server refuses the unknown SHA; the ref is gone too.
+    failed = workspace_sync.run(MISSING_COMMIT, shared=False)
+
+    message = workspace_sync.termination_message()
+    assert failed.returncode == 1
+    assert message.startswith(f"git fetch of commit {MISSING_COMMIT} failed: "), message
+    assert f"upload-pack: not our ref {MISSING_COMMIT}\n" in message
+    assert f"workspace-sync: ERROR: {message}" in failed.stderr
+    assert not (workspace_sync.tree / ".ready").exists()
+
+
+def test_a_url_without_a_repository_fails_with_the_git_error(workspace_sync, tmp_path):
+    commit = workspace_sync.commit(UV_PROJECT)
+
     failed = workspace_sync.run(
-        "f" * 40, shared=False, RIVERS_GIT_REF="refs/heads/gone"
+        commit, shared=False, RIVERS_GIT_URL=(tmp_path / "missing").as_uri()
     )
 
+    message = workspace_sync.termination_message()
     assert failed.returncode == 1
-    assert workspace_sync.termination_message() == ""
-    assert failed.stderr.endswith(
-        "fatal: couldn't find remote ref refs/heads/gone\n"
-        "workspace-sync: ERROR: workspace build failed (exit 128)\n"
+    assert message.startswith(f"git fetch of commit {commit} failed: "), message
+    assert "does not appear to be a git repository\n" in message
+    assert f"workspace-sync: ERROR: {message}" in failed.stderr
+
+
+def test_when_the_ref_fails_too_its_error_is_the_termination_message(workspace_sync):
+    workspace_sync.commit(UV_PROJECT)
+
+    # The remote lacks the commit, and the branch is gone.
+    failed = workspace_sync.run(
+        MISSING_COMMIT, shared=False, RIVERS_GIT_REF="refs/heads/gone"
     )
+
+    error = (
+        "git fetch of refs/heads/gone failed: "
+        "fatal: couldn't find remote ref refs/heads/gone"
+    )
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == f"{error}\n"
+    # Before it fetches the ref, the log says why the fetch by commit failed.
+    log = failed.stderr
+    by_commit = log.index(
+        f"workspace-sync: git fetch of commit {MISSING_COMMIT} failed: "
+    )
+    by_ref = log.index(
+        "workspace-sync: fetching refs/heads/gone instead, then verifying the commit\n"
+    )
+    assert f"upload-pack: not our ref {MISSING_COMMIT}\n" in log[by_commit:by_ref]
+    assert log[by_ref:].endswith(
+        f"workspace-sync: ERROR: {error}\n"
+        "workspace-sync: ERROR: workspace build failed (exit 1)\n"
+    )
+
+
+def test_a_commit_the_server_refuses_by_sha_is_fetched_by_its_ref(workspace_sync):
+    tagged = workspace_sync.commit({**UV_PROJECT, "version.txt": "1\n"})
+    workspace_sync.tag("v1")
+    workspace_sync.commit({"version.txt": "2\n"})
+    workspace_sync.refuse_fetch_by_commit()
+
+    built = workspace_sync.run(tagged, shared=False, RIVERS_GIT_REF="refs/tags/v1")
+
+    assert built.returncode == 0, built.stderr
+    assert (
+        f"workspace-sync: git fetch of commit {tagged} failed: "
+        f"error: Server does not allow request for unadvertised object {tagged}\n"
+        "workspace-sync: fetching refs/tags/v1 instead, then verifying the commit\n"
+    ) in built.stderr
+    assert (workspace_sync.tree / "src" / "version.txt").read_text() == "1\n"
+    assert (workspace_sync.tree / ".ready").exists()
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({}, id="pinned-commit"),
+        pytest.param({"RIVERS_GIT_REF": "refs/heads/main"}, id="branch"),
+    ],
+)
+def test_the_commit_is_fetched_by_its_sha_after_the_branch_moves_on(
+    workspace_sync, env
+):
+    pinned = workspace_sync.commit({**UV_PROJECT, "version.txt": "1\n"})
+    workspace_sync.commit({"version.txt": "2\n"})
+
+    built = workspace_sync.run(pinned, shared=False, **env)
+
+    assert built.returncode == 0, built.stderr
+    assert (workspace_sync.tree / "src" / "version.txt").read_text() == "1\n"
+    assert (workspace_sync.tree / ".ready").exists()
+    assert workspace_sync.uv_calls() == [_install(workspace_sync)]
 
 
 def test_a_build_past_its_time_budget_says_so_in_the_termination_message(
@@ -559,6 +647,44 @@ def test_an_ssh_url_needs_identity_and_known_hosts(workspace_sync, keys, error):
     failed = workspace_sync.run(commit, shared=False, RIVERS_GIT_URL=SSH_URL)
 
     assert failed.returncode == 1
+    assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
+    assert not (workspace_sync.tree / "src").exists()
+
+
+@pytest.mark.parametrize(
+    ("env", "keys", "unreadable"),
+    [
+        pytest.param({}, ["username", "password"], "password", id="password"),
+        pytest.param({}, ["username", "password"], "username", id="username"),
+        pytest.param(
+            {"RIVERS_GIT_URL": SSH_URL},
+            ["identity", "known_hosts"],
+            "identity",
+            id="identity",
+        ),
+        pytest.param(
+            {"RIVERS_GIT_URL": SSH_URL},
+            ["identity", "known_hosts"],
+            "known_hosts",
+            id="known_hosts",
+        ),
+    ],
+)
+def test_a_git_secret_key_the_pod_cannot_read_stops_the_build(
+    workspace_sync, env, keys, unreadable
+):
+    if os.geteuid() == 0:
+        pytest.skip("root reads files whatever their mode")
+    commit = workspace_sync.commit(UV_PROJECT)
+    _git_secret(workspace_sync, *keys)
+    path = workspace_sync.creds / unreadable
+    path.chmod(0)
+
+    failed = workspace_sync.run(commit, shared=False, **env)
+
+    error = f"cannot read the git Secret's '{unreadable}' ({path}): permission denied"
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == f"{error}\n"
     assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
     assert not (workspace_sync.tree / "src").exists()
 

@@ -333,12 +333,19 @@ commit, `status.message` and the end of the `DeploymentAvailable` message
 show the error of the pod's `workspace` init container, after
 `workspace build of main@9f3c1ab failed (Error, exit code 1):`. For an
 error that the init container finds itself, this is its own message: for
-example, a `path` that is not in the repository, or a build that did not
-finish within `dependencies.timeoutSeconds` (default 600 seconds). For all
-other errors, it is the last lines of the init container's log, which
-include the error of `uv` or `git`. Kubernetes keeps at most 80 lines or
-2048 bytes of the log for this message;
-`kubectl -n rivers logs <pod> -c workspace` shows all of it. When
+example, a `path` that is not in the repository, a key of the git Secret
+that the pod cannot read, or a build that did not finish within
+`dependencies.timeoutSeconds` (default 600 seconds). If git cannot fetch
+the commit, the message starts with `git fetch of commit <sha> failed:`
+and gives the last lines of git's error: for example
+`Permission denied (publickey)`, `Could not resolve host`, or
+`not our ref` when the repository does not have the commit. For a branch
+or a tag, the init container then fetches the branch or tag and makes sure
+that it points to the commit. If this fetch also fails, the message gives
+its error. For all other errors, such as a failed install, it is the last
+lines of the init container's log, which include the error of `uv`.
+Kubernetes keeps at most 80 lines or 2048 bytes of the log for this
+message; `kubectl -n rivers logs <pod> -c workspace` shows all of it. When
 `SourceResolved` is `False`, `status.message` shows the resolution error
 instead, because the operator cannot get a commit that repairs the build
 until that error clears. A resolution problem sets the phase to

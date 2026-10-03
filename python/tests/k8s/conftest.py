@@ -110,9 +110,9 @@ def _write_python_tool(path: Path, body: str) -> None:
 class WorkspaceSync:
     """A git remote, a workspace volume and a fake ``uv`` for the sync script.
 
-    ``volume`` stands for the workspace volume: the PVC root in shared mode,
-    the pod's emptyDir in fallback mode. ``tree`` is the subPath the pod
-    mounts at ``/workspace``.
+    The remote's commits go on its branch ``main``. ``volume`` stands for the
+    workspace volume: the PVC root in shared mode, the pod's emptyDir in
+    fallback mode. ``tree`` is the subPath the pod mounts at ``/workspace``.
 
     Args:
         tmp_path: Directory that holds everything the script touches.
@@ -139,7 +139,7 @@ class WorkspaceSync:
         _write_python_tool(bin_dir / "uv", _FAKE_UV)
         for name, body in _missing_tools().items():
             _write_python_tool(bin_dir / name, body)
-        self._git("init", "-q")
+        self._git("init", "-q", "-b", "main")
         self._git("config", "uploadpack.allowAnySHA1InWant", "true")
 
     def commit(self, files: dict[str, str]) -> str:
@@ -158,6 +158,30 @@ class WorkspaceSync:
         self._git("add", "-A")
         self._git("commit", "-q", "-m", "commit")
         return self._git("rev-parse", "HEAD").strip()
+
+    def tag(self, name: str) -> None:
+        """Tag the last commit with an annotated tag.
+
+        Args:
+            name: The tag's name, without ``refs/tags/``.
+        """
+        self._git("tag", "-a", name, "-m", name)
+
+    def refuse_fetch_by_commit(self) -> None:
+        """Make the remote refuse a fetch by SHA of a commit no branch points at.
+
+        Over protocol v2, a remote serves any commit it has, so the script's
+        git speaks v0, and the remote does not allow any SHA in a want. The
+        commit of an annotated tag is then served only by the tag's name.
+        """
+        self._git("config", "uploadpack.allowAnySHA1InWant", "false")
+        self.env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "protocol.version",
+                "GIT_CONFIG_VALUE_0": "0",
+            }
+        )
 
     def run(
         self, commit: str, *, shared: bool, **env: str

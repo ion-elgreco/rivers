@@ -7,8 +7,8 @@
 #
 #   RIVERS_GIT_URL                 repository url (https:// or ssh://)
 #   RIVERS_GIT_COMMIT              pinned 40-hex commit — always the SHA
-#   RIVERS_GIT_REF                 resolved ref (fallback when the server
-#                                  refuses SHA fetches; verified afterwards)
+#   RIVERS_GIT_REF                 resolved ref (fallback when the fetch by
+#                                  commit fails; verified afterwards)
 #   RIVERS_GIT_PATH                subdir holding the project (optional)
 #   RIVERS_DEPS_MODE               auto | uvSync | requirements | none
 #   RIVERS_DEPS_FILES              csv, requirements mode (default requirements.txt)
@@ -53,9 +53,10 @@
 #     says — the operator may not have written this tree's key to it yet.
 #
 # Termination message (the operator shows it in the CodeLocation's status):
-# an error the script finds, or a build past its time budget, is written to
-# /dev/termination-log. Nothing else is: when uv or git fails, the file stays
-# empty, so kubelet reports the tail of the log, where their error is
+# an error the script finds, a failed git fetch with the last lines of git's
+# error, or a build past its time budget, is written to
+# /dev/termination-log. Nothing else is: when uv fails, the file stays empty,
+# so kubelet reports the tail of the log, where uv's error is
 # (terminationMessagePolicy: FallbackToLogsOnError).
 
 set -euo pipefail
@@ -79,9 +80,26 @@ die() {
     exit 1
 }
 
+# The last lines of an error output, without blank lines: room for git's
+# error and its ssh helper's, within the 4 KiB kubelet keeps of the
+# termination log.
+last_lines() {
+    printf '%s\n' "$1" | sed '/^[[:space:]]*$/d' | tail -n 10 | tail -c 2048
+}
+
 # ---- git auth -------------------------------------------------------------
 
 GIT_ARGS=()
+
+# An unreadable key must stop the build here: read as empty, it fails the
+# fetch later with a misleading auth or host-key error.
+need_readable() {
+    local key
+    for key in "$@"; do
+        [ -r "$CREDS_DIR/$key" ] ||
+            die "cannot read the git Secret's '$key' ($CREDS_DIR/$key): permission denied"
+    done
+}
 
 # The url's scheme picks the Secret's keys, as in the operator, so one Secret
 # can serve ssh:// and https:// code locations.
@@ -92,12 +110,16 @@ setup_git_auth() {
                 "git Secret has no 'identity' — ssh:// urls need 'identity' and 'known_hosts'"
             [ -f "$CREDS_DIR/known_hosts" ] || die \
                 "git Secret has 'identity' but no 'known_hosts' — refusing SSH without host-key pinning"
+            need_readable identity known_hosts
             export GIT_SSH_COMMAND="ssh -i $CREDS_DIR/identity -o UserKnownHostsFile=$CREDS_DIR/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
             ;;
         *)
             if [ -f "$CREDS_DIR/username" ] && [ -f "$CREDS_DIR/password" ]; then
-                local basic
-                basic=$(printf '%s:%s' "$(cat "$CREDS_DIR/username")" "$(cat "$CREDS_DIR/password")" | base64 | tr -d '\n')
+                need_readable username password
+                local username password basic
+                username=$(cat "$CREDS_DIR/username")
+                password=$(cat "$CREDS_DIR/password")
+                basic=$(printf '%s:%s' "$username" "$password" | base64 | tr -d '\n')
                 GIT_ARGS+=(-c "http.extraheader=Authorization: Basic $basic")
             fi
             ;;
@@ -106,6 +128,12 @@ setup_git_auth() {
 
 # ---- build ----------------------------------------------------------------
 
+# The `${GIT_ARGS[@]+…}` shape keeps `set -u` happy when the array is empty
+# (anonymous https / ssh-via-GIT_SSH_COMMAND add no -c flags).
+git_fetch() {
+    git ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$SRC" fetch -q --depth 1 origin "$1"
+}
+
 fetch_source() {
     rm -rf "$SRC"
     mkdir -p "$SRC"
@@ -113,14 +141,16 @@ fetch_source() {
     git -C "$SRC" remote add origin "$RIVERS_GIT_URL"
 
     # Fetch by SHA so a force-push cannot change what we get. Some servers
-    # refuse SHA-in-want; fall back to the ref, then VERIFY. The
-    # `${GIT_ARGS[@]+…}` shape keeps `set -u` happy when the array is empty
-    # (anonymous https / ssh-via-GIT_SSH_COMMAND add no -c flags).
-    if ! git ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$SRC" fetch -q --depth 1 origin "$RIVERS_GIT_COMMIT" 2>/dev/null; then
-        [ -n "${RIVERS_GIT_REF:-}" ] || die \
-            "server refused fetch-by-SHA for $RIVERS_GIT_COMMIT and RIVERS_GIT_REF is unset"
-        log "server refused fetch-by-SHA; fetching $RIVERS_GIT_REF and verifying"
-        git ${GIT_ARGS[@]+"${GIT_ARGS[@]}"} -C "$SRC" fetch -q --depth 1 origin "$RIVERS_GIT_REF"
+    # refuse SHA-in-want; fall back to the ref, then VERIFY. Pinned commits
+    # have no ref to fall back to.
+    local error
+    if ! error=$(git_fetch "$RIVERS_GIT_COMMIT" 2>&1); then
+        error="git fetch of commit $RIVERS_GIT_COMMIT failed: $(last_lines "$error")"
+        [ -n "${RIVERS_GIT_REF:-}" ] || die "$error"
+        log "$error"
+        log "fetching $RIVERS_GIT_REF instead, then verifying the commit"
+        error=$(git_fetch "$RIVERS_GIT_REF" 2>&1) ||
+            die "git fetch of $RIVERS_GIT_REF failed: $(last_lines "$error")"
     fi
     git -C "$SRC" checkout -q FETCH_HEAD
 
