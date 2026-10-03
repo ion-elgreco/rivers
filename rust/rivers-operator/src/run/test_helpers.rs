@@ -27,6 +27,8 @@ pub struct ApiRequest {
 
 #[derive(Clone)]
 pub struct MockApiState {
+    /// A LIST answers the pods of its namespace that have every label of
+    /// its `labelSelector`.
     pub pods: BTreeMap<String, Pod>,
     pub code_locations: BTreeMap<String, CodeLocation>,
     /// An apply replaces only `spec`: the seeded `metadata.generation` and
@@ -67,6 +69,7 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
         async move {
             let method = req.method().to_string();
             let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or_default().to_string();
 
             let body_bytes = req.into_body().collect().await.ok().map(|b| b.to_bytes());
             let body_json: Option<serde_json::Value> = body_bytes
@@ -82,7 +85,9 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
 
             let response = match method.as_str() {
                 "GET" => {
-                    if path.contains("/pods/") {
+                    if path.ends_with("/pods") {
+                        json_response(200, &pod_list(&s.pods, &path, &query))
+                    } else if path.contains("/pods/") {
                         let pod_name = path.rsplit('/').next().unwrap_or("");
                         if let Some(pod) = s.pods.get(pod_name) {
                             json_response(200, &serde_json::to_value(pod).unwrap())
@@ -199,6 +204,37 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
     });
 
     kube_client::Client::new(service, "default")
+}
+
+/// The pods of `path`'s namespace with every `k=v` label of `query`'s
+/// `labelSelector`, as a PodList.
+fn pod_list(pods: &BTreeMap<String, Pod>, path: &str, query: &str) -> serde_json::Value {
+    let namespace = path
+        .split("/namespaces/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next());
+    let selector: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == "labelSelector")
+        .flat_map(|(_, terms)| {
+            terms
+                .split(',')
+                .filter_map(|term| {
+                    let (key, value) = term.split_once('=')?;
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let items: Vec<&Pod> = pods
+        .values()
+        .filter(|pod| namespace.is_none() || pod.metadata.namespace.as_deref() == namespace)
+        .filter(|pod| {
+            selector.iter().all(|(key, value)| {
+                pod.metadata.labels.as_ref().and_then(|l| l.get(key)) == Some(value)
+            })
+        })
+        .collect();
+    serde_json::json!({ "apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": items })
 }
 
 /// `x` in `…/<plural>/x` or `…/<plural>/x/status`.

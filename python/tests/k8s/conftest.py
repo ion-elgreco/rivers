@@ -2,9 +2,10 @@
 
 The script runs the way the init container runs it, but against a git remote
 in ``tmp_path`` (a ``file://`` URL) and a fake ``uv`` that records its
-arguments. Hosts without ``flock``, ``timeout`` or GNU ``stat`` (macOS) get
-stand-ins on ``PATH``; Linux CI runs the real tools. macOS runs the script
-with bash 3.2, so it must not use bash-4 syntax.
+arguments. Each run gets a new, empty termination log, as kubelet gives each
+container start one. Hosts without ``flock``, ``timeout`` or GNU ``stat``
+(macOS) get stand-ins on ``PATH``; Linux CI runs the real tools. macOS runs
+the script with bash 3.2, so it must not use bash-4 syntax.
 """
 
 from __future__ import annotations
@@ -28,17 +29,21 @@ _GIT_IDENTITY = {
     "GIT_COMMITTER_EMAIL": "rivers@example.com",
 }
 
-# Appends its argv as one JSON line to $FAKE_UV_LOG and exits 1 when its
-# subcommand is listed in $FAKE_UV_FAIL (comma-separated). `sync` and `venv`
-# create the venv entrypoint, as the real installs do.
+# Appends its argv as one JSON line to $FAKE_UV_LOG, then sleeps
+# $FAKE_UV_SLEEP seconds (default 0). When its subcommand is listed in
+# $FAKE_UV_FAIL (comma-separated), it prints `error: uv <subcommand> failed`
+# to stderr and exits 1. `sync` and `venv` create the venv entrypoint, as the
+# real installs do.
 _FAKE_UV = """\
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_UV_LOG"], "a") as log:
     log.write(json.dumps(args) + "\\n")
+time.sleep(float(os.environ.get("FAKE_UV_SLEEP", "0")))
 if args[0] in os.environ.get("FAKE_UV_FAIL", "").split(","):
+    sys.stderr.write(f"error: uv {args[0]} failed\\n")
     sys.exit(1)
 venv = {"sync": os.environ.get("UV_PROJECT_ENVIRONMENT"), "venv": args[-1]}.get(args[0])
 if venv:
@@ -58,11 +63,21 @@ except BlockingIOError:
     sys.exit(1)
 """
 
-# `timeout DURATION COMMAND...`, without the bound.
+# `timeout DURATION COMMAND...`, as GNU timeout: past DURATION seconds it
+# sends SIGTERM to the command and everything the command started, then
+# exits 124.
 _TIMEOUT = """\
-import os, sys
+import os, signal, subprocess, sys
 
-os.execvp(sys.argv[2], sys.argv[2:])
+duration, *command = sys.argv[1:]
+child = subprocess.Popen(command, start_new_session=True)
+try:
+    code = child.wait(timeout=float(duration))
+except subprocess.TimeoutExpired:
+    os.killpg(child.pid, signal.SIGTERM)
+    child.wait()
+    sys.exit(124)
+sys.exit(code if code >= 0 else 128 - code)
 """
 
 # GNU `stat -c %Y PATH`: modification time in epoch seconds.
@@ -110,6 +125,7 @@ class WorkspaceSync:
         self.creds = tmp_path / "creds"
         self._unmounted_root = tmp_path / "unmounted"
         self._uv_log = tmp_path / "uv.log"
+        self._termination_log = tmp_path / "termination-log"
         bin_dir = tmp_path / "bin"
         home = tmp_path / "home"
         for path in (self.remote, self.volume, self.creds, bin_dir, home):
@@ -157,6 +173,7 @@ class WorkspaceSync:
         Returns:
             The finished process; ``stderr`` holds the script's log.
         """
+        self._termination_log.write_text("")
         return subprocess.run(
             ["bash", str(SYNC_SCRIPT)],
             env={
@@ -168,12 +185,22 @@ class WorkspaceSync:
                     self.volume if shared else self._unmounted_root
                 ),
                 "RIVERS_GIT_CREDS_DIR": str(self.creds),
+                "RIVERS_TERMINATION_LOG": str(self._termination_log),
                 **env,
             },
             capture_output=True,
             text=True,
             timeout=60,
         )
+
+    def termination_message(self) -> str:
+        """Return what the last run wrote to its termination log.
+
+        With ``terminationMessagePolicy: FallbackToLogsOnError``, kubelet
+        reports this message for the init container, or, when it is empty
+        and the container failed, the tail of the container's log.
+        """
+        return self._termination_log.read_text()
 
     def uv_calls(self) -> list[list[str]]:
         """Return the arguments of every ``uv`` call so far, oldest first."""

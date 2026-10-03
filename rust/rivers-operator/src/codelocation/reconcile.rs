@@ -20,7 +20,7 @@ use futures_util::FutureExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube_client::ResourceExt;
-use kube_client::api::{Api, Patch, PatchParams};
+use kube_client::api::{Api, ListParams, Patch, PatchParams};
 use kube_runtime::controller::Action;
 use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
@@ -43,11 +43,13 @@ use super::registry::{
 use super::resources::{
     MAIN_CONTAINER, build_deployment, build_git_deployment, build_keep_config_map, build_service,
     build_workspace_pvc, deployment_name, git_working_dir, grpc_endpoint, keep_config_map_name,
-    service_name, workspace_pvc_name,
+    labels, service_name, workspace_pvc_name,
 };
 use crate::leader::LeaderGate;
 use crate::metrics;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, ContainerStateTerminated, PersistentVolumeClaim, Pod, PodSpec,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use rivers_k8s::crd::run::{Run, RunSource};
 use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
@@ -332,6 +334,7 @@ async fn reconcile_git(
         .as_ref()
         .expect("reconcile_git dispatched for a non-git CodeLocation");
     let endpoint = grpc_endpoint(&name, namespace, cl.spec.grpc_port);
+    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
 
     // Followers neither resolve nor apply: they refresh what the Deployment
     // shows and keep the leader's resolution conditions, so both replicas
@@ -349,7 +352,7 @@ async fn reconcile_git(
                     .any(|c| c.r#type == CONDITION_SOURCE_RESOLVED)
         });
         if published {
-            let rollout = observe_git_deployment(&name, deployments_api).await;
+            let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
             let update = GitStatusUpdate {
                 resolution: None,
                 fetched_at: None,
@@ -415,7 +418,7 @@ async fn reconcile_git(
                         source: Err(failure),
                     }),
                     fetched_at: None,
-                    rollout: observe_git_deployment(&name, deployments_api).await,
+                    rollout: observe_git_deployment(&name, deployments_api, &pods_api).await,
                     endpoint,
                 };
                 patch_git_status(code_locations_api, &name, cl, update).await?;
@@ -436,7 +439,7 @@ async fn reconcile_git(
         &resolved,
     )
     .await?;
-    let rollout = observe_git_deployment(&name, deployments_api).await;
+    let rollout = observe_git_deployment(&name, deployments_api, &pods_api).await;
     let rolling_out = !rollout.complete;
     let update = GitStatusUpdate {
         resolution: Some(GitResolution {
@@ -563,25 +566,50 @@ async fn apply_git_workspace(
     Ok(())
 }
 
-/// Read the git Deployment without mutating anything — shared by the leader
-/// (post-apply) and follower (status refresh) paths.
-async fn observe_git_deployment(name: &str, deployments_api: &Api<Deployment>) -> GitRollout {
+/// Read the git Deployment and, until its rollout is complete, its pods,
+/// without mutating anything — shared by the leader (post-apply) and
+/// follower (status refresh) paths, so both publish the same status.
+async fn observe_git_deployment(
+    name: &str,
+    deployments_api: &Api<Deployment>,
+    pods_api: &Api<Pod>,
+) -> GitRollout {
     let deployment = deployments_api
         .get_status(&deployment_name(name))
         .await
         .ok();
-    git_rollout(deployment.as_ref())
+    let mut rollout = git_rollout(deployment.as_ref());
+    let Some(template) = rollout.template.as_ref().filter(|_| !rollout.complete) else {
+        return rollout;
+    };
+    let selector = labels(name)
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    match pods_api
+        .list(&ListParams::default().labels(&selector))
+        .await
+    {
+        Ok(pods) => rollout.build_failure = newest_build_failure(&pods.items, template),
+        Err(error) => tracing::warn!(
+            code_location = name,
+            %error,
+            "could not list the code-location pods; their build errors are not shown"
+        ),
+    }
+    rollout
 }
 
-/// The tree `deployment`'s pod template runs: its main container's
-/// `RIVERS_RUN_SOURCE`.
+/// The tree `deployment`'s pod template runs.
 fn template_source(deployment: &Deployment) -> Option<RunSource> {
-    let source = deployment
-        .spec
-        .as_ref()?
-        .template
-        .spec
-        .as_ref()?
+    pod_source(deployment.spec.as_ref()?.template.spec.as_ref()?)
+}
+
+/// The tree a code-location pod runs: its main container's
+/// `RIVERS_RUN_SOURCE`.
+fn pod_source(spec: &PodSpec) -> Option<RunSource> {
+    let source = spec
         .containers
         .iter()
         .find(|c| c.name == MAIN_CONTAINER)?
@@ -594,6 +622,30 @@ fn template_source(deployment: &Deployment) -> Option<RunSource> {
     serde_json::from_str(source).ok()
 }
 
+/// The newest failed run of the `workspace` init container among the pods
+/// that run `template`. A container whose last run succeeded has none, even
+/// if a run before it failed.
+fn newest_build_failure(pods: &[Pod], template: &RunSource) -> Option<ContainerStateTerminated> {
+    pods.iter()
+        .filter(|pod| pod.spec.as_ref().and_then(pod_source).as_ref() == Some(template))
+        .filter_map(|pod| {
+            let sync = pod
+                .status
+                .as_ref()?
+                .init_container_statuses
+                .as_ref()?
+                .iter()
+                .find(|c| c.name == workspace::SYNC_CONTAINER)?;
+            let last_run = match sync.state.as_ref().and_then(|s| s.terminated.as_ref()) {
+                Some(ended) => ended,
+                None => sync.last_state.as_ref()?.terminated.as_ref()?,
+            };
+            (last_run.exit_code != 0).then_some((last_run, pod.metadata.name.as_deref()))
+        })
+        .max_by_key(|(last_run, pod_name)| (last_run.finished_at.clone(), *pod_name))
+        .map(|(last_run, _)| last_run.clone())
+}
+
 /// What the git Deployment shows: the tree its pod template runs, and how
 /// far that template has rolled out.
 #[derive(Debug, Default)]
@@ -604,6 +656,9 @@ struct GitRollout {
     /// `None` when the Deployment or its status could not be read.
     ready_replicas: Option<i32>,
     deadline_exceeded: bool,
+    /// While the rollout is not complete: the newest failed build of the
+    /// template's tree in its pods.
+    build_failure: Option<ContainerStateTerminated>,
 }
 
 fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
@@ -616,6 +671,7 @@ fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
         ready_replicas: Some(status.ready_replicas.unwrap_or(0)),
         deadline_exceeded: generation_observed(deployment)
             && has_progress_deadline_exceeded(status),
+        build_failure: None,
     }
 }
 
@@ -877,6 +933,24 @@ fn rollout_message(
     })
 }
 
+/// `workspace build of main@9f3c1ab failed (Error, exit code 1): <its
+/// termination message>`. No times or restart counts: every pass over the
+/// same failure says the same, so it writes the status once.
+fn build_failure_message(target: &RunSource, failed: &ContainerStateTerminated) -> String {
+    let cause = match &failed.reason {
+        Some(reason) => format!("{reason}, exit code {}", failed.exit_code),
+        None => format!("exit code {}", failed.exit_code),
+    };
+    let summary = format!(
+        "workspace build of {} failed ({cause})",
+        source_display(target)
+    );
+    match failed.message.as_deref().map(str::trim) {
+        Some(said) if !said.is_empty() => format!("{summary}: {said}"),
+        _ => summary,
+    }
+}
+
 struct GitStatusUpdate {
     /// `None` on followers: resolution is the leader's.
     resolution: Option<GitResolution>,
@@ -912,7 +986,9 @@ async fn patch_git_status(
 /// Git-mode status. Runs get the serving tree: the pod template's once every
 /// pod runs it and is ready, until then the prior status's — a commit that
 /// is still building, or fails to build, never reaches a run. A rollout in
-/// progress or stuck shows on `DeploymentAvailable`, not in the phase.
+/// progress or stuck shows on `DeploymentAvailable`, not in the phase, with
+/// the error of a failed build of its tree, which `status.message` also
+/// shows unless a resolution error is there.
 fn git_status(
     cl: &CodeLocation,
     update: GitStatusUpdate,
@@ -928,6 +1004,11 @@ fn git_status(
     let desired = cl.spec.replicas;
     let ready =
         serving.is_some() && desired > 0 && rollout.ready_replicas.is_some_and(|r| r >= desired);
+    let build_failure = rollout
+        .template
+        .as_ref()
+        .zip(rollout.build_failure.as_ref())
+        .map(|(target, failed)| build_failure_message(target, failed));
     let (deployment_reason, deployment_message) = if rollout.ready_replicas.is_none() {
         (REASON_NO_DEPLOYMENT_STATUS, None)
     } else if ready && rollout.complete {
@@ -938,11 +1019,17 @@ fn git_status(
         } else {
             REASON_ROLLING_OUT
         };
-        let message = rollout_message(
-            rollout.template.as_ref(),
-            serving.as_ref(),
-            rollout.deadline_exceeded,
-        );
+        let message = match (
+            rollout_message(
+                rollout.template.as_ref(),
+                serving.as_ref(),
+                rollout.deadline_exceeded,
+            ),
+            build_failure.clone(),
+        ) {
+            (Some(rollout), Some(failure)) => Some(format!("{rollout}; {failure}")),
+            (rollout, failure) => rollout.or(failure),
+        };
         (reason, message)
     };
     let mut status = CodeLocationStatus {
@@ -1016,12 +1103,15 @@ fn git_status(
         deployment_message,
         now,
     );
-    // From the condition, so followers that copy it publish the same.
+    // A resolution error first: until it clears, no commit that fixes the
+    // build reaches the pods. From the condition, so followers that copy it
+    // publish the same.
     status.message = status
         .conditions
         .iter()
         .find(|c| c.r#type == CONDITION_SOURCE_RESOLVED && c.status == "False")
-        .and_then(|c| c.message.clone());
+        .and_then(|c| c.message.clone())
+        .or(build_failure);
     status
 }
 
@@ -2606,6 +2696,7 @@ mod tests {
                 complete,
                 ready_replicas: Some(ready),
                 deadline_exceeded: false,
+                build_failure: None,
             }
         }
 
@@ -3184,6 +3275,195 @@ mod tests {
             assert_eq!(pass(&state, LeaderGate::new()).await, None);
         }
 
+        const STALE_LOCK: &str = "error: The lockfile at `uv.lock` needs to be updated, but \
+                                  `--locked` was provided. To update the lockfile, run `uv lock`.";
+
+        /// A pod of code location x that runs `tree`; `sync` is the status of
+        /// its `workspace` init container.
+        fn code_location_pod(name: &str, tree: &RunSource, sync: serde_json::Value) -> Pod {
+            let mut sync_status = json!({ "name": "workspace" });
+            sync_status
+                .as_object_mut()
+                .unwrap()
+                .extend(sync.as_object().unwrap().clone());
+            serde_json::from_value(json!({
+                "metadata": {
+                    "name": name,
+                    "namespace": "y",
+                    "labels": crate::codelocation::resources::labels("x"),
+                },
+                "spec": {
+                    "containers": [{
+                        "name": MAIN_CONTAINER,
+                        "env": [{
+                            "name": rivers_k8s::env::ENV_RUN_SOURCE,
+                            "value": serde_json::to_string(tree).unwrap(),
+                        }],
+                    }],
+                },
+                "status": { "initContainerStatuses": [sync_status] },
+            }))
+            .unwrap()
+        }
+
+        /// The sync failed with `message` at `finished_at`; kubelet waits
+        /// before it starts it again.
+        fn failed_sync(message: &str, finished_at: &str) -> serde_json::Value {
+            json!({
+                "state": { "waiting": {
+                    "reason": "CrashLoopBackOff",
+                    "message": "back-off 40s restarting failed container=workspace",
+                } },
+                "lastState": { "terminated": {
+                    "exitCode": 1,
+                    "reason": "Error",
+                    "message": message,
+                    "finishedAt": finished_at,
+                } },
+                "restartCount": 3,
+            })
+        }
+
+        fn completed_sync() -> serde_json::Value {
+            json!({ "state": { "terminated": {
+                "exitCode": 0,
+                "reason": "Completed",
+                "finishedAt": "2026-10-02T00:00:00Z",
+            } } })
+        }
+
+        fn add_pods(state: &ApiState, pods: impl IntoIterator<Item = Pod>) {
+            let mut s = state.lock().unwrap();
+            for pod in pods {
+                s.pods.insert(pod.metadata.name.clone().unwrap(), pod);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_build_of_the_tree_rolling_out_shows_in_status() {
+            let state = api_with(git_cl_at('b', serving_status('a')), mid_rollout());
+            // The old pod serves a; the new pod cannot build b.
+            add_pods(
+                &state,
+                [
+                    code_location_pod("x-a", &tree('a'), completed_sync()),
+                    code_location_pod(
+                        "x-b",
+                        &tree('b'),
+                        failed_sync(&format!("{STALE_LOCK}\n"), "2026-10-03T00:00:00Z"),
+                    ),
+                ],
+            );
+
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            let failure = format!(
+                "workspace build of bbbbbbb (pinned) failed (Error, exit code 1): {STALE_LOCK}"
+            );
+            assert_eq!(status["message"], failure, "{status}");
+            let available = condition(&status, CONDITION_DEPLOYMENT_AVAILABLE);
+            assert_eq!(available["reason"], REASON_ROLLING_OUT, "{available}");
+            assert_eq!(
+                available["message"],
+                format!(
+                    "rolling out bbbbbbb (pinned) on {}; runs use aaaaaaa (pinned) on {}; {failure}",
+                    runtime('b'),
+                    runtime('a')
+                )
+            );
+            assert_eq!(status["phase"], "Ready");
+            assert_eq!(status["runSource"], run_source_json('a'));
+            // The same failure in the next passes: nothing new to write, from
+            // either replica.
+            assert_eq!(pass(&state, LeaderGate::leading()).await, None);
+            assert_eq!(pass(&state, LeaderGate::new()).await, None);
+        }
+
+        #[test]
+        fn build_failure_is_the_newest_failed_sync_of_a_pod_that_runs_the_template() {
+            let failed_now = json!({ "state": { "terminated": {
+                "exitCode": 1,
+                "reason": "Error",
+                "message": "second",
+                "finishedAt": "2026-10-03T00:02:00Z",
+            } } });
+            let recovered = json!({
+                "state": { "terminated": {
+                    "exitCode": 0,
+                    "reason": "Completed",
+                    "finishedAt": "2026-10-03T00:09:00Z",
+                } },
+                "lastState": { "terminated": {
+                    "exitCode": 1,
+                    "reason": "Error",
+                    "message": "index down",
+                    "finishedAt": "2026-10-03T00:08:00Z",
+                } },
+            });
+            let pods = [
+                code_location_pod(
+                    "x-a",
+                    &tree('a'),
+                    failed_sync("other tree", "2026-10-03T00:10:00Z"),
+                ),
+                code_location_pod(
+                    "x-b-1",
+                    &tree('b'),
+                    failed_sync("first", "2026-10-03T00:01:00Z"),
+                ),
+                code_location_pod("x-b-2", &tree('b'), failed_now),
+                code_location_pod("x-b-3", &tree('b'), recovered),
+            ];
+
+            let newest = newest_build_failure(&pods, &tree('b')).expect("a failed build");
+            assert_eq!(newest.message.as_deref(), Some("second"));
+            assert_eq!(newest_build_failure(&pods[..1], &tree('b')), None);
+            assert_eq!(newest_build_failure(&pods[3..], &tree('b')), None);
+        }
+
+        #[test]
+        fn build_failure_message_shapes() {
+            let failed =
+                |reason: Option<&str>, exit_code, message: Option<&str>| ContainerStateTerminated {
+                    exit_code,
+                    reason: reason.map(str::to_string),
+                    message: message.map(str::to_string),
+                    ..Default::default()
+                };
+            for (failed, expected) in [
+                (
+                    failed(Some("Error"), 1, Some("error: no lock\n")),
+                    "workspace build of bbbbbbb (pinned) failed (Error, exit code 1): \
+                     error: no lock",
+                ),
+                (
+                    failed(Some("OOMKilled"), 137, None),
+                    "workspace build of bbbbbbb (pinned) failed (OOMKilled, exit code 137)",
+                ),
+                (
+                    failed(None, 2, Some(" \n")),
+                    "workspace build of bbbbbbb (pinned) failed (exit code 2)",
+                ),
+            ] {
+                assert_eq!(build_failure_message(&tree('b'), &failed), expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_complete_rollout_reads_no_pods() {
+            let state = api_with(git_cl_at('b', serving_status('a')), rolled_out());
+
+            let (_, requests) = reconcile_with(&state, LeaderGate::leading(), &resolver()).await;
+
+            let pod_reads: Vec<_> = requests
+                .iter()
+                .filter(|r| r.path.contains("/pods"))
+                .collect();
+            assert!(pod_reads.is_empty(), "{pod_reads:?}");
+        }
+
         #[tokio::test]
         async fn run_pods_size_their_workspace_like_the_code_location_pods() {
             use crate::run::test_helpers::emptydir_limits;
@@ -3388,6 +3668,52 @@ mod tests {
                 .collect();
             assert!(applies.is_empty(), "{applies:?}");
             assert_eq!(outage.requeue, Action::requeue(Duration::from_secs(60)));
+        }
+
+        #[tokio::test]
+        async fn a_git_resolution_error_keeps_status_message_over_a_failed_build() {
+            let forge = forge(vec![advertisement(), ResponseTemplate::new(503)]).await;
+            let state = api_with(branch_cl(&forge), rolled_out());
+            pass(&state, LeaderGate::leading())
+                .await
+                .expect("rollout of main");
+            // The pod restarts and cannot fetch main either: the git host is
+            // down for the pods too.
+            let fetch_error = format!(
+                "fatal: unable to access '{}{REPO}/': The requested URL returned error: 503",
+                forge.uri()
+            );
+            {
+                let mut s = state.lock().unwrap();
+                let deployment = s.deployments.get_mut("x").unwrap();
+                let rollout = deployment.status.as_mut().unwrap();
+                rollout.ready_replicas = Some(0);
+                rollout.available_replicas = Some(0);
+                let main = template_source(deployment).unwrap();
+                let pod = code_location_pod(
+                    "x-1",
+                    &main,
+                    failed_sync(&fetch_error, "2026-10-03T00:00:00Z"),
+                );
+                s.pods.insert("x-1".into(), pod);
+            }
+
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            let error = unreachable_error(&forge, "503 Service Unavailable");
+            assert_eq!(
+                source_resolved(&status),
+                ("False", REASON_GIT_UNREACHABLE, error.as_str())
+            );
+            assert_eq!(status["message"], error);
+            assert_eq!(
+                condition(&status, CONDITION_DEPLOYMENT_AVAILABLE)["message"],
+                format!(
+                    "workspace build of main@aaaaaaa failed (Error, exit code 1): {fetch_error}"
+                )
+            );
         }
 
         #[tokio::test]

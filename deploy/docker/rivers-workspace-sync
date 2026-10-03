@@ -51,12 +51,19 @@
 #     script cannot read must never let it delete a tree;
 #   * the prune never removes this pod's own tree, whatever the keep-set
 #     says — the operator may not have written this tree's key to it yet.
+#
+# Termination message (the operator shows it in the CodeLocation's status):
+# an error the script finds, or a build past its time budget, is written to
+# /dev/termination-log. Nothing else is: when uv or git fails, the file stays
+# empty, so kubelet reports the tail of the log, where their error is
+# (terminationMessagePolicy: FallbackToLogsOnError).
 
 set -euo pipefail
 
 WORKSPACE="${RIVERS_WORKSPACE_DIR:-/workspace}"
 WORKSPACES_ROOT="${RIVERS_WORKSPACES_ROOT:-/workspaces}"
 CREDS_DIR="${RIVERS_GIT_CREDS_DIR:-/etc/rivers/git}"
+TERMINATION_LOG="${RIVERS_TERMINATION_LOG:-/dev/termination-log}"
 SRC="$WORKSPACE/src"
 VENV="$WORKSPACE/venv"
 READY="$WORKSPACE/.ready"
@@ -65,11 +72,10 @@ LOCK="$WORKSPACE/.lock"
 log() { printf 'workspace-sync: %s\n' "$*" >&2; }
 die() {
     log "ERROR: $*"
-    # Also land the message where terminationMessagePolicy picks it up even
-    # when FallbackToLogsOnError is misconfigured. `2>/dev/null` must come
-    # FIRST — redirections apply left to right, and a failing open of the
-    # termination log would otherwise print to the real stderr.
-    printf '%s\n' "$*" 2>/dev/null >/dev/termination-log || true
+    # `2>/dev/null` must come FIRST — redirections apply left to right, and a
+    # failing open of the termination log would otherwise print to the real
+    # stderr.
+    printf '%s\n' "$*" 2>/dev/null >"$TERMINATION_LOG" || true
     exit 1
 }
 
@@ -311,12 +317,22 @@ fi
 # timeout(1) is present in the runtime image (debian coreutils); degrade
 # gracefully where it isn't (local dev on macOS) — the budget is
 # belt-and-braces, not the only bound.
+budget="${RIVERS_DEPS_TIMEOUT_SECONDS:-600}"
+build_status=0
 if command -v timeout >/dev/null 2>&1; then
-    timeout "${RIVERS_DEPS_TIMEOUT_SECONDS:-600}" "$0" __build ||
-        die "workspace build failed or exceeded ${RIVERS_DEPS_TIMEOUT_SECONDS:-600}s"
+    timeout "$budget" "$0" __build || build_status=$?
+    # 124: timeout(1) stopped the build.
+    [ "$build_status" -ne 124 ] ||
+        die "workspace build did not finish within ${budget}s (spec.git.dependencies.timeoutSeconds)"
 else
     log "timeout(1) unavailable — running the build unbounded"
-    "$0" __build || die "workspace build failed"
+    "$0" __build || build_status=$?
+fi
+if [ "$build_status" -ne 0 ]; then
+    # Not die: the termination log keeps the build's own message, or stays
+    # empty for the log tail.
+    log "ERROR: workspace build failed (exit $build_status)"
+    exit 1
 fi
 
 : >"$READY" # written LAST — the only "this tree is usable" signal

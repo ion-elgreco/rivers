@@ -328,8 +328,20 @@ accordingly. The operator's requests to git hosts and registries carry
 **When things fail**, `kubectl describe rcl analytics` carries the
 answer: `RefNotFound` / `InvalidRef` / `InvalidUrl` / `GitAuthFailed` /
 `GitHostKeyRejected` / `GitMalformedResponse` on the `SourceResolved`
-condition for resolution problems, and a failed install surfaces `uv`'s
-error tail in `status.message`. A resolution problem sets the phase to
+condition for resolution problems. If a code-location pod cannot build a
+commit, `status.message` and the end of the `DeploymentAvailable` message
+show the error of the pod's `workspace` init container, after
+`workspace build of main@9f3c1ab failed (Error, exit code 1):`. For an
+error that the init container finds itself, this is its own message: for
+example, a `path` that is not in the repository, or a build that did not
+finish within `dependencies.timeoutSeconds` (default 600 seconds). For all
+other errors, it is the last lines of the init container's log, which
+include the error of `uv` or `git`. Kubernetes keeps at most 80 lines or
+2048 bytes of the log for this message;
+`kubectl -n rivers logs <pod> -c workspace` shows all of it. When
+`SourceResolved` is `False`, `status.message` shows the resolution error
+instead, because the operator cannot get a commit that repairs the build
+until that error clears. A resolution problem sets the phase to
 `Failed`, and new runs are rejected until you fix it. A git host that does not answer
 (connection error, HTTP 5xx, or no complete answer within
 `operator.git.timeoutSeconds`, 30 seconds by default) does not take the
@@ -351,7 +363,8 @@ answers.
 A rollout shows on the `DeploymentAvailable` condition: reason
 `RollingOut` while it runs, or `ProgressDeadlineExceeded` when it is
 stuck (for example, the new commit fails to install), with a message that
-names the commit being rolled out and the commit runs still use.
+names the commit being rolled out and the commit runs still use, followed
+by the build error when a pod cannot build that commit.
 
 ## Helm chart customizations
 

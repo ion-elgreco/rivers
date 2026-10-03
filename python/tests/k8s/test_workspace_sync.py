@@ -17,6 +17,11 @@ Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 The url's scheme picks the git Secret's keys, as in the operator: ``ssh://``
 urls use ``identity`` and ``known_hosts``, other urls ``username`` and
 ``password``.
+
+A failed build gives kubelet the most specific termination message there is:
+the error the script found, or the time budget the build ran past. When
+``uv`` or ``git`` fails, the termination log stays empty, so kubelet reports
+the tail of the log, where their error is (``FallbackToLogsOnError``).
 """
 
 from __future__ import annotations
@@ -95,6 +100,96 @@ def test_failed_uv_cache_prune_keeps_the_built_tree(workspace_sync):
     assert "uv cache prune failed (non-fatal)" in built.stderr
     assert (workspace_sync.tree / ".ready").exists()
     assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
+
+
+@pytest.mark.parametrize(
+    ("env", "error"),
+    [
+        pytest.param(
+            {"RIVERS_GIT_PATH": "analytics"},
+            "RIVERS_GIT_PATH 'analytics' does not exist in the repository",
+            id="missing-path",
+        ),
+        pytest.param(
+            {"RIVERS_DEPS_MODE": "poetry"},
+            "unknown RIVERS_DEPS_MODE 'poetry' (auto|uvSync|requirements|none)",
+            id="unknown-deps-mode",
+        ),
+    ],
+)
+def test_the_error_the_build_finds_is_the_termination_message(
+    workspace_sync, env, error
+):
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    failed = workspace_sync.run(commit, shared=False, **env)
+
+    assert failed.returncode == 1
+    assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
+    assert workspace_sync.termination_message() == f"{error}\n"
+    assert not (workspace_sync.tree / ".ready").exists()
+
+
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])
+@pytest.mark.parametrize(
+    ("files", "failing"),
+    [
+        pytest.param(UV_PROJECT, "sync", id="uv-sync"),
+        pytest.param({"requirements.txt": "pandas\n"}, "pip", id="uv-pip-install"),
+    ],
+)
+def test_a_failed_install_leaves_the_log_tail_to_kubelet(
+    workspace_sync, files, failing, shared
+):
+    commit = workspace_sync.commit(files)
+
+    failed = workspace_sync.run(commit, shared=shared, FAKE_UV_FAIL=failing)
+
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == ""
+    assert failed.stderr.endswith(
+        f"error: uv {failing} failed\n"
+        "workspace-sync: ERROR: workspace build failed (exit 1)\n"
+    )
+    assert not (workspace_sync.tree / ".ready").exists()
+
+
+def test_a_failed_fetch_leaves_the_log_tail_to_kubelet(workspace_sync):
+    workspace_sync.commit(UV_PROJECT)
+
+    # The server refuses the unknown SHA; the ref is gone too.
+    failed = workspace_sync.run(
+        "f" * 40, shared=False, RIVERS_GIT_REF="refs/heads/gone"
+    )
+
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == ""
+    assert failed.stderr.endswith(
+        "fatal: couldn't find remote ref refs/heads/gone\n"
+        "workspace-sync: ERROR: workspace build failed (exit 128)\n"
+    )
+
+
+def test_a_build_past_its_time_budget_says_so_in_the_termination_message(
+    workspace_sync,
+):
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    timed_out = workspace_sync.run(
+        commit,
+        shared=False,
+        RIVERS_DEPS_TIMEOUT_SECONDS="1",
+        FAKE_UV_SLEEP="30",
+    )
+
+    error = (
+        "workspace build did not finish within 1s "
+        "(spec.git.dependencies.timeoutSeconds)"
+    )
+    assert timed_out.returncode == 1
+    assert workspace_sync.termination_message() == f"{error}\n"
+    assert f"workspace-sync: ERROR: {error}\n" in timed_out.stderr
+    assert not (workspace_sync.tree / ".ready").exists()
 
 
 def test_prune_keeps_only_the_trees_whose_whole_key_is_kept(workspace_sync):

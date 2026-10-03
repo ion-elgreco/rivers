@@ -47,6 +47,8 @@ pub const GIT_CREDS_MOUNT: &str = "/etc/rivers/git";
 pub const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
 pub const VENV_PATH: &str = "/workspace/venv";
 pub const SYNC_COMMAND: &str = "rivers-workspace-sync";
+/// The init container that runs [`SYNC_COMMAND`].
+pub const SYNC_CONTAINER: &str = "workspace";
 pub const KEEP_CONFIG_MAP_KEY: &str = "keep";
 /// GID of the runtime image's `USER` (deploy/docker/Dockerfile.runtime).
 pub const RUNTIME_GID: i64 = 65532;
@@ -271,7 +273,7 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
     }
 
     Container {
-        name: "workspace".to_string(),
+        name: SYNC_CONTAINER.to_string(),
         image: Some(spec.runtime_image.clone()),
         image_pull_policy: Some("IfNotPresent".to_string()),
         command: Some(vec![SYNC_COMMAND.to_string()]),
