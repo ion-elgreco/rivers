@@ -958,8 +958,8 @@ pub(crate) fn build_unresolved_graph(
     let mut node_map: HashMap<String, ResolvedNode> = HashMap::new();
 
     // Two definitions claiming one name used to overwrite silently, leaving
-    // the graph with whichever registered last (e.g. one `AssetDef` instance
-    // shared by two class-form multi assets, which names both outputs alike).
+    // the graph with whichever registered last (e.g. one named `AssetDef`
+    // shared by two class-form multi assets).
     let claim = |seen: &mut HashSet<String>, name: &str| -> PyResult<()> {
         if !seen.insert(name.to_string()) {
             return Err(AssetDefinitionError::new_err(format!(

@@ -387,10 +387,10 @@ class AssetDef:
         """Build an asset definition shared between multi-asset outputs and deps.
 
         ``name`` may be omitted only when the def is assigned as a class
-        attribute of a class-form ``MultiAsset`` subclass — the attribute name
-        is injected at registration. Step ``compute`` and ``retry`` are
-        declared on :meth:`Asset.from_multi` itself (a multi-asset runs and
-        retries as one step), not per output.
+        attribute of a class-form ``MultiAsset`` subclass — the output then
+        takes the attribute name, and the def's own ``name`` stays ``None``.
+        Step ``compute`` and ``retry`` are declared on :meth:`Asset.from_multi`
+        itself (a multi-asset runs and retries as one step), not per output.
         """
         ...
 

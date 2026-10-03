@@ -492,8 +492,8 @@ pub fn normalize_pool(
 // `name` is an `Option`, and a format string can only render it as `Some("x")`.
 #[pyclass(module = "rivers._core")]
 pub struct AssetDef {
-    /// `None` only in class-form multi assets, where the adapter injects the
-    /// attribute name at registration. `from_multi` rejects unnamed defs.
+    /// `None` only in class-form multi assets, where registration passes a
+    /// copy named after the attribute. `from_multi` rejects unnamed defs.
     #[pyo3(get, set)]
     pub name: Option<String>,
     #[pyo3(get, set)]
@@ -523,6 +523,45 @@ pub struct AssetDef {
     pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
+impl AssetDef {
+    /// Raises instead of panicking when a setter runs on another thread.
+    pub(crate) fn read<'py>(slf: &Bound<'py, Self>) -> PyResult<PyRef<'py, Self>> {
+        slf.try_borrow().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "cannot read this AssetDef while another thread sets one of its fields",
+            )
+        })
+    }
+
+    /// Holds the borrow only while it clones, so callers can run Python on
+    /// the copy.
+    pub(crate) fn copy(slf: &Bound<'_, Self>) -> PyResult<Self> {
+        let py = slf.py();
+        let def = Self::read(slf)?;
+        Ok(Self {
+            name: def.name.clone(),
+            tags: def.tags.clone(),
+            kinds: def.kinds.clone(),
+            group: def.group.clone(),
+            code_version: def.code_version.clone(),
+            io_handler: def.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            metadata: def.metadata.clone(),
+            partitions_def: def.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            partition_mapping: def.partition_mapping.clone(),
+            pool: def.pool.clone(),
+            deps: def.deps.iter().map(|d| d.clone_ref(py)).collect(),
+            actions: def.actions.iter().map(|a| a.clone_ref(py)).collect(),
+        })
+    }
+
+    /// A copy named `name` unless the def has a name of its own.
+    pub(crate) fn named_copy(slf: &Bound<'_, Self>, name: &str) -> PyResult<Self> {
+        let mut def = Self::copy(slf)?;
+        def.name.get_or_insert_with(|| name.to_owned());
+        Ok(def)
+    }
+}
+
 #[pymethods]
 impl AssetDef {
     fn __str__(&self) -> String {
@@ -536,16 +575,17 @@ impl AssetDef {
         )
     }
 
-    fn __eq__(&self, py: Python, other: &AssetDef) -> bool {
-        self.name == other.name
-            && self.tags == other.tags
-            && self.kinds.0 == other.kinds.0
-            && self.group == other.group
-            && self.code_version == other.code_version
-            && self.metadata == other.metadata
-            && self.pool == other.pool
-            && PartitionsDefRef::opt_eq(&self.partitions_def, &other.partitions_def)
-            && io_handler_eq(py, self.io_handler.as_ref(), other.io_handler.as_ref())
+    fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<bool> {
+        let (a, b) = (Self::copy(slf)?, Self::copy(other)?);
+        Ok(a.name == b.name
+            && a.tags == b.tags
+            && a.kinds.0 == b.kinds.0
+            && a.group == b.group
+            && a.code_version == b.code_version
+            && a.metadata == b.metadata
+            && a.pool == b.pool
+            && PartitionsDefRef::opt_eq(&a.partitions_def, &b.partitions_def)
+            && io_handler_eq(slf.py(), a.io_handler.as_ref(), b.io_handler.as_ref()))
     }
 
     fn __hash__(&self) -> u64 {
@@ -601,7 +641,7 @@ impl AssetDef {
     /// Create a new output definition for use with `Asset.from_multi()`.
     ///
     /// `name` may be omitted only when the def is assigned as a class attribute
-    /// of a class-form multi asset — the attribute name is injected then.
+    /// of a class-form multi asset — the output then takes the attribute name.
     #[new]
     #[pyo3(signature = (
         name = None,
@@ -1259,53 +1299,50 @@ impl PyAsset {
 
         let mut py_assets = Vec::with_capacity(output_defs.len());
         for asset in output_defs {
-            let borrow_asset_def = asset.borrow(py);
-            let def_name = borrow_asset_def.name.clone().ok_or_else(|| {
+            let def = AssetDef::copy(asset.bind(py))?;
+            let def_name = def.name.clone().ok_or_else(|| {
                 AssetDefinitionError::new_err(
                     "AssetDef requires name= when passed to Asset.from_multi; only class-form \
                      multi assets may omit it (the attribute name is used)",
                 )
             })?;
-            let io_handler = borrow_asset_def
+            let io_handler = def
                 .io_handler
                 .as_ref()
                 .or(handler.as_ref())
                 .map(|v| v.clone_ref(py));
 
-            let def_kinds = if borrow_asset_def.kinds.is_empty() {
+            let def_kinds = if def.kinds.is_empty() {
                 &kinds
             } else {
-                &borrow_asset_def.kinds
+                &def.kinds
             };
 
             // The fn fires once for all outputs, so input deps from any
             // AssetDef merge into the top-level input set; lineage-only
             // deps stay scoped to this output.
             let (dep_only_names, partition_mapping) =
-                collect_output_deps(py, &mut pd, &borrow_asset_def, &def_name)?;
+                collect_output_deps(py, &mut pd, &def, &def_name)?;
 
-            validate_actions(py, &borrow_asset_def.actions, &def_name)?;
-            let output_actions = merge_output_actions(py, &actions, &borrow_asset_def.actions);
+            validate_actions(py, &def.actions, &def_name)?;
+            let output_actions = merge_output_actions(py, &actions, &def.actions);
 
             py_assets.push(SingleAsset {
                 wraps: None,
                 is_async: false,
                 name: Some(def_name),
-                tags: borrow_asset_def.tags.clone().or_else(|| tags.clone()),
+                tags: def.tags.clone().or_else(|| tags.clone()),
                 kinds: def_kinds.clone(),
-                group: borrow_asset_def.group.clone().or_else(|| group.clone()),
-                code_version: borrow_asset_def
-                    .code_version
-                    .clone()
-                    .or_else(|| code_version.clone()),
+                group: def.group.clone().or_else(|| group.clone()),
+                code_version: def.code_version.clone().or_else(|| code_version.clone()),
                 io_handler,
                 // `from_multi` has no `metadata=`, so the per-output AssetDef is
                 // the only source — and `ActionContext.asset_metadata` reads it.
-                metadata: borrow_asset_def.metadata.clone(),
+                metadata: def.metadata.clone(),
                 backfill_strategy: None,
                 partitions_def: partitions_def
                     .as_ref()
-                    .or(borrow_asset_def.partitions_def.as_ref())
+                    .or(def.partitions_def.as_ref())
                     .map(|p| p.clone_ref(py)),
                 partition_mapping,
                 input_dep_names: Vec::new(),
@@ -1314,7 +1351,7 @@ impl PyAsset {
                 input_metadata: HashMap::new(),
                 hooks: None,
                 automation_condition: None,
-                pool: borrow_asset_def.pool.clone(),
+                pool: def.pool.clone(),
                 retry: None,
                 compute: None,
                 actions: output_actions,

@@ -249,7 +249,7 @@ rs.AssetDef(
 
 | Parameter | Type | Default |
 |-----------|------|---------|
-| `name` | `str \| None` | `None` — required except in a class-form `MultiAsset` body, where the attribute name is injected at registration. `from_multi()` rejects an unnamed def. |
+| `name` | `str \| None` | `None` — required except in a class-form `MultiAsset` body, where the output takes the attribute name and the def's own `name` stays `None`. `from_multi()` rejects an unnamed def. |
 | `tags` | `list[str] \| None` | `None` |
 | `kinds` | `str \| list[str] \| None` | `None` |
 | `group` | `str \| None` | `None` |
