@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn code_location_run_and_step_pods_start_the_tree_alike() {
-        use crate::codelocation::resources::build_git_deployment;
+        use crate::codelocation::resources::build_deployment;
         use rivers_k8s::executor::{K8sStepExecutorConfig, build_step_job};
 
         let run = git_run();
@@ -558,13 +558,13 @@ mod tests {
             };
 
             // The code-location pod that built the tree the run is stamped with.
-            let cl_pod = build_git_deployment(
+            let cl_pod = build_deployment(
                 &cl,
                 &source.runtime_image,
                 "rivers-code-location",
                 &Default::default(),
                 &Default::default(),
-                &workspace::builder_pod_pieces(&tree()),
+                Some(&workspace::builder_pod_pieces(&tree())),
             )
             .spec
             .unwrap()

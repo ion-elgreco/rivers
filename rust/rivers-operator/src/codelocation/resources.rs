@@ -73,14 +73,19 @@ pub fn owner_reference(cl: &CodeLocation) -> OwnerReference {
 /// Build the desired `Deployment`.
 ///
 /// `resolved_image` is the fully-qualified digest reference (`repo@sha256:...`)
-/// coming from `status.resolvedImage`. The container image is pinned to this
-/// value so rolling the tag upstream has no effect on running pods.
+/// of the code location's image, or in git mode of the runtime image. The
+/// container image is pinned to this value so rolling the tag upstream has no
+/// effect on running pods.
+///
+/// `workspace` (git mode) grafts the workspace pieces on: the container runs
+/// out of the materialized tree.
 pub fn build_deployment(
     cl: &CodeLocation,
     resolved_image: &str,
     code_location_service_account: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
+    workspace: Option<&rivers_k8s::workspace::WorkspacePodPieces>,
 ) -> Deployment {
     let name = deployment_name(&cl.name_any());
     let ns = cl.namespace();
@@ -92,6 +97,12 @@ pub fn build_deployment(
     } else {
         Some(spec.image_pull_secrets.clone())
     };
+
+    let mut env = build_base_env(cl, resolved_image, surreal_pod_cfg, otel_pod_cfg);
+    if let Some(pieces) = workspace {
+        env.extend(pieces.main_env.iter().cloned());
+    }
+    let env = rivers_k8s::env::merge_env(env, spec.env.iter().cloned());
 
     Deployment {
         metadata: ObjectMeta {
@@ -107,6 +118,16 @@ pub fn build_deployment(
                 match_labels: Some(lbls.clone()),
                 ..Default::default()
             },
+            // Old pods keep serving the rolled-out tree until their
+            // replacements are ready: the ready count never drops below
+            // spec.replicas, even when a new commit never builds.
+            strategy: workspace.map(|_| DeploymentStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateDeployment {
+                    max_unavailable: Some(IntOrString::Int(0)),
+                    max_surge: None,
+                }),
+            }),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(lbls.clone()),
@@ -119,11 +140,17 @@ pub fn build_deployment(
                             .unwrap_or_else(|| code_location_service_account.to_string()),
                     ),
                     image_pull_secrets: pull_secrets,
+                    security_context: workspace.map(|p| p.pod_security_context.clone()),
+                    init_containers: workspace.map(|p| p.init_containers.clone()),
+                    volumes: workspace.map(|p| p.volumes.clone()),
                     containers: vec![Container {
                         name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_image.to_string()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(vec!["rivers".to_string()]),
+                        command: Some(workspace.map_or_else(
+                            || vec!["rivers".to_string()],
+                            |p| p.main_command.clone(),
+                        )),
                         // `module` is a positional argument to `rivers serve`;
                         // `--grpc-port` is the flag name (not `--port`).
                         // `--surreal-endpoint` is read from the env we inject
@@ -134,6 +161,7 @@ pub fn build_deployment(
                             "--grpc-port".to_string(),
                             spec.grpc_port.to_string(),
                         ]),
+                        working_dir: workspace.map(|p| p.main_working_dir.clone()),
                         ports: Some(vec![ContainerPort {
                             name: Some("grpc".to_string()),
                             container_port: spec.grpc_port,
@@ -141,7 +169,8 @@ pub fn build_deployment(
                             ..Default::default()
                         }]),
                         resources: Some(spec.resources.clone()),
-                        env: Some(build_env(cl, resolved_image, surreal_pod_cfg, otel_pod_cfg)),
+                        env: Some(env),
+                        volume_mounts: workspace.map(|p| p.main_mounts.clone()),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -216,118 +245,8 @@ pub fn build_keep_config_map(
     }
 }
 
-/// Git-mode `Deployment`: same envelope as [`build_deployment`], but the
-/// container runs out of the materialized workspace — the workspace pieces
-/// (command, working directory, mounts, env) grafted on.
-pub fn build_git_deployment(
-    cl: &CodeLocation,
-    resolved_runtime_image: &str,
-    code_location_service_account: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
-    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
-    pieces: &rivers_k8s::workspace::WorkspacePodPieces,
-) -> Deployment {
-    let name = deployment_name(&cl.name_any());
-    let ns = cl.namespace();
-    let spec = &cl.spec;
-    let lbls = labels(&cl.name_any());
-
-    let pull_secrets = if spec.image_pull_secrets.is_empty() {
-        None
-    } else {
-        Some(spec.image_pull_secrets.clone())
-    };
-
-    // Base env minus user env, then workspace env (RIVERS_GIT_COMMIT — the
-    // rollout trigger; the tree's source + volume, stamped on the Runs this
-    // pod launches), then user env merged last so it overrides by name.
-    let mut env = build_base_env(cl, resolved_runtime_image, surreal_pod_cfg, otel_pod_cfg);
-    env.extend(pieces.main_env.iter().cloned());
-    let env = rivers_k8s::env::merge_env(env, cl.spec.env.iter().cloned());
-
-    Deployment {
-        metadata: ObjectMeta {
-            name: Some(name),
-            namespace: ns.clone(),
-            labels: Some(lbls.clone()),
-            owner_references: Some(vec![owner_reference(cl)]),
-            ..Default::default()
-        },
-        spec: Some(DeploymentSpec {
-            replicas: Some(spec.replicas),
-            selector: LabelSelector {
-                match_labels: Some(lbls.clone()),
-                ..Default::default()
-            },
-            // Old pods keep serving the rolled-out tree until their
-            // replacements are ready: the ready count never drops below
-            // spec.replicas, even when a new commit never builds.
-            strategy: Some(DeploymentStrategy {
-                type_: Some("RollingUpdate".to_string()),
-                rolling_update: Some(RollingUpdateDeployment {
-                    max_unavailable: Some(IntOrString::Int(0)),
-                    max_surge: None,
-                }),
-            }),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(lbls.clone()),
-                    ..Default::default()
-                }),
-                spec: Some(PodSpec {
-                    service_account_name: Some(
-                        spec.service_account_name
-                            .clone()
-                            .unwrap_or_else(|| code_location_service_account.to_string()),
-                    ),
-                    image_pull_secrets: pull_secrets,
-                    security_context: Some(pieces.pod_security_context.clone()),
-                    init_containers: Some(pieces.init_containers.clone()),
-                    volumes: Some(pieces.volumes.clone()),
-                    containers: vec![Container {
-                        name: MAIN_CONTAINER.to_string(),
-                        image: Some(resolved_runtime_image.to_string()),
-                        image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(pieces.main_command.clone()),
-                        args: Some(vec![
-                            "serve".to_string(),
-                            spec.module.clone(),
-                            "--grpc-port".to_string(),
-                            spec.grpc_port.to_string(),
-                        ]),
-                        working_dir: Some(pieces.main_working_dir.clone()),
-                        ports: Some(vec![ContainerPort {
-                            name: Some("grpc".to_string()),
-                            container_port: spec.grpc_port,
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        }]),
-                        resources: Some(spec.resources.clone()),
-                        env: Some(env),
-                        volume_mounts: Some(pieces.main_mounts.clone()),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-            },
-            ..Default::default()
-        }),
-        status: None,
-    }
-}
-
-fn build_env(
-    cl: &CodeLocation,
-    resolved_image: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
-    otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
-) -> Vec<EnvVar> {
-    let env = build_base_env(cl, resolved_image, surreal_pod_cfg, otel_pod_cfg);
-    rivers_k8s::env::merge_env(env, cl.spec.env.iter().cloned())
-}
-
 /// Operator-injected env common to both source modes, WITHOUT the user's
-/// `spec.env` (callers merge it last so it overrides by name).
+/// `spec.env` (merged last, after any workspace env, so it overrides by name).
 fn build_base_env(
     cl: &CodeLocation,
     resolved_image: &str,
@@ -468,6 +387,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            None,
         );
 
         let expected = json!({
@@ -543,6 +463,7 @@ mod tests {
                 headers_secret_name: "otel-headers".to_string(),
                 headers_secret_key: "headers".to_string(),
             },
+            None,
         );
 
         let env = serde_json::to_value(&d.spec.unwrap().template.spec.unwrap().containers[0].env)
@@ -615,6 +536,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            None,
         );
 
         let expected = json!({
@@ -703,6 +625,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            None,
         );
 
         let expected_resources = json!({
@@ -737,17 +660,59 @@ mod tests {
         })
     }
 
+    /// Every envelope field set, beside the git source.
+    fn full_git_spec_json() -> serde_json::Value {
+        json!({
+            "git": git_spec_json()["git"],
+            "module": "analytics.pipeline",
+            "identity": "550e8400-e29b-41d4-a716-446655440000",
+            "replicas": 2,
+            "grpcPort": 50051,
+            "serviceAccountName": "analytics-sa",
+            "imagePullSecrets": [{ "name": "ghcr-creds" }],
+            "resources": {
+                "requests": { "cpu": "250m", "memory": "512Mi" },
+                "limits": { "memory": "1Gi" },
+            },
+            "env": [
+                { "name": "UV_INDEX_URL", "value": "https://pypi.internal/simple" },
+                {
+                    "name": "DB_PASSWORD",
+                    "valueFrom": { "secretKeyRef": { "name": "db-creds", "key": "password" } },
+                },
+            ],
+        })
+    }
+
     fn shared_volume() -> rivers_k8s::workspace::WorkspaceVolume {
         rivers_k8s::workspace::WorkspaceVolume::SharedPvc {
             claim_name: workspace_pvc_name("analytics"),
         }
     }
 
+    fn fallback_volume() -> rivers_k8s::workspace::WorkspaceVolume {
+        rivers_k8s::workspace::WorkspaceVolume::EmptyDir {
+            size_limit: Some(Quantity("5Gi".to_string())),
+        }
+    }
+
+    fn otel_endpoint() -> rivers_k8s::env::OtelPodConfig {
+        rivers_k8s::env::OtelPodConfig {
+            endpoint: "https://otlp.example.com:4317".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The pieces the reconciler builds: only the shared PVC has a keep-set.
     fn git_pieces(
         cl: &CodeLocation,
         volume: rivers_k8s::workspace::WorkspaceVolume,
     ) -> rivers_k8s::workspace::WorkspacePodPieces {
         let git = cl.spec.git.as_ref().unwrap();
+        let shared = matches!(
+            volume,
+            rivers_k8s::workspace::WorkspaceVolume::SharedPvc { .. }
+        );
         rivers_k8s::workspace::builder_pod_pieces(&rivers_k8s::workspace::WorkspaceSpec {
             volume,
             runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
@@ -757,11 +722,322 @@ mod tests {
             path: git.path.clone(),
             secret_name: Some("git-creds".to_string()),
             deps: git.dependencies.clone(),
-            keep_config_map: Some(keep_config_map_name("analytics")),
+            keep_config_map: shared.then(|| keep_config_map_name("analytics")),
             keep_revisions: Some(3),
             min_tree_age: Some(std::time::Duration::from_secs(3600)),
             extra_env: cl.spec.env.clone(),
         })
+    }
+
+    /// Subpath and `RIVERS_RUN_SOURCE` of the tree [`git_pieces`] builds.
+    const TREE_KEY: &str = "9f3c1ab8d2e4-1a2b3c4d-edfe9516";
+    const TREE_SOURCE: &str = r#"{"git":{"url":"https://forge.example/acme/pipelines.git","commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","ref":"refs/heads/main","path":"analytics","secretName":"git-creds"},"dependencies":{"mode":"uvSync","extras":["ml"]},"runtimeImage":"ghcr.io/rt@sha256:1a2b3c4dff"}"#;
+
+    #[test]
+    fn git_deployment_matches_golden_for_shared_workspace() {
+        let cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/rt@sha256:1a2b3c4dff",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &otel_endpoint(),
+            Some(&git_pieces(&cl, shared_volume())),
+        );
+
+        let sync = json!({
+            "name": "workspace",
+            "image": "ghcr.io/rt@sha256:1a2b3c4dff",
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["rivers-workspace-sync"],
+            "terminationMessagePolicy": "FallbackToLogsOnError",
+            "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "runAsNonRoot": true,
+                "capabilities": { "drop": ["ALL"] },
+            },
+            "env": [
+                { "name": "RIVERS_GIT_URL", "value": "https://forge.example/acme/pipelines.git" },
+                { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
+                { "name": "RIVERS_GIT_REF", "value": "refs/heads/main" },
+                { "name": "RIVERS_GIT_PATH", "value": "analytics" },
+                { "name": "RIVERS_DEPS_MODE", "value": "uvSync" },
+                { "name": "RIVERS_DEPS_EXTRAS", "value": "ml" },
+                { "name": "UV_PROJECT_ENVIRONMENT", "value": "/workspace/venv" },
+                { "name": "UV_CACHE_DIR", "value": "/uv-cache" },
+                { "name": "UV_LINK_MODE", "value": "copy" },
+                { "name": "UV_COMPILE_BYTECODE", "value": "1" },
+                { "name": "RIVERS_WORKSPACE_KEY", "value": TREE_KEY },
+                {
+                    "name": "RIVERS_WORKSPACE_KEEP",
+                    "valueFrom": { "configMapKeyRef": {
+                        "name": "analytics-workspace-keep", "key": "keep", "optional": true,
+                    } },
+                },
+                { "name": "RIVERS_WORKSPACE_KEEP_REVISIONS", "value": "3" },
+                { "name": "RIVERS_WORKSPACE_MIN_AGE_SECONDS", "value": "3600" },
+                { "name": "UV_INDEX_URL", "value": "https://pypi.internal/simple" },
+                {
+                    "name": "DB_PASSWORD",
+                    "valueFrom": { "secretKeyRef": { "name": "db-creds", "key": "password" } },
+                },
+            ],
+            "volumeMounts": [
+                { "name": "workspace", "mountPath": "/workspace", "subPath": TREE_KEY },
+                { "name": "workspace", "mountPath": "/uv-cache", "subPath": "cache" },
+                { "name": "workspace", "mountPath": "/workspaces" },
+                { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
+            ],
+        });
+        let main = json!({
+            "name": "code-location",
+            "image": "ghcr.io/rt@sha256:1a2b3c4dff",
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/workspace/venv/bin/rivers"],
+            "args": ["serve", "analytics.pipeline", "--grpc-port", "50051"],
+            "workingDir": "/workspace/src/analytics",
+            "ports": [{ "name": "grpc", "containerPort": 50051, "protocol": "TCP" }],
+            "resources": {
+                "requests": { "cpu": "250m", "memory": "512Mi" },
+                "limits": { "memory": "1Gi" },
+            },
+            "env": [
+                { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
+                { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
+                { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
+                { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
+                { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
+                { "name": "RIVERS_SURREAL_NAMESPACE", "value": "rivers" },
+                { "name": "RIVERS_SURREAL_DATABASE", "value": "main" },
+                { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "https://otlp.example.com:4317" },
+                { "name": "RIVERS_OTEL_ENDPOINT", "value": "https://otlp.example.com:4317" },
+                { "name": "PYTHONPATH", "value": "/workspace/src/analytics" },
+                { "name": "VIRTUAL_ENV", "value": "/workspace/venv" },
+                { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
+                { "name": "RIVERS_RUN_SOURCE", "value": TREE_SOURCE },
+                { "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" },
+                { "name": "UV_INDEX_URL", "value": "https://pypi.internal/simple" },
+                {
+                    "name": "DB_PASSWORD",
+                    "valueFrom": { "secretKeyRef": { "name": "db-creds", "key": "password" } },
+                },
+            ],
+            "volumeMounts": [{ "name": "workspace", "mountPath": "/workspace", "subPath": TREE_KEY }],
+        });
+        let expected = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "analytics",
+                "namespace": "team-data",
+                "labels": expected_labels("analytics"),
+                "ownerReferences": [expected_owner_ref("analytics", "uid-1234")],
+            },
+            "spec": {
+                "replicas": 2,
+                "selector": { "matchLabels": expected_labels("analytics") },
+                "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } },
+                "template": {
+                    "metadata": { "labels": expected_labels("analytics") },
+                    "spec": {
+                        "serviceAccountName": "analytics-sa",
+                        "imagePullSecrets": [{ "name": "ghcr-creds" }],
+                        "securityContext": { "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" },
+                        "initContainers": [sync],
+                        "volumes": [
+                            { "name": "workspace", "persistentVolumeClaim": { "claimName": "analytics-workspace" } },
+                            { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
+                        ],
+                        "containers": [main],
+                    },
+                },
+            },
+        });
+
+        assert_eq!(serde_json::to_value(&d).unwrap(), expected);
+    }
+
+    #[test]
+    fn git_deployment_matches_golden_for_fallback_workspace() {
+        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/rt@sha256:1a2b3c4dff",
+            "rivers-code-location",
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            Some(&git_pieces(&cl, fallback_volume())),
+        );
+
+        let sync = json!({
+            "name": "workspace",
+            "image": "ghcr.io/rt@sha256:1a2b3c4dff",
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["rivers-workspace-sync"],
+            "terminationMessagePolicy": "FallbackToLogsOnError",
+            "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "runAsNonRoot": true,
+                "capabilities": { "drop": ["ALL"] },
+            },
+            "env": [
+                { "name": "RIVERS_GIT_URL", "value": "https://forge.example/acme/pipelines.git" },
+                { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
+                { "name": "RIVERS_GIT_REF", "value": "refs/heads/main" },
+                { "name": "RIVERS_GIT_PATH", "value": "analytics" },
+                { "name": "RIVERS_DEPS_MODE", "value": "uvSync" },
+                { "name": "RIVERS_DEPS_EXTRAS", "value": "ml" },
+                { "name": "UV_PROJECT_ENVIRONMENT", "value": "/workspace/venv" },
+                { "name": "UV_NO_CACHE", "value": "1" },
+                { "name": "UV_LINK_MODE", "value": "copy" },
+                { "name": "UV_COMPILE_BYTECODE", "value": "1" },
+                { "name": "RIVERS_WORKSPACE_KEY", "value": TREE_KEY },
+                { "name": "RIVERS_WORKSPACE_KEEP_REVISIONS", "value": "3" },
+                { "name": "RIVERS_WORKSPACE_MIN_AGE_SECONDS", "value": "3600" },
+            ],
+            "volumeMounts": [
+                { "name": "workspace", "mountPath": "/workspace", "subPath": TREE_KEY },
+                { "name": "git-credentials", "mountPath": "/etc/rivers/git", "readOnly": true },
+            ],
+        });
+        let main = json!({
+            "name": "code-location",
+            "image": "ghcr.io/rt@sha256:1a2b3c4dff",
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/workspace/venv/bin/rivers"],
+            "args": ["serve", "analytics.pipeline", "--grpc-port", "3001"],
+            "workingDir": "/workspace/src/analytics",
+            "ports": [{ "name": "grpc", "containerPort": 3001, "protocol": "TCP" }],
+            "resources": {},
+            "env": [
+                { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
+                { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
+                { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
+                { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
+                { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
+                { "name": "RIVERS_SURREAL_NAMESPACE", "value": "rivers" },
+                { "name": "RIVERS_SURREAL_DATABASE", "value": "main" },
+                { "name": "PYTHONPATH", "value": "/workspace/src/analytics" },
+                { "name": "VIRTUAL_ENV", "value": "/workspace/venv" },
+                { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
+                { "name": "RIVERS_RUN_SOURCE", "value": TREE_SOURCE },
+                { "name": "RIVERS_WORKSPACE_EMPTYDIR_LIMIT", "value": "5Gi" },
+            ],
+            "volumeMounts": [{ "name": "workspace", "mountPath": "/workspace", "subPath": TREE_KEY }],
+        });
+        let expected = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "analytics",
+                "namespace": "team-data",
+                "labels": expected_labels("analytics"),
+                "ownerReferences": [expected_owner_ref("analytics", "uid-1234")],
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": expected_labels("analytics") },
+                "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } },
+                "template": {
+                    "metadata": { "labels": expected_labels("analytics") },
+                    "spec": {
+                        "serviceAccountName": "rivers-code-location",
+                        "securityContext": { "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" },
+                        "initContainers": [sync],
+                        "volumes": [
+                            { "name": "workspace", "emptyDir": { "sizeLimit": "5Gi" } },
+                            { "name": "git-credentials", "secret": { "secretName": "git-creds", "defaultMode": 0o440 } },
+                        ],
+                        "containers": [main],
+                    },
+                },
+            },
+        });
+
+        assert_eq!(serde_json::to_value(&d).unwrap(), expected);
+    }
+
+    /// Removes the field at JSON `pointer` and returns it.
+    fn take(doc: &mut serde_json::Value, pointer: &str) -> Option<serde_json::Value> {
+        let (parent, field) = pointer.rsplit_once('/')?;
+        doc.pointer_mut(parent)?.as_object_mut()?.remove(field)
+    }
+
+    #[test]
+    fn git_deployment_is_the_image_deployment_plus_the_workspace() {
+        let cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
+        let build = |workspace: Option<&rivers_k8s::workspace::WorkspacePodPieces>| {
+            serde_json::to_value(build_deployment(
+                &cl,
+                "ghcr.io/rt@sha256:1a2b3c4dff",
+                "rivers-code-location",
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &otel_endpoint(),
+                workspace,
+            ))
+            .unwrap()
+        };
+        let main = "/spec/template/spec/containers/0";
+        for (shape, volume) in [("shared", shared_volume()), ("fallback", fallback_volume())] {
+            let pieces = git_pieces(&cl, volume);
+            let mut image = build(None);
+            let mut git = build(Some(&pieces));
+
+            // Git-only fields: image mode must leave them unset, or git mode
+            // would silently drop the image-mode value.
+            let added = [
+                (
+                    "/spec/strategy".to_string(),
+                    json!({ "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } }),
+                ),
+                (
+                    "/spec/template/spec/securityContext".to_string(),
+                    json!(pieces.pod_security_context),
+                ),
+                (
+                    "/spec/template/spec/initContainers".to_string(),
+                    json!(pieces.init_containers),
+                ),
+                (
+                    "/spec/template/spec/volumes".to_string(),
+                    json!(pieces.volumes),
+                ),
+                (format!("{main}/workingDir"), json!(pieces.main_working_dir)),
+                (format!("{main}/volumeMounts"), json!(pieces.main_mounts)),
+            ];
+            for (pointer, value) in added {
+                assert_eq!(take(&mut git, &pointer), Some(value), "{shape}: {pointer}");
+                assert_eq!(
+                    take(&mut image, &pointer),
+                    None,
+                    "{shape}: image mode sets {pointer}"
+                );
+            }
+
+            let command = format!("{main}/command");
+            assert_eq!(
+                take(&mut git, &command),
+                Some(json!(pieces.main_command)),
+                "{shape}"
+            );
+            assert_eq!(
+                take(&mut image, &command),
+                Some(json!(["rivers"])),
+                "{shape}"
+            );
+
+            // The workspace env sits between the operator's env and the user's.
+            let env = format!("{main}/env");
+            let image_env = take(&mut image, &env).unwrap();
+            let image_env = image_env.as_array().unwrap();
+            let (operator_env, user_env) = image_env.split_at(image_env.len() - cl.spec.env.len());
+            assert_eq!(json!(user_env), json!(cl.spec.env), "{shape}");
+            let workspace_env = json!(pieces.main_env);
+            let expected_env = [operator_env, workspace_env.as_array().unwrap(), user_env].concat();
+            assert_eq!(take(&mut git, &env), Some(json!(expected_env)), "{shape}");
+
+            assert_eq!(git, image, "{shape}");
+        }
     }
 
     #[test]
@@ -805,74 +1081,15 @@ mod tests {
     }
 
     #[test]
-    fn git_deployment_runs_from_the_workspace() {
-        let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
-        let pieces = git_pieces(&cl, shared_volume());
-        let d = build_git_deployment(
-            &cl,
-            "ghcr.io/rt@sha256:1a2b3c4dff",
-            "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
-            &rivers_k8s::env::OtelPodConfig::default(),
-            &pieces,
-        );
-
-        let pod = d.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
-        // Init container + volumes grafted verbatim from the pieces.
-        assert_eq!(
-            serde_json::to_value(pod.init_containers.as_ref().unwrap()).unwrap(),
-            serde_json::to_value(&pieces.init_containers).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(pod.volumes.as_ref().unwrap()).unwrap(),
-            serde_json::to_value(&pieces.volumes).unwrap()
-        );
-
-        let c = &pod.containers[0];
-        assert_eq!(c.image.as_deref(), Some("ghcr.io/rt@sha256:1a2b3c4dff"));
-        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
-        assert_eq!(
-            c.args.as_ref().unwrap(),
-            &vec![
-                "serve".to_string(),
-                "analytics.pipeline".to_string(),
-                "--grpc-port".to_string(),
-                "3001".to_string(),
-            ]
-        );
-        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
-        assert_eq!(
-            serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap(),
-            serde_json::to_value(&pieces.main_mounts).unwrap()
-        );
-
-        let all_env = c.env.as_ref().unwrap();
-        assert!(
-            pieces.main_env.iter().all(|v| all_env.contains(v)),
-            "{all_env:?}"
-        );
-        let env: std::collections::HashMap<&str, &str> = all_env
-            .iter()
-            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
-            .collect();
-        assert_eq!(env["RIVERS_CODE_LOCATION_NAME"], "analytics");
-        assert_eq!(env["RIVERS_MODULE"], "analytics.pipeline");
-        assert_eq!(
-            env["RIVERS_CODE_LOCATION_IMAGE"],
-            "ghcr.io/rt@sha256:1a2b3c4dff"
-        );
-    }
-
-    #[test]
     fn git_deployment_takes_an_old_pod_down_only_after_its_replacement_is_ready() {
         let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
-        let d = build_git_deployment(
+        let d = build_deployment(
             &cl,
             "ghcr.io/rt@sha256:1a2b3c4dff",
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
-            &git_pieces(&cl, shared_volume()),
+            Some(&git_pieces(&cl, shared_volume())),
         );
 
         // maxSurge stays the Kubernetes default (25%, at least one pod).
@@ -896,6 +1113,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            None,
         );
 
         assert_eq!(d.spec.unwrap().strategy, None);
@@ -906,13 +1124,13 @@ mod tests {
         let cl = make_cl(git_spec_json(), "analytics", "team-data", "uid-1234");
         let fallback = rivers_k8s::workspace::WorkspaceVolume::EmptyDir { size_limit: None };
         for (shape, volume) in [("shared", shared_volume()), ("fallback", fallback)] {
-            let d = build_git_deployment(
+            let d = build_deployment(
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
-                &git_pieces(&cl, volume),
+                Some(&git_pieces(&cl, volume)),
             );
             let pod = d.spec.unwrap().template.spec.unwrap();
 
@@ -955,13 +1173,13 @@ mod tests {
             (shared_volume(), Some("analytics-workspace"), None),
             (fallback, None, Some("5Gi")),
         ] {
-            let d = build_git_deployment(
+            let d = build_deployment(
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
-                &git_pieces(&cl, volume),
+                Some(&git_pieces(&cl, volume)),
             );
             let pod = d.spec.unwrap().template.spec.unwrap();
             let env: std::collections::HashMap<String, Option<String>> = pod.containers[0]

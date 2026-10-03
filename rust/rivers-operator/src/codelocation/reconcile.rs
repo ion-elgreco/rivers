@@ -43,9 +43,8 @@ use super::registry::{
     ImageRef, RegistryAuth, RegistryClient, RegistryError, Resolution, ResolveRequest,
 };
 use super::resources::{
-    MAIN_CONTAINER, build_deployment, build_git_deployment, build_keep_config_map, build_service,
-    build_workspace_pvc, deployment_name, grpc_endpoint, keep_config_map_name, labels,
-    service_name, workspace_pvc_name,
+    MAIN_CONTAINER, build_deployment, build_keep_config_map, build_service, build_workspace_pvc,
+    deployment_name, grpc_endpoint, keep_config_map_name, labels, service_name, workspace_pvc_name,
 };
 use crate::leader::LeaderGate;
 use crate::metrics;
@@ -270,6 +269,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
+        None,
     );
     let service = build_service(&cl);
 
@@ -849,13 +849,13 @@ async fn apply_git_workspace(
         }
     }
 
-    let deployment = build_git_deployment(
+    let deployment = build_deployment(
         cl,
         resolved_image,
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
-        &pieces,
+        Some(&pieces),
     );
     let service = build_service(cl);
     let (deployed, served) = tokio::join!(
@@ -3394,13 +3394,13 @@ mod tests {
                 min_tree_age: None,
                 extra_env: Vec::new(),
             });
-            let mut d = build_git_deployment(
+            let mut d = build_deployment(
                 &cl,
                 &runtime('b'),
                 "rivers-code-location",
                 &Default::default(),
                 &Default::default(),
-                &pieces,
+                Some(&pieces),
             );
             d.metadata.generation = Some(2);
             d.status = Some(DeploymentStatus {
