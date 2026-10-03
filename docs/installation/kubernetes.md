@@ -177,10 +177,25 @@ Set `spec.image` to use a private mirror
 in image mode, it then resolves `spec.tag` (default `latest`) or
 `spec.digest`.
 
-**Dependencies** come from the repo itself: `uv.lock` ⇒
-`uv sync --locked`, else `requirements.txt` ⇒ `uv pip install`, else
-nothing is installed (`dependencies.mode` overrides). The lockfile should
-include `rivers` — the venv's `rivers` is what runs.
+**Dependencies** come from the repo itself. With `dependencies.mode: auto`
+(the default), the init container looks in the project directory (`path`):
+
+1. `uv.lock` ⇒ `uv sync --locked`.
+2. Else `requirements.txt` ⇒ `uv pip install`.
+3. Else `pyproject.toml` in a uv workspace ⇒ `uv sync --locked` with the
+   workspace's `uv.lock`. uv writes one `uv.lock`, at the workspace root,
+   so a member has none of its own. The init container uses the nearest
+   `uv.lock` above the project, up to the repository root, if the
+   `pyproject.toml` next to it has `[tool.uv.workspace]`. uv installs the
+   project and the workspace members it depends on. If the workspace does
+   not include the project (`members`, `exclude`), the install fails with
+   uv's error.
+4. Else nothing is installed.
+
+Set `dependencies.mode` to `uvSync`, `requirements` or `none` to choose
+the mode yourself, for example `uvSync` for a workspace member that also
+has a `requirements.txt`. The lockfile should include `rivers` — the
+venv's `rivers` is what runs.
 
 **Credentials Secret keys** (Flux-compatible): `username`/`password` for
 HTTPS (a forge token is a password), or `identity` + `known_hosts` for

@@ -19,6 +19,11 @@
 #   RIVERS_WORKSPACE_KEEP_REVISIONS  recency floor (default 3)
 #   RIVERS_WORKSPACE_MIN_AGE       age floor, Ns/Nm/Nh (default 1h)
 #
+# Deps mode auto reads the project directory: uv.lock ⇒ uvSync; else
+# requirements.txt ⇒ requirements; else a pyproject.toml in a uv workspace
+# (one uv.lock, at the workspace root) ⇒ uvSync, and uv finds that root lock
+# itself; else none.
+#
 # Layout contract (paths are identical in shared-PVC and emptyDir modes):
 #   /workspace        this tree (subPath mount): src/ venv/ .ready .lock
 #   /workspaces       PVC root — present only on the code-location pod,
@@ -101,6 +106,22 @@ fetch_source() {
         "fetched commit $actual does not match pinned $RIVERS_GIT_COMMIT — ref moved between resolve and fetch; retrying on next pod start"
 }
 
+# A uv workspace has one uv.lock, at its root. Succeeds when the nearest
+# uv.lock above $1, up to the repository root, is next to a pyproject.toml
+# with [tool.uv.workspace]. uv checks the workspace's members/exclude itself:
+# a project the workspace does not include fails `uv sync --locked` loudly.
+in_uv_workspace() {
+    local dir="$1"
+    while [ "$dir" != "$SRC" ]; do
+        dir="${dir%/*}"
+        [ -f "$dir/uv.lock" ] || continue
+        grep -qs '^[[:space:]]*\[tool\.uv\.workspace\]' "$dir/pyproject.toml" || return 1
+        log "uv workspace lock: $dir/uv.lock"
+        return 0
+    done
+    return 1
+}
+
 install_deps() {
     local project_dir="$SRC/${RIVERS_GIT_PATH:-}"
     project_dir="${project_dir%/}"
@@ -108,10 +129,14 @@ install_deps() {
 
     local mode="${RIVERS_DEPS_MODE:-auto}"
     if [ "$mode" = auto ]; then
+        # The project's own files come first. Without a pyproject.toml,
+        # `uv sync --project` would install the enclosing project instead.
         if [ -f "$project_dir/uv.lock" ]; then
             mode=uvSync
         elif [ -f "$project_dir/requirements.txt" ]; then
             mode=requirements
+        elif [ -f "$project_dir/pyproject.toml" ] && in_uv_workspace "$project_dir"; then
+            mode=uvSync
         else
             mode=none
         fi

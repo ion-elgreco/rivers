@@ -22,8 +22,10 @@ spec:
     # How often the operator re-resolves the ref (default 5m, min 60s).
     # pollInterval: 2m
     dependencies:
-      # auto → uv.lock ⇒ uv sync --locked; requirements.txt ⇒ uv pip install;
-      # neither ⇒ install nothing.
+      # auto, in `path`: uv.lock ⇒ uv sync --locked; requirements.txt ⇒
+      # uv pip install; pyproject.toml of a uv workspace member ⇒ uv sync
+      # --locked with the workspace root's uv.lock; none of these ⇒ install
+      # nothing.
       mode: auto
   module: analytics.pipeline
   replicas: 1

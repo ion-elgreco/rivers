@@ -241,9 +241,13 @@ impl GitRef {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Dependencies {
-    /// `auto` picks `uvSync` when `uv.lock` exists, else `requirements` when
-    /// `requirements.txt` exists, else installs nothing. Detection happens in
-    /// the workspace pod — the operator never reads repo contents.
+    /// `auto` reads `path`: `uvSync` when `uv.lock` exists, else
+    /// `requirements` when `requirements.txt` exists, else `uvSync` when
+    /// `pyproject.toml` exists and the nearest `uv.lock` above it, up to the
+    /// repository root, is next to a `pyproject.toml` with
+    /// `[tool.uv.workspace]` (a uv workspace member), else installs nothing.
+    /// Detection happens in the workspace pod — the operator never reads repo
+    /// contents.
     #[serde(default)]
     pub mode: DependencyMode,
 
