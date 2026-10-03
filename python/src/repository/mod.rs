@@ -971,7 +971,7 @@ pub(crate) fn build_unresolved_graph(
     let mut claimed: HashSet<String> = HashSet::new();
 
     for decorator_py in assets {
-        let inner_asset = &decorator_py.borrow(py).inner;
+        let inner_asset = &decorator_py.get().inner;
         let mut deps = Vec::new();
 
         match inner_asset {
@@ -1115,7 +1115,7 @@ pub(crate) fn build_unresolved_graph(
     let mut graph_input_metadata: HashMap<String, HashMap<String, HashMap<String, String>>> =
         HashMap::new();
     for decorator_py in assets {
-        let inner_asset = &decorator_py.borrow(py).inner;
+        let inner_asset = &decorator_py.get().inner;
         if let Asset::Graph(graph_asset) = inner_asset {
             let graph_name = graph_asset.name.clone().unwrap_or_default();
             if let Some(ref pd) = graph_asset.partitions_def {
@@ -3261,7 +3261,7 @@ impl PyCodeRepository {
             .copied()
             .collect::<HashSet<_>>();
         for asset_py in &self.raw_assets {
-            let asset = asset_py.borrow(py);
+            let asset = asset_py.get();
             if let Asset::Graph(graph_asset) = asset.inner()
                 && let Some(node_io_handler) = &graph_asset.node_io_handler
             {
@@ -3290,7 +3290,7 @@ impl PyCodeRepository {
                 ResolvedNode::Asset(a) => {
                     let r = a
                         .inner
-                        .borrow(py)
+                        .get()
                         .inner()
                         .retry_for_output(a.output_name.as_deref())
                         .cloned();

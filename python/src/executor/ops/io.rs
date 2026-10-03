@@ -155,7 +155,7 @@ pub(crate) fn load_upstream_input(
 
     let handler = registry.for_upstream_input(py, downstream_node, upstream_node, param_name);
     let metadata = downstream_node
-        .input_metadata(py, param_name)
+        .input_metadata(param_name)
         .or_else(|| upstream_node.metadata());
     let has_mapping = downstream_node
         .partition_mapping()

@@ -6,10 +6,14 @@ threads run Python and rivers code at the same time.
 
 import threading
 
+import pytest
+
 import rivers as rs
+from rivers.exceptions import AssetDefinitionError
 
 N_THREADS = 16
 CALLS_PER_THREAD = 2000
+GRAPHS_PER_THREAD = 5
 
 
 def run_threads(fn, n=N_THREADS):
@@ -79,3 +83,129 @@ def test_task_factory_shared_across_threads():
 
     assert errors == []
     assert results == [(f"task_{i}", ["etl"], i) for i in range(N_THREADS)]
+
+
+ASSET_FACTORIES = {
+    "single": lambda: rs.Asset(partitions_def="shared"),
+    "multi": lambda: rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("out")], partitions_def="shared"
+    ),
+    "graph": lambda: rs.Asset.from_graph(partitions_def="shared"),
+    "external": lambda: rs.Asset.external(
+        io_handler=rs.InMemoryIOHandler(), partitions_def="shared"
+    ),
+}
+
+
+def wrapped_fn(asset):
+    return asset.observe_fn if asset.is_external else asset._asset_fn
+
+
+@pytest.mark.parametrize("kind", ASSET_FACTORIES)
+def test_asset_factory_decorates_many_functions(kind):
+    factory = ASSET_FACTORIES[kind]()
+
+    def first(): ...
+
+    def second(): ...
+
+    assets = [factory(first), factory(second)]
+
+    assert [(type(a), a.name, a.partitions_def, wrapped_fn(a)) for a in assets] == [
+        (type(factory), "first", "shared", first),
+        (type(factory), "second", "shared", second),
+    ]
+    assert factory._name is None
+
+
+def test_asset_factories_materialize_each_function():
+    single = rs.Asset(group="etl")
+    graph = rs.Asset.from_graph(group="etl")
+
+    @single
+    def source() -> int:
+        return 3
+
+    @single
+    def other() -> int:
+        return 5
+
+    @rs.Task
+    def double(source: int) -> int:
+        return source * 2
+
+    @rs.Task
+    def triple(source: int) -> int:
+        return source * 3
+
+    @graph
+    def doubled(source: int):
+        return double(source)
+
+    @graph
+    def tripled(source: int):
+        return triple(source)
+
+    assets = [source, other, doubled, tripled]
+    repo = rs.CodeRepository(
+        assets=assets,
+        tasks=[double, triple],
+        default_executor=rs.Executor.in_process(),
+    )
+
+    assert repo.materialize().success
+    assert {a.name: (a.group, repo.load_node(a.name)) for a in assets} == {
+        "source": ("etl", 3),
+        "other": ("etl", 5),
+        "doubled": ("etl", 6),
+        "tripled": ("etl", 9),
+    }
+
+
+@pytest.mark.parametrize("shared_factory", [False, True], ids=["fresh", "shared"])
+def test_concurrent_graph_composition(shared_factory):
+    @rs.Asset
+    def source() -> int:
+        return 3
+
+    @rs.Task
+    def double(source: int) -> int:
+        return source * 2
+
+    make_graph = rs.Asset.from_graph() if shared_factory else rs.Asset.from_graph
+
+    def compose(i):
+        graphs = []
+        for k in range(GRAPHS_PER_THREAD):
+
+            def body():
+                return double(source())
+
+            body.__name__ = f"g_{i}_{k}"
+            graphs.append(make_graph(body))
+        return graphs
+
+    results, errors = run_threads(compose)
+
+    assert errors == []
+    graphs = [g for per_thread in results for g in per_thread]
+    repo = rs.CodeRepository(
+        assets=[source, *graphs],
+        tasks=[double],
+        default_executor=rs.Executor.in_process(),
+    )
+    assert repo.materialize().success
+    assert {g.name: repo.load_node(g.name) for g in graphs} == {
+        f"g_{i}_{k}": 6 for i in range(N_THREADS) for k in range(GRAPHS_PER_THREAD)
+    }
+
+
+@pytest.mark.parametrize("kind", ASSET_FACTORIES)
+def test_wrapped_asset_called_outside_composition_raises(kind):
+    def body(): ...
+
+    asset = ASSET_FACTORIES[kind]()(body)
+
+    with pytest.raises(AssetDefinitionError, match="already"):
+        asset(lambda: None)
+    assert wrapped_fn(asset) is body

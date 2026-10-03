@@ -587,7 +587,7 @@ impl CodeLocationService for CodeLocationImpl {
                         description: None,
                         partition_def,
                         hooks,
-                        io_handler: node.has_io_handler(py).then(|| "custom".to_string()),
+                        io_handler: node.has_io_handler().then(|| "custom".to_string()),
                         has_self_dependency: false,
                         is_external: node.is_external(),
                         automation_condition,

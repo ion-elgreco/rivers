@@ -137,7 +137,7 @@ pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
         IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
     };
     if let Ok(asset) = obj.bind(py).cast::<PyAsset>() {
-        let asset = asset.borrow();
+        let asset = asset.get();
         return [asset.inner.node_io_handler(), asset.inner.io_handler()]
             .into_iter()
             .flatten()

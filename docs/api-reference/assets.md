@@ -16,6 +16,20 @@ def my_asset():
     return data
 ```
 
+`rs.Asset(...)` without a function is a decorator. Each function it decorates becomes a new asset with the same settings, so you can use one decorator for many functions. `Asset.from_multi()`, `Asset.from_graph()`, and `Asset.external()` without a function work the same way.
+
+```python
+etl = rs.Asset(group="etl", kinds="table")
+
+@etl
+def orders(): ...
+
+@etl
+def customers(): ...
+```
+
+Call an asset only inside an `Asset.from_graph()` body, where the call records the asset as an input of the graph. Outside a graph body, a call to an asset that already has a function raises `AssetDefinitionError`.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |

@@ -167,8 +167,7 @@ impl ResolvedAsset {
         output_name: Option<String>,
         partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
     ) -> PyResult<Self> {
-        let asset_ref = inner.borrow(py);
-        let asset = asset_ref.inner();
+        let asset = inner.get().inner();
 
         let kind = match asset {
             Asset::Single(_) => AssetKind::Single,
@@ -346,8 +345,6 @@ impl ResolvedAsset {
                     .collect()
             })
             .unwrap_or_default();
-
-        drop(asset_ref);
 
         Ok(Self {
             inner,
@@ -689,8 +686,8 @@ impl ResolvedNode {
     pub fn callable(&self, py: Python) -> PyResult<Py<PyAny>> {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                match asset.inner() {
+                let asset = node.inner.get().inner();
+                match asset {
                     Asset::External(ext) => ext
                         .observe_fn
                         .as_ref()
@@ -700,7 +697,7 @@ impl ResolvedNode {
                             )
                         })
                         .map(|f| f.clone_ref(py)),
-                    _ => Ok(asset.inner()._asset_fn()?.clone_ref(py)),
+                    _ => Ok(asset._asset_fn()?.clone_ref(py)),
                 }
             }
             ResolvedNode::Task(node) => {
@@ -728,13 +725,13 @@ impl ResolvedNode {
     pub fn annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                let func = match asset.inner() {
+                let asset = node.inner.get().inner();
+                let func = match asset {
                     Asset::External(ext) => match ext.observe_fn {
                         Some(ref f) => f.clone_ref(py),
                         None => return Ok(None),
                     },
-                    _ => asset.inner()._asset_fn()?.clone_ref(py),
+                    _ => asset._asset_fn()?.clone_ref(py),
                 };
                 let ann = func.getattr(py, "__annotations__")?;
                 Ok(Some(ann.into_bound(py).cast_into::<PyDict>()?))
@@ -855,14 +852,11 @@ impl ResolvedNode {
         }
     }
 
-    pub fn input_metadata(&self, py: Python, param_name: &str) -> Option<HashMap<String, String>> {
+    pub fn input_metadata(&self, param_name: &str) -> Option<HashMap<String, String>> {
         match self {
-            ResolvedNode::Asset(node) => node
-                .inner
-                .borrow(py)
-                .inner()
-                .input_metadata(param_name)
-                .cloned(),
+            ResolvedNode::Asset(node) => {
+                node.inner.get().inner().input_metadata(param_name).cloned()
+            }
             ResolvedNode::Task(node) => {
                 let resolved = node
                     .param_remap
@@ -879,11 +873,10 @@ impl ResolvedNode {
         }
     }
 
-    pub fn has_io_handler(&self, py: Python) -> bool {
+    pub fn has_io_handler(&self) -> bool {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                asset_output_io_handler(asset.inner(), &node.output_name).is_some()
+                asset_output_io_handler(node.inner.get().inner(), &node.output_name).is_some()
             }
             ResolvedNode::Task(node) => {
                 node.io_handler_override.is_some() || node.inner.get().inner.io_handler.is_some()
@@ -896,9 +889,9 @@ impl ResolvedNode {
 
     /// Determines whether IOHandlerRef can reconstruct the handler after re-import
     /// in spawn-based worker subprocesses.
-    pub fn has_definition_io_handler(&self, py: Python) -> bool {
+    pub fn has_definition_io_handler(&self) -> bool {
         match self {
-            ResolvedNode::Asset(_) => self.has_io_handler(py),
+            ResolvedNode::Asset(_) => self.has_io_handler(),
             ResolvedNode::Task(node) => node.inner.get().inner.io_handler.is_some(),
             ResolvedNode::BashTask(node) => node.inner.get().io_handler.is_some(),
         }

@@ -291,7 +291,7 @@ impl PyJob {
                 }
 
                 if self.allow_incomplete_deps {
-                    let has_handler = Python::attach(|py| dep_node.has_io_handler(py));
+                    let has_handler = dep_node.has_io_handler();
                     if !has_handler {
                         return Err(GraphValidationError::new_err(format!(
                             "Job '{}': node '{}' depends on '{}' which is not in the job \
@@ -460,7 +460,7 @@ impl PyJob {
         let mut node_names = Vec::new();
         for obj in &assets {
             if let Ok(asset) = obj.cast_bound::<PyAsset>(py) {
-                let inner = &asset.borrow().inner;
+                let inner = &asset.get().inner;
                 // Multi-assets are registered in the graph under individual output
                 // names, not the parent function name.
                 if let Some(output_names) = inner.multi_asset_names() {

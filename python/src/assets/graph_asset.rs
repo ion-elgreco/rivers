@@ -53,6 +53,42 @@ pub struct GraphAsset {
     pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
+impl GraphAsset {
+    pub fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            name: self.name.clone(),
+            wraps: self.wraps.as_ref().map(|f| f.clone_ref(py)),
+            kinds: self.kinds.clone(),
+            group: self.group.clone(),
+            code_version: self.code_version.clone(),
+            tags: self.tags.clone(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            node_io_handler: self.node_io_handler.as_ref().map(|h| h.clone_ref(py)),
+            metadata: self.metadata.clone(),
+            partitions_def: self.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            partition_mappings: self.partition_mappings.clone(),
+            dep_only_names: self.dep_only_names.clone(),
+            input_io_handlers: self
+                .input_io_handlers
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone_ref(py)))
+                .collect(),
+            input_metadata: self.input_metadata.clone(),
+            hooks: self
+                .hooks
+                .as_ref()
+                .map(|hooks| hooks.iter().map(|h| h.clone_ref(py)).collect()),
+            automation_condition: self.automation_condition.clone(),
+            backfill_strategy: self.backfill_strategy.clone(),
+            retry: self.retry.clone(),
+            invocations: self.invocations.clone(),
+            invocation_order: self.invocation_order.clone(),
+            final_node: self.final_node.clone(),
+            actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+        }
+    }
+}
+
 /// Python-exposed marker subclass created via `Asset.from_graph(...)`.
-#[pyclass(name = "GraphAsset", extends=PyAsset, subclass, module = "rivers._core")]
+#[pyclass(name = "GraphAsset", extends=PyAsset, subclass, frozen, module = "rivers._core")]
 pub struct PyGraphAsset;

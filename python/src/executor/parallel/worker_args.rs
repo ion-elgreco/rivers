@@ -249,7 +249,7 @@ fn build_io_load_spec(
     };
 
     let metadata = downstream_node
-        .input_metadata(py, param_name)
+        .input_metadata(param_name)
         .or_else(|| upstream_node.metadata());
 
     // Skip is already handled by the caller — build_io_load_spec is only called

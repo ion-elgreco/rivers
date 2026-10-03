@@ -26,8 +26,8 @@ class Asset:
     Use ``@Asset`` (bare) or ``@Asset(...)`` (with options) on a function for a
     :class:`SingleAsset`. Use :meth:`Asset.from_multi`, :meth:`Asset.from_graph`,
     or :meth:`Asset.external` for the multi-asset, graph-asset, and external-asset
-    variants. The returned object is a callable producing the asset's value
-    (and is also the registered :class:`Asset` for the repository).
+    variants. An asset without a function is a decorator: each function it
+    decorates becomes a new asset of the same kind with the same settings.
     """
 
     # used as @Asset (no parentheses)
@@ -196,7 +196,16 @@ class Asset:
         automation_condition: AutomationCondition | None = None,
     ) -> "ExternalAsset": ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke the asset's user function directly (used in tests / graphs)."""
+        """Wrap a function, or record a call inside a graph composition.
+
+        On an asset without a function, return a new asset of the same kind
+        that wraps the given function and keeps this asset's settings. Inside
+        an :meth:`Asset.from_graph` body, record an invocation of this asset.
+
+        Raises:
+            AssetDefinitionError: The asset already wraps a function and the
+                call is outside an :meth:`Asset.from_graph` body.
+        """
         ...
 
     def _asset_fn(self) -> Callable:
@@ -336,7 +345,11 @@ class ExternalAsset(Asset):
     """
 
     def __call__(self, f: Callable[..., Any]) -> "ExternalAsset":
-        """Decorator form — attach the observe callable to this external asset."""
+        """Return a new external asset with ``f`` as its observe callable.
+
+        Raises:
+            AssetDefinitionError: This asset already has an observe callable.
+        """
         ...
 
 class AssetDef:
