@@ -281,7 +281,7 @@ pub fn commit_for_ref(adv: &Advertisement, wanted: &GitRef) -> Result<ResolvedRe
 /// SSH material arrives as *contents* (the operator reads the Secret over
 /// the API, it doesn't mount it); the resolver writes it to short-lived
 /// 0600 tempfiles because russh's key/known_hosts APIs are path-based.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub enum GitCredentials {
     #[default]
     Anonymous,
@@ -301,9 +301,10 @@ pub struct GitResolveRequest {
     pub url: String,
     pub r#ref: GitRef,
     pub credentials: GitCredentials,
-    /// How long a branch resolution stays cached. Semver-like tags are
-    /// cached indefinitely (`registry::looks_immutable`), pinned commits
-    /// never hit the network at all.
+    /// How old a cached branch resolution may be and still answer this
+    /// request. Semver-like tags are cached indefinitely
+    /// (`registry::looks_immutable`), pinned commits never hit the network
+    /// at all.
     pub cache_ttl: std::time::Duration,
 }
 
@@ -316,12 +317,54 @@ const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
 /// not stop a host's code locations for days.
 const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// A cached ref no request used for this long is dropped at the next insert:
+/// a day, what `pollInterval: "0"` polls at. Past it, only an immutable tag
+/// or a slower poll fetches again.
+const MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 #[derive(Default)]
 struct Cache {
-    refs: std::collections::HashMap<(String, String), CacheEntry>,
+    refs: std::collections::HashMap<RefKey, CachedRef>,
     /// Hosts that asked the operator to wait, by [`host_of`].
     paused_hosts: std::collections::HashMap<String, HostPause>,
 }
+
+impl Cache {
+    /// Store `entry` for `key`, and drop the refs no request used for
+    /// [`MAX_IDLE`] and the host pauses that ended.
+    fn insert(&mut self, key: RefKey, entry: CacheEntry, now: std::time::Instant) {
+        self.refs
+            .retain(|_, cached| now.saturating_duration_since(cached.last_used) < MAX_IDLE);
+        self.paused_hosts.retain(|_, pause| now < pause.until);
+        self.refs.insert(
+            key,
+            CachedRef {
+                entry,
+                last_used: now,
+            },
+        );
+    }
+}
+
+struct CachedRef {
+    entry: CacheEntry,
+    /// The last cache hit or insert.
+    last_used: std::time::Instant,
+}
+
+/// A ref as one set of credentials sees it: a code location only gets a
+/// cached commit or failure that its own credentials produced.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RefKey {
+    url: String,
+    r#ref: String,
+    credentials: CredentialFingerprint,
+}
+
+/// A hash of the credentials' kind and contents, so the cache never holds
+/// the secret.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CredentialFingerprint(u64);
 
 struct HostPause {
     until: std::time::Instant,
@@ -331,7 +374,7 @@ struct HostPause {
 enum CacheEntry {
     Resolved {
         resolved: ResolvedRef,
-        expires_at: std::time::Instant,
+        resolved_at: std::time::Instant,
         immutable: bool,
     },
     /// Transient failures since the last success; no fetch before
@@ -343,15 +386,18 @@ enum CacheEntry {
     },
 }
 
-/// Ref→commit resolver: cross-CR cache keyed on `(url, ref)`, semver-like
-/// tags resolved once, exponential backoff after transient errors, and a
-/// host that asks the operator to wait gets no fetch, for any ref, until
-/// its `Retry-After` ends. Leader gating is left to the reconciler. Unlike
+/// Ref→commit resolver: cross-CR cache keyed on url, ref and credentials
+/// (each request sets how old a cached commit it takes; refs unused for a
+/// day are dropped), semver-like tags resolved once, exponential backoff
+/// after transient errors, and a host that asks the operator to wait gets
+/// no fetch, for any ref, until its `Retry-After` ends. Leader gating is
+/// left to the reconciler. Unlike
 /// [`super::registry`]'s digest cache, a ref that backs off does not serve
 /// its last result: it fails until a fetch succeeds.
 pub struct GitResolver {
     http: reqwest::Client,
     timeout: std::time::Duration,
+    fingerprints: std::hash::RandomState,
     cache: tokio::sync::Mutex<Cache>,
 }
 
@@ -364,6 +410,7 @@ impl GitResolver {
         Self {
             http,
             timeout,
+            fingerprints: std::hash::RandomState::new(),
             cache: Default::default(),
         }
     }
@@ -386,27 +433,35 @@ impl GitResolver {
             });
         }
 
-        let cache_key = (req.url.clone(), ref_cache_key(&req.r#ref)?);
+        let cache_key = self.ref_key(req)?;
         let host = host_of(&req.url);
         {
-            let cache = self.cache.lock().await;
-            match cache.refs.get(&cache_key) {
-                Some(CacheEntry::Resolved {
-                    resolved,
-                    expires_at,
-                    immutable,
-                }) if *immutable || *expires_at > now => return Ok(resolved.clone()),
-                Some(CacheEntry::Failing {
-                    error,
-                    next_attempt_after,
-                    ..
-                }) if now < *next_attempt_after => {
-                    return Err(GitFailure {
-                        error: error.clone(),
-                        retry_after: Some(*next_attempt_after - now),
-                    });
+            let mut cache = self.cache.lock().await;
+            if let Some(cached) = cache.refs.get_mut(&cache_key) {
+                match &cached.entry {
+                    CacheEntry::Resolved {
+                        resolved,
+                        resolved_at,
+                        immutable,
+                    } if *immutable
+                        || now.saturating_duration_since(*resolved_at) < req.cache_ttl =>
+                    {
+                        cached.last_used = now;
+                        return Ok(resolved.clone());
+                    }
+                    CacheEntry::Failing {
+                        error,
+                        next_attempt_after,
+                        ..
+                    } if now < *next_attempt_after => {
+                        cached.last_used = now;
+                        return Err(GitFailure {
+                            error: error.clone(),
+                            retry_after: Some(*next_attempt_after - now),
+                        });
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             if let Some(pause) = host.as_ref().and_then(|h| cache.paused_hosts.get(h))
                 && now < pause.until
@@ -427,18 +482,16 @@ impl GitResolver {
                     .tag
                     .as_deref()
                     .is_some_and(super::registry::looks_immutable);
-                cache.refs.insert(
-                    cache_key,
-                    CacheEntry::Resolved {
-                        resolved: resolved.clone(),
-                        expires_at: now + req.cache_ttl,
-                        immutable,
-                    },
-                );
+                let entry = CacheEntry::Resolved {
+                    resolved: resolved.clone(),
+                    resolved_at: now,
+                    immutable,
+                };
+                cache.insert(cache_key, entry, now);
                 Ok(resolved)
             }
             Err(error) if error.is_transient() => {
-                let consecutive_errors = match cache.refs.get(&cache_key) {
+                let consecutive_errors = match cache.refs.get(&cache_key).map(|c| &c.entry) {
                     // A concurrent resolve of this ref failed first and
                     // counted this attempt.
                     Some(CacheEntry::Failing {
@@ -473,14 +526,12 @@ impl GitResolver {
                         cache.paused_hosts.insert(host, pause);
                     }
                 }
-                cache.refs.insert(
-                    cache_key,
-                    CacheEntry::Failing {
-                        error: error.clone(),
-                        consecutive_errors,
-                        next_attempt_after: now + wait,
-                    },
-                );
+                let entry = CacheEntry::Failing {
+                    error: error.clone(),
+                    consecutive_errors,
+                    next_attempt_after: now + wait,
+                };
+                cache.insert(cache_key, entry, now);
                 Err(GitFailure {
                     error,
                     retry_after: Some(wait),
@@ -491,6 +542,15 @@ impl GitResolver {
                 Err(error.into())
             }
         }
+    }
+
+    fn ref_key(&self, req: &GitResolveRequest) -> Result<RefKey, GitError> {
+        use std::hash::BuildHasher as _;
+        Ok(RefKey {
+            url: req.url.clone(),
+            r#ref: ref_cache_key(&req.r#ref)?,
+            credentials: CredentialFingerprint(self.fingerprints.hash_one(&req.credentials)),
+        })
     }
 
     async fn fetch_commit(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitError> {
@@ -606,7 +666,7 @@ mod resolver_tests {
     use super::ssh::test_server::{self, ServerBehaviour};
     use super::*;
     use std::time::{Duration, Instant};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -944,6 +1004,10 @@ mod resolver_tests {
             format!("{}/acme/other.git", server.uri()),
             fixtures::branch("dev"),
         );
+        let main_with_token = GitResolveRequest {
+            credentials: basic(USER, TOKEN),
+            ..main_of(&server)
+        };
         let start = Instant::now();
 
         let throttled = resolver.resolve_at(&main, start).await.unwrap_err();
@@ -953,9 +1017,10 @@ mod resolver_tests {
             rate_limited(&server, "429 Too Many Requests")
         );
 
-        // Neither ref on the host is fetched before the 900s are up.
+        // No ref on the host, with any credentials, is fetched before the
+        // 900s are up.
         let almost = start + Duration::from_secs(899);
-        for req in [&other, &main] {
+        for req in [&other, &main_with_token, &main] {
             let waiting = resolver.resolve_at(req, almost).await.unwrap_err();
             assert_eq!(
                 waiting.retry_after,
@@ -1046,6 +1111,284 @@ mod resolver_tests {
                 "{case}"
             );
         }
+    }
+
+    /// The advertisement after a push moved `main` to commit 9.
+    fn pushed_response() -> ResponseTemplate {
+        let mut body = fixtures::pkt("# service=git-upload-pack\n");
+        body.extend(fixtures::flush());
+        body.extend(fixtures::body(&[format!(
+            "{} refs/heads/main\n",
+            fixtures::oid('9')
+        )]));
+        adv_response().set_body_bytes(body)
+    }
+
+    #[tokio::test]
+    async fn each_request_sets_how_old_a_cached_commit_may_be() {
+        let server = git_server(vec![(adv_response(), Some(1)), (pushed_response(), None)]).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let daily = GitResolveRequest {
+            cache_ttl: Duration::from_secs(24 * 3600),
+            ..main_of(&server)
+        };
+        let every_minute = GitResolveRequest {
+            cache_ttl: Duration::from_secs(60),
+            ..main_of(&server)
+        };
+        let start = Instant::now();
+        let first = resolver.resolve_at(&daily, start).await.unwrap();
+        assert_eq!(first.commit, fixtures::oid('a'));
+
+        let later = start + Duration::from_secs(120);
+        let cached = resolver.resolve_at(&daily, later).await.unwrap();
+        assert_eq!(cached.commit, fixtures::oid('a'));
+        assert_eq!(polls(&server).await, 1);
+        let fetched = resolver.resolve_at(&every_minute, later).await.unwrap();
+        assert_eq!(fetched.commit, fixtures::oid('9'));
+        assert_eq!(polls(&server).await, 2);
+        let cached = resolver.resolve_at(&daily, later).await.unwrap();
+        assert_eq!(cached.commit, fixtures::oid('9'));
+        assert_eq!(polls(&server).await, 2);
+    }
+
+    const USER: &str = "ci-bot";
+    const TOKEN: &str = "glpat-valid-8f1c2d";
+
+    fn basic(username: &str, password: &str) -> GitCredentials {
+        GitCredentials::Basic {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    fn ssh_credentials() -> GitCredentials {
+        GitCredentials::Ssh {
+            private_key_openssh: test_server::CLIENT_KEY.to_string(),
+            known_hosts: format!("forge.example {}", test_server::HOST_PUB),
+        }
+    }
+
+    /// A private repository: it advertises its refs to `USER`/`TOKEN` and
+    /// answers everyone else with 401.
+    async fn private_git_server() -> MockServer {
+        use base64::Engine as _;
+        let server = MockServer::start().await;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{TOKEN}"));
+        Mock::given(method("GET"))
+            .and(path("/acme/pipelines.git/info/refs"))
+            .and(header("authorization", format!("Basic {token}").as_str()))
+            .respond_with(adv_response())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_resolution_is_shared_only_with_the_same_credentials() {
+        let server = private_git_server().await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let url = format!("{}/acme/pipelines.git", server.uri());
+        let release = |credentials| GitResolveRequest {
+            credentials,
+            ..request(url.clone(), fixtures::tag("v1.0.0"))
+        };
+        let now = Instant::now();
+        let resolved = resolver
+            .resolve_at(&release(basic(USER, TOKEN)), now)
+            .await
+            .unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('d'));
+
+        let others = [
+            ("no credentials", GitCredentials::Anonymous),
+            ("a revoked token", basic(USER, "glpat-revoked-0000")),
+            ("another user", basic("someone-else", TOKEN)),
+            ("SSH credentials", ssh_credentials()),
+        ];
+        for (case, credentials) in others {
+            let outcome = resolver.resolve_at(&release(credentials), now).await;
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(GitFailure {
+                        error: GitError::AuthFailed(_),
+                        retry_after: None
+                    })
+                ),
+                "{case}: {outcome:?}"
+            );
+        }
+        // Each username/password asked the host; SSH material never fits an
+        // https url.
+        assert_eq!(polls(&server).await, 4);
+
+        // The same credentials from another code location share the commit.
+        let shared = resolver
+            .resolve_at(&release(basic(USER, TOKEN)), now)
+            .await
+            .unwrap();
+        assert_eq!(shared, resolved);
+        assert_eq!(polls(&server).await, 4);
+    }
+
+    #[tokio::test]
+    async fn an_auth_failure_drops_the_commit_those_credentials_resolved() {
+        let server = git_server(vec![
+            (adv_response(), Some(1)),
+            (ResponseTemplate::new(401), None),
+        ])
+        .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let every_minute = GitResolveRequest {
+            credentials: basic(USER, TOKEN),
+            cache_ttl: Duration::from_secs(60),
+            ..main_of(&server)
+        };
+        let daily = GitResolveRequest {
+            cache_ttl: Duration::from_secs(24 * 3600),
+            ..every_minute.clone()
+        };
+        let start = Instant::now();
+        resolver.resolve_at(&every_minute, start).await.unwrap();
+
+        // The token is revoked: once a fetch is refused, the daily request
+        // no longer gets the commit, young enough as it is.
+        let later = start + Duration::from_secs(120);
+        for req in [&every_minute, &daily] {
+            let outcome = resolver.resolve_at(req, later).await;
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(GitFailure {
+                        error: GitError::AuthFailed(_),
+                        retry_after: None
+                    })
+                ),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(polls(&server).await, 3);
+    }
+
+    #[test]
+    fn a_cache_key_holds_no_secret() {
+        let resolver = GitResolver::new(TIMEOUT);
+        let key = |credentials| {
+            let req = GitResolveRequest {
+                credentials,
+                ..request(
+                    "https://forge.example/acme/pipelines.git".to_string(),
+                    fixtures::branch("main"),
+                )
+            };
+            resolver.ref_key(&req).unwrap()
+        };
+
+        for credentials in [basic(USER, TOKEN), ssh_credentials()] {
+            let shown = format!("{:?}", key(credentials));
+            for secret in [USER, TOKEN]
+                .into_iter()
+                .chain(test_server::CLIENT_KEY.lines())
+            {
+                assert!(!shown.contains(secret), "{shown}");
+            }
+        }
+        let no_contents = [
+            key(GitCredentials::Anonymous),
+            key(basic("", "")),
+            key(GitCredentials::Ssh {
+                private_key_openssh: String::new(),
+                known_hosts: String::new(),
+            }),
+        ];
+        assert_ne!(no_contents[0], no_contents[1]);
+        assert_ne!(no_contents[0], no_contents[2]);
+        assert_ne!(no_contents[1], no_contents[2]);
+    }
+
+    /// Which of `reqs` the resolver holds a commit or failure for.
+    async fn held(resolver: &GitResolver, reqs: &[&GitResolveRequest]) -> Vec<bool> {
+        let cache = resolver.cache.lock().await;
+        reqs.iter()
+            .map(|req| cache.refs.contains_key(&resolver.ref_key(req).unwrap()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_insert_drops_the_refs_no_request_used_for_a_day() {
+        let server = git_server(vec![(adv_response(), None)]).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let hour = Duration::from_secs(3600);
+        let daily = |git_ref| GitResolveRequest {
+            cache_ttl: 24 * hour,
+            ..request(format!("{}/acme/pipelines.git", server.uri()), git_ref)
+        };
+        let release = |token: &str| GitResolveRequest {
+            credentials: basic(USER, token),
+            ..daily(fixtures::tag("v1.0.0"))
+        };
+        let old_token = release("glpat-rotated-away");
+        let new_token = release(TOKEN);
+        let main = daily(fixtures::branch("main"));
+        let dev = daily(fixtures::branch("dev"));
+        let start = Instant::now();
+        for req in [&old_token, &main, &dev] {
+            resolver.resolve_at(req, start).await.unwrap();
+        }
+        // The Secret rotates to the new token; main is asked for again.
+        resolver.resolve_at(&new_token, start + hour).await.unwrap();
+        resolver.resolve_at(&main, start + 12 * hour).await.unwrap();
+        assert_eq!(polls(&server).await, 4);
+
+        let light = daily(fixtures::tag("light"));
+        resolver
+            .resolve_at(&light, start + 24 * hour)
+            .await
+            .unwrap();
+        assert_eq!(
+            held(&resolver, &[&old_token, &new_token, &main, &dev, &light]).await,
+            [false, true, true, false, true]
+        );
+    }
+
+    async fn paused_hosts(resolver: &GitResolver) -> Vec<String> {
+        let cache = resolver.cache.lock().await;
+        let mut hosts: Vec<String> = cache.paused_hosts.keys().cloned().collect();
+        hosts.sort();
+        hosts
+    }
+
+    #[tokio::test]
+    async fn an_insert_drops_the_host_pauses_that_ended() {
+        let mut servers = Vec::new();
+        for retry_after in ["900", "3600"] {
+            let throttled = ResponseTemplate::new(429).insert_header("retry-after", retry_after);
+            servers.push(git_server(vec![(throttled, Some(1)), (adv_response(), None)]).await);
+        }
+        let host = |server: &MockServer| server.address().to_string();
+        let resolver = GitResolver::new(TIMEOUT);
+        let start = Instant::now();
+        for server in &servers {
+            resolver
+                .resolve_at(&main_of(server), start)
+                .await
+                .unwrap_err();
+        }
+        let mut both = vec![host(&servers[0]), host(&servers[1])];
+        both.sort();
+        assert_eq!(paused_hosts(&resolver).await, both);
+
+        let ended = start + Duration::from_secs(900);
+        resolver
+            .resolve_at(&main_of(&servers[0]), ended)
+            .await
+            .unwrap();
+        assert_eq!(paused_hosts(&resolver).await, [host(&servers[1])]);
     }
 }
 
