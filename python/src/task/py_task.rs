@@ -2,7 +2,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::assets::decorator::{is_coroutine_function, name_or_fn_name};
+use crate::assets::decorator::{decorated_fn, is_coroutine_function, name_or_fn_name};
 use crate::assets::io_handler::IOHandler;
 use crate::composition::{
     InvokedNodeType, PyInvokedNodeOutput, extract_input_bindings, is_in_composition,
@@ -98,7 +98,12 @@ impl PyTask {
         let py = slf.py();
         let task = &slf.get().inner;
         let Some(func) = &task.wraps else {
-            let inner = task.wrapping(py, args.get_item(0)?.unbind())?;
+            let func = decorated_fn(args, kwargs).ok_or_else(|| {
+                TaskDefinitionError::new_err(
+                    "the Task decorator needs one function, e.g. `@rs.Task(tags=...)` on a def",
+                )
+            })?;
+            let inner = task.wrapping(py, func)?;
             return Ok(Py::new(py, Self { inner })?.into_any());
         };
         if is_in_composition() {

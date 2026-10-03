@@ -28,6 +28,8 @@ def extract(): ...
 def load(): ...
 ```
 
+`etl()` raises `TaskDefinitionError`, because `etl` needs one function.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |

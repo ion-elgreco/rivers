@@ -203,8 +203,10 @@ class Asset:
         an :meth:`Asset.from_graph` body, record an invocation of this asset.
 
         Raises:
-            AssetDefinitionError: The asset already wraps a function and the
-                call is outside an :meth:`Asset.from_graph` body.
+            AssetDefinitionError: The asset has no function and the call does
+                not pass exactly one function, or the asset already wraps a
+                function and the call is outside an :meth:`Asset.from_graph`
+                body.
         """
         ...
 
@@ -348,7 +350,8 @@ class ExternalAsset(Asset):
         """Return a new external asset with ``f`` as its observe callable.
 
         Raises:
-            AssetDefinitionError: This asset already has an observe callable.
+            AssetDefinitionError: ``f`` is not callable, or this asset already
+                has an observe callable.
         """
         ...
 

@@ -126,6 +126,10 @@ class Task:
 
         On a ``Task`` without a function, return a new ``Task`` that wraps the
         given function and keeps this task's settings.
+
+        Raises:
+            TaskDefinitionError: The task has no function and the call does not
+                pass exactly one function.
         """
         ...
 

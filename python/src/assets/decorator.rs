@@ -30,6 +30,19 @@ fn ensure_callable(py: Python, func: &Option<Py<PyAny>>) -> PyResult<()> {
     Ok(())
 }
 
+/// The function in a decorator call: one callable positional argument and
+/// no keyword arguments.
+pub fn decorated_fn(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> Option<Py<PyAny>> {
+    if args.len() != 1 || kwargs.is_some_and(|k| !k.is_empty()) {
+        return None;
+    }
+    let func = args.get_item(0).ok()?;
+    func.is_callable().then(|| func.unbind())
+}
+
 #[derive(Default)]
 struct ProcessedDeps {
     partition_mappings: Option<PartitionMappingDict>,
@@ -1560,7 +1573,12 @@ impl PyAsset {
         let py = slf.py();
         let asset = slf.get().inner();
         if asset.func().is_none() {
-            return Self::new_object(py, asset.wrapping(py, args.get_item(0)?.unbind())?);
+            let func = decorated_fn(args, kwargs).ok_or_else(|| {
+                AssetDefinitionError::new_err(
+                    "the Asset decorator needs one function, e.g. `@rs.Asset(group=...)` on a def",
+                )
+            })?;
+            return Self::new_object(py, asset.wrapping(py, func)?);
         }
         let name = asset
             .name()

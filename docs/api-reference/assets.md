@@ -28,7 +28,18 @@ def orders(): ...
 def customers(): ...
 ```
 
-Call an asset only inside an `Asset.from_graph()` body, where the call records the asset as an input of the graph. Outside a graph body, a call to an asset that already has a function raises `AssetDefinitionError`.
+`etl` stays a decorator: each `@etl` makes a new asset. The decorated `orders` is an asset, not a plain function. Call it only inside an `Asset.from_graph()` body, where `orders()` adds `orders` as an input of the graph:
+
+```python
+@rs.Task
+def summarize(orders): ...
+
+@rs.Asset.from_graph
+def report():
+    return summarize(orders())
+```
+
+Outside a graph body, `orders()` raises `AssetDefinitionError`. `etl()` also raises `AssetDefinitionError`, because `etl` needs one function.
 
 **Parameters:**
 
