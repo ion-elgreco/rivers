@@ -160,7 +160,8 @@ pub struct CodeLocationSpec {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GitSource {
-    /// `https://host/org/repo.git` or `ssh://git@host/org/repo.git`.
+    /// `https://host/org/repo.git` or `ssh://git@host/org/repo.git`. An
+    /// `ssh://` url must name the user (`git` on most git hosts).
     pub url: String,
 
     /// Which revision to pin. Exactly one field set.

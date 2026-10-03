@@ -203,8 +203,13 @@ forge token is a password). Without these two keys the fetch is
 anonymous; a Secret with only one of them is an error. Newlines at the
 end of these two values are ignored, so a file that ends in a newline
 works with `kubectl create secret --from-file`. `ssh://` urls need
-`identity` + `known_hosts`. The keys of the other scheme are ignored, so
-one Secret with all four keys can serve both kinds of url. `identity`
+`identity` + `known_hosts`, and the url must name the user that the key
+logs in as: `ssh://git@github.com/acme/pipelines.git` (`git` on most git
+hosts). Without a user, ssh in the pods would log in as the pod's own
+account: the webhook rejects such a url, and the operator fails a
+CodeLocation that has one with reason `GitAuthFailed`. The keys of the
+other scheme are ignored, so one Secret with all four keys can serve
+both kinds of url. `identity`
 must be a private key without a passphrase. `known_hosts` supports exact
 and hashed (`|1|`) entries only — no `*` wildcards or `@cert-authority`
 lines; list each host explicitly. Each line must be an entry or a

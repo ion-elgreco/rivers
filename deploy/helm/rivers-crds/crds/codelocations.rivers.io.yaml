@@ -243,7 +243,9 @@ spec:
                     - name
                     type: object
                   url:
-                    description: '`https://host/org/repo.git` or `ssh://git@host/org/repo.git`.'
+                    description: |-
+                      `https://host/org/repo.git` or `ssh://git@host/org/repo.git`. An
+                      `ssh://` url must name the user (`git` on most git hosts).
                     type: string
                   workspaceSize:
                     description: |-

@@ -20,6 +20,7 @@ use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, CodeLocati
 use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
+use crate::codelocation::git::ssh::with_git_user;
 use crate::codelocation::reconcile::wanted_image;
 use crate::codelocation::{DirectoryState, ImageRef};
 
@@ -439,6 +440,10 @@ fn mutate_codelocation_on_create(req: &AdmissionRequest<CodeLocation>) -> CodeLo
     CodeLocationOutcome::AcceptedAsIs
 }
 
+/// The source rules apply only when `spec.git` or `spec.image` changes, and
+/// not while the object is being deleted: a CodeLocation that predates a
+/// stricter rule still takes other updates, such as labels or the garbage
+/// collector's finalizer removal.
 fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocationOutcome {
     let (Some(new), Some(old)) = (req.object.as_ref(), req.old_object.as_ref()) else {
         return CodeLocationOutcome::Rejected(
@@ -451,7 +456,12 @@ fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocati
             old.spec.identity, new.spec.identity
         ));
     }
-    if let Err(message) = validate_git_source(new, &git_allowed_hosts()) {
+    let source_changed = new.spec.git != old.spec.git || new.spec.image != old.spec.image;
+    let deleting = new.metadata.deletion_timestamp.is_some();
+    if source_changed
+        && !deleting
+        && let Err(message) = validate_git_source(new, &git_allowed_hosts())
+    {
         return CodeLocationOutcome::Rejected(message);
     }
     CodeLocationOutcome::UpdateAllowed
@@ -459,8 +469,8 @@ fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocati
 
 /// Validate the source shape (RFC-044): at least one of `image`/`git`
 /// (re-checked here for API servers whose CEL support predates the CRD
-/// rule), a well-formed one-of `git.ref`, a supported URL scheme, and the
-/// operator's host allowlist.
+/// rule), a well-formed one-of `git.ref`, a supported URL scheme, a user in
+/// an `ssh://` url, and the operator's host allowlist.
 fn validate_git_source(cl: &CodeLocation, allowed_hosts: &[String]) -> Result<(), String> {
     if cl.spec.image.is_none() && cl.spec.git.is_none() {
         return Err("one of spec.image or spec.git must be set".to_string());
@@ -472,8 +482,8 @@ fn validate_git_source(cl: &CodeLocation, allowed_hosts: &[String]) -> Result<()
     validate_git_url("spec.git.url", &git.url, allowed_hosts)
 }
 
-/// Supported scheme and the operator's host allowlist. `field` names the
-/// url in messages.
+/// Supported scheme, a user in `ssh://` urls, and the operator's host
+/// allowlist. `field` names the url in messages.
 fn validate_git_url(field: &str, raw: &str, allowed_hosts: &[String]) -> Result<(), String> {
     let url =
         url::Url::parse(raw).map_err(|e| format!("{field} '{raw}' is not a valid url: {e}"))?;
@@ -488,6 +498,13 @@ fn validate_git_url(field: &str, raw: &str, allowed_hosts: &[String]) -> Result<
     let Some(host) = url.host_str() else {
         return Err(format!("{field} '{raw}' has no host"));
     };
+    // Without a user, the pods' ssh logs in as their own account.
+    if url.scheme() == "ssh" && url.username().is_empty() {
+        return Err(format!(
+            "{field} must name the ssh user — use {}, or the user your git host expects",
+            with_git_user(&url)
+        ));
+    }
     if !host_allowed(host, allowed_hosts) {
         return Err(format!(
             "git host '{host}' is not in the operator's allowed list — \
@@ -1000,6 +1017,44 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("git host 'forge.example'"), "{err}");
         assert!(err.contains("allowedHosts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_ssh_source_url_without_a_user() {
+        /// A self-stamped run on `url`, which is also the code location's
+        /// own url (as admitted before ssh urls had to name the user).
+        async fn on_url(url: &str) -> RunOutcome {
+            let deps = AdmissionDeps::cache_only(
+                spec_directory(serde_json::json!({
+                    "git": {
+                        "url": url,
+                        "ref": { "branch": "main" },
+                        "secretRef": { "name": "git-creds" },
+                    },
+                }))
+                .await,
+            );
+            let mut source = expected_run_source();
+            source.git.url = url.to_string();
+            let req =
+                admission_request_create("uid-hatch-ssh", "team-data", &self_stamped_run(source));
+            mutate_run(&req, &deps).await
+        }
+
+        assert_eq!(
+            on_url("ssh://github.com/acme/r.git").await,
+            RunOutcome::Rejected(
+                "spec.source.git.url must name the ssh user — use \
+                 ssh://git@github.com/acme/r.git, or the user your git host expects"
+                    .to_string()
+            )
+        );
+        for url in [
+            "ssh://git@github.com/acme/r.git",
+            "https://github.com/acme/r.git",
+        ] {
+            assert_eq!(on_url(url).await, RunOutcome::AcceptedAsIs, "{url}");
+        }
     }
 
     #[tokio::test]
@@ -1558,6 +1613,128 @@ mod tests {
         }));
         let err = validate_git_source(&ftp, &[]).unwrap_err();
         assert!(err.contains("unsupported"), "{err}");
+    }
+
+    const USERLESS_SSH_REJECTION: &str = "spec.git.url must name the ssh user — use \
+        ssh://git@github.com/acme/r.git, or the user your git host expects";
+
+    #[test]
+    fn cl_create_rejects_ssh_url_without_a_user() {
+        let cl = |url: &str| {
+            build_git_cl(serde_json::json!({ "url": url, "ref": { "branch": "main" } }))
+        };
+        let create = |url: &str| {
+            mutate_codelocation(&cl_admission_request_create(
+                "uid-cl-ssh",
+                "team-data",
+                &cl(url),
+            ))
+        };
+
+        assert_eq!(
+            create("ssh://github.com/acme/r.git"),
+            CodeLocationOutcome::Rejected(USERLESS_SSH_REJECTION.to_string())
+        );
+        for url in [
+            "ssh://git@github.com/acme/r.git",
+            "https://github.com/acme/r.git",
+        ] {
+            assert!(
+                matches!(create(url), CodeLocationOutcome::IdentityStamped(_)),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_rejects_ssh_url_without_a_user() {
+        let old = build_git_cl(serde_json::json!({
+            "url": "ssh://git@github.com/acme/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/r.git".to_string();
+        let req = cl_admission_request_update("uid-cl-ssh-update", "team-data", &new, &old);
+        assert_eq!(
+            mutate_codelocation(&req),
+            CodeLocationOutcome::Rejected(USERLESS_SSH_REJECTION.to_string())
+        );
+
+        let req = cl_admission_request_update("uid-cl-ssh-update", "team-data", &old, &old);
+        assert_eq!(
+            mutate_codelocation(&req),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// A CodeLocation admitted before ssh urls had to name the user.
+    fn userless_ssh_cl() -> CodeLocation {
+        build_git_cl(serde_json::json!({
+            "url": "ssh://github.com/acme/r.git",
+            "ref": { "branch": "main" }
+        }))
+    }
+
+    fn cl_update(new: &CodeLocation, old: &CodeLocation) -> CodeLocationOutcome {
+        mutate_codelocation(&cl_admission_request_update(
+            "uid-cl-source-update",
+            "team-data",
+            new,
+            old,
+        ))
+    }
+
+    #[test]
+    fn cl_update_that_keeps_the_source_skips_source_validation() {
+        let old = userless_ssh_cl();
+        let mut new = old.clone();
+        new.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+    }
+
+    #[test]
+    fn cl_update_of_a_deleting_code_location_skips_source_validation() {
+        let mut old = userless_ssh_cl();
+        old.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-03T12:00:00Z".parse().unwrap(),
+            ));
+        old.metadata.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+        // The garbage collector removes its finalizer.
+        let mut new = old.clone();
+        new.metadata.finalizers = None;
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+
+        // Also with a changed source.
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/other.git".to_string();
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+    }
+
+    #[test]
+    fn cl_update_that_changes_the_source_validates_it() {
+        let old = userless_ssh_cl();
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/other.git".to_string();
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(
+                "spec.git.url must name the ssh user — use ssh://git@github.com/acme/other.git, \
+                 or the user your git host expects"
+                    .to_string()
+            )
+        );
+
+        new.spec.git.as_mut().unwrap().url = "ssh://git@github.com/acme/r.git".to_string();
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+
+        // A change of spec.image alone is a source change too.
+        let old = build_cl("analytics", "");
+        let mut new = old.clone();
+        new.spec.image = None;
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected("one of spec.image or spec.git must be set".to_string())
+        );
     }
 
     #[test]

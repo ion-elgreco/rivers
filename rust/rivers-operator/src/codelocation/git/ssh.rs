@@ -26,7 +26,7 @@ use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use super::http::DEFAULT_MAX_ADVERTISEMENT_BYTES;
 use super::{GitError, known_hosts};
 
-/// `ssh://[user@]host[:port]/path`, decomposed. Only the `ssh://` URL form
+/// `ssh://user@host[:port]/path`, decomposed. Only the `ssh://` URL form
 /// is accepted — scp-like `git@host:path` strings are rejected at admission
 /// and again here.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +37,8 @@ pub struct SshTarget {
     pub repo_path: String,
 }
 
+/// A url without a user is an auth failure, not a default: the pods' ssh
+/// would log in as their own account, not as the user resolved with here.
 pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
     let url = url::Url::parse(raw)
         .map_err(|e| GitError::Malformed(format!("invalid ssh url '{raw}': {e}")))?;
@@ -55,16 +57,26 @@ pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
             "'{raw}' has no repository path"
         )));
     }
+    if url.username().is_empty() {
+        return Err(GitError::AuthFailed(format!(
+            "the ssh url must name the user — use {}, or the user your git host expects",
+            with_git_user(&url)
+        )));
+    }
     Ok(SshTarget {
-        user: if url.username().is_empty() {
-            "git".to_string()
-        } else {
-            url.username().to_string()
-        },
+        user: url.username().to_string(),
         host,
         port: url.port().unwrap_or(22),
         repo_path,
     })
+}
+
+/// `url` as `ssh://git@host[:port]/path`: the user most git hosts take.
+/// Built from parts, so no password in `url` reaches a message.
+pub(crate) fn with_git_user(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("ssh://git@{host}{port}{}", url.path())
 }
 
 /// Single-quote `s` for the remote shell: `'…'` with embedded single quotes
@@ -654,24 +666,48 @@ mod tests {
 
     #[test]
     fn parse_ssh_url_shapes() {
-        let t = parse_ssh_url("ssh://git@gitea.internal:2222/acme/repo.git").unwrap();
+        let t = parse_ssh_url("ssh://deploy@gitea.internal:2222/r.git").unwrap();
         assert_eq!(
             t,
             SshTarget {
-                user: "git".to_string(),
+                user: "deploy".to_string(),
                 host: "gitea.internal".to_string(),
                 port: 2222,
-                repo_path: "/acme/repo.git".to_string(),
+                repo_path: "/r.git".to_string(),
             }
         );
-        // Defaults: user git, port 22.
-        let t = parse_ssh_url("ssh://forge.example/org/repo.git").unwrap();
-        assert_eq!(t.user, "git");
+        let t = parse_ssh_url("ssh://git@forge.example/org/repo.git").unwrap();
         assert_eq!(t.port, 22);
 
         assert!(parse_ssh_url("https://forge.example/org/repo.git").is_err());
         assert!(parse_ssh_url("git@forge.example:org/repo.git").is_err());
-        assert!(parse_ssh_url("ssh://forge.example").is_err());
+        assert!(parse_ssh_url("ssh://git@forge.example").is_err());
+    }
+
+    #[test]
+    fn an_ssh_url_without_a_user_is_an_auth_failure() {
+        // The pod's ssh would log in as its own account, not as the user
+        // the operator checked the key with.
+        for (url, fixed) in [
+            (
+                "ssh://github.com/acme/r.git",
+                "ssh://git@github.com/acme/r.git",
+            ),
+            (
+                "ssh://gitea.internal:2222/r.git",
+                "ssh://git@gitea.internal:2222/r.git",
+            ),
+        ] {
+            let err = parse_ssh_url(url).unwrap_err();
+            assert!(matches!(err, GitError::AuthFailed(_)), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "git authentication failed: the ssh url must name the user — use {fixed}, \
+                     or the user your git host expects"
+                )
+            );
+        }
     }
 
     #[test]

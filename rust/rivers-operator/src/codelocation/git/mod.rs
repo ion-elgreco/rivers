@@ -37,8 +37,9 @@ pub enum GitError {
     /// remote changes.
     #[error("ref not found: {0}")]
     RefNotFound(String),
-    /// Credentials rejected (or unusable — e.g. an unreadable private key).
-    /// Terminal until the Secret changes.
+    /// Credentials rejected (or unusable — e.g. an unreadable private key,
+    /// or an ssh url without a user). Terminal until the Secret or the CR
+    /// changes.
     #[error("git authentication failed: {0}")]
     AuthFailed(String),
     /// SSH host key not trusted: unknown host, or a changed key. Never
@@ -471,6 +472,10 @@ impl GitResolver {
         req: &GitResolveRequest,
         now: std::time::Instant,
     ) -> Result<ResolvedRef, GitFailure> {
+        // Also for a pinned commit: the pods fetch it with this url.
+        if Transport::of(&req.url)? == Transport::Ssh {
+            ssh::parse_ssh_url(&req.url)?;
+        }
         // Pinned commit: no lookup, no cache, no network.
         if let Some(commit) = req.r#ref.commit.as_deref().filter(|c| !c.is_empty()) {
             return Ok(ResolvedRef {
@@ -911,6 +916,59 @@ mod resolver_tests {
                  this host's key to the git Secret"
             )
         );
+        assert_eq!(server.connections(), 0);
+    }
+
+    /// A request for `r#ref` on the test git server through an ssh url
+    /// without a user, with credentials the server accepts for user `git`.
+    async fn userless_ssh_request(r#ref: GitRef) -> (ServerBehaviour, GitResolveRequest) {
+        let server = ServerBehaviour::default();
+        let port = test_server::spawn_server(server.clone()).await;
+        let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
+        let mut req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+        req.url = format!("ssh://127.0.0.1:{port}/acme/pipelines.git");
+        req.r#ref = r#ref;
+        (server, req)
+    }
+
+    /// `failure` is the terminal one for `req`'s ssh url without a user.
+    fn assert_userless_failure(failure: &GitFailure, req: &GitResolveRequest) {
+        assert!(
+            matches!(failure.error, GitError::AuthFailed(_)),
+            "{:?}",
+            failure.error
+        );
+        let fixed = req.url.replace("ssh://", "ssh://git@");
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "git authentication failed: the ssh url must name the user — use {fixed}, or \
+                 the user your git host expects"
+            )
+        );
+        assert_eq!(failure.retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn an_ssh_url_without_a_user_fails_before_connecting() {
+        let (server, req) = userless_ssh_request(fixtures::branch("main")).await;
+
+        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        assert_userless_failure(&failure, &req);
+        assert_eq!(server.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_commit_on_an_ssh_url_without_a_user_fails() {
+        // Never fetched here, but the pods fetch the commit with this url.
+        let pinned = GitRef {
+            commit: Some(fixtures::oid('9')),
+            ..Default::default()
+        };
+        let (server, req) = userless_ssh_request(pinned).await;
+
+        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        assert_userless_failure(&failure, &req);
         assert_eq!(server.connections(), 0);
     }
 

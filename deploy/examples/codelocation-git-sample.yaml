@@ -11,6 +11,8 @@ metadata:
 spec:
   git:
     url: https://github.com/acme/pipelines.git
+    # Over SSH the url must name the user (`git` on most git hosts):
+    # url: ssh://git@github.com/acme/pipelines.git
     # Exactly one of branch | tag | commit.
     ref:
       branch: main
