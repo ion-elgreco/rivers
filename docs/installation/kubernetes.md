@@ -266,9 +266,44 @@ even a variable that the install uses, such as `UV_INDEX_URL`: after you
 change it, the code-location pods roll out on the same tree. There is no
 way to rebuild a tree on request. To install with the new value, give the
 CodeLocation a new commit, for example an empty commit
-(`git commit --allow-empty`) on its branch. Without RWX storage every pod
-builds its own tree; that's fine for `executor: parallel` but slow for
-wide `executor: kubernetes` fan-outs.
+(`git commit --allow-empty`) on its branch.
+
+**Fallback mode** (the default,
+`codeLocation.workspace.shared.enabled=false`): every pod builds its own
+tree in an `emptyDir` before its main container starts. It fetches the
+commit from the git host and installs the dependencies from the package
+index, without a cache. Each code-location pod builds when it starts, and
+so does the run pod of each run, also when the operator replaces that
+pod. With `Executor.kubernetes`, the pod of each step, each mapped
+instance and each retry builds too. So a run on the default
+`Executor.parallel()` builds once, and a run of 40 steps on
+`Executor.kubernetes` builds 41 times. A backfill makes one run per
+partition by default, and each of these runs builds. In `requirements`
+mode, each build resolves the requirements again: pin exact versions,
+else different pods can get different versions.
+
+**Failed builds in fallback mode**: each build must finish within
+`dependencies.timeoutSeconds` (default 600 seconds). If the build of a run
+pod fails, for example because the package index does not answer, the
+operator replaces the pod, which builds again, up to 3 times without
+progress (the Run's `spec.maxRestarts`). A step pod is not replaced: its
+Job has `backoffLimit: 0`, so the step fails. A failed build counts as an
+`INFRASTRUCTURE` failure: if the asset has a
+[retry policy](../concepts/retries.md) that retries these, such as
+`RetryOn.TRANSIENT` or the default `RetryOn.ALL`, the retry builds again
+in a new pod.
+
+**Which mode to use**: use shared mode where you have RWX storage and you
+use `Executor.kubernetes`, start many runs (schedules, sensors,
+backfills), or have a large install. Fallback mode is enough for a few
+runs at a time on `Executor.parallel()` or `Executor.in_process()`.
+`Executor.kubernetes` starts all ready steps of a level at the same time,
+unless you set `max_concurrent_steps`. In fallback mode, all of these
+pods then fetch and install at the same time, from the git host and the
+package index. To limit this, set
+`Executor.kubernetes(max_concurrent_steps=...)` for the step pods of a
+run, and a run queue, `RunQueueConfig(max_concurrent_runs=...)`, for the
+runs (see [Concurrency](../concepts/concurrency.md)).
 
 **Writing files**: in shared mode, the tree is read-only in run and step
 pods, so that no run can change the code or the venv that other runs and
