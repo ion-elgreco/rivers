@@ -247,6 +247,19 @@ download again on the next build. In fallback mode, pods install with
 the checkout and the venv. During an install, uv's temporary copy of the
 wheels is in the container's `/tmp`, outside this limit.
 
+**Old trees**: in shared mode, each time a code-location pod starts, it
+deletes old trees from the PVC. It keeps the trees that the CodeLocation
+and its unfinished runs use, the `codeLocation.workspace.keepRevisions`
+newest trees (default 3), and all trees younger than
+`codeLocation.workspace.minTreeAge` (default `1h`). Write `minTreeAge` as
+a whole number with `s`, `m` or `h`, for example `90m` or `24h`. The
+operator does not start if it cannot read `minTreeAge` (for example `1d`,
+`1h30m` or `1.5h`) or `keepRevisions`. If the pod cannot read these
+limits, for example because `spec.env` sets
+`RIVERS_WORKSPACE_MIN_AGE_SECONDS` or `RIVERS_WORKSPACE_KEEP_REVISIONS` to
+a value that is not a whole number, it deletes no tree, and its init
+container log gives the reason.
+
 **Which commit a run uses**: runs get the last *fully rolled-out* commit.
 After a push, the operator rolls the code-location pods to the new
 commit, but `status.resolvedCommit` moves to it only when every pod runs

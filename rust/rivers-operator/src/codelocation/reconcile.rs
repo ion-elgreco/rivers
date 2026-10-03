@@ -98,7 +98,7 @@ pub struct WorkspaceConfig {
     pub shared_size: String,
     pub empty_dir_limit: String,
     pub keep_revisions: u32,
-    pub min_tree_age: String,
+    pub min_tree_age: Duration,
 }
 
 impl Default for WorkspaceConfig {
@@ -109,12 +109,48 @@ impl Default for WorkspaceConfig {
             shared_size: "20Gi".to_string(),
             empty_dir_limit: "2Gi".to_string(),
             keep_revisions: 3,
-            min_tree_age: "1h".to_string(),
+            min_tree_age: Duration::from_secs(3600),
         }
     }
 }
 
 impl WorkspaceConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let mut cfg = Self::default();
+        let env = |name: &str| get(name).filter(|v| !v.is_empty());
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_ENABLED") {
+            cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
+        }
+        cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
+        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
+            cfg.shared_size = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
+            cfg.empty_dir_limit = v;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS") {
+            cfg.keep_revisions = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "RIVERS_WORKSPACE_KEEP_REVISIONS (codeLocation.workspace.keepRevisions): \
+                     expected a whole number, got {v:?}"
+                )
+            })?;
+        }
+        if let Some(v) = env("RIVERS_WORKSPACE_MIN_AGE") {
+            cfg.min_tree_age = humantime_lite::parse(&v).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RIVERS_WORKSPACE_MIN_AGE (codeLocation.workspace.minTreeAge): expected a \
+                     whole number with s, m or h, like 90m or 24h, got {v:?}"
+                )
+            })?;
+        }
+        Ok(cfg)
+    }
+
     /// Workspace volume for the pods of CodeLocation `cl_name` and of its
     /// runs: the CL's shared PVC, or an `emptyDir` capped at
     /// `spec.git.workspaceSize`, else at the chart's `sizeLimit`.
@@ -460,7 +496,7 @@ async fn apply_git_workspace(
             .shared_enabled
             .then(|| keep_config_map_name(&name)),
         keep_revisions: Some(ctx.workspace.keep_revisions),
-        min_tree_age: Some(ctx.workspace.min_tree_age.clone()),
+        min_tree_age: Some(ctx.workspace.min_tree_age),
         extra_env: cl.spec.env.clone(),
     };
     let pieces = workspace::builder_pod_pieces(&wspec);
@@ -1219,8 +1255,8 @@ fn parse_refresh_interval(spec_value: Option<&str>) -> Duration {
     }
 }
 
-/// Minimal duration parser accepting `30s`, `5m`, `1h`. We avoid pulling in
-/// the full `humantime` crate for this one use.
+/// Minimal duration parser accepting `30s`, `5m`, `1h`; a bare number is
+/// seconds.
 mod humantime_lite {
     use std::time::Duration;
 
@@ -1230,13 +1266,18 @@ mod humantime_lite {
             return num.parse::<u64>().ok().map(Duration::from_secs);
         }
         if let Some(num) = s.strip_suffix('m') {
-            return num.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60));
+            return num
+                .parse::<u64>()
+                .ok()
+                .and_then(|m| m.checked_mul(60))
+                .map(Duration::from_secs);
         }
         if let Some(num) = s.strip_suffix('h') {
             return num
                 .parse::<u64>()
                 .ok()
-                .map(|h| Duration::from_secs(h * 3600));
+                .and_then(|h| h.checked_mul(3600))
+                .map(Duration::from_secs);
         }
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
@@ -1552,6 +1593,48 @@ mod tests {
             parse_refresh_interval(Some("300s")),
             Duration::from_secs(300)
         );
+    }
+
+    fn workspace_config(vars: &[(&str, &str)]) -> anyhow::Result<WorkspaceConfig> {
+        WorkspaceConfig::from_lookup(&|k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn workspace_config_refuses_floors_the_prune_cannot_read() {
+        for (var, value) in [
+            ("RIVERS_WORKSPACE_MIN_AGE", "1d"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "7d"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "2H"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "1h30m"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "1.5h"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "abc"),
+            ("RIVERS_WORKSPACE_MIN_AGE", "-1h"),
+            // Past u64::MAX seconds.
+            ("RIVERS_WORKSPACE_MIN_AGE", "5124095576030432h"),
+            ("RIVERS_WORKSPACE_KEEP_REVISIONS", "three"),
+            ("RIVERS_WORKSPACE_KEEP_REVISIONS", "2.5"),
+            ("RIVERS_WORKSPACE_KEEP_REVISIONS", "-1"),
+        ] {
+            let expected = if var == "RIVERS_WORKSPACE_MIN_AGE" {
+                format!(
+                    "RIVERS_WORKSPACE_MIN_AGE (codeLocation.workspace.minTreeAge): expected a \
+                     whole number with s, m or h, like 90m or 24h, got {value:?}"
+                )
+            } else {
+                format!(
+                    "RIVERS_WORKSPACE_KEEP_REVISIONS (codeLocation.workspace.keepRevisions): \
+                     expected a whole number, got {value:?}"
+                )
+            };
+            match workspace_config(&[(var, value)]) {
+                Ok(cfg) => panic!("{var}={value} accepted: {cfg:?}"),
+                Err(e) => assert_eq!(e.to_string(), expected),
+            }
+        }
     }
 
     #[test]
@@ -2823,6 +2906,62 @@ mod tests {
                 trees.join(","),
                 "one tree per dependency setting"
             );
+        }
+
+        #[tokio::test]
+        async fn sync_container_gets_the_chart_floors_as_whole_numbers() {
+            for (chart, keep, age) in [
+                (vec![], "3", "3600"),
+                (
+                    vec![
+                        ("RIVERS_WORKSPACE_KEEP_REVISIONS", "5"),
+                        ("RIVERS_WORKSPACE_MIN_AGE", "90m"),
+                    ],
+                    "5",
+                    "5400",
+                ),
+                (
+                    vec![
+                        ("RIVERS_WORKSPACE_KEEP_REVISIONS", "0"),
+                        ("RIVERS_WORKSPACE_MIN_AGE", "0s"),
+                    ],
+                    "0",
+                    "0",
+                ),
+                (vec![("RIVERS_WORKSPACE_MIN_AGE", "24h")], "3", "86400"),
+                (vec![("RIVERS_WORKSPACE_MIN_AGE", "45s")], "3", "45"),
+                (vec![("RIVERS_WORKSPACE_MIN_AGE", "600")], "3", "600"),
+            ] {
+                let mut vars = vec![("RIVERS_WORKSPACE_SHARED_ENABLED", "true")];
+                vars.extend(chart.iter().copied());
+                let workspace = workspace_config(&vars).unwrap();
+                let state = api_with(git_cl_at('a', serving_status('a')), rolled_out());
+
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), workspace).await;
+
+                let pod = state.lock().unwrap().deployments["x"]
+                    .spec
+                    .clone()
+                    .unwrap()
+                    .template
+                    .spec
+                    .unwrap();
+                let floors: Vec<(&str, &str)> = pod.init_containers.as_ref().unwrap()[0]
+                    .env
+                    .iter()
+                    .flatten()
+                    .filter(|e| e.name.starts_with("RIVERS_WORKSPACE_"))
+                    .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+                    .collect();
+                assert_eq!(
+                    floors,
+                    [
+                        ("RIVERS_WORKSPACE_KEEP_REVISIONS", keep),
+                        ("RIVERS_WORKSPACE_MIN_AGE_SECONDS", age),
+                    ],
+                    "{chart:?}"
+                );
+            }
         }
 
         #[tokio::test]

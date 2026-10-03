@@ -25,6 +25,8 @@
 //!   fallback mode it builds its own tree and looks like the builder minus
 //!   the prune surface.
 
+use std::time::Duration;
+
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapKeySelector, Container, EnvVar, EnvVarSource, PodSecurityContext,
     SecretVolumeSource, SecurityContext, Volume, VolumeMount,
@@ -79,7 +81,7 @@ pub struct WorkspaceSpec {
     /// Builder only: keep-set ConfigMap consumed via `configMapKeyRef`.
     pub keep_config_map: Option<String>,
     pub keep_revisions: Option<u32>,
-    pub min_tree_age: Option<String>,
+    pub min_tree_age: Option<Duration>,
     /// The CL's `spec.env`, applied to the init container too (RFC-036
     /// extended: `UV_INDEX_URL` & co. are needed at install time).
     pub extra_env: Vec<EnvVar>,
@@ -230,8 +232,11 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
         if let Some(n) = spec.keep_revisions {
             env.push(env_var("RIVERS_WORKSPACE_KEEP_REVISIONS", &n.to_string()));
         }
-        if let Some(age) = &spec.min_tree_age {
-            env.push(env_var("RIVERS_WORKSPACE_MIN_AGE", age));
+        if let Some(age) = spec.min_tree_age {
+            env.push(env_var(
+                "RIVERS_WORKSPACE_MIN_AGE_SECONDS",
+                &age.as_secs().to_string(),
+            ));
         }
     }
     let env = crate::env::merge_env(env, spec.extra_env.iter().cloned());
@@ -426,7 +431,7 @@ mod tests {
             deps: deps(),
             keep_config_map: Some("analytics-workspace-keep".to_string()),
             keep_revisions: Some(3),
-            min_tree_age: Some("1h".to_string()),
+            min_tree_age: Some(Duration::from_secs(3600)),
             extra_env: vec![k8s_openapi::api::core::v1::EnvVar {
                 name: "UV_INDEX_URL".to_string(),
                 value: Some("https://pypi.internal/simple".to_string()),
@@ -481,7 +486,7 @@ mod tests {
                     { "name": "RIVERS_WORKSPACE_KEEP", "valueFrom": { "configMapKeyRef": {
                         "name": "analytics-workspace-keep", "key": "keep", "optional": true }}},
                     { "name": "RIVERS_WORKSPACE_KEEP_REVISIONS", "value": "3" },
-                    { "name": "RIVERS_WORKSPACE_MIN_AGE", "value": "1h" },
+                    { "name": "RIVERS_WORKSPACE_MIN_AGE_SECONDS", "value": "3600" },
                     { "name": "UV_INDEX_URL", "value": "https://pypi.internal/simple" },
                 ],
                 "volumeMounts": [

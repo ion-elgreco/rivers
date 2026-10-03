@@ -781,7 +781,7 @@ mod tests {
             deps: git.dependencies.clone(),
             keep_config_map: Some(keep_config_map_name("analytics")),
             keep_revisions: Some(3),
-            min_tree_age: Some("1h".to_string()),
+            min_tree_age: Some(std::time::Duration::from_secs(3600)),
             extra_env: cl.spec.env.clone(),
         })
     }

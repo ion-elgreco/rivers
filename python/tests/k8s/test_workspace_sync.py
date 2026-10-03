@@ -4,7 +4,8 @@ Shared mode keeps one uv cache on the PVC. After each successful build the
 script prunes it to the wheels built from source (``uv cache prune --ci``).
 Fallback pods install without a cache, so there is nothing to prune. Past
 the recency and age floors, the tree prune keeps a tree only when its whole
-name is in the keep-set.
+name is in the keep-set. A floor that is not a whole number skips the tree
+prune.
 
 Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
 ``uv.lock``, else its ``requirements.txt``. A member of a uv workspace has no
@@ -18,6 +19,7 @@ urls use ``identity`` and ``known_hosts``, other urls ``username`` and
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -102,7 +104,7 @@ def test_prune_keeps_only_the_trees_whose_whole_key_is_kept(workspace_sync):
         shared=True,
         RIVERS_WORKSPACE_KEEP=f"tree,{kept}",
         RIVERS_WORKSPACE_KEEP_REVISIONS="0",
-        RIVERS_WORKSPACE_MIN_AGE="0s",
+        RIVERS_WORKSPACE_MIN_AGE_SECONDS="0",
     )
 
     assert built.returncode == 0, built.stderr
@@ -111,6 +113,81 @@ def test_prune_keeps_only_the_trees_whose_whole_key_is_kept(workspace_sync):
         p.name for p in workspace_sync.volume.iterdir() if not p.name.startswith(".")
     )
     assert left == [kept, "cache", "tree"]
+
+
+DAY = 24 * 3600
+OLD_TREES = {"old-1": 2 * DAY, "old-2": 3 * DAY, "old-3": 4 * DAY}
+
+
+def _sibling_trees(workspace_sync, ages: dict[str, int]) -> None:
+    now = time.time()
+    for name, age in ages.items():
+        (workspace_sync.volume / name).mkdir()
+        os.utime(workspace_sync.volume / name, (now - age, now - age))
+
+
+def _trees(workspace_sync) -> list[str]:
+    return sorted(
+        p.name for p in workspace_sync.volume.iterdir() if not p.name.startswith(".")
+    )
+
+
+@pytest.mark.parametrize(
+    ("keep_revisions", "min_age"),
+    [
+        pytest.param("0", "1d", id="min-age-1d"),
+        pytest.param("0", "1h30m", id="min-age-1h30m"),
+        pytest.param("0", "abc", id="min-age-abc"),
+        pytest.param("three", "3600", id="keep-revisions-three"),
+        pytest.param("2.5", "3600", id="keep-revisions-2.5"),
+    ],
+)
+def test_prune_deletes_nothing_when_it_cannot_read_a_floor(
+    workspace_sync, keep_revisions, min_age
+):
+    _sibling_trees(workspace_sync, OLD_TREES)
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    built = workspace_sync.run(
+        commit,
+        shared=True,
+        RIVERS_WORKSPACE_KEEP="tree",
+        RIVERS_WORKSPACE_KEEP_REVISIONS=keep_revisions,
+        RIVERS_WORKSPACE_MIN_AGE_SECONDS=min_age,
+    )
+
+    assert built.returncode == 0, built.stderr
+    assert _trees(workspace_sync) == ["old-1", "old-2", "old-3", "tree"]
+    assert (
+        f"workspace-sync: prune: skipped — RIVERS_WORKSPACE_KEEP_REVISIONS="
+        f"'{keep_revisions}' and RIVERS_WORKSPACE_MIN_AGE_SECONDS='{min_age}' "
+        "must both be whole numbers\n"
+    ) in built.stderr
+
+
+@pytest.mark.parametrize(
+    ("keep_revisions", "left"),
+    [
+        pytest.param("1", ["tree", "young"], id="age-floor-keeps-young"),
+        pytest.param("3", ["old-1", "tree", "young"], id="recency-floor-keeps-old-1"),
+    ],
+)
+def test_prune_removes_the_old_trees_past_both_floors(
+    workspace_sync, keep_revisions, left
+):
+    _sibling_trees(workspace_sync, {"young": 60, **OLD_TREES})
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    built = workspace_sync.run(
+        commit,
+        shared=True,
+        RIVERS_WORKSPACE_KEEP="tree",
+        RIVERS_WORKSPACE_KEEP_REVISIONS=keep_revisions,
+        RIVERS_WORKSPACE_MIN_AGE_SECONDS="3600",
+    )
+
+    assert built.returncode == 0, built.stderr
+    assert _trees(workspace_sync) == left
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])

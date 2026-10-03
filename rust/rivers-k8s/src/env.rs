@@ -623,7 +623,7 @@ mod tests {
                 deps: source.dependencies.clone(),
                 keep_config_map: Some("analytics-workspace-keep".to_string()),
                 keep_revisions: Some(3),
-                min_tree_age: Some("1h".to_string()),
+                min_tree_age: Some(std::time::Duration::from_secs(3600)),
                 extra_env: vec![],
             })
             .main_env;
@@ -783,7 +783,7 @@ mod tests {
                 deps: source.dependencies.clone(),
                 keep_config_map: Some("analytics-workspace-keep".to_string()),
                 keep_revisions: Some(3),
-                min_tree_age: Some("1h".to_string()),
+                min_tree_age: Some(std::time::Duration::from_secs(3600)),
                 extra_env: vec![],
             });
             // A run that the code-location pod launches carries its source.

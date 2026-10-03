@@ -16,8 +16,8 @@
 #   RIVERS_DEPS_GROUPS             csv → uv sync --group …
 #   RIVERS_DEPS_TIMEOUT_SECONDS    fetch+install budget (default 600)
 #   RIVERS_WORKSPACE_KEEP          csv of workspace keys the prune must retain
-#   RIVERS_WORKSPACE_KEEP_REVISIONS  recency floor (default 3)
-#   RIVERS_WORKSPACE_MIN_AGE       age floor, Ns/Nm/Nh (default 1h)
+#   RIVERS_WORKSPACE_KEEP_REVISIONS   recency floor, whole number (default 3)
+#   RIVERS_WORKSPACE_MIN_AGE_SECONDS  age floor, whole seconds (default 3600)
 #
 # Deps mode auto reads the project directory: uv.lock ⇒ uvSync; else
 # requirements.txt ⇒ requirements; else a pyproject.toml in a uv workspace
@@ -40,7 +40,9 @@
 #     short-circuit — reclamation triggers on pod starts, not commits;
 #   * the uv cache is pruned only after a build, the one step that fills it;
 #   * prune failures are non-fatal — a full volume must not block the tree
-#     that was just built successfully.
+#     that was just built successfully;
+#   * a floor that is not a whole number skips the prune — a value the
+#     script cannot read must never let it delete a tree.
 
 set -euo pipefail
 
@@ -205,13 +207,11 @@ build() {
 
 # ---- prune (step 5) -------------------------------------------------------
 
-parse_duration_seconds() {
-    case "$1" in
-        *h) echo $((${1%h} * 3600)) ;;
-        *m) echo $((${1%m} * 60)) ;;
-        *s) echo "${1%s}" ;;
-        *) echo "$1" ;;
-    esac
+# Digits only, and small enough for `[`: a floor test that errors would
+# let the tree go.
+is_whole_number() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 0 ] 2>/dev/null
 }
 
 prune() {
@@ -220,8 +220,11 @@ prune() {
 
     local keep_csv=",${RIVERS_WORKSPACE_KEEP:-},"
     local keep_n="${RIVERS_WORKSPACE_KEEP_REVISIONS:-3}"
-    local min_age_s
-    min_age_s=$(parse_duration_seconds "${RIVERS_WORKSPACE_MIN_AGE:-1h}")
+    local min_age_s="${RIVERS_WORKSPACE_MIN_AGE_SECONDS:-3600}"
+    if ! is_whole_number "$keep_n" || ! is_whole_number "$min_age_s"; then
+        log "prune: skipped — RIVERS_WORKSPACE_KEEP_REVISIONS='$keep_n' and RIVERS_WORKSPACE_MIN_AGE_SECONDS='$min_age_s' must both be whole numbers"
+        return 0
+    fi
 
     # flock -n: at most one pruner at a time; the rest skip. A prune that
     # finds nothing eligible is a directory listing — redundancy is free.

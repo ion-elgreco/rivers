@@ -59,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let workspace_cfg = codelocation::WorkspaceConfig::from_env()?;
+
     let client = Client::try_default().await?;
     let namespace = rivers_k8s::env::detect_namespace();
     let surreal_config = rivers_k8s::env::detect_surreal_connect_config();
@@ -85,28 +87,6 @@ async fn main() -> anyhow::Result<()> {
     // Built up front so the run reconciler's Context can reference it; the
     // watcher + gRPC tasks are spawned later via `spawn_registry_service`.
     let directory_state = Arc::new(codelocation::DirectoryState::new());
-
-    let workspace_cfg = {
-        let mut cfg = codelocation::WorkspaceConfig::default();
-        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_ENABLED") {
-            cfg.shared_enabled = matches!(v.as_str(), "true" | "1");
-        }
-        cfg.storage_class = env("RIVERS_WORKSPACE_STORAGE_CLASS");
-        if let Some(v) = env("RIVERS_WORKSPACE_SHARED_SIZE") {
-            cfg.shared_size = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_EMPTYDIR_LIMIT") {
-            cfg.empty_dir_limit = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_KEEP_REVISIONS").and_then(|v| v.parse().ok()) {
-            cfg.keep_revisions = v;
-        }
-        if let Some(v) = env("RIVERS_WORKSPACE_MIN_AGE") {
-            cfg.min_tree_age = v;
-        }
-        cfg
-    };
 
     let run_ctx = Arc::new(run::Context {
         client: client.clone(),
