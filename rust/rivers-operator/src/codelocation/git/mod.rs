@@ -94,12 +94,26 @@ impl From<GitError> for GitFailure {
     }
 }
 
-/// Transport/protocol failures out of russh that we didn't classify
-/// ourselves land as transient — host-key and auth outcomes are produced
+/// Transport/protocol failures out of russh land as transient, except no
+/// host-key algorithm in common: our list is the key types `known_hosts`
+/// records for the host (`known_hosts::HostKeys::algorithms`), so that is a
+/// host-key rejection. Other host-key and auth outcomes are produced
 /// explicitly before this conversion can occur.
 impl From<russh::Error> for GitError {
     fn from(e: russh::Error) -> Self {
-        GitError::Unreachable(e.to_string())
+        match e {
+            russh::Error::NoCommonAlgo {
+                kind: russh::AlgorithmKind::Key,
+                ours,
+                theirs,
+            } => GitError::HostKeyRejected(format!(
+                "the host offers {} and the git Secret's `known_hosts` allows only {} for it — \
+                 add one of the host's offered keys to `known_hosts`",
+                theirs.join(", "),
+                ours.join(", ")
+            )),
+            e => GitError::Unreachable(e.to_string()),
+        }
     }
 }
 

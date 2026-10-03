@@ -204,6 +204,9 @@ is required with `identity` and supports exact and hashed (`|1|`) entries
 only — no `*` wildcards or `@cert-authority` lines; list each host
 explicitly. Each line must be an entry or a comment: the operator refuses
 a `known_hosts` with any other line and does not connect to the host.
+Ed25519, ECDSA and RSA host keys work, not DSA. One key per host is
+enough: the operator asks each host only for the key types that
+`known_hosts` lists for it.
 
 **Shared workspace** (recommended where you have RWX storage): set
 `codeLocation.workspace.shared.enabled=true` and the code+venv is built

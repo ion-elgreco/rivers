@@ -127,13 +127,17 @@ pub(crate) async fn fetch_advertisement_with_cap(
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(timeout),
+        preferred: russh::Preferred {
+            key: host_keys.algorithms()?.into(),
+            ..russh::Preferred::DEFAULT
+        },
         ..Default::default()
     });
     let handler = HostKeyCheck(host_keys);
 
     // `connect` returns `H::Error`, so a host-key rejection from the handler
-    // surfaces as our own GitError; transport failures arrive via
-    // `From<russh::Error>` as `Unreachable`.
+    // surfaces as our own GitError; russh's own errors arrive via
+    // `From<russh::Error>`.
     let mut handle = client::connect(config, (target.host.as_str(), target.port), handler).await?;
 
     let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
@@ -230,6 +234,46 @@ AAAEAePrUUBrPim4oMVYXt6hNWyccDkZeMfyjXbV/qzxFx6ViXHrGv1EZGzi9tPYZ+mCp6
 mJ98ybVQvfbdNz3hrFeQAAAABGhvc3QB
 -----END OPENSSH PRIVATE KEY-----
 ";
+    // ECDSA P-256 and RSA 2048 host keys, generated the same way.
+    pub(crate) const ECDSA_HOST_PUB: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBD3Jl0sLsh30HWs8Oge6DWH1DvM3x5tId44vx5vakRiOGd7UOibKDTURI/tgGISQloA70kzLr1vdlByTS9ku51k=";
+    pub(crate) const ECDSA_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ9yZdLC7Id9B1rPDoHug1h9Q7zN8eb
+SHeOL8eb2pEYjhne1Domyg01ESP7YBiEkJaAO9JMy69b3ZQck0vZLudZAAAAmE6AyE1OgM
+hNAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBD3Jl0sLsh30HWs8
+Oge6DWH1DvM3x5tId44vx5vakRiOGd7UOibKDTURI/tgGISQloA70kzLr1vdlByTS9ku51
+kAAAAgHlQws6aGudt2/q03RKUuNjJNKSxI1rmyE9z6Gb9bAC4AAAAA
+-----END OPENSSH PRIVATE KEY-----
+";
+    pub(crate) const RSA_HOST_PUB: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDqyZy6n10ANLsqh7xRyowl9TDgYPJp2QFIB8xhxrFxZx+nM/rixg4GDolm92kN4tT8BV68I7tHt4cx5MtrkMs65Gmx4gA3OB/aDnCpIMk66ecmeXs6aBCkKFxKqDSu3YOqZ/COm5dikIs42PDgkf1u13veDUPtsrTzkd8HI4R5gNbCTq/tZ4DO5+LA8kmCWb/AMziFj/XlEKMNRsjHi0vBN7WlWfYJD1x23xO7JWaUjrJF9hK5gb9Q2ansoCn9DWqttvnvdRGXSbx2w3aP9md40bZG90IsFMaJK1K4sR6UmdYQ52chhZizdn3mFJFmkSYEbCY2GlZX/6kLNOK3rKXv";
+    pub(crate) const RSA_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAQEA6smcup9dADS7Koe8UcqMJfUw4GDyadkBSAfMYcaxcWcfpzP64sYO
+Bg6JZvdpDeLU/AVevCO7R7eHMeTLa5DLOuRpseIANzgf2g5wqSDJOunnJnl7OmgQpChcSq
+g0rt2DqmfwjpuXYpCLONjw4JH9btd73g1D7bK085HfByOEeYDWwk6v7WeAzufiwPJJglm/
+wDM4hY/15RCjDUbIx4tLwTe1pVn2CQ9cdt8TuyVmlI6yRfYSuYG/UNmp7KAp/Q1qrbb573
+URl0m8dsN2j/ZneNG2RvdCLBTGiStSuLEelJnWEOdnIYWYs3Z95hSRZpEmBGwmNhpWV/+p
+CzTit6yl7wAAA7j/gvke/4L5HgAAAAdzc2gtcnNhAAABAQDqyZy6n10ANLsqh7xRyowl9T
+DgYPJp2QFIB8xhxrFxZx+nM/rixg4GDolm92kN4tT8BV68I7tHt4cx5MtrkMs65Gmx4gA3
+OB/aDnCpIMk66ecmeXs6aBCkKFxKqDSu3YOqZ/COm5dikIs42PDgkf1u13veDUPtsrTzkd
+8HI4R5gNbCTq/tZ4DO5+LA8kmCWb/AMziFj/XlEKMNRsjHi0vBN7WlWfYJD1x23xO7JWaU
+jrJF9hK5gb9Q2ansoCn9DWqttvnvdRGXSbx2w3aP9md40bZG90IsFMaJK1K4sR6UmdYQ52
+chhZizdn3mFJFmkSYEbCY2GlZX/6kLNOK3rKXvAAAAAwEAAQAAAQEAlEt3dOCHa0PjG//T
+0I1wa+EsV+yj8HsiNg7G5tMK7KfH9GH+ixGxdd3kp2aJsj2dbPkvVwHynl+rQrZSTcSMuM
+vgfnxSyo3mgGIygoC02UM3vrNoRAHK0QS1Fmqbq/851H4GEOzxd034wZU0v4M2YbY1BJG4
+YABKDrYJ+oZSfDLQstRFYRKyMdA7JU+CvFbNjZFQwBj7KZ6SDzNuZLpm6v8relCEiAKI9e
+MSWsOqcaKyOuhN9bo7eTTIwCZrLzIUSR0AHr5Sw3Wj967vVt3X/geNFVNMsbBxf8XnUq+4
+CQENNuZFzMEeCqF/AvTrGYr9WNgjgPpQwOeglcq54Ako0QAAAIEAhi7ELdZ6mzbFPKVPDB
+t4whwOg+SEow2qCCIABYk4oqAsUT+z9wGT+QxDe3mkfLdxIl36B8DmwetzXFunphWf+u3/
+gmqr+PXjk8NIdTHymVcdewbUaP3VTTwA5k6n4Md8nsiBP6g9PsxwpNnXJUlDGxwxSc/+SN
+7rAfBzFDzc7HUAAACBAPl3UBNdIkibvVZvS9j13S284k/LnPZShLRxG2/TWB/k8+r/HpuW
+cO5RcikfTxiw4UTiDfXF8p+T+ko9LJy/cMGJJZq+AvPO4u+9mSW+GhJzuSbrL77J+Zze31
+fhNvNS3AmJS2wIrw5+pmObtBHo5xfaphr18+5sK4yoZuwD7EqTAAAAgQDw7+EC660pCEr2
+EFm2/aclGiTMqjSIl4VEZwXr67KPrnZKgqJRzG9/GfWRKFX4EMrUQLnijrOXsfx9k0eyEL
+3y4QzbEdci9FI4qKwClmIrzrASmZWnZT2j2CPJUBSQ5noECrX9CFg2AAZt5ttbveVI4SvN
+E874t4SYF2IL9avktQAAAAAB
+-----END OPENSSH PRIVATE KEY-----
+";
     /// An ed25519 key with the passphrase `correct horse battery staple`.
     pub(crate) const PASSPHRASE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBbt00mIv
@@ -248,6 +292,8 @@ Qjm9zYDGIBlKeGwA==
         pub(crate) exit_status: u32,
         pub(crate) stderr: Option<&'static str>,
         pub(crate) authorized_pub: &'static str,
+        /// The host keys the server can present.
+        pub(crate) host_keys: Vec<&'static str>,
         /// The connections the server accepted.
         pub(crate) connections: Arc<AtomicUsize>,
     }
@@ -260,6 +306,7 @@ Qjm9zYDGIBlKeGwA==
                 exit_status: 0,
                 stderr: None,
                 authorized_pub: CLIENT_PUB,
+                host_keys: vec![HOST_KEY],
                 connections: Arc::default(),
             }
         }
@@ -365,7 +412,11 @@ Qjm9zYDGIBlKeGwA==
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(server::Config {
-            keys: vec![decode_secret_key(HOST_KEY, None).unwrap()],
+            keys: behaviour
+                .host_keys
+                .iter()
+                .map(|key| decode_secret_key(key, None).unwrap())
+                .collect(),
             ..Default::default()
         });
         tokio::spawn(async move {
@@ -396,6 +447,104 @@ mod tests {
     }
 
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    const ROGUE_ECDSA_PUB: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBQOOCWBjec6lOoe6rlMytTsM3nU6dGU8eeIALBjDBrQ1yLhpkwqO/2WW2DdlW5sponZMlcIS3ExCBicbnQddkA=";
+    /// From Python `cryptography`: OpenSSH 10 no longer makes DSA keys.
+    const DSA_PUB: &str = "ssh-dss AAAAB3NzaC1kc3MAAACBAJgs9kIE3deKCau/lBFHIX3ZNYbNjoCnmz7OJW3IHNa1Il7ghlKac5+7Dn2kzcYr+vEWNJEq7VkwzujBxlFFDtlKvI9l7P2f/NRgX/rdwxdmmOCKmeMmMDVvrEmQRj34qc++L0nDd+JDLEUPuSFRld0+R+rYOZAiqPV1jyUztpBLAAAAFQC7w2w7c+NTV90M/aFbivHpWoqwJQAAAIAKn5PsatJgiLf0hHc7tR0w4rvCnoY1ISiXCd+Dpw8MosoI+3/ypMyeQZoA14iTGOKXXP6eYUyUt79dQ1hBh8KkbwxH7jcbQ6gNnPho0oqdgBz1QENcqqeOXmheKFWPmfJPd7oS4Kcq1StcbjFN9cn7tzUvbZaERk4cnD47PQw73QAAAIEAkUWwehPM1TbfdZW6Wkc/Zzu+VzOepGk+9PIOZxdkg1xi7WHUDh4XhSknnmA1mDCcNT7uijXs4rWoxruYr8BVO8MZlMd/EHCnpwxtG7WVZjYYJOlkVjSbSNVpDO/GfJzpwiwuxL8JNbWft6DYFUBVgKNp+8+pBCR4oKTVNxTI6U0=";
+
+    /// A server with an Ed25519, an ECDSA and an RSA host key, like most
+    /// forges.
+    fn forge() -> ServerBehaviour {
+        ServerBehaviour {
+            host_keys: vec![HOST_KEY, ECDSA_HOST_KEY, RSA_HOST_KEY],
+            ..Default::default()
+        }
+    }
+
+    /// Spawn `server` and resolve `main` with a `known_hosts` that pins only
+    /// `pinned` for it. Returns the server's port and the commit.
+    async fn resolve_main_pinning(
+        server: &ServerBehaviour,
+        pinned: &str,
+    ) -> (u16, Result<String, GitError>) {
+        let port = spawn_server(server.clone()).await;
+        let known_hosts = known_hosts_pinning(port, pinned);
+        let target =
+            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
+        let commit = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
+            .await
+            .map(|bytes| {
+                let adv = parse_advertisement(&bytes).unwrap();
+                commit_for_ref(&adv, &fixtures::branch("main"))
+                    .unwrap()
+                    .commit
+            });
+        (port, commit)
+    }
+
+    #[tokio::test]
+    async fn a_forge_pinned_by_its_ecdsa_key_alone_resolves() {
+        let server = forge();
+        let (_, commit) = resolve_main_pinning(&server, ECDSA_HOST_PUB).await;
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_forge_pinned_by_its_rsa_key_alone_resolves() {
+        let server = forge();
+        let (_, commit) = resolve_main_pinning(&server, RSA_HOST_PUB).await;
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_forge_whose_key_of_the_pinned_type_differs_is_rejected() {
+        let server = forge();
+        let (port, commit) = resolve_main_pinning(&server, ROGUE_ECDSA_PUB).await;
+        assert_eq!(
+            commit.unwrap_err().to_string(),
+            format!(
+                "host key rejected: HOST KEY CHANGED for '127.0.0.1:{port}' (known_hosts line 1) \
+                 — possible man-in-the-middle; refusing. Update the Secret only after out-of-band \
+                 verification"
+            )
+        );
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_without_a_key_of_the_pinned_type_is_rejected() {
+        let server = ServerBehaviour::default();
+        let (_, commit) = resolve_main_pinning(&server, ECDSA_HOST_PUB).await;
+        let err = commit.unwrap_err();
+        assert!(matches!(err, GitError::HostKeyRejected(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "host key rejected: the host offers ssh-ed25519 and the git Secret's `known_hosts` \
+             allows only ecdsa-sha2-nistp256 for it — add one of the host's offered keys to \
+             `known_hosts`"
+        );
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pin_of_a_key_type_the_operator_cannot_check_fails_before_connecting() {
+        let server = forge();
+        let (port, commit) = resolve_main_pinning(&server, DSA_PUB).await;
+        let err = commit.unwrap_err();
+        assert!(matches!(err, GitError::KnownHostsUnavailable(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "known_hosts unavailable: the git Secret's `known_hosts` has only ssh-dss keys \
+                 for '127.0.0.1:{port}'; the operator accepts ssh-ed25519, ecdsa-sha2-nistp256, \
+                 ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, ssh-rsa host keys — add the host's \
+                 key of one of these types"
+            )
+        );
+        assert_eq!(server.connections(), 0);
+    }
 
     #[tokio::test]
     async fn end_to_end_resolves_branch_over_ssh() {

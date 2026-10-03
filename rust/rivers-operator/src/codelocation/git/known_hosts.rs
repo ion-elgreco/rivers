@@ -4,9 +4,11 @@
 //! connection to the host. `ssh_key` parses each line; this module owns the
 //! rest:
 //!
-//! * a `known_hosts` with no entry, or with a line that is not an entry, is
-//!   a *distinct* error, so a broken Secret is diagnosable and never
-//!   reaches the host;
+//! * a `known_hosts` with no entry, with a line that is not an entry, or
+//!   with only key types russh cannot check for the host, is a *distinct*
+//!   error, so a broken Secret is diagnosable and never reaches the host;
+//! * the host is offered only the key types recorded for it, so the key it
+//!   presents is one an entry can match;
 //! * a changed key must be named as such, not folded into "unknown host";
 //! * only exact (`host`, `[host]:port`) and hashed (`|1|`) host names match
 //!   — no `*` wildcards, no `@cert-authority`/`@revoked` lines — and tests
@@ -15,8 +17,9 @@
 //! Everything here fails closed. There is deliberately no accept-unknown
 //! path anywhere in this module's API.
 
-use russh::keys::PublicKey;
+use russh::Preferred;
 use russh::keys::ssh_key::known_hosts::{Entry, HostPatterns};
+use russh::keys::{Algorithm, PublicKey};
 
 use super::GitError;
 
@@ -71,6 +74,33 @@ impl HostKeys {
         })
     }
 
+    /// The host-key algorithms to offer the host: russh's own, in its order,
+    /// for the key types recorded for the host. With any other type offered,
+    /// a host that has it presents a key no entry can match.
+    pub fn algorithms(&self) -> Result<Vec<Algorithm>, GitError> {
+        let algorithms: Vec<Algorithm> = Preferred::DEFAULT
+            .key
+            .iter()
+            .filter(|algorithm| {
+                self.keys
+                    .iter()
+                    .any(|(_, key)| key.algorithm() == key_type(algorithm))
+            })
+            .cloned()
+            .collect();
+        if algorithms.is_empty() {
+            return Err(GitError::KnownHostsUnavailable(format!(
+                "the git Secret's `known_hosts` has only {} keys for '{}:{}'; the operator \
+                 accepts {} host keys — add the host's key of one of these types",
+                names(self.keys.iter().map(|(_, key)| key.algorithm())),
+                self.host,
+                self.port,
+                names(Preferred::DEFAULT.key.iter().map(key_type)),
+            )));
+        }
+        Ok(algorithms)
+    }
+
     /// Accept `key` only when `known_hosts` records it for the host.
     pub fn verify(&self, key: &PublicKey) -> Result<(), GitError> {
         // `key_data()`, not `==`: `PublicKey`'s `PartialEq` includes the
@@ -105,6 +135,25 @@ fn matches_host(patterns: &HostPatterns, name: &str) -> bool {
             ring::hmac::verify(&key, name.as_bytes(), hash).is_ok()
         }
     }
+}
+
+/// The key type of `algorithm`: all RSA algorithms use `ssh-rsa` keys.
+fn key_type(algorithm: &Algorithm) -> Algorithm {
+    match algorithm {
+        Algorithm::Rsa { .. } => Algorithm::Rsa { hash: None },
+        other => other.clone(),
+    }
+}
+
+/// `algorithms` as a list, each named once.
+fn names(algorithms: impl Iterator<Item = Algorithm>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for name in algorithms.map(|algorithm| algorithm.to_string()) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(", ")
 }
 
 fn not_listed(host: &str, port: u16) -> GitError {
@@ -228,6 +277,33 @@ mod tests {
             matches!(err, GitError::KnownHostsUnavailable(ref m)
                 if m.starts_with("line 2 of the git Secret's `known_hosts` is not a host key entry")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn algorithms_are_russh_order_for_the_recorded_key_types() {
+        use super::super::ssh::test_server::{ECDSA_HOST_PUB, RSA_HOST_PUB};
+
+        let known_hosts = format!(
+            "[gitea.internal]:2222 {RSA_HOST_PUB}\n[gitea.internal]:2222 {ECDSA_HOST_PUB}\n\
+             other.example {HOST_PUB}\n"
+        );
+        let algorithms: Vec<String> = HostKeys::new(&known_hosts, "gitea.internal", 2222)
+            .unwrap()
+            .algorithms()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // OpenSSH >= 8.8 servers refuse `ssh-rsa` (SHA-1) by default.
+        assert_eq!(
+            algorithms,
+            [
+                "ecdsa-sha2-nistp256",
+                "rsa-sha2-512",
+                "rsa-sha2-256",
+                "ssh-rsa"
+            ]
         );
     }
 
