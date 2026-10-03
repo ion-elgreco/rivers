@@ -212,6 +212,8 @@ fn sync_init_container(spec: &WorkspaceSpec, role: SyncRole) -> Container {
     env.push(env_var("UV_COMPILE_BYTECODE", "1"));
 
     if role == SyncRole::Builder {
+        // The prune never removes this tree, whatever the keep-set says.
+        env.push(env_var("RIVERS_WORKSPACE_KEY", &spec.key()));
         if let Some(cm) = &spec.keep_config_map {
             env.push(EnvVar {
                 name: "RIVERS_WORKSPACE_KEEP".to_string(),
@@ -480,6 +482,7 @@ mod tests {
                     { "name": "UV_CACHE_DIR", "value": "/uv-cache" },
                     { "name": "UV_LINK_MODE", "value": "copy" },
                     { "name": "UV_COMPILE_BYTECODE", "value": "1" },
+                    { "name": "RIVERS_WORKSPACE_KEY", "value": "9f3c1ab8d2e4-1a2b3c4d-03a30844" },
                     // Keep-set via ConfigMap indirection — see module docs.
                     // optional: a missing ConfigMap degrades to an empty
                     // keep-set; the recency + age floors still guard.
@@ -583,6 +586,33 @@ mod tests {
             serde_json::to_value(&shared_volume_env).unwrap(),
             json!([{ "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" }])
         );
+    }
+
+    #[test]
+    fn the_builder_tells_its_prune_which_tree_it_mounts() {
+        for (shape, pieces) in [
+            ("builder shared", builder_pod_pieces(&spec(shared()))),
+            ("builder fallback", builder_pod_pieces(&spec(fallback()))),
+        ] {
+            let init = &pieces.init_containers[0];
+            let key = init
+                .env
+                .iter()
+                .flatten()
+                .find(|e| e.name == "RIVERS_WORKSPACE_KEY")
+                .and_then(|e| e.value.as_deref());
+            let sub_paths: Vec<_> = init
+                .volume_mounts
+                .iter()
+                .flatten()
+                .chain(&pieces.main_mounts)
+                .filter(|m| m.mount_path == WORKSPACE_MOUNT)
+                .map(|m| m.sub_path.as_deref())
+                .collect();
+
+            assert_eq!(key, Some("9f3c1ab8d2e4-1a2b3c4d-03a30844"), "{shape}");
+            assert_eq!(sub_paths, [key, key], "{shape}");
+        }
     }
 
     #[test]

@@ -35,8 +35,6 @@ pub struct MockApiState {
     /// What a GET of each Secret answers: the Secret, or an API error. A
     /// Secret not listed is not found.
     pub secrets: BTreeMap<String, Result<Secret, kube_core::Status>>,
-    /// What a LIST of Runs answers: the Runs, or an API error.
-    pub runs: Result<Vec<Run>, kube_core::Status>,
     /// The ConfigMaps applied, by name.
     pub config_maps: BTreeMap<String, ConfigMap>,
     pub requests: Vec<ApiRequest>,
@@ -57,7 +55,6 @@ impl Default for MockApiState {
             code_locations,
             deployments: BTreeMap::new(),
             secrets: BTreeMap::new(),
-            runs: Ok(Vec::new()),
             config_maps: BTreeMap::new(),
             requests: Vec::new(),
         }
@@ -113,21 +110,6 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                                 json_response(status.code, &serde_json::to_value(status).unwrap())
                             }
                             None => json_response(404, &not_found_status()),
-                        }
-                    } else if path.ends_with("/runs") {
-                        match &s.runs {
-                            Ok(runs) => json_response(
-                                200,
-                                &serde_json::json!({
-                                    "apiVersion": "rivers.io/v1alpha1",
-                                    "kind": "RunList",
-                                    "metadata": {},
-                                    "items": runs,
-                                }),
-                            ),
-                            Err(status) => {
-                                json_response(status.code, &serde_json::to_value(status).unwrap())
-                            }
                         }
                     } else {
                         json_response(200, &serde_json::json!({}))

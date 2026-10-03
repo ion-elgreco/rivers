@@ -126,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
         .parse::<codelocation::ImageRef>()
         .map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
 
+    let run_controller =
+        Controller::new(runs, WatcherConfig::default()).owns(pods, WatcherConfig::default());
+
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),
         namespace: namespace.clone(),
@@ -137,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         runtime_image: runtime_image.clone(),
         workspace: workspace_cfg,
+        runs: run_controller.store(),
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
@@ -166,8 +170,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%pod_identity, "starting rivers-operator");
 
-    let run_controller = Controller::new(runs, WatcherConfig::default())
-        .owns(pods, WatcherConfig::default())
+    let run_controller = run_controller
         .run(run::reconcile, run::error_policy, run_ctx)
         .for_each(|res| async move {
             match res {

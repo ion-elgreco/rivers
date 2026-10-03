@@ -4,7 +4,8 @@ Shared mode keeps one uv cache on the PVC. After each successful build the
 script prunes it to the wheels built from source (``uv cache prune --ci``).
 Fallback pods install without a cache, so there is nothing to prune. Past
 the recency and age floors, the tree prune keeps a tree only when its whole
-name is in the keep-set. A floor that is not a whole number skips the tree
+name is in the keep-set, or when it is the pod's own tree
+(``RIVERS_WORKSPACE_KEY``). A floor that is not a whole number skips the tree
 prune. The prune renames a tree to ``.deleting-<key>-…`` before it deletes
 it, so a prune that is killed mid-delete leaves no partial tree with
 ``.ready`` under the key. The next prune deletes what was left.
@@ -200,6 +201,37 @@ def test_prune_removes_the_old_trees_past_both_floors(
         name for name in left if (workspace_sync.volume / name / ".ready").exists()
     ]
     assert ready == left
+
+
+@pytest.mark.parametrize(
+    ("built", "min_age"),
+    [
+        pytest.param(True, "3600", id="ready-tree-past-both-floors"),
+        pytest.param(False, "0", id="new-tree-without-an-age-floor"),
+    ],
+)
+def test_prune_never_removes_the_tree_of_its_own_pod(workspace_sync, built, min_age):
+    # A rollback in a pass where the operator could not refresh the keep-set:
+    # it names only the tree that was in use before.
+    trees = {"in-use": DAY, **OLD_TREES}
+    if built:
+        trees["tree"] = 5 * DAY
+    _sibling_trees(workspace_sync, trees)
+    commit = workspace_sync.commit(UV_PROJECT)
+
+    started = workspace_sync.run(
+        commit,
+        shared=True,
+        RIVERS_WORKSPACE_KEY="tree",
+        RIVERS_WORKSPACE_KEEP="in-use",
+        RIVERS_WORKSPACE_KEEP_REVISIONS="0",
+        RIVERS_WORKSPACE_MIN_AGE_SECONDS=min_age,
+    )
+
+    assert started.returncode == 0, started.stderr
+    assert _volume(workspace_sync) == [".prune.lock", "in-use", "tree"]
+    assert (workspace_sync.tree / ".ready").exists()
+    assert (workspace_sync.tree / "venv" / "bin" / "rivers").exists()
 
 
 EVICTED = "4b1d2c3e4f5a-1a2b3c4d-37c771fd"

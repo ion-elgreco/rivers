@@ -16,11 +16,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube_client::ResourceExt;
 use kube_client::api::{Api, Patch, PatchParams};
 use kube_runtime::controller::Action;
+use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
     CodeLocation, CodeLocationCondition, CodeLocationPhase, CodeLocationSpec, CodeLocationStatus,
@@ -47,7 +49,7 @@ use crate::leader::LeaderGate;
 use crate::metrics;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use rivers_k8s::crd::run::RunSource;
+use rivers_k8s::crd::run::{Run, RunSource};
 use rivers_k8s::workspace::{self, WorkspaceSpec, WorkspaceVolume};
 
 /// Default registry-refresh interval when the CR does not override it.
@@ -80,6 +82,8 @@ pub struct Context {
     pub code_location_service_account: String,
     /// Chart-level workspace settings for git-sourced CLs.
     pub workspace: WorkspaceConfig,
+    /// The run controller's store: the operator's one watch on Runs.
+    pub runs: Store<Run>,
     /// SurrealDB endpoint, scope (`use_ns` / `use_db`) and auth-secret
     /// coordinates stamped onto every code-location pod the operator creates.
     /// Read once from the operator's own env at startup. When `auth_secret`
@@ -514,30 +518,31 @@ async fn apply_git_workspace(
         )
         .await?;
         // Keep-set: the tree being rolled out, the tree runs get until that
-        // rollout finishes, and every non-terminal run's tree. One LIST per
-        // reconcile is fine at reconcile cadence; a stale snapshot is covered
-        // by keepRevisions + minTreeAge (see the RFC's prune soundness
-        // argument). A failed LIST leaves the keep-set in force: one built
-        // without the Runs would drop their trees. The ConfigMap indirection
-        // means this refresh never rolls the Deployment.
-        let runs_api: Api<rivers_k8s::crd::run::Run> =
-            Api::namespaced(ctx.client.clone(), namespace);
-        match runs_api.list(&Default::default()).await {
-            Ok(runs) => {
-                let serving_key = cl
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.run_source.as_ref())
-                    .map(RunSource::workspace_key);
-                let keep =
-                    workspace_keep_csv(&wspec.key(), serving_key.as_deref(), &name, &runs.items);
-                let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-                apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "listing Runs for the keep-set; the keep-set in force stays"
-            ),
+        // rollout finishes, and every non-terminal run's tree, from the run
+        // controller's store. A store that lags the API server is covered by
+        // keepRevisions + minTreeAge (see the RFC's prune soundness
+        // argument). Until the store has synced the keep-set in force stays:
+        // one built from a partial store would drop the trees of the runs it
+        // misses. The ConfigMap indirection means this refresh never rolls
+        // the Deployment.
+        if let Some(Ok(())) = ctx.runs.wait_until_ready().now_or_never() {
+            let serving_key = cl
+                .status
+                .as_ref()
+                .and_then(|s| s.run_source.as_ref())
+                .map(RunSource::workspace_key);
+            let runs = ctx.runs.state();
+            let keep = workspace_keep_csv(
+                &wspec.key(),
+                serving_key.as_deref(),
+                namespace,
+                &name,
+                runs.iter().map(Arc::as_ref),
+            );
+            let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+            apply_config_map(&cm_api, &build_keep_config_map(cl, &keep)).await?;
+        } else {
+            tracing::info!("the Run store has not synced yet; the keep-set in force stays");
         }
     }
 
@@ -645,23 +650,27 @@ fn generation_observed(deployment: &Deployment) -> bool {
 
 /// Keep-set for the prune step: the tree being rolled out (`target_key`),
 /// the tree runs get until that rollout finishes (`serving_key`), plus the
-/// tree of every non-terminal Run referencing the CL — queued (`Pending`, or
-/// no status yet) and `Cancelling` included, not just `Running`; a run
-/// waiting on a concurrency pool is precisely the one most likely to sit
-/// through several commits. Keys, not commits: each run's tree is keyed on
-/// its source's runtime image, whatever image its pods run. Sorted + deduped
-/// so the ConfigMap value is deterministic and refreshes don't churn.
-fn workspace_keep_csv(
+/// tree of every non-terminal Run of the CL (`namespace`/`cl_name`) — queued
+/// (`Pending`, or no status yet) and `Cancelling` included, not just
+/// `Running`; a run waiting on a concurrency pool is precisely the one most
+/// likely to sit through several commits. Keys, not commits: each run's tree
+/// is keyed on its source's runtime image, whatever image its pods run.
+/// Sorted + deduped so the ConfigMap value is deterministic and refreshes
+/// don't churn.
+fn workspace_keep_csv<'a>(
     target_key: &str,
     serving_key: Option<&str>,
+    namespace: &str,
     cl_name: &str,
-    runs: &[rivers_k8s::crd::run::Run],
+    runs: impl IntoIterator<Item = &'a Run>,
 ) -> String {
     let mut keys = std::collections::BTreeSet::new();
     keys.insert(target_key.to_string());
     keys.extend(serving_key.map(str::to_string));
     for run in runs {
-        if run.spec.code_location_ref.name != cl_name {
+        if run.metadata.namespace.as_deref() != Some(namespace)
+            || run.spec.code_location_ref.name != cl_name
+        {
             continue;
         }
         let terminal = run
@@ -1719,6 +1728,7 @@ mod tests {
         }))
         .unwrap();
         let mut run = Run::new(&format!("run-{commit_char}"), spec);
+        run.metadata.namespace = Some("y".into());
         run.status = phase.map(|p| RunCrdStatus {
             phase: Some(p),
             ..Default::default()
@@ -1728,6 +1738,8 @@ mod tests {
 
     #[test]
     fn keep_set_holds_current_and_non_terminal_runs() {
+        let mut other_namespace = run_for("analytics", 'h', Some(RunPhase::Running));
+        other_namespace.metadata.namespace = Some("z".into());
         let runs = vec![
             run_for("analytics", 'a', Some(RunPhase::Running)),
             run_for("analytics", 'b', Some(RunPhase::Pending)),
@@ -1737,9 +1749,10 @@ mod tests {
             run_for("analytics", 'g', Some(RunPhase::TimedOut)),  // released
             run_for("analytics", 'a', None),                      // no status yet == not terminal
             run_for("other", 'f', Some(RunPhase::Running)),       // different CL
+            other_namespace,                                      // same name, other namespace
         ];
 
-        let keep = workspace_keep_csv("current-key", None, "analytics", &runs);
+        let keep = workspace_keep_csv("current-key", None, "y", "analytics", &runs);
 
         // a (Running + statusless dedup), b (Pending — queued runs hold
         // their tree), c (Cancelling). Terminal runs release; other CLs'
@@ -1777,7 +1790,7 @@ mod tests {
             );
             let run = run_for("analytics", 'a', phase.clone());
 
-            let keep = workspace_keep_csv("current-key", None, "analytics", &[run]);
+            let keep = workspace_keep_csv("current-key", None, "y", "analytics", &[run]);
 
             let expected = if kept {
                 format!("{run_key},current-key")
@@ -1796,7 +1809,7 @@ mod tests {
             "ghcr.io/acme/rivers-runtime@sha256:{}",
             "1a2b3c4d".repeat(8)
         );
-        let run = rivers_k8s::crd::run::Run::new(
+        let mut run = rivers_k8s::crd::run::Run::new(
             "run-a",
             serde_json::from_value(serde_json::json!({
                 "codeLocationRef": { "name": "analytics" },
@@ -1809,10 +1822,11 @@ mod tests {
             }))
             .unwrap(),
         );
+        run.metadata.namespace = Some("y".into());
 
         let run_key = run.spec.source.as_ref().unwrap().workspace_key();
 
-        let keep = workspace_keep_csv("current-key", None, "analytics", &[run]);
+        let keep = workspace_keep_csv("current-key", None, "y", "analytics", &[run]);
 
         assert!(run_key.contains("-1a2b3c4d-"), "{run_key}");
         assert_eq!(keep, format!("{run_key},current-key"));
@@ -1911,6 +1925,7 @@ mod tests {
                 leader: Arc::new(LeaderGate::leading()),
                 code_location_service_account: "rivers-code-location".into(),
                 workspace: WorkspaceConfig::default(),
+                runs: kube_runtime::reflector::store().0,
                 surreal_pod_cfg: Default::default(),
                 otel_pod_cfg: Default::default(),
             }
@@ -2364,6 +2379,8 @@ mod tests {
         use super::*;
         use crate::run::test_helpers::{ApiRequest, MockApiState, mock_client};
         use k8s_openapi::api::apps::v1::DeploymentStatus;
+        use kube_runtime::reflector::store::Writer;
+        use kube_runtime::watcher;
         use serde_json::json;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2491,15 +2508,24 @@ mod tests {
             leader: LeaderGate,
             git: &Arc<git::GitResolver>,
         ) -> (Action, Vec<ApiRequest>) {
-            reconcile_in(state, leader, git, WorkspaceConfig::default()).await
+            reconcile_in(
+                state,
+                leader,
+                git,
+                WorkspaceConfig::default(),
+                run_store(Vec::new()),
+            )
+            .await
         }
 
-        /// [`reconcile_with`] under the chart's `workspace` settings.
+        /// [`reconcile_with`] under the chart's `workspace` settings, with
+        /// `runs` as the run controller's store.
         async fn reconcile_in(
             state: &ApiState,
             leader: LeaderGate,
             git: &Arc<git::GitResolver>,
             workspace: WorkspaceConfig,
+            runs: Store<Run>,
         ) -> (Action, Vec<ApiRequest>) {
             let (cl, seen) = {
                 let s = state.lock().unwrap();
@@ -2514,11 +2540,30 @@ mod tests {
                 leader: Arc::new(leader),
                 code_location_service_account: "rivers-code-location".into(),
                 workspace,
+                runs,
                 surreal_pod_cfg: Default::default(),
                 otel_pod_cfg: Default::default(),
             };
             let requeue = reconcile(Arc::new(cl), Arc::new(ctx)).await.unwrap();
             (requeue, state.lock().unwrap().requests[seen..].to_vec())
+        }
+
+        /// The run controller's store while its first LIST comes in: `runs`
+        /// have arrived, more may follow. It stays so while the writer lives.
+        fn listing_run_store(runs: Vec<Run>) -> (Store<Run>, Writer<Run>) {
+            let (store, mut writer) = kube_runtime::reflector::store();
+            writer.apply_watcher_event(&watcher::Event::Init);
+            for run in runs {
+                writer.apply_watcher_event(&watcher::Event::InitApply(run));
+            }
+            (store, writer)
+        }
+
+        /// The run controller's store once its first LIST, `runs`, is in.
+        fn run_store(runs: Vec<Run>) -> Store<Run> {
+            let (store, mut writer) = listing_run_store(runs);
+            writer.apply_watcher_event(&watcher::Event::InitDone);
+            store
         }
 
         /// The status `requests` patched, if any.
@@ -2825,6 +2870,7 @@ mod tests {
             let keep = workspace_keep_csv(
                 &tree('b').workspace_key(),
                 Some(&tree('a').workspace_key()),
+                "y",
                 "x",
                 &[],
             );
@@ -2851,7 +2897,7 @@ mod tests {
             deps.groups = vec!["test".into()];
             let state = api_with(cl, mid_rollout());
             // Admitted before the gpu extra: it still runs on plain tree a.
-            state.lock().unwrap().runs = Ok(vec![rivers_k8s::crd::run::Run::new(
+            let mut run = Run::new(
                 "r",
                 serde_json::from_value(json!({
                     "codeLocationRef": { "name": "x" },
@@ -2860,13 +2906,17 @@ mod tests {
                     "source": run_source_json('a'),
                 }))
                 .unwrap(),
-            )]);
-            let shared = WorkspaceConfig {
-                shared_enabled: true,
-                ..Default::default()
-            };
+            );
+            run.metadata.namespace = Some("y".into());
 
-            reconcile_in(&state, LeaderGate::leading(), &resolver(), shared).await;
+            reconcile_in(
+                &state,
+                LeaderGate::leading(),
+                &resolver(),
+                shared(),
+                run_store(vec![run]),
+            )
+            .await;
 
             let s = state.lock().unwrap();
             let target = template_source(&s.deployments["x"]).unwrap();
@@ -2931,7 +2981,7 @@ mod tests {
                 .clone()
         }
 
-        /// Commit b rolls out while tree a serves and a long run still uses
+        /// Commit b rolls out while tree a serves and [`long_run`] still uses
         /// tree c, outside the floors. The keep-set in force is from a pass
         /// before commit b.
         fn rolling_out_beside_a_long_run() -> ApiState {
@@ -2941,30 +2991,64 @@ mod tests {
                 source_at('c').workspace_key(),
             ]);
             let state = api_with(cl.clone(), mid_rollout());
-            {
-                let mut s = state.lock().unwrap();
-                s.config_maps.insert(
-                    keep_config_map_name("x"),
-                    build_keep_config_map(&cl, &in_force),
-                );
-                s.runs = Ok(vec![run_for("x", 'c', Some(RunPhase::Running))]);
-            }
+            state.lock().unwrap().config_maps.insert(
+                keep_config_map_name("x"),
+                build_keep_config_map(&cl, &in_force),
+            );
             state
         }
 
+        fn long_run() -> Run {
+            run_for("x", 'c', Some(RunPhase::Running))
+        }
+
+        /// The requests of `requests` that LIST Runs.
+        fn runs_lists(requests: &[ApiRequest]) -> Vec<&ApiRequest> {
+            requests
+                .iter()
+                .filter(|r| r.method == "GET" && r.path.ends_with("/runs"))
+                .collect()
+        }
+
         #[tokio::test]
-        async fn failed_runs_list_leaves_the_keep_set_in_force() {
+        async fn keep_set_takes_the_runs_of_this_code_location_from_the_run_store() {
             let state = rolling_out_beside_a_long_run();
-            let in_force = keep_in(&state);
-            state.lock().unwrap().runs = Err(kube_core::Status::failure(
-                "the server has received too many requests and has asked us to try again later",
-                "TooManyRequests",
-            )
-            .with_code(429));
+            let mut other_namespace = run_for("x", 'f', Some(RunPhase::Running));
+            other_namespace.metadata.namespace = Some("z".into());
+            let runs = run_store(vec![
+                long_run(),
+                run_for("x", 'd', Some(RunPhase::Succeeded)),
+                run_for("other", 'e', Some(RunPhase::Running)),
+                other_namespace,
+            ]);
 
             let (_, requests) =
-                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared()).await;
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared(), runs).await;
 
+            let lists = runs_lists(&requests);
+            assert!(lists.is_empty(), "{lists:?}");
+            assert_eq!(
+                keep_in(&state),
+                keep_value(vec![
+                    tree('a').workspace_key(),
+                    tree('b').workspace_key(),
+                    source_at('c').workspace_key(),
+                ])
+            );
+        }
+
+        #[tokio::test]
+        async fn keep_set_in_force_stays_until_the_run_store_has_synced() {
+            let state = rolling_out_beside_a_long_run();
+            let in_force = keep_in(&state);
+            // The first LIST has not reached the long run yet.
+            let (runs, _listing) = listing_run_store(Vec::new());
+
+            let (_, requests) =
+                reconcile_in(&state, LeaderGate::leading(), &resolver(), shared(), runs).await;
+
+            let lists = runs_lists(&requests);
+            assert!(lists.is_empty(), "{lists:?}");
             let keep_requests: Vec<_> = requests
                 .iter()
                 .filter(|r| r.path.contains("/configmaps/"))
@@ -2979,22 +3063,6 @@ mod tests {
             assert_eq!(
                 patched_status(&requests).expect("status patch")["runSource"],
                 run_source_json('a')
-            );
-        }
-
-        #[tokio::test]
-        async fn listed_runs_keep_their_trees_beside_the_code_location_trees() {
-            let state = rolling_out_beside_a_long_run();
-
-            reconcile_in(&state, LeaderGate::leading(), &resolver(), shared()).await;
-
-            assert_eq!(
-                keep_in(&state),
-                keep_value(vec![
-                    tree('a').workspace_key(),
-                    tree('b').workspace_key(),
-                    source_at('c').workspace_key(),
-                ])
             );
         }
 
@@ -3027,7 +3095,14 @@ mod tests {
                 let workspace = workspace_config(&vars).unwrap();
                 let state = api_with(git_cl_at('a', serving_status('a')), rolled_out());
 
-                reconcile_in(&state, LeaderGate::leading(), &resolver(), workspace).await;
+                reconcile_in(
+                    &state,
+                    LeaderGate::leading(),
+                    &resolver(),
+                    workspace,
+                    run_store(Vec::new()),
+                )
+                .await;
 
                 let pod = state.lock().unwrap().deployments["x"]
                     .spec
@@ -3040,7 +3115,12 @@ mod tests {
                     .env
                     .iter()
                     .flatten()
-                    .filter(|e| e.name.starts_with("RIVERS_WORKSPACE_"))
+                    .filter(|e| {
+                        matches!(
+                            e.name.as_str(),
+                            "RIVERS_WORKSPACE_KEEP_REVISIONS" | "RIVERS_WORKSPACE_MIN_AGE_SECONDS"
+                        )
+                    })
                     .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
                     .collect();
                 assert_eq!(

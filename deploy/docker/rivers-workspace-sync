@@ -15,6 +15,8 @@
 #   RIVERS_DEPS_EXTRAS             csv → uv sync --extra …
 #   RIVERS_DEPS_GROUPS             csv → uv sync --group …
 #   RIVERS_DEPS_TIMEOUT_SECONDS    fetch+install budget (default 600)
+#   RIVERS_WORKSPACE_KEY           key of this pod's own tree, which the
+#                                  prune never removes
 #   RIVERS_WORKSPACE_KEEP          csv of workspace keys the prune must retain
 #   RIVERS_WORKSPACE_KEEP_REVISIONS   recency floor, whole number (default 3)
 #   RIVERS_WORKSPACE_MIN_AGE_SECONDS  age floor, whole seconds (default 3600)
@@ -46,7 +48,9 @@
 #     .ready under the key; each prune first deletes the .deleting-*
 #     entries that earlier prunes left;
 #   * a floor that is not a whole number skips the prune — a value the
-#     script cannot read must never let it delete a tree.
+#     script cannot read must never let it delete a tree;
+#   * the prune never removes this pod's own tree, whatever the keep-set
+#     says — the operator may not have written this tree's key to it yet.
 
 set -euo pipefail
 
@@ -223,6 +227,7 @@ prune() {
     [ -d "$WORKSPACES_ROOT" ] || return 0
 
     local keep_csv=",${RIVERS_WORKSPACE_KEEP:-},"
+    local own="${RIVERS_WORKSPACE_KEY:-}"
     local keep_n="${RIVERS_WORKSPACE_KEEP_REVISIONS:-3}"
     local min_age_s="${RIVERS_WORKSPACE_MIN_AGE_SECONDS:-3600}"
     if ! is_whole_number "$keep_n" || ! is_whole_number "$min_age_s"; then
@@ -253,6 +258,9 @@ prune() {
         [ -d "$dir" ] || continue
         case "$tree" in cache | .*) continue ;; esac
         rank=$((rank + 1))
+        if [ "$tree" = "$own" ]; then
+            continue # this pod's own tree
+        fi
         case "$keep_csv" in *",$tree,"*)
             continue # keep-set (current commit + non-terminal runs)
             ;;
