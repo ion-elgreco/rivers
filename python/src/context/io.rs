@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::sync::MutexExt;
+use pyo3::types::{IntoPyDict, PyDict};
 
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::{MetadataValue, coerce_metadata_dict};
 use crate::partitions::PartitionContext;
 
 #[pyclass(name = "OutputContext", frozen, module = "rivers._core")]
@@ -76,12 +77,11 @@ impl PyOutputContext {
     /// Add output metadata from a dict of key-value pairs.
     /// Values can be MetadataValue or raw str/int/float/bool/None (auto-coerced).
     fn add_output_metadata(&self, metadata: Bound<'_, PyDict>) -> PyResult<()> {
-        let mut entries = self._output_metadata.lock().unwrap();
-        for (k, v) in metadata.iter() {
-            let key: String = k.extract()?;
-            let mv = coerce_to_metadata_value(v.py(), &v)?;
-            entries.insert(key, mv);
-        }
+        let entries = coerce_metadata_dict(&metadata)?;
+        self._output_metadata
+            .lock_py_attached(metadata.py())
+            .unwrap()
+            .extend(entries);
         Ok(())
     }
 
@@ -94,15 +94,11 @@ impl PyOutputContext {
     /// The output metadata collected by IO handlers, or None if empty.
     #[getter]
     fn output_metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let entries = self._output_metadata.lock().unwrap();
+        let entries = self._output_metadata.lock_py_attached(py).unwrap().clone();
         if entries.is_empty() {
             return Ok(py.None());
         }
-        let dict = PyDict::new(py);
-        for (k, v) in &*entries {
-            dict.set_item(k, v.clone())?;
-        }
-        Ok(dict.into())
+        Ok(entries.into_py_dict(py)?.into_any().unbind())
     }
 
     pub fn drain_data_version(&self) -> Option<String> {

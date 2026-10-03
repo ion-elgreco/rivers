@@ -924,7 +924,7 @@ fn drain_ctx_state(
         && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
     {
         let ctx_borrow = bound.borrow();
-        let metadata = ctx_borrow.drain_output_metadata();
+        let metadata = ctx_borrow.drain_output_metadata(py);
         let dv = ctx_borrow.drain_data_version();
         return Ok((metadata, dv));
     }

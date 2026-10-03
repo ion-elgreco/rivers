@@ -4,11 +4,11 @@ use std::sync::Mutex;
 
 use crate::errors::PartitionValidationError;
 use pyo3::prelude::*;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::sync::{MutexExt, PyOnceLock};
+use pyo3::types::{IntoPyDict, PyDict, PyTuple, PyType};
 
 use crate::errors::ExecutionError;
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::{MetadataValue, coerce_metadata_dict};
 use crate::partitions::{PartitionContext, PyPartitionKey};
 
 /// Context injected into asset functions as the first parameter.
@@ -89,15 +89,15 @@ impl PyAssetExecutionContext {
         self
     }
 
-    pub fn drain_output_metadata(&self) -> Vec<(String, MetadataValue)> {
-        let mut guard = self._output_metadata.lock().unwrap();
+    pub fn drain_output_metadata(&self, py: Python<'_>) -> Vec<(String, MetadataValue)> {
+        let mut guard = self._output_metadata.lock_py_attached(py).unwrap();
         std::mem::take(&mut *guard).into_iter().collect()
     }
 
     /// Read accumulated output metadata without draining.
     /// Used by generator multi-assets to apply context metadata as shared metadata per-yield.
-    pub fn peek_output_metadata(&self) -> Vec<(String, MetadataValue)> {
-        let guard = self._output_metadata.lock().unwrap();
+    pub fn peek_output_metadata(&self, py: Python<'_>) -> Vec<(String, MetadataValue)> {
+        let guard = self._output_metadata.lock_py_attached(py).unwrap();
         guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 }
@@ -165,12 +165,11 @@ impl PyAssetExecutionContext {
     /// Add output metadata from a dict of key-value pairs.
     /// Values can be MetadataValue or raw str/int/float/bool/None (auto-coerced).
     fn add_output_metadata(&self, metadata: Bound<'_, PyDict>) -> PyResult<()> {
-        let mut entries = self._output_metadata.lock().unwrap();
-        for (k, v) in metadata.iter() {
-            let key: String = k.extract()?;
-            let mv = coerce_to_metadata_value(v.py(), &v)?;
-            entries.insert(key, mv);
-        }
+        let entries = coerce_metadata_dict(&metadata)?;
+        self._output_metadata
+            .lock_py_attached(metadata.py())
+            .unwrap()
+            .extend(entries);
         Ok(())
     }
 
@@ -183,15 +182,11 @@ impl PyAssetExecutionContext {
     /// The output metadata collected so far, or None if empty.
     #[getter]
     fn output_metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let entries = self._output_metadata.lock().unwrap();
+        let entries = self.peek_output_metadata(py);
         if entries.is_empty() {
             return Ok(py.None());
         }
-        let dict = PyDict::new(py);
-        for (k, v) in &*entries {
-            dict.set_item(k, v.clone())?;
-        }
-        Ok(dict.into())
+        Ok(entries.into_py_dict(py)?.into_any().unbind())
     }
 
     /// True if this asset is being executed with a partition key.

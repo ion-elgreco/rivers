@@ -195,7 +195,7 @@ where
         // Cumulative ctx-level metadata (peek, not drain) + per-yield ctx dv (drain).
         let ctx_metadata = gen_ctx
             .as_ref()
-            .map(|c| c.borrow(py).peek_output_metadata())
+            .map(|c| c.borrow(py).peek_output_metadata(py))
             .unwrap_or_default();
         let ctx_dv = gen_ctx
             .as_ref()
