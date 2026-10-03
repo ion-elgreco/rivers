@@ -20,11 +20,11 @@ tonic-prost.workspace = true
 tonic-health.workspace = true
 prost.workspace = true
 
-pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310", "jiff-02"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
-pyo3-arrow = { version = "0.17", default-features = false }
-arrow-schema = "58"
-arrow-ipc = "58"
+pyo3 = { version = "0.29.3", features = ["extension-module", "abi3-py310", "jiff-02"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+pyo3-arrow = { version = "0.19", default-features = false }
+arrow-schema = "59"
+arrow-ipc = "59"
 jiff.workspace = true
 croner.workspace = true
 url.workspace = true
@@ -59,4 +59,4 @@ k8s-openapi.workspace = true
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 [build-dependencies]
-pyo3-build-config = "0.29"
+pyo3-build-config = "0.29.3"

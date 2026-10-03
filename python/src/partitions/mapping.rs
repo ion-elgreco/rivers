@@ -1503,9 +1503,8 @@ impl<'py> pyo3::IntoPyObject<'py> for &PartitionMappingDict {
 impl FromPyObject<'_, '_> for PartitionMappingDict {
     type Error = PyErr;
 
-    #[allow(deprecated)]
     fn extract(ob: pyo3::Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
-        let dict = ob.downcast::<PyDict>()?;
+        let dict = ob.cast::<PyDict>()?;
         let mut map = HashMap::with_capacity(dict.len());
         for (key, value) in dict.iter() {
             let key_str = if let Ok(s) = key.extract::<String>() {
