@@ -2,7 +2,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::{MetadataValue, coerce_metadata_dict};
 
 /// Per-asset materialization result.
 ///
@@ -392,16 +392,6 @@ fn extract_metadata_dict(
     py: Python,
     dict: &Option<Py<PyDict>>,
 ) -> PyResult<Vec<(String, MetadataValue)>> {
-    let dict = match dict {
-        Some(d) => d,
-        None => return Ok(Vec::new()),
-    };
-    let bound = dict.bind(py);
-    let mut entries = Vec::with_capacity(bound.len());
-    for (k, v) in bound.iter() {
-        let key: String = k.extract()?;
-        let mv = coerce_to_metadata_value(py, &v)?;
-        entries.push((key, mv));
-    }
-    Ok(entries)
+    dict.as_ref()
+        .map_or(Ok(Vec::new()), |d| coerce_metadata_dict(d.bind(py)))
 }

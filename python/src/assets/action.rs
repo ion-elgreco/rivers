@@ -438,17 +438,11 @@ pub struct PyActionResult {
 }
 
 fn coerce_metadata(
-    py: Python,
     metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
 ) -> PyResult<Vec<(String, crate::metadata::MetadataValue)>> {
-    let mut entries = Vec::new();
-    for (k, v) in metadata.iter().flat_map(|md| md.iter()) {
-        entries.push((
-            k.extract()?,
-            crate::metadata::coerce_to_metadata_value(py, &v)?,
-        ));
-    }
-    Ok(entries)
+    metadata.map_or(Ok(Vec::new()), |md| {
+        crate::metadata::coerce_metadata_dict(&md)
+    })
 }
 
 #[pymethods]
@@ -457,13 +451,10 @@ impl PyActionResult {
     /// `metadata` lands on the run's `ActionCompleted` event.
     #[staticmethod]
     #[pyo3(signature = (metadata=None))]
-    fn unchanged(
-        py: Python,
-        metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
-    ) -> PyResult<Self> {
+    fn unchanged(metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
         Ok(Self {
             materialized: false,
-            metadata: coerce_metadata(py, metadata)?,
+            metadata: coerce_metadata(metadata)?,
             data_version: None,
         })
     }
@@ -473,13 +464,12 @@ impl PyActionResult {
     #[staticmethod]
     #[pyo3(signature = (metadata=None, data_version=None))]
     fn materialized(
-        py: Python,
         metadata: Option<pyo3::Bound<'_, pyo3::types::PyDict>>,
         data_version: Option<String>,
     ) -> PyResult<Self> {
         Ok(Self {
             materialized: true,
-            metadata: coerce_metadata(py, metadata)?,
+            metadata: coerce_metadata(metadata)?,
             data_version,
         })
     }
