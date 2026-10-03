@@ -6,6 +6,9 @@
 //!           advertisement's flush-pkt → send a flush-pkt + EOF → parse
 //! ```
 //!
+//! One deadline, the operator's git timeout, covers every step from
+//! `connect` to upload-pack's exit.
+//!
 //! The Secret's key and `known_hosts` are used as contents and both are
 //! checked before connecting. Host keys are verified against the
 //! `known_hosts` entries via [`super::known_hosts`] before authentication —
@@ -29,8 +32,13 @@ use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use super::http::DEFAULT_MAX_ADVERTISEMENT_BYTES;
 use super::{GitError, known_hosts};
 
-/// How long upload-pack gets to exit once it has the client's flush-pkt.
+/// How long upload-pack gets to exit once it has the client's flush-pkt,
+/// if the fetch's timeout leaves that long.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// How much of upload-pack's stderr a failure keeps: the end, where git
+/// prints its `fatal:` line.
+const MAX_STDERR_BYTES: usize = 4096;
 
 /// `ssh://user@host[:port]/path`, decomposed. Only the `ssh://` URL form
 /// is accepted — scp-like `git@host:path` strings are rejected at admission
@@ -38,6 +46,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshTarget {
     pub user: String,
+    /// An IPv6 address is in its short form, without brackets: OpenSSH
+    /// names it so in `known_hosts`, however the url writes it.
     pub host: String,
     pub port: u16,
     /// The path as git sends it to `git-upload-pack`; see
@@ -55,10 +65,11 @@ pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
             "'{raw}' is not an ssh:// url (scp-style 'git@host:path' is not supported)"
         )));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| GitError::Malformed(format!("'{raw}' has no host")))?
-        .to_string();
+    let host = match url.host() {
+        Some(url::Host::Ipv6(address)) => address.to_string(),
+        Some(host) => host.to_string(),
+        None => return Err(GitError::Malformed(format!("'{raw}' has no host"))),
+    };
     // Also refuses `?` or `#` before the first `/`: `url` ends the host
     // there, git does not.
     if url.path().is_empty() || url.path() == "/" {
@@ -159,7 +170,9 @@ impl client::Handler for HostKeyCheck {
     }
 }
 
-/// Fetch the ref advertisement over SSH, fully buffered.
+/// Fetch the ref advertisement over SSH, fully buffered. `timeout` bounds
+/// the whole fetch: a host that does not finish in time is
+/// [`GitError::Unreachable`], with the stage it did not finish.
 pub async fn fetch_advertisement(
     target: &SshTarget,
     auth: &SshAuth<'_>,
@@ -186,8 +199,10 @@ pub(crate) async fn fetch_advertisement_with_cap(
     })?;
     let host_keys = known_hosts::HostKeys::new(auth.known_hosts, &target.host, target.port)?;
 
+    // No `inactivity_timeout`: a host that keeps sending resets it, and when
+    // it fires, the read ends as if upload-pack had closed (a terminal
+    // error); the deadline below is the one time limit.
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(timeout),
         preferred: russh::Preferred {
             key: host_keys.algorithms()?.into(),
             ..russh::Preferred::DEFAULT
@@ -196,77 +211,194 @@ pub(crate) async fn fetch_advertisement_with_cap(
     });
     let handler = HostKeyCheck(host_keys);
 
-    // `connect` returns `H::Error`, so a host-key rejection from the handler
-    // surfaces as our own GitError; russh's own errors arrive via
-    // `From<russh::Error>`.
-    let mut handle = client::connect(config, (target.host.as_str(), target.port), handler).await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stage = Stage::Connect;
+    let mut connection = None;
+    let started = tokio::time::timeout_at(deadline, async {
+        let (stream, socket) = connect(target).await?;
+        connection = Some(socket);
+        stage = Stage::Handshake;
+        // `connect_stream` returns `H::Error`, so a host-key rejection from
+        // the handler surfaces as our own GitError; russh's own errors
+        // arrive via `From<russh::Error>`.
+        let mut handle = client::connect_stream(config, stream, handler).await?;
 
-    let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
-    let outcome = handle
-        .authenticate_publickey(
-            target.user.clone(),
-            PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
-        )
-        .await?;
-    if !matches!(outcome, russh::client::AuthResult::Success) {
-        return Err(GitError::AuthFailed(format!(
-            "server rejected publickey authentication for user '{}'",
-            target.user
-        )));
-    }
-
-    let mut channel = handle.channel_open_session().await?;
-    let command = format!("git-upload-pack {}", shell_quote_single(&target.repo_path));
-    channel.exec(true, command).await?;
-
-    let mut body = Vec::new();
-    let mut scanned = 0;
-    let mut stderr = Vec::new();
-    let mut exit_status = None;
-    let mut advertised = false;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } => {
-                body.extend_from_slice(&data);
-                if body.len() > cap {
-                    return Err(GitError::Malformed(format!(
-                        "advertisement exceeds {cap} bytes"
-                    )));
-                }
-                advertised = reaches_flush(&body, &mut scanned)?;
-                if advertised {
-                    break;
-                }
-            }
-            // ext 1 == SSH_EXTENDED_DATA_STDERR — upload-pack's error text.
-            ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
-            ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
-            _ => {}
+        stage = Stage::Login;
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let outcome = handle
+            .authenticate_publickey(
+                target.user.clone(),
+                PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
+            )
+            .await?;
+        if !matches!(outcome, russh::client::AuthResult::Success) {
+            return Err(GitError::AuthFailed(format!(
+                "server rejected publickey authentication for user '{}'",
+                target.user
+            )));
         }
-    }
-    if advertised {
-        let _ = tokio::time::timeout(EXIT_GRACE, want_nothing(&mut channel)).await;
+
+        stage = Stage::Exec;
+        let mut channel = handle.channel_open_session().await?;
+        let command = format!("git-upload-pack {}", shell_quote_single(&target.repo_path));
+        channel.exec(true, command).await?;
+
+        stage = Stage::Refs;
+        let output = Output::read(&mut channel, cap).await?;
+        Ok::<_, GitError>((handle, channel, output))
+    })
+    .await;
+    let Ok(started) = started else {
+        // russh's session task can outlive the dropped future: mid-handshake
+        // it does not see the dropped handle, and a host that keeps sending
+        // keeps it reading. Shutting the connection down ends it.
+        if let Some(socket) = connection {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        return Err(stage.timed_out(target, timeout));
+    };
+    let (handle, mut channel, output) = started?;
+
+    if output.advertised {
+        let grace = deadline.min(tokio::time::Instant::now() + EXIT_GRACE);
+        let _ = tokio::time::timeout_at(grace, want_nothing(&mut channel)).await;
     }
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
+    output.into_advertisement(target)
+}
 
-    match exit_status {
-        // As for `git ls-remote`: once the refs are in, how upload-pack
-        // exits does not matter.
-        _ if advertised => Ok(body),
-        Some(0) => Ok(body),
-        // Some servers close without sending an exit-status; the parser's
-        // flush-required strictness catches a truncated body.
-        None if !body.is_empty() => Ok(body),
-        other => {
-            let stderr = String::from_utf8_lossy(&stderr);
-            Err(GitError::RefNotFound(format!(
-                "git-upload-pack failed{} for '{}': {}",
-                other.map(|s| format!(" (exit {s})")).unwrap_or_default(),
+/// Opens the TCP connection, as two handles on it: russh's session task
+/// takes the first, and a fetch that runs out of time shuts the
+/// connection down through the second.
+async fn connect(
+    target: &SshTarget,
+) -> Result<(tokio::net::TcpStream, std::net::TcpStream), GitError> {
+    let unreachable = |e: std::io::Error| GitError::Unreachable(e.to_string());
+    let stream = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .and_then(tokio::net::TcpStream::into_std)
+        .map_err(unreachable)?;
+    let socket = stream.try_clone().map_err(unreachable)?;
+    let stream = tokio::net::TcpStream::from_std(stream).map_err(unreachable)?;
+    Ok((stream, socket))
+}
+
+/// Where a fetch was when it ran out of time.
+#[derive(Clone, Copy)]
+enum Stage {
+    Connect,
+    Handshake,
+    Login,
+    Exec,
+    Refs,
+}
+
+impl Stage {
+    fn timed_out(self, target: &SshTarget, timeout: Duration) -> GitError {
+        let host = format!("'{}'", known_hosts::address(&target.host, target.port));
+        let stage = match self {
+            Stage::Connect => format!("connecting to {host}"),
+            Stage::Handshake => format!("the SSH handshake with {host}"),
+            Stage::Login => format!("logging in to {host}"),
+            Stage::Exec => format!("starting git-upload-pack on {host}"),
+            Stage::Refs => format!("reading the refs from {host}"),
+        };
+        GitError::Unreachable(format!(
+            "{stage} did not finish within {}s",
+            timeout.as_secs()
+        ))
+    }
+}
+
+/// What upload-pack wrote until its advertisement's flush-pkt, or until it
+/// closed the channel.
+struct Output {
+    stdout: Vec<u8>,
+    /// The last [`MAX_STDERR_BYTES`] of stderr; `stderr_cut` if more came.
+    stderr: Vec<u8>,
+    stderr_cut: bool,
+    exit_status: Option<u32>,
+    advertised: bool,
+}
+
+impl Output {
+    async fn read(channel: &mut russh::Channel<client::Msg>, cap: usize) -> Result<Self, GitError> {
+        let mut output = Output {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stderr_cut: false,
+            exit_status: None,
+            advertised: false,
+        };
+        let mut scanned = 0;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    output.stdout.extend_from_slice(&data);
+                    if output.stdout.len() > cap {
+                        return Err(GitError::Malformed(format!(
+                            "advertisement exceeds {cap} bytes"
+                        )));
+                    }
+                    output.advertised = reaches_flush(&output.stdout, &mut scanned)?;
+                    if output.advertised {
+                        break;
+                    }
+                }
+                // ext 1 == SSH_EXTENDED_DATA_STDERR — upload-pack's error text.
+                ChannelMsg::ExtendedData { data, ext: 1 } => output.keep_stderr(&data),
+                ChannelMsg::ExitStatus { exit_status } => output.exit_status = Some(exit_status),
+                _ => {}
+            }
+        }
+        Ok(output)
+    }
+
+    fn keep_stderr(&mut self, data: &[u8]) {
+        self.stderr.extend_from_slice(data);
+        let excess = self.stderr.len().saturating_sub(MAX_STDERR_BYTES);
+        if excess > 0 {
+            self.stderr.drain(..excess);
+            self.stderr_cut = true;
+        }
+    }
+
+    fn into_advertisement(self, target: &SshTarget) -> Result<Vec<u8>, GitError> {
+        match self.exit_status {
+            // As for `git ls-remote`: once the refs are in, how upload-pack
+            // exits does not matter.
+            _ if self.advertised => Ok(self.stdout),
+            Some(0) => Ok(self.stdout),
+            // The connection or the channel ended mid-read.
+            None => {
+                let stderr = self.stderr_text();
+                Err(GitError::Unreachable(format!(
+                    "the connection to '{}' closed before all refs arrived{}",
+                    known_hosts::address(&target.host, target.port),
+                    if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {stderr}")
+                    }
+                )))
+            }
+            Some(status) => Err(GitError::RefNotFound(format!(
+                "git-upload-pack failed (exit {status}) for '{}': {}",
                 target.repo_path,
-                stderr.trim()
-            )))
+                self.stderr_text()
+            ))),
+        }
+    }
+
+    fn stderr_text(&self) -> String {
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stderr = stderr.trim();
+        if self.stderr_cut {
+            format!("…{stderr}")
+        } else {
+            stderr.to_string()
         }
     }
 }
@@ -401,6 +533,8 @@ Qjm9zYDGIBlKeGwA==
         AwaitRequest,
         /// Exits with this status and closes the channel at once.
         Exit(u32),
+        /// Never answers the request: no exit, no close.
+        Stall,
     }
 
     #[derive(Clone)]
@@ -408,15 +542,20 @@ Qjm9zYDGIBlKeGwA==
         pub(crate) advertisement: Vec<u8>,
         pub(crate) expected_command: String,
         pub(crate) after_advertisement: AfterAdvertisement,
-        pub(crate) stderr: Option<&'static str>,
+        pub(crate) stderr: Option<String>,
         pub(crate) authorized_pub: &'static str,
         /// The host keys the server can present.
         pub(crate) host_keys: Vec<&'static str>,
         /// How often the server sends an SSH keepalive while the client is
         /// silent.
         pub(crate) keepalive: Option<Duration>,
+        /// Drops the TCP connection, with no SSH goodbye, once neither side
+        /// has sent anything for this long.
+        pub(crate) drop_when_idle: Option<Duration>,
         /// The connections the server accepted.
         pub(crate) connections: Arc<AtomicUsize>,
+        /// The connections that ended.
+        pub(crate) closed: Arc<tokio::sync::watch::Sender<usize>>,
         /// The commands clients asked to exec, in order.
         pub(crate) commands: Arc<Mutex<Vec<String>>>,
         /// What clients wrote to upload-pack's stdin.
@@ -433,7 +572,9 @@ Qjm9zYDGIBlKeGwA==
                 authorized_pub: CLIENT_PUB,
                 host_keys: vec![HOST_KEY],
                 keepalive: None,
+                drop_when_idle: None,
                 connections: Arc::default(),
+                closed: Arc::new(tokio::sync::watch::channel(0).0),
                 commands: Arc::default(),
                 received: Arc::default(),
             }
@@ -443,6 +584,15 @@ Qjm9zYDGIBlKeGwA==
     impl ServerBehaviour {
         pub(crate) fn connections(&self) -> usize {
             self.connections.load(Ordering::SeqCst)
+        }
+
+        /// Whether every connection the server accepted ends within
+        /// `within`.
+        pub(crate) async fn all_closed_within(&self, within: Duration) -> bool {
+            let accepted = self.connections();
+            let mut closed = self.closed.subscribe();
+            let all_closed = closed.wait_for(|&closed| closed == accepted);
+            matches!(tokio::time::timeout(within, all_closed).await, Ok(Ok(_)))
         }
 
         pub(crate) fn commands(&self) -> Vec<String> {
@@ -477,7 +627,22 @@ Qjm9zYDGIBlKeGwA==
         exited: bool,
     }
 
+    /// russh drops the handler when the connection ends.
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            self.behaviour.closed.send_modify(|closed| *closed += 1);
+        }
+    }
+
     impl TestSession {
+        fn answers_requests(&self) -> bool {
+            !self.exited
+                && matches!(
+                    self.behaviour.after_advertisement,
+                    AfterAdvertisement::AwaitRequest
+                )
+        }
+
         fn exit(
             &mut self,
             channel: ChannelId,
@@ -556,11 +721,11 @@ Qjm9zYDGIBlKeGwA==
                 channel,
                 bytes::Bytes::from(self.behaviour.advertisement.clone()),
             )?;
-            if let Some(err) = self.behaviour.stderr {
-                session.extended_data(channel, 1, bytes::Bytes::from_static(err.as_bytes()))?;
+            if let Some(err) = &self.behaviour.stderr {
+                session.extended_data(channel, 1, bytes::Bytes::from(err.clone()))?;
             }
             match self.behaviour.after_advertisement {
-                AfterAdvertisement::AwaitRequest => Ok(()),
+                AfterAdvertisement::AwaitRequest | AfterAdvertisement::Stall => Ok(()),
                 AfterAdvertisement::Exit(status) => self.exit(channel, status, session),
             }
         }
@@ -577,7 +742,7 @@ Qjm9zYDGIBlKeGwA==
                 .unwrap()
                 .extend_from_slice(data);
             self.request.extend_from_slice(data);
-            if !self.exited && self.request.starts_with(b"0000") {
+            if self.answers_requests() && self.request.starts_with(b"0000") {
                 return self.exit(channel, 0, session);
             }
             Ok(())
@@ -588,7 +753,7 @@ Qjm9zYDGIBlKeGwA==
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if self.exited {
+            if !self.answers_requests() {
                 return Ok(());
             }
             session.extended_data(
@@ -603,7 +768,13 @@ Qjm9zYDGIBlKeGwA==
     /// Boot a russh server on an ephemeral port; returns its port.
     pub(crate) async fn spawn_server(behaviour: ServerBehaviour) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        serve(listener, behaviour)
+    }
+
+    /// Run a russh server on `listener`; returns its port.
+    pub(crate) fn serve(listener: tokio::net::TcpListener, behaviour: ServerBehaviour) -> u16 {
         let port = listener.local_addr().unwrap().port();
+        let defaults = server::Config::default();
         let config = Arc::new(server::Config {
             keys: behaviour
                 .host_keys
@@ -611,13 +782,58 @@ Qjm9zYDGIBlKeGwA==
                 .map(|key| decode_secret_key(key, None).unwrap())
                 .collect(),
             keepalive_interval: behaviour.keepalive,
-            ..Default::default()
+            inactivity_timeout: behaviour.drop_when_idle.or(defaults.inactivity_timeout),
+            ..defaults
         });
         tokio::spawn(async move {
             let mut srv = TestGitServer { behaviour };
             let _ = srv.run_on_socket(config, &listener).await;
         });
         port
+    }
+
+    /// A host that takes TCP connections but is no working SSH server.
+    #[derive(Clone, Copy)]
+    pub(crate) enum StalledHost {
+        /// Never writes: an L4 load balancer without a live backend.
+        Silent,
+        /// Sends an SSH banner, then an SSH_MSG_IGNORE packet every 200ms,
+        /// and never starts the key exchange.
+        Ignoring,
+    }
+
+    /// Serves one connection as `host` on an ephemeral port; returns the
+    /// port, and what the client sent until it closed the connection.
+    pub(crate) async fn spawn_stalled_host(
+        host: StalledHost,
+    ) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Unencrypted: packet length 12, padding length 6, the payload
+        // (message 2 and an empty string), 6 bytes of padding.
+        const IGNORE: [u8; 16] = [0, 0, 0, 12, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sent = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = stream.split();
+            let stall = async {
+                if let StalledHost::Ignoring = host {
+                    writer.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await?;
+                    loop {
+                        writer.write_all(&IGNORE).await?;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                std::future::pending::<std::io::Result<()>>().await
+            };
+            let mut sent = Vec::new();
+            tokio::select! {
+                _ = reader.read_to_end(&mut sent) => {}
+                _ = stall => {}
+            }
+            sent
+        });
+        (port, sent)
     }
 }
 
@@ -668,20 +884,29 @@ mod tests {
         resolve_main(server, pinned, OPERATOR_TIMEOUT).await
     }
 
-    /// [`resolve_main_pinning`] with `timeout`; the resolve must end within
-    /// 5s.
+    /// [`resolve_main_pinning`] with `timeout`.
     async fn resolve_main(
         server: &ServerBehaviour,
         pinned: &str,
         timeout: Duration,
     ) -> (u16, Result<String, GitError>) {
         let port = spawn_server(server.clone()).await;
+        (port, resolve_main_at(port, pinned, timeout).await)
+    }
+
+    /// Resolve `main` on the host at `port` with a `known_hosts` that pins
+    /// `pinned` for it; the resolve must end within 5s.
+    async fn resolve_main_at(
+        port: u16,
+        pinned: &str,
+        timeout: Duration,
+    ) -> Result<String, GitError> {
         let known_hosts = known_hosts_pinning(port, pinned);
         let target =
             parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/acme/pipelines.git")).unwrap();
         let auth = client_auth(&known_hosts);
         let fetch = fetch_advertisement(&target, &auth, timeout);
-        let commit = tokio::time::timeout(Duration::from_secs(5), fetch)
+        tokio::time::timeout(Duration::from_secs(5), fetch)
             .await
             .expect("the resolve did not end within 5s")
             .map(|bytes| {
@@ -689,8 +914,167 @@ mod tests {
                 commit_for_ref(&adv, &fixtures::branch("main"))
                     .unwrap()
                     .commit
-            });
-        (port, commit)
+            })
+    }
+
+    /// The timeout of the tests that run into it.
+    const SHORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// `resolve`'s outcome, and how long it took.
+    async fn timed<T>(resolve: impl std::future::Future<Output = T>) -> (T, Duration) {
+        let started = tokio::time::Instant::now();
+        let outcome = resolve.await;
+        (outcome, started.elapsed())
+    }
+
+    /// The line the client opens each connection with.
+    fn client_banner() -> String {
+        let russh::SshId::Standard(id) = client::Config::default().client_id else {
+            unreachable!("russh's own id is a standard one")
+        };
+        format!("{id}\r\n")
+    }
+
+    #[tokio::test]
+    async fn a_host_that_never_answers_is_unreachable_once_the_timeout_is_up() {
+        let (port, sent) = spawn_stalled_host(StalledHost::Silent).await;
+
+        let (outcome, took) = timed(resolve_main_at(port, HOST_PUB, SHORT_TIMEOUT)).await;
+
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            format!(
+                "git host unreachable: the SSH handshake with '127.0.0.1:{port}' did not finish \
+                 within 1s"
+            )
+        );
+        assert!(took < 2 * SHORT_TIMEOUT, "{took:?}");
+        // The host got the client's banner, then the connection closed.
+        let sent = tokio::time::timeout(SHORT_TIMEOUT, sent)
+            .await
+            .expect("the connection is still open")
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&sent), client_banner());
+    }
+
+    #[tokio::test]
+    async fn a_handshake_kept_busy_ends_with_its_resolve() {
+        // russh's session task keeps reading a host that keeps sending.
+        let (port, sent) = spawn_stalled_host(StalledHost::Ignoring).await;
+
+        let (outcome, took) = timed(resolve_main_at(port, HOST_PUB, SHORT_TIMEOUT)).await;
+
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            format!(
+                "git host unreachable: the SSH handshake with '127.0.0.1:{port}' did not finish \
+                 within 1s"
+            )
+        );
+        assert!(took < 2 * SHORT_TIMEOUT, "{took:?}");
+        let sent = tokio::time::timeout(SHORT_TIMEOUT, sent)
+            .await
+            .expect("the connection is still open")
+            .unwrap();
+        assert!(sent.starts_with(client_banner().as_bytes()), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn keepalives_do_not_stretch_a_resolve_past_its_timeout() {
+        // The refs never end, and the server keeps the session busy.
+        let mut advertisement = fixtures::ssh_adv();
+        advertisement.truncate(advertisement.len() - fixtures::flush().len());
+        let server = ServerBehaviour {
+            advertisement,
+            keepalive: Some(Duration::from_millis(200)),
+            ..forge()
+        };
+
+        let ((port, outcome), took) = timed(resolve_main(&server, HOST_PUB, SHORT_TIMEOUT)).await;
+
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            format!(
+                "git host unreachable: reading the refs from '127.0.0.1:{port}' did not finish \
+                 within 1s"
+            )
+        );
+        assert!(took < 2 * SHORT_TIMEOUT, "{took:?}");
+        assert!(server.all_closed_within(SHORT_TIMEOUT).await);
+        assert_eq!(server.received(), b"");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_upload_pack_to_exit_stays_within_the_timeout() {
+        // upload-pack never exits, and keepalives hold the session open.
+        let server = ServerBehaviour {
+            after_advertisement: AfterAdvertisement::Stall,
+            keepalive: Some(Duration::from_millis(200)),
+            ..forge()
+        };
+
+        let ((_, commit), took) = timed(resolve_main(&server, HOST_PUB, SHORT_TIMEOUT)).await;
+
+        assert_eq!(commit.unwrap(), fixtures::oid('a'));
+        assert_eq!(server.received(), b"0000");
+        assert!(took < EXIT_GRACE, "{took:?}");
+        assert!(server.all_closed_within(SHORT_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_drops_connection_attempts_is_unreachable_once_the_timeout_is_up() {
+        // A full listen queue: the kernel drops further SYNs, as a firewall
+        // that blackholes the port does.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut queued = Vec::new();
+        for _ in 0..16 {
+            let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
+            match tokio::time::timeout(Duration::from_millis(500), connect).await {
+                Ok(Ok(stream)) => queued.push(stream),
+                Ok(Err(e)) => panic!("the listen queue refused a connection: {e}"),
+                Err(_) => break,
+            }
+        }
+        assert!(queued.len() < 16, "the listen queue never filled");
+
+        let (outcome, took) = timed(resolve_main_at(port, HOST_PUB, SHORT_TIMEOUT)).await;
+
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            format!(
+                "git host unreachable: connecting to '127.0.0.1:{port}' did not finish within 1s"
+            )
+        );
+        assert!(took < 2 * SHORT_TIMEOUT, "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_keeps_the_end_of_a_long_stderr() {
+        let noise: String = (0..10_000)
+            .map(|i| format!("remote: counting objects {i}\n"))
+            .collect();
+        let stderr =
+            format!("{noise}fatal: '/acme/pipelines.git' does not appear to be a git repository\n");
+        let server = ServerBehaviour {
+            advertisement: Vec::new(),
+            after_advertisement: AfterAdvertisement::Exit(128),
+            stderr: Some(stderr.clone()),
+            ..forge()
+        };
+
+        let (_, outcome) = resolve_main_pinning(&server, HOST_PUB).await;
+
+        let kept = &stderr[stderr.len() - MAX_STDERR_BYTES..];
+        assert_eq!(
+            outcome.unwrap_err().to_string(),
+            format!(
+                "ref not found: git-upload-pack failed (exit 128) for '/acme/pipelines.git': …{}",
+                kept.trim()
+            )
+        );
     }
 
     #[tokio::test]
@@ -918,7 +1302,9 @@ mod tests {
         let behaviour = ServerBehaviour {
             advertisement: Vec::new(),
             after_advertisement: AfterAdvertisement::Exit(128),
-            stderr: Some("fatal: '/acme/pipelines.git' does not appear to be a git repository"),
+            stderr: Some(
+                "fatal: '/acme/pipelines.git' does not appear to be a git repository".to_string(),
+            ),
             ..Default::default()
         };
         let port = spawn_server(behaviour).await;
@@ -964,6 +1350,45 @@ mod tests {
         assert!(parse_ssh_url("https://forge.example/org/repo.git").is_err());
         assert!(parse_ssh_url("git@forge.example:org/repo.git").is_err());
         assert!(parse_ssh_url("ssh://git@forge.example").is_err());
+    }
+
+    #[test]
+    fn an_ipv6_host_is_its_address_without_brackets() {
+        let t = parse_ssh_url("ssh://git@[0:0::1]:2222/r.git").unwrap();
+        assert_eq!(
+            t,
+            SshTarget {
+                user: "git".to_string(),
+                host: "::1".to_string(),
+                port: 2222,
+                repo_path: "/r.git".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_literal_host_resolves() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("skipped: this host has no IPv6 loopback ({e})");
+                return;
+            }
+        };
+        let port = serve(listener, forge());
+        // What OpenSSH records for ssh://git@[0:0::1]:<port>/…: the address
+        // in its short form, in brackets with the port.
+        let known_hosts = format!("[::1]:{port} {HOST_PUB}\n");
+        let target =
+            parse_ssh_url(&format!("ssh://git@[0:0::1]:{port}/acme/pipelines.git")).unwrap();
+
+        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT)
+            .await
+            .unwrap();
+
+        let adv = parse_advertisement(&bytes).unwrap();
+        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
     }
 
     #[test]

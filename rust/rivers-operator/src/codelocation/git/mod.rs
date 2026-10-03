@@ -685,7 +685,7 @@ fn ref_cache_key(r#ref: &GitRef) -> Result<String, GitError> {
 
 #[cfg(test)]
 mod resolver_tests {
-    use super::ssh::test_server::{self, ServerBehaviour};
+    use super::ssh::test_server::{self, AfterAdvertisement, ServerBehaviour, StalledHost};
     use super::*;
     use std::time::{Duration, Instant};
     use wiremock::matchers::{header, method, path};
@@ -824,6 +824,83 @@ mod resolver_tests {
         let resolved = resolver.resolve(&req).await.unwrap();
         assert_eq!(resolved.commit, fixtures::oid('a'));
         assert_eq!(resolved.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    #[tokio::test]
+    async fn an_ssh_host_that_never_answers_fails_the_resolve_and_backs_off() {
+        let (port, _) = test_server::spawn_stalled_host(StalledHost::Silent).await;
+        let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
+        let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+        let resolver = GitResolver::new(Duration::from_secs(1));
+
+        let failure = tokio::time::timeout(Duration::from_secs(5), resolver.resolve(&req))
+            .await
+            .expect("the resolve did not end within 5s")
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error.to_string(),
+            format!(
+                "git host unreachable: the SSH handshake with '127.0.0.1:{port}' did not finish \
+                 within 1s"
+            )
+        );
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
+    }
+
+    /// Resolve `main` on a test git server that behaves as `server`.
+    async fn resolve_over_ssh(server: ServerBehaviour) -> (u16, GitFailure) {
+        let port = test_server::spawn_server(server).await;
+        let known_hosts = format!("[127.0.0.1]:{port} {}", test_server::HOST_PUB);
+        let req = ssh_request(port, test_server::CLIENT_KEY, &known_hosts);
+        let failure = GitResolver::new(TIMEOUT).resolve(&req).await.unwrap_err();
+        (port, failure)
+    }
+
+    #[tokio::test]
+    async fn an_ssh_connection_that_ends_before_the_refs_do_backs_off() {
+        let mut half = fixtures::ssh_adv();
+        half.truncate(half.len() / 2);
+        for advertisement in [half, Vec::new()] {
+            // No exit status, no flush-pkt: the host drops the connection.
+            let server = ServerBehaviour {
+                advertisement,
+                drop_when_idle: Some(Duration::from_secs(1)),
+                ..Default::default()
+            };
+
+            let (port, failure) = resolve_over_ssh(server).await;
+
+            assert_eq!(
+                failure.error.to_string(),
+                format!(
+                    "git host unreachable: the connection to '127.0.0.1:{port}' closed before \
+                     all refs arrived"
+                )
+            );
+            assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_pack_that_fails_over_ssh_fails_for_good() {
+        let server = ServerBehaviour {
+            advertisement: Vec::new(),
+            after_advertisement: AfterAdvertisement::Exit(128),
+            stderr: Some(
+                "fatal: '/acme/pipelines.git' does not appear to be a git repository\n".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let (_, failure) = resolve_over_ssh(server).await;
+
+        assert_eq!(
+            failure.error.to_string(),
+            "ref not found: git-upload-pack failed (exit 128) for '/acme/pipelines.git': fatal: \
+             '/acme/pipelines.git' does not appear to be a git repository"
+        );
+        assert_eq!(failure.retry_after, None);
     }
 
     #[tokio::test]

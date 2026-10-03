@@ -300,10 +300,11 @@ answer: `RefNotFound` / `InvalidRef` / `GitAuthFailed` / `GitHostKeyRejected` /
 problems, and a failed install surfaces `uv`'s error tail in
 `status.message`. A resolution problem sets the phase to `Failed`, and
 new runs are rejected until you fix it. A git host that does not answer
-(connection error, timeout, HTTP 5xx) does not take the CodeLocation
-down: it stays `Ready` on the commit it serves, with `SourceResolved`
-`False`, reason `GitUnreachable`, and the error, also in
-`status.message`. In shared mode, runs keep using that commit's tree. In
+(connection error, HTTP 5xx, or no complete answer within
+`operator.git.timeoutSeconds`, 30 seconds by default) does not take the
+CodeLocation down: it stays `Ready` on the commit it serves, with
+`SourceResolved` `False`, reason `GitUnreachable`, and the error, also
+in `status.message`. In shared mode, runs keep using that commit's tree. In
 fallback mode, each run pod fetches the commit itself, so a run that
 starts while the host is down fails. The operator asks the host again
 after 1, 2 and 4 minutes, then every 5 minutes, and picks up new commits

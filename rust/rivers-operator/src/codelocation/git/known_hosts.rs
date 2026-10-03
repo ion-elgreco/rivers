@@ -90,11 +90,10 @@ impl HostKeys {
             .collect();
         if algorithms.is_empty() {
             return Err(GitError::KnownHostsUnavailable(format!(
-                "the git Secret's `known_hosts` has only {} keys for '{}:{}'; the operator \
+                "the git Secret's `known_hosts` has only {} keys for '{}'; the operator \
                  accepts {} host keys — add the host's key of one of these types",
                 names(self.keys.iter().map(|(_, key)| key.algorithm())),
-                self.host,
-                self.port,
+                address(&self.host, self.port),
                 names(Preferred::DEFAULT.key.iter().map(key_type)),
             )));
         }
@@ -117,9 +116,9 @@ impl HostKeys {
         }
         match changed_line {
             Some(line) => Err(GitError::HostKeyRejected(format!(
-                "HOST KEY CHANGED for '{}:{}' (known_hosts line {line}) — possible \
+                "HOST KEY CHANGED for '{}' (known_hosts line {line}) — possible \
                  man-in-the-middle; refusing. Update the Secret only after out-of-band verification",
-                self.host, self.port
+                address(&self.host, self.port)
             ))),
             None => Err(not_listed(&self.host, self.port)),
         }
@@ -158,9 +157,19 @@ fn names(algorithms: impl Iterator<Item = Algorithm>) -> String {
 
 fn not_listed(host: &str, port: u16) -> GitError {
     GitError::HostKeyRejected(format!(
-        "host '{host}:{port}' is not in known_hosts (exact and hashed |1| entries only; \
-         wildcards and @cert-authority are unsupported) — add this host's key to the git Secret"
+        "host '{}' is not in known_hosts (exact and hashed |1| entries only; wildcards and \
+         @cert-authority are unsupported) — add this host's key to the git Secret",
+        address(host, port)
     ))
+}
+
+/// `host:port` for messages, an IPv6 host in brackets.
+pub(crate) fn address(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +204,26 @@ mod tests {
     #[test]
     fn exact_entry_default_port_accepts() {
         verify(&format!("gitea.internal {HOST_PUB}\n"), 22).unwrap();
+    }
+
+    #[test]
+    fn an_ipv6_host_is_named_as_openssh_names_it() {
+        // OpenSSH: `::1` on port 22, `[::1]:2222` on another port.
+        for (known_hosts, port) in [("::1", 22), ("[::1]:2222", 2222)] {
+            HostKeys::new(&format!("{known_hosts} {HOST_PUB}\n"), "::1", port)
+                .unwrap()
+                .verify(&host_key())
+                .unwrap();
+        }
+        let err = HostKeys::new(&format!("gitea.internal {HOST_PUB}\n"), "::1", 2222)
+            .err()
+            .expect("::1 is not listed");
+        assert_eq!(
+            err.to_string(),
+            "host key rejected: host '[::1]:2222' is not in known_hosts (exact and hashed |1| \
+             entries only; wildcards and @cert-authority are unsupported) — add this host's key \
+             to the git Secret"
+        );
     }
 
     #[test]

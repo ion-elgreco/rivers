@@ -28,7 +28,7 @@ rustls.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 jiff.workspace = true
 uuid.workspace = true
 futures-util = { workspace = true }
