@@ -30,7 +30,7 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const HTTP_SERVICE_PREAMBLE: &[u8] = b"# service=";
 const UPLOAD_PACK_SERVICE: &[u8] = b"git-upload-pack";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum GitError {
     /// The requested ref is not in the advertisement (or, over HTTP, the
     /// repository itself was not found). Terminal until the CR or the
@@ -55,6 +55,31 @@ pub enum GitError {
     /// The response was not a protocol-v0 ref advertisement.
     #[error("malformed advertisement: {0}")]
     Malformed(String),
+}
+
+impl GitError {
+    /// A failure that passes on its own; every other one stands until the
+    /// CR, the Secret or the remote changes.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, GitError::Unreachable(_))
+    }
+}
+
+/// A resolve that produced no commit.
+#[derive(Debug)]
+pub struct GitFailure {
+    pub error: GitError,
+    /// Transient errors: how long until the resolver fetches the ref again.
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl From<GitError> for GitFailure {
+    fn from(error: GitError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
 }
 
 /// Transport/protocol failures out of russh that we didn't classify
@@ -270,19 +295,35 @@ pub struct GitResolveRequest {
     pub cache_ttl: std::time::Duration,
 }
 
-struct CachedResolution {
-    resolved: ResolvedRef,
-    expires_at: std::time::Instant,
-    immutable: bool,
+/// The longest wait between fetches of a failing ref: the default poll
+/// interval, so a host that stays down is asked no more often than a
+/// default code location polls it, and its recovery shows within one poll.
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+enum CacheEntry {
+    Resolved {
+        resolved: ResolvedRef,
+        expires_at: std::time::Instant,
+        immutable: bool,
+    },
+    /// Transient failures since the last success; no fetch before
+    /// `next_attempt_after`.
+    Failing {
+        error: GitError,
+        consecutive_errors: u32,
+        next_attempt_after: std::time::Instant,
+    },
 }
 
 /// Ref→commit resolver with the same posture as [`super::registry`]'s
 /// digest resolver: cross-CR cache keyed on `(url, ref)`, immutable-tag
-/// short-circuit, leader gating left to the reconciler.
+/// short-circuit, exponential backoff after transient errors, leader gating
+/// left to the reconciler. Unlike the registry's, a ref that backs off does
+/// not serve its last result: it fails until a fetch succeeds.
 pub struct GitResolver {
     http: reqwest::Client,
     timeout: std::time::Duration,
-    cache: tokio::sync::Mutex<std::collections::HashMap<(String, String), CachedResolution>>,
+    cache: tokio::sync::Mutex<std::collections::HashMap<(String, String), CacheEntry>>,
 }
 
 impl GitResolver {
@@ -294,7 +335,16 @@ impl GitResolver {
         }
     }
 
-    pub async fn resolve(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitError> {
+    pub async fn resolve(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitFailure> {
+        self.resolve_at(req, std::time::Instant::now()).await
+    }
+
+    /// [`Self::resolve`] at `now` (tests step the clock).
+    async fn resolve_at(
+        &self,
+        req: &GitResolveRequest,
+        now: std::time::Instant,
+    ) -> Result<ResolvedRef, GitFailure> {
         // Pinned commit: no lookup, no cache, no network.
         if let Some(commit) = req.r#ref.commit.as_deref().filter(|c| !c.is_empty()) {
             return Ok(ResolvedRef {
@@ -304,33 +354,87 @@ impl GitResolver {
         }
 
         let cache_key = (req.url.clone(), ref_cache_key(&req.r#ref)?);
-        {
-            let cache = self.cache.lock().await;
-            if let Some(entry) = cache.get(&cache_key) {
-                if entry.immutable || entry.expires_at > std::time::Instant::now() {
-                    return Ok(entry.resolved.clone());
-                }
+        match self.cache.lock().await.get(&cache_key) {
+            Some(CacheEntry::Resolved {
+                resolved,
+                expires_at,
+                immutable,
+            }) if *immutable || *expires_at > now => return Ok(resolved.clone()),
+            Some(CacheEntry::Failing {
+                error,
+                next_attempt_after,
+                ..
+            }) if now < *next_attempt_after => {
+                return Err(GitFailure {
+                    error: error.clone(),
+                    retry_after: Some(*next_attempt_after - now),
+                });
             }
+            _ => {}
         }
 
-        let bytes = self.fetch(req).await?;
-        let advertisement = parse_advertisement(&bytes)?;
-        let resolved = commit_for_ref(&advertisement, &req.r#ref)?;
+        let outcome = self.fetch_commit(req).await;
+        let mut cache = self.cache.lock().await;
+        match outcome {
+            Ok(resolved) => {
+                let immutable = req
+                    .r#ref
+                    .tag
+                    .as_deref()
+                    .is_some_and(super::registry::looks_immutable);
+                cache.insert(
+                    cache_key,
+                    CacheEntry::Resolved {
+                        resolved: resolved.clone(),
+                        expires_at: now + req.cache_ttl,
+                        immutable,
+                    },
+                );
+                Ok(resolved)
+            }
+            Err(error) if error.is_transient() => {
+                let consecutive_errors = match cache.get(&cache_key) {
+                    // A concurrent resolve of this ref failed first and
+                    // counted this attempt.
+                    Some(CacheEntry::Failing {
+                        error: counted,
+                        next_attempt_after,
+                        ..
+                    }) if *next_attempt_after > now => {
+                        return Err(GitFailure {
+                            error: counted.clone(),
+                            retry_after: Some(*next_attempt_after - now),
+                        });
+                    }
+                    Some(CacheEntry::Failing {
+                        consecutive_errors, ..
+                    }) => consecutive_errors.saturating_add(1),
+                    _ => 1,
+                };
+                let backoff = super::registry::exponential_backoff(consecutive_errors, MAX_BACKOFF);
+                cache.insert(
+                    cache_key,
+                    CacheEntry::Failing {
+                        error: error.clone(),
+                        consecutive_errors,
+                        next_attempt_after: now + backoff,
+                    },
+                );
+                Err(GitFailure {
+                    error,
+                    retry_after: Some(backoff),
+                })
+            }
+            Err(error) => {
+                cache.remove(&cache_key);
+                Err(error.into())
+            }
+        }
+    }
 
-        let immutable = req
-            .r#ref
-            .tag
-            .as_deref()
-            .is_some_and(super::registry::looks_immutable);
-        self.cache.lock().await.insert(
-            cache_key,
-            CachedResolution {
-                resolved: resolved.clone(),
-                expires_at: std::time::Instant::now() + req.cache_ttl,
-                immutable,
-            },
-        );
-        Ok(resolved)
+    async fn fetch_commit(&self, req: &GitResolveRequest) -> Result<ResolvedRef, GitError> {
+        let bytes = self.fetch(req).await?;
+        commit_for_ref(&parse_advertisement(&bytes)?, &req.r#ref)
     }
 
     async fn fetch(&self, req: &GitResolveRequest) -> Result<Vec<u8>, GitError> {
@@ -430,7 +534,7 @@ fn ref_cache_key(r#ref: &GitRef) -> Result<String, GitError> {
 mod resolver_tests {
     use super::ssh::test_server::{self, ServerBehaviour};
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -555,7 +659,7 @@ mod resolver_tests {
             credentials: GitCredentials::Anonymous,
             cache_ttl: TTL,
         };
-        let err = resolver.resolve(&req).await.unwrap_err();
+        let err = resolver.resolve(&req).await.unwrap_err().error;
         assert!(
             matches!(err, GitError::AuthFailed(ref m) if m.contains("identity")),
             "{err}"
@@ -569,8 +673,161 @@ mod resolver_tests {
             "ftp://forge.example/r.git".to_string(),
             fixtures::branch("m"),
         );
-        let err = resolver.resolve(&req).await.unwrap_err();
+        let err = resolver.resolve(&req).await.unwrap_err().error;
         assert!(matches!(err, GitError::Malformed(_)), "{err}");
+    }
+
+    /// A git server answering ref polls with each response its number of
+    /// times in turn; `None` answers every later poll.
+    async fn git_server(responses: Vec<(ResponseTemplate, Option<u64>)>) -> MockServer {
+        let server = MockServer::start().await;
+        for (response, times) in responses {
+            let mock = Mock::given(method("GET"))
+                .and(path("/acme/pipelines.git/info/refs"))
+                .respond_with(response);
+            match times {
+                Some(n) => mock.up_to_n_times(n),
+                None => mock,
+            }
+            .mount(&server)
+            .await;
+        }
+        server
+    }
+
+    fn main_of(server: &MockServer) -> GitResolveRequest {
+        request(
+            format!("{}/acme/pipelines.git", server.uri()),
+            fixtures::branch("main"),
+        )
+    }
+
+    async fn polls(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn transient_failures_back_off_exponentially_and_a_success_resets_it() {
+        let server = git_server(vec![
+            (ResponseTemplate::new(503), Some(5)),
+            (adv_response(), Some(1)),
+            (ResponseTemplate::new(503), None),
+        ])
+        .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = main_of(&server);
+
+        let mut now = Instant::now();
+        let mut backoffs = Vec::new();
+        for _ in 0..5 {
+            let failure = resolver.resolve_at(&req, now).await.unwrap_err();
+            assert!(
+                matches!(failure.error, GitError::Unreachable(_)),
+                "{}",
+                failure.error
+            );
+            let backoff = failure.retry_after.expect("a transient error backs off");
+            // A second before the backoff ends, the host is not asked.
+            let waiting = resolver
+                .resolve_at(&req, now + backoff - Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(waiting.retry_after, Some(Duration::from_secs(1)));
+            backoffs.push(backoff.as_secs());
+            now += backoff;
+        }
+        assert_eq!(backoffs, [60, 120, 240, 300, 300]);
+
+        let resolved = resolver.resolve_at(&req, now).await.unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+        let failure = resolver.resolve_at(&req, now + TTL).await.unwrap_err();
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
+        assert_eq!(polls(&server).await, 7);
+    }
+
+    #[tokio::test]
+    async fn a_ref_backing_off_stays_unresolved_until_a_fetch_succeeds() {
+        let server = git_server(vec![
+            (adv_response(), Some(1)),
+            (ResponseTemplate::new(503), Some(1)),
+            (adv_response(), None),
+        ])
+        .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = main_of(&server);
+        let start = Instant::now();
+        resolver.resolve_at(&req, start).await.unwrap();
+        let failed_at = start + TTL;
+        let failure = resolver.resolve_at(&req, failed_at).await.unwrap_err();
+
+        // The host answers again, but until the backoff ends the last error
+        // stands: the commit resolved before it is not current.
+        let waiting = resolver
+            .resolve_at(&req, failed_at + Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(waiting.error.to_string(), failure.error.to_string());
+        assert_eq!(waiting.retry_after, Some(Duration::from_secs(30)));
+        assert_eq!(polls(&server).await, 2);
+
+        let resolved = resolver
+            .resolve_at(&req, failed_at + Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+    }
+
+    #[tokio::test]
+    async fn concurrent_failures_of_a_ref_count_once() {
+        let slow_503 = ResponseTemplate::new(503).set_delay(Duration::from_millis(200));
+        let server = git_server(vec![(slow_503, None)]).await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = main_of(&server);
+        let now = Instant::now();
+
+        let (a, b) = tokio::join!(
+            resolver.resolve_at(&req, now),
+            resolver.resolve_at(&req, now)
+        );
+
+        assert_eq!(polls(&server).await, 2);
+        assert_eq!(a.unwrap_err().retry_after, Some(Duration::from_secs(60)));
+        assert_eq!(b.unwrap_err().retry_after, Some(Duration::from_secs(60)));
+        let next = resolver
+            .resolve_at(&req, now + Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(next.retry_after, Some(Duration::from_secs(120)));
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_the_host_ends_the_backoff() {
+        let server = git_server(vec![
+            (ResponseTemplate::new(503), Some(2)),
+            (ResponseTemplate::new(401), Some(1)),
+            (ResponseTemplate::new(503), None),
+        ])
+        .await;
+        let resolver = GitResolver::new(TIMEOUT);
+        let req = main_of(&server);
+        let start = Instant::now();
+        resolver.resolve_at(&req, start).await.unwrap_err();
+        let second = resolver
+            .resolve_at(&req, start + Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(second.retry_after, Some(Duration::from_secs(120)));
+
+        let answered_at = start + Duration::from_secs(180);
+        let auth = resolver.resolve_at(&req, answered_at).await.unwrap_err();
+        assert!(
+            matches!(auth.error, GitError::AuthFailed(_)),
+            "{}",
+            auth.error
+        );
+        assert_eq!(auth.retry_after, None);
+        let next = resolver.resolve_at(&req, answered_at).await.unwrap_err();
+        assert_eq!(next.retry_after, Some(Duration::from_secs(60)));
     }
 }
 

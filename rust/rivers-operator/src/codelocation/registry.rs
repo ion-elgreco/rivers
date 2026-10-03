@@ -539,7 +539,7 @@ fn apply_auth(headers: &mut HeaderMap, auth: &RegistryAuth) {
     }
 }
 
-fn exponential_backoff(consecutive_errors: u32, cap: Duration) -> Duration {
+pub(super) fn exponential_backoff(consecutive_errors: u32, cap: Duration) -> Duration {
     let base = Duration::from_secs(60);
     // 1, 2, 4, 8, 16 ... minutes, capped.
     let shift = consecutive_errors.saturating_sub(1).min(12);
