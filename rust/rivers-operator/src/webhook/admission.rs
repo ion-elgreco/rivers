@@ -15,10 +15,7 @@ use jsonptr::PointerBuf;
 use kube_client::Api;
 use kube_core::DynamicObject;
 use kube_core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview, Operation};
-use rivers_api::CodeLocationEntry;
-use rivers_k8s::crd::code_location::{
-    CodeLocation, CodeLocationPhase, CodeLocationSpec, validate_commit,
-};
+use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, validate_commit};
 use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
@@ -159,8 +156,8 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
         );
     }
 
-    let entry = match lookup_with_fallback(deps, ref_ns, ref_name).await {
-        Ok(Some(e)) => e,
+    let cl = match lookup_code_location_with_fallback(deps, ref_ns, ref_name).await {
+        Ok(Some(cl)) => cl,
         Ok(None) => {
             return RunOutcome::Rejected(format!(
                 "codeLocation '{ref_name}' not found in namespace '{ref_ns}'"
@@ -173,63 +170,54 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
         }
     };
 
-    if entry.phase != CodeLocationPhase::Ready.as_str() {
+    let Some(status) = cl
+        .status
+        .as_ref()
+        .filter(|s| s.phase == Some(CodeLocationPhase::Ready))
+    else {
+        let phase = cl.status.as_ref().and_then(|s| s.phase.as_ref());
         return RunOutcome::Rejected(format!(
             "codeLocation '{ref_ns}/{ref_name}' is not Ready (phase={})",
-            entry.phase
+            phase.map_or("Unknown", CodeLocationPhase::as_str)
+        ));
+    };
+
+    // Runs get the serving tree, whatever the spec says now: it changes only
+    // once a tree has fully rolled out, so it needs no generation check.
+    let source = status.run_source.clone();
+    if source.is_none() && cl.spec.git.is_some() {
+        return RunOutcome::Rejected(format!(
+            "codeLocation '{ref_ns}/{ref_name}' has no rolled-out git tree yet; \
+             status.runSource is empty — retry once its rollout finishes"
         ));
     }
-    if entry.image.is_empty() {
+    let image = match &source {
+        Some(source) => source.runtime_image.clone(),
+        None => status.resolved_image.clone().unwrap_or_default(),
+    };
+    if image.is_empty() {
         return RunOutcome::Rejected(format!(
             "codeLocation '{ref_ns}/{ref_name}' has no resolved image yet; \
              status.resolvedImage is empty"
         ));
     }
 
-    // Git-sourced CL: stamp provenance from spec (coordinates) + entry
-    // (pinned commit and runtime image). The spec cache is populated by the
-    // same watcher that feeds entries, status-independent — a missing spec
-    // here means an image-mode CL, not a race.
-    let source = match deps.directory.lookup_spec(ref_ns, ref_name).await {
-        Some(spec) if spec.git.is_some() => {
-            let git = spec.git.as_ref().expect("checked");
-            if entry.resolved_commit.is_empty() {
-                return RunOutcome::Rejected(format!(
-                    "codeLocation '{ref_ns}/{ref_name}' has no resolved commit yet; \
-                     status.resolvedCommit is empty"
-                ));
-            }
-            Some(RunSource {
-                git: GitCoordinates {
-                    url: git.url.clone(),
-                    commit: entry.resolved_commit.clone(),
-                    r#ref: Some(entry.resolved_ref.clone()).filter(|r| !r.is_empty()),
-                    path: git.path.clone(),
-                    secret_name: git.secret_ref.as_ref().map(|s| s.name.clone()),
-                },
-                dependencies: git.dependencies.clone(),
-                runtime_image: entry.image.clone(),
-            })
-        }
-        _ => None,
-    };
-
     RunOutcome::Mutated {
-        image: entry.image,
-        module: entry.module,
-        identity: entry.identity,
+        image,
+        module: cl.spec.module.clone(),
+        identity: cl.spec.identity.clone(),
         source,
     }
 }
 
 /// Escape-hatch provenance: commit, ref, path and dependencies are the
 /// caller's own (e.g. a pod still serving the previous commit), but the url
-/// and Secret must be the CodeLocation's — a fallback-mode run pod mounts
-/// that Secret and sends its credentials to that url — and so must the
-/// runtime image's repository, since that image runs the init container
-/// that mounts the Secret: the serving tree's (`status.resolvedImage`) or
-/// the one the CL's pods move to (`spec.image`, else the chart default).
-/// Any digest is accepted, as during a rollout.
+/// and Secret must be the CodeLocation's ([`check_git_remote`]) — a
+/// fallback-mode run pod mounts that Secret and sends its credentials to
+/// that url — and so must the runtime image's repository, since that image
+/// runs the init container that mounts the Secret: the serving tree's
+/// (`status.resolvedImage`) or the one the CL's pods move to (`spec.image`,
+/// else the chart default). Any digest is accepted, as during a rollout.
 async fn check_self_stamped_source(
     source: &RunSource,
     namespace: &str,
@@ -256,8 +244,8 @@ async fn check_self_stamped_source(
             )
         })?;
 
-    let (spec, entry) = match lookup_code_location_with_fallback(deps, namespace, name).await {
-        Ok(Some(found)) => found,
+    let cl = match lookup_code_location_with_fallback(deps, namespace, name).await {
+        Ok(Some(cl)) => cl,
         Ok(None) => {
             return Err(format!(
                 "codeLocation '{name}' not found in namespace '{namespace}'"
@@ -269,32 +257,16 @@ async fn check_self_stamped_source(
             ));
         }
     };
-    let Some(cl_git) = &spec.git else {
-        return Err(format!(
-            "codeLocation '{namespace}/{name}' is not git-sourced; remove spec.source"
-        ));
-    };
-    if git.url != cl_git.url {
-        return Err(format!(
-            "spec.source.git.url does not match spec.git.url of codeLocation '{namespace}/{name}'"
-        ));
-    }
-    let cl_secret = cl_git.secret_ref.as_ref().map(|s| s.name.as_str());
-    if git.secret_name.as_deref() != cl_secret {
-        let show = |s: Option<&str>| s.map_or_else(|| "none".to_string(), |s| format!("'{s}'"));
-        return Err(format!(
-            "spec.source.git.secretName {} does not match spec.git.secretRef {} \
-             of codeLocation '{namespace}/{name}'",
-            show(git.secret_name.as_deref()),
-            show(cl_secret),
-        ));
-    }
-    let mut repositories: Vec<String> = entry
-        .and_then(|e| e.image.parse::<ImageRef>().ok())
+    check_git_remote(git, &cl, namespace, name)?;
+    let mut repositories: Vec<String> = cl
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved_image.as_deref())
+        .and_then(|image| image.parse::<ImageRef>().ok())
         .map(|image| image.repository)
         .into_iter()
         .collect();
-    let wanted = wanted_image(&spec, &deps.runtime_image).repository;
+    let wanted = wanted_image(&cl.spec, &deps.runtime_image).repository;
     if !repositories.contains(&wanted) {
         repositories.push(wanted);
     }
@@ -305,6 +277,76 @@ async fn check_self_stamped_source(
              of codeLocation '{namespace}/{name}'",
             source.runtime_image,
             quoted.join(" or "),
+        ));
+    }
+    Ok(())
+}
+
+/// A git url and the Secret whose credentials go to it, as the fields of a
+/// CodeLocation name them.
+struct GitRemote<'a> {
+    url: &'a str,
+    secret: Option<&'a str>,
+    url_field: &'static str,
+    secret_field: &'static str,
+}
+
+/// `source`'s url and Secret must be a pair that `cl` names: in `spec.git`,
+/// or in the serving tree (`status.runSource`), whose pods stamp it until a
+/// change of url or Secret has rolled out.
+fn check_git_remote(
+    source: &GitCoordinates,
+    cl: &CodeLocation,
+    namespace: &str,
+    name: &str,
+) -> Result<(), String> {
+    let mut remotes: Vec<GitRemote> = Vec::new();
+    if let Some(git) = &cl.spec.git {
+        remotes.push(GitRemote {
+            url: &git.url,
+            secret: git.secret_ref.as_ref().map(|s| s.name.as_str()),
+            url_field: "spec.git.url",
+            secret_field: "spec.git.secretRef",
+        });
+    }
+    if let Some(serving) = cl.status.as_ref().and_then(|s| s.run_source.as_ref()) {
+        let remote = GitRemote {
+            url: &serving.git.url,
+            secret: serving.git.secret_name.as_deref(),
+            url_field: "status.runSource.git.url",
+            secret_field: "status.runSource.git.secretName",
+        };
+        if !remotes
+            .iter()
+            .any(|r| (r.url, r.secret) == (remote.url, remote.secret))
+        {
+            remotes.push(remote);
+        }
+    }
+    if remotes.is_empty() {
+        return Err(format!(
+            "codeLocation '{namespace}/{name}' is not git-sourced; remove spec.source"
+        ));
+    }
+    let same_url: Vec<&GitRemote> = remotes.iter().filter(|r| r.url == source.url).collect();
+    if same_url.is_empty() {
+        let fields: Vec<&str> = remotes.iter().map(|r| r.url_field).collect();
+        return Err(format!(
+            "spec.source.git.url does not match {} of codeLocation '{namespace}/{name}'",
+            fields.join(" or ")
+        ));
+    }
+    let secret = source.secret_name.as_deref();
+    if !same_url.iter().any(|r| r.secret == secret) {
+        let show = |s: Option<&str>| s.map_or_else(|| "none".to_string(), |s| format!("'{s}'"));
+        let wanted: Vec<String> = same_url
+            .iter()
+            .map(|r| format!("{} {}", r.secret_field, show(r.secret)))
+            .collect();
+        return Err(format!(
+            "spec.source.git.secretName {} does not match {} of codeLocation '{namespace}/{name}'",
+            show(secret),
+            wanted.join(" or "),
         ));
     }
     Ok(())
@@ -564,38 +606,22 @@ fn is_uuid_v4(s: &str) -> bool {
     uuid.get_version_num() == 4
 }
 
-/// Cache lookup with one-shot live `GET` fallback ([`live_get`]).
-async fn lookup_with_fallback(
-    deps: &AdmissionDeps,
-    namespace: &str,
-    name: &str,
-) -> anyhow::Result<Option<CodeLocationEntry>> {
-    if let Some(entry) = deps.directory.lookup(namespace, name).await {
-        return Ok(Some(entry));
-    }
-    Ok(live_get(deps, name)
-        .await?
-        .as_ref()
-        .and_then(crate::codelocation::directory::project_entry))
-}
-
-/// The CodeLocation's spec and, once it has a status, its directory entry:
-/// both from the cache, else both from one live `GET` ([`live_get`]).
+/// The CodeLocation as the watcher last saw it with a status, else as one
+/// live `GET` ([`live_get`]) returns it: spec and status of one object.
 async fn lookup_code_location_with_fallback(
     deps: &AdmissionDeps,
     namespace: &str,
     name: &str,
-) -> anyhow::Result<Option<(Arc<CodeLocationSpec>, Option<CodeLocationEntry>)>> {
-    if let (Some(spec), Some(entry)) = (
-        deps.directory.lookup_spec(namespace, name).await,
-        deps.directory.lookup(namespace, name).await,
-    ) {
-        return Ok(Some((spec, Some(entry))));
+) -> anyhow::Result<Option<Arc<CodeLocation>>> {
+    if let Some(cl) = deps
+        .directory
+        .lookup_code_location(namespace, name)
+        .await
+        .filter(|cl| cl.status.is_some())
+    {
+        return Ok(Some(cl));
     }
-    Ok(live_get(deps, name).await?.map(|cl| {
-        let entry = crate::codelocation::directory::project_entry(&cl);
-        (Arc::new(cl.spec), entry)
-    }))
+    Ok(live_get(deps, name).await?.map(Arc::new))
 }
 
 /// The live `GET` MUST be a quorum read against etcd — kube's default
@@ -704,6 +730,7 @@ pub(crate) fn cl_admission_request_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rivers_k8s::crd::code_location::CodeLocationSpec;
     use rivers_k8s::crd::run::RunSpec;
 
     fn build_run(name: &str, image: &str) -> Run {
@@ -716,28 +743,83 @@ mod tests {
         Run::new("test-run", spec)
     }
 
-    fn ready_entry(
-        ns: &str,
-        name: &str,
-        image: &str,
-        module: &str,
-        identity: &str,
-    ) -> CodeLocationEntry {
-        CodeLocationEntry {
-            namespace: ns.to_string(),
-            name: name.to_string(),
-            grpc_endpoint: "grpc://example:50051".to_string(),
-            image: image.to_string(),
-            module: module.to_string(),
-            phase: CodeLocationPhase::Ready.as_str().to_string(),
-            observed_generation: 1,
-            identity: identity.to_string(),
-            resolved_commit: String::new(),
-            resolved_ref: String::new(),
-        }
+    /// `team-data/analytics` with `spec` and `status`.
+    fn code_location(spec: serde_json::Value, status: serde_json::Value) -> CodeLocation {
+        let mut cl = CodeLocation::new("analytics", serde_json::from_value(spec).unwrap());
+        cl.metadata.namespace = Some("team-data".to_string());
+        cl.status = Some(serde_json::from_value(status).unwrap());
+        cl
+    }
+
+    /// The webhook of an operator replica whose directory watcher has seen
+    /// `cl`.
+    async fn watching(cl: CodeLocation) -> AdmissionDeps {
+        let directory = Arc::new(DirectoryState::new());
+        directory.upsert_code_location(cl).await;
+        AdmissionDeps::cache_only(directory)
+    }
+
+    type MockApi = Arc<std::sync::Mutex<crate::run::test_helpers::MockApiState>>;
+
+    /// The webhook of a replica whose watcher has not seen `cl`: the API
+    /// server answers its live `GET`.
+    fn reading_live(cl: CodeLocation) -> (AdmissionDeps, MockApi) {
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        let api_state: MockApi = Arc::new(std::sync::Mutex::new(MockApiState::default()));
+        api_state
+            .lock()
+            .unwrap()
+            .code_locations
+            .insert(cl.metadata.name.clone().unwrap(), cl);
+        let deps = AdmissionDeps {
+            code_locations: Some(Api::namespaced(mock_client(api_state.clone()), "team-data")),
+            ..AdmissionDeps::cache_only(Arc::new(DirectoryState::new()))
+        };
+        (deps, api_state)
+    }
+
+    const ANALYTICS_URL: &str =
+        "/apis/rivers.io/v1alpha1/namespaces/team-data/codelocations/analytics";
+
+    /// Paths of the `GET`s the API server answered.
+    fn live_gets(api_state: &MockApi) -> Vec<String> {
+        api_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Status of a git CodeLocation whose pods all run `tree` and are ready.
+    fn serving(tree: &RunSource) -> serde_json::Value {
+        serde_json::json!({
+            "phase": "Ready",
+            "resolvedImage": tree.runtime_image,
+            "resolvedCommit": tree.git.commit,
+            "resolvedRef": tree.git.r#ref,
+            "runSource": tree,
+        })
+    }
+
+    /// A git CodeLocation serving the tree of its spec,
+    /// [`expected_run_source`].
+    fn git_cl() -> CodeLocation {
+        code_location(git_spec(), serving(&expected_run_source()))
+    }
+
+    /// `spec`, Ready on runtime image `runtime('a')`, without `runSource`.
+    fn ready_cl(spec: serde_json::Value) -> CodeLocation {
+        code_location(
+            spec,
+            serde_json::json!({ "phase": "Ready", "resolvedImage": runtime('a') }),
+        )
     }
 
     const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+    const IDENTITY: &str = "11111111-1111-4111-8111-111111111111";
     /// Repository of the chart's default runtime image, which a git CL
     /// without `spec.image` runs ([`AdmissionDeps::cache_only`]).
     fn runtime_repository() -> String {
@@ -773,26 +855,8 @@ mod tests {
         assert_eq!(mutate_run(&req, deps).await, RunOutcome::AcceptedAsIs);
     }
 
-    /// Directory state for a git-sourced CL: entry with a pinned commit AND
-    /// the cached spec (the webhook stamps coordinates from both halves).
-    async fn git_directory(ns: &str, name: &str, commit: &str) -> Arc<DirectoryState> {
-        let state = Arc::new(DirectoryState::new());
-        let mut entry = ready_entry(
-            ns,
-            name,
-            &runtime('a'),
-            "analytics.pipeline",
-            "11111111-1111-4111-8111-111111111111",
-        );
-        entry.resolved_commit = commit.to_string();
-        entry.resolved_ref = "refs/heads/main".to_string();
-        state.upsert(entry).await;
-        state.upsert_spec(ns, name, Arc::new(git_spec())).await;
-        state
-    }
-
-    fn git_spec() -> CodeLocationSpec {
-        serde_json::from_value(serde_json::json!({
+    fn git_spec() -> serde_json::Value {
+        serde_json::json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
                 "ref": { "branch": "main" },
@@ -801,27 +865,8 @@ mod tests {
                 "dependencies": { "mode": "uvSync" },
             },
             "module": "analytics.pipeline",
-        }))
-        .unwrap()
-    }
-
-    /// `team-data/analytics` with `spec`, Ready on runtime image `runtime('a')`.
-    async fn spec_directory(spec: serde_json::Value) -> Arc<DirectoryState> {
-        let state = Arc::new(DirectoryState::new());
-        let spec: CodeLocationSpec = serde_json::from_value(spec).unwrap();
-        state
-            .upsert_spec("team-data", "analytics", Arc::new(spec))
-            .await;
-        state
-            .upsert(ready_entry(
-                "team-data",
-                "analytics",
-                &runtime('a'),
-                "analytics.pipeline",
-                "11111111-1111-4111-8111-111111111111",
-            ))
-            .await;
-        state
+            "identity": IDENTITY,
+        })
     }
 
     /// Digest-pinned Run carrying its own `spec.source` (escape hatch).
@@ -853,45 +898,126 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn create_stamps_source_for_git_cl() {
-        let state = git_directory("team-data", "analytics", COMMIT).await;
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-git-1", "team-data", &run);
-        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
-            RunOutcome::Mutated { image, source, .. } => {
-                assert_eq!(image, runtime('a'));
-                // The tree is the commit built with the CL's runtime image.
-                assert_eq!(
-                    serde_json::to_value(&source).unwrap()["runtimeImage"],
-                    runtime('a')
-                );
-                assert_eq!(source, Some(expected_run_source()));
-            }
-            other => panic!("expected Mutated, got {other:?}"),
+    /// What a Run without `image` gets from the webhook of `deps`.
+    async fn create(deps: &AdmissionDeps) -> RunOutcome {
+        let req = admission_request_create("uid-create", "team-data", &build_run("analytics", ""));
+        mutate_run(&req, deps).await
+    }
+
+    /// What the webhook stamps on a Run that gets `tree`: the tree, its
+    /// runtime image, and the module and identity of [`git_spec`].
+    fn stamped(tree: RunSource) -> RunOutcome {
+        RunOutcome::Mutated {
+            image: tree.runtime_image.clone(),
+            module: "analytics.pipeline".to_string(),
+            identity: IDENTITY.to_string(),
+            source: Some(tree),
         }
     }
 
     #[tokio::test]
-    async fn create_rejects_git_cl_whose_commit_is_unresolved() {
-        // Entry Ready but no pinned commit — must not admit a run that
-        // would have no tree to mount.
-        let state = git_directory("team-data", "analytics", "").await;
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-git-2", "team-data", &run);
-        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
-            RunOutcome::Rejected(msg) => assert!(msg.contains("commit"), "{msg}"),
-            other => panic!("expected Rejected, got {other:?}"),
+    async fn create_stamps_source_for_git_cl() {
+        assert_eq!(
+            create(&watching(git_cl()).await).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reads_the_serving_tree_with_one_live_get_on_a_cache_miss() {
+        let (deps, api_state) = reading_live(git_cl());
+        assert_eq!(create(&deps).await, stamped(expected_run_source()));
+        assert_eq!(live_gets(&api_state), vec![ANALYTICS_URL]);
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_serving_tree_while_a_spec_change_rolls_out() {
+        // A new url, ref, path, Secret, dependencies and runtime image,
+        // whose pods are not all ready yet.
+        let spec = serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines-v2.git",
+                "ref": { "branch": "release" },
+                "path": "services/analytics",
+                "secretRef": { "name": "git-creds-v2" },
+                "dependencies": { "mode": "requirements", "files": ["requirements.lock"] },
+            },
+            "image": MIRROR,
+            "module": "analytics.pipeline",
+            "identity": IDENTITY,
+        });
+        let cl = code_location(spec, serving(&expected_run_source()));
+        assert_eq!(
+            create(&watching(cl.clone()).await).await,
+            stamped(expected_run_source())
+        );
+        assert_eq!(
+            create(&reading_live(cl).0).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_runtime_image_of_the_tree_it_stamps() {
+        // spec.image runs the tree's venv, so it comes with the tree, not
+        // from status.resolvedImage.
+        let mut status = serving(&expected_run_source());
+        status["resolvedImage"] = serde_json::json!(runtime('b'));
+        assert_eq!(
+            create(&watching(code_location(git_spec(), status)).await).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_ready_git_cl_without_a_serving_tree() {
+        let retry = RunOutcome::Rejected(
+            "codeLocation 'team-data/analytics' has no rolled-out git tree yet; \
+             status.runSource is empty — retry once its rollout finishes"
+                .to_string(),
+        );
+        for status in [
+            // Published before status.runSource existed.
+            serde_json::json!({
+                "phase": "Ready",
+                "resolvedImage": runtime('a'),
+                "resolvedCommit": COMMIT,
+                "resolvedRef": "refs/heads/main",
+            }),
+            // The image-mode status of a CodeLocation that just moved to git.
+            serde_json::json!({
+                "phase": "Ready",
+                "resolvedImage": format!("ghcr.io/acme/pipeline@sha256:{}", "c".repeat(64)),
+            }),
+        ] {
+            let cl = code_location(git_spec(), status);
+            assert_eq!(create(&watching(cl.clone()).await).await, retry);
+            assert_eq!(create(&reading_live(cl).0).await, retry);
         }
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_serving_git_tree_until_image_mode_takes_over() {
+        // spec.git removed; the operator has not reconciled the change yet.
+        let spec = serde_json::json!({
+            "image": "ghcr.io/acme/pipeline",
+            "tag": "v2",
+            "module": "analytics.pipeline",
+            "identity": IDENTITY,
+        });
+        let cl = code_location(spec, serving(&expected_run_source()));
+        assert_eq!(
+            create(&watching(cl).await).await,
+            stamped(expected_run_source())
+        );
     }
 
     #[tokio::test]
     async fn create_rejects_hand_set_source_on_the_normal_path() {
-        let state = git_directory("team-data", "analytics", COMMIT).await;
         let mut run = build_run("analytics", "");
         run.spec.source = Some(expected_run_source());
         let req = admission_request_create("uid-git-3", "team-data", &run);
-        match mutate_run(&req, &AdmissionDeps::cache_only(state)).await {
+        match mutate_run(&req, &watching(git_cl()).await).await {
             RunOutcome::Rejected(msg) => assert!(msg.contains("webhook"), "{msg}"),
             other => panic!("expected Rejected, got {other:?}"),
         }
@@ -902,14 +1028,11 @@ mod tests {
         // Daemon-dispatched runs pre-set a digest image AND their own
         // provenance — the daemon pins the commit its own code runs.
         let digest_image = format!("ghcr.io/x@sha256:{}", "a".repeat(64));
-        let state = git_directory("team-data", "analytics", COMMIT).await;
+        let deps = watching(git_cl()).await;
         let mut run = build_run("analytics", &digest_image);
         run.spec.source = Some(expected_run_source());
         let req = admission_request_create("uid-git-4", "team-data", &run);
-        assert_eq!(
-            mutate_run(&req, &AdmissionDeps::cache_only(state.clone())).await,
-            RunOutcome::AcceptedAsIs
-        );
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
 
         // …but a malformed pin is still rejected.
         let mut bad = build_run("analytics", &digest_image);
@@ -918,14 +1041,56 @@ mod tests {
         bad.spec.source = Some(src);
         let req = admission_request_create("uid-git-5", "team-data", &bad);
         assert!(matches!(
-            mutate_run(&req, &AdmissionDeps::cache_only(state)).await,
+            mutate_run(&req, &deps).await,
             RunOutcome::Rejected(_)
         ));
     }
 
     #[tokio::test]
+    async fn escape_hatch_accepts_the_serving_trees_url_and_secret_while_a_change_rolls_out() {
+        // The pods of the serving tree stamp its url and Secret until the
+        // new spec's pods are all ready.
+        const OLD_URL: &str = "https://forge.example/acme/pipelines.git";
+        const NEW_URL: &str = "https://forge.example/acme/pipelines-v2.git";
+        let mut spec = git_spec();
+        spec["git"]["url"] = serde_json::json!(NEW_URL);
+        spec["git"]["secretRef"] = serde_json::json!({ "name": "git-creds-v2" });
+        let deps = watching(code_location(spec, serving(&expected_run_source()))).await;
+        let source = |url: &str, secret: &str| RunSource {
+            git: GitCoordinates {
+                url: url.to_string(),
+                secret_name: Some(secret.to_string()),
+                ..expected_run_source().git
+            },
+            ..expected_run_source()
+        };
+
+        expect_accepted(&self_stamped_run(source(OLD_URL, "git-creds")), &deps).await;
+        expect_accepted(&self_stamped_run(source(NEW_URL, "git-creds-v2")), &deps).await;
+
+        let other_url = source("https://attacker.example/acme/pipelines.git", "git-creds");
+        assert_eq!(
+            expect_rejected(&self_stamped_run(other_url), &deps).await,
+            "spec.source.git.url does not match spec.git.url or status.runSource.git.url \
+             of codeLocation 'team-data/analytics'"
+        );
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source(OLD_URL, "db-credentials")), &deps).await,
+            "spec.source.git.secretName 'db-credentials' does not match \
+             status.runSource.git.secretName 'git-creds' of codeLocation 'team-data/analytics'"
+        );
+        // Each url only with its own Secret: the credentials of one host
+        // never go to the other.
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source(NEW_URL, "git-creds")), &deps).await,
+            "spec.source.git.secretName 'git-creds' does not match \
+             spec.git.secretRef 'git-creds-v2' of codeLocation 'team-data/analytics'"
+        );
+    }
+
+    #[tokio::test]
     async fn escape_hatch_rejects_an_uppercase_commit() {
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
         let mut source = expected_run_source();
         source.git.commit = UPPERCASE_COMMIT.to_string();
         assert_eq!(
@@ -938,7 +1103,7 @@ mod tests {
     async fn escape_hatch_rejects_other_repo_url() {
         // The source url is where a fallback run pod sends the CL's
         // credentials.
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
         let mut source = expected_run_source();
         source.git.url = "https://attacker.example/acme/pipelines.git".to_string();
         let msg = expect_rejected(&self_stamped_run(source), &deps).await;
@@ -952,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn escape_hatch_rejects_other_secret_name() {
         // The source secretName is the Secret a fallback run pod mounts.
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
         let mut source = expected_run_source();
         source.git.secret_name = Some("db-credentials".to_string());
         let msg = expect_rejected(&self_stamped_run(source.clone()), &deps).await;
@@ -976,15 +1141,13 @@ mod tests {
 
     #[tokio::test]
     async fn escape_hatch_rejects_secret_when_codelocation_has_none() {
-        let deps = AdmissionDeps::cache_only(
-            spec_directory(serde_json::json!({
-                "git": {
-                    "url": "https://forge.example/acme/pipelines.git",
-                    "ref": { "branch": "main" },
-                },
-            }))
-            .await,
-        );
+        let deps = watching(ready_cl(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "ref": { "branch": "main" },
+            },
+        })))
+        .await;
         let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
         assert!(
             msg.contains(
@@ -1003,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn escape_hatch_rejects_source_host_outside_allowed_hosts() {
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
         let source = expected_run_source();
         check_self_stamped_source(
             &source,
@@ -1032,16 +1195,14 @@ mod tests {
         /// A self-stamped run on `url`, which is also the code location's
         /// own url (as admitted before ssh urls had to name the user).
         async fn on_url(url: &str) -> RunOutcome {
-            let deps = AdmissionDeps::cache_only(
-                spec_directory(serde_json::json!({
-                    "git": {
-                        "url": url,
-                        "ref": { "branch": "main" },
-                        "secretRef": { "name": "git-creds" },
-                    },
-                }))
-                .await,
-            );
+            let deps = watching(ready_cl(serde_json::json!({
+                "git": {
+                    "url": url,
+                    "ref": { "branch": "main" },
+                    "secretRef": { "name": "git-creds" },
+                },
+            })))
+            .await;
             let mut source = expected_run_source();
             source.git.url = url.to_string();
             let req =
@@ -1067,13 +1228,11 @@ mod tests {
 
     #[tokio::test]
     async fn escape_hatch_rejects_source_for_image_mode_codelocation() {
-        let deps = AdmissionDeps::cache_only(
-            spec_directory(serde_json::json!({
-                "image": "ghcr.io/acme/pipeline",
-                "tag": "v1",
-            }))
-            .await,
-        );
+        let deps = watching(ready_cl(serde_json::json!({
+            "image": "ghcr.io/acme/pipeline",
+            "tag": "v1",
+        })))
+        .await;
         let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
         assert!(
             msg.contains("codeLocation 'team-data/analytics' is not git-sourced"),
@@ -1095,7 +1254,7 @@ mod tests {
     async fn escape_hatch_accepts_own_repo_at_another_commit_and_path() {
         // A pod still serving the previous commit during a rollout stamps
         // that commit; ref, path and dependencies follow the commit.
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
         let mut source = expected_run_source();
         source.git.commit = "b".repeat(40);
         source.git.r#ref = Some("refs/heads/release".to_string());
@@ -1111,7 +1270,7 @@ mod tests {
     async fn escape_hatch_builds_trees_only_with_the_code_locations_runtime_repository() {
         // The source's runtime image runs the sync init container, which
         // mounts the CodeLocation's git Secret in fallback mode.
-        let deps = AdmissionDeps::cache_only(git_directory("team-data", "analytics", COMMIT).await);
+        let deps = watching(git_cl()).await;
 
         // Another digest of the same repository: a runtime image rollout.
         expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
@@ -1138,12 +1297,11 @@ mod tests {
     /// A git CL whose pods are up before its first rollout completed: a
     /// status without `resolvedImage`.
     async fn before_the_first_rollout() -> AdmissionDeps {
-        let state = git_directory("team-data", "analytics", COMMIT).await;
-        let mut entry = state.lookup("team-data", "analytics").await.unwrap();
-        entry.image = String::new();
-        entry.phase = CodeLocationPhase::Deploying.as_str().to_string();
-        state.upsert(entry).await;
-        AdmissionDeps::cache_only(state)
+        watching(code_location(
+            git_spec(),
+            serde_json::json!({ "phase": "Deploying" }),
+        ))
+        .await
     }
 
     const MIRROR: &str = "harbor.internal/rivers/rivers-runtime";
@@ -1151,9 +1309,9 @@ mod tests {
     /// A git CL whose `spec.image` moved to [`MIRROR`] while runs still get
     /// the tree built with the chart's default runtime image.
     async fn while_spec_image_moves_to_the_mirror() -> AdmissionDeps {
-        let mut spec = serde_json::to_value(git_spec()).unwrap();
+        let mut spec = git_spec();
         spec["image"] = serde_json::json!(MIRROR);
-        AdmissionDeps::cache_only(spec_directory(spec).await)
+        watching(ready_cl(spec)).await
     }
 
     #[tokio::test]
@@ -1200,27 +1358,7 @@ mod tests {
 
     #[tokio::test]
     async fn escape_hatch_reads_codelocation_with_live_get_on_cache_miss() {
-        use crate::run::test_helpers::{MockApiState, mock_client};
-        let api_state = Arc::new(std::sync::Mutex::new(MockApiState::default()));
-        let mut cl = CodeLocation::new("analytics", git_spec());
-        cl.metadata.namespace = Some("team-data".to_string());
-        cl.status = Some(
-            serde_json::from_value(serde_json::json!({
-                "phase": "Ready",
-                "resolvedImage": runtime('a'),
-                "resolvedCommit": COMMIT,
-            }))
-            .unwrap(),
-        );
-        api_state
-            .lock()
-            .unwrap()
-            .code_locations
-            .insert("analytics".to_string(), cl);
-        let deps = AdmissionDeps {
-            code_locations: Some(Api::namespaced(mock_client(api_state.clone()), "team-data")),
-            ..AdmissionDeps::cache_only(Arc::new(DirectoryState::new()))
-        };
+        let (deps, api_state) = reading_live(git_cl());
 
         let mut source = expected_run_source();
         source.git.secret_name = Some("db-credentials".to_string());
@@ -1234,18 +1372,7 @@ mod tests {
         );
         assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
 
-        let gets: Vec<String> = api_state
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .filter(|r| r.method == "GET")
-            .map(|r| r.path.clone())
-            .collect();
-        assert_eq!(
-            gets,
-            vec!["/apis/rivers.io/v1alpha1/namespaces/team-data/codelocations/analytics"; 2]
-        );
+        assert_eq!(live_gets(&api_state), vec![ANALYTICS_URL; 2]);
     }
 
     #[tokio::test]
@@ -1282,30 +1409,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_mutates_when_codelocation_ready_and_image_unset() {
-        let state = Arc::new(DirectoryState::new());
-        state
-            .upsert(ready_entry(
-                "team-data",
-                "analytics",
-                "ghcr.io/x@sha256:aaaa",
-                "my.module",
-                "11111111-1111-4111-8111-111111111111",
-            ))
-            .await;
-
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-1", "team-data", &run);
-
-        let outcome = mutate_run(&req, &AdmissionDeps::cache_only(state)).await;
-        assert_eq!(
-            outcome,
-            RunOutcome::Mutated {
-                image: "ghcr.io/x@sha256:aaaa".to_string(),
-                module: "my.module".to_string(),
-                identity: "11111111-1111-4111-8111-111111111111".to_string(),
-                source: None,
-            }
+        let cl = code_location(
+            serde_json::json!({
+                "image": "ghcr.io/x",
+                "module": "my.module",
+                "identity": IDENTITY,
+            }),
+            serde_json::json!({ "phase": "Ready", "resolvedImage": "ghcr.io/x@sha256:aaaa" }),
         );
+        let image_mode = RunOutcome::Mutated {
+            image: "ghcr.io/x@sha256:aaaa".to_string(),
+            module: "my.module".to_string(),
+            identity: IDENTITY.to_string(),
+            source: None,
+        };
+        assert_eq!(create(&watching(cl.clone()).await).await, image_mode);
+        assert_eq!(create(&reading_live(cl).0).await, image_mode);
     }
 
     #[tokio::test]
@@ -1326,22 +1445,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_when_codelocation_not_ready() {
-        let state = Arc::new(DirectoryState::new());
-        let mut entry = ready_entry(
-            "team-data",
-            "analytics",
-            "ghcr.io/x@sha256:cc",
-            "m",
-            "22222222-2222-4222-8222-222222222222",
+        let cl = code_location(
+            serde_json::json!({ "image": "ghcr.io/x", "module": "m" }),
+            serde_json::json!({ "phase": "Failed", "resolvedImage": "ghcr.io/x@sha256:cc" }),
         );
-        entry.phase = CodeLocationPhase::Failed.as_str().to_string();
-        state.upsert(entry).await;
-
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-4", "team-data", &run);
-
-        let outcome = mutate_run(&req, &AdmissionDeps::cache_only(state)).await;
-        match outcome {
+        match create(&watching(cl).await).await {
             RunOutcome::Rejected(msg) => {
                 assert!(msg.contains("not Ready"));
                 assert!(msg.contains("Failed"));
@@ -1471,16 +1579,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_admission_emits_jsonpatch_for_mutated_create() {
-        let state = Arc::new(DirectoryState::new());
-        state
-            .upsert(ready_entry(
-                "team-data",
-                "analytics",
-                "ghcr.io/x@sha256:dd",
-                "m",
-                "44444444-4444-4444-8444-444444444444",
-            ))
-            .await;
+        let deps = watching(code_location(
+            serde_json::json!({
+                "image": "ghcr.io/x",
+                "module": "m",
+                "identity": "44444444-4444-4444-8444-444444444444",
+            }),
+            serde_json::json!({ "phase": "Ready", "resolvedImage": "ghcr.io/x@sha256:dd" }),
+        ))
+        .await;
         let run = build_run("analytics", "");
         let req = admission_request_create("uid-pat", "team-data", &run);
         let review = AdmissionReview {
@@ -1492,7 +1599,7 @@ mod tests {
             response: None,
         };
 
-        let resp = handle_run_admission(review, &AdmissionDeps::cache_only(state)).await;
+        let resp = handle_run_admission(review, &deps).await;
         let r = resp.response.unwrap();
         assert!(r.allowed);
         let patch_bytes = r.patch.expect("mutation produced a JSON Patch");

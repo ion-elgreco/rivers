@@ -467,13 +467,9 @@ mod tests {
 
         let storage = memory_storage().await;
         let ctx = make_context(client, storage.clone());
-        ctx.directory
-            .upsert_spec(
-                "default",
-                "demo",
-                Arc::new(git_code_location(Some("10Gi")).spec),
-            )
-            .await;
+        let mut cl = git_code_location(Some("10Gi"));
+        cl.metadata.namespace = Some("default".to_string());
+        ctx.directory.upsert_code_location(cl).await;
         let mut run = test_run_running("run-1", Some(0));
         run.spec.source = Some(git_run_source());
 

@@ -258,11 +258,19 @@ build they keep it until a later commit rolls out. Meanwhile the
 CodeLocation stays `Ready`: the git
 Deployment never takes an old pod down before its replacement is ready, so
 `spec.replicas` pods stay ready throughout (a rollout needs room for one
-extra pod). A `Run` you create yourself without `image` gets this commit.
+extra pod). A `Run` you create yourself without `image` gets this tree:
+the webhook copies `status.runSource` into the run's `spec.source`, and
+its runtime image into `spec.image`. A change of the url, `path`, Secret,
+`dependencies` or runtime image also reaches runs only when its rollout
+finishes. Just after you add `spec.git` to an image-mode CodeLocation,
+`status.runSource` is empty and the webhook rejects such runs; try again
+when the first tree has rolled out.
 A run launched from a code-location pod (UI launches, schedules, sensors,
 backfills) pins the commit that pod serves, so during a rollout each run
-uses the same tree as the pod that launched it. To wait until a push is
-live:
+uses the same tree as the pod that launched it. The webhook accepts the
+url and Secret of such a run if they are those of `spec.git`, or, while a
+change of them rolls out, those of `status.runSource`. To wait until a
+push is live:
 `kubectl -n rivers wait rcl/analytics --for=jsonpath='{.status.resolvedCommit}'=<sha>`.
 
 **Other images for run and step pods**: in git mode,
