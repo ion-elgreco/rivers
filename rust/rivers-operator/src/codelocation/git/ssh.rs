@@ -34,6 +34,8 @@ pub struct SshTarget {
     pub user: String,
     pub host: String,
     pub port: u16,
+    /// The path as git sends it to `git-upload-pack`; see
+    /// [`upload_pack_path`].
     pub repo_path: String,
 }
 
@@ -51,8 +53,9 @@ pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
         .host_str()
         .ok_or_else(|| GitError::Malformed(format!("'{raw}' has no host")))?
         .to_string();
-    let repo_path = url.path().to_string();
-    if repo_path.is_empty() || repo_path == "/" {
+    // Also refuses `?` or `#` before the first `/`: `url` ends the host
+    // there, git does not.
+    if url.path().is_empty() || url.path() == "/" {
         return Err(GitError::Malformed(format!(
             "'{raw}' has no repository path"
         )));
@@ -67,8 +70,48 @@ pub fn parse_ssh_url(raw: &str) -> Result<SshTarget, GitError> {
         user: url.username().to_string(),
         host,
         port: url.port().unwrap_or(22),
-        repo_path,
+        repo_path: upload_pack_path(raw)?,
     })
+}
+
+/// The path git's ssh transport asks `git-upload-pack` for (connect.c
+/// `parse_connect_url`): the url text from the first `/` after the host,
+/// percent-decoded, without the `/` before a `~` — `~user/…` and `~/…` are
+/// relative to a home directory on the host.
+fn upload_pack_path(raw: &str) -> Result<String, GitError> {
+    let after_scheme = raw.split_once("://").map_or("", |(_, rest)| rest);
+    let text = after_scheme.find('/').map_or("", |i| &after_scheme[i..]);
+    let path = String::from_utf8(git_url_decode(text)).map_err(|_| {
+        GitError::Malformed(format!(
+            "the repository path '{text}' is not UTF-8 once percent-decoded"
+        ))
+    })?;
+    Ok(match path.strip_prefix("/~") {
+        Some(home) => format!("~{home}"),
+        None => path,
+    })
+}
+
+/// git's `url_decode` (url.c): `%xx` becomes its byte, except `%00` and a
+/// `%` without two hex digits, which stay as written.
+fn git_url_decode(text: &str) -> Vec<u8> {
+    let hex = |b: &u8| char::from(*b).to_digit(16);
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let [first, tail @ ..] = rest {
+        let escape = match rest {
+            [b'%', hi, lo, after @ ..] => hex(hi)
+                .zip(hex(lo))
+                .map(|(hi, lo)| ((hi << 4) | lo) as u8)
+                .filter(|&byte| byte != 0)
+                .map(|byte| (byte, after)),
+            _ => None,
+        };
+        let (byte, after) = escape.unwrap_or((*first, tail));
+        decoded.push(byte);
+        rest = after;
+    }
+    decoded
 }
 
 /// `url` as `ssh://git@host[:port]/path`: the user most git hosts take.
@@ -218,8 +261,8 @@ pub(crate) mod test_server {
     use russh::keys::decode_secret_key;
     use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session};
     use russh::{Channel, ChannelId};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     // Fixed ed25519 fixtures generated once with ssh-keygen; the pubkeys
     // pair with the private keys below.
@@ -308,6 +351,8 @@ Qjm9zYDGIBlKeGwA==
         pub(crate) host_keys: Vec<&'static str>,
         /// The connections the server accepted.
         pub(crate) connections: Arc<AtomicUsize>,
+        /// The commands clients asked to exec, in order.
+        pub(crate) commands: Arc<Mutex<Vec<String>>>,
     }
 
     impl Default for ServerBehaviour {
@@ -320,6 +365,7 @@ Qjm9zYDGIBlKeGwA==
                 authorized_pub: CLIENT_PUB,
                 host_keys: vec![HOST_KEY],
                 connections: Arc::default(),
+                commands: Arc::default(),
             }
         }
     }
@@ -327,6 +373,10 @@ Qjm9zYDGIBlKeGwA==
     impl ServerBehaviour {
         pub(crate) fn connections(&self) -> usize {
             self.connections.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
         }
     }
 
@@ -389,6 +439,11 @@ Qjm9zYDGIBlKeGwA==
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            self.behaviour
+                .commands
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(data).into_owned());
             // Exact byte match — this is also what proves the client's
             // shell-quoting reached the wire literally.
             if data == self.behaviour.expected_command.as_bytes() {
@@ -574,6 +629,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_pack_gets_a_home_relative_path_as_git_sends_it() {
+        let command = "git-upload-pack '~svc/pipelines.git'";
+        let server = ServerBehaviour {
+            expected_command: command.to_string(),
+            ..Default::default()
+        };
+        let port = spawn_server(server.clone()).await;
+        let known_hosts = known_hosts_pinning(port, HOST_PUB);
+        let target =
+            parse_ssh_url(&format!("ssh://git@127.0.0.1:{port}/~svc/pipelines.git")).unwrap();
+
+        let bytes = fetch_advertisement(&target, &client_auth(&known_hosts), TIMEOUT).await;
+
+        assert_eq!(server.commands(), [command]);
+        let adv = parse_advertisement(&bytes.unwrap()).unwrap();
+        let resolved = commit_for_ref(&adv, &fixtures::branch("main")).unwrap();
+        assert_eq!(resolved.commit, fixtures::oid('a'));
+    }
+
+    #[tokio::test]
     async fn unauthorized_key_is_auth_failed() {
         let behaviour = ServerBehaviour {
             authorized_pub: ROGUE_PUB, // our client key is not this one
@@ -706,6 +781,72 @@ mod tests {
                     "git authentication failed: the ssh url must name the user — use {fixed}, \
                      or the user your git host expects"
                 )
+            );
+        }
+    }
+
+    /// Each `(url, path)` case's url parses to `path`. The paths are what
+    /// `git ls-remote <url>` (git 2.49) asks git-upload-pack for.
+    #[track_caller]
+    fn assert_repo_paths(cases: &[(&str, &str)]) {
+        let got: Vec<_> = cases
+            .iter()
+            .map(|(url, _)| (*url, parse_ssh_url(url).unwrap().repo_path))
+            .collect();
+        let want: Vec<_> = cases
+            .iter()
+            .map(|(url, path)| (*url, path.to_string()))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_home_relative_path_loses_only_the_slash_before_the_tilde() {
+        assert_repo_paths(&[
+            (
+                "ssh://git@forge.internal/~svc/pipelines.git",
+                "~svc/pipelines.git",
+            ),
+            ("ssh://git@host:2222/~/r.git", "~/r.git"),
+            ("ssh://git@[::1]:2222/~/r.git", "~/r.git"),
+            ("ssh://git@host/srv/git/r.git", "/srv/git/r.git"),
+            ("ssh://git@host//~svc/r.git", "//~svc/r.git"),
+        ]);
+    }
+
+    #[test]
+    fn the_path_is_decoded_and_kept_as_git_reads_it() {
+        assert_repo_paths(&[
+            ("ssh://git@host/%7Esvc/r.git", "~svc/r.git"),
+            ("ssh://git@host/my%20repo.git", "/my repo.git"),
+            ("ssh://git@host/projets-é/r.git", "/projets-é/r.git"),
+            ("ssh://git@host/a%2Fb.git", "/a/b.git"),
+            ("ssh://git@host/x%00y%zz%4.git", "/x%00y%zz%4.git"),
+            ("ssh://git@host/a/../b.git", "/a/../b.git"),
+            ("ssh://git@host/r.git?x=1#frag", "/r.git?x=1#frag"),
+        ]);
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_once_decoded_is_malformed() {
+        let err = parse_ssh_url("ssh://git@host/%FF.git").unwrap_err();
+        assert!(
+            matches!(err, GitError::Malformed(ref m)
+                if m == "the repository path '/%FF.git' is not UTF-8 once percent-decoded"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_query_or_fragment_before_the_path_is_refused() {
+        // git's host runs up to the first `/`, so ssh would log in to
+        // `evil`; `url` ends the host at `?`/`#` and sees `host`.
+        for url in ["ssh://git@host#@evil/r.git", "ssh://git@host?@evil/r.git"] {
+            let err = parse_ssh_url(url).unwrap_err();
+            assert!(
+                matches!(err, GitError::Malformed(ref m)
+                    if *m == format!("'{url}' has no repository path")),
+                "{err:?}"
             );
         }
     }
