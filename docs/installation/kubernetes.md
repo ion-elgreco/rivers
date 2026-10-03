@@ -200,7 +200,9 @@ venv's `rivers` is what runs.
 **Credentials Secret keys** (Flux-compatible): the url's scheme selects
 the keys. `https://` (and `http://`) urls use `username`/`password` (a
 forge token is a password). Without these two keys the fetch is
-anonymous; a Secret with only one of them is an error. `ssh://` urls need
+anonymous; a Secret with only one of them is an error. Newlines at the
+end of these two values are ignored, so a file that ends in a newline
+works with `kubectl create secret --from-file`. `ssh://` urls need
 `identity` + `known_hosts`. The keys of the other scheme are ignored, so
 one Secret with all four keys can serve both kinds of url. `identity`
 must be a private key without a passphrase. `known_hosts` supports exact

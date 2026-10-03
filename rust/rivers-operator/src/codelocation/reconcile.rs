@@ -678,9 +678,10 @@ async fn apply_config_map(
 /// Build [`GitCredentials`] from the CR's Secret. The url's scheme picks the
 /// keys, like the pod's sync script: `ssh://` needs `identity` + `known_hosts`;
 /// `https://` / `http://` use `username` + `password`, or none for an
-/// anonymous fetch. The other scheme's keys are ignored, so ssh and https
-/// code locations can share one Secret. A Secret that does not exist or
-/// that the operator may not read is an auth failure, not an outage.
+/// anonymous fetch. These two lose their trailing newlines, as the script's
+/// `$(cat …)` drops them. The other scheme's keys are ignored, so ssh and
+/// https code locations can share one Secret. A Secret that does not exist
+/// or that the operator may not read is an auth failure, not an outage.
 async fn git_credentials(
     git_spec: &rivers_k8s::crd::code_location::GitSource,
     secrets_api: &Api<Secret>,
@@ -714,6 +715,7 @@ async fn git_credentials(
         data.get(key)
             .map(|v| String::from_utf8_lossy(&v.0).into_owned())
     };
+    let cat = |key: &str| entry(key).map(|v| v.trim_end_matches('\n').to_owned());
 
     match transport {
         git::Transport::Ssh => match (entry("identity"), entry("known_hosts")) {
@@ -736,7 +738,7 @@ async fn git_credentials(
                 )))
             }
         },
-        git::Transport::Http => match (entry("username"), entry("password")) {
+        git::Transport::Http => match (cat("username"), cat("password")) {
             (Some(username), Some(password)) => Ok(GitCredentials::Basic { username, password }),
             (None, None) => Ok(GitCredentials::Anonymous),
             (Some(_), None) => Err(git::GitError::AuthFailed(format!(
@@ -2177,6 +2179,63 @@ mod tests {
                 "{error}"
             );
         }
+
+        /// `[username, password]` of Basic credentials (their `Debug` is
+        /// redacted).
+        fn basic(credentials: &GitCredentials) -> [&str; 2] {
+            match credentials {
+                GitCredentials::Basic { username, password } => [username, password],
+                other => panic!("not Basic: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn username_and_password_drop_trailing_newlines_like_the_pod() {
+            let stored = secret(&[
+                ("username", "bot\n"),
+                ("password", "ghp_TOKEN\n\n"),
+                ("identity", "PRIVATE KEY\n"),
+                ("known_hosts", "forge.example ssh-ed25519 AAAA\n"),
+            ]);
+
+            let https = credentials(HTTPS, true, Some(Ok(stored.clone())))
+                .await
+                .unwrap();
+            assert_eq!(basic(&https), ["bot", "ghp_TOKEN"]);
+
+            let ssh = credentials(SSH, true, Some(Ok(stored))).await.unwrap();
+            let GitCredentials::Ssh {
+                private_key_openssh,
+                known_hosts,
+            } = &ssh
+            else {
+                panic!("not Ssh: {ssh:?}");
+            };
+            assert_eq!(
+                [private_key_openssh.as_str(), known_hosts.as_str()],
+                ["PRIVATE KEY\n", "forge.example ssh-ed25519 AAAA\n"]
+            );
+        }
+
+        #[tokio::test]
+        async fn username_and_password_keep_what_the_pods_cat_keeps() {
+            // (stored value, what the sync script's `$(cat …)` reads)
+            let cases = [
+                ("ghp\nTOKEN\n", "ghp\nTOKEN"),
+                ("ghp_TOKEN\r\n", "ghp_TOKEN\r"),
+            ];
+            for (stored, read) in cases {
+                let got = credentials(
+                    HTTPS,
+                    true,
+                    Some(Ok(secret(&[("username", stored), ("password", stored)]))),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(basic(&got), [read, read], "stored {stored:?}");
+            }
+        }
     }
 
     mod rollout {
@@ -3067,6 +3126,59 @@ mod tests {
             // The tree of the applied Deployment's pod template.
             assert_eq!(status["runSource"]["git"]["commit"], commit('a'));
             assert_eq!(status["runSource"]["git"]["secretName"], "git-creds");
+        }
+
+        #[tokio::test]
+        async fn https_code_location_fetches_with_a_password_file_that_ends_in_a_newline() {
+            use super::git_secret::secret;
+            use base64::Engine as _;
+            use wiremock::matchers::header;
+
+            let forge = MockServer::start().await;
+            let basic = base64::engine::general_purpose::STANDARD.encode("bot:ghp_TOKEN");
+            Mock::given(method("GET"))
+                .and(path(format!("{REPO}/info/refs")))
+                .and(header("authorization", format!("Basic {basic}")))
+                .respond_with(advertisement())
+                .expect(1)
+                .mount(&forge)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("{REPO}/info/refs")))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&forge)
+                .await;
+            let cl = make_cl(json!({
+                "git": {
+                    "url": format!("{}{REPO}", forge.uri()),
+                    "ref": { "branch": "main" },
+                    "secretRef": { "name": "git-creds" },
+                },
+                "digest": digest('a'),
+            }));
+            let state = api_with(cl, rolled_out());
+            // echo ghp_TOKEN > token.txt; kubectl create secret generic git-creds \
+            //   --from-literal=username=bot --from-file=password=token.txt
+            state.lock().unwrap().secrets.insert(
+                "git-creds".into(),
+                Ok(secret(&[("username", "bot"), ("password", "ghp_TOKEN\n")])),
+            );
+
+            let status = pass(&state, LeaderGate::leading())
+                .await
+                .expect("status patch");
+
+            assert_eq!(status["phase"], "Ready", "{status}");
+            assert_eq!(status["resolvedCommit"], commit('a'));
+            assert_eq!(
+                source_resolved(&status),
+                ("True", REASON_COMMIT_RESOLVED, commit('a').as_str())
+            );
+            let deployment = state.lock().unwrap().deployments["x"].clone();
+            assert_eq!(
+                template_source(&deployment).map(|source| source.git.commit),
+                Some(commit('a'))
+            );
         }
     }
 }
