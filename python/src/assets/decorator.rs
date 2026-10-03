@@ -205,13 +205,12 @@ fn merge_partition_mappings(
 
 /// Every listed action must be bound to a function and names must be unique.
 fn validate_actions(
-    py: Python,
     actions: &[Py<super::action::PyAssetAction>],
     asset_desc: &str,
 ) -> PyResult<()> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in actions {
-        let a = a.borrow(py);
+        let a = a.get();
         if a.func.is_none() {
             return Err(AssetDefinitionError::new_err(format!(
                 "asset '{asset_desc}': action '{}' has no function — apply the \
@@ -237,10 +236,10 @@ fn merge_output_actions(
     per_def: &[Py<super::action::PyAssetAction>],
 ) -> Vec<Py<super::action::PyAssetAction>> {
     let def_names: std::collections::HashSet<String> =
-        per_def.iter().map(|a| a.borrow(py).name.clone()).collect();
+        per_def.iter().map(|a| a.get().name.clone()).collect();
     top_level
         .iter()
-        .filter(|a| !def_names.contains(&a.borrow(py).name))
+        .filter(|a| !def_names.contains(&a.get().name))
         .chain(per_def.iter())
         .map(|a| a.clone_ref(py))
         .collect()
@@ -1212,7 +1211,7 @@ impl PyAsset {
         let handler = io_handler;
 
         name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<asset>"))?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<asset>"))?;
 
         let pool = normalize_pool(pool, pool_slots)?;
         let retry = crate::retry::extract_retry_ref(retry)?;
@@ -1306,7 +1305,7 @@ impl PyAsset {
         ensure_callable(py, &wraps)?;
 
         name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<multi asset>"))?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<multi asset>"))?;
 
         let mut pd = process_deps(py, &top_level_deps);
 
@@ -1337,7 +1336,7 @@ impl PyAsset {
             let (dep_only_names, partition_mapping) =
                 collect_output_deps(py, &mut pd, &def, &def_name)?;
 
-            validate_actions(py, &def.actions, &def_name)?;
+            validate_actions(&def.actions, &def_name)?;
             let output_actions = merge_output_actions(py, &actions, &def.actions);
 
             py_assets.push(SingleAsset {
@@ -1458,7 +1457,7 @@ impl PyAsset {
         let handler = io_handler;
 
         name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<graph asset>"))?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<graph asset>"))?;
 
         let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let pd = process_deps(py, &deps);

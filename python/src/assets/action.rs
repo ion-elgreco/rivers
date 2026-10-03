@@ -182,7 +182,7 @@ impl From<ActionOrdering> for PyActionOrdering {
 
 /// A named operation on an asset. Reusable: the same instance may be attached
 /// to any number of assets (decorator `actions=[...]` or class attribute).
-#[pyclass(name = "AssetAction", module = "rivers._core")]
+#[pyclass(name = "AssetAction", frozen, module = "rivers._core")]
 pub struct PyAssetAction {
     pub name: String,
     pub outcome: ActionOutcome,

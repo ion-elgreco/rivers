@@ -329,9 +329,7 @@ impl ResolvedAsset {
                 asset
                     .output_actions(lookup)
                     .iter()
-                    .map(|a| {
-                        crate::assets::action::ResolvedAction::from_asset_action(py, &a.borrow(py))
-                    })
+                    .map(|a| crate::assets::action::ResolvedAction::from_asset_action(py, a.get()))
                     .collect()
             }
         };

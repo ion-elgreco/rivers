@@ -34,7 +34,12 @@ fn try_extract_binding(
     }
 }
 
-#[pyclass(name = "InvokedNodeOutput", from_py_object, module = "rivers._core")]
+#[pyclass(
+    name = "InvokedNodeOutput",
+    frozen,
+    from_py_object,
+    module = "rivers._core"
+)]
 #[derive(Debug, Clone)]
 pub struct PyInvokedNodeOutput {
     #[pyo3(get)]
@@ -89,7 +94,7 @@ impl PyInvokedNodeOutput {
     }
 }
 
-#[pyclass(name = "MappedOutput", from_py_object, module = "rivers._core")]
+#[pyclass(name = "MappedOutput", frozen, from_py_object, module = "rivers._core")]
 #[derive(Debug, Clone)]
 pub struct PyMappedOutput {
     #[pyo3(get)]

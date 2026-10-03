@@ -29,7 +29,7 @@ use crate::repository::resolved_node::ResolvedNode;
 use crate::storage::DetachOnClose;
 use crate::task::{PyBashTask, PyTask};
 
-#[pyclass(name = "Job", module = "rivers._core")]
+#[pyclass(name = "Job", frozen, module = "rivers._core")]
 pub struct PyJob {
     pub(crate) name: String,
     pub(crate) node_names: Vec<String>,

@@ -16,6 +16,7 @@ use crate::errors::ConfigurationError;
 /// Why a step failed. Drives retry eligibility and is recorded on failure events.
 #[pyclass(
     name = "FailureReason",
+    frozen,
     eq,
     eq_int,
     from_py_object,
@@ -164,7 +165,14 @@ impl PyBackoff {
 
 /// Preset failure sets eligible for retry. `retry_on` also accepts an explicit
 /// list of exception types / [`PyFailureReason`] (normalized in `RetryPolicy`).
-#[pyclass(name = "RetryOn", eq, eq_int, from_py_object, module = "rivers._core")]
+#[pyclass(
+    name = "RetryOn",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    module = "rivers._core"
+)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PyRetryOn {
     #[pyo3(name = "ALL")]

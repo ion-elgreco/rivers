@@ -37,7 +37,7 @@ fn unwrap_callable(py: Python, obj: &Py<PyAny>) -> Py<PyAny> {
 }
 
 /// Lightweight function reference that pickles as (module, qualname) strings.
-#[pyclass(name = "FuncRef", module = "rivers._core")]
+#[pyclass(name = "FuncRef", frozen, module = "rivers._core")]
 pub struct PyFuncRef {
     module: String,
     qualname: String,
@@ -78,7 +78,7 @@ pub fn _reconstruct_func_ref(py: Python, module: String, qualname: String) -> Py
 
 /// A bound method that pickles as its function and owner, and unpickles as
 /// the same bound method.
-#[pyclass(name = "BoundMethod", module = "rivers._core")]
+#[pyclass(name = "BoundMethod", frozen, module = "rivers._core")]
 pub struct PyBoundMethod {
     func: Py<PyAny>,
     owner: Py<PyAny>,
@@ -102,7 +102,7 @@ impl PyBoundMethod {
 }
 
 /// Lightweight IO handler reference that reconstructs from the asset definition.
-#[pyclass(name = "IOHandlerRef", module = "rivers._core")]
+#[pyclass(name = "IOHandlerRef", frozen, module = "rivers._core")]
 pub struct PyIOHandlerRef {
     module: String,
     qualname: String,
@@ -200,7 +200,7 @@ pub fn _reconstruct_io_handler_ref(
 
 /// Stands in for an `IOHandlerRef` that found no handler in the worker, so
 /// the step fails instead of skipping the write.
-#[pyclass(name = "MissingIOHandler", module = "rivers._core")]
+#[pyclass(name = "MissingIOHandler", frozen, module = "rivers._core")]
 struct PyMissingIOHandler {
     reference: String,
 }
@@ -226,7 +226,7 @@ impl PyMissingIOHandler {
 }
 
 /// Describes how to load an upstream input from an IO handler in the worker.
-#[pyclass(name = "IOLoadSpec", module = "rivers._core")]
+#[pyclass(name = "IOLoadSpec", frozen, module = "rivers._core")]
 pub struct PyIOLoadSpec {
     #[pyo3(get)]
     pub handler: Py<PyAny>,
@@ -257,7 +257,7 @@ impl PyIOLoadSpec {
 }
 
 /// Describes how to load collected map instance outputs as a list in the worker.
-#[pyclass(name = "CollectLoadSpec", module = "rivers._core")]
+#[pyclass(name = "CollectLoadSpec", frozen, module = "rivers._core")]
 pub struct PyCollectLoadSpec {
     #[pyo3(get)]
     pub specs: Py<PyAny>,
@@ -277,7 +277,7 @@ impl PyCollectLoadSpec {
 }
 
 /// Describes how to load collected map instance outputs as a lazy iterator in the worker.
-#[pyclass(name = "CollectStreamLoadSpec", module = "rivers._core")]
+#[pyclass(name = "CollectStreamLoadSpec", frozen, module = "rivers._core")]
 pub struct PyCollectStreamLoadSpec {
     #[pyo3(get)]
     pub specs: Py<PyAny>,
@@ -317,7 +317,7 @@ impl PyCollectStreamLoadSpec {
 /// to KV after collecting the result, keyed by the materialization's
 /// `data_version` (loky workers don't write KV themselves — embedded RocksDB
 /// is single-process; the orchestrator owns the lock).
-#[pyclass(name = "WorkerResult", module = "rivers._core")]
+#[pyclass(name = "WorkerResult", frozen, module = "rivers._core")]
 pub struct PyWorkerResult {
     #[pyo3(get)]
     pub outputs: Py<PyAny>,
@@ -589,9 +589,9 @@ pub fn worker_execute_step(
     let resolved_args: Vec<Py<PyAny>> = args
         .iter()
         .map(|arg| {
-            if arg.extract::<PyRef<'_, PyIOLoadSpec>>().is_ok() {
+            if arg.is_instance_of::<PyIOLoadSpec>() {
                 load_from_spec(py, &arg.unbind())
-            } else if arg.extract::<PyRef<'_, PyCollectLoadSpec>>().is_ok() {
+            } else if arg.is_instance_of::<PyCollectLoadSpec>() {
                 // Barrier collect: load all specs into a list
                 let specs: Vec<Py<PyAny>> = arg.getattr("specs")?.extract()?;
                 let items: Vec<Py<PyAny>> = specs
@@ -600,7 +600,7 @@ pub fn worker_execute_step(
                     .collect::<PyResult<_>>()?;
                 let list = PyList::new(py, items.iter().map(|v| v.bind(py)))?;
                 Ok(list.unbind().into_any())
-            } else if arg.extract::<PyRef<'_, PyCollectStreamLoadSpec>>().is_ok() {
+            } else if arg.is_instance_of::<PyCollectStreamLoadSpec>() {
                 // Streaming collect: return lazy iterator
                 let specs: Vec<Py<PyAny>> = arg.getattr("specs")?.extract()?;
                 let iter = WorkerCollectStreamIter {

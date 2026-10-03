@@ -3112,11 +3112,7 @@ impl PyCodeRepository {
         let job_names_owned: Vec<String> = self
             .raw_jobs
             .as_ref()
-            .map(|jobs| {
-                jobs.iter()
-                    .map(|j| j.borrow(py).name().to_string())
-                    .collect()
-            })
+            .map(|jobs| jobs.iter().map(|j| j.get().name().to_string()).collect())
             .unwrap_or_default();
         let asset_name_set: HashSet<&str> = node_map.keys().map(String::as_str).collect();
         let job_name_set: HashSet<&str> = job_names_owned.iter().map(String::as_str).collect();
@@ -3159,7 +3155,6 @@ impl PyCodeRepository {
     /// reflected in execution must run `resolve_resources_and_handlers` first.
     fn validate_and_build_job_plans(
         &self,
-        py: Python,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
         node_map: &HashMap<String, ResolvedNode>,
         step_kinds: &HashMap<String, rivers_core::execution::plan::StepKind>,
@@ -3173,7 +3168,7 @@ impl PyCodeRepository {
         if let Some(ref job_list) = self.raw_jobs {
             let mut seen_names: HashSet<String> = HashSet::new();
             for job_py in job_list {
-                let mut job = job_py.borrow(py).declaration();
+                let mut job = job_py.get().declaration();
                 let name = job.name().to_string();
                 if !seen_names.insert(name.clone()) {
                     return Err(GraphValidationError::new_err(format!(
@@ -3541,7 +3536,6 @@ impl PyCodeRepository {
         }
 
         let jobs = self.validate_and_build_job_plans(
-            py,
             resolved_graph,
             &node_map,
             &step_kinds,
@@ -3587,7 +3581,7 @@ impl PyCodeRepository {
         let jobs_info: HashMap<String, JobSummary> = job_map
             .iter()
             .map(|(name, job_py)| {
-                let job = job_py.borrow(py);
+                let job = job_py.get();
                 (
                     name.clone(),
                     JobSummary {
@@ -3792,7 +3786,6 @@ impl PyCodeRepository {
             .as_ref()
             .expect("graph resolved by build_and_validate");
         self.validate_and_build_job_plans(
-            py,
             resolved_graph,
             &bg.node_map,
             &bg.step_kinds,
@@ -4867,8 +4860,7 @@ impl PyCodeRepository {
             config.clone(),
         ))?;
         Python::attach(|py| {
-            job.bind(py)
-                .borrow()
+            job.get()
                 .execute_stored_run(py, &run_id, Some(py_pk), config, false, false)
         })
     }
