@@ -1,3 +1,8 @@
+import pytest
+
+pytest.importorskip("deltalake")
+pytest.importorskip("polars")
+
 import json
 import re
 from collections import Counter
@@ -6,7 +11,6 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow as pa
-import pytest
 import rivers as rs
 from deltalake import DeltaTable
 from polars.testing import assert_frame_equal

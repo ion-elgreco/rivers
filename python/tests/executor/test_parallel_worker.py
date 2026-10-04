@@ -7,7 +7,6 @@ mixed configurations, and per-asset executor overrides.
 
 import obstore
 import obstore.store
-import polars as pl
 import pyarrow as pa
 import pytest
 from pydantic import BaseModel
@@ -1159,6 +1158,7 @@ def test_mp_override_invalid_raises():
 
 
 def _delta_handler(tmp_path, **kwargs):
+    pytest.importorskip("deltalake")
     return rs.DeltaIOHandler(table_uri=str(tmp_path), **kwargs)
 
 
@@ -1180,6 +1180,7 @@ def test_mp_delta_pyarrow_round_trip(tmp_path):
 
 def test_mp_delta_polars_round_trip(tmp_path):
     """Delta IO handler writes PyArrow, downstream reads as Polars DataFrame via IO load."""
+    pl = pytest.importorskip("polars")
     handler = _delta_handler(tmp_path)
 
     @rs.Asset(io_handler=handler)
@@ -1220,6 +1221,7 @@ def test_mp_delta_parallel_writes(tmp_path):
 
 def test_mp_delta_chain(tmp_path):
     """Chain: delta_src → delta_transform → delta_sink."""
+    pl = pytest.importorskip("polars")
     handler = _delta_handler(tmp_path)
 
     @rs.Asset(io_handler=handler)
@@ -1308,6 +1310,7 @@ def test_mp_delta_overwrite_mode(tmp_path):
 
 def test_mp_delta_polars_write(tmp_path):
     """Writing a Polars DataFrame through Delta IO in parallel."""
+    pl = pytest.importorskip("polars")
     handler = _delta_handler(tmp_path)
 
     @rs.Asset(io_handler=handler)
@@ -1355,6 +1358,7 @@ def test_mp_delta_diamond_dag(tmp_path):
 
 def test_mp_delta_merge_upsert(tmp_path):
     """Delta merge upsert in parallel context."""
+    pytest.importorskip("deltalake")
     from rivers.io_handlers.delta import MergeConfig
 
     # First create the table

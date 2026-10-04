@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("grpc")
+
 import datetime as dt
 import ipaddress
 import os
@@ -10,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import grpc
-import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec

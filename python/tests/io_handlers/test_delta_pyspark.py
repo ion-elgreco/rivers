@@ -9,12 +9,16 @@ the Delta only for this test file.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("deltalake")
+pytest.importorskip("pyspark")
+
 import logging
 from unittest.mock import patch
 
 import pandas as pd
 import pyarrow as pa
-import pytest
 import rivers as rs
 from deltalake import CommitProperties, WriterProperties
 from pyspark.sql import SparkSession

@@ -1,10 +1,12 @@
 """Tests that helpful error messages are raised when optional deps are missing."""
 
+import pytest
+
+pytest.importorskip("deltalake")
+
 import contextlib
 import sys
 from unittest.mock import patch
-
-import pytest
 
 import rivers as rs
 
