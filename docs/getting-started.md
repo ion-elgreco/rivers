@@ -15,6 +15,8 @@ pip install rivers[polars]    # Polars DataFrames / LazyFrames for Delta
 pip install rivers[otel]      # OpenTelemetry instrumentation
 ```
 
+rivers also runs on free-threaded Python 3.14t. See [Free-threaded Python](installation/free-threading.md).
+
 ## Your first asset
 
 An asset is a function that produces a data artifact. Decorate it with `@Asset`:
