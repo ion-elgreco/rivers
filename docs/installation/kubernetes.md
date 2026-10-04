@@ -192,7 +192,10 @@ pods run*. Omit it in git mode to run the chart's default runtime image
 `ghcr.io/ion-elgreco/rivers-runtime:<chart version>-py3.12`). Each release
 publishes this image for Python 3.11, 3.12 and 3.13 (tags
 `<version>-py3.11`, `-py3.12`, `-py3.13`), for `linux/amd64` and
-`linux/arm64`. `spec.tag` or `spec.digest` on its own replaces that
+`linux/arm64`. The init container that builds the trees is
+`rivers workspace-sync`, from the rivers package in the image: a runtime
+image you build yourself needs git, uv 0.10.0 or later, and the rivers
+package of the chart's version. `spec.tag` or `spec.digest` on its own replaces that
 image's tag or digest, e.g. `tag: 0.5.0-py3.11` for another interpreter.
 Set `spec.image` to use a private mirror
 (`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`); as
@@ -207,14 +210,17 @@ code. It resolves a semver-like tag, such as `0.5.0-py3.11`, only once.
 
 1. `uv.lock` ⇒ `uv sync --locked`.
 2. Else `requirements.txt` ⇒ `uv pip install`.
-3. Else `pyproject.toml` in a uv workspace ⇒ `uv sync --locked` with the
-   workspace's `uv.lock`. uv writes one `uv.lock`, at the workspace root,
-   so a member has none of its own. The init container uses the nearest
-   `uv.lock` above the project, up to the repository root, if the
-   `pyproject.toml` next to it has `[tool.uv.workspace]`. uv installs the
-   project and the workspace members it depends on. If the workspace does
-   not include the project (`members`, `exclude`), the install fails with
-   uv's error.
+3. Else `pyproject.toml` ⇒ the init container asks uv for the project's
+   workspace root (`uv workspace dir`); a root inside the checkout with
+   `uv.lock` ⇒ `uv sync --locked` with that lock. uv writes one `uv.lock`,
+   at the workspace root, so a member has none of its own; uv installs the
+   project and the workspace members it depends on. A project with no lock
+   of its own under a `uv.lock` that uv does not count it in — missing from
+   `members`, `exclude`d, or the lock of a plain project — fails the build
+   with a message that names the remedies: add it to `members`, give it
+   its own lock, or set `dependencies.mode: none`.
+   `uv workspace dir --project <path>` in the repository shows what the
+   init container sees.
 4. Else nothing is installed.
 
 Set `dependencies.mode` to `uvSync`, `requirements` or `none` to choose
@@ -363,8 +369,9 @@ tree at the same time and break it.
 each successful build, the code-location pod runs `uv cache prune --ci`:
 only the wheels that uv built from source stay, and pre-built wheels
 download again on the next build. If you build your own runtime image, it
-needs uv 0.8.19 or later: an older `uv cache prune` does not wait for the
-installs of other pods, and can delete files that they use. In fallback
+needs uv 0.10.0 or later (`uv workspace dir`, and a `uv cache prune` that
+waits for the installs of other pods instead of deleting files that they
+use). In fallback
 mode, pods install with `UV_NO_CACHE=1` and keep no cache. The `emptyDir`
 limit (`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`)
 must hold the checkout and the venv. During an install, uv's temporary

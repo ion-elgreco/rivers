@@ -1050,10 +1050,11 @@ async fn ensure_workspace_pvc(
 }
 
 /// Build [`GitCredentials`] from the CR's Secret. The url's scheme picks the
-/// keys, like the pod's sync script: `ssh://` needs `identity` + `known_hosts`;
+/// keys, like the pod's `rivers workspace-sync`: `ssh://` needs `identity` +
+/// `known_hosts`;
 /// `https://` / `http://` use `username` + `password`, or none for an
-/// anonymous fetch. These two lose their trailing newlines, as the script's
-/// `$(cat …)` drops them. The other scheme's keys are ignored, so ssh and
+/// anonymous fetch. These two lose their trailing newlines, as the pod's sync
+/// drops them. The other scheme's keys are ignored, so ssh and
 /// https code locations can share one Secret. A Secret that does not exist
 /// or that the operator may not read is an auth failure, not an outage.
 async fn git_credentials(
@@ -2875,7 +2876,7 @@ mod tests {
 
         #[tokio::test]
         async fn username_and_password_keep_what_the_pods_cat_keeps() {
-            // (stored value, what the sync script's `$(cat …)` reads)
+            // (stored value, what the pod's sync reads)
             let cases = [
                 ("ghp\nTOKEN\n", "ghp\nTOKEN"),
                 ("ghp_TOKEN\r\n", "ghp_TOKEN\r"),

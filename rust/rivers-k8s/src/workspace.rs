@@ -15,7 +15,7 @@
 //! container:
 //!
 //! * **builder** (the code-location pod) — always runs
-//!   `rivers-workspace-sync`; in shared mode it then prunes the trees beside
+//!   `rivers workspace-sync`; in shared mode it then prunes the trees beside
 //!   its own ([`Prune`]): it mounts the PVC root at `/workspaces` to see
 //!   them, and receives the keep-set via `configMapKeyRef` (never inline — an
 //!   inline value would live in the pod template and roll the Deployment on
@@ -43,12 +43,12 @@ pub const UV_CACHE_MOUNT: &str = "/uv-cache";
 pub const UV_CACHE_SUBPATH: &str = "cache";
 pub const GIT_CREDS_MOUNT: &str = "/etc/rivers/git";
 /// The pod `command` in git mode, whatever the dependencies mode: in mode
-/// `none` the sync script links it to the runtime image's `rivers`.
+/// `none` the sync links it to the runtime image's `rivers`.
 const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
 pub const VENV_PATH: &str = "/workspace/venv";
 /// The checkout.
 const SRC_PATH: &str = "/workspace/src";
-pub const SYNC_COMMAND: &str = "rivers-workspace-sync";
+pub const SYNC_COMMAND: [&str; 2] = ["rivers", "workspace-sync"];
 /// The init container that runs [`SYNC_COMMAND`].
 pub const SYNC_CONTAINER: &str = "workspace";
 pub const KEEP_CONFIG_MAP_KEY: &str = "keep";
@@ -186,31 +186,10 @@ fn pod_pieces(spec: &WorkspaceSpec, shape: Shape) -> WorkspacePodPieces {
 
 fn sync_init_container(spec: &WorkspaceSpec, key: &str, build: Build) -> Container {
     let git = &spec.source.git;
-    let deps = &spec.source.dependencies;
     let mut env = vec![
-        env_var("RIVERS_GIT_URL", &git.url),
-        env_var("RIVERS_GIT_COMMIT", &git.commit),
+        run_source_env(&spec.source),
+        env_var("UV_PROJECT_ENVIRONMENT", VENV_PATH),
     ];
-    if let Some(r) = &git.r#ref {
-        env.push(env_var("RIVERS_GIT_REF", r));
-    }
-    if let Some(p) = &git.path {
-        env.push(env_var("RIVERS_GIT_PATH", p));
-    }
-    env.push(env_var("RIVERS_DEPS_MODE", deps.mode.as_str()));
-    if !deps.files.is_empty() {
-        env.push(env_var("RIVERS_DEPS_FILES", &deps.files.join(",")));
-    }
-    if !deps.extras.is_empty() {
-        env.push(env_var("RIVERS_DEPS_EXTRAS", &deps.extras.join(",")));
-    }
-    if !deps.groups.is_empty() {
-        env.push(env_var("RIVERS_DEPS_GROUPS", &deps.groups.join(",")));
-    }
-    if let Some(t) = deps.timeout_seconds {
-        env.push(env_var("RIVERS_DEPS_TIMEOUT_SECONDS", &t.to_string()));
-    }
-    env.push(env_var("UV_PROJECT_ENVIRONMENT", VENV_PATH));
     // A fallback pod's cache is never reused, and it would hold a second copy
     // of the venv inside the size-limited emptyDir.
     env.push(match build {
@@ -273,7 +252,7 @@ fn sync_init_container(spec: &WorkspaceSpec, key: &str, build: Build) -> Contain
         name: SYNC_CONTAINER.to_string(),
         image: Some(spec.source.runtime_image.clone()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        command: Some(vec![SYNC_COMMAND.to_string()]),
+        command: Some(SYNC_COMMAND.map(String::from).to_vec()),
         // Default policy reads only /dev/termination-log; the fallback puts
         // uv's/git's stderr tail where the reconciler can lift it into
         // status.message.
@@ -358,11 +337,17 @@ fn credentials_volume(spec: &WorkspaceSpec) -> Option<Volume> {
     })
 }
 
+/// The tree as JSON: what the init container builds, and what the main
+/// container hands on to the Runs and step Jobs it launches.
+fn run_source_env(source: &RunSource) -> EnvVar {
+    let json = serde_json::to_string(source).expect("RunSource serializes");
+    env_var(crate::env::ENV_RUN_SOURCE, &json)
+}
+
 /// The tree's provenance and volume ride along on every pod that runs from
 /// it: [`crate::env::detect_git_workspace`] reads them back in-pod, so the
 /// Runs and step Jobs a pod launches get the same tree.
 fn main_env(spec: &WorkspaceSpec) -> Vec<EnvVar> {
-    let source = serde_json::to_string(&spec.source).expect("RunSource serializes");
     let mut env = vec![
         // The CLI imports the module from ".", which no longer finds it once
         // code changes directory, also in the worker processes it starts.
@@ -370,7 +355,7 @@ fn main_env(spec: &WorkspaceSpec) -> Vec<EnvVar> {
         env_var("VIRTUAL_ENV", VENV_PATH),
         // In the pod template ⇒ a new commit rolls the Deployment.
         env_var("RIVERS_GIT_COMMIT", &spec.source.git.commit),
-        env_var(crate::env::ENV_RUN_SOURCE, &source),
+        run_source_env(&spec.source),
     ];
     match &spec.volume {
         WorkspaceVolume::SharedPvc { claim_name } => {
@@ -425,6 +410,15 @@ mod tests {
         }
     }
 
+    /// `spec()`'s tree, as `RIVERS_RUN_SOURCE` carries it.
+    const SOURCE_JSON: &str = concat!(
+        r#"{"git":{"url":"https://forge.example/acme/pipelines.git","#,
+        r#""commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","#,
+        r#""ref":"refs/heads/main","path":"analytics","secretName":"git-creds"},"#,
+        r#""dependencies":{"mode":"auto","extras":["dev"],"timeoutSeconds":300},"#,
+        r#""runtimeImage":"ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff"}"#,
+    );
+
     /// The chart's default floors.
     fn prune() -> Prune {
         Prune {
@@ -455,7 +449,7 @@ mod tests {
                 "name": "workspace",
                 "image": "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff",
                 "imagePullPolicy": "IfNotPresent",
-                "command": ["rivers-workspace-sync"],
+                "command": ["rivers", "workspace-sync"],
                 "terminationMessagePolicy": "FallbackToLogsOnError",
                 "securityContext": {
                     "allowPrivilegeEscalation": false,
@@ -463,13 +457,7 @@ mod tests {
                     "runAsNonRoot": true,
                 },
                 "env": [
-                    { "name": "RIVERS_GIT_URL", "value": "https://forge.example/acme/pipelines.git" },
-                    { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
-                    { "name": "RIVERS_GIT_REF", "value": "refs/heads/main" },
-                    { "name": "RIVERS_GIT_PATH", "value": "analytics" },
-                    { "name": "RIVERS_DEPS_MODE", "value": "auto" },
-                    { "name": "RIVERS_DEPS_EXTRAS", "value": "dev" },
-                    { "name": "RIVERS_DEPS_TIMEOUT_SECONDS", "value": "300" },
+                    { "name": "RIVERS_RUN_SOURCE", "value": SOURCE_JSON },
                     { "name": "UV_PROJECT_ENVIRONMENT", "value": "/workspace/venv" },
                     { "name": "UV_CACHE_DIR", "value": "/uv-cache" },
                     { "name": "UV_LINK_MODE", "value": "copy" },
@@ -513,13 +501,7 @@ mod tests {
                 { "name": "PYTHONPATH", "value": "/workspace/src/analytics" },
                 { "name": "VIRTUAL_ENV", "value": "/workspace/venv" },
                 { "name": "RIVERS_GIT_COMMIT", "value": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" },
-                { "name": "RIVERS_RUN_SOURCE", "value": concat!(
-                    r#"{"git":{"url":"https://forge.example/acme/pipelines.git","#,
-                    r#""commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","#,
-                    r#""ref":"refs/heads/main","path":"analytics","secretName":"git-creds"},"#,
-                    r#""dependencies":{"mode":"auto","extras":["dev"],"timeoutSeconds":300},"#,
-                    r#""runtimeImage":"ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff"}"#,
-                ) },
+                { "name": "RIVERS_RUN_SOURCE", "value": SOURCE_JSON },
                 { "name": "RIVERS_WORKSPACE_PVC", "value": "analytics-workspace" },
             ])
         );
@@ -678,7 +660,7 @@ mod tests {
             .map(|e| e.name.as_str())
             .collect();
         assert!(!env_names.contains(&"RIVERS_WORKSPACE_KEEP"));
-        assert!(env_names.contains(&"RIVERS_GIT_URL"));
+        assert!(env_names.contains(&"RIVERS_RUN_SOURCE"));
         // Fallback consumers fetch, so they DO carry credentials.
         assert!(
             serde_json::to_value(&pieces.volumes)
