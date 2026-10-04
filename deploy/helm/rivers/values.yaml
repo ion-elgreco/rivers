@@ -118,7 +118,7 @@ operator:
   # should leave this false. When false, CodeLocations against an HTTP-only
   # registry must pre-set spec.digest to skip the probe.
   allowInsecureRegistry: false
-  # Git-sourced CodeLocations (RFC-044).
+  # Git-sourced CodeLocations.
   git:
     # Hosts spec.git.url may point at. Empty admits any host; the admission
     # webhook rejects CRs pointing elsewhere.

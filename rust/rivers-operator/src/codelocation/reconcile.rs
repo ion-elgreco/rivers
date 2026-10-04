@@ -79,7 +79,7 @@ pub struct Context {
     pub client: kube_client::Client,
     pub namespace: String,
     pub registry: Arc<RegistryClient>,
-    /// Ref→commit resolver for git-sourced CodeLocations (RFC-044). Only
+    /// Ref→commit resolver for git-sourced CodeLocations. Only
     /// the leader calls it, as with `registry`.
     pub git: Arc<super::git::GitResolver>,
     /// Default runtime image for git CLs that don't set `spec.image`.

@@ -1,4 +1,4 @@
-# rivers-runtime — base image for git-sourced CodeLocations (RFC-044).
+# rivers-runtime — base image for git-sourced CodeLocations.
 #
 # Carries python, uv, git, CA certs and the rivers CLI, whose
 # `workspace-sync` command builds the trees. Published per Python version

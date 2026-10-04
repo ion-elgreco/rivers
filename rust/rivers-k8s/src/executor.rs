@@ -35,14 +35,14 @@ pub struct K8sStepExecutorConfig {
     /// `configMapKeyRef` / `fieldRef` semantics are preserved end-to-end.
     pub extra_env: Vec<EnvVar>,
     pub partition_key: Option<String>,
-    /// Git-mode workspace (RFC-044): when set, each step Job mounts the
+    /// Git-mode workspace: when set, each step Job mounts the
     /// materialized tree (read-only in shared mode; built per pod in
     /// fallback mode) and runs the venv's `rivers` from the checkout.
     pub workspace: Option<crate::workspace::WorkspaceSpec>,
 }
 
 impl K8sStepExecutorConfig {
-    /// Git mode (RFC-044): step Jobs mount the tree this pod runs, from the
+    /// Git mode: step Jobs mount the tree this pod runs, from the
     /// `RIVERS_RUN_SOURCE` and workspace volume env the operator stamped on
     /// it; `worker_image` runs on that tree. Image mode leaves `workspace`
     /// unset.

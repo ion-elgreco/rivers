@@ -236,7 +236,7 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
 
 /// Git-workspace envs on every pod that runs from a tree (code-location
 /// pod, run executor pod, step Jobs), read back in-pod so the Runs and step
-/// Jobs it launches get the same tree (RFC-044). `RIVERS_RUN_SOURCE`
+/// Jobs it launches get the same tree. `RIVERS_RUN_SOURCE`
 /// carries the tree's `RunSource` as JSON — one typed channel instead of a
 /// fan of `RIVERS_GIT_*` vars.
 pub const ENV_RUN_SOURCE: &str = "RIVERS_RUN_SOURCE";

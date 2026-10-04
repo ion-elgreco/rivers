@@ -1,4 +1,4 @@
-//! Git ref → commit resolution (RFC-044).
+//! Git ref → commit resolution.
 //!
 //! The operator resolves `spec.git.ref` to a pinned commit the way
 //! `registry.rs` resolves `tag` → digest. Both transports yield the same

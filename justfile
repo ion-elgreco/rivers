@@ -202,7 +202,7 @@ k8s-build: _k8s-compile
     cp python/pyproject.toml deploy/staging/pyproject.toml
     cp -r dev/k3d/k8s_test_pipeline deploy/staging/k8s_test_pipeline
     docker build -f dev/k3d/Dockerfile.code-location -t rivers-code-location:latest deploy/staging
-    # rivers-runtime: the git-sourced CodeLocation base image (RFC-044).
+    # rivers-runtime: the git-sourced CodeLocation base image.
     mkdir -p deploy/staging/wheels && cp dist/*.whl deploy/staging/wheels/
     docker build -f deploy/docker/Dockerfile.runtime -t rivers-runtime:latest deploy/staging
     if [ "${RIVERS_K8S_SKIP_DEMO:-}" != "1" ]; then

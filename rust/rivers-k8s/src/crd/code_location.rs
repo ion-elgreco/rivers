@@ -36,7 +36,7 @@ pub const REASON_ROLLING_OUT: &str = "RollingOut";
 pub const REASON_NO_DEPLOYMENT_STATUS: &str = "NoDeploymentStatus";
 pub const REASON_AWAITING_LEADER: &str = "AwaitingLeader";
 
-// git source (RFC-044)
+// git source
 pub const REASON_COMMIT_RESOLVED: &str = "CommitResolved";
 pub const REASON_COMMIT_PINNED: &str = "CommitPinned";
 pub const REASON_REF_NOT_FOUND: &str = "RefNotFound";
@@ -106,7 +106,7 @@ pub struct CodeLocationSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
-    /// Git source for the pipeline code (RFC-044). Mutually composable with
+    /// Git source for the pipeline code. Mutually composable with
     /// `image` (see there); at least one of the two must be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitSource>,
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(v, serde_json::Value::String("Ready".to_string()));
     }
 
-    // ---- git source (RFC-044) ----
+    // ---- git source ----
 
     #[test]
     fn git_source_parses_camel_case() {

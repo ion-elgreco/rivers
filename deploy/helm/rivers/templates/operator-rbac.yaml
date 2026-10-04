@@ -46,7 +46,7 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
-  # Git-sourced CodeLocations (RFC-044): the owned workspace PVC and the
+  # Git-sourced CodeLocations: the owned workspace PVC and the
   # keep-set ConfigMap, deleted when the CodeLocation goes back to image mode.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]

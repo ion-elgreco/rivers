@@ -155,7 +155,7 @@ spec:
                 type: array
               git:
                 description: |-
-                  Git source for the pipeline code (RFC-044). Mutually composable with
+                  Git source for the pipeline code. Mutually composable with
                   `image` (see there); at least one of the two must be set.
                 nullable: true
                 properties:

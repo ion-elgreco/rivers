@@ -17,7 +17,7 @@ ghcr.io/ion-elgreco/rivers-ui:{{ .Chart.AppVersion }}
 {{- end -}}
 
 {{/*
-Default runtime image for git-sourced CodeLocations (RFC-044), parsed by the
+Default runtime image for git-sourced CodeLocations, parsed by the
 operator at startup. A CodeLocation without spec.image runs this tag unless
 it sets spec.tag or spec.digest.
 */}}

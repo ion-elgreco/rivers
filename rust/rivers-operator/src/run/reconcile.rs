@@ -34,7 +34,7 @@ pub struct Context {
     /// watcher syncs) `fetch_cl_spec` falls back to a live API GET.
     pub directory: Arc<DirectoryState>,
     /// Chart-level workspace settings, needed to mount git-mode runs'
-    /// trees onto their executor pods (RFC-044).
+    /// trees onto their executor pods.
     pub workspace: crate::codelocation::WorkspaceConfig,
     /// SurrealDB connection bundle stamped onto every Run pod the operator
     /// creates.

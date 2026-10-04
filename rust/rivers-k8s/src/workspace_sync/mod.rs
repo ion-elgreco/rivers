@@ -1,4 +1,4 @@
-//! The `workspace` init container of git-sourced CodeLocation pods (RFC-044),
+//! The `workspace` init container of git-sourced CodeLocation pods,
 //! run as `rivers workspace-sync`: builds the tree at the workspace mount
 //! (checkout + venv), then prunes the trees beside it on the shared volume.
 //! Driven by env:

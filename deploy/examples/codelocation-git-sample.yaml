@@ -1,4 +1,4 @@
-# Git-sourced CodeLocation (RFC-044).
+# Git-sourced CodeLocation.
 #
 # The operator resolves `git.ref` to a pinned commit and shows it under
 # `kubectl get rcl` as e.g. `main@9f3c1ab`. The pods run the chart's default

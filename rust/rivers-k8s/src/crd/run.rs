@@ -115,8 +115,8 @@ pub struct RunSpec {
     #[serde(default = "default_service_account")]
     pub service_account_name: String,
 
-    /// Git provenance for runs against a git-sourced CodeLocation
-    /// (RFC-044). Stamped on CREATE by the admission webhook from the CL's
+    /// Git provenance for runs against a git-sourced CodeLocation.
+    /// Stamped on CREATE by the admission webhook from the CL's
     /// status, or, for a digest-pinned `image`, by the code-location pod
     /// that launches the run (its own tree); immutable after; absent for
     /// image-mode runs. In shared workspace mode nothing downstream fetches

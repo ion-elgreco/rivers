@@ -521,7 +521,7 @@ fn check_codelocation_update(
     CodeLocationOutcome::UpdateAllowed
 }
 
-/// Validate the source shape (RFC-044): at least one of `image`/`git`
+/// Validate the source shape: at least one of `image`/`git`
 /// (re-checked here for API servers whose CEL support predates the CRD
 /// rule), a well-formed one-of `git.ref`, the url rules of
 /// [`validate_git_url`], a `path` inside the repository and a workspace size

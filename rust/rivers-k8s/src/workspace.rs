@@ -1,4 +1,4 @@
-//! Workspace pod-spec pieces for git-sourced CodeLocations (RFC-044).
+//! Workspace pod-spec pieces for git-sourced CodeLocations.
 //!
 //! This is the ONE builder for workspace mounts, init containers, volumes,
 //! env and the main container's command and working directory — consumed by
