@@ -6844,11 +6844,13 @@ name = "rivers-k8s"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "k8s-openapi",
  "kube-client",
  "kube-core",
  "kube-derive",
  "kube_quantity",
+ "libc",
  "regex",
  "rivers-core",
  "rust_decimal",
@@ -6857,6 +6859,7 @@ dependencies = [
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
 ]

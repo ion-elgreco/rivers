@@ -28,9 +28,16 @@ tokio = { workspace = true, features = ["rt", "time"] }
 # Workspace keys: a fixed hash, so that the operator and the run pods (maybe
 # another rivers version) agree. Already in the build through SurrealDB.
 sha2 = "0.10"
+# `rivers workspace-sync`: the Basic auth header for git over https.
+base64.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `rivers workspace-sync`: SIGTERM to a child's process group past the build budget.
+libc = "0.2"
 
 [dev-dependencies]
 regex.workspace = true
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [[bin]]
