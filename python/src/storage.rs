@@ -800,6 +800,58 @@ impl From<rivers_core::storage::ConcurrencyClaimStatus> for PyConcurrencyClaimSt
     }
 }
 
+pub(crate) trait HoldsStorage {
+    fn storage(&self) -> &Arc<SurrealStorage>;
+}
+
+impl HoldsStorage for Arc<SurrealStorage> {
+    fn storage(&self) -> &Arc<SurrealStorage> {
+        self
+    }
+}
+
+impl HoldsStorage for ScopedStorageHandle<SurrealStorage> {
+    fn storage(&self) -> &Arc<SurrealStorage> {
+        self.backend()
+    }
+}
+
+/// A storage handle owned by a Python object or a resolved repository.
+/// Dropping the last handle closes the storage, which can wait for its
+/// datastore to shut down.
+pub(crate) struct DetachOnClose<H: HoldsStorage>(Option<H>);
+
+impl<H: HoldsStorage> DetachOnClose<H> {
+    pub(crate) fn new(handle: H) -> Self {
+        Self(Some(handle))
+    }
+}
+
+impl<H: HoldsStorage> std::ops::Deref for DetachOnClose<H> {
+    type Target = H;
+
+    fn deref(&self) -> &H {
+        self.0.as_ref().expect("taken only on drop")
+    }
+}
+
+impl<H: HoldsStorage> Drop for DetachOnClose<H> {
+    fn drop(&mut self) {
+        let Some(handle) = self.0.take() else {
+            return;
+        };
+        let storage = Arc::clone(handle.storage());
+        drop(handle);
+        let Some(storage) = Arc::into_inner(storage) else {
+            return;
+        };
+        // Inside a runtime the storage closes in the background.
+        if tokio::runtime::Handle::try_current().is_err() {
+            Python::try_attach(|py| py.detach(|| drop(storage)));
+        }
+    }
+}
+
 /// SurrealDB-backed storage exposed to Python.
 ///
 /// Bundles the SurrealDB connection (`Arc<SurrealStorage>`) with a stable
@@ -809,7 +861,7 @@ impl From<rivers_core::storage::ConcurrencyClaimStatus> for PyConcurrencyClaimSt
 /// context so the Python API stays free of CL identity arguments.
 #[pyclass(name = "Storage", frozen, module = "rivers._core")]
 pub struct PyStorage {
-    pub(crate) handle: ScopedStorageHandle<SurrealStorage>,
+    pub(crate) handle: DetachOnClose<ScopedStorageHandle<SurrealStorage>>,
     pub(crate) storage_type: PyStorageType,
 }
 
@@ -836,7 +888,10 @@ impl PyStorage {
 
     fn from_storage(storage: SurrealStorage, storage_type: PyStorageType) -> Self {
         Self {
-            handle: ScopedStorageHandle::new(Arc::new(storage), Self::detect_storage_cl()),
+            handle: DetachOnClose::new(ScopedStorageHandle::new(
+                Arc::new(storage),
+                Self::detect_storage_cl(),
+            )),
             storage_type,
         }
     }

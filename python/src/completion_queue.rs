@@ -51,7 +51,7 @@ pub fn completion_channel() -> (CompletionSender, CompletionReceiver) {
 /// Python-facing CompletionQueue. Supports sync iteration.
 /// The GIL is released while blocking on the channel, so map instances
 /// running in other threads can complete.
-#[pyclass(name = "CompletionQueue", module = "rivers._core")]
+#[pyclass(name = "CompletionQueue", frozen, module = "rivers._core")]
 pub struct PyCompletionQueue {
     inner: Arc<Mutex<CompletionReceiver>>,
 }

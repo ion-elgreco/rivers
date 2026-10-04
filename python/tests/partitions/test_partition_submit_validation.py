@@ -7,10 +7,13 @@ missing or invalid partition key would only fail once the coordinator
 dequeued it — these tests pin the new fail-fast behavior.
 """
 
+import pytest
+
+pytest.importorskip("grpc")
+
 from datetime import datetime
 
 import grpc
-import pytest
 
 import rivers as rs
 from rivers.exceptions import ExecutionError

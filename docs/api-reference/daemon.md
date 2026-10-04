@@ -46,8 +46,8 @@ Each sensor and schedule can specify an `eval_mode` that controls how the evalua
 
 | Mode | Description |
 |------|-------------|
-| `EvalMode.Auto` | **(default)** Auto-detects async vs sync. Async functions run automatically on the Python event loop managed from Rust (GIL released during I/O). Sync functions run in-process via a dedicated thread with GIL. |
-| `EvalMode.InProcess` | Always run in the daemon process. Async functions run on the Python event loop managed from Rust; sync functions run on a dedicated thread holding the GIL. |
+| `EvalMode.Auto` | **(default)** Auto-detects async vs sync. Async functions run automatically on the Python event loop managed from Rust. Sync functions run in-process on a dedicated thread. |
+| `EvalMode.InProcess` | Always run in the daemon process. Async functions run on the Python event loop managed from Rust; sync functions run on a dedicated thread. |
 | `EvalMode.Subprocess` | Run in a loky subprocess for true parallelism. Requires `pip install loky`. Config injection and resources are not available in subprocess mode. |
 
 ### Example
@@ -58,12 +58,12 @@ import rivers as rs
 # Auto (default): both sync and async run in-process
 @rs.Sensor(job_name="my_job")
 def my_sync_sensor(context: rs.SensorEvaluationContext):
-    # Runs in-process via dedicated thread with GIL
+    # Runs in-process on a dedicated thread
     return rs.RunRequest()
 
 @rs.Sensor(job_name="my_job")
 async def my_async_sensor(context: rs.SensorEvaluationContext):
-    # Runs in-process, GIL released during await
+    # Runs in-process on the event loop
     import httpx
     async with httpx.AsyncClient() as client:
         resp = await client.get("https://api.example.com/status")
@@ -121,8 +121,8 @@ At daemon startup, each eval function is classified:
 
 - **`inspect.iscoroutinefunction`** detects async functions
 - Combined with the user's `eval_mode` setting, this determines the dispatch:
-    - **Async in-process**: the coroutine runs automatically on the Python event loop managed from Rust. The GIL is released during `await` points, allowing true I/O concurrency.
-    - **Sync in-process**: the function runs on a dedicated tokio blocking thread, holding the GIL for the duration of the call.
+    - **Async in-process**: the coroutine runs automatically on the Python event loop managed from Rust. Other evaluations run while it waits at `await` points.
+    - **Sync in-process**: the function runs on a dedicated tokio blocking thread. Up to four sensor and schedule evaluations run at once.
     - **Subprocess**: the eval function and context data are submitted to a loky process pool. The subprocess reconstructs the context from primitives and calls the function (no resources / config injection available across the boundary).
 
 ## API
@@ -132,8 +132,8 @@ At daemon startup, each eval function is classified:
 | Method | Description |
 |--------|-------------|
 | `AutomationDaemon(repo, storage, *, max_ticks_retained=100, condition_eval_interval="30s")` | Create a daemon. `max_ticks_retained` limits stored tick history per automation. `condition_eval_interval` is the interval between automation condition evaluations (human-readable duration, e.g. `"30s"`, `"1m"`). |
-| `start()` | Start evaluation loops for all running schedules and sensors. |
-| `stop()` | Signal all loops to stop and wait for cleanup. |
+| `start()` | Start evaluation loops for all running schedules and sensors. A daemon starts once: another call, from any thread, emits a `UserWarning` and does nothing, also after `stop()`. |
+| `stop()` | Signal all loops to stop and wait for cleanup. A stopped daemon does not start again: create a new one. |
 
 ### `EvalMode`
 

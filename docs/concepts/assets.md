@@ -289,7 +289,7 @@ The merged metadata reaches `context.asset_metadata`, the IO handlers and the en
 
 ## Output metadata
 
-IO handlers and asset functions can attach runtime metadata via `context.add_output_metadata()`. This metadata is available in the job result and can include `MetadataValue` instances for typed values:
+Asset functions and IO handlers can attach runtime metadata via `context.add_output_metadata()`. This metadata is stored on the materialization event and can include `MetadataValue` instances for typed values:
 
 ```python
 context.add_output_metadata({
@@ -297,6 +297,8 @@ context.add_output_metadata({
     "schema": rs.MetadataValue.json('{"id": "int64"}'),
 })
 ```
+
+The IO handler adds its entries in `handle_output`, after the asset function returns. On a key that both set, the handler's value is stored, because it describes the data that was written.
 
 ### Using `Output` for declarative metadata
 

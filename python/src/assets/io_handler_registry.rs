@@ -156,7 +156,7 @@ impl IOHandlerRegistry {
 
     fn resolve_for_output(&self, py: Python, node: &ResolvedNode) -> (Py<PyAny>, IOHandlerSource) {
         if let Some(handler) = node.io_handler(py) {
-            return (handler, output_source_for(py, node));
+            return (handler, output_source_for(node));
         }
         (self.default.clone_ref(py), IOHandlerSource::Default)
     }
@@ -172,7 +172,7 @@ impl IOHandlerRegistry {
             return (handler, IOHandlerSource::InputOverride);
         }
         if let Some(handler) = upstream.io_handler(py) {
-            return (handler, output_source_for(py, upstream));
+            return (handler, output_source_for(upstream));
         }
         (self.default.clone_ref(py), IOHandlerSource::Default)
     }
@@ -183,8 +183,8 @@ impl IOHandlerRegistry {
 /// Both are eligible for `IOHandlerRef` wrapping in the pickle path, but
 /// reconstruction looks up different attributes (`io_handler` vs
 /// `node_io_handler`) — see `_reconstruct_io_handler_ref`.
-fn output_source_for(py: Python, node: &ResolvedNode) -> IOHandlerSource {
-    if node.has_definition_io_handler(py) {
+fn output_source_for(node: &ResolvedNode) -> IOHandlerSource {
+    if node.has_definition_io_handler() {
         IOHandlerSource::Definition
     } else {
         IOHandlerSource::GraphOverride

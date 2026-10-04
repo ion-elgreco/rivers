@@ -7,11 +7,15 @@ them locally; when disabled (e.g. in K8s step pods) the parent streams are
 silenced and only the buffered text is shipped back through the run event log.
 """
 
+import collections
 import contextvars
 import sys
+import threading
 
 _capture = contextvars.ContextVar("_step_capture", default=None)
 _get = _capture.get
+# Takes the place of a finished step's buffers: holds nothing.
+_SINK = collections.deque(maxlen=0)
 
 
 class _Writer:
@@ -75,6 +79,9 @@ class StepCapture:
     def finish(self):
         """Stop capturing and return ``(stdout, stderr)``.
 
+        Threads that inherited the step's context can still write after this
+        call. Those writes are not kept.
+
         Returns:
             A two-tuple of strings holding everything the step wrote. Output is
             never dropped: a step that logs more than expected is a thing to
@@ -89,19 +96,21 @@ class StepCapture:
         return (out, err)
 
     def _join(self, idx):
-        """Concatenate buffer ``idx`` and clear it."""
-        r = "".join(self._bufs[idx])
-        self._bufs[idx].clear()
-        return r
+        """Concatenate buffer ``idx`` and drop later writes to it."""
+        buf, self._bufs[idx] = self._bufs[idx], _SINK
+        return "".join(buf)
 
 
 _installed = False
+_install_lock = threading.Lock()
 
 
 def install(*, tee=True):
     """Install the capturing writers as ``sys.stdout`` / ``sys.stderr``.
 
-    Idempotent: subsequent calls are no-ops.
+    Idempotent and safe to call from many threads at once: the streams are
+    wrapped once, and no call returns before they are wrapped. A missing
+    stream (``None`` under ``pythonw`` or with closed stdio) stays ``None``.
 
     Args:
         tee: When ``True`` writes also pass through to the real streams so the
@@ -111,6 +120,13 @@ def install(*, tee=True):
     global _installed
     if _installed:
         return
-    _installed = True
-    sys.stdout = _Writer(sys.stdout, 0, tee)
-    sys.stderr = _Writer(sys.stderr, 1, tee)
+    with _install_lock:
+        if _installed:
+            return
+        # Both streams or neither, then the flag: a caller that sees the flag
+        # finds both wrapped, and a failed call leaves nothing to wrap twice.
+        sys.stdout, sys.stderr = (
+            None if sys.stdout is None else _Writer(sys.stdout, 0, tee),
+            None if sys.stderr is None else _Writer(sys.stderr, 1, tee),
+        )
+        _installed = True

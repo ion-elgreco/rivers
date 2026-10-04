@@ -885,9 +885,9 @@ def test_external_actions_list_is_an_error():
         desugar(Feed)
 
 
-def test_assetdef_shared_across_classes_is_an_error():
-    """One AssetDef reused by two classes named both outputs the same, and the
-    second silently replaced the first in the graph."""
+def test_assetdef_shared_across_classes_names_each_output():
+    """One unnamed AssetDef reused by two classes names each output after its
+    own attribute: registration never writes the name into the def."""
     shared = rs.AssetDef()
 
     class First(rs.MultiAsset):
@@ -904,8 +904,10 @@ def test_assetdef_shared_across_classes_is_an_error():
         def materialize(cls):
             return {"other": 2}
 
-    with pytest.raises(AssetDefinitionError, match="out"):
-        rs.CodeRepository(assets=[First, Second], default_executor=IP).resolve()
+    repo = rs.CodeRepository(assets=[First, Second], default_executor=IP)
+    assert repo.materialize().success
+    assert {n: repo.load_node(n) for n in ("out", "other")} == {"out": 1, "other": 2}
+    assert shared.name is None
 
 
 def test_same_asset_listed_twice_registers_once():

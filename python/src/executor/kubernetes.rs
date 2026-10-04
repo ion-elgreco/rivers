@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,7 +13,7 @@ use rivers_core::execution::retry::{
 use rivers_core::storage::{EventType, StorageBackend};
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::executor::StepJobOverrides;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::errors::ExecutionError;
@@ -67,58 +67,47 @@ pub(crate) struct KubernetesBackend {
     /// Resolved once via [`rivers_k8s::env::current_code_location_id`]
     /// (panics in cloud mode if the operator-injected env is missing).
     pub code_location_id: String,
-    /// Structured envvars sourced from `CodeLocation.spec.env` via a one-shot
-    /// kube API GET on first construction. Forwarded verbatim to step pods so
-    /// `valueFrom.secretKeyRef` / `configMapKeyRef` / `fieldRef` semantics
-    /// survive the orchestrator → step-pod hop.
-    pub extra_env: Vec<EnvVar>,
-    /// In-cluster kube client. `kube_client::Client` is internally `Arc`-y so
-    /// cloning is cheap; one client per backend instance, reused across both
-    /// Job creation and the CodeLocation lookup in [`fetch_code_location_env`].
-    pub client: kube_client::Client,
 }
 
 /// Process-scoped kube client. `kube_client::Client` is internally `Arc`-y, so
-/// every `KubernetesBackend` holds a cheap clone of the same underlying
-/// connection pool — one `try_default()` per run pod, not per level batch.
-fn shared_kube_client() -> kube_client::Client {
-    static CLIENT: OnceLock<kube_client::Client> = OnceLock::new();
+/// every batch holds a cheap clone of the same underlying connection pool —
+/// one `try_default()` per run pod, not per level batch.
+async fn shared_kube_client() -> anyhow::Result<kube_client::Client> {
+    static CLIENT: OnceCell<kube_client::Client> = OnceCell::const_new();
     CLIENT
-        .get_or_init(|| {
-            rt().block_on(kube_client::Client::try_default())
-                .expect("failed to construct in-cluster kube client")
+        .get_or_try_init(|| async {
+            kube_client::Client::try_default()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to construct in-cluster kube client: {e}"))
         })
-        .clone()
+        .await
+        .cloned()
 }
 
-/// Look up `CodeLocation.spec.env` via kube API once per process and cache
-/// the result. The run pod handles a single CodeLocation throughout its
-/// lifetime, so a process-scoped cache is correct — multiple
-/// `KubernetesBackend` instances (one per execution level) share one fetch.
-///
-/// Panics if the CR or its env can't be retrieved. `KubernetesBackend` only
-/// ever runs inside a pod the operator created, where the CodeLocation env
-/// vars are always set; a failure here is a config bug worth surfacing
-/// immediately rather than running the workflow with silently-empty step env.
-fn fetch_code_location_env(client: &kube_client::Client) -> Vec<EnvVar> {
-    static CACHE: OnceLock<Vec<EnvVar>> = OnceLock::new();
+/// `CodeLocation.spec.env`, fetched once per process: the run pod handles a
+/// single CodeLocation throughout its lifetime. Forwarded verbatim to step
+/// pods so `valueFrom.secretKeyRef` / `configMapKeyRef` / `fieldRef`
+/// semantics survive the orchestrator → step-pod hop.
+async fn fetch_code_location_env(client: &kube_client::Client) -> anyhow::Result<Vec<EnvVar>> {
+    static CACHE: OnceCell<Vec<EnvVar>> = OnceCell::const_new();
     CACHE
-        .get_or_init(|| {
-            let name = rivers_k8s::env::detect_code_location_name().expect(
+        .get_or_try_init(|| async {
+            let name = rivers_k8s::env::detect_code_location_name().context(
                 "RIVERS_CODE_LOCATION_NAME is required for KubernetesBackend; \
                  the operator stamps it on the run pod from the owning CodeLocation CR",
-            );
+            )?;
             let namespace = rivers_k8s::env::detect_namespace();
             let api: kube_client::Api<CodeLocation> =
                 kube_client::Api::namespaced(client.clone(), &namespace);
-            rt().block_on(api.get(&name))
-                .unwrap_or_else(|e| {
-                    panic!("failed to fetch CodeLocation '{name}' in namespace '{namespace}': {e}")
-                })
-                .spec
-                .env
+            let code_location = api.get(&name).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to fetch CodeLocation '{name}' in namespace '{namespace}': {e}"
+                )
+            })?;
+            anyhow::Ok(code_location.spec.env)
         })
-        .clone()
+        .await
+        .cloned()
 }
 
 impl KubernetesBackend {
@@ -136,8 +125,6 @@ impl KubernetesBackend {
         let run_cr_name = std::env::var("RIVERS_RUN_CR_NAME").unwrap_or_default();
         let run_cr_uid = std::env::var("RIVERS_RUN_CR_UID").unwrap_or_default();
         let code_location_id = rivers_k8s::env::current_code_location_id();
-        let client = shared_kube_client();
-        let extra_env = fetch_code_location_env(&client);
 
         Self {
             worker_image,
@@ -152,24 +139,33 @@ impl KubernetesBackend {
             run_cr_name,
             run_cr_uid,
             code_location_id,
-            extra_env,
-            client,
         }
     }
 
+    /// The step-pod config, with the kube client that creates the step Jobs.
     fn build_config(
         &self,
         run_id: &str,
         partition_key: Option<String>,
-    ) -> Result<rivers_k8s::executor::K8sStepExecutorConfig, PyErr> {
+    ) -> PyResult<(
+        kube_client::Client,
+        rivers_k8s::executor::K8sStepExecutorConfig,
+    )> {
         let worker_image = self.worker_image.clone().ok_or_else(|| {
             crate::errors::ConfigurationError::new_err(
                 "Kubernetes executor requires a worker image. Set RIVERS_CODE_LOCATION_IMAGE \
                  env var or pass worker_image to Executor.kubernetes()",
             )
         })?;
+        let (client, extra_env) = rt()
+            .block_on(async {
+                let client = shared_kube_client().await?;
+                let extra_env = fetch_code_location_env(&client).await?;
+                anyhow::Ok((client, extra_env))
+            })
+            .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
 
-        Ok(rivers_k8s::executor::K8sStepExecutorConfig {
+        let config = rivers_k8s::executor::K8sStepExecutorConfig {
             workspace: None,
             worker_image,
             namespace: self.namespace.clone(),
@@ -183,10 +179,11 @@ impl KubernetesBackend {
             run_cr_name: self.run_cr_name.clone(),
             run_cr_uid: self.run_cr_uid.clone(),
             code_location_id: self.code_location_id.clone(),
-            extra_env: self.extra_env.clone(),
+            extra_env,
             partition_key,
         }
-        .with_detected_workspace())
+        .with_detected_workspace();
+        Ok((client, config))
     }
 }
 
@@ -700,7 +697,7 @@ impl ExecutorBackend for KubernetesBackend {
         }
 
         let pk_string = ctx.scope.partition_key.as_ref().map(|pk| pk.to_json());
-        let config = match self.build_config(ctx.scope.run_id, pk_string) {
+        let (client, config) = match py.detach(|| self.build_config(ctx.scope.run_id, pk_string)) {
             Ok(c) => c,
             Err(e) => {
                 for inst in &instances {
@@ -730,7 +727,6 @@ impl ExecutorBackend for KubernetesBackend {
         let storage = Arc::clone(ctx.sink.storage.backend());
         let run_id = ctx.scope.run_id.to_string();
         let code_location_id = self.code_location_id.clone();
-        let client = self.client.clone();
         let config = Arc::new(config);
 
         let results: Vec<(String, bool)> = py.detach(move || {

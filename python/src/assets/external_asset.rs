@@ -23,6 +23,24 @@ pub struct ExternalAsset {
     pub backfill_strategy: Option<PyBackfillStrategy>,
 }
 
+impl ExternalAsset {
+    pub fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            name: self.name.clone(),
+            tags: self.tags.clone(),
+            kinds: self.kinds.clone(),
+            group: self.group.clone(),
+            io_handler: self.io_handler.clone_ref(py),
+            metadata: self.metadata.clone(),
+            partitions_def: self.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            observe_fn: self.observe_fn.as_ref().map(|f| f.clone_ref(py)),
+            is_async_observe: self.is_async_observe,
+            automation_condition: self.automation_condition.clone(),
+            backfill_strategy: self.backfill_strategy.clone(),
+        }
+    }
+}
+
 /// Python-exposed marker subclass created via `Asset.external(...)`.
-#[pyclass(name = "ExternalAsset", extends=PyAsset, subclass, module = "rivers._core")]
+#[pyclass(name = "ExternalAsset", extends=PyAsset, subclass, frozen, module = "rivers._core")]
 pub struct PyExternalAsset;

@@ -16,6 +16,20 @@ def another_task(data):
     return heavy_transform(data)
 ```
 
+`rs.Task(...)` without a function is a decorator. Each function it decorates becomes a new task with the same settings, so you can use one decorator for many functions:
+
+```python
+etl = rs.Task(tags=["etl"])
+
+@etl
+def extract(): ...
+
+@etl
+def load(): ...
+```
+
+`etl()` raises `TaskDefinitionError`, because `etl` needs one function.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |

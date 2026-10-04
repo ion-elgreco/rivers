@@ -30,6 +30,7 @@ impl AsyncBridge {
         let loop_thread = std::thread::spawn(move || {
             Python::try_attach(|py| {
                 let _ = loop_ref.call_method0(py, "run_forever");
+                let _ = loop_ref.call_method0(py, "close");
             });
         });
 

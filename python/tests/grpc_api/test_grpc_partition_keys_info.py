@@ -7,10 +7,13 @@ Multi assets had no picker. These tests pin that all enumerable kinds
 still returns empty (it can't be enumerated).
 """
 
+import pytest
+
+pytest.importorskip("grpc")
+
 from datetime import datetime, timedelta
 
 import grpc
-import pytest
 
 import rivers as rs
 

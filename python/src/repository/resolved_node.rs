@@ -103,7 +103,7 @@ pub(crate) struct ResolvedTask {
     /// For tasks inside a graph asset composition: maps parameter names
     /// to upstream node names. E.g., `{"value": "a"}` means the `value`
     /// parameter receives the output of node `a`.
-    /// `None` for standalone tasks (deps resolved from `__annotations__`).
+    /// `None` for standalone tasks (deps resolved by parameter name).
     pub param_remap: Option<HashMap<String, String>>,
     /// Name of the parent graph asset for namespaced composition tasks
     /// (i.e. `ns_name = "{parent_graph_name}/{task_name}"`). `None` for
@@ -167,8 +167,7 @@ impl ResolvedAsset {
         output_name: Option<String>,
         partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
     ) -> PyResult<Self> {
-        let asset_ref = inner.borrow(py);
-        let asset = asset_ref.inner();
+        let asset = inner.get().inner();
 
         let kind = match asset {
             Asset::Single(_) => AssetKind::Single,
@@ -330,9 +329,7 @@ impl ResolvedAsset {
                 asset
                     .output_actions(lookup)
                     .iter()
-                    .map(|a| {
-                        crate::assets::action::ResolvedAction::from_asset_action(py, &a.borrow(py))
-                    })
+                    .map(|a| crate::assets::action::ResolvedAction::from_asset_action(py, a.get()))
                     .collect()
             }
         };
@@ -346,8 +343,6 @@ impl ResolvedAsset {
                     .collect()
             })
             .unwrap_or_default();
-
-        drop(asset_ref);
 
         Ok(Self {
             inner,
@@ -436,8 +431,7 @@ impl ResolvedTask {
         input_metadata_override: Option<HashMap<String, HashMap<String, String>>>,
         partition_defs: &HashMap<String, Py<PartitionsDefinition>>,
     ) -> PyResult<Self> {
-        let task_ref = inner.borrow(py);
-        let task = &task_ref.inner;
+        let task = &inner.get().inner;
 
         let name = task
             .name
@@ -457,8 +451,6 @@ impl ResolvedTask {
         let partition_mapping = partition_mapping_override
             .or_else(|| task.partition_mapping.as_ref().map(|m| m.0.clone()));
         let io_handler = task.io_handler.as_ref().map(|h| h.clone_ref(py));
-
-        drop(task_ref);
 
         Ok(Self {
             inner,
@@ -509,13 +501,12 @@ impl ResolvedBashTask {
         partitions_def: Option<PartitionsDefinition>,
         partition_mapping_override: Option<HashMap<String, PartitionMapping>>,
     ) -> Self {
-        let bash_ref = inner.borrow(py);
-        let name = bash_ref.name.clone();
-        let tags = bash_ref.tags.clone();
+        let bash = inner.get();
+        let name = bash.name.clone();
+        let tags = bash.tags.clone();
         let partition_mapping = partition_mapping_override
-            .or_else(|| bash_ref.partition_mapping.as_ref().map(|m| m.0.clone()));
-        let io_handler = bash_ref.io_handler.as_ref().map(|h| h.clone_ref(py));
-        drop(bash_ref);
+            .or_else(|| bash.partition_mapping.as_ref().map(|m| m.0.clone()));
+        let io_handler = bash.io_handler.as_ref().map(|h| h.clone_ref(py));
 
         Self {
             inner,
@@ -693,8 +684,8 @@ impl ResolvedNode {
     pub fn callable(&self, py: Python) -> PyResult<Py<PyAny>> {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                match asset.inner() {
+                let asset = node.inner.get().inner();
+                match asset {
                     Asset::External(ext) => ext
                         .observe_fn
                         .as_ref()
@@ -704,12 +695,11 @@ impl ResolvedNode {
                             )
                         })
                         .map(|f| f.clone_ref(py)),
-                    _ => Ok(asset.inner()._asset_fn()?.clone_ref(py)),
+                    _ => Ok(asset._asset_fn()?.clone_ref(py)),
                 }
             }
             ResolvedNode::Task(node) => {
-                let task = node.inner.borrow(py);
-                let func = task.inner.wraps.as_ref().ok_or_else(|| {
+                let func = node.inner.get().inner.wraps.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err("Task has no wrapped function")
                 })?;
                 Ok(func.clone_ref(py))
@@ -733,20 +723,19 @@ impl ResolvedNode {
     pub fn annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                let func = match asset.inner() {
+                let asset = node.inner.get().inner();
+                let func = match asset {
                     Asset::External(ext) => match ext.observe_fn {
                         Some(ref f) => f.clone_ref(py),
                         None => return Ok(None),
                     },
-                    _ => asset.inner()._asset_fn()?.clone_ref(py),
+                    _ => asset._asset_fn()?.clone_ref(py),
                 };
                 let ann = func.getattr(py, "__annotations__")?;
                 Ok(Some(ann.into_bound(py).cast_into::<PyDict>()?))
             }
             ResolvedNode::Task(node) => {
-                let task = node.inner.borrow(py);
-                let func = task.inner.wraps.as_ref().ok_or_else(|| {
+                let func = node.inner.get().inner.wraps.as_ref().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err("Task has no wrapped function")
                 })?;
                 let ann = func.getattr(py, "__annotations__")?;
@@ -861,14 +850,11 @@ impl ResolvedNode {
         }
     }
 
-    pub fn input_metadata(&self, py: Python, param_name: &str) -> Option<HashMap<String, String>> {
+    pub fn input_metadata(&self, param_name: &str) -> Option<HashMap<String, String>> {
         match self {
-            ResolvedNode::Asset(node) => node
-                .inner
-                .borrow(py)
-                .inner()
-                .input_metadata(param_name)
-                .cloned(),
+            ResolvedNode::Asset(node) => {
+                node.inner.get().inner().input_metadata(param_name).cloned()
+            }
             ResolvedNode::Task(node) => {
                 let resolved = node
                     .param_remap
@@ -885,29 +871,27 @@ impl ResolvedNode {
         }
     }
 
-    pub fn has_io_handler(&self, py: Python) -> bool {
+    pub fn has_io_handler(&self) -> bool {
         match self {
             ResolvedNode::Asset(node) => {
-                let asset = node.inner.borrow(py);
-                asset_output_io_handler(asset.inner(), &node.output_name).is_some()
+                asset_output_io_handler(node.inner.get().inner(), &node.output_name).is_some()
             }
             ResolvedNode::Task(node) => {
-                node.io_handler_override.is_some()
-                    || node.inner.borrow(py).inner.io_handler.is_some()
+                node.io_handler_override.is_some() || node.inner.get().inner.io_handler.is_some()
             }
             ResolvedNode::BashTask(node) => {
-                node.io_handler_override.is_some() || node.inner.borrow(py).io_handler.is_some()
+                node.io_handler_override.is_some() || node.inner.get().io_handler.is_some()
             }
         }
     }
 
     /// Determines whether IOHandlerRef can reconstruct the handler after re-import
     /// in spawn-based worker subprocesses.
-    pub fn has_definition_io_handler(&self, py: Python) -> bool {
+    pub fn has_definition_io_handler(&self) -> bool {
         match self {
-            ResolvedNode::Asset(_) => self.has_io_handler(py),
-            ResolvedNode::Task(node) => node.inner.borrow(py).inner.io_handler.is_some(),
-            ResolvedNode::BashTask(node) => node.inner.borrow(py).io_handler.is_some(),
+            ResolvedNode::Asset(_) => self.has_io_handler(),
+            ResolvedNode::Task(node) => node.inner.get().inner.io_handler.is_some(),
+            ResolvedNode::BashTask(node) => node.inner.get().io_handler.is_some(),
         }
     }
 

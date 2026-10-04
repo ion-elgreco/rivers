@@ -1,5 +1,7 @@
 """Tests for input validation and error paths."""
 
+import functools
+
 import pytest
 
 import rivers as rs
@@ -149,6 +151,60 @@ def test_in_latest_time_window_allowed_inside_dep_aggregate():
 
     repo = rs.CodeRepository(assets=[watcher])
     repo.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Asset and Task function validation
+# ---------------------------------------------------------------------------
+
+
+def func(): ...
+
+
+DECORATORS = {
+    "single": (rs.Asset, {}, AssetDefinitionError),
+    "multi": (rs.Asset.from_multi, {}, AssetDefinitionError),
+    "graph": (rs.Asset.from_graph, {}, AssetDefinitionError),
+    "external": (
+        rs.Asset.external,
+        {"io_handler": DummyHandler()},
+        AssetDefinitionError,
+    ),
+    "task": (rs.Task, {}, TaskDefinitionError),
+}
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [((), {}), ((42,), {}), ((func, func), {}), ((func,), {"name": "x"})],
+    ids=["no_args", "non_callable", "two_functions", "keyword"],
+)
+@pytest.mark.parametrize("kind", DECORATORS)
+def test_decorator_needs_one_function(kind, args, kwargs):
+    make, settings, error = DECORATORS[kind]
+
+    with pytest.raises(error, match="decorator needs one function"):
+        make(**settings)(*args, **kwargs)
+
+
+@pytest.mark.parametrize("name", [None, "x"], ids=["unnamed", "named"])
+@pytest.mark.parametrize("wraps", [42, "x"], ids=["int", "str"])
+@pytest.mark.parametrize("kind", DECORATORS)
+def test_constructor_rejects_non_callable(kind, wraps, name):
+    make, settings, error = DECORATORS[kind]
+
+    with pytest.raises(error, match="decorator needs one function"):
+        make(wraps, name=name, **settings)
+
+
+@pytest.mark.parametrize("kind", DECORATORS)
+def test_constructor_needs_name_for_nameless_callable(kind):
+    make, settings, _ = DECORATORS[kind]
+    nameless = functools.partial(func)
+
+    assert make(nameless, name="x", **settings).name == "x"
+    with pytest.raises(AttributeError, match="__name__"):
+        make(nameless, **settings)
 
 
 # ---------------------------------------------------------------------------

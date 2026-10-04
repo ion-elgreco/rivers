@@ -242,6 +242,8 @@ def streamed():
 
 By default `collect_stream()` emits in **completion order**; pass `ordered=True` to emit in mapping-key order instead. Streaming is the right choice when downstream is itself streaming-friendly (a writer, an aggregator) — it avoids buffering the full result set.
 
+The consumer can read one stream from many threads. Each result goes to one thread only.
+
 ### Named instances with `DynamicOutput`
 
 By default, fanned-out instances are named with their numeric index (`double[0]`, `double[1]`, ...). When the producer wants stable, human-readable instance names, return a list of `rs.DynamicOutput`:

@@ -99,9 +99,9 @@ def test_actions_none_is_accepted_everywhere():
 
 
 def test_asset_def_str_does_not_leak_rust_option():
-    """``AssetDef.name`` is ``Option<String>`` so the class form can inject the
-    attribute name later. The pyclass format string must still print the name,
-    not the Rust wrapper around it.
+    """``AssetDef.name`` is ``Option<String>`` so a class-form def can leave it
+    unset. The pyclass format string must still print the name, not the Rust
+    wrapper around it.
     """
     s = str(rs.AssetDef("orders"))
     assert "Some(" not in s, s

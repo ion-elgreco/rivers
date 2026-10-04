@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 FIXTURES = Path(__file__).parent / "shutdown_fixtures"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PROTO_PATH = str(REPO_ROOT / "proto")
@@ -114,6 +116,9 @@ class TestGracefulShutdown:
         """Start a gRPC server, trigger a slow materialization, send a terminate
         signal mid-flight, and verify the work completed before the process
         exited."""
+        # The trigger client is a grpcio script.
+        pytest.importorskip("grpc")
+        pytest.importorskip("grpc_tools")
         marker = tmp_path / "completed.marker"
         err_path = tmp_path / "server.err"
         grpc_port = _find_free_port()

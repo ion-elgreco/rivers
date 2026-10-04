@@ -17,8 +17,9 @@ class BaseIOHandler(BaseSettings, ABC):
     Attach to an asset via ``@Asset(io_handler=MyHandler(...))``.
 
     ``handle_output`` is called after the asset function returns to persist the result.
-    Use ``context.add_output_metadata(key, value)`` inside ``handle_output`` to attach
-    metadata about the write (e.g. path, byte size, duration).
+    Call ``context.add_output_metadata({"path": path, "size_bytes": size})`` inside
+    ``handle_output`` to attach metadata about the write. The entries are stored on
+    the materialization; on a key the asset also set, the handler's value is stored.
 
     ``load_input`` is called to load a previously persisted asset output when the
     in-memory result is not available.

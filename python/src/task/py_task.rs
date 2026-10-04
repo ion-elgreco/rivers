@@ -1,8 +1,10 @@
 //! PyTask — a Python-callable task used inside graph asset composition.
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyTuple};
 
-use crate::assets::decorator::{is_coroutine_function, name_or_fn_name};
+use crate::assets::decorator::{
+    decorated_fn, ensure_callable, is_coroutine_function, name_or_fn_name,
+};
 use crate::assets::io_handler::IOHandler;
 use crate::composition::{
     InvokedNodeType, PyInvokedNodeOutput, extract_input_bindings, is_in_composition,
@@ -11,6 +13,12 @@ use crate::composition::{
 use crate::errors::TaskDefinitionError;
 use crate::partitions::PartitionsDefRef;
 use crate::partitions::mapping::PartitionMappingDict;
+
+fn needs_one_function() -> PyErr {
+    TaskDefinitionError::new_err(
+        "the Task decorator needs one function, e.g. `@rs.Task(tags=...)` on a def",
+    )
+}
 
 pub struct Task {
     pub wraps: Option<Py<PyAny>>,
@@ -24,13 +32,36 @@ pub struct Task {
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
+impl Task {
+    /// A copy of this config that wraps `func`, named after `func` unless the
+    /// config has a name.
+    fn wrapping(&self, py: Python, func: Py<PyAny>) -> PyResult<Self> {
+        let name = match &self.name {
+            Some(name) => name.clone(),
+            None => func.getattr(py, "__name__")?.to_string(),
+        };
+        let wraps = Some(func);
+        Ok(Self {
+            is_async: is_coroutine_function(py, &wraps),
+            wraps,
+            name: Some(name),
+            tags: self.tags.clone(),
+            partitions_def: self.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            partition_mapping: self.partition_mapping.clone(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            retry: self.retry.clone(),
+        })
+    }
+}
+
 /// A composable task, exposed to Python as `Task`.
 ///
 /// `Task` acts as both a decorator (`@Task`, `@Task(name=...)`) and a
-/// composable node in the execution DAG. When called inside a composition
-/// context it records an invocation; otherwise it executes the wrapped
-/// function directly.
-#[pyclass(name = "Task", module = "rivers._core")]
+/// composable node in the execution DAG. A `Task` without a function is a
+/// decorator: each call returns a new `Task` around the given function. A
+/// `Task` with a function records an invocation when called inside a
+/// composition context, and calls the function otherwise.
+#[pyclass(name = "Task", module = "rivers._core", frozen)]
 pub struct PyTask {
     pub inner: Task,
 }
@@ -49,7 +80,8 @@ impl PyTask {
         io_handler: Option<IOHandler>,
         retry: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let task_name = name_or_fn_name(py, name, &wraps);
+        ensure_callable(py, &wraps, needs_one_function)?;
+        let task_name = name_or_fn_name(py, name, &wraps)?;
 
         let is_async = is_coroutine_function(py, &wraps);
         Ok(Self {
@@ -69,43 +101,27 @@ impl PyTask {
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(
         slf: &Bound<'_, Self>,
-        py: Python,
         args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        let mut this = slf.borrow_mut();
-
-        if this.inner.wraps.is_none() {
-            let func = args.get_item(0)?;
-            let func: Py<PyAny> = func.into();
-            let function_name = func.getattr(py, "__name__")?.to_string();
-            this.inner.is_async = is_coroutine_function(py, &Some(func.clone_ref(py)));
-            this.inner.wraps = Some(func);
-            this.inner.name.get_or_insert(function_name);
-            drop(this);
-            Ok(slf.clone().unbind().into_any())
-        } else if is_in_composition() {
-            let name = this
-                .inner
+        let py = slf.py();
+        let task = &slf.get().inner;
+        let Some(func) = &task.wraps else {
+            let func = decorated_fn(args, kwargs).ok_or_else(needs_one_function)?;
+            let inner = task.wrapping(py, func)?;
+            return Ok(Py::new(py, Self { inner })?.into_any());
+        };
+        if is_in_composition() {
+            let name = task
                 .name
-                .as_ref()
-                .ok_or_else(|| TaskDefinitionError::new_err("Task must have a name"))?
-                .clone();
-            drop(this);
+                .as_deref()
+                .ok_or_else(|| TaskDefinitionError::new_err("Task must have a name"))?;
             let input_bindings = extract_input_bindings(args, kwargs)?;
-            let registered_name = observe_invocation(&name, InvokedNodeType::Task, input_bindings);
+            let registered_name = observe_invocation(name, InvokedNodeType::Task, input_bindings);
             let output = PyInvokedNodeOutput::with_default_output(registered_name);
             Ok(output.into_pyobject(py)?.into_any().unbind())
         } else {
-            let func = this
-                .inner
-                .wraps
-                .as_ref()
-                .ok_or_else(|| TaskDefinitionError::new_err("Task has no function"))?
-                .clone_ref(py);
-            drop(this);
-            let result = func.call(py, args, kwargs)?;
-            Ok(result)
+            func.call(py, args, kwargs)
         }
     }
 

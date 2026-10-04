@@ -40,18 +40,47 @@ pub struct MultiAsset {
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
 }
 
+impl MultiAsset {
+    pub fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            name: self.name.clone(),
+            wraps: self.wraps.as_ref().map(|f| f.clone_ref(py)),
+            is_async: self.is_async,
+            code_version: self.code_version.clone(),
+            assets: self.assets.iter().map(|a| a.clone_ref(py)).collect(),
+            partitions_def: self.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            input_dep_names: self.input_dep_names.clone(),
+            dep_only_names: self.dep_only_names.clone(),
+            partition_mappings: self.partition_mappings.clone(),
+            input_io_handlers: self
+                .input_io_handlers
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone_ref(py)))
+                .collect(),
+            input_metadata: self.input_metadata.clone(),
+            hooks: self
+                .hooks
+                .as_ref()
+                .map(|hooks| hooks.iter().map(|h| h.clone_ref(py)).collect()),
+            automation_condition: self.automation_condition.clone(),
+            backfill_strategy: self.backfill_strategy.clone(),
+            compute: self.compute.clone(),
+            retry: self.retry.clone(),
+        }
+    }
+}
+
 /// Python-exposed marker subclass created via `Asset.from_multi(...)`.
-#[pyclass(name = "MultiAsset", extends=PyAsset, subclass, module = "rivers._core")]
+#[pyclass(name = "MultiAsset", extends=PyAsset, subclass, frozen, module = "rivers._core")]
 pub struct PyMultiAsset;
 
 #[pymethods]
 impl PyMultiAsset {
     /// The `AssetDef` for each output defined by this multi-asset.
     #[getter]
-    fn output_defs(self_: PyRef<'_, Self>) -> Vec<AssetDef> {
-        let py = self_.py();
-        let super_ = self_.as_super();
-        match super_.inner() {
+    fn output_defs(slf: &Bound<'_, Self>) -> Vec<AssetDef> {
+        let py = slf.py();
+        match slf.as_super().get().inner() {
             Asset::Multi(multi) => multi
                 .assets
                 .iter()

@@ -26,9 +26,10 @@ use crate::executor::Executor;
 use crate::partitions::PyPartitionKey;
 use crate::repository::PyRunResult;
 use crate::repository::resolved_node::ResolvedNode;
+use crate::storage::DetachOnClose;
 use crate::task::{PyBashTask, PyTask};
 
-#[pyclass(name = "Job", module = "rivers._core")]
+#[pyclass(name = "Job", frozen, module = "rivers._core")]
 pub struct PyJob {
     pub(crate) name: String,
     pub(crate) node_names: Vec<String>,
@@ -49,7 +50,7 @@ pub struct PyJob {
     /// Storage scoped to the owning code location, set by `CodeRepository`
     /// during resolve. `None` for unresolved jobs. Used by `run_record` (which
     /// short-circuits when this is None) and `execute_run` for materialization.
-    storage: Option<ScopedStorageHandle<SurrealStorage>>,
+    storage: Option<DetachOnClose<ScopedStorageHandle<SurrealStorage>>>,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     /// Repository `retries` registry, copied in by `configure_for_repo` so
     /// named refs on actions resolve at execution time.
@@ -79,7 +80,7 @@ impl PyJob {
     }
 
     pub(crate) fn set_storage(&mut self, storage: ScopedStorageHandle<SurrealStorage>) {
-        self.storage = Some(storage);
+        self.storage = Some(DetachOnClose::new(storage));
     }
 
     pub(crate) fn set_resources(
@@ -291,7 +292,7 @@ impl PyJob {
                 }
 
                 if self.allow_incomplete_deps {
-                    let has_handler = Python::attach(|py| dep_node.has_io_handler(py));
+                    let has_handler = dep_node.has_io_handler();
                     if !has_handler {
                         return Err(GraphValidationError::new_err(format!(
                             "Job '{}': node '{}' depends on '{}' which is not in the job \
@@ -460,7 +461,7 @@ impl PyJob {
         let mut node_names = Vec::new();
         for obj in &assets {
             if let Ok(asset) = obj.cast_bound::<PyAsset>(py) {
-                let inner = &asset.borrow().inner;
+                let inner = &asset.get().inner;
                 // Multi-assets are registered in the graph under individual output
                 // names, not the parent function name.
                 if let Some(output_names) = inner.multi_asset_names() {
@@ -479,14 +480,14 @@ impl PyJob {
                 }
             } else if let Ok(task) = obj.cast_bound::<PyTask>(py) {
                 let task_name = task
-                    .borrow()
+                    .get()
                     .inner
                     .name
                     .clone()
                     .ok_or_else(|| GraphValidationError::new_err("Task has no name"))?;
                 node_names.push(task_name);
             } else if let Ok(bash) = obj.cast_bound::<PyBashTask>(py) {
-                node_names.push(bash.borrow().name.clone());
+                node_names.push(bash.get().name.clone());
             } else if let Ok(t) = obj.bind(py).cast::<pyo3::types::PyType>()
                 && t.is_subclass_of::<PyAsset>()?
             {
@@ -637,7 +638,7 @@ impl PyJob {
         }
         let storage = self
             .storage
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
         let registry = self.resolve_io_handler_registry(py)?;
 

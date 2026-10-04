@@ -16,6 +16,31 @@ def my_asset():
     return data
 ```
 
+`rs.Asset(...)` without a function is a decorator. Each function it decorates becomes a new asset with the same settings, so you can use one decorator for many functions. `Asset.from_multi()`, `Asset.from_graph()`, and `Asset.external()` without a function work the same way.
+
+```python
+etl = rs.Asset(group="etl", kinds="table")
+
+@etl
+def orders(): ...
+
+@etl
+def customers(): ...
+```
+
+`etl` stays a decorator: each `@etl` makes a new asset. The decorated `orders` is an asset, not a plain function. Call it only inside an `Asset.from_graph()` body, where `orders()` adds `orders` as an input of the graph:
+
+```python
+@rs.Task
+def summarize(orders): ...
+
+@rs.Asset.from_graph
+def report():
+    return summarize(orders())
+```
+
+Outside a graph body, `orders()` raises `AssetDefinitionError`. `etl()` also raises `AssetDefinitionError`, because `etl` needs one function.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |
@@ -235,7 +260,7 @@ rs.AssetDef(
 
 | Parameter | Type | Default |
 |-----------|------|---------|
-| `name` | `str \| None` | `None` — required except in a class-form `MultiAsset` body, where the attribute name is injected at registration. `from_multi()` rejects an unnamed def. |
+| `name` | `str \| None` | `None` — required except in a class-form `MultiAsset` body, where the output takes the attribute name and the def's own `name` stays `None`. `from_multi()` rejects an unnamed def. |
 | `tags` | `list[str] \| None` | `None` |
 | `kinds` | `str \| list[str] \| None` | `None` |
 | `group` | `str \| None` | `None` |
@@ -368,7 +393,7 @@ def my_asset() -> rs.Output:
     )
 ```
 
-The IO handler receives the **unwrapped value**, not the `Output` object. If combined with `context.add_output_metadata()`, both are merged — `Output` metadata takes precedence on key conflicts.
+The IO handler receives the **unwrapped value**, not the `Output` object. If combined with `context.add_output_metadata()`, both are merged — `Output` metadata takes precedence on key conflicts. Metadata the IO handler adds in `handle_output` takes precedence over both.
 
 **Parameters:**
 

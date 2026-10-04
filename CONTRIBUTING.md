@@ -17,7 +17,7 @@ mise install --locked
 If you prefer to manage tools yourself, the individual prerequisites are listed below.
 
 - **Rust** — install via [rustup](https://rustup.rs); it picks up the version pinned in `rust-toolchain.toml`
-- **Python** ≥ 3.10
+- **Python** ≥ 3.11
 - **[uv](https://docs.astral.sh/uv/)** — package manager for the Python side
 - **[just](https://github.com/casey/just)** — task runner; all dev commands go through the `justfile` at the repo root
 - **[protoc](https://github.com/protocolbuffers/protobuf/releases)** — the gRPC crate generates Rust from `proto/rivers.proto` at build time; the version is pinned in `mise.toml`
@@ -93,7 +93,7 @@ rfc/                Design RFCs
 
 - **Rust:** use `anyhow` for application error handling. Keep modules focused — split when they pass ~500 lines.
 - **Python:** Pydantic `BaseModel` for config and model classes. Google-style docstrings with reStructuredText directives.
-- **PyO3:** 0.28.x with `abi3-py310`. Use `Python::try_attach` (not the removed `with_gil`); `Py::clone_ref(py)` rather than bare `.clone()`.
+- **PyO3:** 0.29.x with `abi3-py311`. Use `Python::try_attach` (not the removed `with_gil`); `Py::clone_ref(py)` rather than bare `.clone()`.
 - **Stubs:** when you change a Python-facing API, update the corresponding `.pyi` file under `python/rivers/`.
 - **Docs:** when you change a public API, add or update the relevant page under `docs/` (built via `just docs-serve` for live preview).
 - **Comments:** default to none. Only write a comment when the *why* is non-obvious — a hidden constraint, an invariant, or a workaround for a specific bug. Don't restate what the code already says.

@@ -5,7 +5,7 @@ use pyo3::types::{PyTuple, PyType};
 ///
 /// Used in type annotations as `SelfDependency[T]` to indicate the asset receives
 /// its own prior output as an input parameter.
-#[pyclass(name = "SelfDependency", module = "rivers._core")]
+#[pyclass(name = "SelfDependency", frozen, module = "rivers._core")]
 pub struct PySelfDependency {
     pub(crate) inner: Option<Py<PyAny>>,
 }

@@ -107,8 +107,9 @@ an asset.
 ## The other three kinds
 
 **Multi assets** gain the most: outputs are attributes, so names aren't repeated as
-strings and per-output configuration sits next to the name it configures. `AssetDef`
-without `name=` takes the attribute name; an explicit `name=` wins:
+strings and per-output configuration sits next to the name it configures. An output
+whose `AssetDef` has no `name=` takes the attribute name (the `AssetDef` itself is not
+changed); an explicit `name=` wins:
 
 ```python
 class Ingest(rs.MultiAsset):

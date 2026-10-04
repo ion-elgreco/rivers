@@ -1,7 +1,6 @@
 //! SensorEvaluationContext — passed to sensor evaluation functions.
-use std::sync::OnceLock;
-
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 
 /// Context passed to sensor evaluation functions.
 #[pyclass(name = "SensorEvaluationContext", frozen, module = "rivers._core")]
@@ -16,7 +15,7 @@ pub struct PySensorEvaluationContext {
     pub last_tick_time: Option<f64>,
     /// Pydantic config instance (set via `SensorEvaluationContext[Config]` generic).
     pub config_instance: Option<Py<PyAny>>,
-    _logger: OnceLock<Py<PyAny>>,
+    _logger: PyOnceLock<Py<PyAny>>,
 }
 
 impl PySensorEvaluationContext {
@@ -26,7 +25,7 @@ impl PySensorEvaluationContext {
             cursor,
             last_tick_time,
             config_instance: None,
-            _logger: OnceLock::new(),
+            _logger: PyOnceLock::new(),
         }
     }
 
@@ -56,14 +55,13 @@ impl PySensorEvaluationContext {
 
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let logger = self._logger.get_or_init(|| {
-            let logging = py.import("logging").expect("failed to import logging");
+        let logger = self._logger.get_or_try_init(py, || {
+            let logging = py.import("logging")?;
             let name = format!("code-repo.sensors.{}", self.sensor_name);
             logging
                 .call_method1("getLogger", (name,))
-                .expect("failed to get logger")
-                .unbind()
-        });
+                .map(Bound::unbind)
+        })?;
         Ok(logger.bind(py).clone())
     }
 

@@ -64,6 +64,8 @@ def my_asset(context: AssetExecutionContext):
 
 Values are auto-coerced to `MetadataValue` (str, int, float, bool, None supported); pass an explicit `MetadataValue` for typed variants.
 
+The entries are stored on the materialization event. If the IO handler adds an entry with the same key in `handle_output`, the handler's value is stored.
+
 #### `register_data_version(version)`
 
 Register a custom data version for this materialization, overriding the auto-generated UUID:

@@ -13,11 +13,10 @@
 //!   be `.await`-ed by an async caller: per-step worker dispatch
 //!   (`executor/dispatch/step_lifecycle.rs`), per-tick eval phases
 //!   (`daemon/schedule.rs`, `daemon/sensors.rs`, `daemon/eval_dispatcher.rs`),
-//!   joining OS threads from async shutdown (`shutdown.rs`). Gated by
-//!   [`crate::daemon::GIL_SEMAPHORE`] where applicable to bound concurrent
-//!   GIL holders.
+//!   joining OS threads from async shutdown (`shutdown.rs`). Evals are capped
+//!   by [`crate::daemon::PY_EVAL_PERMITS`].
 //! * **`std::thread::spawn(...)`** — *long-lived* GIL work that should not
-//!   squat on the bounded blocking pool or hold a `GIL_SEMAPHORE` permit for
+//!   squat on the bounded blocking pool or hold a `PY_EVAL_PERMITS` permit for
 //!   its lifetime: per-run materialize (`backends/local.rs`,
 //!   `daemon/dispatchers.rs::launch_started_run` + Direct dispatcher),
 //!   per-backfill execution (`daemon/subdaemons.rs`, `LocalBackfillDispatcher`),

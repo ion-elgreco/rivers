@@ -44,6 +44,42 @@ pub struct SingleAsset {
     pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
+impl SingleAsset {
+    pub fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            wraps: self.wraps.as_ref().map(|f| f.clone_ref(py)),
+            is_async: self.is_async,
+            name: self.name.clone(),
+            tags: self.tags.clone(),
+            kinds: self.kinds.clone(),
+            group: self.group.clone(),
+            code_version: self.code_version.clone(),
+            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            metadata: self.metadata.clone(),
+            partitions_def: self.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            partition_mapping: self.partition_mapping.clone(),
+            input_dep_names: self.input_dep_names.clone(),
+            dep_only_names: self.dep_only_names.clone(),
+            input_io_handlers: self
+                .input_io_handlers
+                .iter()
+                .map(|(k, h)| (k.clone(), h.clone_ref(py)))
+                .collect(),
+            input_metadata: self.input_metadata.clone(),
+            hooks: self
+                .hooks
+                .as_ref()
+                .map(|hooks| hooks.iter().map(|h| h.clone_ref(py)).collect()),
+            automation_condition: self.automation_condition.clone(),
+            backfill_strategy: self.backfill_strategy.clone(),
+            pool: self.pool.clone(),
+            retry: self.retry.clone(),
+            compute: self.compute.clone(),
+            actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+        }
+    }
+}
+
 /// Python-exposed marker subclass created by the `Asset(...)` decorator.
-#[pyclass(name = "SingleAsset", extends=PyAsset, module = "rivers._core")]
+#[pyclass(name = "SingleAsset", extends=PyAsset, frozen, module = "rivers._core")]
 pub struct PySingleAsset;

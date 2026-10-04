@@ -9,7 +9,7 @@ use crate::automation::sensor::PySensorStatus;
 use crate::repository::PyCodeRepository;
 
 use super::{
-    BoxedPyFuture, GIL_SEMAPHORE, PrecomputedArgs, ResolvedEvalMode, SensorOutcome,
+    BoxedPyFuture, PY_EVAL_PERMITS, PrecomputedArgs, ResolvedEvalMode, SensorOutcome,
     assemble_call_args, extract_sensor_outcome_from_parts, precompute_args, resolve_eval_mode,
 };
 
@@ -107,7 +107,7 @@ pub(super) async fn evaluate_sensor_sync(
     let asset_sel: Option<Vec<String>> = default_asset_selection.map(|s| s.to_vec());
     let launched_by = launched_by.clone();
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<SensorOutcome, String> {
             let ctx = Py::new(
@@ -170,7 +170,7 @@ pub(super) async fn evaluate_sensor_async(
     let asset_sel: Option<Vec<String>> = default_asset_selection.map(|s| s.to_vec());
     let launched_by = launched_by.clone();
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     let rust_future = tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<BoxedPyFuture, String> {
             let ctx = Py::new(
@@ -205,7 +205,7 @@ pub(super) async fn evaluate_sensor_async(
 
     let py_result = rust_future.await.map_err(|e| e.to_string())?;
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<SensorOutcome, String> {
             let parsed = parse_sensor_result(py, &py_result, default_job.as_deref())
