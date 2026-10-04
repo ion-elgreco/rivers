@@ -193,9 +193,12 @@ pods run*. Omit it in git mode to run the chart's default runtime image
 publishes this image for Python 3.11, 3.12 and 3.13 (tags
 `<version>-py3.11`, `-py3.12`, `-py3.13`), for `linux/amd64` and
 `linux/arm64`. The init container that builds the trees is
-`rivers workspace-sync`, from the rivers package in the image: a runtime
-image you build yourself needs git, uv 0.10.0 or later, and the rivers
-package of the chart's version. `spec.tag` or `spec.digest` on its own replaces that
+`rivers-runtime workspace-sync`, a static binary in the image: a runtime
+image you build yourself needs git, uv 0.10.0 or later, the rivers package
+of the chart's version, and `/usr/local/bin/rivers-runtime` from the
+published image (`COPY --from=ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.12
+/usr/local/bin/rivers-runtime /usr/local/bin/`). `spec.tag` or `spec.digest`
+on its own replaces that
 image's tag or digest, e.g. `tag: 0.5.0-py3.11` for another interpreter.
 Set `spec.image` to use a private mirror
 (`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`); as

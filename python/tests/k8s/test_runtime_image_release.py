@@ -39,6 +39,10 @@ GLIBC_WHEEL_TARGETS = {
     "amd64": "x86_64-unknown-linux-gnu",
     "arm64": "aarch64-unknown-linux-gnu",
 }
+MUSL_TARGETS = {
+    "amd64": "x86_64-unknown-linux-musl",
+    "arm64": "aarch64-unknown-linux-musl",
+}
 VERSION = "1.2.3"
 GITHUB = {
     "ref_name": f"v{VERSION}",
@@ -71,6 +75,7 @@ class Release:
     builds: list[Build]
     manifests: dict[str, list[str]]
     artifacts: dict[str, dict]
+    uploads: dict[str, str]
 
 
 def _load_workflow(path: Path) -> dict:
@@ -142,19 +147,28 @@ def _builds_runtime_image(job: dict) -> bool:
     )
 
 
-def _uploaded_artifacts(job: dict) -> dict[str, dict]:
-    """Artifact name -> the matrix combination of the job run that uploads it."""
+def _uploaded_artifacts(job: dict) -> dict[str, tuple[dict, str]]:
+    """Artifact name -> (the matrix combination of the job run that uploads it, its path)."""
     uploads = {}
     for combo in _combos(job):
         ctx = {"github": GITHUB, "matrix": combo}
         for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/upload-artifact@"):
-                uploads[_render(step["with"]["name"], ctx)] = combo
+                uploads[_render(step["with"]["name"], ctx)] = (
+                    combo,
+                    _render(step["with"]["path"], ctx),
+                )
     return uploads
 
 
-def _run_job(workflow: dict, job: dict, matrix: dict, workdir: Path) -> JobRun:
-    """Run one matrix combination of a job: shell steps for real, actions as stand-ins."""
+def _run_job(
+    workflow: dict, job: dict, matrix: dict, workdir: Path, uploads: dict[str, str]
+) -> JobRun:
+    """Run one matrix combination of a job: shell steps for real, actions as stand-ins.
+
+    A downloaded artifact stands in as one file named after what its job
+    uploaded: ``<name>.whl`` for a wheel glob, else the uploaded file's name.
+    """
     workspace = workdir / "workspace"
     fake_bin = workdir / "bin"
     workspace.mkdir(parents=True)
@@ -212,7 +226,9 @@ def _run_job(workflow: dict, job: dict, matrix: dict, workdir: Path) -> JobRun:
             name = _render(args["name"], ctx)
             dest = workspace / _render(args.get("path", "."), ctx)
             dest.mkdir(parents=True, exist_ok=True)
-            (dest / f"{name}.whl").touch()
+            uploaded = uploads.get(name, f"{name}.whl")
+            file = f"{name}.whl" if "*" in uploaded else Path(uploaded).name
+            (dest / file).touch()
         elif uses.startswith("docker/build-push-action@"):
             context = workspace / _render(args["context"], ctx)
             build_args = _render(args.get("build-args", ""), ctx)
@@ -255,29 +271,38 @@ def release(tmp_path) -> Release:
     builds: list[Build] = []
     manifests: dict[str, list[str]] = {}
     artifacts: dict[str, dict] = {}
+    uploads: dict[str, str] = {}
     for w, workflow in enumerate(_tag_release_workflows()):
         jobs = workflow["jobs"]
         for job_id, job in jobs.items():
             if not _builds_runtime_image(job):
                 continue
             for upstream in _needs(job):
-                artifacts.update(_uploaded_artifacts(jobs[upstream]))
+                for name, (combo, path) in _uploaded_artifacts(jobs[upstream]).items():
+                    artifacts[name] = combo
+                    uploads[name] = path
             for i, combo in enumerate(_combos(job)):
                 builds += _run_job(
-                    workflow, job, combo, tmp_path / f"{w}-{job_id}-{i}"
+                    workflow, job, combo, tmp_path / f"{w}-{job_id}-{i}", uploads
                 ).builds
             for other_id, other in jobs.items():
                 if job_id not in _needs(other):
                     continue
                 for i, combo in enumerate(_combos(other)):
                     run = _run_job(
-                        workflow, other, combo, tmp_path / f"{w}-{other_id}-{i}"
+                        workflow,
+                        other,
+                        combo,
+                        tmp_path / f"{w}-{other_id}-{i}",
+                        uploads,
                     )
                     for call in run.docker_calls:
                         if call[:3] == ["buildx", "imagetools", "create"]:
                             tags, sources = _imagetools_create(call[3:])
                             manifests.update(dict.fromkeys(tags, sources))
-    return Release(builds=builds, manifests=manifests, artifacts=artifacts)
+    return Release(
+        builds=builds, manifests=manifests, artifacts=artifacts, uploads=uploads
+    )
 
 
 def _chart_values() -> dict:
@@ -365,4 +390,15 @@ def test_runtime_images_install_the_release_glibc_wheel_of_their_arch(release):
                 for w in wheels
             ]
             assert targets == [target], f"py{python} {arch} context: {sorted(context)}"
-            assert context == {f"wheels/{w}" for w in wheels}, sorted(context)
+            assert context == {f"wheels/{w}" for w in wheels} | {"rivers-runtime"}, (
+                sorted(context)
+            )
+
+
+def test_runtime_images_carry_the_static_rivers_runtime_of_their_arch(release):
+    for arch, target in MUSL_TARGETS.items():
+        name = f"rivers-runtime-{arch}"
+        assert release.artifacts.get(name, {}).get("target") == target, (
+            f"{name}: {release.artifacts.get(name)}"
+        )
+        assert release.uploads[name].endswith(f"{target}/release/rivers-runtime")
