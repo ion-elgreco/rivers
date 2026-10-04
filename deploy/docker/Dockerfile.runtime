@@ -1,16 +1,16 @@
 # rivers-runtime — base image for git-sourced CodeLocations.
 #
-# Carries python, uv, git, CA certs and the rivers CLI, whose
-# `workspace-sync` command builds the trees. Published per Python version
-# for linux/amd64 and linux/arm64 by the release-python workflow:
+# Carries python, uv, git, CA certs, the rivers CLI and `rivers-runtime`,
+# whose `workspace-sync` command builds the trees. Published per Python
+# version for linux/amd64 and linux/arm64 by the release-python workflow:
 #   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13
 #
-# Build context must contain the rivers wheel under wheels/ (the release
-# stages the glibc wheel of the image's arch there; `just k8s-build` stages
-# a local build).
+# Build context must contain the rivers wheel under wheels/ and the static
+# rivers-runtime binary of the image's arch (the release stages both;
+# `just k8s-build` stages local builds).
 #
-# Not distroless: python, git and ssh come from Debian packages here,
-# though nothing in the image needs a shell any more. Hardening: slim Debian
+# Not distroless: python, git and ssh come from Debian packages here;
+# rivers-runtime is static (musl) and nothing in the image needs a shell. Hardening: slim Debian
 # base, non-root user, no build toolchain. Not pinned: the python base tag and
 # uv:latest follow upstream at build time. CI does not scan the image for
 # CVEs.
@@ -32,6 +32,9 @@ RUN apt-get update \
 
 COPY wheels/*.whl /tmp/wheels/
 RUN uv pip install --system --no-cache /tmp/wheels/*.whl && rm -rf /tmp/wheels
+
+COPY rivers-runtime /usr/local/bin/rivers-runtime
+RUN chmod 0755 /usr/local/bin/rivers-runtime
 
 ARG RIVERS_VERSION=dev
 ARG RIVERS_REVISION=unknown

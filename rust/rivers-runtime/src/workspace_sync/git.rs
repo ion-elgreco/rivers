@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use base64::Engine as _;
@@ -40,10 +40,10 @@ pub(crate) fn auth(url: &str, paths: &Paths) -> Result<Auth, Failure> {
         read_key(creds_dir, "identity")?;
         read_key(creds_dir, "known_hosts")?;
         // git hands GIT_SSH_COMMAND to `sh -c` as soon as it holds a space.
-        // GIT_SSH takes a program only: the options live in a helper the
-        // kernel runs through its shebang — the image needs no shell.
-        let helper = paths.workspace.join(".git-ssh");
-        write_ssh_helper(&helper, &identity, &known_hosts)?;
+        // GIT_SSH takes a program only: a symlink to this binary, which run
+        // by that name execs ssh with the options — no shell, no interpreter.
+        let helper = paths.workspace.join(GIT_SSH_HELPER);
+        link_helper(&helper)?;
         auth.env
             .push(("GIT_SSH".to_string(), helper.display().to_string()));
         // Without it git probes an unknown program with `ssh -G` first.
@@ -62,26 +62,70 @@ pub(crate) fn auth(url: &str, paths: &Paths) -> Result<Auth, Failure> {
     Ok(auth)
 }
 
-/// `GIT_SSH` runs `<helper> [-p port] host command`; the helper execs ssh
-/// with the Secret's identity and known_hosts in front of git's arguments.
-/// Its interpreter is the Python running `rivers`.
-fn write_ssh_helper(helper: &Path, identity: &Path, known_hosts: &Path) -> Result<(), Failure> {
-    let python = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/env python3"));
-    let script = format!(
-        "#!{}\nimport os, sys\nos.execvp(\"ssh\", [\"ssh\", \"-i\", {:?}, \"-o\", {:?}, \"-o\", \"StrictHostKeyChecking=yes\", \"-o\", \"IdentitiesOnly=yes\", *sys.argv[1:]])\n",
-        python.display(),
-        identity.display().to_string(),
-        format!("UserKnownHostsFile={}", known_hosts.display()),
-    );
+/// Name of the `GIT_SSH` symlink in the tree; run by that name, the binary
+/// is the ssh helper.
+pub const GIT_SSH_HELPER: &str = ".git-ssh";
+
+fn link_helper(helper: &Path) -> Result<(), Failure> {
     let failed =
-        |e: std::io::Error| Failure::Message(format!("cannot write {}: {e}", helper.display()));
-    fs::write(helper, script).map_err(failed)?;
+        |e: std::io::Error| Failure::Message(format!("cannot link {}: {e}", helper.display()));
+    let binary = std::env::current_exe().map_err(failed)?;
+    if fs::symlink_metadata(helper).is_ok() {
+        fs::remove_file(helper).map_err(failed)?;
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(helper, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+        std::os::unix::fs::symlink(&binary, helper).map_err(failed)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = binary;
+        Err(failed(std::io::Error::other(
+            "the ssh helper needs a Unix filesystem",
+        )))
+    }
+}
+
+/// What git runs as `GIT_SSH`: ssh with the Secret's identity and
+/// known_hosts in front of git's arguments (`[-p port] host command`).
+pub fn git_ssh(args: &[String]) -> i32 {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let paths = Paths::from_lookup(&env);
+    let mut cmd = Command::new("ssh");
+    cmd.args(ssh_options(&paths.creds_dir)).args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let error = cmd.exec();
+        log(format_args!("cannot run ssh: {error}"));
+        127
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(status) => child::exit_code(&status),
+            Err(error) => {
+                log(format_args!("cannot run ssh: {error}"));
+                127
+            }
+        }
+    }
+}
+
+fn ssh_options(creds_dir: &Path) -> [String; 8] {
+    [
+        "-i".to_string(),
+        creds_dir.join("identity").display().to_string(),
+        "-o".to_string(),
+        format!(
+            "UserKnownHostsFile={}",
+            creds_dir.join("known_hosts").display()
+        ),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+    ]
 }
 
 /// A Secret key the url needs. An unreadable key must stop the build here:
@@ -254,6 +298,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_auth_runs_ssh_through_a_helper_without_a_shell() {
         let dir = tempdir().unwrap();
@@ -262,7 +307,7 @@ mod tests {
             &paths.creds_dir,
             &["identity", "known_hosts", "username", "password"],
         );
-        let helper = paths.workspace.join(".git-ssh");
+        let helper = paths.workspace.join(GIT_SSH_HELPER);
         assert_eq!(
             auth(SSH_URL, &paths),
             Ok(Auth {
@@ -273,22 +318,26 @@ mod tests {
                 ],
             })
         );
+        assert_eq!(
+            fs::read_link(&helper).unwrap(),
+            std::env::current_exe().unwrap()
+        );
         let creds = paths.creds_dir.display();
         assert_eq!(
-            fs::read_to_string(&helper).unwrap(),
-            format!(
-                "#!{}\nimport os, sys\nos.execvp(\"ssh\", [\"ssh\", \"-i\", \"{creds}/identity\", \"-o\", \"UserKnownHostsFile={creds}/known_hosts\", \"-o\", \"StrictHostKeyChecking=yes\", \"-o\", \"IdentitiesOnly=yes\", *sys.argv[1:]])\n",
-                std::env::current_exe().unwrap().display()
-            )
+            ssh_options(&paths.creds_dir).to_vec(),
+            vec![
+                "-i".to_string(),
+                format!("{creds}/identity"),
+                "-o".to_string(),
+                format!("UserKnownHostsFile={creds}/known_hosts"),
+                "-o".to_string(),
+                "StrictHostKeyChecking=yes".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+            ]
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                fs::metadata(&helper).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-        }
+        // Linking again replaces the symlink.
+        assert!(auth(SSH_URL, &paths).is_ok());
     }
 
     #[test]

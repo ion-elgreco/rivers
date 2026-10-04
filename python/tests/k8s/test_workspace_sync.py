@@ -1,4 +1,4 @@
-"""``rivers workspace-sync``, run against a local git remote and a fake ``uv``.
+"""``rivers-runtime workspace-sync``, run against a local git remote and a fake ``uv``.
 
 Shared mode keeps one uv cache on the PVC. After each successful build the
 sync prunes it to the wheels built from source (``uv cache prune --ci``).

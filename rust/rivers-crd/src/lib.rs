@@ -5,3 +5,4 @@
 pub mod crd;
 pub mod defaults;
 pub mod quantity;
+pub mod workspace;

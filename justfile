@@ -41,10 +41,12 @@ wasm-dev:
 # Build and install rivers as editable (release WASM — use for UI work or shipping)
 develop: venv wasm
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
+    cargo build -p rivers-runtime --profile {{ profile }}
 
 # Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
 develop-fast: venv wasm-dev
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
+    cargo build -p rivers-runtime --profile {{ profile }}
 
 # Build and install rivers as editable (release mode, stripped WASM)
 develop-release: venv wasm
@@ -52,11 +54,11 @@ develop-release: venv wasm
 
 # Run Python tests
 test:
-    uv run --no-sync pytest python/
+    RIVERS_RUNTIME_BIN='{{ justfile_directory() }}/target/{{ profile_dir }}/rivers-runtime' uv run --no-sync pytest python/
 
 # Run Python tests (excluding spark tests)
 test-dev:
-    uv run --no-sync pytest -m "not spark_test" python/
+    RIVERS_RUNTIME_BIN='{{ justfile_directory() }}/target/{{ profile_dir }}/rivers-runtime' uv run --no-sync pytest -m "not spark_test" python/
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
@@ -177,6 +179,8 @@ site-deploy push="--push":
 # === K8s Integration Testing ===
 
 linux_target := "aarch64-unknown-linux-gnu"
+# rivers-runtime is static: the runtime image copies it whatever its libc.
+linux_musl_target := "aarch64-unknown-linux-musl"
 cluster_name := env_var_or_default("RIVERS_K3D_CLUSTER", "rivers-test")
 
 # Regenerate CRD YAML from Rust types (source of truth) into the rivers-crds Helm chart
@@ -204,6 +208,7 @@ k8s-build: _k8s-compile
     docker build -f dev/k3d/Dockerfile.code-location -t rivers-code-location:latest deploy/staging
     # rivers-runtime: the git-sourced CodeLocation base image.
     mkdir -p deploy/staging/wheels && cp dist/*.whl deploy/staging/wheels/
+    cp target/{{ linux_musl_target }}/debug/rivers-runtime deploy/staging/
     docker build -f deploy/docker/Dockerfile.runtime -t rivers-runtime:latest deploy/staging
     if [ "${RIVERS_K8S_SKIP_DEMO:-}" != "1" ]; then
         cp -r examples/demo_project deploy/staging/demo_project
@@ -219,6 +224,8 @@ _k8s-compile: wasm _k8s-wheel
     #!/usr/bin/env bash
     set -euo pipefail
     cargo zigbuild -p rivers-operator --target {{ linux_target }}
+    rustup target add {{ linux_musl_target }} >/dev/null
+    cargo zigbuild -p rivers-runtime --target {{ linux_musl_target }}
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
     fi

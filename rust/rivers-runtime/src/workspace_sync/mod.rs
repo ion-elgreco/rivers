@@ -1,5 +1,5 @@
 //! The `workspace` init container of git-sourced CodeLocation pods,
-//! run as `rivers workspace-sync`: builds the tree at the workspace mount
+//! run as `rivers-runtime workspace-sync`: builds the tree at the workspace mount
 //! (checkout + venv), then prunes the trees beside it on the shared volume.
 //! Driven by env:
 //!
@@ -61,9 +61,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::crd::run::RunSource;
-use crate::env::ENV_RUN_SOURCE;
-use crate::workspace::{GIT_CREDS_MOUNT, WORKSPACE_MOUNT, WORKSPACES_ROOT_MOUNT};
+use rivers_crd::crd::run::RunSource;
+use rivers_crd::workspace::{
+    ENV_RUN_SOURCE, GIT_CREDS_MOUNT, WORKSPACE_MOUNT, WORKSPACES_ROOT_MOUNT,
+};
 
 mod child;
 mod deps;
@@ -71,6 +72,7 @@ mod git;
 mod prune;
 
 use child::Deadline;
+pub use git::{GIT_SSH_HELPER, git_ssh};
 
 pub const LOG_PREFIX: &str = "workspace-sync: ";
 const TERMINATION_LOG: &str = "/dev/termination-log";
@@ -347,8 +349,8 @@ impl BuildLock {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::crd::code_location::{Dependencies, DependencyMode};
-    use crate::crd::run::GitCoordinates;
+    use rivers_crd::crd::code_location::{Dependencies, DependencyMode};
+    use rivers_crd::crd::run::GitCoordinates;
 
     pub(crate) fn config(workspace: &Path, path: Option<&str>, mode: DependencyMode) -> Config {
         Config {

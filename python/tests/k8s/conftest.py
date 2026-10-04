@@ -1,10 +1,10 @@
-"""Harness for running ``rivers workspace-sync`` on the host.
+"""Harness for running ``rivers-runtime workspace-sync`` on the host.
 
-The command runs the way the init container runs it, as the venv's
-``rivers`` console script, but against a git remote in ``tmp_path`` (a
-``file://`` URL), a fake ``uv`` that records its arguments and hands
-``uv workspace`` queries to the real uv, and a ``python3`` that records its
-arguments before it runs. Each ``WorkspaceSync.run`` gets a new, empty
+The binary runs the way the init container runs it (``just develop-fast``
+builds it; ``RIVERS_RUNTIME_BIN`` names another build), but against a git
+remote in ``tmp_path`` (a ``file://`` URL), a fake ``uv`` that records its
+arguments and hands ``uv workspace`` queries to the real uv, and a
+``python3`` that records its arguments before it runs. Each ``WorkspaceSync.run`` gets a new, empty
 termination log, as kubelet gives each container start one.
 
 A held step waits until the test releases it (``WorkspaceSync.release``), or
@@ -28,7 +28,13 @@ from typing import IO
 
 import pytest
 
-SYNC_COMMAND = [str(Path(sys.executable).with_name("rivers")), "workspace-sync"]
+RUNTIME_BIN = Path(
+    os.environ.get(
+        "RIVERS_RUNTIME_BIN",
+        Path(__file__).resolve().parents[3] / "target" / "debug" / "rivers-runtime",
+    )
+)
+SYNC_COMMAND = [str(RUNTIME_BIN), "workspace-sync"]
 RUNTIME_IMAGE = "ghcr.io/example/rivers-runtime@sha256:" + "1a2b3c4d" * 8
 _GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "rivers",
@@ -470,6 +476,10 @@ def workspace_sync(tmp_path: Path) -> Iterator[WorkspaceSync]:
     """A fresh remote and volume for one test."""
     if sys.platform == "win32":
         pytest.skip("the workspace sync runs in Linux pods")
+    if not RUNTIME_BIN.exists():
+        pytest.fail(
+            f"{RUNTIME_BIN} is missing: run `just develop-fast`, which builds rivers-runtime"
+        )
     sync = WorkspaceSync(tmp_path)
     yield sync
     sync.stop()

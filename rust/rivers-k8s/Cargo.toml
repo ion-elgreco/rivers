@@ -24,15 +24,8 @@ rivers-core = { path = "../rivers-core" }
 anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
-# `rivers workspace-sync`: the Basic auth header for git over https.
-base64.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-# `rivers workspace-sync`: SIGTERM to a child's process group past the build budget.
-libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [[bin]]

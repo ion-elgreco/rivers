@@ -239,7 +239,7 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
 /// Jobs it launches get the same tree. `RIVERS_RUN_SOURCE`
 /// carries the tree's `RunSource` as JSON — one typed channel instead of a
 /// fan of `RIVERS_GIT_*` vars.
-pub const ENV_RUN_SOURCE: &str = "RIVERS_RUN_SOURCE";
+pub use rivers_crd::workspace::ENV_RUN_SOURCE;
 /// Shared-mode PVC claim name; unset/empty means emptyDir fallback.
 pub const ENV_WORKSPACE_PVC: &str = "RIVERS_WORKSPACE_PVC";
 pub const ENV_WORKSPACE_EMPTYDIR_LIMIT: &str = "RIVERS_WORKSPACE_EMPTYDIR_LIMIT";

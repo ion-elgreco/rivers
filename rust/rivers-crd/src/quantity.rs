@@ -1,5 +1,8 @@
 //! Kubernetes quantities (`10Gi`, `500M`, `1e9`) as the API server reads
 //! them, for the sizes the operator copies into PVCs and `emptyDir`s.
+//! Not `kube_quantity` (which rivers-k8s uses for arithmetic): its parser
+//! takes `1e3Ki` and `++1`, which the API server refuses, and refuses `1E`
+//! and `1Ei`, which it takes — and a CRD `pattern` needs the regex anyway.
 
 /// Schema `pattern` of [`is_positive`] for CRD fields, except that it takes
 /// an exponent of any size.

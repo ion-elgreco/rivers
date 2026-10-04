@@ -7,4 +7,3 @@ pub mod executor;
 pub mod resume;
 pub mod run_backend;
 pub mod workspace;
-pub mod workspace_sync;

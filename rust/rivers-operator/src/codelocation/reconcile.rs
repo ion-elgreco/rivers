@@ -1050,7 +1050,7 @@ async fn ensure_workspace_pvc(
 }
 
 /// Build [`GitCredentials`] from the CR's Secret. The url's scheme picks the
-/// keys, like the pod's `rivers workspace-sync`: `ssh://` needs `identity` +
+/// keys, like the pod's `rivers-runtime workspace-sync`: `ssh://` needs `identity` +
 /// `known_hosts`;
 /// `https://` / `http://` use `username` + `password`, or none for an
 /// anonymous fetch. These two lose their trailing newlines, as the pod's sync

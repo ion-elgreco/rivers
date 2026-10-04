@@ -15,7 +15,7 @@
 //! container:
 //!
 //! * **builder** (the code-location pod) — always runs
-//!   `rivers workspace-sync`; in shared mode it then prunes the trees beside
+//!   `rivers-runtime workspace-sync`; in shared mode it then prunes the trees beside
 //!   its own ([`Prune`]): it mounts the PVC root at `/workspaces` to see
 //!   them, and receives the keep-set via `configMapKeyRef` (never inline — an
 //!   inline value would live in the pod template and roll the Deployment on
@@ -35,22 +35,19 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::crd::run::RunSource;
 
+pub use rivers_crd::workspace::{
+    GIT_CREDS_MOUNT, SYNC_COMMAND, SYNC_CONTAINER, UV_CACHE_MOUNT, VENV_PATH, WORKSPACE_MOUNT,
+    WORKSPACES_ROOT_MOUNT,
+};
+
 pub const WORKSPACE_VOLUME: &str = "workspace";
 pub const GIT_CREDS_VOLUME: &str = "git-credentials";
-pub const WORKSPACE_MOUNT: &str = "/workspace";
-pub const WORKSPACES_ROOT_MOUNT: &str = "/workspaces";
-pub const UV_CACHE_MOUNT: &str = "/uv-cache";
 pub const UV_CACHE_SUBPATH: &str = "cache";
-pub const GIT_CREDS_MOUNT: &str = "/etc/rivers/git";
 /// The pod `command` in git mode, whatever the dependencies mode: in mode
 /// `none` the sync links it to the runtime image's `rivers`.
 const VENV_RIVERS_BIN: &str = "/workspace/venv/bin/rivers";
-pub const VENV_PATH: &str = "/workspace/venv";
 /// The checkout.
 const SRC_PATH: &str = "/workspace/src";
-pub const SYNC_COMMAND: [&str; 2] = ["rivers", "workspace-sync"];
-/// The init container that runs [`SYNC_COMMAND`].
-pub const SYNC_CONTAINER: &str = "workspace";
 pub const KEEP_CONFIG_MAP_KEY: &str = "keep";
 /// GID of the runtime image's `USER` (deploy/docker/Dockerfile.runtime).
 pub const RUNTIME_GID: i64 = 65532;
@@ -449,7 +446,7 @@ mod tests {
                 "name": "workspace",
                 "image": "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff",
                 "imagePullPolicy": "IfNotPresent",
-                "command": ["rivers", "workspace-sync"],
+                "command": ["rivers-runtime", "workspace-sync"],
                 "terminationMessagePolicy": "FallbackToLogsOnError",
                 "securityContext": {
                     "allowPrivilegeEscalation": false,

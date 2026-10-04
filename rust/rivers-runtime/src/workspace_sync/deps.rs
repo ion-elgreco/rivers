@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::crd::code_location::DependencyMode;
+use rivers_crd::crd::code_location::DependencyMode;
 
 use super::child::{self, Deadline, Output};
 use super::{Config, Failure, log};

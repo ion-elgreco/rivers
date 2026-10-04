@@ -749,7 +749,7 @@ mod tests {
             "name": "workspace",
             "image": "ghcr.io/rt@sha256:1a2b3c4dff",
             "imagePullPolicy": "IfNotPresent",
-            "command": ["rivers", "workspace-sync"],
+            "command": ["rivers-runtime", "workspace-sync"],
             "terminationMessagePolicy": "FallbackToLogsOnError",
             "securityContext": {
                 "allowPrivilegeEscalation": false,
@@ -868,7 +868,7 @@ mod tests {
             "name": "workspace",
             "image": "ghcr.io/rt@sha256:1a2b3c4dff",
             "imagePullPolicy": "IfNotPresent",
-            "command": ["rivers", "workspace-sync"],
+            "command": ["rivers-runtime", "workspace-sync"],
             "terminationMessagePolicy": "FallbackToLogsOnError",
             "securityContext": {
                 "allowPrivilegeEscalation": false,

@@ -6860,19 +6860,16 @@ name = "rivers-k8s"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "k8s-openapi",
  "kube-client",
  "kube-core",
  "kube_quantity",
- "libc",
  "rivers-core",
  "rivers-crd",
  "rust_decimal",
  "serde",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -6921,6 +6918,17 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "rivers-runtime"
+version = "0.0.0-dev"
+dependencies = [
+ "base64 0.23.1",
+ "libc",
+ "rivers-crd",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
