@@ -133,10 +133,7 @@ impl<'py> Capture<'py> {
         exc: &Bound<'py, PyAny>,
         depth: usize,
     ) -> PyResult<(Vec<Vec<ExceptionInfo>>, u32)> {
-        // Python 3.10 has no exception groups.
-        let Ok(members) = te.getattr("exceptions") else {
-            return Ok((Vec::new(), 0));
-        };
+        let members = te.getattr("exceptions")?;
         if members.is_none() {
             return Ok((Vec::new(), 0));
         }

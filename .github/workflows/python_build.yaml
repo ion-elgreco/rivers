@@ -44,7 +44,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.11", "3.13"]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -118,7 +118,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.10" }
+          - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.11" }
           - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.13" }
           - { label: linux-glibc-arm64, runner: ubuntu-24.04-arm, python-version: "3.13" }
           - { label: macos-arm64, runner: macos-15, python-version: "3.13" }

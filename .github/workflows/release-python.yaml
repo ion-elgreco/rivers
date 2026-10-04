@@ -3,8 +3,8 @@ name: release-python
 # Builds the rivers Python wheels for all supported platforms and
 # publishes to PyPI via Trusted Publishing on tag push (v*.*.*).
 #
-# Wheels are abi3-py310, so one wheel per (os, libc, arch) covers
-# Python 3.10+. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
+# Wheels are abi3-py311, so one wheel per (os, libc, arch) covers
+# Python 3.11+. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
 # linux-musl/{x86_64, aarch64} (musllinux_1_2), macos/{x86_64, arm64},
 # windows/x86_64.
 

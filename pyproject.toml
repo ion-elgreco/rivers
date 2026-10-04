@@ -1,7 +1,7 @@
 [project]
 name = "rivers-workspace"
 version = "0.0.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [tool.uv]
 default-groups = ["dev", "grpc"]
