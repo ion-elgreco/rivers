@@ -10,6 +10,8 @@ profile := env_var_or_default("PROFILE", "dev")
 # profile (release, ci, ...) outputs to `target/<triple>/<profile>/`.
 
 profile_dir := if profile == "dev" { "debug" } else { profile }
+# The pod-side binary the k8s tests run (python/tests/k8s), built by `_runtime-bin`.
+runtime_bin := justfile_directory() + "/target/" + profile_dir + "/rivers-runtime"
 
 # Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
 # behavior. Keep in sync with the pipx install in .github/actions/setup-env.
@@ -43,34 +45,36 @@ wasm-dev:
     wasm-bindgen target/wasm32-unknown-unknown/{{ profile_dir }}/rivers_ui.wasm --out-dir rust/rivers-ui/pkg --target web --no-typescript
 
 # Build and install rivers as editable (release WASM — use for UI work or shipping)
-develop: venv wasm
+develop: venv wasm _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
-    cargo build -p rivers-runtime --profile {{ profile }}
 
 # Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
-develop-fast: venv wasm-dev
+develop-fast: venv wasm-dev _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
-    cargo build -p rivers-runtime --profile {{ profile }}
 
 # develop-fast for free-threaded Python (3.14t), into .venv-ft
-develop-ft: venv-ft wasm-dev
+develop-ft: venv-ft wasm-dev _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv-ft' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # Build and install rivers as editable (release mode, stripped WASM)
-develop-release: venv wasm
+develop-release: venv wasm _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --release
 
+# rivers-runtime for the host, as `just test` runs it; the profile follows PROFILE like maturin's.
+_runtime-bin:
+    cargo build -p rivers-runtime --profile {{ profile }}
+
 # Run Python tests
-test:
-    RIVERS_RUNTIME_BIN='{{ justfile_directory() }}/target/{{ profile_dir }}/rivers-runtime' uv run --no-sync pytest python/
+test: _runtime-bin
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest python/
 
 # Run Python tests on free-threaded Python; an import that turns the GIL back on fails
-test-ft:
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
+test-ft: _runtime-bin
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
 
 # Run Python tests (excluding spark tests)
-test-dev:
-    RIVERS_RUNTIME_BIN='{{ justfile_directory() }}/target/{{ profile_dir }}/rivers-runtime' uv run --no-sync pytest -m "not spark_test" python/
+test-dev: _runtime-bin
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "not spark_test" python/
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
