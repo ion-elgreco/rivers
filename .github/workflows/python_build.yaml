@@ -128,6 +128,7 @@ jobs:
           - { label: linux-glibc-arm64, runner: ubuntu-24.04-arm, python-version: "3.13" }
           - { label: macos-arm64, runner: macos-15, python-version: "3.13" }
           - { label: windows-x86_64, runner: windows-latest, python-version: "3.13" }
+          - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.14" }
           # Free-threaded (no GIL) builds
           - { label: linux-glibc-x86_64, runner: ubuntu-latest, python-version: "3.14t" }
           - { label: linux-glibc-arm64, runner: ubuntu-24.04-arm, python-version: "3.14t" }
