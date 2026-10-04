@@ -6840,6 +6840,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivers-crd"
+version = "0.0.0-dev"
+dependencies = [
+ "k8s-openapi",
+ "kube-client",
+ "kube-core",
+ "kube-derive",
+ "regex",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_yaml 0.9.34+deprecated",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "rivers-k8s"
 version = "0.0.0-dev"
 dependencies = [
@@ -6848,17 +6864,14 @@ dependencies = [
  "k8s-openapi",
  "kube-client",
  "kube-core",
- "kube-derive",
  "kube_quantity",
  "libc",
- "regex",
  "rivers-core",
+ "rivers-crd",
  "rust_decimal",
- "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
