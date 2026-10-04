@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::sync::MutexExt;
+use pyo3::types::{IntoPyDict, PyDict};
 
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::{MetadataValue, coerce_metadata_dict};
 use crate::partitions::PartitionContext;
 
 #[pyclass(name = "OutputContext", frozen, module = "rivers._core")]
@@ -21,7 +22,7 @@ pub struct PyOutputContext {
     pub partition: Option<PartitionContext>,
     #[pyo3(get)]
     pub type_hint: Option<Py<PyAny>>,
-    _output_metadata: Mutex<HashMap<String, MetadataValue>>,
+    _output_metadata: Mutex<Vec<(String, MetadataValue)>>,
     _data_version: Mutex<Option<String>>,
 }
 
@@ -37,7 +38,7 @@ impl PyOutputContext {
             asset_metadata,
             partition,
             type_hint,
-            _output_metadata: Mutex::new(HashMap::new()),
+            _output_metadata: Mutex::new(Vec::new()),
             _data_version: Mutex::new(None),
         }
     }
@@ -54,9 +55,14 @@ impl PyOutputContext {
             asset_metadata,
             partition,
             type_hint,
-            _output_metadata: Mutex::new(initial.into_iter().collect()),
+            _output_metadata: Mutex::new(initial),
             _data_version: Mutex::new(None),
         }
+    }
+
+    /// The metadata it was built with, overlaid by what the handler added.
+    pub fn drain_output_metadata(&self, py: Python<'_>) -> Vec<(String, MetadataValue)> {
+        std::mem::take(&mut *self._output_metadata.lock_py_attached(py).unwrap())
     }
 }
 
@@ -76,11 +82,14 @@ impl PyOutputContext {
     /// Add output metadata from a dict of key-value pairs.
     /// Values can be MetadataValue or raw str/int/float/bool/None (auto-coerced).
     fn add_output_metadata(&self, metadata: Bound<'_, PyDict>) -> PyResult<()> {
-        let mut entries = self._output_metadata.lock().unwrap();
-        for (k, v) in metadata.iter() {
-            let key: String = k.extract()?;
-            let mv = coerce_to_metadata_value(v.py(), &v)?;
-            entries.insert(key, mv);
+        let entries = coerce_metadata_dict(&metadata)?;
+        let mut stored = self
+            ._output_metadata
+            .lock_py_attached(metadata.py())
+            .unwrap();
+        for (key, value) in entries {
+            stored.retain(|(k, _)| *k != key);
+            stored.push((key, value));
         }
         Ok(())
     }
@@ -94,15 +103,11 @@ impl PyOutputContext {
     /// The output metadata collected by IO handlers, or None if empty.
     #[getter]
     fn output_metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let entries = self._output_metadata.lock().unwrap();
+        let entries = self._output_metadata.lock_py_attached(py).unwrap().clone();
         if entries.is_empty() {
             return Ok(py.None());
         }
-        let dict = PyDict::new(py);
-        for (k, v) in &*entries {
-            dict.set_item(k, v.clone())?;
-        }
-        Ok(dict.into())
+        Ok(entries.into_py_dict(py)?.into_any().unbind())
     }
 
     pub fn drain_data_version(&self) -> Option<String> {

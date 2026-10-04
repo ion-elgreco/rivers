@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ConditionEvalWriteMsg, TickWriteMsg};
 use crate::executor::ops::now_ts;
 use crate::partitions::{PartitionMapping, PartitionsDefinition};
-use crate::repository::PyCodeRepository;
+use crate::repository::ResolvedState;
 use crate::repository::resolved_node::ResolvedNode;
 
 mod engine;
@@ -117,75 +117,64 @@ fn partition_universe_for(
     }
 }
 
-impl PyCodeRepository {
-    /// Extract assets with automation conditions from the repo.
-    pub(in crate::daemon) fn extract_asset_conditions(&self) -> Vec<AssetConditionInfo> {
-        let guard = self.state.read().unwrap();
-        let Some(state) = guard.as_ref() else {
-            return Vec::new();
-        };
-
-        let mut by_key: HashMap<String, AssetConditionInfo> = HashMap::new();
-        for (name, node) in &state.node_map {
-            if let ResolvedNode::Asset(asset_node) = node
-                && let Some(ref cond) = asset_node.automation_condition
-            {
-                let deps = state
-                    .inner_repo
-                    .assets()
-                    .get(name)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let partition_info = partition_info_from_node(name, node, &state.node_map, deps);
-                let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
-                by_key.insert(
-                    name.clone(),
-                    AssetConditionInfo {
-                        asset_key: name.clone(),
-                        condition: cond.node.clone(),
-                        partition_info,
-                        backfill_strategy,
-                    },
-                );
-            }
+/// Extract assets with automation conditions from the repo.
+pub(in crate::daemon) fn extract_asset_conditions(
+    state: &ResolvedState,
+) -> Vec<AssetConditionInfo> {
+    let mut by_key: HashMap<String, AssetConditionInfo> = HashMap::new();
+    for (name, node) in &state.node_map {
+        if let ResolvedNode::Asset(asset_node) = node
+            && let Some(ref cond) = asset_node.automation_condition
+        {
+            let deps = state
+                .inner_repo
+                .assets()
+                .get(name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let partition_info = partition_info_from_node(name, node, &state.node_map, deps);
+            let backfill_strategy = node.backfill_strategy().map(|s| s.to_core());
+            by_key.insert(
+                name.clone(),
+                AssetConditionInfo {
+                    asset_key: name.clone(),
+                    condition: cond.node.clone(),
+                    partition_info,
+                    backfill_strategy,
+                },
+            );
         }
-
-        if by_key.is_empty() {
-            return Vec::new();
-        }
-
-        state.inner_repo.sort_topologically(by_key)
     }
 
-    /// Extract upstream partition keys for all conditioned assets.
-    pub(in crate::daemon) fn extract_upstream_partition_keys(
-        &self,
-        conditions: &[AssetConditionInfo],
-    ) -> HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> {
-        let guard = self.state.read().unwrap();
-        let Some(state) = guard.as_ref() else {
-            return HashMap::new();
-        };
+    if by_key.is_empty() {
+        return Vec::new();
+    }
 
-        let mut map: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> =
-            HashMap::new();
-        for cond in conditions {
-            if let Some(ref pi) = cond.partition_info {
-                map.entry(cond.asset_key.clone())
-                    .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
-                for (_, upstream_key) in pi.mappings.keys() {
-                    if !map.contains_key(upstream_key)
-                        && let Some(node) = state.node_map.get(upstream_key)
-                        && let Some(def) = node.partitions_def()
-                    {
-                        let (core_keys, universe) = def_keys_and_universe(def);
-                        map.insert(upstream_key.clone(), (core_keys, universe));
-                    }
+    state.inner_repo.sort_topologically(by_key)
+}
+
+/// Extract upstream partition keys for all conditioned assets.
+pub(in crate::daemon) fn extract_upstream_partition_keys(
+    state: &ResolvedState,
+    conditions: &[AssetConditionInfo],
+) -> HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> {
+    let mut map: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> = HashMap::new();
+    for cond in conditions {
+        if let Some(ref pi) = cond.partition_info {
+            map.entry(cond.asset_key.clone())
+                .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
+            for (_, upstream_key) in pi.mappings.keys() {
+                if !map.contains_key(upstream_key)
+                    && let Some(node) = state.node_map.get(upstream_key)
+                    && let Some(def) = node.partitions_def()
+                {
+                    let (core_keys, universe) = def_keys_and_universe(def);
+                    map.insert(upstream_key.clone(), (core_keys, universe));
                 }
             }
         }
-        map
     }
+    map
 }
 
 /// `upstream_def` is the definition of the side the mapping shifts within.

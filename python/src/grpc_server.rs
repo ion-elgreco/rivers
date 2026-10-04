@@ -91,8 +91,10 @@ impl CodeLocationImpl {
         let selection = selection.to_vec();
         self.run_on_python(move |py, repo| {
             let repo_ref = repo.get();
-            let guard = repo_ref.state.read().unwrap();
-            let state = guard.as_ref().ok_or("repository not resolved")?;
+            let state = repo_ref
+                .state
+                .get_attached(py)
+                .ok_or("repository not resolved")?;
             let document = parse_run_config(py, &config).map_err(|e| e.to_string())?;
             let empty = PyDict::new(py);
             let mut issues = Vec::new();
@@ -441,11 +443,13 @@ impl CodeLocationService for CodeLocationImpl {
     ) -> Result<Response<GetPartitionKeysResponse>, Status> {
         let req = request.into_inner();
         let resp = self
-            .run_on_python(move |_py, repo| {
+            .run_on_python(move |py, repo| {
                 let repo_ref = repo.get();
-                let guard = repo_ref.state.read().unwrap();
-                let state = guard.as_ref().ok_or("repository not resolved")?;
-                let target = resolve_partition_target(state, &req.asset_key, &req.dimension)?;
+                let state = repo_ref
+                    .state
+                    .get_attached(py)
+                    .ok_or("repository not resolved")?;
+                let target = resolve_partition_target(&state, &req.asset_key, &req.dimension)?;
                 // Empty query = browse (cheap total + window); non-empty = filter
                 // (page the matches; `total` is the match count).
                 let (keys, total) = if req.query.is_empty() {
@@ -484,11 +488,13 @@ impl CodeLocationService for CodeLocationImpl {
     ) -> Result<Response<GetPartitionKeyIndexResponse>, Status> {
         let req = request.into_inner();
         let resp = self
-            .run_on_python(move |_py, repo| {
+            .run_on_python(move |py, repo| {
                 let repo_ref = repo.get();
-                let guard = repo_ref.state.read().unwrap();
-                let state = guard.as_ref().ok_or("repository not resolved")?;
-                let target = resolve_partition_target(state, &req.asset_key, &req.dimension)?;
+                let state = repo_ref
+                    .state
+                    .get_attached(py)
+                    .ok_or("repository not resolved")?;
+                let target = resolve_partition_target(&state, &req.asset_key, &req.dimension)?;
                 let index = target
                     .single_dim_key_index(&req.key)
                     .map_err(|e| e.to_string())?
@@ -526,8 +532,10 @@ impl CodeLocationService for CodeLocationImpl {
         let resp = self
             .run_on_python(|py, repo| {
                 let repo_ref = repo.get();
-                let guard = repo_ref.state.read().unwrap();
-                let state = guard.as_ref().ok_or("repository not resolved")?;
+                let state = repo_ref
+                    .state
+                    .get_attached(py)
+                    .ok_or("repository not resolved")?;
 
                 let mut assets = Vec::new();
                 for (name, node) in &state.node_map {
@@ -587,7 +595,7 @@ impl CodeLocationService for CodeLocationImpl {
                         description: None,
                         partition_def,
                         hooks,
-                        io_handler: node.has_io_handler(py).then(|| "custom".to_string()),
+                        io_handler: node.has_io_handler().then(|| "custom".to_string()),
                         has_self_dependency: false,
                         is_external: node.is_external(),
                         automation_condition,

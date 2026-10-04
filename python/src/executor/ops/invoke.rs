@@ -485,7 +485,7 @@ pub(crate) fn process_raw_result(
         if let Some(first) = ctx_ref {
             if let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>() {
                 let ctx = ctx.borrow();
-                (ctx.drain_output_metadata(), ctx.drain_data_version())
+                (ctx.drain_output_metadata(py), ctx.drain_data_version())
             } else {
                 (Vec::new(), None)
             }
@@ -849,7 +849,7 @@ pub(crate) fn execute_action_step(
             && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
         {
             let ctx_ref = bound.borrow();
-            output_metadata = ctx_ref.drain_output_metadata();
+            output_metadata = ctx_ref.drain_output_metadata(py);
             data_version = ctx_ref.drain_data_version();
         }
         if let Some(ext) = crate::result_types::try_extract_result_type(py, &result)? {

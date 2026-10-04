@@ -26,7 +26,7 @@ use super::parse::{extract_sensor_outcome_from_parts, extract_tick_outcome_from_
 use super::schedule::{evaluate_schedule_async, evaluate_schedule_sync};
 use super::sensors::{evaluate_sensor_async, evaluate_sensor_sync};
 use super::types::{
-    AutomationKind, EvalOutcome, EvalParams, GIL_SEMAPHORE, ResolvedEvalMode, TickResult,
+    AutomationKind, EvalOutcome, EvalParams, PY_EVAL_PERMITS, ResolvedEvalMode, TickResult,
 };
 use crate::automation::{parse_schedule_result, parse_sensor_result};
 use crate::executor::parallel::worker_args::make_func_ref;
@@ -355,7 +355,7 @@ async fn batch_submit_subprocess(
         })
         .collect();
 
-    let _permit = GIL_SEMAPHORE.acquire().await.unwrap();
+    let _permit = PY_EVAL_PERMITS.acquire().await.unwrap();
     let results = tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Vec<Result<Py<PyAny>, String>> {
             let core = match py.import("rivers._core") {
@@ -496,7 +496,7 @@ async fn wait_subprocess_result(
     .await
     .map_err(|e| e.to_string())??;
 
-    let _permit = GIL_SEMAPHORE.acquire().await.map_err(|e| e.to_string())?;
+    let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         Python::try_attach(|py| -> Result<EvalOutcome, String> {
             match kind {

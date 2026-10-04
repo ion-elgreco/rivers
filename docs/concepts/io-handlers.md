@@ -114,9 +114,11 @@ class JsonIOHandler(BaseIOHandler):
             return json.load(f)
 ```
 
+The metadata a handler adds with `context.add_output_metadata()` is stored on the materialization event, together with the asset's own metadata. On a key that both set, the handler's value is stored.
+
 ### Register data version during handle_output
 
-IO handlers can register a data version while materialing, by using `output_context.register_data_version()`. This takes precedence over the auto created UUID version.
+IO handlers can register a data version while materializing, by using `output_context.register_data_version()`. This takes precedence over the auto created UUID version.
 
 All IO handlers **must** inherit from `BaseIOHandler`. Duck-typing (objects that merely have `handle_output`/`load_input` methods) is not supported.
 

@@ -63,7 +63,7 @@ impl<'py> IntoPyObject<'py> for &PyBashCommand {
 }
 
 /// A task that executes a shell command, exposed to Python as `BashTask`.
-#[pyclass(name = "BashTask", module = "rivers._core")]
+#[pyclass(name = "BashTask", module = "rivers._core", frozen)]
 pub struct PyBashTask {
     pub name: String,
     pub command: PyBashCommand,
@@ -116,12 +116,15 @@ impl PyBashTask {
             let output = PyInvokedNodeOutput::with_default_output(registered_name);
             Ok(output.into_pyobject(py)?.into_any().unbind())
         } else {
-            let result = rivers_core::task::execute_bash_command(
-                &self.command.0,
-                self.env.as_ref(),
-                self.cwd.as_deref(),
-            )
-            .map_err(PyOSError::new_err)?;
+            let result = py
+                .detach(|| {
+                    rivers_core::task::execute_bash_command(
+                        &self.command.0,
+                        self.env.as_ref(),
+                        self.cwd.as_deref(),
+                    )
+                })
+                .map_err(PyOSError::new_err)?;
             Ok(result.into_pyobject(py)?.into_any().unbind())
         }
     }

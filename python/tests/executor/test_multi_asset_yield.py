@@ -704,18 +704,20 @@ def test_generator_per_output_metadata_not_merged_parallel(tmp_path, storage):
     events_a = storage.get_events_for_asset("a")
     mat_a = [e for e in events_a if e.event_type == "Materialization"]
     assert len(mat_a) == 1
-    assert mat_a[0].metadata == [
-        ("rows", '{"Int":{"value":100}}'),
-        ("only_a", '{"Text":{"value":"a"}}'),
-    ]
+    meta_a = dict(mat_a[0].metadata)
+    assert meta_a["rows"] == '{"Int":{"value":100}}'
+    assert meta_a["only_a"] == '{"Text":{"value":"a"}}'
+    assert meta_a["path"] == '{"Text":{"value":"a.pkl"}}'
+    assert "only_b" not in meta_a
 
     events_b = storage.get_events_for_asset("b")
     mat_b = [e for e in events_b if e.event_type == "Materialization"]
     assert len(mat_b) == 1
-    assert mat_b[0].metadata == [
-        ("rows", '{"Int":{"value":200}}'),
-        ("only_b", '{"Text":{"value":"b"}}'),
-    ]
+    meta_b = dict(mat_b[0].metadata)
+    assert meta_b["rows"] == '{"Int":{"value":200}}'
+    assert meta_b["only_b"] == '{"Text":{"value":"b"}}'
+    assert meta_b["path"] == '{"Text":{"value":"b.pkl"}}'
+    assert "only_a" not in meta_b
 
 
 def test_generator_context_metadata_applies_to_all_yields(storage):

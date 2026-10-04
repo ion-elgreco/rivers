@@ -114,7 +114,7 @@ Controls how a schedule or sensor evaluation function is executed by the daemon.
 
 | Value | Description |
 |-------|-------------|
-| `EvalMode.Auto` | Inferred at daemon start — async functions run automatically on the Python event loop managed from Rust (GIL released during `await`); sync functions run on a dedicated thread holding the GIL. |
+| `EvalMode.Auto` | Inferred at daemon start — async functions run automatically on the Python event loop managed from Rust; sync functions run on a dedicated thread. |
 | `EvalMode.InProcess` | Same as `Auto` today — keep the function in the daemon process. |
 | `EvalMode.Subprocess` | Always run in a loky subprocess. Resources and config injection are not available. |
 

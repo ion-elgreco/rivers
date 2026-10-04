@@ -7,11 +7,14 @@ metadata overrides an in-process ``materialize(config=...)`` does.
 metadata so the UI can pre-fill its editor.
 """
 
+import pytest
+
+pytest.importorskip("grpc")
+
 import json
 import os
 
 import grpc
-import pytest
 import rivers as rs
 from _polling import wait_for_run_terminal
 from pydantic import BaseModel, Field, SecretStr, field_validator

@@ -4,7 +4,7 @@
 //! machine that ran the step.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyString};
+use pyo3::types::{PyList, PyString, PyTraceback};
 use rivers_core::execution::traceback::{
     CONTEXT_LINES, ChainLink, ExceptionInfo, Frame, GROUP_DEPTH, GROUP_WIDTH, Traceback,
     fold_repeats,
@@ -29,7 +29,7 @@ pub(crate) fn capture_json(
     if let Ok(stashed) = exc.getattr(STASH_ATTR) {
         return stashed.extract().ok();
     }
-    match capture(py, exc.as_any(), app_package) {
+    match capture(py, exc.as_any(), err.traceback(py), app_package) {
         Ok(traceback) if traceback.has_no_frames() => None,
         Ok(traceback) => Some(traceback.to_json()),
         Err(e) => {
@@ -52,15 +52,18 @@ pub(crate) fn node_package(py: Python<'_>, node: Option<&ResolvedNode>) -> Optio
     app_package(node?.callable(py).ok()?.bind(py))
 }
 
+/// `tb` is passed in because before Python 3.12 a `PyErr` keeps its traceback
+/// apart from the exception value, whose `__traceback__` is then `None`.
 fn capture(
     py: Python<'_>,
     exc: &Bound<'_, PyAny>,
+    tb: Option<Bound<'_, PyTraceback>>,
     app_package: Option<&str>,
 ) -> PyResult<Traceback> {
     let te = py
         .import("traceback")?
         .getattr("TracebackException")?
-        .call_method1("from_exception", (exc,))?;
+        .call1((exc.get_type(), exc, tb))?;
     let text = PyString::new(py, "").call_method1("join", (te.call_method0("format")?,))?;
     let capture = Capture {
         paths: Paths::load(py, app_package)?,
@@ -130,10 +133,7 @@ impl<'py> Capture<'py> {
         exc: &Bound<'py, PyAny>,
         depth: usize,
     ) -> PyResult<(Vec<Vec<ExceptionInfo>>, u32)> {
-        // Python 3.10 has no exception groups.
-        let Ok(members) = te.getattr("exceptions") else {
-            return Ok((Vec::new(), 0));
-        };
+        let members = te.getattr("exceptions")?;
         if members.is_none() {
             return Ok((Vec::new(), 0));
         }

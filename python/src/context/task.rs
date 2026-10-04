@@ -1,8 +1,7 @@
 //! TaskContext — passed to @Task functions during graph asset execution.
-use std::sync::OnceLock;
-
 use crate::errors::PartitionValidationError;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
 
 use crate::partitions::PartitionContext;
@@ -18,7 +17,7 @@ pub struct PyTaskExecutionContext {
     pub partition: Option<PartitionContext>,
     /// Pydantic config instance (set via `TaskExecutionContext[Config]` generic).
     pub config_instance: Option<Py<PyAny>>,
-    _logger: OnceLock<Py<PyAny>>,
+    _logger: PyOnceLock<Py<PyAny>>,
 }
 
 impl PyTaskExecutionContext {
@@ -32,7 +31,7 @@ impl PyTaskExecutionContext {
             tags,
             partition,
             config_instance: None,
-            _logger: OnceLock::new(),
+            _logger: PyOnceLock::new(),
         }
     }
 
@@ -91,14 +90,13 @@ impl PyTaskExecutionContext {
 
     #[getter]
     fn log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let logger = self._logger.get_or_init(|| {
-            let logging = py.import("logging").expect("failed to import logging");
+        let logger = self._logger.get_or_try_init(py, || {
+            let logging = py.import("logging")?;
             let name = format!("code-repo.tasks.{}", self.task_name);
             logging
                 .call_method1("getLogger", (name,))
-                .expect("failed to get logger")
-                .unbind()
-        });
+                .map(Bound::unbind)
+        })?;
         Ok(logger.bind(py).clone())
     }
 

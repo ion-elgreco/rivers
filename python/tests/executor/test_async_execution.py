@@ -471,6 +471,48 @@ def test_async_multi_asset_dict_return(executor_kind):
     assert repo.load_node("q") == 200
 
 
+# ── Event loop lifecycle ──
+
+
+@pytest.mark.parametrize("kind", ["coroutine", "generator"])
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_run_closes_its_event_loop(tmp_path, executor_kind, kind):
+    """The run closes the event loop its async steps ran on. An unclosed loop
+    was closed later by its ``__del__`` during garbage collection, after its
+    sockets could already be closed: on 3.14t that raised ``ValueError:
+    Invalid file descriptor: -1``."""
+    import obstore.store
+
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+    loops = []
+
+    @rs.Asset(io_handler=handler)
+    async def value() -> int:
+        loops.append(asyncio.get_running_loop())
+        return 1
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("value")], io_handler=handler)
+    async def streamed():
+        loops.append(asyncio.get_running_loop())
+        yield rs.Output(value=1, output_name="value")
+
+    executor = (
+        rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2)
+    )
+    repo = rs.CodeRepository(
+        assets=[value if kind == "coroutine" else streamed],
+        default_executor=executor,
+    )
+    repo.materialize()
+
+    assert repo.load_node("value") == 1
+    assert [loop.is_closed() for loop in loops] == [True]
+
+
 # ── Cross-executor coverage ──
 
 

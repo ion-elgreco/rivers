@@ -8,7 +8,7 @@ use pyo3::exceptions::PyTypeError;
 
 use crate::errors::InvalidMetadataError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyList, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use url::Url;
 
 use crate::schema::{PySchemaWrapper, schema_from_ipc_bytes, schema_to_ipc_bytes};
@@ -388,4 +388,16 @@ pub fn coerce_to_metadata_value(
         "Cannot coerce {} to MetadataValue. Use MetadataValue.text(), .int(), etc.",
         value.get_type().name()?
     )))
+}
+
+/// Coerce every entry of a user's metadata dict with [`coerce_to_metadata_value`].
+pub fn coerce_metadata_dict(
+    metadata: &Bound<'_, PyDict>,
+) -> PyResult<Vec<(String, MetadataValue)>> {
+    // Iterate a copy: coercion runs user code, and other threads can change `metadata`.
+    metadata
+        .copy()?
+        .iter()
+        .map(|(k, v)| Ok((k.extract()?, coerce_to_metadata_value(v.py(), &v)?)))
+        .collect()
 }

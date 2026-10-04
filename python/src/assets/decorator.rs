@@ -16,18 +16,33 @@ use crate::composition::{
     extract_input_bindings, is_in_composition, observe_invocation,
 };
 use crate::errors::AssetDefinitionError;
+use crate::executor::ops::enumerate_params;
 
-fn ensure_callable(py: Python, func: &Option<Py<PyAny>>) -> PyResult<()> {
-    if !func
-        .as_ref()
-        .map(|f| f.getattr(py, "__call__").is_ok())
-        .unwrap_or(true)
-    {
-        return Err(AssetDefinitionError::new_err(
-            "Non callable function provided as input",
-        ));
+fn needs_one_function() -> PyErr {
+    AssetDefinitionError::new_err(
+        "the Asset decorator needs one function, e.g. `@rs.Asset(group=...)` on a def",
+    )
+}
+
+/// Raise `err()` when `func` is set but not callable.
+pub fn ensure_callable(py: Python, func: &Option<Py<PyAny>>, err: fn() -> PyErr) -> PyResult<()> {
+    match func {
+        Some(f) if !f.bind(py).is_callable() => Err(err()),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// The function in a decorator call: one callable positional argument and
+/// no keyword arguments.
+pub fn decorated_fn(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> Option<Py<PyAny>> {
+    if args.len() != 1 || kwargs.is_some_and(|k| !k.is_empty()) {
+        return None;
+    }
+    let func = args.get_item(0).ok()?;
+    func.is_callable().then(|| func.unbind())
 }
 
 #[derive(Default)]
@@ -192,13 +207,12 @@ fn merge_partition_mappings(
 
 /// Every listed action must be bound to a function and names must be unique.
 fn validate_actions(
-    py: Python,
     actions: &[Py<super::action::PyAssetAction>],
     asset_desc: &str,
 ) -> PyResult<()> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in actions {
-        let a = a.borrow(py);
+        let a = a.get();
         if a.func.is_none() {
             return Err(AssetDefinitionError::new_err(format!(
                 "asset '{asset_desc}': action '{}' has no function — apply the \
@@ -224,10 +238,10 @@ fn merge_output_actions(
     per_def: &[Py<super::action::PyAssetAction>],
 ) -> Vec<Py<super::action::PyAssetAction>> {
     let def_names: std::collections::HashSet<String> =
-        per_def.iter().map(|a| a.borrow(py).name.clone()).collect();
+        per_def.iter().map(|a| a.get().name.clone()).collect();
     top_level
         .iter()
-        .filter(|a| !def_names.contains(&a.borrow(py).name))
+        .filter(|a| !def_names.contains(&a.get().name))
         .chain(per_def.iter())
         .map(|a| a.clone_ref(py))
         .collect()
@@ -271,11 +285,11 @@ pub fn name_or_fn_name(
     py: Python,
     name: Option<String>,
     func: &Option<Py<PyAny>>,
-) -> Option<String> {
-    name.or_else(|| {
-        func.as_ref()
-            .map(|f| f.getattr(py, "__name__").unwrap().to_string())
-    })
+) -> PyResult<Option<String>> {
+    match (name, func) {
+        (None, Some(f)) => Ok(Some(f.getattr(py, "__name__")?.to_string())),
+        (name, _) => Ok(name),
+    }
 }
 pub fn is_coroutine_function(py: Python, func: &Option<Py<PyAny>>) -> bool {
     func.as_ref().is_some_and(|f| {
@@ -492,8 +506,8 @@ pub fn normalize_pool(
 // `name` is an `Option`, and a format string can only render it as `Some("x")`.
 #[pyclass(module = "rivers._core")]
 pub struct AssetDef {
-    /// `None` only in class-form multi assets, where the adapter injects the
-    /// attribute name at registration. `from_multi` rejects unnamed defs.
+    /// `None` only in class-form multi assets, where registration passes a
+    /// copy named after the attribute. `from_multi` rejects unnamed defs.
     #[pyo3(get, set)]
     pub name: Option<String>,
     #[pyo3(get, set)]
@@ -523,6 +537,45 @@ pub struct AssetDef {
     pub actions: Vec<Py<super::action::PyAssetAction>>,
 }
 
+impl AssetDef {
+    /// Raises instead of panicking when a setter runs on another thread.
+    pub(crate) fn read<'py>(slf: &Bound<'py, Self>) -> PyResult<PyRef<'py, Self>> {
+        slf.try_borrow().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "cannot read this AssetDef while another thread sets one of its fields",
+            )
+        })
+    }
+
+    /// Holds the borrow only while it clones, so callers can run Python on
+    /// the copy.
+    pub(crate) fn copy(slf: &Bound<'_, Self>) -> PyResult<Self> {
+        let py = slf.py();
+        let def = Self::read(slf)?;
+        Ok(Self {
+            name: def.name.clone(),
+            tags: def.tags.clone(),
+            kinds: def.kinds.clone(),
+            group: def.group.clone(),
+            code_version: def.code_version.clone(),
+            io_handler: def.io_handler.as_ref().map(|h| h.clone_ref(py)),
+            metadata: def.metadata.clone(),
+            partitions_def: def.partitions_def.as_ref().map(|p| p.clone_ref(py)),
+            partition_mapping: def.partition_mapping.clone(),
+            pool: def.pool.clone(),
+            deps: def.deps.iter().map(|d| d.clone_ref(py)).collect(),
+            actions: def.actions.iter().map(|a| a.clone_ref(py)).collect(),
+        })
+    }
+
+    /// A copy named `name` unless the def has a name of its own.
+    pub(crate) fn named_copy(slf: &Bound<'_, Self>, name: &str) -> PyResult<Self> {
+        let mut def = Self::copy(slf)?;
+        def.name.get_or_insert_with(|| name.to_owned());
+        Ok(def)
+    }
+}
+
 #[pymethods]
 impl AssetDef {
     fn __str__(&self) -> String {
@@ -536,16 +589,17 @@ impl AssetDef {
         )
     }
 
-    fn __eq__(&self, py: Python, other: &AssetDef) -> bool {
-        self.name == other.name
-            && self.tags == other.tags
-            && self.kinds.0 == other.kinds.0
-            && self.group == other.group
-            && self.code_version == other.code_version
-            && self.metadata == other.metadata
-            && self.pool == other.pool
-            && PartitionsDefRef::opt_eq(&self.partitions_def, &other.partitions_def)
-            && io_handler_eq(py, self.io_handler.as_ref(), other.io_handler.as_ref())
+    fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<bool> {
+        let (a, b) = (Self::copy(slf)?, Self::copy(other)?);
+        Ok(a.name == b.name
+            && a.tags == b.tags
+            && a.kinds.0 == b.kinds.0
+            && a.group == b.group
+            && a.code_version == b.code_version
+            && a.metadata == b.metadata
+            && a.pool == b.pool
+            && PartitionsDefRef::opt_eq(&a.partitions_def, &b.partitions_def)
+            && io_handler_eq(slf.py(), a.io_handler.as_ref(), b.io_handler.as_ref()))
     }
 
     fn __hash__(&self) -> u64 {
@@ -601,7 +655,7 @@ impl AssetDef {
     /// Create a new output definition for use with `Asset.from_multi()`.
     ///
     /// `name` may be omitted only when the def is assigned as a class attribute
-    /// of a class-form multi asset — the attribute name is injected then.
+    /// of a class-form multi asset — the output then takes the attribute name.
     #[new]
     #[pyo3(signature = (
         name = None,
@@ -731,7 +785,9 @@ pub enum Asset {
 /// When called as a decorator it wraps a Python function and produces a
 /// `SingleAsset`. When used as a factory classmethod it produces the
 /// corresponding subclass (`MultiAsset`, `GraphAsset`, `ExternalAsset`).
-#[pyclass(name = "Asset", subclass, module = "rivers._core")]
+/// An asset without a function is a decorator: each call returns a new asset
+/// of the same kind around the given function.
+#[pyclass(name = "Asset", subclass, frozen, module = "rivers._core")]
 pub struct PyAsset {
     pub inner: Asset,
 }
@@ -974,51 +1030,67 @@ impl Asset {
         }
     }
 
-    /// For graph assets, this also runs the function in a composition context to capture
-    /// the invocation DAG.
-    fn set_wraps(&mut self, py: Python<'_>, wraps: Py<PyAny>) -> PyResult<()> {
-        let function_name = wraps.as_ref().getattr(py, "__name__")?.to_string();
-        let is_async = is_coroutine_function(py, &Some(wraps.clone_ref(py)));
+    /// The compute function, or an external asset's observe function.
+    fn func(&self) -> Option<&Py<PyAny>> {
         match self {
-            Asset::Single(single_asset) => {
-                validate_input_dep_names(py, &wraps, &single_asset.input_dep_names)?;
-                single_asset.wraps = Some(wraps);
-                single_asset.is_async = is_async;
-                if single_asset.name.is_none() {
-                    single_asset.name = Some(function_name)
-                }
-            }
-            Asset::Graph(graph_asset) => {
-                graph_asset.wraps = Some(wraps.clone_ref(py));
-                if graph_asset.name.is_none() {
-                    graph_asset.name = Some(function_name)
-                }
-                let name = graph_asset
-                    .name
-                    .as_ref()
-                    .ok_or_else(|| AssetDefinitionError::new_err("Graph asset must have a name"))?;
-                let (invocations, order, final_n) = call_graph_fn_in_composition(py, &wraps, name)?;
-                graph_asset.invocations = invocations;
-                graph_asset.invocation_order = order;
-                graph_asset.final_node = final_n;
-            }
-            Asset::External(ext) => {
-                ext.observe_fn = Some(wraps);
-                ext.is_async_observe = is_async;
-                if ext.name.is_none() {
-                    ext.name = Some(function_name)
-                }
-            }
-            Asset::Multi(multi_asset) => {
-                validate_input_dep_names(py, &wraps, &multi_asset.input_dep_names)?;
-                multi_asset.wraps = Some(wraps);
-                multi_asset.is_async = is_async;
-                if multi_asset.name.is_none() {
-                    multi_asset.name = Some(function_name)
-                }
-            }
+            Asset::Single(a) => a.wraps.as_ref(),
+            Asset::Multi(a) => a.wraps.as_ref(),
+            Asset::Graph(a) => a.wraps.as_ref(),
+            Asset::External(a) => a.observe_fn.as_ref(),
         }
-        Ok(())
+    }
+
+    /// A copy of this asset that wraps `func`, named after `func` unless the
+    /// asset has a name. A graph asset runs `func` in a composition context
+    /// to capture the invocation DAG.
+    fn wrapping(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<Self> {
+        let name = match self.name() {
+            Some(name) => name.clone(),
+            None => func.getattr(py, "__name__")?.to_string(),
+        };
+        Ok(match self {
+            Asset::Single(a) => {
+                validate_input_dep_names(py, &func, &a.input_dep_names)?;
+                let wraps = Some(func);
+                Asset::Single(SingleAsset {
+                    name: Some(name),
+                    is_async: is_coroutine_function(py, &wraps),
+                    wraps,
+                    ..a.clone_ref(py)
+                })
+            }
+            Asset::Multi(a) => {
+                validate_input_dep_names(py, &func, &a.input_dep_names)?;
+                let wraps = Some(func);
+                Asset::Multi(MultiAsset {
+                    name: Some(name),
+                    is_async: is_coroutine_function(py, &wraps),
+                    wraps,
+                    ..a.clone_ref(py)
+                })
+            }
+            Asset::Graph(a) => {
+                let (invocations, invocation_order, final_node) =
+                    call_graph_fn_in_composition(py, &func, &name)?;
+                Asset::Graph(GraphAsset {
+                    name: Some(name),
+                    wraps: Some(func),
+                    invocations,
+                    invocation_order,
+                    final_node,
+                    ..a.clone_ref(py)
+                })
+            }
+            Asset::External(a) => {
+                let observe_fn = Some(func);
+                Asset::External(ExternalAsset {
+                    name: Some(name),
+                    is_async_observe: is_coroutine_function(py, &observe_fn),
+                    observe_fn,
+                    ..a.clone_ref(py)
+                })
+            }
+        })
     }
 }
 
@@ -1029,15 +1101,8 @@ fn call_graph_fn_in_composition(
     func: &Py<PyAny>,
     graph_name: &str,
 ) -> PyResult<(Vec<InvokedNode>, Vec<String>, Option<String>)> {
-    let annotations = func.getattr(py, "__annotations__")?;
-    let annotations: &Bound<PyDict> = annotations.cast_bound(py)?;
-
     let mut placeholder_args: Vec<Py<PyAny>> = Vec::new();
-    for (k, _v) in annotations.iter() {
-        let param_name: String = k.extract()?;
-        if param_name == "return" {
-            continue;
-        }
+    for (param_name, _) in enumerate_params(py, func)? {
         let placeholder = PyInvokedNodeOutput::new(
             param_name,
             rivers_core::composition::DEFAULT_OUTPUT_NAME.to_string(),
@@ -1066,6 +1131,19 @@ fn call_graph_fn_in_composition(
 impl PyAsset {
     pub(crate) fn inner(&self) -> &Asset {
         &self.inner
+    }
+
+    /// A new Python object of the subclass that matches the kind of `inner`.
+    fn new_object(py: Python<'_>, inner: Asset) -> PyResult<Py<PyAny>> {
+        let base = |inner| PyClassInitializer::from(Self { inner });
+        Ok(match inner {
+            Asset::Single(_) => Py::new(py, base(inner).add_subclass(PySingleAsset))?.into_any(),
+            Asset::Multi(_) => Py::new(py, base(inner).add_subclass(PyMultiAsset))?.into_any(),
+            Asset::Graph(_) => Py::new(py, base(inner).add_subclass(PyGraphAsset))?.into_any(),
+            Asset::External(_) => {
+                Py::new(py, base(inner).add_subclass(PyExternalAsset))?.into_any()
+            }
+        })
     }
 }
 
@@ -1123,12 +1201,12 @@ impl PyAsset {
         let actions = actions.unwrap_or_default();
         let py = cls.py();
 
-        ensure_callable(cls.py(), &wraps)?;
+        ensure_callable(py, &wraps, needs_one_function)?;
 
         let handler = io_handler;
 
-        name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<asset>"))?;
+        name = name_or_fn_name(py, name, &wraps)?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<asset>"))?;
 
         let pool = normalize_pool(pool, pool_slots)?;
         let retry = crate::retry::extract_retry_ref(retry)?;
@@ -1161,10 +1239,7 @@ impl PyAsset {
             compute: compute.map(|c| c.inner),
             actions,
         });
-
-        let base = PyAsset { inner: py_asset };
-        let py_obj = Py::new(py, (PySingleAsset {}, base))?;
-        Ok(py_obj.into_any())
+        Self::new_object(py, py_asset)
     }
 
     /// Create a multi-output asset from a list of `AssetDef` output definitions.
@@ -1222,62 +1297,59 @@ impl PyAsset {
         let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let kinds = kinds.unwrap_or_default();
 
-        ensure_callable(py, &wraps)?;
+        ensure_callable(py, &wraps, needs_one_function)?;
 
-        name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<multi asset>"))?;
+        name = name_or_fn_name(py, name, &wraps)?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<multi asset>"))?;
 
         let mut pd = process_deps(py, &top_level_deps);
 
         let mut py_assets = Vec::with_capacity(output_defs.len());
         for asset in output_defs {
-            let borrow_asset_def = asset.borrow(py);
-            let def_name = borrow_asset_def.name.clone().ok_or_else(|| {
+            let def = AssetDef::copy(asset.bind(py))?;
+            let def_name = def.name.clone().ok_or_else(|| {
                 AssetDefinitionError::new_err(
                     "AssetDef requires name= when passed to Asset.from_multi; only class-form \
                      multi assets may omit it (the attribute name is used)",
                 )
             })?;
-            let io_handler = borrow_asset_def
+            let io_handler = def
                 .io_handler
                 .as_ref()
                 .or(handler.as_ref())
                 .map(|v| v.clone_ref(py));
 
-            let def_kinds = if borrow_asset_def.kinds.is_empty() {
+            let def_kinds = if def.kinds.is_empty() {
                 &kinds
             } else {
-                &borrow_asset_def.kinds
+                &def.kinds
             };
 
             // The fn fires once for all outputs, so input deps from any
             // AssetDef merge into the top-level input set; lineage-only
             // deps stay scoped to this output.
             let (dep_only_names, partition_mapping) =
-                collect_output_deps(py, &mut pd, &borrow_asset_def, &def_name)?;
+                collect_output_deps(py, &mut pd, &def, &def_name)?;
 
-            validate_actions(py, &borrow_asset_def.actions, &def_name)?;
-            let output_actions = merge_output_actions(py, &actions, &borrow_asset_def.actions);
+            validate_actions(&def.actions, &def_name)?;
+            let output_actions = merge_output_actions(py, &actions, &def.actions);
 
             py_assets.push(SingleAsset {
                 wraps: None,
                 is_async: false,
                 name: Some(def_name),
-                tags: borrow_asset_def.tags.clone().or_else(|| tags.clone()),
+                tags: def.tags.clone().or_else(|| tags.clone()),
                 kinds: def_kinds.clone(),
-                group: borrow_asset_def.group.clone().or_else(|| group.clone()),
-                code_version: borrow_asset_def
-                    .code_version
-                    .clone()
-                    .or_else(|| code_version.clone()),
+                group: def.group.clone().or_else(|| group.clone()),
+                code_version: def.code_version.clone().or_else(|| code_version.clone()),
                 io_handler,
                 // `from_multi` has no `metadata=`, so the per-output AssetDef is
                 // the only source — and `ActionContext.asset_metadata` reads it.
-                metadata: borrow_asset_def.metadata.clone(),
+                metadata: def.metadata.clone(),
                 backfill_strategy: None,
                 partitions_def: partitions_def
                     .as_ref()
-                    .or(borrow_asset_def.partitions_def.as_ref())
+                    .or(def.partitions_def.as_ref())
                     .map(|p| p.clone_ref(py)),
                 partition_mapping,
                 input_dep_names: Vec::new(),
@@ -1286,7 +1358,7 @@ impl PyAsset {
                 input_metadata: HashMap::new(),
                 hooks: None,
                 automation_condition: None,
-                pool: borrow_asset_def.pool.clone(),
+                pool: def.pool.clone(),
                 retry: None,
                 compute: None,
                 actions: output_actions,
@@ -1330,9 +1402,7 @@ impl PyAsset {
             compute: compute.map(|c| c.inner),
             retry: crate::retry::extract_retry_ref(retry)?,
         });
-        let base = PyAsset { inner: py_asset };
-        let py_obj = Py::new(py, (PyMultiAsset {}, base))?;
-        Ok(py_obj.into_any())
+        Self::new_object(py, py_asset)
     }
 
     /// Create a graph-backed asset that composes other assets.
@@ -1381,8 +1451,10 @@ impl PyAsset {
         let py = cls.py();
         let handler = io_handler;
 
-        name = name_or_fn_name(py, name, &wraps);
-        validate_actions(py, &actions, name.as_deref().unwrap_or("<graph asset>"))?;
+        ensure_callable(py, &wraps, needs_one_function)?;
+
+        name = name_or_fn_name(py, name, &wraps)?;
+        validate_actions(&actions, name.as_deref().unwrap_or("<graph asset>"))?;
 
         let deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
         let pd = process_deps(py, &deps);
@@ -1426,10 +1498,7 @@ impl PyAsset {
             graph_asset.final_node = final_n;
         }
 
-        let py_asset = Asset::Graph(graph_asset);
-        let base = PyAsset { inner: py_asset };
-        let py_obj = Py::new(py, (PyGraphAsset {}, base))?;
-        Ok(py_obj.into_any())
+        Self::new_object(py, Asset::Graph(graph_asset))
     }
 
     /// Create an external asset representing data produced outside of rivers.
@@ -1463,11 +1532,13 @@ impl PyAsset {
     ) -> PyResult<Py<PyAny>> {
         let py = _cls.py();
 
+        ensure_callable(py, &wraps, needs_one_function)?;
+
         let handler = io_handler.ok_or_else(|| {
             AssetDefinitionError::new_err("External assets require an io_handler")
         })?;
 
-        let asset_name = name_or_fn_name(py, name, &wraps);
+        let asset_name = name_or_fn_name(py, name, &wraps)?;
 
         let is_async_observe = is_coroutine_function(py, &wraps);
         let py_asset = Asset::External(ExternalAsset {
@@ -1483,47 +1554,45 @@ impl PyAsset {
             automation_condition,
             backfill_strategy: None,
         });
-
-        let base = PyAsset { inner: py_asset };
-        let py_obj = Py::new(py, (PyExternalAsset {}, base))?;
-        Ok(py_obj.into_any())
+        Self::new_object(py, py_asset)
     }
 
-    /// Handle both decorator application and composition invocation.
+    /// On an asset without a function, return a new asset of the same kind
+    /// that wraps the given function and keeps this asset's settings.
     ///
-    /// If called inside a composition context and the asset already has a function
-    /// bound, this records a graph invocation and returns a placeholder output.
-    /// Otherwise, the first positional argument is treated as the function to wrap.
+    /// Inside a graph composition, record an invocation of this asset and
+    /// return a placeholder output.
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(
         slf: &Bound<'_, Self>,
-        py: Python,
         args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        let mut this = slf.borrow_mut();
-
-        if is_in_composition() && this.inner._asset_fn().is_ok() {
-            let name = this
-                .inner
-                .name()
-                .as_ref()
-                .ok_or_else(|| AssetDefinitionError::new_err("Asset must have a name"))?
-                .clone();
-            drop(this);
-            let input_bindings = extract_input_bindings(args, kwargs)?;
-            let registered_name = observe_invocation(&name, InvokedNodeType::Asset, input_bindings);
-            let output = PyInvokedNodeOutput::new(
-                registered_name,
-                rivers_core::composition::DEFAULT_OUTPUT_NAME.to_string(),
-            );
-            return Ok(output.into_pyobject(py)?.into_any().unbind());
+        let py = slf.py();
+        let asset = slf.get().inner();
+        if asset.func().is_none() {
+            let func = decorated_fn(args, kwargs).ok_or_else(needs_one_function)?;
+            return Self::new_object(py, asset.wrapping(py, func)?);
         }
-
-        let f: Py<PyAny> = args.get_item(0)?.into();
-        this.inner.set_wraps(py, f)?;
-        drop(this);
-        Ok(slf.clone().unbind().into_any())
+        let name = asset
+            .name()
+            .as_deref()
+            .ok_or_else(|| AssetDefinitionError::new_err("Asset must have a name"))?;
+        if let Asset::External(_) = asset {
+            return Err(AssetDefinitionError::new_err(format!(
+                "external asset '{name}' already has an observe function"
+            )));
+        }
+        if !is_in_composition() {
+            return Err(AssetDefinitionError::new_err(format!(
+                "asset '{name}' already wraps a function; call it only inside an \
+                 Asset.from_graph body"
+            )));
+        }
+        let input_bindings = extract_input_bindings(args, kwargs)?;
+        let registered_name = observe_invocation(name, InvokedNodeType::Asset, input_bindings);
+        let output = PyInvokedNodeOutput::with_default_output(registered_name);
+        Ok(output.into_pyobject(py)?.into_any().unbind())
     }
 
     #[getter]

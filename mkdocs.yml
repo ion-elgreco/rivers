@@ -64,6 +64,7 @@ nav:
   - Installation:
       - Overview: installation/overview.md
       - Kubernetes: installation/kubernetes.md
+      - Free-threaded Python: installation/free-threading.md
   - Guides:
       - Migrating from Dagster/Prefect: guides/migrating.md
       - Class-Based Assets: guides/class-assets.md

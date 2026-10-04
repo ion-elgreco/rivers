@@ -1,10 +1,13 @@
 """Integration tests for the gRPC CodeLocation server."""
 
+import pytest
+
+pytest.importorskip("grpc")
+
 import contextlib
 import re
 
 import grpc
-import pytest
 
 import rivers as rs
 from _polling import wait_for_asset_materialized as _wait_for_asset_materialized

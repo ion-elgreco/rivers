@@ -57,15 +57,14 @@ impl<'py> pyo3::IntoPyObject<'py> for TickRequest {
     }
 }
 
-#[allow(deprecated)]
 impl<'py> pyo3::FromPyObject<'py, '_> for TickRequest {
     type Error = PyErr;
 
     fn extract(ob: pyo3::Borrowed<'py, '_, PyAny>) -> Result<Self, Self::Error> {
-        if let Ok(r) = ob.downcast::<PyRunRequest>() {
-            Ok(Self::Run(r.clone().unbind()))
-        } else if let Ok(b) = ob.downcast::<PyBackfillRequest>() {
-            Ok(Self::Backfill(b.clone().unbind()))
+        if let Ok(r) = ob.cast::<PyRunRequest>() {
+            Ok(Self::Run(r.to_owned().unbind()))
+        } else if let Ok(b) = ob.cast::<PyBackfillRequest>() {
+            Ok(Self::Backfill(b.to_owned().unbind()))
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(format!(
                 "expected RunRequest or BackfillRequest, got {}",

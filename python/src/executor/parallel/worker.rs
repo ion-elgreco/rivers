@@ -4,6 +4,7 @@
 //! Reuses existing Rust functions for result extraction, IO handling, etc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -36,7 +37,7 @@ fn unwrap_callable(py: Python, obj: &Py<PyAny>) -> Py<PyAny> {
 }
 
 /// Lightweight function reference that pickles as (module, qualname) strings.
-#[pyclass(name = "FuncRef", module = "rivers._core")]
+#[pyclass(name = "FuncRef", frozen, module = "rivers._core")]
 pub struct PyFuncRef {
     module: String,
     qualname: String,
@@ -77,7 +78,7 @@ pub fn _reconstruct_func_ref(py: Python, module: String, qualname: String) -> Py
 
 /// A bound method that pickles as its function and owner, and unpickles as
 /// the same bound method.
-#[pyclass(name = "BoundMethod", module = "rivers._core")]
+#[pyclass(name = "BoundMethod", frozen, module = "rivers._core")]
 pub struct PyBoundMethod {
     func: Py<PyAny>,
     owner: Py<PyAny>,
@@ -101,7 +102,7 @@ impl PyBoundMethod {
 }
 
 /// Lightweight IO handler reference that reconstructs from the asset definition.
-#[pyclass(name = "IOHandlerRef", module = "rivers._core")]
+#[pyclass(name = "IOHandlerRef", frozen, module = "rivers._core")]
 pub struct PyIOHandlerRef {
     module: String,
     qualname: String,
@@ -137,7 +138,7 @@ pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
         IOHandler::ResourceRef(_) | IOHandler::Resource(_) => None,
     };
     if let Ok(asset) = obj.bind(py).cast::<PyAsset>() {
-        let asset = asset.borrow();
+        let asset = asset.get();
         return [asset.inner.node_io_handler(), asset.inner.io_handler()]
             .into_iter()
             .flatten()
@@ -145,7 +146,7 @@ pub(super) fn handler_attr(py: Python, obj: &Py<PyAny>) -> Option<Py<PyAny>> {
     }
     if let Ok(task) = obj.bind(py).cast::<PyTask>() {
         return task
-            .borrow()
+            .get()
             .inner
             .io_handler
             .as_ref()
@@ -199,7 +200,7 @@ pub fn _reconstruct_io_handler_ref(
 
 /// Stands in for an `IOHandlerRef` that found no handler in the worker, so
 /// the step fails instead of skipping the write.
-#[pyclass(name = "MissingIOHandler", module = "rivers._core")]
+#[pyclass(name = "MissingIOHandler", frozen, module = "rivers._core")]
 struct PyMissingIOHandler {
     reference: String,
 }
@@ -225,7 +226,7 @@ impl PyMissingIOHandler {
 }
 
 /// Describes how to load an upstream input from an IO handler in the worker.
-#[pyclass(name = "IOLoadSpec", module = "rivers._core")]
+#[pyclass(name = "IOLoadSpec", frozen, module = "rivers._core")]
 pub struct PyIOLoadSpec {
     #[pyo3(get)]
     pub handler: Py<PyAny>,
@@ -256,7 +257,7 @@ impl PyIOLoadSpec {
 }
 
 /// Describes how to load collected map instance outputs as a list in the worker.
-#[pyclass(name = "CollectLoadSpec", module = "rivers._core")]
+#[pyclass(name = "CollectLoadSpec", frozen, module = "rivers._core")]
 pub struct PyCollectLoadSpec {
     #[pyo3(get)]
     pub specs: Py<PyAny>,
@@ -276,7 +277,7 @@ impl PyCollectLoadSpec {
 }
 
 /// Describes how to load collected map instance outputs as a lazy iterator in the worker.
-#[pyclass(name = "CollectStreamLoadSpec", module = "rivers._core")]
+#[pyclass(name = "CollectStreamLoadSpec", frozen, module = "rivers._core")]
 pub struct PyCollectStreamLoadSpec {
     #[pyo3(get)]
     pub specs: Py<PyAny>,
@@ -316,7 +317,7 @@ impl PyCollectStreamLoadSpec {
 /// to KV after collecting the result, keyed by the materialization's
 /// `data_version` (loky workers don't write KV themselves — embedded RocksDB
 /// is single-process; the orchestrator owns the lock).
-#[pyclass(name = "WorkerResult", module = "rivers._core")]
+#[pyclass(name = "WorkerResult", frozen, module = "rivers._core")]
 pub struct PyWorkerResult {
     #[pyo3(get)]
     pub outputs: Py<PyAny>,
@@ -501,11 +502,12 @@ pub fn _reconstruct_partition_context(py: Python, data: Bound<'_, PyDict>) -> Py
 }
 
 /// Lazy iterator for _CollectStreamLoadSpec resolution.
-/// Each __next__ loads one map instance result from IO.
-#[pyclass(module = "rivers._core")]
+/// Each __next__ loads one map instance result from IO; threads that share it
+/// each get different results.
+#[pyclass(frozen, module = "rivers._core")]
 pub struct WorkerCollectStreamIter {
     specs: Vec<Py<PyAny>>, // list of _IOLoadSpec Python objects
-    index: usize,
+    index: AtomicUsize,
 }
 
 #[pymethods]
@@ -514,12 +516,10 @@ impl WorkerCollectStreamIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if self.index >= self.specs.len() {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let Some(spec) = self.specs.get(self.index.fetch_add(1, Ordering::Relaxed)) else {
             return Err(PyStopIteration::new_err(()));
-        }
-        let spec = &self.specs[self.index];
-        self.index += 1;
+        };
         load_from_spec(py, spec)
     }
 }
@@ -589,9 +589,9 @@ pub fn worker_execute_step(
     let resolved_args: Vec<Py<PyAny>> = args
         .iter()
         .map(|arg| {
-            if arg.extract::<PyRef<'_, PyIOLoadSpec>>().is_ok() {
+            if arg.is_instance_of::<PyIOLoadSpec>() {
                 load_from_spec(py, &arg.unbind())
-            } else if arg.extract::<PyRef<'_, PyCollectLoadSpec>>().is_ok() {
+            } else if arg.is_instance_of::<PyCollectLoadSpec>() {
                 // Barrier collect: load all specs into a list
                 let specs: Vec<Py<PyAny>> = arg.getattr("specs")?.extract()?;
                 let items: Vec<Py<PyAny>> = specs
@@ -600,10 +600,13 @@ pub fn worker_execute_step(
                     .collect::<PyResult<_>>()?;
                 let list = PyList::new(py, items.iter().map(|v| v.bind(py)))?;
                 Ok(list.unbind().into_any())
-            } else if arg.extract::<PyRef<'_, PyCollectStreamLoadSpec>>().is_ok() {
+            } else if arg.is_instance_of::<PyCollectStreamLoadSpec>() {
                 // Streaming collect: return lazy iterator
                 let specs: Vec<Py<PyAny>> = arg.getattr("specs")?.extract()?;
-                let iter = WorkerCollectStreamIter { specs, index: 0 };
+                let iter = WorkerCollectStreamIter {
+                    specs,
+                    index: AtomicUsize::new(0),
+                };
                 Ok(Py::new(py, iter)?.into_any())
             } else {
                 Ok(arg.unbind())
@@ -708,7 +711,7 @@ pub fn worker_execute_step(
                     ops::OutputItem::Materialization {
                         name,
                         value,
-                        metadata,
+                        mut metadata,
                         data_version,
                     } => {
                         // value.is_some() => Output: write IO from the worker
@@ -721,8 +724,9 @@ pub fn worker_execute_step(
                             };
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                            let io_dv = write_output(py, handler, &out_ctx, &value)?;
-                            (io_dv.or(data_version), ResultKind::Output)
+                            let written = write_output(py, handler, &out_ctx, &value)?;
+                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            (written.data_version.or(data_version), ResultKind::Output)
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
@@ -808,7 +812,7 @@ pub fn worker_execute_step(
                     ops::OutputItem::Materialization {
                         name,
                         value,
-                        metadata,
+                        mut metadata,
                         data_version,
                     } => {
                         let (final_dv, kind) = if let Some(value) = value {
@@ -818,8 +822,9 @@ pub fn worker_execute_step(
                                 let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                                 let out_ctx =
                                     Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                                let io_dv = write_output(py, handler, &out_ctx, &value)?;
-                                io_dv.or(data_version)
+                                let written = write_output(py, handler, &out_ctx, &value)?;
+                                ops::merge_metadata(&mut metadata, &written.metadata);
+                                written.data_version.or(data_version)
                             } else {
                                 data_version
                             };
@@ -924,7 +929,7 @@ fn drain_ctx_state(
         && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
     {
         let ctx_borrow = bound.borrow();
-        let metadata = ctx_borrow.drain_output_metadata();
+        let metadata = ctx_borrow.drain_output_metadata(py);
         let dv = ctx_borrow.drain_data_version();
         return Ok((metadata, dv));
     }

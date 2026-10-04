@@ -8,7 +8,6 @@ so the source lines come from that machine: a loky worker captures its own.
 
 import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,16 +132,13 @@ def test_failed_step_stores_its_traceback(storage, setup, tmp_path, is_async):
     assert frame["context_line"] == SOURCE[lineno - 1]
     assert frame["pre_context"] == SOURCE[lineno - 6 : lineno - 1]
     assert frame["post_context"] == SOURCE[lineno : lineno + 5]
-    if sys.version_info >= (3, 11):
-        expr = 'values["missing"]'
-        start = SOURCE[lineno - 1].index(expr)
-        assert (frame["colno"], frame["end_lineno"], frame["end_colno"]) == (
-            start + 1,
-            lineno,
-            start + len(expr),
-        )
-    else:
-        assert "colno" not in frame
+    expr = 'values["missing"]'
+    start = SOURCE[lineno - 1].index(expr)
+    assert (frame["colno"], frame["end_lineno"], frame["end_colno"]) == (
+        start + 1,
+        lineno,
+        start + len(expr),
+    )
     assert tb["text"].startswith("Traceback (most recent call last):\n")
     assert tb["text"].endswith("KeyError: 'missing'\n")
 
@@ -297,9 +293,6 @@ def test_multi_asset_failure_stores_a_traceback_per_output(storage, setup):
         assert exc["frames"][-1]["lineno"] == line_of("pair-raise")
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="exception groups are new in Python 3.11"
-)
 def test_exception_group_members_are_captured(storage, setup):
     @rs.Asset(io_handler=setup.handler)
     def fan() -> int:

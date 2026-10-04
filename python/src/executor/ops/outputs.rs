@@ -15,16 +15,17 @@
 //! ```
 //!
 //! `OutputItem.metadata` is stripped of any `MetadataValue::DataVersion`
-//! entries (those are folded into `data_version`). The IO-handler-supplied
-//! data_version is NOT considered here — for a Materialization, the consumer
-//! still wins via `Some(io_dv).or(item.data_version)` after `handle_step_output`.
+//! entries (those are folded into `data_version`). What the IO handler sets
+//! during the write is NOT considered here — for a Materialization, the
+//! consumer overlays it after `write_output`: the handler's metadata wins via
+//! `merge_metadata`, its data_version via `.or(item.data_version)`.
 //!
 //! ## Construction discipline
 //!
 //! `OutputItem`'s variants are constructible only from inside this module
 //! (private fields). Consumers can `match` and read but cannot fabricate a
 //! partially-merged `OutputItem`; a `merge_metadata` call outside this
-//! module is skipping the contract.
+//! module, other than that handler overlay, is skipping the contract.
 
 use std::collections::HashSet;
 
@@ -195,7 +196,7 @@ where
         // Cumulative ctx-level metadata (peek, not drain) + per-yield ctx dv (drain).
         let ctx_metadata = gen_ctx
             .as_ref()
-            .map(|c| c.borrow(py).peek_output_metadata())
+            .map(|c| c.borrow(py).peek_output_metadata(py))
             .unwrap_or_default();
         let ctx_dv = gen_ctx
             .as_ref()

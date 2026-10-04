@@ -49,7 +49,7 @@ def add_output_metadata(
 ) -> None
 ```
 
-Attach runtime metadata to the output. Values are automatically converted to `MetadataValue` instances.
+Attach runtime metadata to the output. Values are automatically converted to `MetadataValue` instances. The entries are stored on the materialization event. On a key that the asset also set, the handler's value is stored.
 
 ```python
 def register_data_version(self, version: str) -> None

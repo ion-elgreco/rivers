@@ -155,7 +155,7 @@ pub(crate) fn load_upstream_input(
 
     let handler = registry.for_upstream_input(py, downstream_node, upstream_node, param_name);
     let metadata = downstream_node
-        .input_metadata(py, param_name)
+        .input_metadata(param_name)
         .or_else(|| upstream_node.metadata());
     let has_mapping = downstream_node
         .partition_mapping()
@@ -201,9 +201,17 @@ pub(crate) fn load_step_output(
     handler.call_method1(py, "load_input", (ctx,))
 }
 
-/// Write a result to IO via a handler. Returns the data_version registered by
-/// the IO handler. This is the shared core used by both the in-process
-/// executor and the parallel worker.
+/// What an IO handler left on the `OutputContext` of one write.
+pub(crate) struct WrittenOutput {
+    /// Set by `register_data_version()`; wins over the asset's data version.
+    pub data_version: Option<String>,
+    /// The context's metadata after `handle_output`. Overlay it on the
+    /// output's metadata with `merge_metadata`: the handler's entries win.
+    pub metadata: Vec<(String, MetadataValue)>,
+}
+
+/// Write a result to IO via a handler. This is the shared core used by both
+/// the in-process executor and the parallel worker.
 ///
 /// Fan-out `dynamic_keys` indices live in rivers-internal KV, not in user IO —
 /// the orchestrator writes them via `kv_set` after this function returns,
@@ -213,15 +221,17 @@ pub(crate) fn write_output(
     handler: &Py<PyAny>,
     out_ctx: &Py<PyOutputContext>,
     result: &Py<PyAny>,
-) -> PyResult<Option<String>> {
+) -> PyResult<WrittenOutput> {
     handler.call_method1(py, "handle_output", (out_ctx.clone_ref(py), result))?;
-    let data_version = out_ctx.borrow(py).drain_data_version();
-    Ok(data_version)
+    let ctx = out_ctx.get();
+    Ok(WrittenOutput {
+        data_version: ctx.drain_data_version(),
+        metadata: ctx.drain_output_metadata(py),
+    })
 }
 
-/// Returns the data_version registered by the IO handler via
-/// `output_context.register_data_version()`. Walks the registry chain
-/// `node.io_handler() → default`.
+/// Writes through the registry chain `node.io_handler() → default`, with
+/// `output_metadata` visible to the handler as `context.output_metadata`.
 pub(crate) fn handle_step_output(
     py: Python,
     step_name: &str,
@@ -231,7 +241,7 @@ pub(crate) fn handle_step_output(
     return_hint: Option<&Py<PyAny>>,
     output_metadata: Vec<(String, MetadataValue)>,
     registry: &IOHandlerRegistry,
-) -> PyResult<Option<String>> {
+) -> PyResult<WrittenOutput> {
     let handler = registry.for_output(py, node);
     let metadata = node.metadata();
     let partition = build_partition_context(node, partition_key)?;

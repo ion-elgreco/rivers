@@ -1,5 +1,10 @@
 """DataFusion type handler for the Delta Lake IO handler."""
 
+import pytest
+
+pytest.importorskip("deltalake")
+pytest.importorskip("datafusion")
+
 import gc
 
 import pyarrow as pa

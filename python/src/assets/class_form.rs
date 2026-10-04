@@ -470,10 +470,15 @@ pub(crate) fn node_names(cls: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
                 type_name(t)?
             )));
         }
-        return Ok(defs
+        return defs
             .iter()
-            .map(|(attr, ad)| ad.borrow().name.clone().unwrap_or_else(|| attr.clone()))
-            .collect());
+            .map(|(attr, ad)| {
+                Ok(AssetDef::read(ad)?
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| attr.clone()))
+            })
+            .collect();
     }
     Ok(vec![asset_name(t)?])
 }
@@ -620,18 +625,15 @@ fn desugar_multi(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
             type_name(cls)?
         )));
     }
-    for (attr, ad) in &defs {
-        if ad.borrow().name.is_none() {
-            ad.borrow_mut().name = Some(attr.clone());
-        }
-    }
+    // The defs are class attributes shared by every build of the class.
+    let output_defs = defs
+        .iter()
+        .map(|(attr, ad)| Py::new(py, AssetDef::named_copy(ad, attr)?))
+        .collect::<PyResult<Vec<_>>>()?;
     let f = bound_verb(cls, "materialize", &defined_on)?;
     let ctor = py.get_type::<PyAsset>().getattr("from_multi")?;
     let cfg = collect_config(cls, &ctor)?;
-    cfg.set_item(
-        "output_defs",
-        defs.iter().map(|(_, ad)| ad).collect::<Vec<_>>(),
-    )?;
+    cfg.set_item("output_defs", output_defs)?;
     cfg.set_item("name", asset_name(cls)?)?;
     cfg.set_item("actions", collect_actions(cls)?)?;
     let factory = ctor.call((), Some(&cfg))?;

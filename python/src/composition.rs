@@ -34,7 +34,12 @@ fn try_extract_binding(
     }
 }
 
-#[pyclass(name = "InvokedNodeOutput", from_py_object, module = "rivers._core")]
+#[pyclass(
+    name = "InvokedNodeOutput",
+    frozen,
+    from_py_object,
+    module = "rivers._core"
+)]
 #[derive(Debug, Clone)]
 pub struct PyInvokedNodeOutput {
     #[pyo3(get)]
@@ -55,10 +60,10 @@ impl PyInvokedNodeOutput {
     #[pyo3(signature = (task, *, max_concurrency=None))]
     fn map(
         &self,
-        task: PyRef<'_, PyTask>,
+        task: &Bound<'_, PyTask>,
         max_concurrency: Option<usize>,
     ) -> PyResult<PyMappedOutput> {
-        let task_name = task.inner.name.as_deref().ok_or_else(|| {
+        let task_name = task.get().inner.name.as_deref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(".map() target Task has no name")
         })?;
 
@@ -89,7 +94,7 @@ impl PyInvokedNodeOutput {
     }
 }
 
-#[pyclass(name = "MappedOutput", from_py_object, module = "rivers._core")]
+#[pyclass(name = "MappedOutput", frozen, from_py_object, module = "rivers._core")]
 #[derive(Debug, Clone)]
 pub struct PyMappedOutput {
     #[pyo3(get)]

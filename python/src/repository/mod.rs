@@ -6,9 +6,11 @@
 pub mod resolved_node;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::thread::ThreadId;
 
 use pyo3::prelude::*;
+use pyo3::sync::{MutexExt, RwLockExt};
 
 use crate::errors::{
     AssetDefinitionError, AssetNotFoundError, ConfigurationError, ExecutionError,
@@ -61,7 +63,7 @@ where
 
 /// The verb a job's runs execute, for stamping on their `RunRecord`.
 /// `None` for materialize jobs (and unknown/unresolved names). Takes the
-/// borrowed map so callers that already hold the state guard can use it.
+/// borrowed map so callers that already hold the state can use it.
 fn job_action(jobs_info: &HashMap<String, JobSummary>, job_name: Option<&str>) -> Option<String> {
     job_name.and_then(|j| jobs_info.get(j).and_then(|s| s.action.clone()))
 }
@@ -187,7 +189,7 @@ fn resolve_selection<'a>(
 
 /// Every selected asset must exist and define `verb` — the shared boundary
 /// check (gRPC RunAction, backfill verbs). A free function over the node map
-/// so callers already holding the state lock don't re-enter it.
+/// so callers already holding the state don't read it again.
 fn ensure_assets_support_action(
     node_map: &HashMap<String, ResolvedNode>,
     selection: &[String],
@@ -290,7 +292,7 @@ fn ensure_whole_asset_chosen<'a>(
 /// Storage-side companion to [`validate_partition_for_selection`]: a Dynamic
 /// def can't validate membership statically (its keys live in storage), so
 /// collect the `(asset, namespace, keys)` triples to verify against
-/// `dynamic_partitions` once the state lock is released.
+/// `dynamic_partitions` in storage.
 type DynamicKeyCheck = (String, String, Vec<String>);
 
 fn dynamic_partition_checks<'a, I>(
@@ -528,7 +530,7 @@ use crate::partitions::{
     PartitionsDefinition, PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange,
     resolve_partitions_def_ref,
 };
-use crate::storage::{PyLaunchedBy, PyStorage, PyStorageType};
+use crate::storage::{DetachOnClose, PyLaunchedBy, PyStorage, PyStorageType};
 use crate::task::{PyBashTask, PyTask};
 
 use self::resolved_node::{ResolvedAsset, ResolvedBashTask, ResolvedNode, ResolvedTask};
@@ -558,7 +560,7 @@ impl PyRunResult {
 pub struct PyRunHandle {
     #[pyo3(get)]
     pub(crate) run_id: String,
-    storage: Arc<SurrealStorage>,
+    storage: DetachOnClose<Arc<SurrealStorage>>,
 }
 
 #[pymethods]
@@ -708,27 +710,37 @@ impl PyBackfillStatusResult {
     }
 }
 
+/// The parameters that take upstream data, in declaration order: those
+/// `enumerate_params` lists, except the context, `self` and resources.
+fn upstream_params(
+    py: Python,
+    func: &Py<PyAny>,
+    resource_keys: &HashSet<&String>,
+) -> PyResult<Vec<String>> {
+    let mut params = Vec::new();
+    for (name, annotation) in enumerate_params(py, func)? {
+        let is_ctx = annotation
+            .as_ref()
+            .is_some_and(|a| is_context_annotation(py, a));
+        if is_ctx || name == "context" || name == "self" || resource_keys.contains(&name) {
+            continue;
+        }
+        params.push(name);
+    }
+    Ok(params)
+}
+
 fn append_deps(
     py: Python,
     deps: &mut Vec<NodeRef>,
     func: &Py<PyAny>,
     resource_keys: &HashSet<&String>,
 ) -> PyResult<()> {
-    for (name, annotation) in enumerate_params(py, func)? {
-        if name == "return" || name == "self" {
-            continue;
-        }
-        let is_ctx = annotation
-            .as_ref()
-            .is_some_and(|a| is_context_annotation(py, a));
-        if is_ctx || name == "context" {
-            continue;
-        }
-        if resource_keys.contains(&name) {
-            continue;
-        }
-        deps.push(NodeRef::ByName(name));
-    }
+    deps.extend(
+        upstream_params(py, func, resource_keys)?
+            .into_iter()
+            .map(NodeRef::ByName),
+    );
     Ok(())
 }
 
@@ -958,8 +970,8 @@ pub(crate) fn build_unresolved_graph(
     let mut node_map: HashMap<String, ResolvedNode> = HashMap::new();
 
     // Two definitions claiming one name used to overwrite silently, leaving
-    // the graph with whichever registered last (e.g. one `AssetDef` instance
-    // shared by two class-form multi assets, which names both outputs alike).
+    // the graph with whichever registered last (e.g. one named `AssetDef`
+    // shared by two class-form multi assets).
     let claim = |seen: &mut HashSet<String>, name: &str| -> PyResult<()> {
         if !seen.insert(name.to_string()) {
             return Err(AssetDefinitionError::new_err(format!(
@@ -971,7 +983,7 @@ pub(crate) fn build_unresolved_graph(
     let mut claimed: HashSet<String> = HashSet::new();
 
     for decorator_py in assets {
-        let inner_asset = &decorator_py.borrow(py).inner;
+        let inner_asset = &decorator_py.get().inner;
         let mut deps = Vec::new();
 
         match inner_asset {
@@ -1115,7 +1127,7 @@ pub(crate) fn build_unresolved_graph(
     let mut graph_input_metadata: HashMap<String, HashMap<String, HashMap<String, String>>> =
         HashMap::new();
     for decorator_py in assets {
-        let inner_asset = &decorator_py.borrow(py).inner;
+        let inner_asset = &decorator_py.get().inner;
         if let Asset::Graph(graph_asset) = inner_asset {
             let graph_name = graph_asset.name.clone().unwrap_or_default();
             if let Some(ref pd) = graph_asset.partitions_def {
@@ -1186,63 +1198,50 @@ pub(crate) fn build_unresolved_graph(
     }
     let composition_task_names: HashSet<String> = composition_bindings.keys().cloned().collect();
 
+    /// Positional arguments fill the upstream parameters in order; a parameter
+    /// left unbound resolves by name. Every argument is a dependency.
     fn build_remap_from_bindings(
         py: Python,
         bindings: Vec<InputBinding>,
         wraps: &Option<Py<PyAny>>,
+        resource_keys: &HashSet<&String>,
     ) -> PyResult<(Vec<NodeRef>, HashMap<String, String>)> {
         let mut remap = HashMap::new();
         let mut all_deps: Vec<NodeRef> = Vec::new();
-
-        let named: Vec<_> = bindings.iter().filter(|b| b.param_name.is_some()).collect();
-        let positional: Vec<_> = bindings.iter().filter(|b| b.param_name.is_none()).collect();
-
-        let named_params: HashSet<String> = named
-            .iter()
-            .map(|b| b.param_name.clone().unwrap())
-            .collect();
-        for b in &named {
-            let pname = b.param_name.clone().unwrap();
-            remap.insert(pname, b.upstream_node_name.clone());
-            all_deps.push(NodeRef::ByName(b.upstream_node_name.clone()));
+        let mut positional = Vec::new();
+        for b in bindings {
+            match b.param_name {
+                Some(pname) => {
+                    all_deps.push(NodeRef::ByName(b.upstream_node_name.clone()));
+                    remap.insert(pname, b.upstream_node_name);
+                }
+                None => positional.push(b.upstream_node_name),
+            }
         }
 
+        let mut positional = positional.into_iter();
         if let Some(wraps) = wraps {
-            let annotations = get_annotations(py, wraps)?;
-            let mut pos_idx = 0;
-            for (k, v) in annotations.iter() {
-                let pname: String = k.extract()?;
-                if pname == "return" || pname == "self" {
+            for pname in upstream_params(py, wraps, resource_keys)? {
+                if remap.contains_key(&pname) {
                     continue;
                 }
-                // Skip context parameters — they are injected by the executor,
-                // not resolved as upstream dependencies.
-                if is_context_annotation(py, &v) || pname == "context" {
-                    continue;
-                }
-                if named_params.contains(&pname) {
-                    continue;
-                }
-                if pos_idx < positional.len() {
-                    remap.insert(pname, positional[pos_idx].upstream_node_name.clone());
-                    all_deps.push(NodeRef::ByName(
-                        positional[pos_idx].upstream_node_name.clone(),
-                    ));
-                    pos_idx += 1;
-                } else {
-                    // Unbound param: resolve by name (annotation-based)
-                    all_deps.push(NodeRef::ByName(pname));
+                match positional.next() {
+                    Some(upstream) => {
+                        all_deps.push(NodeRef::ByName(upstream.clone()));
+                        remap.insert(pname, upstream);
+                    }
+                    None => all_deps.push(NodeRef::ByName(pname)),
                 }
             }
         }
+        all_deps.extend(positional.map(NodeRef::ByName));
         Ok((all_deps, remap))
     }
 
     for task_py in tasks {
         if let Ok(py_task) = task_py.cast_bound::<PyTask>(py) {
-            let task = py_task.borrow();
+            let task = &py_task.get().inner;
             let task_name = task
-                .inner
                 .name
                 .clone()
                 .ok_or_else(|| AssetDefinitionError::new_err("Task has no name"))?;
@@ -1255,7 +1254,7 @@ pub(crate) fn build_unresolved_graph(
                     for ns_name in &namespaced_names {
                         let bindings = composition_bindings.remove(ns_name).unwrap_or_default();
                         let (comp_deps, remap) =
-                            build_remap_from_bindings(py, bindings, &task.inner.wraps)?;
+                            build_remap_from_bindings(py, bindings, &task.wraps, resource_keys)?;
                         // Inherit partitions_def and partition mappings from parent graph asset.
                         // Only propagate mapping entries for this task's actual deps.
                         let graph_name = ns_name.split('/').next().unwrap_or("");
@@ -1315,18 +1314,14 @@ pub(crate) fn build_unresolved_graph(
                     false
                 };
 
-            drop(task);
-
-            // Bare entries use annotation-based deps which may reference
-            // params that don't exist as graph nodes — skip when this task
-            // is used exclusively inside graph compositions.
+            // Bare entries take deps from parameter names, which may not exist
+            // as graph nodes — skip when this task is used exclusively inside
+            // graph compositions.
             if !has_namespaced {
                 let mut deps = Vec::new();
-                let task = py_task.borrow();
-                if let Some(ref wraps) = task.inner.wraps {
+                if let Some(ref wraps) = task.wraps {
                     append_deps(py, &mut deps, wraps, resource_keys)?;
                 }
-                drop(task);
                 unresolved_graph.insert(task_name.clone(), deps);
                 node_map.insert(
                     task_name,
@@ -1344,9 +1339,7 @@ pub(crate) fn build_unresolved_graph(
                 );
             }
         } else if let Ok(py_bash) = task_py.cast_bound::<PyBashTask>(py) {
-            let bash = py_bash.borrow();
-            let task_name = bash.name.clone();
-            drop(bash);
+            let task_name = py_bash.get().name.clone();
 
             let bash_ref: Py<PyBashTask> = py_bash.clone().unbind();
 
@@ -1544,7 +1537,7 @@ pub(crate) struct ResolvedState {
     pub(crate) jobs_info: HashMap<String, JobSummary>,
     pub(crate) sensors_info: HashMap<String, SensorSummary>,
     pub(crate) schedules_info: HashMap<String, ScheduleSummary>,
-    pub(crate) storage: Arc<SurrealStorage>,
+    pub(crate) storage: DetachOnClose<Arc<SurrealStorage>>,
     pub(crate) storage_type: PyStorageType,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     pub(crate) io_handler_registry: crate::assets::io_handler_registry::IOHandlerRegistry,
@@ -1558,24 +1551,51 @@ pub(crate) struct ResolvedState {
     pub(crate) code_location_id: String,
 }
 
+/// The [`ResolvedState`] a repository shares with its [`RepoHandle`]s. A
+/// caller takes its own `Arc` and the lock is released at once, so a run
+/// keeps the state it started with when the repository releases it.
+#[derive(Clone, Default)]
+pub(crate) struct SharedState(Arc<RwLock<Option<Arc<ResolvedState>>>>);
+
+impl SharedState {
+    pub(crate) fn get(&self) -> Option<Arc<ResolvedState>> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub(crate) fn get_attached(&self, py: Python<'_>) -> Option<Arc<ResolvedState>> {
+        self.0.read_py_attached(py).unwrap().clone()
+    }
+
+    /// `None` also while a writer holds the lock.
+    fn try_get(&self) -> Option<Arc<ResolvedState>> {
+        self.0.try_read().ok()?.clone()
+    }
+
+    /// Returns the previous state, so it is dropped after the lock is released.
+    fn replace(
+        &self,
+        py: Python<'_>,
+        state: Option<Arc<ResolvedState>>,
+    ) -> Option<Arc<ResolvedState>> {
+        std::mem::replace(&mut *self.0.write_py_attached(py).unwrap(), state)
+    }
+}
+
 /// Non-py twin of [`PyCodeRepository`] for the dispatch surface.
 ///
-/// Holds an `Arc` of the same shared resolved-state lock that the pyclass
-/// holds, so the dispatcher (and any other Rust caller) can submit runs
-/// without going through `repo.borrow(py)`. The hot path is fully GIL-free:
-/// reads acquire the read lock, drop it after extracting what's needed,
-/// then `await` the storage write.
+/// Shares the pyclass's [`SharedState`], so the dispatcher (and any other
+/// Rust caller) can submit runs without going through `repo.borrow(py)`.
 ///
 /// Construct via [`PyCodeRepository::handle`] under the GIL once at
 /// dispatcher startup; clone freely thereafter.
 #[derive(Clone)]
 pub(crate) struct RepoHandle {
-    state: Arc<std::sync::RwLock<Option<ResolvedState>>>,
+    state: SharedState,
     backfill_cancel_flags:
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
-/// One run to enqueue via [`RepoHandle::submit_runs`].
+/// One run to enqueue via [`submit_runs`].
 pub(crate) struct RunSubmission {
     /// `None` = all assets.
     pub(crate) selection: Option<Vec<String>>,
@@ -1592,19 +1612,22 @@ pub(crate) struct RunSubmission {
 }
 
 impl RepoHandle {
+    fn resolved(&self) -> PyResult<Arc<ResolvedState>> {
+        self.state.get().ok_or_else(|| {
+            ExecutionError::new_err("Repository not resolved — call resolve() first")
+        })
+    }
+
     /// Best-effort: fail a `Started` run whose launch never began (e.g. the
     /// interpreter was finalizing), so it can't wedge in-flight gating forever.
     /// `reason` is persisted on a `RunLaunchFailed` event — without it the run
     /// detail has an empty timeline and the error only reaches the terminal.
     pub(crate) async fn mark_run_launch_failed(&self, run_id: &str, reason: &str) {
-        let (storage, code_location_id) = {
-            let guard = self.state.read().unwrap();
-            match guard.as_ref() {
-                Some(state) => (state.storage.clone(), state.code_location_id.clone()),
-                None => return,
-            }
+        let Some(state) = self.state.get() else {
+            return;
         };
-        crate::daemon::fail_unlaunched_run(&storage, &code_location_id, run_id, reason).await;
+        crate::daemon::fail_unlaunched_run(&state.storage, &state.code_location_id, run_id, reason)
+            .await;
     }
 
     /// Look up a user-defined job's asset selection. `None` if the repo
@@ -1612,25 +1635,20 @@ impl RepoHandle {
     /// pre-computed map populated at resolve time.
     pub(crate) fn job_asset_names(&self, name: &str) -> Option<Vec<String>> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .and_then(|s| s.jobs_info.get(name).map(|j| j.asset_names.clone()))
     }
 
     /// The verb a user-defined job runs; `None` means materialize.
     pub(crate) fn job_verb(&self, name: &str) -> Option<String> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .and_then(|s| job_action(&s.jobs_info, Some(name)))
     }
 
     /// Assets defining `action`, sorted.
     pub(crate) fn assets_supporting_action(&self, action: &str) -> PyResult<Vec<String>> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         Ok(assets_supporting_action(&state.node_map, action))
@@ -1642,8 +1660,7 @@ impl RepoHandle {
         selection: &[String],
         action: &str,
     ) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         ensure_assets_support_action(&state.node_map, selection, action)
@@ -1656,8 +1673,7 @@ impl RepoHandle {
         asset_names: &[String],
         action: &str,
     ) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         ensure_whole_asset_chosen(
@@ -1670,8 +1686,7 @@ impl RepoHandle {
     /// [`Self::validate_keyless_action`] for a keyless gRPC `ExecuteJob`: the
     /// job's verb over its assets. A materialize job has no choice to make.
     pub(crate) fn validate_keyless_job(&self, job_name: &str) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         let Some(job) = state.jobs_info.get(job_name) else {
@@ -1689,8 +1704,7 @@ impl RepoHandle {
 
     /// See [`ensure_job_verb`].
     pub(crate) fn validate_job_verb(&self, job_name: &str, expected: Option<&str>) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get().ok_or_else(|| {
             ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
         })?;
         ensure_job_verb(&state.jobs_info, job_name, expected)
@@ -1698,44 +1712,32 @@ impl RepoHandle {
 
     pub(crate) fn list_jobs(&self) -> Vec<JobSummary> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|s| s.jobs_info.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn job_names(&self) -> Vec<String> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|s| s.jobs_info.keys().cloned().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn code_location_id(&self) -> Option<String> {
-        self.state
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.code_location_id.clone())
+        self.state.get().map(|s| s.code_location_id.clone())
     }
 
     pub(crate) fn list_sensors(&self) -> Vec<SensorSummary> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|s| s.sensors_info.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn list_schedules(&self) -> Vec<ScheduleSummary> {
         self.state
-            .read()
-            .unwrap()
-            .as_ref()
+            .get()
             .map(|s| s.schedules_info.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -1751,12 +1753,8 @@ impl RepoHandle {
         job_name: Option<String>,
         config: Option<String>,
     ) -> PyResult<PyRunHandle> {
-        // Sync prep under the read lock — drop the guard before the await.
         let (record, storage, dyn_checks) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
+            let state = self.resolved()?;
             let graph = state
                 .inner_repo
                 .graph
@@ -1775,13 +1773,13 @@ impl RepoHandle {
             // The record carries the job's verb, so the key must satisfy it.
             let action = job_action(&state.jobs_info, job_name.as_deref());
             validate_partition_for_verb(
-                state,
+                &state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
                 action.as_deref(),
             )?;
             let dyn_checks = dynamic_partition_checks(
-                state,
+                &state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
             );
@@ -1827,117 +1825,8 @@ impl RepoHandle {
 
         Ok(PyRunHandle {
             run_id: record.run_id,
-            storage,
+            storage: DetachOnClose::new(storage),
         })
-    }
-
-    pub(crate) async fn submit_runs(
-        &self,
-        runs: Vec<RunSubmission>,
-        launched_by: LaunchedBy,
-    ) -> PyResult<Vec<String>> {
-        let (records, storage, dyn_checks) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            let graph = state
-                .inner_repo
-                .graph
-                .as_ref()
-                .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
-
-            let now = now_ts();
-            let all_names: Vec<String> = graph
-                .node_indices()
-                .map(|idx| graph[idx].name.clone())
-                .collect();
-
-            let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
-            let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
-
-            for sub in &runs {
-                let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
-                let action = sub.action.clone();
-                validate_partition_for_verb(
-                    state,
-                    asset_names.iter().map(String::as_str),
-                    sub.partition_key.as_ref(),
-                    action.as_deref(),
-                )?;
-                dyn_checks.extend(dynamic_partition_checks(
-                    state,
-                    asset_names.iter().map(String::as_str),
-                    sub.partition_key.as_ref(),
-                ));
-                let run_id = uuid::Uuid::new_v4().to_string();
-                let run_tags = sub.tags.clone().unwrap_or_default();
-                let priority = priority_from_tags(&run_tags);
-                let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
-
-                records.push(RunRecord {
-                    run_id,
-                    code_location_id: state.code_location_id.clone(),
-                    job_name: sub.job_name.clone(),
-                    status: RunStatus::Queued,
-                    start_time: now,
-                    end_time: None,
-                    tags: run_tags,
-                    node_names: asset_names,
-                    priority,
-                    partition_key: core_pk,
-                    block_reason: None,
-                    launched_by: launched_by.clone(),
-                    action,
-                    config: sub.config.clone(),
-                });
-            }
-            (records, state.storage.clone(), dyn_checks)
-        };
-
-        if let Some(first) = records.first() {
-            verify_dynamic_partition_keys(&storage, &first.code_location_id, &dyn_checks).await?;
-        }
-
-        // Backfill runs carry the run_ids link on the backfill record in the
-        // same transaction, so the link can never lie about what exists.
-        match &launched_by {
-            LaunchedBy::Backfill { backfill_id } => {
-                let live = storage
-                    .enqueue_backfill_runs(&records, backfill_id)
-                    .await
-                    .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?;
-                if !live {
-                    let canceled: Vec<rivers_core::storage::PartitionKey> = records
-                        .iter()
-                        .filter_map(|r| r.partition_key.as_ref())
-                        .flat_map(|pk| pk.members())
-                        .collect();
-                    let _ = storage
-                        .update_backfill_progress(backfill_id, &[], &[], &[], &canceled)
-                        .await;
-                    tracing::info!(
-                        target: "rivers::repo",
-                        backfill_id = %backfill_id,
-                        count = records.len(),
-                        "backfill canceled during submission — swept enqueued batch"
-                    );
-                }
-            }
-            _ => storage
-                .enqueue_runs(&records)
-                .await
-                .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?,
-        }
-
-        let run_ids: Vec<String> = records.into_iter().map(|r| r.run_id).collect();
-        tracing::info!(
-            target: "rivers::repo",
-            count = run_ids.len(),
-            "runs enqueued (batch)"
-        );
-
-        Ok(run_ids)
     }
 
     /// Direct counterpart to [`Self::submit_run`]: write a `RunRecord`
@@ -1958,69 +1847,16 @@ impl RepoHandle {
         run_id_override: Option<String>,
         config: Option<String>,
     ) -> PyResult<String> {
-        let (record, storage, dyn_checks) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-
-            let summary = state
-                .jobs_info
-                .get(job_name)
-                .ok_or_else(|| ExecutionError::new_err(format!("Job '{job_name}' not found")))?;
-            let asset_names = summary.asset_names.clone();
-            let action = summary.action.clone();
-
-            validate_partition_for_verb(
-                state,
-                asset_names.iter().map(String::as_str),
-                partition_key,
-                action.as_deref(),
-            )?;
-            let dyn_checks = dynamic_partition_checks(
-                state,
-                asset_names.iter().map(String::as_str),
-                partition_key,
-            );
-
-            let run_id = run_id_override.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let now = now_ts();
-            let core_pk = partition_key.map(|pk| pk.into());
-
-            let record = RunRecord {
-                run_id,
-                code_location_id: state.code_location_id.clone(),
-                job_name: Some(job_name.to_string()),
-                status: RunStatus::Started,
-                start_time: now,
-                end_time: None,
-                tags: Vec::new(),
-                node_names: asset_names,
-                priority: 0,
-                partition_key: core_pk,
-                block_reason: None,
-                launched_by,
-                action,
-                config,
-            };
-            (record, state.storage.clone(), dyn_checks)
-        };
-
-        verify_dynamic_partition_keys(&storage, &record.code_location_id, &dyn_checks).await?;
-
-        storage
-            .create_run(&record)
-            .await
-            .map_err(|e| ExecutionError::new_err(format!("Failed to create run: {e}")))?;
-
-        tracing::info!(
-            target: "rivers::repo",
-            run_id = %record.run_id,
-            job_name = %job_name,
-            "started run created"
-        );
-
-        Ok(record.run_id)
+        let state = self.resolved()?;
+        create_started_run(
+            &state,
+            job_name,
+            partition_key,
+            launched_by,
+            run_id_override,
+            config,
+        )
+        .await
     }
 
     /// Materialization counterpart to [`Self::create_started_run`]:
@@ -2047,44 +1883,18 @@ impl RepoHandle {
         action: Option<String>,
         config: Option<String>,
     ) -> PyResult<()> {
-        let (record, storage) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-
-            let priority = priority_from_tags(&tags);
-            let record = RunRecord {
-                run_id,
-                code_location_id: state.code_location_id.clone(),
-                job_name: None,
-                status: RunStatus::Started,
-                start_time: now_ts(),
-                end_time: None,
-                tags,
-                node_names: asset_selection,
-                priority,
-                partition_key,
-                block_reason: None,
-                launched_by,
-                action,
-                config,
-            };
-            (record, state.storage.clone())
-        };
-
-        storage
-            .create_run(&record)
-            .await
-            .map_err(|e| ExecutionError::new_err(format!("Failed to create run: {e}")))?;
-
-        tracing::info!(
-            target: "rivers::repo",
-            run_id = %record.run_id,
-            "materialization run created"
-        );
-
-        Ok(())
+        let state = self.resolved()?;
+        create_materialization_run(
+            &state,
+            asset_selection,
+            partition_key,
+            tags,
+            launched_by,
+            run_id,
+            action,
+            config,
+        )
+        .await
     }
 
     /// Validate `partition_key` against the given `asset_names` —
@@ -2125,19 +1935,16 @@ impl RepoHandle {
         verb: Option<&str>,
     ) -> PyResult<()> {
         let (dyn_checks, storage, code_location_id) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
+            let state = self.resolved()?;
             validate_partition_for_verb(
-                state,
+                &state,
                 asset_names.iter().map(String::as_str),
                 partition_key,
                 verb,
             )?;
             (
                 dynamic_partition_checks(
-                    state,
+                    &state,
                     asset_names.iter().map(String::as_str),
                     partition_key,
                 ),
@@ -2154,10 +1961,7 @@ impl RepoHandle {
     /// (Direct `dispatch_materialization`'s fire-and-forget thread,
     /// Queued's record-write) would otherwise swallow the error.
     pub(crate) fn validate_assets_exist(&self, asset_names: &[String]) -> PyResult<()> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
-            ExecutionError::new_err("Repository not resolved — call resolve() first")
-        })?;
+        let state = self.resolved()?;
         resolve_selection(&state.node_map, asset_names)?;
         Ok(())
     }
@@ -2165,12 +1969,8 @@ impl RepoHandle {
     /// GIL-free. Used by gRPC `materialize` to expand empty selection
     /// ("materialize everything") into an explicit list before dispatch.
     pub(crate) fn asset_names(&self) -> PyResult<Vec<String>> {
-        let guard = self.state.read().unwrap();
-        Ok(guard
-            .as_ref()
-            .ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?
+        Ok(self
+            .resolved()?
             .node_map
             .iter()
             .filter(|&(_k, n)| matches!(n, ResolvedNode::Asset(_)))
@@ -2179,11 +1979,9 @@ impl RepoHandle {
     }
 
     /// Returns a `Py<PyJob>` ready for GIL-bound use (e.g. `execute_run` on
-    /// a launch thread). Drops the read lock before returning so it can't
-    /// serialize against `resolve()` for the caller's GIL-attached work.
+    /// a launch thread).
     pub(crate) fn get_job(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyJob>> {
-        let guard = self.state.read().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
+        let state = self.state.get_attached(py).ok_or_else(|| {
             ExecutionError::new_err("Repository not resolved — call resolve() first")
         })?;
         state
@@ -2197,13 +1995,7 @@ impl RepoHandle {
         &self,
         backfill_id: &str,
     ) -> PyResult<Option<PyBackfillStatusResult>> {
-        let storage = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            state.storage.clone()
-        };
+        let storage = self.resolved()?.storage.clone();
         let record = storage
             .get_backfill(backfill_id)
             .await
@@ -2232,13 +2024,7 @@ impl RepoHandle {
         dry_run: bool,
         launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
-        let storage = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            state.storage.clone()
-        };
+        let storage = self.resolved()?.storage.clone();
         let record = storage
             .get_backfill(backfill_id)
             .await
@@ -2293,10 +2079,7 @@ impl RepoHandle {
         launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::RunRerunRequest> {
         let (storage, own_cl) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
+            let state = self.resolved()?;
             (state.storage.clone(), state.code_location_id.clone())
         };
         let record = storage
@@ -2356,16 +2139,13 @@ impl RepoHandle {
         launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
         // Dynamic keys live in storage, not the def — capture the namespace and
-        // fetch after dropping the guard; other kinds enumerate from the def here.
+        // fetch it from storage below; other kinds enumerate from the def here.
         enum Universe {
             Keys(Vec<PyPartitionKey>),
             Dynamic(String),
         }
         let (universe, storage, code_location_id) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
+            let state = self.resolved()?;
             let def = state
                 .node_map
                 .get(asset_key)
@@ -2452,13 +2232,7 @@ impl RepoHandle {
             }
         };
 
-        let storage = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            state.storage.clone()
-        };
+        let storage = self.resolved()?.storage.clone();
         let status = storage
             .cancel_backfill(&backfill_id)
             .await
@@ -2512,10 +2286,7 @@ impl RepoHandle {
     /// signal the run backend (Local in-process / K8s pod kill).
     pub(crate) async fn cancel_run(&self, run_id: &str) -> PyResult<bool> {
         let (storage, run_backend) = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
+            let state = self.resolved()?;
             (state.storage.clone(), state.run_backend.clone())
         };
 
@@ -2554,13 +2325,7 @@ impl RepoHandle {
     /// Delete a terminal run and its history from storage. Errors if the
     /// run is still active; `Ok(false)` if no such run exists.
     pub(crate) async fn delete_run(&self, run_id: &str) -> PyResult<bool> {
-        let storage = {
-            let guard = self.state.read().unwrap();
-            let state = guard.as_ref().ok_or_else(|| {
-                ExecutionError::new_err("Repository not resolved — call resolve() first")
-            })?;
-            state.storage.clone()
-        };
+        let storage = self.resolved()?.storage.clone();
 
         let deleted = storage
             .delete_run(run_id)
@@ -2570,6 +2335,269 @@ impl RepoHandle {
             tracing::info!(target: "rivers::repo", run_id = %run_id, "run deleted");
         }
         Ok(deleted)
+    }
+}
+
+/// Batched storage write.
+async fn submit_runs(
+    state: &ResolvedState,
+    runs: Vec<RunSubmission>,
+    launched_by: LaunchedBy,
+) -> PyResult<Vec<String>> {
+    let (records, storage, dyn_checks) = {
+        let graph = state
+            .inner_repo
+            .graph
+            .as_ref()
+            .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
+
+        let now = now_ts();
+        let all_names: Vec<String> = graph
+            .node_indices()
+            .map(|idx| graph[idx].name.clone())
+            .collect();
+
+        let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
+        let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
+
+        for sub in &runs {
+            let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
+            let action = sub.action.clone();
+            validate_partition_for_verb(
+                state,
+                asset_names.iter().map(String::as_str),
+                sub.partition_key.as_ref(),
+                action.as_deref(),
+            )?;
+            dyn_checks.extend(dynamic_partition_checks(
+                state,
+                asset_names.iter().map(String::as_str),
+                sub.partition_key.as_ref(),
+            ));
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let run_tags = sub.tags.clone().unwrap_or_default();
+            let priority = priority_from_tags(&run_tags);
+            let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
+
+            records.push(RunRecord {
+                run_id,
+                code_location_id: state.code_location_id.clone(),
+                job_name: sub.job_name.clone(),
+                status: RunStatus::Queued,
+                start_time: now,
+                end_time: None,
+                tags: run_tags,
+                node_names: asset_names,
+                priority,
+                partition_key: core_pk,
+                block_reason: None,
+                launched_by: launched_by.clone(),
+                action,
+                config: sub.config.clone(),
+            });
+        }
+        (records, state.storage.clone(), dyn_checks)
+    };
+
+    if let Some(first) = records.first() {
+        verify_dynamic_partition_keys(&storage, &first.code_location_id, &dyn_checks).await?;
+    }
+
+    // Backfill runs carry the run_ids link on the backfill record in the
+    // same transaction, so the link can never lie about what exists.
+    match &launched_by {
+        LaunchedBy::Backfill { backfill_id } => {
+            let live = storage
+                .enqueue_backfill_runs(&records, backfill_id)
+                .await
+                .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?;
+            if !live {
+                let canceled: Vec<rivers_core::storage::PartitionKey> = records
+                    .iter()
+                    .filter_map(|r| r.partition_key.as_ref())
+                    .flat_map(|pk| pk.members())
+                    .collect();
+                let _ = storage
+                    .update_backfill_progress(backfill_id, &[], &[], &[], &canceled)
+                    .await;
+                tracing::info!(
+                    target: "rivers::repo",
+                    backfill_id = %backfill_id,
+                    count = records.len(),
+                    "backfill canceled during submission — swept enqueued batch"
+                );
+            }
+        }
+        _ => storage
+            .enqueue_runs(&records)
+            .await
+            .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?,
+    }
+
+    let run_ids: Vec<String> = records.into_iter().map(|r| r.run_id).collect();
+    tracing::info!(
+        target: "rivers::repo",
+        count = run_ids.len(),
+        "runs enqueued (batch)"
+    );
+
+    Ok(run_ids)
+}
+
+/// See [`RepoHandle::create_started_run`].
+async fn create_started_run(
+    state: &ResolvedState,
+    job_name: &str,
+    partition_key: Option<&PyPartitionKey>,
+    launched_by: LaunchedBy,
+    run_id_override: Option<String>,
+    config: Option<String>,
+) -> PyResult<String> {
+    let (record, storage, dyn_checks) = {
+        let summary = state
+            .jobs_info
+            .get(job_name)
+            .ok_or_else(|| ExecutionError::new_err(format!("Job '{job_name}' not found")))?;
+        let asset_names = summary.asset_names.clone();
+        let action = summary.action.clone();
+
+        validate_partition_for_verb(
+            state,
+            asset_names.iter().map(String::as_str),
+            partition_key,
+            action.as_deref(),
+        )?;
+        let dyn_checks =
+            dynamic_partition_checks(state, asset_names.iter().map(String::as_str), partition_key);
+
+        let run_id = run_id_override.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = now_ts();
+        let core_pk = partition_key.map(|pk| pk.into());
+
+        let record = RunRecord {
+            run_id,
+            code_location_id: state.code_location_id.clone(),
+            job_name: Some(job_name.to_string()),
+            status: RunStatus::Started,
+            start_time: now,
+            end_time: None,
+            tags: Vec::new(),
+            node_names: asset_names,
+            priority: 0,
+            partition_key: core_pk,
+            block_reason: None,
+            launched_by,
+            action,
+            config,
+        };
+        (record, state.storage.clone(), dyn_checks)
+    };
+
+    verify_dynamic_partition_keys(&storage, &record.code_location_id, &dyn_checks).await?;
+
+    storage
+        .create_run(&record)
+        .await
+        .map_err(|e| ExecutionError::new_err(format!("Failed to create run: {e}")))?;
+
+    tracing::info!(
+        target: "rivers::repo",
+        run_id = %record.run_id,
+        job_name = %job_name,
+        "started run created"
+    );
+
+    Ok(record.run_id)
+}
+
+/// See [`RepoHandle::create_materialization_run`].
+async fn create_materialization_run(
+    state: &ResolvedState,
+    asset_selection: Vec<String>,
+    partition_key: Option<rivers_core::storage::PartitionKey>,
+    tags: Vec<(String, String)>,
+    launched_by: LaunchedBy,
+    run_id: String,
+    action: Option<String>,
+    config: Option<String>,
+) -> PyResult<()> {
+    let priority = priority_from_tags(&tags);
+    let record = RunRecord {
+        run_id,
+        code_location_id: state.code_location_id.clone(),
+        job_name: None,
+        status: RunStatus::Started,
+        start_time: now_ts(),
+        end_time: None,
+        tags,
+        node_names: asset_selection,
+        priority,
+        partition_key,
+        block_reason: None,
+        launched_by,
+        action,
+        config,
+    };
+
+    state
+        .storage
+        .create_run(&record)
+        .await
+        .map_err(|e| ExecutionError::new_err(format!("Failed to create run: {e}")))?;
+
+    tracing::info!(
+        target: "rivers::repo",
+        run_id = %record.run_id,
+        "materialization run created"
+    );
+
+    Ok(())
+}
+
+/// Serializes the first resolve, so concurrent first callers resolve once.
+/// A call from the resolving thread itself, made by code the resolve runs
+/// such as a resource's `setup()`, gets an error: it would wait for itself.
+#[derive(Default)]
+struct ResolveLock {
+    mutex: Mutex<()>,
+    owner: Mutex<Option<ThreadId>>,
+}
+
+impl ResolveLock {
+    fn lock(&self, py: Python<'_>) -> PyResult<ResolveGuard<'_>> {
+        let current = std::thread::current().id();
+        if *self.owner() == Some(current) {
+            return Err(ExecutionError::new_err(
+                "CodeRepository is still resolving — do not use it from code that runs \
+                 during resolve, such as a resource's setup()",
+            ));
+        }
+        let guard = self
+            .mutex
+            .lock_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
+        *self.owner() = Some(current);
+        Ok(ResolveGuard {
+            lock: self,
+            _guard: guard,
+        })
+    }
+
+    fn owner(&self) -> MutexGuard<'_, Option<ThreadId>> {
+        self.owner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Clears the owner before it releases the lock, also when the resolve
+/// fails or panics.
+struct ResolveGuard<'a> {
+    lock: &'a ResolveLock,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl Drop for ResolveGuard<'_> {
+    fn drop(&mut self) {
+        *self.lock.owner() = None;
     }
 }
 
@@ -2592,9 +2620,8 @@ pub struct PyCodeRepository {
     pub(crate) run_queue_config: Option<Py<crate::concurrency::PyRunQueueConfig>>,
     pub(crate) run_backend_config: Option<Py<crate::concurrency::PyRunBackendConfig>>,
     pool_limits: Option<HashMap<String, i32>>,
-    /// Wrapped in `Arc` so a non-py [`RepoHandle`] can hold a shared reference
-    /// and dispatch runs without going through `repo.borrow(py)`.
-    pub(crate) state: Arc<std::sync::RwLock<Option<ResolvedState>>>,
+    pub(crate) state: SharedState,
+    resolve_lock: ResolveLock,
     backfill_cancel_flags:
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Worker threads for this location's runs, shared into the daemon and gRPC
@@ -2657,21 +2684,12 @@ impl PyCodeRepository {
             .await
     }
 
-    /// Batched storage write.
-    pub(crate) async fn submit_runs(
-        &self,
-        runs: Vec<RunSubmission>,
-        launched_by: LaunchedBy,
-    ) -> PyResult<Vec<String>> {
-        self.handle().submit_runs(runs, launched_by).await
-    }
-
     /// Build a non-py [`RepoHandle`] sharing this repo's resolved state.
     /// Cheap (one Arc clone + bool copy); call once at dispatcher startup
     /// while holding the GIL, then use the handle from any thread.
     pub(crate) fn handle(&self) -> RepoHandle {
         RepoHandle {
-            state: Arc::clone(&self.state),
+            state: self.state.clone(),
             backfill_cancel_flags: Arc::clone(&self.backfill_cancel_flags),
         }
     }
@@ -2709,7 +2727,8 @@ impl PyCodeRepository {
         if existing.is_none() {
             let core_pk = partition_key.as_ref().map(|pk| pk.into());
             let asset_selection: Vec<String> = synthetic_job.asset_names();
-            io_rt().block_on(self.handle().create_materialization_run(
+            io_rt().block_on(create_materialization_run(
+                state,
                 asset_selection,
                 core_pk,
                 tags_vec.clone(),
@@ -2752,8 +2771,8 @@ impl PyCodeRepository {
         retry: Option<rivers_core::execution::retry::RetryRef>,
         launched_by: LaunchedBy,
     ) -> PyResult<PyRunResult> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let resolved = self.ensure_resolved()?;
+        let state = &*resolved;
         let config = Python::attach(|py| {
             checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
@@ -2921,8 +2940,8 @@ impl PyCodeRepository {
         resume: bool,
         launched_by: LaunchedBy,
     ) -> PyResult<PyRunResult> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let resolved = self.ensure_resolved()?;
+        let state = &*resolved;
         let config = Python::attach(|py| {
             checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
@@ -2986,8 +3005,7 @@ impl PyCodeRepository {
 
     /// Logs errors instead of propagating them.
     fn teardown_resources(&self, py: Python) {
-        let guard = self.state.read().unwrap();
-        if let Some(state) = guard.as_ref() {
+        if let Some(state) = self.state.get_attached(py) {
             for (key, resource) in &state.resources {
                 if let ResourceVariant::Resource(inner) = resource {
                     let obj = inner.bind(py);
@@ -3001,29 +3019,12 @@ impl PyCodeRepository {
         }
     }
 
-    pub fn asset_names(&self) -> PyResult<Vec<String>> {
-        let guard = self.state.read().unwrap();
-        Ok(guard
-            .as_ref()
-            .ok_or_else(|| {
-                ExecutionError::new_err("CodeRepository not resolved — call resolve() first")
-            })?
-            .node_map
-            .iter()
-            .filter(|&(_k, n)| matches!(n, ResolvedNode::Asset(_)))
-            .map(|(k, _n)| k.clone())
-            .collect())
-    }
-
-    fn ensure_resolved(&self) -> PyResult<std::sync::RwLockReadGuard<'_, Option<ResolvedState>>> {
-        {
-            let guard = self.state.read().unwrap();
-            if guard.is_none() {
-                drop(guard);
-                Python::attach(|py| self.resolve_inner(py, None))?;
-            }
+    /// The resolved state; resolves with in-memory storage on first use.
+    fn ensure_resolved(&self) -> PyResult<Arc<ResolvedState>> {
+        match self.state.try_get() {
+            Some(state) => Ok(state),
+            None => Python::attach(|py| self.resolve_inner(py, None)),
         }
-        Ok(self.state.read().unwrap())
     }
 
     /// Storage-independent graph-only validation: builds the graph, runs
@@ -3108,11 +3109,7 @@ impl PyCodeRepository {
         let job_names_owned: Vec<String> = self
             .raw_jobs
             .as_ref()
-            .map(|jobs| {
-                jobs.iter()
-                    .map(|j| j.borrow(py).name().to_string())
-                    .collect()
-            })
+            .map(|jobs| jobs.iter().map(|j| j.get().name().to_string()).collect())
             .unwrap_or_default();
         let asset_name_set: HashSet<&str> = node_map.keys().map(String::as_str).collect();
         let job_name_set: HashSet<&str> = job_names_owned.iter().map(String::as_str).collect();
@@ -3155,7 +3152,6 @@ impl PyCodeRepository {
     /// reflected in execution must run `resolve_resources_and_handlers` first.
     fn validate_and_build_job_plans(
         &self,
-        py: Python,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
         node_map: &HashMap<String, ResolvedNode>,
         step_kinds: &HashMap<String, rivers_core::execution::plan::StepKind>,
@@ -3169,7 +3165,7 @@ impl PyCodeRepository {
         if let Some(ref job_list) = self.raw_jobs {
             let mut seen_names: HashSet<String> = HashSet::new();
             for job_py in job_list {
-                let mut job = job_py.borrow(py).declaration();
+                let mut job = job_py.get().declaration();
                 let name = job.name().to_string();
                 if !seen_names.insert(name.clone()) {
                     return Err(GraphValidationError::new_err(format!(
@@ -3267,7 +3263,7 @@ impl PyCodeRepository {
             .copied()
             .collect::<HashSet<_>>();
         for asset_py in &self.raw_assets {
-            let asset = asset_py.borrow(py);
+            let asset = asset_py.get();
             if let Asset::Graph(graph_asset) = asset.inner()
                 && let Some(node_io_handler) = &graph_asset.node_io_handler
             {
@@ -3296,18 +3292,18 @@ impl PyCodeRepository {
                 ResolvedNode::Asset(a) => {
                     let r = a
                         .inner
-                        .borrow(py)
+                        .get()
                         .inner()
                         .retry_for_output(a.output_name.as_deref())
                         .cloned();
                     a.retry = Self::resolve_retry_ref(r, &self.raw_retries, "asset", &a.name)?;
                 }
                 ResolvedNode::Task(t) => {
-                    let r = t.inner.borrow(py).inner.retry.clone();
+                    let r = t.inner.get().inner.retry.clone();
                     t.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &t.name)?;
                 }
                 ResolvedNode::BashTask(b) => {
-                    let r = b.inner.borrow(py).retry.clone();
+                    let r = b.inner.get().retry.clone();
                     b.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &b.name)?;
                 }
             }
@@ -3470,12 +3466,17 @@ impl PyCodeRepository {
     }
 
     #[tracing::instrument(skip_all, target = "rivers::repo", name = "resolve")]
-    fn resolve_inner(&self, py: Python, storage: Option<&PyStorage>) -> PyResult<()> {
-        {
-            let guard = self.state.read().unwrap();
-            if guard.is_some() {
-                return Ok(());
-            }
+    fn resolve_inner(
+        &self,
+        py: Python,
+        storage: Option<&PyStorage>,
+    ) -> PyResult<Arc<ResolvedState>> {
+        if let Some(state) = self.state.get_attached(py) {
+            return Ok(state);
+        }
+        let _resolving = self.resolve_lock.lock(py)?;
+        if let Some(state) = self.state.get_attached(py) {
+            return Ok(state);
         }
 
         let BuiltGraph {
@@ -3532,7 +3533,6 @@ impl PyCodeRepository {
         }
 
         let jobs = self.validate_and_build_job_plans(
-            py,
             resolved_graph,
             &node_map,
             &step_kinds,
@@ -3578,7 +3578,7 @@ impl PyCodeRepository {
         let jobs_info: HashMap<String, JobSummary> = job_map
             .iter()
             .map(|(name, job_py)| {
-                let job = job_py.borrow(py);
+                let job = job_py.get();
                 (
                     name.clone(),
                     JobSummary {
@@ -3632,14 +3632,14 @@ impl PyCodeRepository {
             })
             .collect();
 
-        *self.state.write().unwrap() = Some(ResolvedState {
+        let state = Arc::new(ResolvedState {
             inner_repo,
             node_map,
             jobs: job_map,
             jobs_info,
             sensors_info,
             schedules_info,
-            storage: storage_arc,
+            storage: DetachOnClose::new(storage_arc),
             storage_type,
             resources: self
                 .raw_resources
@@ -3653,8 +3653,9 @@ impl PyCodeRepository {
             run_backend,
             code_location_id,
         });
+        self.state.replace(py, Some(Arc::clone(&state)));
 
-        Ok(())
+        Ok(state)
     }
 }
 
@@ -3751,7 +3752,8 @@ impl PyCodeRepository {
             run_queue_config: run_queue,
             run_backend_config: run_backend,
             pool_limits,
-            state: Arc::new(std::sync::RwLock::new(None)),
+            state: SharedState::default(),
+            resolve_lock: ResolveLock::default(),
             backfill_cancel_flags: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gil_threads: crate::gil_threads::GilThreads::new(),
         })
@@ -3761,7 +3763,8 @@ impl PyCodeRepository {
     /// If not called explicitly, auto-resolves with in-memory storage on first use.
     #[pyo3(signature = (storage=None))]
     fn resolve(&self, py: Python, storage: Option<&PyStorage>) -> PyResult<()> {
-        self.resolve_inner(py, storage)
+        self.resolve_inner(py, storage)?;
+        Ok(())
     }
 
     /// Run the storage-independent validation pipeline: graph composition,
@@ -3780,7 +3783,6 @@ impl PyCodeRepository {
             .as_ref()
             .expect("graph resolved by build_and_validate");
         self.validate_and_build_job_plans(
-            py,
             resolved_graph,
             &bg.node_map,
             &bg.step_kinds,
@@ -3792,8 +3794,7 @@ impl PyCodeRepository {
 
     #[getter]
     fn assets(&self, py: Python) -> PyResult<HashMap<String, Py<PyAsset>>> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
         Ok(state
             .node_map
             .iter()
@@ -3809,13 +3810,12 @@ impl PyCodeRepository {
 
     #[getter]
     fn storage(&self) -> PyResult<PyStorage> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
         Ok(PyStorage {
-            handle: rivers_core::storage::ScopedStorageHandle::new(
+            handle: DetachOnClose::new(rivers_core::storage::ScopedStorageHandle::new(
                 Arc::clone(&state.storage),
                 rivers_core::storage::CodeLocationContext::new(state.code_location_id.clone()),
-            ),
+            )),
             storage_type: state.storage_type,
         })
     }
@@ -3856,8 +3856,8 @@ impl PyCodeRepository {
             .ok_or_else(|| NodeNotFoundError::new_err(format!("Sensor '{}' not found", name)))?;
         let sens_ref = sens.borrow(py);
         let empty = HashMap::new();
-        let guard = self.state.read().unwrap();
-        let resources = guard.as_ref().map(|s| &s.resources).unwrap_or(&empty);
+        let state = self.state.get_attached(py);
+        let resources = state.as_ref().map(|s| &s.resources).unwrap_or(&empty);
         sensor::evaluate_sensor(py, &sens_ref, cursor, last_tick_time, resources)
     }
 
@@ -3880,14 +3880,13 @@ impl PyCodeRepository {
                 .to_string()
         });
         let empty = HashMap::new();
-        let guard = self.state.read().unwrap();
-        let resources = guard.as_ref().map(|s| &s.resources).unwrap_or(&empty);
+        let state = self.state.get_attached(py);
+        let resources = state.as_ref().map(|s| &s.resources).unwrap_or(&empty);
         schedule::evaluate_schedule(py, &sched_ref, &exec_time, resources)
     }
 
     pub(crate) fn get_job(&self, py: Python, name: &str) -> PyResult<Py<PyJob>> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
         state
             .jobs
             .get(name)
@@ -3911,8 +3910,7 @@ impl PyCodeRepository {
         // externals are skipped, not fatal) and observing nothing is a
         // successful no-op — repos without externals call this too.
         let targets: Vec<String> = {
-            let guard = self.ensure_resolved()?;
-            let state = guard.as_ref().unwrap();
+            let state = self.ensure_resolved()?;
             let mut names: Vec<String> = state
                 .node_map
                 .iter()
@@ -4019,8 +4017,7 @@ impl PyCodeRepository {
     /// debugging "which handler does asset X actually use?" without
     /// running execution.
     fn io_handler_for_output(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
         let node = state.node_map.get(&name).ok_or_else(|| {
             NodeNotFoundError::new_err(format!("Node '{}' not found in repository", name))
         })?;
@@ -4035,8 +4032,7 @@ impl PyCodeRepository {
         partition_key: Option<PyPartitionKey>,
         type_hint: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
         let node = state.node_map.get(&name).ok_or_else(|| {
             NodeNotFoundError::new_err(format!("Node '{}' not found in repository", name))
         })?;
@@ -4061,10 +4057,7 @@ impl PyCodeRepository {
         grpc_url: String,
         synthetic: Option<String>,
     ) -> PyResult<()> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
-        let storage_arc = Arc::clone(&state.storage);
-        drop(guard);
+        let storage_arc = Arc::clone(&self.ensure_resolved()?.storage);
 
         py.detach(|| {
             let graph = if let Some(ref scale) = synthetic {
@@ -4203,7 +4196,7 @@ impl PyCodeRepository {
 
     pub(crate) fn cancel_backfill(&self, py: Python<'_>, backfill_id: String) -> PyResult<bool> {
         py.detach(|| {
-            let _guard = self.ensure_resolved()?;
+            self.ensure_resolved()?;
             io_rt().block_on(self.handle().cancel_backfill(backfill_id))
         })
     }
@@ -4214,7 +4207,7 @@ impl PyCodeRepository {
         backfill_id: String,
     ) -> PyResult<Option<PyBackfillStatusResult>> {
         py.detach(|| {
-            let _guard = self.ensure_resolved()?;
+            self.ensure_resolved()?;
             io_rt().block_on(self.handle().get_backfill(&backfill_id))
         })
     }
@@ -4233,16 +4226,13 @@ impl PyCodeRepository {
         dry_run: bool,
     ) -> PyResult<PyBackfillResult> {
         py.detach(|| {
-            let record = {
-                let guard = self.ensure_resolved()?;
-                let state = guard.as_ref().unwrap();
-                io_rt()
-                    .block_on(state.storage.get_backfill(&backfill_id))
-                    .map_err(|e| ExecutionError::new_err(format!("Failed to load backfill: {e}")))?
-                    .ok_or_else(|| {
-                        ExecutionError::new_err(format!("backfill '{backfill_id}' not found"))
-                    })?
-            };
+            let state = self.ensure_resolved()?;
+            let record = io_rt()
+                .block_on(state.storage.get_backfill(&backfill_id))
+                .map_err(|e| ExecutionError::new_err(format!("Failed to load backfill: {e}")))?
+                .ok_or_else(|| {
+                    ExecutionError::new_err(format!("backfill '{backfill_id}' not found"))
+                })?;
 
             let partition_keys: Vec<PyPartitionKey> = record
                 .partition_keys
@@ -4255,8 +4245,6 @@ impl PyCodeRepository {
             // whole rerun on the first retired key.
             let total = partition_keys.len();
             let (candidates, storage, code_location_id) = {
-                let guard = self.state.read().unwrap();
-                let state = guard.as_ref().expect("ensure_resolved succeeded above");
                 let selection_names: Vec<String> = match &record.job_name {
                     Some(name) => state
                         .jobs_info
@@ -4271,7 +4259,7 @@ impl PyCodeRepository {
                     .into_iter()
                     .filter(|key| {
                         validate_partition_for_verb(
-                            state,
+                            &state,
                             selection_names.iter().map(String::as_str),
                             Some(key),
                             record.action.as_deref(),
@@ -4280,7 +4268,7 @@ impl PyCodeRepository {
                     })
                     .map(|key| {
                         let checks = dynamic_partition_checks(
-                            state,
+                            &state,
                             selection_names.iter().map(String::as_str),
                             Some(&key),
                         );
@@ -4381,12 +4369,7 @@ impl PyCodeRepository {
     /// Drop the resolved state and the storage it holds; the next call
     /// resolves again. The CLI removes its scratch store after this.
     fn _release_storage(&self, py: Python) {
-        let Some(state) = self.state.write().unwrap().take() else {
-            return;
-        };
-        let storage = Arc::clone(&state.storage);
-        drop(state);
-        py.detach(move || drop(storage));
+        drop(self.state.replace(py, None));
     }
 
     /// Test helper. Only works when run_queue is configured. `job_name`
@@ -4410,8 +4393,7 @@ impl PyCodeRepository {
         // explicitly first. Production callers (gRPC, daemon) always run after
         // resolve and bypass this helper.
         let config = {
-            let guard = self.ensure_resolved()?;
-            let state = guard.as_ref().unwrap();
+            let state = self.ensure_resolved()?;
             checked_run_config(
                 py,
                 run_config_to_json(py, config.as_ref())?.as_deref(),
@@ -4419,11 +4401,11 @@ impl PyCodeRepository {
                 &state.resources,
             )?
         };
-        let selection = match &job_name {
-            Some(job) if selection.is_none() => self.handle().job_asset_names(job),
-            _ => selection,
-        };
         py.detach(|| {
+            let selection = match &job_name {
+                Some(job) if selection.is_none() => self.handle().job_asset_names(job),
+                _ => selection,
+            };
             io_rt().block_on(self.submit_run(
                 selection,
                 partition_key.as_ref(),
@@ -4447,17 +4429,13 @@ impl PyCodeRepository {
         tracing::trace!(target: "rivers::dbg::grpc", %host, port, "_start_grpc_server: ENTER");
         let py = slf.py();
         let binding = slf.borrow();
-        let _guard = binding.ensure_resolved()?;
+        let (storage, code_location_id) = {
+            let state = binding.ensure_resolved()?;
+            (Arc::clone(&state.storage), state.code_location_id.clone())
+        };
         let repo_handle = binding.handle();
         let has_run_queue = binding.has_run_queue();
         let repo: Py<PyCodeRepository> = slf.clone().unbind();
-        let (storage, code_location_id) = {
-            let state_guard = binding.state.read().unwrap();
-            let state = state_guard
-                .as_ref()
-                .expect("ensure_resolved succeeded above");
-            (Arc::clone(&state.storage), state.code_location_id.clone())
-        };
         let gil_threads = binding.gil_threads.clone();
         let repo_arc = Arc::new(repo.clone_ref(py));
         let run_dispatcher = Arc::new(crate::daemon::RunDispatcherKind::new(
@@ -4532,8 +4510,8 @@ impl PyCodeRepository {
         crate::shutdown::register_grpc_handle(handle, server_cancel);
 
         tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server: waiting for port via mpsc");
-        let actual_port = port_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+        let actual_port = py
+            .detach(move || port_rx.recv_timeout(std::time::Duration::from_secs(5)))
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get gRPC port: {e}"))
             })?;
@@ -4571,8 +4549,8 @@ impl PyCodeRepository {
         launched_by: rivers_core::storage::LaunchedBy,
         action: Option<String>,
     ) -> PyResult<PyBackfillResult> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let resolved = self.ensure_resolved()?;
+        let state = &*resolved;
         let config = Python::attach(|py| {
             checked_run_config(py, config.as_deref(), &state.node_map, &state.resources)
         })?;
@@ -4794,13 +4772,9 @@ impl PyCodeRepository {
             .block_on(state.storage.create_backfill(&record))
             .map_err(|e| ExecutionError::new_err(format!("Failed to create backfill: {e}")))?;
 
-        drop(guard); // release lock before executing
-
         if block {
-            self.execute_backfill_inner(&backfill_id)?;
+            self.execute_backfill_with(state, &backfill_id)?;
 
-            let guard = self.ensure_resolved()?;
-            let state = guard.as_ref().unwrap();
             let final_record = rt()
                 .block_on(state.storage.get_backfill(&backfill_id))
                 .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
@@ -4861,8 +4835,10 @@ impl PyCodeRepository {
     /// it via [`PyJob::execute_run`] — identical to how `execute_job` runs a
     /// single partition. The Materialization counterpart is
     /// [`Self::materialize_with_launcher`].
+    #[allow(clippy::too_many_arguments)]
     fn execute_backfill_job_run(
         &self,
+        state: &ResolvedState,
         job: &Py<PyJob>,
         job_name: &str,
         py_pk: PyPartitionKey,
@@ -4870,7 +4846,8 @@ impl PyCodeRepository {
         backfill_id: &str,
         run_id: String,
     ) -> PyResult<PyRunResult> {
-        let run_id = io_rt().block_on(self.handle().create_started_run(
+        let run_id = io_rt().block_on(create_started_run(
+            state,
             job_name,
             Some(&py_pk),
             LaunchedBy::Backfill {
@@ -4880,16 +4857,17 @@ impl PyCodeRepository {
             config.clone(),
         ))?;
         Python::attach(|py| {
-            job.bind(py)
-                .borrow()
+            job.get()
                 .execute_stored_run(py, &run_id, Some(py_pk), config, false, false)
         })
     }
 
     pub(crate) fn execute_backfill_inner(&self, backfill_id: &str) -> PyResult<()> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let state = self.ensure_resolved()?;
+        self.execute_backfill_with(&state, backfill_id)
+    }
 
+    fn execute_backfill_with(&self, state: &ResolvedState, backfill_id: &str) -> PyResult<()> {
         let record = rt()
             .block_on(state.storage.get_backfill(backfill_id))
             .map_err(|e| ExecutionError::new_err(format!("{e}")))?
@@ -4988,6 +4966,7 @@ impl PyCodeRepository {
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
                     Some(job) => self.execute_backfill_job_run(
+                        state,
                         job,
                         job_name,
                         batch_pk,
@@ -5093,8 +5072,8 @@ impl PyCodeRepository {
     }
 
     pub(crate) fn execute_backfill_queued_inner(&self, backfill_id: &str) -> PyResult<()> {
-        let guard = self.ensure_resolved()?;
-        let state = guard.as_ref().unwrap();
+        let resolved = self.ensure_resolved()?;
+        let state = &*resolved;
 
         let record = rt()
             .block_on(state.storage.get_backfill(backfill_id))
@@ -5148,7 +5127,8 @@ impl PyCodeRepository {
 
             // The run_ids link is written by enqueue_backfill_runs in the
             // same transaction as the runs themselves.
-            io_rt().block_on(self.submit_runs(
+            io_rt().block_on(submit_runs(
+                state,
                 runs,
                 LaunchedBy::Backfill {
                     backfill_id: backfill_id.to_string(),

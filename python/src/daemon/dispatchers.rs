@@ -37,7 +37,7 @@ pub(crate) fn launch_started_run(
                 }
             };
             let launched =
-                job.borrow(py)
+                job.get()
                     .execute_stored_run(py, &run_id, partition_key, config, false, true);
             if let Err(e) = launched {
                 tracing::error!(
