@@ -106,7 +106,7 @@ pre-commit-check:
     uv run --no-sync rumdl check . --flavor mkdocs --fail-on never --disable MD013,MD033,MD041
     uv run --no-sync ruff check python/
     uv run --no-sync ruff format --check --diff python/
-    uv run --no-sync typos python/
+    uv run --no-sync typos .
     cd python && uv run --no-sync pyright .
 
 # Start the example project dev UI (optionally with a synthetic graph: just demo 1k)

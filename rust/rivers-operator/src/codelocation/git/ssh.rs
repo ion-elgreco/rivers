@@ -1479,7 +1479,7 @@ mod tests {
         assert_repo_paths(&[
             ("ssh://git@host/%7Esvc/r.git", "~svc/r.git"),
             ("ssh://git@host/my%20repo.git", "/my repo.git"),
-            ("ssh://git@host/projets-é/r.git", "/projets-é/r.git"),
+            ("ssh://git@host/café/r.git", "/café/r.git"),
             ("ssh://git@host/a%2Fb.git", "/a/b.git"),
             ("ssh://git@host/x%00y%zz%4.git", "/x%00y%zz%4.git"),
             ("ssh://git@host/a/../b.git", "/a/../b.git"),

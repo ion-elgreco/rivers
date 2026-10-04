@@ -2611,7 +2611,7 @@ mod tests {
 
     #[test]
     fn git_config_refuses_an_allow_insecure_it_cannot_read() {
-        for value in ["yes", "on", "2", "ture"] {
+        for value in ["yes", "on", "2", "truth"] {
             let err = git_config(&[("RIVERS_GIT_ALLOW_INSECURE", value)]).unwrap_err();
             assert_eq!(
                 err.to_string(),
