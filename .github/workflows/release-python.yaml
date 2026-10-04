@@ -4,8 +4,9 @@ name: release-python
 # publishes to PyPI via Trusted Publishing on tag push (v*.*.*).
 #
 # Each (os, libc, arch) gets an abi3-py311 wheel, which covers Python
-# 3.11+, and a cp314t wheel for free-threaded 3.14, which abi3 does not
-# cover. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
+# 3.11+, a cp314t wheel for free-threaded 3.14, which abi3 does not
+# cover, and an abi3t wheel for 3.15+ with or without the GIL.
+# Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_28),
 # linux-musl/{x86_64, aarch64} (musllinux_1_2), macos/{x86_64, arm64},
 # windows/x86_64.
 
@@ -129,7 +130,7 @@ jobs:
           # protoc is downloaded as a binary so package-name drift
           # between manylinux_2_28 (AlmaLinux) and musllinux_1_2
           # (Alpine) doesn't bite us.
-          before-script-linux: |
+          before-script-linux: &before-script-linux |
             set -euo pipefail
             if command -v dnf >/dev/null; then
               dnf install -y clang
@@ -150,6 +151,18 @@ jobs:
             unzip -o /tmp/protoc.zip -d /usr/local
             rm /tmp/protoc.zip
             protoc --version
+
+      # A separate call: with the abi3t feature, the 3.13 wheel above
+      # would turn version-specific.
+      - name: Build abi3t wheel (3.15+)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --features pyo3/abi3t-py315 -i python3.15t
+          sccache: false
+          before-script-linux: *before-script-linux
 
       - name: Attest wheel provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -221,12 +234,15 @@ jobs:
         with:
           tool: protoc@3.36.1
 
-      - name: Install Python 3.13 and free-threaded 3.14t
+      - name: Install Python 3.13 and free-threaded 3.14t, 3.15t
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: |
             3.13
             3.14t
+            3.15t
+          # Takes a 3.15 release candidate while no final 3.15 exists.
+          allow-prereleases: true
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -234,6 +250,16 @@ jobs:
           working-directory: python
           target: ${{ matrix.target }}
           args: --release --out dist -i python3.13 python3.14t
+          sccache: false
+
+      # A separate call: with the abi3t feature, the 3.13 wheel above
+      # would turn version-specific.
+      - name: Build abi3t wheel (3.15+)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          args: --release --out dist --features pyo3/abi3t-py315 -i python3.15t
           sccache: false
 
       - name: Attest wheel provenance
@@ -303,12 +329,15 @@ jobs:
         with:
           tool: protoc@3.36.1
 
-      - name: Install Python 3.13 and free-threaded 3.14t
+      - name: Install Python 3.13 and free-threaded 3.14t, 3.15t
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: |
             3.13
             3.14t
+            3.15t
+          # Takes a 3.15 release candidate while no final 3.15 exists.
+          allow-prereleases: true
 
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -316,6 +345,16 @@ jobs:
           working-directory: python
           target: ${{ matrix.target }}
           args: --release --out dist -i python3.13 python3.14t
+          sccache: false
+
+      # A separate call: with the abi3t feature, the 3.13 wheel above
+      # would turn version-specific.
+      - name: Build abi3t wheel (3.15+)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          args: --release --out dist --features pyo3/abi3t-py315 -i python3.15t
           sccache: false
 
       - name: Attest wheel provenance

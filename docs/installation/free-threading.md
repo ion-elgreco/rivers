@@ -1,6 +1,6 @@
 # Free-threaded Python
 
-rivers supports free-threaded CPython 3.14 (`3.14t`, [PEP 703](https://peps.python.org/pep-0703/)). This interpreter runs without the GIL, so Python threads run in parallel.
+rivers supports free-threaded CPython 3.14 and later (`3.14t`, `3.15t`, [PEP 703](https://peps.python.org/pep-0703/)). These interpreters run without the GIL, so Python threads run in parallel.
 
 ## Install
 
@@ -11,7 +11,9 @@ uv venv --python 3.14t
 uv pip install rivers
 ```
 
-rivers publishes `cp314t` wheels for Linux (glibc and musl, x86_64 and aarch64), macOS (x86_64 and arm64), and Windows (x86_64).
+rivers publishes free-threaded wheels for Linux (glibc and musl, x86_64 and aarch64), macOS (x86_64 and arm64), and Windows (x86_64): a `cp314t` wheel for 3.14t, and an `abi3t` wheel for 3.15t and later.
+
+On 3.15t, the `obstore` dependency has no wheel yet. The install then compiles it from source, which needs a [Rust toolchain](https://rustup.rs).
 
 `import rivers` keeps the GIL disabled:
 
@@ -26,6 +28,8 @@ If your code imports an extension module that does not support free-threading, P
 These extras work on 3.14t: `pyarrow`, `pandas`, `datafusion`, and `otel`.
 
 The `delta`, `delta-*`, and `polars` extras do not install yet: `deltalake` and `polars` have no free-threaded wheels.
+
+On 3.15t, only `otel` installs for now: `pyarrow` and `datafusion` have no 3.15t wheels yet.
 
 ## Thread safety of your code
 
