@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
 /// After SIGTERM, how long a child gets before SIGKILL.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// When the build must be done.
@@ -154,6 +155,7 @@ fn terminate(child: &mut Child) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", script]);
