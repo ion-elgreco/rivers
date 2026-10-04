@@ -44,6 +44,7 @@ pub mod schema;
 pub mod shutdown;
 pub mod storage;
 mod task;
+mod workspace_sync;
 
 use assets::register_asset_module;
 use automation::{register_automation_module, register_schedule_module, register_sensor_module};
@@ -160,6 +161,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_retry_policy, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_backoff, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(workspace_sync::workspace_sync, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         executor::parallel::worker::_reconstruct_func_ref,
         m

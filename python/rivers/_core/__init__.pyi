@@ -855,6 +855,19 @@ def runtime_info() -> dict[str, int]:
     """
     ...
 
+def workspace_sync() -> int:
+    """Build the workspace tree of a git-sourced code location.
+
+    Runs as the ``workspace`` init container of the code location's pods:
+    fetches the pinned commit, installs the dependencies into the tree's
+    venv, then prunes old trees on the shared volume. Driven by
+    ``RIVERS_RUN_SOURCE`` and the ``RIVERS_WORKSPACE_*`` env.
+
+    Returns:
+        The process exit code: ``0`` when the tree is ready, else ``1``.
+    """
+    ...
+
 __all__ = [
     "AutomationDaemon",
     "Asset",

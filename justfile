@@ -204,7 +204,6 @@ k8s-build: _k8s-compile
     docker build -f dev/k3d/Dockerfile.code-location -t rivers-code-location:latest deploy/staging
     # rivers-runtime: the git-sourced CodeLocation base image (RFC-044).
     mkdir -p deploy/staging/wheels && cp dist/*.whl deploy/staging/wheels/
-    cp deploy/docker/rivers-workspace-sync deploy/staging/
     docker build -f deploy/docker/Dockerfile.runtime -t rivers-runtime:latest deploy/staging
     if [ "${RIVERS_K8S_SKIP_DEMO:-}" != "1" ]; then
         cp -r examples/demo_project deploy/staging/demo_project

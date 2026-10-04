@@ -356,7 +356,7 @@ jobs:
     needs: build-linux
     runs-on: ${{ matrix.platform.runner }}
     permissions:
-      contents: read       # checkout Dockerfile.runtime + rivers-workspace-sync
+      contents: read       # checkout Dockerfile.runtime
       packages: write      # push images to ghcr.io
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
       attestations: write  # publish SLSA provenance to repo attestation log
@@ -389,9 +389,6 @@ jobs:
         with:
           name: ${{ matrix.platform.wheel }}
           path: staging/wheels/
-
-      - name: Stage rivers-workspace-sync
-        run: cp deploy/docker/rivers-workspace-sync staging/
 
       - name: Resolve image ref
         id: ref

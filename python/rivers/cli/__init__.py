@@ -509,6 +509,16 @@ def execute_step(
         raise typer.Exit(1)
 
 
+@app.command(name="workspace-sync")
+def workspace_sync() -> None:
+    """Build the workspace tree of a git-sourced code location (its pods' init container)."""
+    from rivers._core import workspace_sync as sync
+
+    code = sync()
+    if code:
+        raise typer.Exit(code)
+
+
 @app.command()
 def materialize(
     module: str = typer.Argument(help="Python module path containing CodeRepository"),

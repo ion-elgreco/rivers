@@ -1,7 +1,7 @@
-"""``rivers-workspace-sync``, run against a local git remote and a fake ``uv``.
+"""``rivers workspace-sync``, run against a local git remote and a fake ``uv``.
 
 Shared mode keeps one uv cache on the PVC. After each successful build the
-script prunes it to the wheels built from source (``uv cache prune --ci``).
+sync prunes it to the wheels built from source (``uv cache prune --ci``).
 Fallback pods install without a cache, so there is nothing to prune. Past
 the recency and age floors, the tree prune keeps a tree only when its whole
 name is in the keep-set, or when it is the pod's own tree
@@ -10,21 +10,24 @@ prune. The prune renames a tree to ``.deleting-<key>-…`` before it deletes
 it, so a prune that is killed mid-delete leaves no partial tree with
 ``.ready`` under the key. The next prune deletes what was left.
 
-Deps mode ``auto`` reads the project directory (``RIVERS_GIT_PATH``): its
-``uv.lock``, else its ``requirements.txt``. A member of a uv workspace has no
-``uv.lock`` of its own, so ``auto`` uses the lock at the workspace root.
+Deps mode ``auto`` reads the project directory (``path``): its ``uv.lock``,
+else its ``requirements.txt``. A member of a uv workspace has no ``uv.lock``
+of its own: the sync asks uv for the project's workspace root
+(``uv workspace dir``) and uses the lock there. A project that uv does not
+count in the workspace above it fails the build, naming the remedies.
 
 The url's scheme picks the git Secret's keys, as in the operator: ``ssh://``
 urls use ``identity`` and ``known_hosts``, other urls ``username`` and
 ``password``. A key that the url needs and the pod cannot read stops the
-build before the fetch.
+build before the fetch. git runs ssh through a ``GIT_SSH`` helper, not a
+shell.
 
-The script fetches the commit by its SHA, so a branch that moves on does not
+The sync fetches the commit by its SHA, so a branch that moves on does not
 change the tree. When that fetch fails, it fetches the branch or tag
-(``RIVERS_GIT_REF``) and verifies the commit. A pinned commit has no ref.
+(``ref``) and verifies the commit. A pinned commit has no ref.
 
 A failed build gives kubelet the most specific termination message there is:
-the error the script found, a failed git fetch with the last lines of git's
+the error the sync found, a failed git fetch with the last lines of git's
 error, or the time budget the build ran past. When ``uv`` fails, the
 termination log stays empty, so kubelet reports the tail of the log, where
 uv's error is (``FallbackToLogsOnError``).
@@ -46,9 +49,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import shutil
-import signal
-import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -58,6 +58,10 @@ import pytest
 UV_PROJECT = {"uv.lock": "version = 1\n"}
 UV_WORKSPACE = {
     "pyproject.toml": '[tool.uv.workspace]\nmembers = ["analytics", "libs/*"]\n',
+    "uv.lock": "version = 1\n",
+}
+UV_WORKSPACE_INLINE = {
+    "pyproject.toml": '[tool.uv]\nworkspace = { members = ["analytics", "libs/*"] }\n',
     "uv.lock": "version = 1\n",
 }
 MEMBER = '[project]\nname = "analytics"\nversion = "0.1.0"\n'
@@ -123,32 +127,32 @@ def test_failed_uv_cache_prune_keeps_the_built_tree(workspace_sync):
     assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
 
 
-@pytest.mark.parametrize(
-    ("env", "error"),
-    [
-        pytest.param(
-            {"RIVERS_GIT_PATH": "analytics"},
-            "RIVERS_GIT_PATH 'analytics' does not exist in the repository",
-            id="missing-path",
-        ),
-        pytest.param(
-            {"RIVERS_DEPS_MODE": "poetry"},
-            "unknown RIVERS_DEPS_MODE 'poetry' (auto|uvSync|requirements|none)",
-            id="unknown-deps-mode",
-        ),
-    ],
-)
-def test_the_error_the_build_finds_is_the_termination_message(
-    workspace_sync, env, error
-):
+def test_the_error_the_build_finds_is_the_termination_message(workspace_sync):
     commit = workspace_sync.commit(UV_PROJECT)
 
-    failed = workspace_sync.run(commit, shared=False, **env)
+    failed = workspace_sync.run(commit, shared=False, path="analytics")
 
+    error = "spec.git.path 'analytics' does not exist in the repository"
     assert failed.returncode == 1
     assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
     assert workspace_sync.termination_message() == f"{error}\n"
     assert not (workspace_sync.tree / ".ready").exists()
+
+
+def test_a_run_source_the_sync_cannot_read_is_the_termination_message(workspace_sync):
+    commit = workspace_sync.commit(UV_PROJECT)
+    source = {**workspace_sync.source(commit), "dependencies": {"mode": "poetry"}}
+
+    failed = workspace_sync.run(commit, shared=False, source=source)
+
+    message = workspace_sync.termination_message()
+    assert failed.returncode == 1
+    assert message.startswith("RIVERS_RUN_SOURCE is not valid RunSource JSON: "), (
+        message
+    )
+    assert "poetry" in message
+    assert f"workspace-sync: ERROR: {message}" in failed.stderr
+    assert not (workspace_sync.tree / "src").exists()
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])
@@ -195,7 +199,7 @@ def test_a_url_without_a_repository_fails_with_the_git_error(workspace_sync, tmp
     commit = workspace_sync.commit(UV_PROJECT)
 
     failed = workspace_sync.run(
-        commit, shared=False, RIVERS_GIT_URL=(tmp_path / "missing").as_uri()
+        commit, shared=False, url=(tmp_path / "missing").as_uri()
     )
 
     message = workspace_sync.termination_message()
@@ -209,9 +213,7 @@ def test_when_the_ref_fails_too_its_error_is_the_termination_message(workspace_s
     workspace_sync.commit(UV_PROJECT)
 
     # The remote lacks the commit, and the branch is gone.
-    failed = workspace_sync.run(
-        MISSING_COMMIT, shared=False, RIVERS_GIT_REF="refs/heads/gone"
-    )
+    failed = workspace_sync.run(MISSING_COMMIT, shared=False, ref="refs/heads/gone")
 
     error = (
         "git fetch of refs/heads/gone failed: "
@@ -240,7 +242,7 @@ def test_a_commit_the_server_refuses_by_sha_is_fetched_by_its_ref(workspace_sync
     workspace_sync.commit({"version.txt": "2\n"})
     workspace_sync.refuse_fetch_by_commit()
 
-    built = workspace_sync.run(tagged, shared=False, RIVERS_GIT_REF="refs/tags/v1")
+    built = workspace_sync.run(tagged, shared=False, ref="refs/tags/v1")
 
     assert built.returncode == 0, built.stderr
     assert (
@@ -253,19 +255,19 @@ def test_a_commit_the_server_refuses_by_sha_is_fetched_by_its_ref(workspace_sync
 
 
 @pytest.mark.parametrize(
-    "env",
+    "fields",
     [
         pytest.param({}, id="pinned-commit"),
-        pytest.param({"RIVERS_GIT_REF": "refs/heads/main"}, id="branch"),
+        pytest.param({"ref": "refs/heads/main"}, id="branch"),
     ],
 )
 def test_the_commit_is_fetched_by_its_sha_after_the_branch_moves_on(
-    workspace_sync, env
+    workspace_sync, fields
 ):
     pinned = workspace_sync.commit({**UV_PROJECT, "version.txt": "1\n"})
     workspace_sync.commit({"version.txt": "2\n"})
 
-    built = workspace_sync.run(pinned, shared=False, **env)
+    built = workspace_sync.run(pinned, shared=False, **fields)
 
     assert built.returncode == 0, built.stderr
     assert (workspace_sync.tree / "src" / "version.txt").read_text() == "1\n"
@@ -281,7 +283,7 @@ def test_a_build_past_its_time_budget_says_so_in_the_termination_message(
     timed_out = workspace_sync.run(
         commit,
         shared=False,
-        RIVERS_DEPS_TIMEOUT_SECONDS="1",
+        timeout=1,
         FAKE_UV_SLEEP="30",
     )
 
@@ -440,46 +442,18 @@ SERVING_TREE = {
     "RIVERS_WORKSPACE_MIN_AGE_SECONDS": "3600",
 }
 
-# `rm` stopped by SIGKILL: it deletes the `venv` directories under its
-# targets, then kills the script that runs it, as the kubelet ends an init
-# container. Calls whose targets hold no `venv` run the real `rm`.
-_KILLED_RM = """\
-import os, shutil, signal, sys
-from pathlib import Path
 
-targets = [Path(arg) for arg in sys.argv[1:] if not arg.startswith("-")]
-venvs = [venv for target in targets if target.is_dir() for venv in target.rglob("venv")]
-if not venvs:
-    os.execv(REAL_RM, ["rm", *sys.argv[1:]])
-for venv in venvs:
-    shutil.rmtree(venv, ignore_errors=True)
-os.kill(os.getppid(), signal.SIGKILL)
-sys.exit(137)
-"""
+def _leftover_of_a_killed_prune(workspace_sync) -> Path:
+    """What a prune killed mid-delete leaves: the evicted tree set aside, its venv gone."""
+    aside = workspace_sync.volume / f".deleting-{EVICTED}-1-1"
+    (aside / "src").mkdir(parents=True)
+    (aside / ".ready").touch()
+    return aside
 
 
-def _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit: str) -> None:
-    """Start the code-location pod; its prune is killed while it deletes EVICTED."""
-    bin_dir = tmp_path / "killed-rm"
-    bin_dir.mkdir()
-    rm = bin_dir / "rm"
-    rm.write_text(f"#!{sys.executable}\nREAL_RM = {shutil.which('rm')!r}\n{_KILLED_RM}")
-    rm.chmod(0o755)
-
-    killed = workspace_sync.run(
-        commit,
-        shared=True,
-        PATH=f"{bin_dir}{os.pathsep}{workspace_sync.env['PATH']}",
-        **SERVING_TREE,
-    )
-
-    assert killed.returncode == -signal.SIGKILL, killed.stderr
-
-
-def test_a_tree_whose_prune_was_killed_is_built_again(workspace_sync, tmp_path):
-    _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
+def test_a_tree_whose_prune_was_killed_is_built_again(workspace_sync):
+    aside = _leftover_of_a_killed_prune(workspace_sync)
     commit = workspace_sync.commit(UV_PROJECT)
-    _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit)
 
     # The code location is pinned back to the commit of the evicted tree.
     evicted = workspace_sync.volume / EVICTED
@@ -492,28 +466,21 @@ def test_a_tree_whose_prune_was_killed_is_built_again(workspace_sync, tmp_path):
 
     assert rebuilt.returncode == 0, rebuilt.stderr
     assert workspace_sync.uv_calls() == [
-        _install(workspace_sync),
         ["sync", "--locked", "--project", str(evicted / "src")],
         PRUNE_CACHE,
     ]
     assert (evicted / "venv" / "bin" / "rivers").exists()
+    assert not aside.exists()
 
 
-def test_the_next_prune_deletes_the_tree_a_killed_prune_left(workspace_sync, tmp_path):
-    _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
+def test_the_next_prune_deletes_the_tree_a_killed_prune_left(workspace_sync):
+    aside = _leftover_of_a_killed_prune(workspace_sync)
     commit = workspace_sync.commit(UV_PROJECT)
-    _kill_the_prune_while_it_deletes(workspace_sync, tmp_path, commit)
-
-    entries = _volume(workspace_sync)
-    assert entries[1:] == [".prune.lock", "tree"], entries
-    assert entries[0].startswith(f".deleting-{EVICTED}-"), entries
-    aside = workspace_sync.volume / entries[0]
-    assert (aside / ".ready").exists()
-    assert not (aside / "venv").exists()
 
     pruned = workspace_sync.run(commit, shared=True, **SERVING_TREE)
 
     assert pruned.returncode == 0, pruned.stderr
+    assert f"prune: removing {aside.name}, left by an earlier prune" in pruned.stderr
     assert _volume(workspace_sync) == [".prune.lock", "tree"]
 
 
@@ -536,69 +503,38 @@ def test_a_pod_waiting_for_the_tree_starts_while_the_builder_prunes_the_uv_cache
     assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
 
 
-# `rm` that, before it deletes a tree that the prune set aside
-# (`.deleting-…`), waits for the test to release "rm".
-_HELD_RM = """\
-import os, sys, time
-from pathlib import Path
-
-if any(Path(arg).name.startswith(".deleting-") for arg in sys.argv[1:]):
-    released = Path(os.environ["FAKE_RELEASED"])
-    while released.is_dir() and not (released / "rm").exists():
-        time.sleep(0.02)
-os.execv(REAL_RM, ["rm", *sys.argv[1:]])
-"""
-
-
-def _holding_tree_deletes(workspace_sync, tmp_path) -> str:
-    """Return a ``PATH`` on which the prune's deletes wait for the release of "rm"."""
-    bin_dir = tmp_path / "held-rm"
-    bin_dir.mkdir()
-    rm = bin_dir / "rm"
-    rm.write_text(f"#!{sys.executable}\nREAL_RM = {shutil.which('rm')!r}\n{_HELD_RM}")
-    rm.chmod(0o755)
-    return f"{bin_dir}{os.pathsep}{workspace_sync.env['PATH']}"
-
-
-# A second pod cannot show this: it could take the prune lock first, and
-# then the pod under test would not delete.
-@pytest.mark.parametrize(
-    "built", [True, False], ids=["pod-that-built-the-tree", "pod-that-waited"]
-)
-def test_the_build_lock_is_free_while_a_pod_deletes_old_trees(
-    workspace_sync, tmp_path, built
-):
+def test_the_build_lock_is_free_once_the_tree_is_ready(workspace_sync):
+    """The lock goes before the prunes: ``prune::tests::renames_before_deleting``
+    and ``workspace_sync::tests::build_lock_blocks_a_second_holder_until_released``
+    pin the order in Rust; here the pod is held in the uv cache prune, after
+    the tree prune."""
     _sibling_trees(workspace_sync, {EVICTED: 2 * DAY})
     commit = workspace_sync.commit(UV_PROJECT)
-    env = {"PATH": _holding_tree_deletes(workspace_sync, tmp_path), **SERVING_TREE}
-    if built:
-        pod = workspace_sync.start(commit, shared=True, **env)
-    else:
-        # Another pod builds the tree.
-        with workspace_sync.holding_build_lock():
-            pod = workspace_sync.start(commit, shared=True, **env)
-            pod.wait_for("waiting for the build lock")
-            (workspace_sync.tree / ".ready").touch()
+    pod = workspace_sync.start(
+        commit, shared=True, FAKE_UV_HOLD="cache", **SERVING_TREE
+    )
     pod.wait_for(f"prune: removing {EVICTED}")
 
     assert workspace_sync.build_lock_is_free()
+    assert pod.process.poll() is None, pod.log()
 
-    workspace_sync.release("rm")
+    workspace_sync.release("cache")
     assert pod.exit_code_within(10) == 0, pod.log()
     assert _volume(workspace_sync) == [".prune.lock", "tree"]
-    assert workspace_sync.uv_calls() == (
-        [_install(workspace_sync), PRUNE_CACHE] if built else []
-    )
+    assert workspace_sync.uv_calls() == [_install(workspace_sync), PRUNE_CACHE]
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "fallback"])
 @pytest.mark.parametrize("member", ["analytics", "libs/analytics"])
+@pytest.mark.parametrize(
+    "workspace", [UV_WORKSPACE, UV_WORKSPACE_INLINE], ids=["table", "inline-table"]
+)
 def test_auto_syncs_a_uv_workspace_member_with_the_root_lock(
-    workspace_sync, member, shared
+    workspace_sync, workspace, member, shared
 ):
-    commit = workspace_sync.commit({**UV_WORKSPACE, f"{member}/pyproject.toml": MEMBER})
+    commit = workspace_sync.commit({**workspace, f"{member}/pyproject.toml": MEMBER})
 
-    built = workspace_sync.run(commit, shared=shared, RIVERS_GIT_PATH=member)
+    built = workspace_sync.run(commit, shared=shared, path=member)
 
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> uvSync" in built.stderr
@@ -613,7 +549,7 @@ def test_auto_syncs_a_project_with_its_own_uv_lock(workspace_sync):
         {"analytics/pyproject.toml": MEMBER, "analytics/uv.lock": "version = 1\n"}
     )
 
-    built = workspace_sync.run(commit, shared=False, RIVERS_GIT_PATH="analytics")
+    built = workspace_sync.run(commit, shared=False, path="analytics")
 
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> uvSync" in built.stderr
@@ -623,7 +559,7 @@ def test_auto_syncs_a_project_with_its_own_uv_lock(workspace_sync):
 def test_auto_installs_the_project_requirements_txt(workspace_sync):
     commit = workspace_sync.commit({"analytics/requirements.txt": "pandas\n"})
 
-    built = workspace_sync.run(commit, shared=False, RIVERS_GIT_PATH="analytics")
+    built = workspace_sync.run(commit, shared=False, path="analytics")
 
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> requirements" in built.stderr
@@ -643,7 +579,7 @@ def test_auto_prefers_the_project_requirements_txt_to_the_workspace_lock(
         }
     )
 
-    built = workspace_sync.run(commit, shared=False, RIVERS_GIT_PATH="analytics")
+    built = workspace_sync.run(commit, shared=False, path="analytics")
 
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> requirements" in built.stderr
@@ -657,14 +593,6 @@ def test_auto_prefers_the_project_requirements_txt_to_the_workspace_lock(
     [
         pytest.param({"analytics/pyproject.toml": MEMBER}, id="no-lock"),
         pytest.param(
-            {
-                "pyproject.toml": '[project]\nname = "root"\nversion = "0.1.0"\n',
-                "uv.lock": "version = 1\n",
-                "analytics/pyproject.toml": MEMBER,
-            },
-            id="lock-of-a-project-that-is-not-a-workspace",
-        ),
-        pytest.param(
             {**UV_WORKSPACE, "analytics/pipeline.py": ""},
             id="directory-without-pyproject",
         ),
@@ -673,7 +601,7 @@ def test_auto_prefers_the_project_requirements_txt_to_the_workspace_lock(
 def test_auto_installs_nothing_without_a_lock_for_the_project(workspace_sync, files):
     commit = workspace_sync.commit(files)
 
-    built = workspace_sync.run(commit, shared=False, RIVERS_GIT_PATH="analytics")
+    built = workspace_sync.run(commit, shared=False, path="analytics")
 
     assert built.returncode == 0, built.stderr
     assert "deps mode auto -> none" in built.stderr
@@ -682,18 +610,94 @@ def test_auto_installs_nothing_without_a_lock_for_the_project(workspace_sync, fi
 
 def test_auto_does_not_look_for_a_lock_above_the_repository(workspace_sync):
     commit = workspace_sync.commit({"analytics/pyproject.toml": MEMBER})
+    # A workspace above the checkout that names the project: uv reports it.
     workspace_sync.tree.mkdir()
-    for name, content in UV_WORKSPACE.items():
-        (workspace_sync.tree / name).write_text(content)
+    (workspace_sync.tree / "pyproject.toml").write_text(
+        '[tool.uv.workspace]\nmembers = ["src/analytics"]\n'
+    )
+    (workspace_sync.tree / "uv.lock").write_text("version = 1\n")
 
-    built = workspace_sync.run(commit, shared=False, RIVERS_GIT_PATH="analytics")
+    built = workspace_sync.run(commit, shared=False, path="analytics")
 
     assert built.returncode == 0, built.stderr
+    assert f"uv workspace root: {workspace_sync.tree}\n" in built.stderr
     assert "deps mode auto -> none" in built.stderr
     assert workspace_sync.uv_calls() == []
 
 
+REMEDIES = (
+    "'{path}' has no uv.lock, and uv does not count it as a member of the workspace "
+    "at the repository root: add it to [tool.uv.workspace] members, give it its "
+    "own uv.lock, or set spec.git.dependencies.mode to none"
+)
+
+
+@pytest.mark.parametrize(
+    ("files", "path"),
+    [
+        pytest.param(
+            {
+                **UV_WORKSPACE,
+                "pyproject.toml": '[tool.uv.workspace]\nmembers = ["libs/*"]\n',
+            },
+            "analytics",
+            id="not-in-members",
+        ),
+        pytest.param(
+            {
+                **UV_WORKSPACE,
+                "pyproject.toml": (
+                    '[tool.uv.workspace]\nmembers = ["analytics", "libs/*"]\n'
+                    'exclude = ["libs/excluded"]\n'
+                ),
+            },
+            "libs/excluded",
+            id="excluded",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "root"\nversion = "0.1.0"\n',
+                "uv.lock": "version = 1\n",
+            },
+            "analytics",
+            id="lock-of-a-project-that-is-not-a-workspace",
+        ),
+    ],
+)
+def test_a_project_the_workspace_does_not_include_fails_with_the_remedies(
+    workspace_sync, files, path
+):
+    commit = workspace_sync.commit({**files, f"{path}/pyproject.toml": MEMBER})
+
+    failed = workspace_sync.run(commit, shared=False, path=path)
+
+    error = REMEDIES.format(path=path)
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == f"{error}\n"
+    assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
+    assert f"uv workspace root: {workspace_sync.tree / 'src' / path}\n" in failed.stderr
+    assert workspace_sync.uv_calls() == []
+    assert not (workspace_sync.tree / ".ready").exists()
+
+
+def test_a_broken_pyproject_fails_the_build_with_uvs_error(workspace_sync):
+    commit = workspace_sync.commit(
+        {**UV_WORKSPACE, "analytics/pyproject.toml": "[project\nname = 'analytics'\n"}
+    )
+
+    failed = workspace_sync.run(commit, shared=False, path="analytics")
+
+    assert failed.returncode == 1
+    assert workspace_sync.termination_message() == ""
+    assert "TOML parse error" in failed.stderr
+    assert failed.stderr.endswith(
+        "workspace-sync: ERROR: workspace build failed (exit 2)\n"
+    )
+    assert workspace_sync.uv_calls() == []
+
+
 SHARED_LIB = '[project]\nname = "shared"\nversion = "0.1.0"\n'
+UNUSED_LIB = '[project]\nname = "unused"\nversion = "0.1.0"\n'
 MODULE = "X = 1\n"
 
 
@@ -702,7 +706,7 @@ class Layout(NamedTuple):
 
     Attributes:
         files: Content by path, relative to the repository root.
-        path: The project directory (``RIVERS_GIT_PATH``); empty for a
+        path: The project directory (``path``); empty for a
             project at the repository root.
         editable: The directories that ``uv`` installs as editable.
         compiled: The directories that a shared build compiles, in order.
@@ -745,6 +749,7 @@ LAYOUTS = [
                 "analytics/src/analytics/assets.py": MODULE,
                 "libs/shared/pyproject.toml": SHARED_LIB,
                 "libs/shared/src/shared/io.py": MODULE,
+                "libs/unused/pyproject.toml": UNUSED_LIB,
                 "libs/unused/src/unused/io.py": MODULE,
             },
             path="analytics",
@@ -798,7 +803,7 @@ def _build(workspace_sync, tmp_path, layout: Layout, *, shared: bool):
     (elsewhere / "io.py").write_text(MODULE)
     src = workspace_sync.tree / "src"
     editable = [str(src / name) for name in layout.editable] + [str(elsewhere)]
-    env = {"RIVERS_GIT_PATH": layout.path} if layout.path else {}
+    env = {"path": layout.path} if layout.path else {}
     commit = workspace_sync.commit(layout.files)
     return workspace_sync.run(
         commit, shared=shared, FAKE_UV_EDITABLE=os.pathsep.join(editable), **env
@@ -880,7 +885,7 @@ def test_an_ssh_url_needs_identity_and_known_hosts(workspace_sync, keys, error):
     commit = workspace_sync.commit(UV_PROJECT)
     _git_secret(workspace_sync, *keys)
 
-    failed = workspace_sync.run(commit, shared=False, RIVERS_GIT_URL=SSH_URL)
+    failed = workspace_sync.run(commit, shared=False, url=SSH_URL)
 
     assert failed.returncode == 1
     assert f"workspace-sync: ERROR: {error}\n" in failed.stderr
@@ -888,18 +893,15 @@ def test_an_ssh_url_needs_identity_and_known_hosts(workspace_sync, keys, error):
 
 
 @pytest.mark.parametrize(
-    ("env", "keys", "unreadable"),
+    ("fields", "keys", "unreadable"),
     [
         pytest.param({}, ["username", "password"], "password", id="password"),
         pytest.param({}, ["username", "password"], "username", id="username"),
         pytest.param(
-            {"RIVERS_GIT_URL": SSH_URL},
-            ["identity", "known_hosts"],
-            "identity",
-            id="identity",
+            {"url": SSH_URL}, ["identity", "known_hosts"], "identity", id="identity"
         ),
         pytest.param(
-            {"RIVERS_GIT_URL": SSH_URL},
+            {"url": SSH_URL},
             ["identity", "known_hosts"],
             "known_hosts",
             id="known_hosts",
@@ -907,7 +909,7 @@ def test_an_ssh_url_needs_identity_and_known_hosts(workspace_sync, keys, error):
     ],
 )
 def test_a_git_secret_key_the_pod_cannot_read_stops_the_build(
-    workspace_sync, env, keys, unreadable
+    workspace_sync, fields, keys, unreadable
 ):
     if os.geteuid() == 0:
         pytest.skip("root reads files whatever their mode")
@@ -916,7 +918,7 @@ def test_a_git_secret_key_the_pod_cannot_read_stops_the_build(
     path = workspace_sync.creds / unreadable
     path.chmod(0)
 
-    failed = workspace_sync.run(commit, shared=False, **env)
+    failed = workspace_sync.run(commit, shared=False, **fields)
 
     error = f"cannot read the git Secret's '{unreadable}' ({path}): permission denied"
     assert failed.returncode == 1
@@ -939,7 +941,7 @@ def test_an_ssh_url_fetches_with_the_identity_and_known_hosts(workspace_sync, tm
     workspace_sync.run(
         commit,
         shared=False,
-        RIVERS_GIT_URL=SSH_URL,
+        url=SSH_URL,
         PATH=f"{ssh_bin}{os.pathsep}{workspace_sync.env['PATH']}",
         FAKE_SSH_LOG=str(ssh_log),
     )

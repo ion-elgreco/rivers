@@ -1,12 +1,11 @@
-"""Harness for running ``deploy/docker/rivers-workspace-sync`` on the host.
+"""Harness for running ``rivers workspace-sync`` on the host.
 
-The script runs the way the init container runs it, but against a git remote
-in ``tmp_path`` (a ``file://`` URL), a fake ``uv`` that records its
-arguments, and a ``python3`` that records its arguments before it runs. Each
-``WorkspaceSync.run`` gets a new, empty termination log, as kubelet gives each
-container start one. Hosts without ``flock``, ``timeout`` or GNU ``stat``
-(macOS) get stand-ins on ``PATH``; Linux CI runs the real tools. macOS runs
-the script with bash 3.2, so it must not use bash-4 syntax.
+The command runs the way the init container runs it, as the venv's
+``rivers`` console script, but against a git remote in ``tmp_path`` (a
+``file://`` URL), a fake ``uv`` that records its arguments and hands
+``uv workspace`` queries to the real uv, and a ``python3`` that records its
+arguments before it runs. Each ``WorkspaceSync.run`` gets a new, empty
+termination log, as kubelet gives each container start one.
 
 A held step waits until the test releases it (``WorkspaceSync.release``), or
 until the test ends.
@@ -15,6 +14,7 @@ until the test ends.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import shutil
@@ -28,9 +28,8 @@ from typing import IO
 
 import pytest
 
-SYNC_SCRIPT = (
-    Path(__file__).resolve().parents[3] / "deploy" / "docker" / "rivers-workspace-sync"
-)
+SYNC_COMMAND = [str(Path(sys.executable).with_name("rivers")), "workspace-sync"]
+RUNTIME_IMAGE = "ghcr.io/example/rivers-runtime@sha256:" + "1a2b3c4d" * 8
 _GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "rivers",
     "GIT_AUTHOR_EMAIL": "rivers@example.com",
@@ -38,7 +37,8 @@ _GIT_IDENTITY = {
     "GIT_COMMITTER_EMAIL": "rivers@example.com",
 }
 
-# Appends its argv as one JSON line to $FAKE_UV_LOG, then sleeps
+# Hands `uv workspace` queries to the real uv ($FAKE_UV_REAL), unrecorded.
+# Otherwise appends its argv as one JSON line to $FAKE_UV_LOG, then sleeps
 # $FAKE_UV_SLEEP seconds (default 0). When its subcommand is listed in
 # $FAKE_UV_HOLD (comma-separated), it is held: it waits for the release of
 # the subcommand. When its subcommand is listed in $FAKE_UV_FAIL, it prints
@@ -52,6 +52,8 @@ import json, os, sys, time
 from pathlib import Path
 
 args = sys.argv[1:]
+if args[:1] == ["workspace"]:
+    os.execv(os.environ["FAKE_UV_REAL"], ["uv", *args])
 with open(os.environ["FAKE_UV_LOG"], "a") as log:
     log.write(json.dumps(args) + "\\n")
 time.sleep(float(os.environ.get("FAKE_UV_SLEEP", "0")))
@@ -82,7 +84,7 @@ if venv:
 """
 
 # Appends its argv as one JSON line to $FAKE_PYTHON3_LOG, then runs as the
-# interpreter of the tests, so that the script's `python3 -m compileall`
+# interpreter of the tests, so that the sync's `python3 -m compileall`
 # compiles.
 _PYTHON3 = """\
 import json, os, sys
@@ -92,60 +94,72 @@ with open(os.environ["FAKE_PYTHON3_LOG"], "a") as log:
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 """
 
-# `flock [-n] FD`. The lock belongs to the open file, which the calling shell
-# keeps open, so it outlives this process as flock(1)'s does.
-_FLOCK = """\
-import fcntl, sys
-
-*opts, fd = sys.argv[1:]
-try:
-    fcntl.flock(int(fd), fcntl.LOCK_EX | (fcntl.LOCK_NB if "-n" in opts else 0))
-except BlockingIOError:
-    sys.exit(1)
-"""
-
-# `timeout DURATION COMMAND...`, as GNU timeout: past DURATION seconds it
-# sends SIGTERM to the command and everything the command started, then
-# exits 124.
-_TIMEOUT = """\
-import os, signal, subprocess, sys
-
-duration, *command = sys.argv[1:]
-child = subprocess.Popen(command, start_new_session=True)
-try:
-    code = child.wait(timeout=float(duration))
-except subprocess.TimeoutExpired:
-    os.killpg(child.pid, signal.SIGTERM)
-    child.wait()
-    sys.exit(124)
-sys.exit(code if code >= 0 else 128 - code)
-"""
-
-# GNU `stat -c %Y PATH`: modification time in epoch seconds.
-_STAT = """\
-import os, sys
-
-assert sys.argv[1:3] == ["-c", "%Y"], sys.argv
-print(int(os.stat(sys.argv[3]).st_mtime))
-"""
-
-
-def _missing_tools() -> dict[str, str]:
-    """Stand-ins for the tools this host lacks, by command name."""
-    shims = {}
-    if shutil.which("flock") is None:
-        shims["flock"] = _FLOCK
-    if shutil.which("timeout") is None:
-        shims["timeout"] = _TIMEOUT
-    gnu_stat = subprocess.run(["stat", "-c", "%Y", "/"], capture_output=True)
-    if gnu_stat.returncode != 0:
-        shims["stat"] = _STAT
-    return shims
-
 
 def _write_python_tool(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}")
     path.chmod(0o755)
+
+
+@functools.cache
+def _require_uv() -> str:
+    """Return the host's uv, 0.10.0 or later: ``uv workspace dir`` names the workspace root."""
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.fail("install uv 0.10.0 or later: the sync asks `uv workspace dir`")
+    version = subprocess.run(
+        [uv, "--version"], capture_output=True, text=True, check=True
+    ).stdout.split()[1]
+    major, minor = (int(part) for part in version.split(".")[:2])
+    if (major, minor) < (0, 10):
+        pytest.fail(
+            f"uv {version}: install uv 0.10.0 or later, the sync asks `uv workspace dir`"
+        )
+    return uv
+
+
+def run_source(
+    url: str,
+    commit: str,
+    *,
+    ref: str | None = None,
+    path: str | None = None,
+    mode: str = "auto",
+    files: tuple[str, ...] = (),
+    extras: tuple[str, ...] = (),
+    groups: tuple[str, ...] = (),
+    timeout: int | None = None,
+) -> dict:
+    """The ``RIVERS_RUN_SOURCE`` of one pod, as the operator stamps it.
+
+    Args:
+        url: The repository url.
+        commit: The pinned commit.
+        ref: The resolved branch or tag (``refs/heads/main``), the fetch fallback.
+        path: The project directory in the repository.
+        mode: The dependencies mode.
+        files: ``requirements`` mode: the files to install.
+        extras: ``uvSync`` mode: ``--extra`` names.
+        groups: ``uvSync`` mode: ``--group`` names.
+        timeout: The build's time budget in seconds.
+
+    Returns:
+        The JSON object.
+    """
+    git: dict = {"url": url, "commit": commit}
+    if ref:
+        git["ref"] = ref
+    if path:
+        git["path"] = path
+    dependencies: dict = {"mode": mode}
+    if files:
+        dependencies["files"] = list(files)
+    if extras:
+        dependencies["extras"] = list(extras)
+    if groups:
+        dependencies["groups"] = list(groups)
+    if timeout is not None:
+        dependencies["timeoutSeconds"] = timeout
+    return {"git": git, "dependencies": dependencies, "runtimeImage": RUNTIME_IMAGE}
 
 
 def _json_lines(path: Path) -> list[list[str]]:
@@ -166,11 +180,11 @@ def _flock(file: IO[str], *, wait: bool) -> bool:
 
 
 class StartedPod:
-    """One run of the script that the test does not wait for.
+    """One run of the sync that the test does not wait for.
 
     Args:
-        process: The script, which leads its own process group.
-        log: The file that gets the script's log (its stderr).
+        process: The sync, which leads its own process group.
+        log: The file that gets the sync's log (its stderr).
     """
 
     def __init__(self, process: subprocess.Popen[bytes], log: Path) -> None:
@@ -178,34 +192,34 @@ class StartedPod:
         self._log = log
 
     def log(self) -> str:
-        """Return what the script has logged so far."""
+        """Return what the sync has logged so far."""
         return self._log.read_text()
 
     def wait_for(self, text: str) -> None:
-        """Wait until the script logs ``text``.
+        """Wait until the sync logs ``text``.
 
         Args:
             text: Text that a line of the log contains.
 
         Raises:
-            AssertionError: The script exited, or 20 seconds went by, before
+            AssertionError: The sync exited, or 20 seconds went by, before
                 it logged ``text``.
         """
         deadline = time.monotonic() + 20
         while text not in self.log():
             exited = self.process.poll() is not None
             if (exited and text not in self.log()) or time.monotonic() > deadline:
-                raise AssertionError(f"the script did not log {text!r}:\n{self.log()}")
+                raise AssertionError(f"the sync did not log {text!r}:\n{self.log()}")
             time.sleep(0.02)
 
     def exit_code_within(self, seconds: float) -> int | None:
-        """Wait for the script to exit.
+        """Wait for the sync to exit.
 
         Args:
             seconds: How long to wait.
 
         Returns:
-            The exit code, or ``None`` if the script still runs after ``seconds``.
+            The exit code, or ``None`` if the sync still runs after ``seconds``.
         """
         try:
             return self.process.wait(timeout=seconds)
@@ -213,21 +227,21 @@ class StartedPod:
             return None
 
     def stop(self) -> None:
-        """Wait up to 10 seconds for the script to end, then kill its process group."""
+        """Wait up to 10 seconds for the sync to end, then kill its process group."""
         if self.exit_code_within(10) is None:
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait()
 
 
 class WorkspaceSync:
-    """A git remote, a workspace volume and a fake ``uv`` for the sync script.
+    """A git remote, a workspace volume and a fake ``uv`` for the sync.
 
     The remote's commits go on its branch ``main``. ``volume`` stands for the
     workspace volume: the PVC root in shared mode, the pod's emptyDir in
     fallback mode. ``tree`` is the subPath the pod mounts at ``/workspace``.
 
     Args:
-        tmp_path: Directory that holds everything the script touches.
+        tmp_path: Directory that holds everything the sync touches.
     """
 
     def __init__(self, tmp_path: Path) -> None:
@@ -254,11 +268,10 @@ class WorkspaceSync:
             "FAKE_UV_LOG": str(self._uv_log),
             "FAKE_PYTHON3_LOG": str(self._python3_log),
             "FAKE_RELEASED": str(self._released),
+            "FAKE_UV_REAL": _require_uv(),
         }
         _write_python_tool(bin_dir / "uv", _FAKE_UV)
         _write_python_tool(bin_dir / "python3", _PYTHON3)
-        for name, body in _missing_tools().items():
-            _write_python_tool(bin_dir / name, body)
         self._git("init", "-q", "-b", "main")
         self._git("config", "uploadpack.allowAnySHA1InWant", "true")
 
@@ -290,7 +303,7 @@ class WorkspaceSync:
     def refuse_fetch_by_commit(self) -> None:
         """Make the remote refuse a fetch by SHA of a commit no branch points at.
 
-        Over protocol v2, a remote serves any commit it has, so the script's
+        Over protocol v2, a remote serves any commit it has, so the sync's
         git speaks v0, and the remote does not allow any SHA in a want. The
         commit of an annotated tag is then served only by the tag's name.
         """
@@ -303,46 +316,76 @@ class WorkspaceSync:
             }
         )
 
-    def run(
-        self, commit: str, *, shared: bool, **env: str
-    ) -> subprocess.CompletedProcess[str]:
-        """Run the script as one pod's init container.
+    def source(self, commit: str, *, url: str | None = None, **fields) -> dict:
+        """The ``RIVERS_RUN_SOURCE`` of a pod that builds ``commit`` of the remote.
 
         Args:
-            commit: The pinned commit to build (``RIVERS_GIT_COMMIT``).
+            commit: The pinned commit.
+            url: Another repository url than the remote's.
+            **fields: The other fields of :func:`run_source`.
+
+        Returns:
+            The JSON object.
+        """
+        return run_source(url or self.remote.as_uri(), commit, **fields)
+
+    def run(
+        self,
+        commit: str,
+        *,
+        shared: bool,
+        url: str | None = None,
+        ref: str | None = None,
+        path: str | None = None,
+        timeout: int | None = None,
+        source: dict | None = None,
+        **env: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the sync as one pod's init container.
+
+        Args:
+            commit: The pinned commit to build.
             shared: Shared-PVC mode, where the code-location pod mounts the
                 volume root at ``/workspaces``. Fallback pods do not.
+            url: Another repository url than the remote's.
+            ref: The resolved branch or tag, the fetch fallback.
+            path: The project directory in the repository.
+            timeout: The build's time budget in seconds.
+            source: The whole ``RIVERS_RUN_SOURCE`` instead, for one the
+                operator would never stamp.
             **env: Extra or overriding environment variables.
 
         Returns:
-            The finished process; ``stderr`` holds the script's log.
+            The finished process; ``stderr`` holds the sync's log.
         """
         self._termination_log.write_text("")
+        if source is None:
+            source = self.source(commit, url=url, ref=ref, path=path, timeout=timeout)
         return subprocess.run(
-            ["bash", str(SYNC_SCRIPT)],
-            env=self._pod_env(commit, shared, env),
+            SYNC_COMMAND,
+            env=self._pod_env(shared, env, source),
             capture_output=True,
             text=True,
             timeout=60,
         )
 
     def start(self, commit: str, *, shared: bool, **env: str) -> StartedPod:
-        """Start the script as one pod's init container, and do not wait for it.
+        """Start the sync as one pod's init container, and do not wait for it.
 
         Args:
-            commit: The pinned commit to build (``RIVERS_GIT_COMMIT``).
+            commit: The pinned commit to build.
             shared: Shared-PVC mode, as in :meth:`run`.
             **env: Extra or overriding environment variables.
 
         Returns:
-            The running script. At the end of the test, every held step is
-            released, and a script that does not end then is killed.
+            The running sync. At the end of the test, every held step is
+            released, and a sync that does not end then is killed.
         """
         log = self._tmp_path / f"pod-{len(self._started)}.log"
         with log.open("w") as stderr:
             process = subprocess.Popen(
-                ["bash", str(SYNC_SCRIPT)],
-                env=self._pod_env(commit, shared, env),
+                SYNC_COMMAND,
+                env=self._pod_env(shared, env, self.source(commit)),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
@@ -375,7 +418,7 @@ class WorkspaceSync:
             return _flock(lock, wait=False)
 
     def stop(self) -> None:
-        """Release every held step, then let each started script end."""
+        """Release every held step, then let each started sync end."""
         shutil.rmtree(self._released)
         for pod in self._started:
             pod.stop()
@@ -398,12 +441,11 @@ class WorkspaceSync:
         return _json_lines(self._python3_log)
 
     def _pod_env(
-        self, commit: str, shared: bool, env: dict[str, str]
+        self, shared: bool, env: dict[str, str], source: dict
     ) -> dict[str, str]:
         return {
             **self.env,
-            "RIVERS_GIT_URL": self.remote.as_uri(),
-            "RIVERS_GIT_COMMIT": commit,
+            "RIVERS_RUN_SOURCE": json.dumps(source),
             "RIVERS_WORKSPACE_DIR": str(self.tree),
             "RIVERS_WORKSPACES_ROOT": str(
                 self.volume if shared else self._unmounted_root
@@ -427,7 +469,7 @@ class WorkspaceSync:
 def workspace_sync(tmp_path: Path) -> Iterator[WorkspaceSync]:
     """A fresh remote and volume for one test."""
     if sys.platform == "win32":
-        pytest.skip("rivers-workspace-sync is a bash script for Linux pods")
+        pytest.skip("the workspace sync runs in Linux pods")
     sync = WorkspaceSync(tmp_path)
     yield sync
     sync.stop()

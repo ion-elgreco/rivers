@@ -365,4 +365,4 @@ def test_runtime_images_install_the_release_glibc_wheel_of_their_arch(release):
                 for w in wheels
             ]
             assert targets == [target], f"py{python} {arch} context: {sorted(context)}"
-            assert "rivers-workspace-sync" in context
+            assert context == {f"wheels/{w}" for w in wheels}, sorted(context)

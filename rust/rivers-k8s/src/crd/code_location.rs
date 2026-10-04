@@ -282,12 +282,13 @@ impl GitRef {
 #[serde(rename_all = "camelCase")]
 pub struct Dependencies {
     /// `auto` reads `path`: `uvSync` when `uv.lock` exists, else
-    /// `requirements` when `requirements.txt` exists, else `uvSync` when
-    /// `pyproject.toml` exists and the nearest `uv.lock` above it, up to the
-    /// repository root, is next to a `pyproject.toml` with
-    /// `[tool.uv.workspace]` (a uv workspace member), else installs nothing.
-    /// Detection happens in the workspace pod — the operator never reads repo
-    /// contents.
+    /// `requirements` when `requirements.txt` exists, else, with a
+    /// `pyproject.toml`, `uvSync` when the workspace root uv reports for the
+    /// project (`uv workspace dir`) is inside the checkout and has `uv.lock`;
+    /// a project with no lock of its own under a `uv.lock` that uv does not
+    /// count it in (missing from `members`, `exclude`d, or the lock of a
+    /// plain project) fails the build; else installs nothing. Detection
+    /// happens in the workspace pod — the operator never reads repo contents.
     #[serde(default)]
     pub mode: DependencyMode,
 
@@ -322,8 +323,8 @@ pub enum DependencyMode {
 }
 
 impl DependencyMode {
-    /// The serde name (`auto` / `uvSync` / …): the sync script and the
-    /// workspace key speak the CRD's vocabulary.
+    /// The serde name (`auto` / `uvSync` / …): the workspace key speaks the
+    /// CRD's vocabulary.
     pub fn as_str(self) -> &'static str {
         match self {
             DependencyMode::Auto => "auto",
