@@ -23,6 +23,10 @@ _default:
 venv:
     uv sync --no-install-workspace --all-extras --all-packages
 
+# Free-threaded (3.14t) venv in .venv-ft, without deps that lack free-threaded wheels (gRPC client, delta/polars/datafusion)
+venv-ft:
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' uv sync --no-install-workspace --all-packages --python 3.14t --no-group grpc --extra pyarrow --extra pandas --extra otel
+
 # Build the UI's hydration WASM (release).
 wasm:
     cargo build -p rivers-ui --target wasm32-unknown-unknown --release --no-default-features --features hydrate
@@ -46,6 +50,10 @@ develop: venv wasm
 develop-fast: venv wasm-dev
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
+# develop-fast for free-threaded Python (3.14t), into .venv-ft
+develop-ft: venv-ft wasm-dev
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv-ft' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
+
 # Build and install rivers as editable (release mode, stripped WASM)
 develop-release: venv wasm
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --release
@@ -53,6 +61,10 @@ develop-release: venv wasm
 # Run Python tests
 test:
     uv run --no-sync pytest python/
+
+# Run Python tests on free-threaded Python; an import that turns the GIL back on fails
+test-ft:
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
 
 # Run Python tests (excluding spark tests)
 test-dev:

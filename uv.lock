@@ -1673,8 +1673,6 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "cryptography" },
-    { name = "grpcio" },
-    { name = "grpcio-tools" },
     { name = "kr8s" },
     { name = "psutil" },
     { name = "py-spy" },
@@ -1686,14 +1684,16 @@ dev = [
     { name = "rumdl" },
     { name = "typos" },
 ]
+grpc = [
+    { name = "grpcio" },
+    { name = "grpcio-tools" },
+]
 
 [package.metadata]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "cryptography", specifier = ">=48.0.1" },
-    { name = "grpcio", specifier = ">=1.82.1" },
-    { name = "grpcio-tools", specifier = ">=1.82.1" },
     { name = "kr8s", specifier = ">=0.20" },
     { name = "psutil", specifier = ">=7.0" },
     { name = "py-spy", specifier = ">=0.4.0" },
@@ -1704,6 +1704,10 @@ dev = [
     { name = "ruff", specifier = ">=0.15.22" },
     { name = "rumdl", specifier = ">=0.2.37" },
     { name = "typos", specifier = ">=1.48.0" },
+]
+grpc = [
+    { name = "grpcio", specifier = ">=1.82.1" },
+    { name = "grpcio-tools", specifier = ">=1.82.1" },
 ]
 
 [[package]]

@@ -3,6 +3,9 @@ name = "rivers-workspace"
 version = "0.0.0"
 requires-python = ">=3.10"
 
+[tool.uv]
+default-groups = ["dev", "grpc"]
+
 [tool.uv.workspace]
 members = [
     "python",
@@ -20,10 +23,14 @@ dev = [
     "ruff>=0.15.22",
     "typos>=1.48.0",
     "cryptography>=48.0.1",
-    "grpcio>=1.82.1",
-    "grpcio-tools>=1.82.1",
     "kr8s>=0.20",
     "rumdl>=0.2.37",
     # Memory sampling for the comparison benchmark in bench/.
     "psutil>=7.0",
+]
+# gRPC client for the API tests. No free-threaded (3.14t) wheels yet, so
+# `just venv-ft` leaves this group out.
+grpc = [
+    "grpcio>=1.82.1",
+    "grpcio-tools>=1.82.1",
 ]
