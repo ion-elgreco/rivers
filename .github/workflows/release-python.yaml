@@ -3,8 +3,9 @@ name: release-python
 # Builds the rivers Python wheels for all supported platforms and
 # publishes to PyPI via Trusted Publishing on tag push (v*.*.*).
 #
-# Wheels are abi3-py311, so one wheel per (os, libc, arch) covers
-# Python 3.11+. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
+# Each (os, libc, arch) gets an abi3-py311 wheel, which covers Python
+# 3.11+, and a cp314t wheel for free-threaded 3.14, which abi3 does not
+# cover. Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_17),
 # linux-musl/{x86_64, aarch64} (musllinux_1_2), macos/{x86_64, arm64},
 # windows/x86_64.
 
@@ -120,7 +121,7 @@ jobs:
           working-directory: python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist
+          args: --release --out dist -i python3.13 python3.14t
           sccache: false
           # rivers-api needs protoc at build time (prost-build);
           # surrealdb-librocksdb-sys needs libclang.so (bindgen).
@@ -166,7 +167,7 @@ jobs:
     name: Build wheel (macos ${{ matrix.arch }})
     needs: build-wasm
 
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read       # checkout sources
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
@@ -181,9 +182,11 @@ jobs:
           # libc++ headers gate to 10.13+. Bump explicitly.
           - target: x86_64-apple-darwin
             arch: x86_64
+            runner: macos-15-intel
             deployment-target: "10.13"
           - target: aarch64-apple-darwin
             arch: arm64
+            runner: macos-14
             deployment-target: "11.0"
 
     env:
@@ -218,12 +221,19 @@ jobs:
         with:
           tool: protoc@3.36.1
 
+      - name: Install Python 3.13 and free-threaded 3.14t
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.13
+            3.14t
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: python
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist -i python3.13 python3.14t
           sccache: false
 
       - name: Attest wheel provenance
@@ -293,12 +303,19 @@ jobs:
         with:
           tool: protoc@3.36.1
 
+      - name: Install Python 3.13 and free-threaded 3.14t
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.13
+            3.14t
+
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: python
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist -i python3.13 python3.14t
           sccache: false
 
       - name: Attest wheel provenance
