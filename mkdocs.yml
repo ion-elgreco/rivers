@@ -64,6 +64,8 @@ nav:
   - Installation:
       - Overview: installation/overview.md
       - Kubernetes: installation/kubernetes.md
+      - Git-sourced CodeLocations: installation/git-code-locations.md
+      - Git workspace reference: installation/git-workspace-reference.md
       - Free-threaded Python: installation/free-threading.md
   - Guides:
       - Migrating from Dagster/Prefect: guides/migrating.md

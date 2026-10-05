@@ -20,7 +20,7 @@ spec:
   # Pin the exact digest to bypass registry lookups entirely:
   # digest: sha256:aabbccddeeff...
   module: analytics.pipeline
-  replicas: 1
+  replicas: 1  # the maximum; code locations do not scale out yet
   grpcPort: 3001
   # digestRefreshInterval: 5m
   resources:

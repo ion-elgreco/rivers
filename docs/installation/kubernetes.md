@@ -56,7 +56,7 @@ the service with your usual `Ingress` / `Gateway`.
 
 A `CodeLocation` is a deployment unit — one image containing a Python
 module that exposes a `CodeRepository`. The operator pulls the image,
-resolves a tag to a digest, and runs replicas of `rivers serve`.
+resolves a tag to a digest, and runs `rivers serve`.
 
 ```yaml title="analytics.yaml"
 apiVersion: rivers.io/v1alpha1
@@ -73,8 +73,8 @@ spec:
 ```sh
 kubectl apply -f analytics.yaml
 kubectl -n rivers get codelocations
-# NAME        PHASE   IMAGE                                    REPLICAS   AGE
-# analytics   Ready   ghcr.io/acme/pipelines@sha256:abc12...   1/1        30s
+# NAME        PHASE   SOURCE                                  REPLICAS   AGE
+# analytics   Ready   ghcr.io/acme/pipelines@sha256:abc1234   1/1        30s
 ```
 
 Once `PHASE=Ready` the UI lists the location's assets, jobs, and run
@@ -93,7 +93,7 @@ spec:
   image: ghcr.io/acme/pipelines
   tag: v0.2.0
   module: pipelines.analytics
-  replicas: 3
+  replicas: 1             # the maximum; code locations do not scale out yet
   digestRefreshInterval: 5m
   resources:
     requests:
@@ -135,11 +135,10 @@ spec:
 
 ## Git-sourced CodeLocations
 
-Instead of baking your code into an image, point a `CodeLocation` at a
-**git repository**. The operator resolves the ref to a pinned commit, an
-init container fetches the code and installs dependencies with `uv` into a
-mounted workspace, and every run pins that exact commit — the release
-pipeline shrinks to `git push`.
+A `CodeLocation` can take its code from a git repository instead of an
+image. The operator pins the ref to a commit, the pods fetch that commit
+and install its dependencies with `uv`, and every run uses the commit of
+the pod that launched it.
 
 ```yaml title="analytics-git.yaml"
 apiVersion: rivers.io/v1alpha1
@@ -164,393 +163,10 @@ kubectl -n rivers get rcl
 # analytics   Ready   main@9f3c1ab   1/1        45s
 ```
 
-**Pinning a commit**: `ref.commit` takes the full 40-character SHA in
-lowercase, as `git rev-parse` prints it. The same applies to
-`spec.source.git.commit` of a `Run` that you create with your own
-`spec.source`. The API server and the webhook reject a short or uppercase
-SHA. A CodeLocation that has one all the same (for example, one created
-before these checks) fails with reason `InvalidRef`, and the operator
-does not deploy it.
-
-**Project directory**: `path` is relative to the repository root, like
-`analytics` or `services/analytics`. Leave it out for the repository
-root. The webhook rejects a `path` that starts with `/`, that has a `..`
-segment, or that has a `.` or empty segment (`./analytics`,
-`services//analytics`): one spelling for each directory, so that each
-directory gets one tree. A `/` at the end is fine. The same applies to
-`spec.source.git.path` of a `Run` that you create with your own
-`spec.source`. Code-location, run and step pods start in the project
-directory, `/workspace/src/<path>`, and have it on `PYTHONPATH`. Thus
-Python finds `module` also after your code changes the working directory,
-for example in workers of `Executor.parallel()` that start after the
-change. A `PYTHONPATH` in `spec.env` replaces this value: to keep this
-behaviour, put the project directory in your value too.
-
-How it composes with `image`: `spec.image` is always *the container the
-pods run*. Omit it in git mode to run the chart's default runtime image
-(`codeLocation.runtime.*`, by default
-`ghcr.io/ion-elgreco/rivers-runtime:<chart version>-py3.12`). Each release
-publishes this image for Python 3.11, 3.12 and 3.13 (tags
-`<version>-py3.11`, `-py3.12`, `-py3.13`), for `linux/amd64` and
-`linux/arm64`. The init container that builds the trees is
-`rivers-runtime workspace-sync`, a static binary in the image: a runtime
-image you build yourself needs git, uv 0.10.0 or later, the rivers package
-of the chart's version, and `/usr/local/bin/rivers-runtime` from the
-published image (`COPY --from=ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.12
-/usr/local/bin/rivers-runtime /usr/local/bin/`). `spec.tag` or `spec.digest`
-on its own replaces that
-image's tag or digest, e.g. `tag: 0.5.0-py3.11` for another interpreter.
-Set `spec.image` to use a private mirror
-(`image: harbor.internal/rivers/rivers-runtime`, `tag: 0.5.0-py3.11`); as
-in image mode, it then resolves `spec.tag` (default `latest`) or
-`spec.digest`. The operator resolves the runtime image's tag again every
-`digestRefreshInterval` (default `5m`), as in image mode, and rolls the
-pods out on a new digest. It does this also when `ref.commit` pins the
-code. It resolves a semver-like tag, such as `0.5.0-py3.11`, only once.
-
-**Dependencies** come from the repo itself. With `dependencies.mode: auto`
-(the default), the init container looks in the project directory (`path`):
-
-1. `uv.lock` ⇒ `uv sync --locked`.
-2. Else `requirements.txt` ⇒ `uv pip install`.
-3. Else `pyproject.toml` ⇒ the init container asks uv for the project's
-   workspace root (`uv workspace dir`); a root inside the checkout with
-   `uv.lock` ⇒ `uv sync --locked` with that lock. uv writes one `uv.lock`,
-   at the workspace root, so a member has none of its own; uv installs the
-   project and the workspace members it depends on. A project with no lock
-   of its own under a `uv.lock` that uv does not count it in — missing from
-   `members`, `exclude`d, or the lock of a plain project — fails the build
-   with a message that names the remedies: add it to `members`, give it
-   its own lock, or set `dependencies.mode: none`.
-   `uv workspace dir --project <path>` in the repository shows what the
-   init container sees.
-4. Else nothing is installed.
-
-Set `dependencies.mode` to `uvSync`, `requirements` or `none` to choose
-the mode yourself, for example `uvSync` for a workspace member that also
-has a `requirements.txt`. The lockfile should include `rivers` — the
-venv's `rivers` is what runs.
-
-**Credentials Secret keys** (Flux-compatible): the url's scheme selects
-the keys. `https://` (and `http://`) urls use `username`/`password` (a
-forge token is a password). Without these two keys the fetch is
-anonymous; a Secret with only one of them is an error. Newlines at the
-end of these two values are ignored, so a file that ends in a newline
-works with `kubectl create secret --from-file`. `ssh://` urls need
-`identity` + `known_hosts`, and the url must name the user that the key
-logs in as: `ssh://git@github.com/acme/pipelines.git` (`git` on most git
-hosts). Without a user, ssh in the pods would log in as the pod's own
-account: the webhook rejects such a url, and the operator fails a
-CodeLocation that has one with reason `GitAuthFailed`. The keys of the
-other scheme are ignored, so one Secret with all four keys can serve
-both kinds of url. `identity`
-must be a private key without a passphrase. `known_hosts` supports exact
-and hashed (`|1|`) entries only — no `*` wildcards or `@cert-authority`
-lines; list each host explicitly. Each line must be an entry or a
-comment: the operator refuses a `known_hosts` with any other line and
-does not connect to the host. Ed25519, ECDSA and RSA host keys work, not
-DSA. One key per host is enough: the operator asks each host only for the
-key types that `known_hosts` lists for it. If `secretRef` names a Secret
-that does not exist, or that the operator may not read, the CodeLocation
-fails with reason `GitAuthFailed`.
-
-**Url rules**: put credentials only in the Secret. The url goes into the
-pods' environment, into each run's `spec.source` and into the tree's
-`.git/config`, so the webhook rejects a url with a password
-(`https://bot:TOKEN@…`). A user alone (`https://bot@…`, `ssh://git@…`) is
-fine. The webhook rejects `http://` urls unless `operator.git.allowInsecure`
-is `true`: over http, the code and the Secret's credentials are not
-encrypted, so enable it only for a git host on a trusted network. The
-webhook also rejects a url that sends git to another host than the one the
-url seems to name: a `\` in an `https://` or `http://` url, or, in an
-`ssh://` url, `?`, `#` or `%2F` before the path or a `%` escape in the
-host. The same rules apply to `spec.source.git.url` of a `Run` that you
-create with your own `spec.source`. A CodeLocation that has such a url all
-the same (for example, one created before these checks) fails with reason
-`InvalidUrl`, and the operator does not fetch from its url.
-
-**Shared workspace** (recommended where you have RWX storage): set
-`codeLocation.workspace.shared.enabled=true` and the code+venv is built
-once on a per-CL PVC, then mounted read-only by every run and step pod —
-a wide fan-out starts as fast as image mode. Each tree is for one commit,
-one runtime image, one `path` and one `dependencies` setting
-(`timeoutSeconds` excluded). If you change one of these, the
-code-location pod builds a new tree. `spec.env` is not part of a tree,
-even a variable that the install uses, such as `UV_INDEX_URL`: after you
-change it, the code-location pods roll out on the same tree. There is no
-way to rebuild a tree on request. To install with the new value, give the
-CodeLocation a new commit, for example an empty commit
-(`git commit --allow-empty`) on its branch. Run and step pods cannot write
-Python's compiled files (`__pycache__`) into the tree, so the build
-compiles the files that these pods import from the repository: the files
-of the project directory (`path`), and of editable installs from the
-repository, such as uv workspace members. If your code imports other files
-of the repository, for example through `sys.path`, each process that
-imports them compiles them again.
-
-**Fallback mode** (the default,
-`codeLocation.workspace.shared.enabled=false`): every pod builds its own
-tree in an `emptyDir` before its main container starts. It fetches the
-commit from the git host and installs the dependencies from the package
-index, without a cache. Each code-location pod builds when it starts, and
-so does the run pod of each run, also when the operator replaces that
-pod. With `Executor.kubernetes`, the pod of each step, each mapped
-instance and each retry builds too. So a run on the default
-`Executor.parallel()` builds once, and a run of 40 steps on
-`Executor.kubernetes` builds 41 times. A backfill makes one run per
-partition by default, and each of these runs builds. In `requirements`
-mode, each build resolves the requirements again: pin exact versions,
-else different pods can get different versions.
-
-**Failed builds in fallback mode**: each build must finish within
-`dependencies.timeoutSeconds` (default 600 seconds). If the build of a run
-pod fails, for example because the package index does not answer, the
-operator replaces the pod, which builds again, up to 3 times without
-progress (the Run's `spec.maxRestarts`). A step pod is not replaced: its
-Job has `backoffLimit: 0`, so the step fails. A failed build counts as an
-`INFRASTRUCTURE` failure: if the asset has a
-[retry policy](../concepts/retries.md) that retries these, such as
-`RetryOn.TRANSIENT` or the default `RetryOn.ALL`, the retry builds again
-in a new pod.
-
-**Which mode to use**: use shared mode where you have RWX storage and you
-use `Executor.kubernetes`, start many runs (schedules, sensors,
-backfills), or have a large install. Fallback mode is enough for a few
-runs at a time on `Executor.parallel()` or `Executor.in_process()`.
-`Executor.kubernetes` starts all ready steps of a level at the same time,
-unless you set `max_concurrent_steps`. In fallback mode, all of these
-pods then fetch and install at the same time, from the git host and the
-package index. To limit this, set
-`Executor.kubernetes(max_concurrent_steps=...)` for the step pods of a
-run, and a run queue, `RunQueueConfig(max_concurrent_runs=...)`, for the
-runs (see [Concurrency](../concepts/concurrency.md)).
-
-**Writing files**: in shared mode, the tree is read-only in run and step
-pods, so that no run can change the code or the venv that other runs and
-the code-location pods use. Only the code-location pods, which build the
-tree, can write to it. Run and step pods start in the project directory,
-`/workspace/src/<path>`, so code that writes to a relative path fails
-there: `open("scratch.csv", "w")` raises
-`OSError: [Errno 30] Read-only file system`, and
-`df.write_parquet("out.parquet")`, `sqlite3.connect("cache.db")` or an
-IO handler with a relative path, such as
-`DeltaIOHandler(table_uri="lake")`, fail too. The same code can work in
-fallback mode, where each pod writes to its own tree (the writes count
-against the `emptyDir` limit), and in image mode, where the working
-directory is the image's `WORKDIR`. Write to other places instead:
-
-- For scratch files, use `tempfile`, or an absolute path outside
-  `/workspace`, for example in `/tmp`. The container's `/tmp` is writable
-  unless a policy of your cluster sets `readOnlyRootFilesystem`, and its
-  files go away with the pod.
-- For data that later steps or runs read, give IO handlers an
-  object-store location, such as
-  `DeltaIOHandler(table_uri="s3://acme-lake/analytics")`. A local path
-  lives only as long as its pod, and steps can run in other pods.
-
-**Volume permissions**: the runtime image runs as user and group 65532,
-and every git-mode pod sets `fsGroup: 65532`, so that this user can read
-the git Secret and write the tree. In shared mode, group 65532 must also
-be able to write to the RWX volume, but not every storage driver applies
-`fsGroup` to it: a CSI driver with the default `fsGroupPolicy`,
-`ReadWriteOnceWithFSType`, skips RWX volumes, and in-tree `nfs` volumes
-ignore `fsGroup`. On such storage, give the volume's root directory group
-65532 and mode `2775` (setgid), or make it writable for all users. Else
-the code-location pod's build fails with `Permission denied`. On
-OpenShift, the default `restricted-v2` SCC rejects pods with this fixed
-`fsGroup`, as it rejects the chart's operator and UI pods, which set a
-fixed user and group too.
-
-**File locks**: in shared mode, the code-location pods lock files on the
-RWX volume (`flock`), so that two pods do not build the same tree or
-delete old trees at the same time, and uv does not prune its cache while
-another pod installs. These locks must work across nodes. If your storage
-keeps them on one node, two pods on different nodes can build the same
-tree at the same time and break it.
-
-**uv cache**: in shared mode, uv's cache is on the PVC (`cache/`). After
-each successful build, the code-location pod runs `uv cache prune --ci`:
-only the wheels that uv built from source stay, and pre-built wheels
-download again on the next build. If you build your own runtime image, it
-needs uv 0.10.0 or later (`uv workspace dir`, and a `uv cache prune` that
-waits for the installs of other pods instead of deleting files that they
-use). In fallback
-mode, pods install with `UV_NO_CACHE=1` and keep no cache. The `emptyDir`
-limit (`codeLocation.workspace.sizeLimit` or `spec.git.workspaceSize`)
-must hold the checkout and the venv. During an install, uv's temporary
-copy of the wheels is in the container's `/tmp`, outside this limit, so
-`/tmp` must be writable: a policy that sets `readOnlyRootFilesystem` on
-the pods makes these installs fail.
-
-**Workspace size**: `spec.git.workspaceSize` and the chart's
-`codeLocation.workspace.shared.size` and `codeLocation.workspace.sizeLimit`
-are Kubernetes quantities more than zero, like `10Gi`, `500M` or `1e9`.
-`5GB` is not a quantity: write `5G` (10^9 bytes) or `5Gi` (2^30 bytes).
-The API server and the webhook reject any other `workspaceSize`, and the
-operator does not start with any other chart value. In shared mode, the
-size is the request of the PVC that the operator creates; the operator does
-not resize a PVC that is already there.
-
-**Old trees**: in shared mode, each time a code-location pod starts, it
-deletes old trees from the PVC. It keeps the trees that the CodeLocation
-and its unfinished runs use, the `codeLocation.workspace.keepRevisions`
-newest trees (default 3), and all trees younger than
-`codeLocation.workspace.minTreeAge` (default `1h`). A pod never deletes
-its own tree. Write `minTreeAge` as
-a whole number with `s`, `m` or `h`, for example `90m` or `24h`. The
-operator does not start if it cannot read `minTreeAge` (for example `1d`,
-`1h30m` or `1.5h`) or `keepRevisions`. If the pod cannot read these
-limits, for example because `spec.env` sets
-`RIVERS_WORKSPACE_MIN_AGE_SECONDS` or `RIVERS_WORKSPACE_KEEP_REVISIONS` to
-a value that is not a whole number, it deletes no tree, and its init
-container log gives the reason. Before the pod deletes a tree, it renames
-it to `.deleting-<key>-…`. If the pod stops during a deletion, no part of
-the tree stays under its key, and the next pod start deletes the rest.
-The pod deletes old trees, and prunes the uv cache, in its init container
-after its own tree is ready, so its main container starts only after that.
-On NFS or EFS, the deletion of a tree with many files can take minutes.
-Other pods that wait for the same tree do not wait for the deletion or the
-prune.
-
-**Back to image mode**: when you remove `spec.git`, the operator rolls
-the code-location pods out on `spec.image`. It clears `status.runSource`,
-`resolvedCommit`, `resolvedRef` and `lastFetchedAt`, and new runs get the
-image. If the operator cannot resolve `spec.image`, the CodeLocation is
-`Failed` but keeps these fields, because its pods still run the git
-source. In shared mode, the operator then deletes the workspace PVC and its
-keep ConfigMap, but only when no pod can mount the PVC: every
-code-location pod runs the image, and no `Run` of the CodeLocation has a
-git `spec.source`. A finished run counts too. Its pods stay until you
-delete the `Run`, and Kubernetes does not delete a PVC that a pod mounts.
-Until then, the `WorkspaceKept` condition gives the reason. With reason
-`RunsUseWorkspace`, it names the runs: delete the finished ones to free
-the PVC. The operator checks again every minute. It deletes only a PVC
-and a ConfigMap that the CodeLocation owns, not others with the same
-name. If you add `spec.git` again before the PVC is deleted, the pods use
-it again. If the PVC is being deleted, the operator waits until it is
-gone, and then creates a new one.
-
-**New commits**: the operator fetches the branch or tag from the git host
-about every `pollInterval` (default `5m`, at least `1m`), and a semver-like
-tag, such as `v1.2.3`, only once. `status.lastFetchedAt` is the time of the
-last fetch. CodeLocations with the same url, ref and credentials share their
-fetches. A pinned commit is never fetched and has no `lastFetchedAt`.
-
-**Which commit a run uses**: runs get the last *fully rolled-out* commit.
-After a push, the operator rolls the code-location pods to the new
-commit, but `status.resolvedCommit` moves to it only when every pod runs
-it and is ready. `status.runSource` records that tree's full source (url,
-commit, path, Secret, dependencies, and the runtime image that built it,
-which is also `status.resolvedImage`); it moves with `resolvedCommit`.
-Until then runs keep the previous commit, and if the new commit fails to
-build they keep it until a later commit rolls out. Meanwhile the
-CodeLocation stays `Ready`: the git
-Deployment never takes an old pod down before its replacement is ready, so
-`spec.replicas` pods stay ready throughout (a rollout needs room for one
-extra pod). A `Run` you create yourself without `image` gets this tree:
-the webhook copies `status.runSource` into the run's `spec.source`, and
-its runtime image into `spec.image`. A change of the url, `path`, Secret,
-`dependencies` or runtime image also reaches runs only when its rollout
-finishes. Just after you add `spec.git` to an image-mode CodeLocation,
-`status.runSource` is empty and the webhook rejects such runs; try again
-when the first tree has rolled out.
-A run launched from a code-location pod (UI launches, schedules, sensors,
-backfills) pins the commit that pod serves, so during a rollout each run
-uses the same tree as the pod that launched it. The webhook accepts the
-url and Secret of such a run if they are those of `spec.git`, or, while a
-change of them rolls out, those of `status.runSource`. To wait until a
-push is live:
-`kubectl -n rivers wait rcl/analytics --for=jsonpath='{.status.resolvedCommit}'=<sha>`.
-
-**Other images for run and step pods**: in git mode,
-`RunBackendConfig.kubernetes(image=...)` and
-`Executor.kubernetes(worker_image=...)` replace only the image of the
-main container of run and step pods. These pods still run the tree that
-the runtime image built: the checkout and the venv. The run records that
-image in `spec.source.runtimeImage`, and in fallback mode the init
-container that builds the pod's tree runs it. The main container starts
-`/workspace/venv/bin/rivers`, so its image must have the same Python
-version at the same path as the runtime image: build it `FROM` the
-runtime image. A `Run` you create with a digest `image` and your own
-`spec.source` must set `spec.source.runtimeImage` to a digest in the
-CodeLocation's runtime image repository: that of `spec.image` (or of the
-chart's default runtime image), or, while a change of `spec.image` rolls
-out, that of `status.resolvedImage`. The webhook rejects other images.
-
-**Egress**: in shared mode only the code-location pod needs outbound
-access to the git host and the package index (run/step pods fetch
-nothing); in fallback mode every pod does. Adjust NetworkPolicies
-accordingly. The operator's requests to git hosts and registries carry
-`User-Agent: rivers-operator/<version>`, for firewalls that filter on it.
-
-**When things fail**, `kubectl describe rcl analytics` carries the
-answer: `RefNotFound` / `InvalidRef` / `InvalidUrl` / `GitAuthFailed` /
-`GitHostKeyRejected` / `GitMalformedResponse` on the `SourceResolved`
-condition for resolution problems. If a code-location pod cannot build a
-commit, `status.message` and the end of the `DeploymentAvailable` message
-show the error of the pod's `workspace` init container, after
-`workspace build of main@9f3c1ab failed (Error, exit code 1):`. For an
-error that the init container finds itself, this is its own message: for
-example, a `path` that is not in the repository, a key of the git Secret
-that the pod cannot read, or a build that did not finish within
-`dependencies.timeoutSeconds` (default 600 seconds). If git cannot fetch
-the commit, the message starts with `git fetch of commit <sha> failed:`
-and gives the last lines of git's error: for example
-`Permission denied (publickey)`, `Could not resolve host`, or
-`not our ref` when the repository does not have the commit. For a branch
-or a tag, the init container then fetches the branch or tag and makes sure
-that it points to the commit. If this fetch also fails, the message gives
-its error. For all other errors, such as a failed install, it is the last
-lines of the init container's log, which include the error of `uv`.
-Kubernetes keeps at most 80 lines or 2048 bytes of the log for this
-message; `kubectl -n rivers logs <pod> -c workspace` shows all of it. When
-`SourceResolved` is `False`, `status.message` shows the resolution error
-instead, because the operator cannot get a commit that repairs the build
-until that error clears. A resolution problem sets the phase to
-`Failed`, and new runs are rejected until you fix it. A git host that does not answer
-(connection error, HTTP 5xx, or no complete answer within
-`operator.git.timeoutSeconds`, 30 seconds by default) does not take the
-CodeLocation down: it stays `Ready` on the commit it serves, with
-`SourceResolved` `False`, reason `GitUnreachable`, and the error, also
-in `status.message`. In shared mode, runs keep using that commit's tree. In
-fallback mode, each run pod fetches the commit itself, so a run that
-starts while the host is down fails. The operator asks the host again
-after 1, 2 and 4 minutes, then every 5 minutes, and picks up new commits
-when the host answers. A host that rate-limits the operator (HTTP 429,
-or 503 with `Retry-After`) has the same result, with reason
-`GitRateLimited`. The operator then sends no request to that host, for
-any CodeLocation, until the host's `Retry-After` time is over: at most
-one hour, and not sooner than the steps above. The message gives the
-time of the next request. Before the first commit has rolled out there
-is nothing to serve, and the CodeLocation is `Failed` until the host
-answers.
-
-The registry of the runtime image works the same way. If it does not
-answer (connection error or HTTP 5xx) or rate-limits the operator (HTTP
-429), a CodeLocation that serves a commit stays `Ready` on it, with
-`ImageResolved` `False`, reason `RegistryError` or `RateLimited`, and the
-error, also in `status.message`. The operator asks the registry again
-later, for a 429 when its `Retry-After` time is over. A tag that the
-registry does not have (`TagNotFound`) or a registry login that fails
-(`AuthenticationFailed`) sets the phase to `Failed`.
-
-A rollout shows on the `DeploymentAvailable` condition: reason
-`RollingOut` while it runs, or `ProgressDeadlineExceeded` when it is
-stuck (for example, the new commit fails to install), with a message that
-names the commit being rolled out and the commit runs still use, followed
-by the build error when a pod cannot build that commit.
-
-If the API server refuses an object of a git CodeLocation (its
-Deployment, Service, workspace PVC or keep ConfigMap), for example because
-of a policy, a quota or a value that it does not take, `DeploymentAvailable`
-has reason `ApplyFailed` and the API server's error, after
-`applying Deployment 'analytics' failed:` (or the object that failed). The
-same error is in `status.message`. The pods that run keep running, so a
-CodeLocation that serves a commit stays `Ready` on it and runs keep using
-it. Before the first commit has rolled out there is nothing to serve, and
-the CodeLocation is `Failed`. The operator tries again when you change the
-CodeLocation, else after 5 minutes, or after 1 minute for a server error
-(HTTP 5xx), a conflict or throttling.
+[Git-sourced CodeLocations](git-code-locations.md) covers refs,
+dependencies, credentials, the runtime image, the shared workspace and
+troubleshooting. The [workspace reference](git-workspace-reference.md)
+covers storage, retention and outages.
 
 ## Helm chart customizations
 

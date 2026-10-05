@@ -474,6 +474,9 @@ fn mutate_codelocation_on_create(
     if let Err(message) = validate_git_source(cl, git) {
         return CodeLocationOutcome::Rejected(message);
     }
+    if let Err(message) = validate_replicas(cl.spec.replicas) {
+        return CodeLocationOutcome::Rejected(message);
+    }
 
     let identity = cl.spec.identity.trim();
     if identity.is_empty() {
@@ -491,10 +494,11 @@ fn mutate_codelocation_on_create(
     CodeLocationOutcome::AcceptedAsIs
 }
 
-/// The source rules apply only when `spec.git` or `spec.image` changes, and
-/// not while the object is being deleted: a CodeLocation that predates a
-/// stricter rule still takes other updates, such as labels or the garbage
-/// collector's finalizer removal.
+/// The source rules apply only when `spec.git` or `spec.image` changes, the
+/// replicas bounds only when `spec.replicas` changes, and neither while the
+/// object is being deleted: a CodeLocation that predates a stricter rule
+/// still takes other updates, such as labels or the garbage collector's
+/// finalizer removal.
 fn check_codelocation_update(
     req: &AdmissionRequest<CodeLocation>,
     git: &GitConfig,
@@ -515,6 +519,12 @@ fn check_codelocation_update(
     if source_changed
         && !deleting
         && let Err(message) = validate_git_source(new, git)
+    {
+        return CodeLocationOutcome::Rejected(message);
+    }
+    if new.spec.replicas != old.spec.replicas
+        && !deleting
+        && let Err(message) = validate_replicas(new.spec.replicas)
     {
         return CodeLocationOutcome::Rejected(message);
     }
@@ -550,6 +560,17 @@ fn validate_git_source(cl: &CodeLocation, git_config: &GitConfig) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// Mirrors the CRD schema's `minimum`/`maximum` on `spec.replicas`: code
+/// locations do not scale out yet.
+fn validate_replicas(replicas: i32) -> Result<(), String> {
+    if (0..=1).contains(&replicas) {
+        return Ok(());
+    }
+    Err(format!(
+        "spec.replicas {replicas} must be 0 or 1: code locations do not scale out yet"
+    ))
 }
 
 /// The pods build and run the project at `$SRC/<path>`: `path` names a
@@ -1740,6 +1761,57 @@ mod tests {
         let cl = CodeLocation::new("bare", spec);
         let err = validate_git_source(&cl, &GitConfig::default()).unwrap_err();
         assert!(err.contains("spec.image or spec.git"));
+    }
+
+    fn image_cl(replicas: i32) -> CodeLocation {
+        let spec = serde_json::from_value(serde_json::json!({
+            "image": "ghcr.io/acme/pipeline",
+            "replicas": replicas,
+        }))
+        .unwrap();
+        CodeLocation::new("analytics", spec)
+    }
+
+    #[test]
+    fn cl_create_rejects_replicas_outside_zero_or_one() {
+        for replicas in [2, -1] {
+            let req = cl_admission_request_create("uid-cl-r1", "team-data", &image_cl(replicas));
+            let CodeLocationOutcome::Rejected(err) =
+                mutate_codelocation(&req, &GitConfig::default())
+            else {
+                panic!("replicas {replicas} was admitted");
+            };
+            assert!(
+                err.contains(&format!("spec.replicas {replicas} must be 0 or 1")),
+                "{err}"
+            );
+        }
+        let req = cl_admission_request_create("uid-cl-r0", "team-data", &image_cl(0));
+        assert!(matches!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_rejects_a_replicas_change_above_one() {
+        let req = cl_admission_request_update("uid-cl-r2", "team-data", &image_cl(3), &image_cl(1));
+        assert!(matches!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_of_other_fields_keeps_replicas_that_predate_the_cap() {
+        let old = image_cl(3);
+        let mut new = old.clone();
+        new.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        let req = cl_admission_request_update("uid-cl-r3", "team-data", &new, &old);
+        assert_eq!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::UpdateAllowed
+        );
     }
 
     #[test]

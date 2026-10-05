@@ -30,7 +30,7 @@ spec:
       # nothing.
       mode: auto
   module: analytics.pipeline
-  replicas: 1
+  replicas: 1  # the maximum; code locations do not scale out yet
   # Optional runtime-image override (defaults to the chart's rivers-runtime):
   # image: harbor.acme.internal/rivers/rivers-runtime
   # tag: 0.5.0-py3.11
