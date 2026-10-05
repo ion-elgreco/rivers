@@ -36,6 +36,11 @@ pub fn JobDetailPage() -> impl IntoView {
     let (page, set_page) = signal(0u64);
     let (page_size, set_page_size) = signal(25u64);
     let (refresh_tick, set_refresh_tick) = signal(0u64);
+    let live = use_live_kick(
+        &["runs"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
 
     let jobs = Resource::new(
         move || {
@@ -75,20 +80,15 @@ pub fn JobDetailPage() -> impl IntoView {
     );
 
     let all_assets = Resource::new(
-        move || loc.get(),
-        |(ns, name)| get_assets(ns, name, None, None, None),
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
 
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
 
-    let live_status = use_live_kick(
-        &["runs"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     let (exec_pending, set_exec_pending) = signal(false);
     let (exec_error, set_exec_error) = signal::<Option<String>>(None);
@@ -227,7 +227,7 @@ pub fn JobDetailPage() -> impl IntoView {
             Crumb::new(name()).mono(),
         ]>
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
             {move || exec_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}

@@ -477,12 +477,6 @@ class CodeRepository:
         """Exit context manager — calls :meth:`shutdown`."""
         ...
 
-    def _start_ui_server(
-        self, host: str, port: int, grpc_url: str, synthetic: str | None = None
-    ) -> None:
-        """(Internal) start the in-process UI HTTP server."""
-        ...
-
     def _start_grpc_server(self, host: str, port: int) -> None:
         """(Internal) start the in-process gRPC code-location server."""
         ...

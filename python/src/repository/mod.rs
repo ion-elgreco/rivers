@@ -19,7 +19,6 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 
 use crate::errors::{AssetDefinitionError, ExecutionError, NodeNotFoundError};
-use rivers_core::assets::graph::{GraphTopology, TopologyNode};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::{BackfillFailurePolicy, LaunchedBy, StorageBackend};
 
@@ -462,74 +461,6 @@ impl PyCodeRepository {
             type_hint,
         };
         handler.call_method1(py, "load_input", (ctx,))
-    }
-
-    #[pyo3(signature = (host, port, grpc_url, synthetic=None))]
-    fn _start_ui_server(
-        &self,
-        py: Python,
-        host: String,
-        port: u16,
-        grpc_url: String,
-        synthetic: Option<String>,
-    ) -> PyResult<()> {
-        let storage_arc = Arc::clone(&self.ensure_resolved()?.storage);
-
-        py.detach(|| {
-            let graph = if let Some(ref scale) = synthetic {
-                let n = rivers_ui::synthetic::parse_node_count(scale);
-                let g = rivers_ui::synthetic::generate_synthetic_graph(n);
-                Some(GraphTopology {
-                    nodes: g
-                        .nodes
-                        .into_iter()
-                        .map(|n| TopologyNode {
-                            name: n.name,
-                            kind: n
-                                .kind
-                                .parse()
-                                .expect("synthetic graph produced invalid NodeKind"),
-                            group: n.group,
-                            parent_graph: n.parent_graph,
-                        })
-                        .collect(),
-                    edges: g.edges,
-                })
-            } else {
-                None
-            };
-            let graph = graph.map(Arc::new);
-
-            // Dev mode: synthesize a one-entry registry pointing at the
-            // in-process gRPC backend. In a real cluster this list comes from
-            // the operator's `CodeLocationRegistry`; here we have no
-            // operator, so the UI sees a single location named "default" in
-            // namespace "dev".
-            let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
-            let registry =
-                rivers_ui::code_location_registry::Registry::dev_single(grpc_url, module);
-
-            // Post-drain shutdown token: UI stays alive during drain so /readyz is reachable.
-            let shutdown = crate::shutdown::shutdown_token().child_token();
-            let handle = rt().spawn(async move {
-                let auth = match rivers_ui::auth::AuthRuntime::from_env().await {
-                    Ok(auth) => auth,
-                    Err(e) => {
-                        tracing::error!(target: "rivers::auth", error = %e, "invalid RIVERS_AUTH_* configuration; UI not started");
-                        return;
-                    }
-                };
-                if let Err(e) =
-                    rivers_ui::start_server(storage_arc, graph, host, port, registry, auth, shutdown)
-                        .await
-                {
-                    tracing::error!(target: "rivers::ui", error = %e, "UI server error");
-                }
-            });
-            crate::shutdown::register_ui_handle(handle);
-        });
-
-        Ok(())
     }
 
     // ── Backfill API ──

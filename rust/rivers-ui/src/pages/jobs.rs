@@ -32,11 +32,16 @@ use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunRecord};
 #[component]
 pub fn JobsListPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["runs"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let loc = use_current_location();
 
     let jobs = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_jobs(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_jobs(ns, name).await },
     );
 
     // Scoped by the already-resolved job names from `jobs`, so a live kick only
@@ -59,15 +64,10 @@ pub fn JobsListPage() -> impl IntoView {
     );
 
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
 
-    let live_status = use_live_kick(
-        &["runs"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     let navigate = leptos_router::hooks::use_navigate();
 
@@ -110,7 +110,7 @@ pub fn JobsListPage() -> impl IntoView {
             }
         >
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

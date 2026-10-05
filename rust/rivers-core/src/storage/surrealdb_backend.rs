@@ -359,21 +359,20 @@ impl SurrealStorage {
         Ok(storage)
     }
 
-    /// Subscribe to change notifications on an arbitrary table via a SurrealDB LIVE query.
-    pub async fn subscribe_table(
-        &self,
-        table: &str,
-    ) -> Result<futures_util::stream::BoxStream<'static, ()>> {
+    /// Subscribe to change notifications on `table` via a SurrealDB LIVE
+    /// query. Each change yields `()`; only the record id travels with it.
+    pub async fn subscribe_table(&self, table: &str) -> Result<LiveTable> {
         use futures_util::StreamExt;
         use std::sync::Arc;
-        use surrealdb::types::{Action, Object};
-        let stream = self
-            .db
-            .select::<Vec<Object>>(table.to_string())
-            .live()
-            .await?;
+        use surrealdb::Notification;
+        use surrealdb::types::{Action, Uuid, Value};
+        let mut response = self.db.query(format!("LIVE SELECT id FROM {table}")).await?;
+        let id = response
+            .take::<Option<Uuid>>(0)?
+            .context("LIVE SELECT returned no query id")?;
+        let stream = response.stream::<Notification<Value>>(0)?;
         let table_owned: Arc<str> = Arc::from(table);
-        Ok(stream
+        let changes = stream
             .filter_map(move |result| {
                 let table = Arc::clone(&table_owned);
                 async move {
@@ -395,7 +394,54 @@ impl SurrealStorage {
                     }
                 }
             })
-            .boxed())
+            .boxed();
+        Ok(LiveTable {
+            changes,
+            db: self.db.clone(),
+            id,
+        })
+    }
+}
+
+/// A table's live query. [`LiveTable::close`] ends it on the session that
+/// created it. The SDK's own kill on drop runs from a session that never
+/// selected a namespace, fails, and leaves the query to the server for as
+/// long as the connection lives.
+pub struct LiveTable {
+    changes: futures_util::stream::BoxStream<'static, ()>,
+    db: Surreal<Any>,
+    id: surrealdb::types::Uuid,
+}
+
+impl LiveTable {
+    /// Kill the query, then let the stream run to its `Killed` notification
+    /// so the SDK side drops quietly; past the budget it drops as is.
+    pub async fn close(mut self) {
+        use futures_util::StreamExt;
+        let killed = self
+            .db
+            .query("KILL $id")
+            .bind(("id", self.id))
+            .await
+            .and_then(|response| response.check());
+        if let Err(e) = killed {
+            tracing::debug!(target: "rivers::storage", id = %self.id, error = %e, "live query kill failed");
+        }
+        let drained = async {
+            while self.changes.next().await.is_some() {}
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drained).await;
+    }
+}
+
+impl futures_util::Stream for LiveTable {
+    type Item = ();
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<()>> {
+        self.get_mut().changes.as_mut().poll_next(cx)
     }
 }
 

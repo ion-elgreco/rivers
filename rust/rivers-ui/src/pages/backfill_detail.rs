@@ -97,7 +97,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
     let rerun_armed = crate::helpers::use_confirm_armed(move || params.track());
     let navigate = leptos_router::hooks::use_navigate();
 
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["backfills", "runs"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -115,7 +115,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
                     Crumb::new(short_id(&id, 8)).mono().copyable(id.clone()),
                 ]>
                     <LiveStatusChip
-                        status=live_status
+                        status=live.status
                         on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
                     />
                     {move || action_error.get().map(|msg| view! { <span class="text-error">{msg}</span> })}

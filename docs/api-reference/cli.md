@@ -52,7 +52,19 @@ rivers dev my_pipeline \
   --storage-path .rivers/storage/
 ```
 
-Resolves the repository, then starts the gRPC backend, the web UI, and (unless `--no-daemon`) the automation daemon. Tears down storage on exit.
+Serves the embedded storage and the web UI from this process, and runs the code location (the gRPC backend and, unless `--no-daemon`, the automation daemon) in a child process. Tears down storage on exit.
+
+### Reloading code
+
+A reload replaces the code location with a fresh interpreter, so every edit is picked up: new or renamed assets, changed dependencies, new imports, edited helper modules. Storage, the UI server and open browser tabs stay up; the tabs refetch definitions once the new code location is serving.
+
+The previous code location retires first: it stops scheduling and releases its gRPC port, and the new one starts as soon as the port is free, so two daemons never run at the same time. Runs that were in flight finish in the background with no time limit, and the retired process exits on its own; the console prints `Generation N finished.` Queued runs wait in storage for the new code location. Stopping `rivers dev` with Ctrl-C stops every generation, including those still finishing runs, with the usual 30 s cap.
+
+Press **Reload code location** in the sidebar of the UI.
+
+A code location that does not come back (a syntax error, a failed import, a failed resolve) does not end the session: the error shows in the console and under the reload button, and the next reload tries again. Only a code location that fails on the first start ends `rivers dev`.
+
+The embedded storage is served on an ephemeral loopback port. With `--surreal-endpoint`, the UI and the code location connect to that server instead and nothing is served locally.
 
 Every flag (and the module argument) can also come from configuration, with CLI flags taking precedence: `RIVERS_<GROUP>_<KEY>` environment variables (e.g. `RIVERS_SERVER_PORT`, `RIVERS_MODULE_PATH`), then the `[module]`/`[server]`/`[storage]`/`[daemon]` tables in `rivers.toml`, then `[tool.rivers.*]` in `pyproject.toml` — both files found by walking up from the current directory.
 
@@ -77,7 +89,7 @@ rivers serve my_pipeline \
   --surreal-endpoint $RIVERS_SURREAL_ENDPOINT
 ```
 
-Connects to a remote SurrealDB instance, starts the gRPC backend and web UI, and runs the automation daemon. Designed to run inside a code-location pod.
+Connects to a remote SurrealDB instance, starts the gRPC backend, and runs the automation daemon. Designed to run inside a code-location pod.
 
 `--surreal-endpoint` may also be set via the `RIVERS_SURREAL_ENDPOINT` env var.
 

@@ -37,10 +37,9 @@ pub fn shutdown_token() -> &'static CancellationToken {
 enum Service {
     Daemon = 0,
     Grpc = 1,
-    Ui = 2,
 }
 
-const SERVICE_NAMES: [&str; 3] = ["daemon", "grpc", "ui"];
+const SERVICE_NAMES: [&str; 2] = ["daemon", "grpc"];
 
 enum ServiceHandle {
     Tokio(tokio::task::JoinHandle<()>),
@@ -52,43 +51,46 @@ struct Slot {
     /// Cancels the previous instance when a new registration replaces it,
     /// so we don't leak its runtime / thread / bound sockets while waiting
     /// for the next graceful shutdown.
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
+    /// Daemon only: cancelled once every loop has exited and nothing
+    /// dispatches any more, while its in-flight runs still drain.
+    scheduling_stopped: Option<CancellationToken>,
 }
 
-static SLOTS: Mutex<[Option<Slot>; 3]> = Mutex::new([const { None }; 3]);
+static SLOTS: Mutex<[Option<Slot>; 2]> = Mutex::new([const { None }; 2]);
 
-fn replace_handle(svc: Service, handle: ServiceHandle, cancel: Option<CancellationToken>) {
-    let prev = SLOTS.lock().unwrap()[svc as usize].replace(Slot { handle, cancel });
-    let Some(Slot { handle, cancel }) = prev else {
-        return;
-    };
-    if let Some(token) = cancel {
+fn replace_handle(svc: Service, slot: Slot) {
+    if let Some(prev) = SLOTS.lock().unwrap()[svc as usize].replace(slot) {
         // Cooperative shutdown: the task observes the cancel token and
-        // drains itself gracefully (subdaemons join, Arc<SurrealStorage>
-        // clones drop)
-        token.cancel();
-        drop(handle);
-        return;
-    }
-    // No cancel token: abort the tokio task. Threads are left to the OS
-    // (tonic's graceful shutdown can wait many seconds for stale client
-    // connections, and we don't want the new instance to block on that).
-    match handle {
-        ServiceHandle::Thread(_) => {}
-        ServiceHandle::Tokio(j) => j.abort(),
+        // drains itself (subdaemons join, Arc<SurrealStorage> clones drop).
+        prev.cancel.cancel();
     }
 }
 
-pub fn register_daemon_handle(h: tokio::task::JoinHandle<()>, cancel: CancellationToken) {
-    replace_handle(Service::Daemon, ServiceHandle::Tokio(h), Some(cancel));
+pub fn register_daemon_handle(
+    h: tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
+    scheduling_stopped: CancellationToken,
+) {
+    replace_handle(
+        Service::Daemon,
+        Slot {
+            handle: ServiceHandle::Tokio(h),
+            cancel,
+            scheduling_stopped: Some(scheduling_stopped),
+        },
+    );
 }
 
 pub fn register_grpc_handle(h: std::thread::JoinHandle<()>, cancel: CancellationToken) {
-    replace_handle(Service::Grpc, ServiceHandle::Thread(h), Some(cancel));
-}
-
-pub fn register_ui_handle(h: tokio::task::JoinHandle<()>) {
-    replace_handle(Service::Ui, ServiceHandle::Tokio(h), None);
+    replace_handle(
+        Service::Grpc,
+        Slot {
+            handle: ServiceHandle::Thread(h),
+            cancel,
+            scheduling_stopped: None,
+        },
+    );
 }
 
 /// Stop the running gRPC server (if any): cancel its token and join its thread,
@@ -97,12 +99,10 @@ pub fn register_ui_handle(h: tokio::task::JoinHandle<()>) {
 /// `shutdown_token` + `drain_service(Grpc)`.
 pub fn stop_grpc() {
     let slot = SLOTS.lock().unwrap()[Service::Grpc as usize].take();
-    let Some(Slot { handle, cancel }) = slot else {
+    let Some(Slot { handle, cancel, .. }) = slot else {
         return;
     };
-    if let Some(token) = cancel {
-        token.cancel();
-    }
+    cancel.cancel();
     if let ServiceHandle::Thread(j) = handle {
         let _ = j.join();
     }
@@ -112,6 +112,9 @@ pub fn stop_grpc() {
 
 static SIGNAL_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// The first terminate signal starts the drain. Every further signal
+/// escalates: the one that finds the 30s cap unarmed arms it, the next
+/// force-exits.
 fn install_signal_handler() -> std::io::Result<()> {
     if SIGNAL_HANDLER_INSTALLED.load(Relaxed) {
         return Ok(());
@@ -137,24 +140,29 @@ fn install_signal_handler() -> std::io::Result<()> {
 
         drain.cancel();
 
-        // Second signal → force exit
-        signals.recv().await;
-        tracing::warn!(target: "rivers::shutdown", "second signal received, force exiting");
-        std::process::exit(1);
+        loop {
+            signals.recv().await;
+            if arm_watchdog() {
+                tracing::warn!(target: "rivers::shutdown", "second signal received, capping the drain at 30s");
+            } else {
+                tracing::warn!(target: "rivers::shutdown", "repeated signal received, force exiting");
+                std::process::exit(1);
+            }
+        }
     });
 
     Ok(())
 }
 
 #[cfg(unix)]
-struct TerminateSignals {
+pub(crate) struct TerminateSignals {
     sigterm: tokio::signal::unix::Signal,
     sigint: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
 impl TerminateSignals {
-    fn try_new() -> std::io::Result<Self> {
+    pub(crate) fn try_new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             sigterm: signal(SignalKind::terminate())?,
@@ -162,7 +170,7 @@ impl TerminateSignals {
         })
     }
 
-    async fn recv(&mut self) -> &'static str {
+    pub(crate) async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.sigterm.recv() => "SIGTERM",
             _ = self.sigint.recv() => "SIGINT",
@@ -171,7 +179,7 @@ impl TerminateSignals {
 }
 
 #[cfg(windows)]
-struct TerminateSignals {
+pub(crate) struct TerminateSignals {
     ctrl_c: tokio::signal::windows::CtrlC,
     ctrl_break: tokio::signal::windows::CtrlBreak,
     ctrl_close: tokio::signal::windows::CtrlClose,
@@ -180,7 +188,7 @@ struct TerminateSignals {
 
 #[cfg(windows)]
 impl TerminateSignals {
-    fn try_new() -> std::io::Result<Self> {
+    pub(crate) fn try_new() -> std::io::Result<Self> {
         use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
         Ok(Self {
             ctrl_c: ctrl_c()?,
@@ -190,7 +198,7 @@ impl TerminateSignals {
         })
     }
 
-    async fn recv(&mut self) -> &'static str {
+    pub(crate) async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.ctrl_c.recv() => "CTRL_C",
             _ = self.ctrl_break.recv() => "CTRL_BREAK",
@@ -206,11 +214,7 @@ impl TerminateSignals {
 const NOT_STARTED: u8 = 0;
 const WAITING: u8 = 1;
 const DONE: u8 = 2;
-static STATES: [AtomicU8; 3] = [
-    AtomicU8::new(NOT_STARTED),
-    AtomicU8::new(NOT_STARTED),
-    AtomicU8::new(NOT_STARTED),
-];
+static STATES: [AtomicU8; 2] = [AtomicU8::new(NOT_STARTED), AtomicU8::new(NOT_STARTED)];
 
 async fn drain_service(svc: Service) {
     let idx = svc as usize;
@@ -235,12 +239,16 @@ async fn drain_service(svc: Service) {
     tracing::info!(target: "rivers::shutdown", service = SERVICE_NAMES[idx], "drained");
 }
 
-async fn run_shutdown() {
-    drain_token().cancelled().await;
-    tracing::info!(target: "rivers::shutdown", "drain signal received, starting graceful shutdown");
+static WATCHDOG: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 
-    // Watchdog starts after drain fires — not before, to avoid killing an idle process
-    let watchdog = tokio::spawn(async {
+/// Force-exit in 30s unless shutdown completes first; `false` when it was
+/// already armed. Armed only after the drain fires, never on an idle process.
+fn arm_watchdog() -> bool {
+    let mut slot = WATCHDOG.lock().unwrap();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(rt().spawn(async {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let blocking: Vec<&str> = SERVICE_NAMES
             .iter()
@@ -259,20 +267,50 @@ async fn run_shutdown() {
             "shutdown timed out after 30s, force exiting",
         );
         std::process::exit(1);
-    });
+    }));
+    true
+}
+
+/// Resolves once the daemon stopped scheduling; at once when no daemon is
+/// registered.
+async fn daemon_stopped_scheduling() {
+    let scheduling_stopped = SLOTS.lock().unwrap()[Service::Daemon as usize]
+        .as_ref()
+        .and_then(|slot| slot.scheduling_stopped.clone());
+    if let Some(token) = scheduling_stopped {
+        STATES[Service::Daemon as usize].store(WAITING, Relaxed);
+        token.cancelled().await;
+        tracing::info!(target: "rivers::shutdown", "daemon stopped scheduling");
+    }
+}
+
+/// Once the drain fires, stop the services. In retire mode they stop as soon
+/// as the daemon cannot dispatch any more, so the gRPC port is free while this
+/// process still drains its runs, and the 30s cap waits for a second signal.
+/// Otherwise the daemon drains first, under the cap.
+async fn run_shutdown(retire: bool) {
+    drain_token().cancelled().await;
+    tracing::info!(target: "rivers::shutdown", "drain signal received, starting graceful shutdown");
 
     // Phase 1: drain_token is already cancelled, so:
     //   - gRPC health is NOT_SERVING (LB removes pod)
     //   - daemon sees child token cancelled, stops scheduling, drains evals
-    drain_service(Service::Daemon).await;
+    if retire {
+        daemon_stopped_scheduling().await;
+    } else {
+        arm_watchdog();
+        drain_service(Service::Daemon).await;
+    }
 
     // Phase 2: stop servers. Each subsystem self-drains its in-flight runs
     // before its handle resolves (daemon in `daemon_main_loop`, gRPC in its
     // serve thread), so there's no separate pool to drain here.
     shutdown_token().cancel();
-    tokio::join!(drain_service(Service::Grpc), drain_service(Service::Ui));
+    tokio::join!(drain_service(Service::Daemon), drain_service(Service::Grpc));
 
-    watchdog.abort();
+    if let Some(watchdog) = WATCHDOG.lock().unwrap().take() {
+        watchdog.abort();
+    }
     tracing::info!(target: "rivers::shutdown", "shutdown complete");
 }
 
@@ -285,12 +323,16 @@ pub fn py_install_signal_handler() -> PyResult<()> {
     Ok(())
 }
 
+/// Block until graceful shutdown completes. With `retire`, the first terminate
+/// signal stops scheduling and releases the gRPC port once the daemon loops
+/// have exited, while in-flight runs drain without the 30s cap; a second
+/// signal arms the cap, a third force-exits.
 #[pyfunction]
-#[pyo3(name = "wait_for_exit")]
-pub fn py_wait_for_exit(py: Python<'_>) -> PyResult<()> {
+#[pyo3(name = "wait_for_exit", signature = (retire = false))]
+pub fn py_wait_for_exit(py: Python<'_>, retire: bool) -> PyResult<()> {
     install_signal_handler()?;
     py.detach(|| {
-        rt().block_on(run_shutdown());
+        rt().block_on(run_shutdown(retire));
     });
     Ok(())
 }

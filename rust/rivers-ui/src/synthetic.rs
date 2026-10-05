@@ -95,3 +95,26 @@ pub fn generate_synthetic_graph(target_nodes: usize) -> GraphTopology {
 
     GraphTopology { nodes, edges }
 }
+
+/// The synthetic topology of `scale` nodes as the core type the servers
+/// pre-load in place of storage.
+#[cfg(feature = "ssr")]
+pub fn core_topology(scale: &str) -> rivers_core::assets::graph::GraphTopology {
+    let g = generate_synthetic_graph(parse_node_count(scale));
+    rivers_core::assets::graph::GraphTopology {
+        nodes: g
+            .nodes
+            .into_iter()
+            .map(|n| rivers_core::assets::graph::TopologyNode {
+                name: n.name,
+                kind: n
+                    .kind
+                    .parse()
+                    .expect("synthetic graph produced invalid NodeKind"),
+                group: n.group,
+                parent_graph: n.parent_graph,
+            })
+            .collect(),
+        edges: g.edges,
+    }
+}

@@ -248,7 +248,7 @@ _k8s-compile: wasm _k8s-wheel
 
 # Cross-compile just the Python wheel for Linux
 _k8s-wheel:
-    cd python && CARGO_TARGET_DIR='{{ justfile_directory() }}/target/maturin' VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin build --target {{ linux_target }} --zig --out ../dist
+    cd python && CARGO_TARGET_DIR='{{ justfile_directory() }}/target/maturin' VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin build --target {{ linux_target }} --zig --no-default-features --out ../dist
 
 # Create k3d cluster, build images, deploy with Helm
 k8s-up: k8s-build

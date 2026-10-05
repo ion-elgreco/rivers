@@ -92,7 +92,7 @@ pub fn BackfillsListPage() -> impl IntoView {
         |_| async move { get_backfills_summary().await },
     );
 
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["backfills"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -135,7 +135,7 @@ pub fn BackfillsListPage() -> impl IntoView {
             }
         >
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| reload.run(()))
             />
         </Topbar>

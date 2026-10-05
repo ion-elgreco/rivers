@@ -851,12 +851,142 @@ class DynamicOutput:
     def value(self) -> Any: ...
     def __init__(self, key: str, value: Any) -> None: ...
 
+class DevHost:
+    """Host side of ``rivers dev``: the embedded storage server, the web UI, and
+    the supervisor of the code-location child process.
+
+    Example::
+
+        host = DevHost(".rivers/storage/")
+        storage = Storage.connect(host.endpoint)
+        host.start_code_location(sys.executable, "pipeline", "repo", "127.0.0.1", 3001, False)
+        host.start_ui(storage, "127.0.0.1", 3000, "http://127.0.0.1:3001")
+        host.run()  # until Ctrl-C; the UI reloads the code location
+        host.stop_code_location()
+        host.stop()
+    """
+
+    def __init__(
+        self, storage_path: str | None = None, endpoint: str | None = None
+    ) -> None:
+        """Start the host.
+
+        Args:
+            storage_path: Directory of the embedded RocksDB store, served on a
+                loopback ``ws://`` port for the UI and the code location.
+            endpoint: An external SurrealDB server to use instead; nothing is
+                served then, and ``storage_path`` is ignored.
+
+        Raises:
+            ValueError: Neither a storage path nor an endpoint was given.
+            RuntimeError: The embedded server did not start, or this build of
+                rivers has no embedded server.
+        """
+        ...
+
+    @property
+    def endpoint(self) -> str:
+        """The SurrealDB endpoint of this session: the embedded server's
+        ``ws://127.0.0.1:<port>``, or the external one."""
+        ...
+
+    def start_code_location(
+        self,
+        python: str,
+        module: str,
+        repo_var: str,
+        host: str,
+        grpc_port: int,
+        no_daemon: bool,
+    ) -> bool:
+        """Start the first generation of the code location and wait until it serves.
+
+        The child runs :func:`serve_dev_code_location` under ``python -c`` in
+        its own session, so the terminal's Ctrl-C reaches only the host.
+
+        Args:
+            python: Interpreter to run the child with, usually ``sys.executable``.
+            module: Python module path containing the ``CodeRepository``.
+            repo_var: Variable name of the ``CodeRepository`` in ``module``.
+            host: gRPC bind host.
+            grpc_port: gRPC port; every generation binds this port in turn.
+            no_daemon: Disable the automation daemon in the child.
+
+        Returns:
+            bool: ``False`` when it did not come up (the reason is printed to
+            stderr).
+        """
+        ...
+
+    def start_ui(
+        self,
+        storage: Storage,
+        host: str,
+        port: int,
+        grpc_url: str,
+        synthetic: str | None = None,
+    ) -> None:
+        """Start the web UI in this process.
+
+        Args:
+            storage: The connection the UI reads from.
+            host: Bind host.
+            port: Bind port; the next free one of the following 99 is used
+                when it is taken.
+            grpc_url: The code location's gRPC endpoint.
+            synthetic: Replace the graph with a synthetic DAG of this size.
+        """
+        ...
+
+    def run(self) -> None:
+        """Supervise the code location until a terminate signal.
+
+        A reload request from the UI retires the running generation (it stops
+        scheduling, releases the gRPC port and finishes its runs in the
+        background) and starts a fresh one once the port is free. Retired
+        generations are reaped as they exit. A hangup stops the host like
+        Ctrl-C does.
+        """
+        ...
+
+    def stop_code_location(self) -> None:
+        """Stop every generation: terminate all, wait up to 30 s, kill the rest.
+
+        A further terminate signal during the wait kills them at once.
+        """
+        ...
+
+    def stop_ui(self) -> None:
+        """Stop the web UI; a no-op without one."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the web UI, then the embedded storage server. Idempotent."""
+        ...
+
 def install_signal_handler() -> None:
     """Install Rust-side SIGTERM/SIGINT handler for graceful two-phase shutdown."""
     ...
 
-def wait_for_exit() -> None:
-    """Block until graceful shutdown completes (drain → shutdown → exit)."""
+def wait_for_exit(retire: bool = False) -> None:
+    """Block until graceful shutdown completes (drain → shutdown → exit).
+
+    With ``retire``, the first terminate signal stops scheduling, releases the
+    gRPC port once the daemon loops have exited, and drains in-flight runs
+    without the 30 s cap. A second signal arms the cap; a third forces exit.
+    """
+    ...
+
+def serve_dev_code_location() -> None:
+    """Entry of the code location that ``rivers dev`` runs in a child process.
+
+    The dev host starts it as ``python -c "import rivers._core as c;
+    c.serve_dev_code_location()"`` with the module, repository variable, bind
+    host, gRPC port, storage endpoint and daemon switch in ``RIVERS_*``
+    environment variables. It imports the module, resolves it against the
+    host's storage, serves gRPC and runs the daemon, and retires on the first
+    terminate signal.
+    """
     ...
 
 def runtime_info() -> dict[str, int]:
@@ -876,6 +1006,7 @@ __all__ = [
     "BashTask",
     "Compute",
     "ComputeEscalation",
+    "DevHost",
     "FailureReason",
     "InputContext",
     "InvokedNodeOutput",

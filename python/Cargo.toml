@@ -40,7 +40,7 @@ rustls-native-certs = "0.8"
 tracing-opentelemetry = "0.32"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "signal"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "signal", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
@@ -54,9 +54,24 @@ rivers-k8s = { path = "../rust/rivers-k8s" }
 # them where needed).
 kube-client.workspace = true
 k8s-openapi.workspace = true
+# Embedded SurrealDB server behind `rivers dev`. Pinned exactly: SurrealDB
+# calls this crate's API unstable.
+surrealdb-server = { version = "=3.3.0", default-features = false, features = ["storage-rocksdb"], optional = true }
+axum = { workspace = true, optional = true }
+
+[features]
+default = ["dev-server"]
+# The embedded storage server of `rivers dev`; left out of the code-location pod image.
+dev-server = ["dep:surrealdb-server", "dep:axum"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29.3"

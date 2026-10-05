@@ -6,6 +6,7 @@ use leptos_router::hooks::use_location;
 use crate::components::global_search::GlobalSearch;
 use crate::components::location_switcher::LocationSwitcher;
 use crate::loc::{loc_path, use_current_location};
+use crate::server_fns::dev::{get_dev_reload_state, reload_code_location};
 use crate::server_fns::locations::list_code_locations;
 use crate::server_fns::user::get_current_user;
 
@@ -87,6 +88,9 @@ const ICON_POOLS: &str = r#"<rect x="3" y="4" width="18" height="5" rx="1"/><rec
 const ICON_QUEUE: &str = r#"<circle cx="6" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="2" fill="currentColor" stroke="none"/>"#;
 const ICON_DEPLOYMENT: &str = r#"<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="10" x2="20" y2="10"/><circle cx="8" cy="7" r="1"/><circle cx="12" cy="7" r="1"/>"#;
 
+const ICON_RELOAD: &str =
+    r#"<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>"#;
+
 const ICON_SEARCH: &str =
     r#"<circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>"#;
 
@@ -160,6 +164,55 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
     }
 }
 
+/// Under `rivers dev`, restarts the code location in a fresh interpreter so
+/// edits take effect. Rendered only when the host can reload.
+#[component]
+fn ReloadLocationButton(collapsed: Signal<bool>) -> impl IntoView {
+    let state = Resource::new(|| (), |_| get_dev_reload_state());
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+
+    let start = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        leptos::task::spawn_local(async move {
+            let verdict = reload_code_location().await;
+            busy.set(false);
+            error.set(verdict.err().map(|e| crate::helpers::err_text(&e)));
+        });
+    };
+
+    view! {
+        <Transition fallback=|| ()>
+            {move || state.get().and_then(|r| r.ok()).filter(|s| s.enabled).map(|_| view! {
+                <button
+                    class="locations-reload"
+                    title="Restart the code location to pick up edits"
+                    disabled=move || busy.get()
+                    on:click=start
+                >
+                    <span
+                        class="nav-icon locations-reload-icon"
+                        class:locations-reload-icon--busy=move || busy.get()
+                        inner_html=nav_svg(ICON_RELOAD)
+                    ></span>
+                    <span class="nav-label" class:nav-label--hidden=move || collapsed.get()>
+                        {move || if busy.get() { "Reloading…" } else { "Reload code location" }}
+                    </span>
+                </button>
+                {move || error.get().map(|msg| view! {
+                    <div class="locations-reload-error" class:nav-label--hidden=move || collapsed.get()>
+                        {msg}
+                    </div>
+                })}
+            })}
+        </Transition>
+    }
+}
+
 #[component]
 pub fn Shell(children: Children) -> impl IntoView {
     let collapsed = RwSignal::new(false);
@@ -202,6 +255,7 @@ pub fn Shell(children: Children) -> impl IntoView {
                             }.into_any(),
                         })}
                     </Transition>
+                    <ReloadLocationButton collapsed=collapsed_signal/>
                 </div>
 
                 <div class="sidebar-nav">

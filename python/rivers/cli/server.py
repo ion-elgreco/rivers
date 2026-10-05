@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import importlib.util
 import os
 import sys
 
@@ -36,10 +37,12 @@ def dev(
         None, help="Override graph with synthetic DAG (e.g. 100, 1k, 10k, 50k)"
     ),
 ) -> None:
-    """Start rivers development UI.
+    """Start the rivers development server.
 
-    Resolves the repository (registering assets and graph topology in storage),
-    then starts the gRPC backend and web UI servers in-process.
+    Serves the embedded storage and the web UI from this process, and runs the
+    code location (gRPC backend and automation daemon) in a child process. A
+    reload restarts that child in a fresh interpreter, so every edit is picked
+    up: press the reload button in the UI.
     """
     cfg = RiversConfig.from_cli(
         module=module,
@@ -56,8 +59,6 @@ def dev(
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
     if cfg.module.path:
         os.environ["RIVERS_MODULE"] = cfg.module.path
-    if cfg.storage.endpoint:
-        os.environ["RIVERS_SURREAL_ENDPOINT"] = cfg.storage.endpoint
 
     if cfg.module.path is None:
         typer.echo(
@@ -67,75 +68,62 @@ def dev(
         )
         raise typer.Exit(1)
 
-    # Import user module and resolve repository before opening storage —
-    # otherwise a bad module name strands a RocksDB-locked dir on disk.
+    # The child imports the module; this only fails fast on a bad name.
     # Absolute cwd, not "." — the "." finder caches listings across chdirs.
     sys.path.insert(0, os.getcwd())
-    try:
-        mod = importlib.import_module(cfg.module.path)
-    except ModuleNotFoundError:
+    if not _module_exists(cfg.module.path):
         typer.echo(f"Error: module '{cfg.module.path}' not found", err=True)
         raise typer.Exit(1)
 
-    repo_obj = getattr(mod, cfg.module.repo_var, None)
-    if repo_obj is None:
-        typer.echo(
-            f"Error: '{cfg.module.repo_var}' not found in module '{cfg.module.path}'",
-            err=True,
-        )
-        raise typer.Exit(1)
+    _serve_dev(cfg, cfg.module.path)
 
-    from rivers import CodeRepository
 
-    if not isinstance(repo_obj, CodeRepository):
-        typer.echo(f"Error: '{cfg.module.repo_var}' is not a CodeRepository", err=True)
-        raise typer.Exit(1)
+def _module_exists(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
-    storage_endpoint = cfg.storage.endpoint
 
-    if storage_endpoint is not None:
-        storage = _open_or_prompt_migrate(
-            lambda: Storage.connect(storage_endpoint),
-            lambda: Storage.migrate_remote(storage_endpoint),
-        )
-    else:
-        storage = _open_or_prompt_migrate(
-            lambda: Storage.embedded(cfg.storage.path),
-            lambda: Storage.migrate_embedded(cfg.storage.path),
-        )
+def _serve_dev(cfg: RiversConfig, module: str) -> None:
+    """Run the dev host: storage server, web UI, and the supervised code location."""
+    from rivers._core import DevHost
+
+    host = DevHost(cfg.storage.path, cfg.storage.endpoint)
+    os.environ["RIVERS_SURREAL_ENDPOINT"] = host.endpoint
+    if cfg.storage.endpoint is None:
         atexit.register(_cleanup_storage, cfg.storage.path)
 
-    repo_obj.resolve(storage=storage)
-
-    _serve_dev(cfg, repo_obj, storage)
-
-
-def _serve_dev(cfg: RiversConfig, repo_obj, storage) -> None:
-    """Start the gRPC backend, web UI, and automation daemon, then block."""
-    # Start gRPC backend server (returns actual port, may differ if requested was in use)
-    actual_grpc_port = repo_obj._start_grpc_server(
-        cfg.server.host, cfg.server.grpc_port
-    )
-
-    # Start UI server in-process (shares same storage, no lock conflict)
-    grpc_url = f"http://{cfg.server.host}:{actual_grpc_port}"
-    repo_obj._start_ui_server(
-        cfg.server.host,
-        cfg.server.port,
-        grpc_url,
-        synthetic=cfg.synthetic.size,
-    )
-
-    # Start automation daemon (schedules + sensors)
-    if not cfg.daemon.no_daemon:
-        from rivers._core import AutomationDaemon
-
-        daemon = AutomationDaemon(repo=repo_obj, storage=storage)
-        daemon.start()
-
-    from rivers._core import wait_for_exit
-
-    wait_for_exit()
+    storage = None
+    try:
+        storage = _open_or_prompt_migrate(
+            lambda: Storage.connect(host.endpoint),
+            lambda: Storage.migrate_remote(host.endpoint),
+        )
+        if not host.start_code_location(
+            sys.executable,
+            module,
+            cfg.module.repo_var,
+            cfg.server.host,
+            cfg.server.grpc_port,
+            cfg.daemon.no_daemon,
+        ):
+            raise typer.Exit(1)
+        host.start_ui(
+            storage,
+            cfg.server.host,
+            cfg.server.port,
+            f"http://{cfg.server.host}:{cfg.server.grpc_port}",
+            cfg.synthetic.size,
+        )
+        typer.echo(f"Code location {module} is up; reload it from the UI.")
+        host.run()
+    finally:
+        host.stop_code_location()
+        host.stop_ui()
+        # This process's client closes before the server it talks to.
+        storage = None
+        host.stop()
 
 
 @app.command()
@@ -155,8 +143,8 @@ def serve(
 ) -> None:
     """Start rivers code location server for Kubernetes deployment.
 
-    Connects to a remote SurrealDB instance, starts the gRPC backend and web UI,
-    and runs the automation daemon. Designed to run inside a K8s code-location pod.
+    Connects to a remote SurrealDB instance, starts the gRPC backend, and runs
+    the automation daemon. Designed to run inside a K8s code-location pod.
     """
     os.environ["RIVERS_MODULE"] = module
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
@@ -165,6 +153,14 @@ def serve(
     storage = Storage.connect(surreal_endpoint)
 
     sys.path.insert(0, ".")
+    repo_obj = _import_repo(module, repo_var)
+    repo_obj.resolve(storage=storage)
+
+    _serve_code_location(repo_obj, storage, host, grpc_port, no_daemon)
+
+
+def _import_repo(module: str, repo_var: str):
+    """Import ``module`` and return its ``CodeRepository``, or exit with the reason."""
     try:
         mod = importlib.import_module(module)
     except ModuleNotFoundError:
@@ -181,10 +177,29 @@ def serve(
     if not isinstance(repo_obj, CodeRepository):
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
+    return repo_obj
 
-    repo_obj.resolve(storage=storage)
 
-    repo_obj._start_grpc_server(host, grpc_port)
+def _serve_code_location(
+    repo_obj,
+    storage,
+    host: str,
+    grpc_port: int,
+    no_daemon: bool,
+    retire: bool = False,
+) -> None:
+    """Start the gRPC backend and the automation daemon, then block.
+
+    With ``retire``, the first terminate signal stops scheduling, releases the
+    gRPC port and lets in-flight runs finish without a cap: how ``rivers dev``
+    replaces a code location.
+    """
+    actual_port = repo_obj._start_grpc_server(host, grpc_port)
+    if actual_port != grpc_port:
+        typer.echo(
+            f"Warning: gRPC port {grpc_port} is in use; serving on {actual_port}",
+            err=True,
+        )
 
     if not no_daemon:
         from rivers._core import AutomationDaemon
@@ -194,4 +209,4 @@ def serve(
 
     from rivers._core import wait_for_exit
 
-    wait_for_exit()
+    wait_for_exit(retire=retire)

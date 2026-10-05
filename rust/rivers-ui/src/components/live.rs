@@ -5,7 +5,16 @@
 //! and calls `on_kick` at a bounded rate. The SSE payload is never read —
 //! each event is a pure "refetch now" signal; the callback decides what
 //! state to invalidate. The hook returns a reactive [`LiveStatus`] signal
-//! for the UI chip.
+//! for the UI chip and a definitions tick (see [`Live`]).
+//!
+//! # Definitions
+//!
+//! Every subscription also carries the `code_location` channel, which the
+//! `rivers dev` host ticks once a reloaded code location serves. That event
+//! moves `definitions` and kicks; nothing else moves `definitions`, so the
+//! resources keyed on it (assets info, jobs, topology, layout) refetch only
+//! when the definitions can have changed, never on the safety-net or
+//! return-to-visible refreshes below.
 //!
 //! # Rate-cap contract (leading-edge + trailing-edge throttle)
 //!
@@ -57,6 +66,18 @@ pub enum LiveStatus {
     Stale,
 }
 
+/// What [`use_live_kick`] hands back.
+#[derive(Clone, Copy)]
+pub struct Live {
+    /// Connection health for the topbar chip.
+    pub status: ReadSignal<LiveStatus>,
+    /// Moves when the code location reloads; key definition resources on it.
+    pub definitions: RwSignal<u32>,
+}
+
+/// The channel the `rivers dev` host ticks once a reloaded code location serves.
+const DEFINITIONS_CHANNEL: &str = "code_location";
+
 /// Safety-net refresh cadence — forces a refetch every 5 minutes regardless
 /// of SSE state. See module docs. Only referenced from the hydrate-feature
 /// branch of [`use_live_kick`].
@@ -105,7 +126,7 @@ pub fn use_live_kick(
     channels: &'static [&'static str],
     throttle_ms: u32,
     on_kick: Callback<()>,
-) -> ReadSignal<LiveStatus> {
+) -> Live {
     use leptos::wasm_bindgen::JsCast;
     use leptos::wasm_bindgen::closure::Closure;
     use web_sys::{AbortController, AddEventListenerOptions, EventSource};
@@ -113,9 +134,14 @@ pub fn use_live_kick(
     // Initial status: Reconnecting. Transitions to Live on the first `open`
     // event, or Stale on a terminal `error`.
     let (status, set_status) = signal(LiveStatus::Reconnecting);
+    let definitions = RwSignal::new(0u32);
+    let live = Live {
+        status,
+        definitions,
+    };
 
     if channels.is_empty() {
-        return status;
+        return live;
     }
 
     // One AbortController per hook invocation — its abort() detaches the
@@ -136,6 +162,15 @@ pub fn use_live_kick(
     let suppressed: StoredValue<bool> = StoredValue::new(false);
     let pending: StoredValue<bool> = StoredValue::new(false);
     let timer: StoredValue<Option<TimeoutHandle>> = StoredValue::new(None);
+    let kick = move || {
+        if suppressed.get_value() {
+            pending.set_value(true);
+        } else {
+            on_kick.run(());
+            suppressed.set_value(true);
+            schedule_trailing(suppressed, pending, timer, on_kick, throttle_ms);
+        }
+    };
 
     // Current connection. `None` while the tab is hidden.
     let es_slot: StoredValue<Option<EventSource>> = StoredValue::new(None);
@@ -168,7 +203,10 @@ pub fn use_live_kick(
         // above, so it's now safe to drop the old Closures.
         ACTIVE_ES_CLOSURES.with(|slot| slot.borrow_mut().clear());
 
-        let url = format!("/api/events?channels={}", channels.join(","));
+        let url = format!(
+            "/api/events?channels={},{DEFINITIONS_CHANNEL}",
+            channels.join(",")
+        );
         let es = match EventSource::new(&url) {
             Ok(es) => es,
             Err(err) => {
@@ -178,7 +216,7 @@ pub fn use_live_kick(
             }
         };
 
-        let mut closures: Vec<Box<dyn std::any::Any>> = Vec::with_capacity(2 + channels.len());
+        let mut closures: Vec<Box<dyn std::any::Any>> = Vec::with_capacity(3 + channels.len());
 
         // `open` → Live. `error` → Reconnecting while the browser retries
         // (readyState = CONNECTING), Stale once it gives up (readyState =
@@ -208,20 +246,21 @@ pub fn use_live_kick(
         closures.push(Box::new(err_cb));
 
         for channel in channels {
-            let handler = Closure::<dyn Fn(MessageEvent)>::new(move |_ev: MessageEvent| {
-                if suppressed.get_value() {
-                    pending.set_value(true);
-                } else {
-                    on_kick.run(());
-                    suppressed.set_value(true);
-                    schedule_trailing(suppressed, pending, timer, on_kick, throttle_ms);
-                }
-            });
+            let handler = Closure::<dyn Fn(MessageEvent)>::new(move |_ev: MessageEvent| kick());
             let event_name = format!("{channel}-changed");
             let _ =
                 es.add_event_listener_with_callback(&event_name, handler.as_ref().unchecked_ref());
             closures.push(Box::new(handler));
         }
+        let reloaded = Closure::<dyn Fn(MessageEvent)>::new(move |_ev: MessageEvent| {
+            definitions.update(|t| *t += 1);
+            kick();
+        });
+        let _ = es.add_event_listener_with_callback(
+            &format!("{DEFINITIONS_CHANNEL}-changed"),
+            reloaded.as_ref().unchecked_ref(),
+        );
+        closures.push(Box::new(reloaded));
         ACTIVE_ES_CLOSURES.with(|slot| *slot.borrow_mut() = closures);
 
         // Register in both the per-instance slot (for this hook's own
@@ -377,7 +416,7 @@ pub fn use_live_kick(
         timer.set_value(None);
     });
 
-    status
+    live
 }
 
 /// End-of-window handler: if events arrived during the current suppression
@@ -417,11 +456,14 @@ pub fn use_live_kick(
     _channels: &'static [&'static str],
     _throttle_ms: u32,
     _on_kick: Callback<()>,
-) -> ReadSignal<LiveStatus> {
+) -> Live {
     // SSR has no EventSource; pages render their initial HTML, then hydration
-    // takes over and replaces this no-op signal with the real one.
+    // takes over and replaces these no-op signals with the real ones.
     let (status, _) = signal(LiveStatus::Reconnecting);
-    status
+    Live {
+        status,
+        definitions: RwSignal::new(0),
+    }
 }
 
 /// Small topbar indicator showing the current [`LiveStatus`]: a coloured dot

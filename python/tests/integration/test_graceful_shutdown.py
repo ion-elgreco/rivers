@@ -111,6 +111,56 @@ def _server_env(tmp_path, pipeline_module, grpc_port, **extra):
     return env
 
 
+def _ready_port(server: subprocess.Popen, err_path: Path) -> int:
+    """The port a server subprocess reports in its READY line, once it accepts."""
+    ready_line = _read_ready_line(server, err_path)
+    assert ready_line.startswith("READY:"), f"Unexpected output: {ready_line}"
+    port = int(ready_line.split(":")[1])
+    assert _wait_for_port(port, timeout=10), "gRPC server did not start"
+    return port
+
+
+def _start_trigger(port: int) -> subprocess.Popen:
+    """Start a slow materialization over gRPC; returns once the call is in flight."""
+    env = os.environ.copy()
+    env.update(
+        {"PYTHONUNBUFFERED": "1", "GRPC_PORT": str(port), "PROTO_PATH": PROTO_PATH}
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(FIXTURES / "grpc_trigger.py")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    calling_line = proc.stdout.readline().decode().strip()
+    assert calling_line == "CALLING", f"Unexpected trigger output: {calling_line}"
+    return proc
+
+
+def _port_closed(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return False
+    except OSError:
+        return True
+
+
+def _wait_until(predicate, timeout: float, what: str) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def _kill_leftovers(*procs: subprocess.Popen | None) -> None:
+    for p in procs:
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.wait(timeout=5)
+
+
 class TestGracefulShutdown:
     def test_inflight_materialization_completes_on_sigterm(self, tmp_path):
         """Start a gRPC server, trigger a slow materialization, send a terminate
@@ -128,30 +178,7 @@ class TestGracefulShutdown:
 
         trigger_proc = None
         try:
-            ready_line = _read_ready_line(server, err_path)
-            assert ready_line.startswith("READY:"), f"Unexpected output: {ready_line}"
-            actual_port = int(ready_line.split(":")[1])
-            assert _wait_for_port(actual_port, timeout=10), "gRPC server did not start"
-
-            trigger_env = os.environ.copy()
-            trigger_env.update(
-                {
-                    "PYTHONUNBUFFERED": "1",
-                    "GRPC_PORT": str(actual_port),
-                    "PROTO_PATH": PROTO_PATH,
-                }
-            )
-            trigger_proc = subprocess.Popen(
-                [sys.executable, str(FIXTURES / "grpc_trigger.py")],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=trigger_env,
-            )
-
-            calling_line = trigger_proc.stdout.readline().decode().strip()
-            assert calling_line == "CALLING", (
-                f"Unexpected trigger output: {calling_line}"
-            )
+            trigger_proc = _start_trigger(_ready_port(server, err_path))
 
             time.sleep(1.5)
             server.send_signal(_TERMINATE_SIGNAL)
@@ -165,10 +192,7 @@ class TestGracefulShutdown:
             except subprocess.TimeoutExpired:
                 trigger_proc.kill()
         finally:
-            for p in [server, trigger_proc]:
-                if p is not None and p.poll() is None:
-                    p.kill()
-                    p.wait(timeout=5)
+            _kill_leftovers(server, trigger_proc)
 
         stderr = err_path.read_text(errors="replace")
         assert server.returncode == 0, (
@@ -194,20 +218,123 @@ class TestGracefulShutdown:
 
         proc = _start_server(env, err_path)
         try:
-            ready_line = _read_ready_line(proc, err_path)
-            assert ready_line.startswith("READY:"), f"Unexpected output: {ready_line}"
-            actual_port = int(ready_line.split(":")[1])
-            assert _wait_for_port(actual_port, timeout=10)
-
+            _ready_port(proc, err_path)
             proc.send_signal(_TERMINATE_SIGNAL)
             proc.wait(timeout=10)
         finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=5)
+            _kill_leftovers(proc)
 
         stderr = err_path.read_text(errors="replace")
         assert proc.returncode == 0, f"Exit code {proc.returncode}\nstderr:\n{stderr}"
         assert "shutdown complete" in stderr, (
             f"No shutdown complete in logs.\nstderr:\n{stderr}"
         )
+
+
+class TestRetire:
+    """``wait_for_exit(retire=True)``: the first terminate signal releases the
+    gRPC port as soon as the daemon stopped scheduling and drains in-flight
+    runs without a cap; the next signals bring the cap back, then force."""
+
+    def test_port_is_released_while_the_run_finishes(self, tmp_path):
+        pytest.importorskip("grpc")
+        pytest.importorskip("grpc_tools")
+        marker = tmp_path / "completed.marker"
+        err_path = tmp_path / "server.err"
+        env = _server_env(
+            tmp_path,
+            "pipeline_slow",
+            _find_free_port(),
+            MARKER_PATH=str(marker),
+            RETIRE="1",
+        )
+        server = _start_server(env, err_path)
+        trigger_proc = None
+        try:
+            port = _ready_port(server, err_path)
+            trigger_proc = _start_trigger(port)
+            time.sleep(1.0)
+            server.send_signal(_TERMINATE_SIGNAL)
+            _wait_until(lambda: _port_closed(port), 10, "the gRPC port to be released")
+            assert not marker.exists(), "the port was released only after the run"
+            server.wait(timeout=20)
+            trigger_proc.wait(timeout=10)
+        finally:
+            _kill_leftovers(server, trigger_proc)
+
+        stderr = err_path.read_text(errors="replace")
+        assert server.returncode == 0, f"exit {server.returncode}\nstderr:\n{stderr}"
+        assert marker.exists(), f"the run did not finish\nstderr:\n{stderr}"
+        assert "shutdown complete" in stderr, stderr
+        assert "timed out" not in stderr, stderr
+
+    def test_port_is_released_once_the_daemon_stopped_scheduling(self, tmp_path):
+        eval_marker = tmp_path / "eval.marker"
+        err_path = tmp_path / "server.err"
+        env = _server_env(
+            tmp_path,
+            "pipeline_slow_sensor",
+            _find_free_port(),
+            EVAL_MARKER=str(eval_marker),
+            EVAL_SLEEP="4",
+            DAEMON="1",
+            RETIRE="1",
+        )
+        server = _start_server(env, err_path)
+        try:
+            port = _ready_port(server, err_path)
+            _wait_until(eval_marker.exists, 15, "the first sensor evaluation")
+            signalled = time.monotonic()
+            server.send_signal(_TERMINATE_SIGNAL)
+            _wait_until(lambda: _port_closed(port), 20, "the gRPC port to be released")
+            released_after = time.monotonic() - signalled
+            server.wait(timeout=20)
+        finally:
+            _kill_leftovers(server)
+
+        stderr = err_path.read_text(errors="replace")
+        assert server.returncode == 0, f"exit {server.returncode}\nstderr:\n{stderr}"
+        assert released_after >= 2.0, (
+            f"port released {released_after:.1f}s after the signal, "
+            f"while a sensor evaluation was still running\nstderr:\n{stderr}"
+        )
+        assert "daemon stopped scheduling" in stderr, stderr
+        assert "shutdown complete" in stderr, stderr
+
+    def test_second_signal_caps_the_drain_and_third_forces_exit(self, tmp_path):
+        pytest.importorskip("grpc")
+        pytest.importorskip("grpc_tools")
+        marker = tmp_path / "completed.marker"
+        err_path = tmp_path / "server.err"
+        env = _server_env(
+            tmp_path,
+            "pipeline_slow",
+            _find_free_port(),
+            MARKER_PATH=str(marker),
+            RETIRE="1",
+        )
+        server = _start_server(env, err_path)
+        trigger_proc = None
+        try:
+            port = _ready_port(server, err_path)
+            trigger_proc = _start_trigger(port)
+            time.sleep(0.5)
+            server.send_signal(_TERMINATE_SIGNAL)
+            _wait_until(lambda: _port_closed(port), 10, "the gRPC port to be released")
+            server.send_signal(_TERMINATE_SIGNAL)
+            _wait_until(
+                lambda: (
+                    "capping the drain at 30s" in err_path.read_text(errors="replace")
+                ),
+                10,
+                "the second signal to arm the cap",
+            )
+            server.send_signal(_TERMINATE_SIGNAL)
+            server.wait(timeout=10)
+        finally:
+            _kill_leftovers(server, trigger_proc)
+
+        stderr = err_path.read_text(errors="replace")
+        assert server.returncode == 1, f"exit {server.returncode}\nstderr:\n{stderr}"
+        assert "force exiting" in stderr, stderr
+        assert not marker.exists(), "the third signal did not cut the run short"
