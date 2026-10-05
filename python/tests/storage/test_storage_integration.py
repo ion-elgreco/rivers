@@ -7,7 +7,8 @@ import pytest
 from typer.testing import CliRunner
 
 import rivers as rs
-from rivers.cli import _cleanup_storage, _create_storage, app
+from rivers.cli import app
+from rivers.cli._common import _cleanup_storage, _create_storage
 
 runner = CliRunner()
 

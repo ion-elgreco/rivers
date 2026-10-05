@@ -15,7 +15,8 @@ import pytest
 from rivers.testing import embedded_storage
 from typer.testing import CliRunner
 
-from rivers.cli import _format_backfill_status, app
+from rivers.cli import app
+from rivers.cli.backfill import _format_backfill_status
 
 runner = CliRunner()
 
@@ -207,7 +208,7 @@ def test_queue_commands_name_the_verb(resolved_tmp_path, monkeypatch):
     storage._create_run("q-etl", "etl", "Queued", 2000)
     # RocksDB allows one opener per process: hand the CLI the open store.
     monkeypatch.setattr(
-        "rivers.cli.Storage",
+        "rivers.cli.run_queue.Storage",
         type("_S", (), {"embedded": staticmethod(lambda *a, **k: storage)}),
     )
 
@@ -327,7 +328,7 @@ def _connect_to(monkeypatch, path):
         return store
 
     monkeypatch.setattr(
-        "rivers.cli.Storage", type("_S", (), {"connect": staticmethod(connect)})
+        "rivers.cli._common.Storage", type("_S", (), {"connect": staticmethod(connect)})
     )
     return store, endpoints
 

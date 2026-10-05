@@ -9,7 +9,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import pytest
+
 import rivers as rs
+
+IP = rs.Executor.in_process()
+MP = rs.Executor.parallel(max_workers=2)
+
+EXECUTORS = [pytest.param(IP, id="in_process"), pytest.param(MP, id="parallel")]
+
+
+def event_types(repo, run_id):
+    return sorted(str(e.event_type) for e in repo.storage.get_events_for_run(run_id))
 
 
 def static_pd(keys):

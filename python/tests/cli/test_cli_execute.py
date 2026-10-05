@@ -42,7 +42,7 @@ def _cloud_env(monkeypatch, path):
     monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", "default")
     store = Storage.embedded(str(path))
     monkeypatch.setattr(
-        "rivers.cli.Storage",
+        "rivers.cli.run.Storage",
         type("_S", (), {"connect": staticmethod(lambda *a, **k: store)}),
     )
     return store
