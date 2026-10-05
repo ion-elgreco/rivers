@@ -3,7 +3,7 @@
 //! These functions are submitted to loky as the wrapper callable. Loky
 //! cloudpickles the wrapper's arguments — `eval_fn` is shipped as a `FuncRef`
 //! that auto-reconstructs to the imported callable in the worker (see
-//! `executor::parallel::worker::PyFuncRef`), so the user's function is never
+//! `executor::parallel::refs::PyFuncRef`), so the user's function is never
 //! pickled. Resources cross via `(name, class, json_data)` tuples and are
 //! re-instantiated in the worker. Same pattern as the multiprocess executor.
 //!

@@ -4,7 +4,7 @@
 `plan.apply_fan_out_kinds(step_kinds)`, which rewrites map-step kinds from
 `Normal` to `Mapped` so the executor fans out element-wise.
 
-`materialize_with_launcher` (python/src/repository/mod.rs) builds its plan via
+`materialize_with_launcher` (python/src/repository/launch.rs) builds its plan via
 `ExecutionPlan::from_subgraph(...)` but never calls `apply_fan_out_kinds`. As a
 result the map step runs once with the whole list as input, producing a type
 error like ``Asset '<name>/<task>' returned value of type 'list' but expected

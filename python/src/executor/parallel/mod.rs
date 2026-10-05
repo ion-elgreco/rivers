@@ -2,6 +2,7 @@
 mod collect_specs;
 mod execute;
 mod loky;
+pub(crate) mod refs;
 pub(crate) mod worker;
 pub(crate) mod worker_args;
 

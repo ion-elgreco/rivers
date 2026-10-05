@@ -1,4 +1,5 @@
 //! Shared executor operations: invocation, IO, fan-out, and finalization.
+mod annotations;
 mod fan_out;
 mod finalize;
 pub(crate) mod invoke;
@@ -85,6 +86,10 @@ pub(crate) fn build_multi_asset_groups(
 }
 
 pub(crate) use crate::partitions::mapping::UpstreamKeyResolution;
+pub(crate) use annotations::{
+    annotation_is, enumerate_params, extract_config_from_annotation, extract_return_hint,
+    get_annotations, is_action_context_annotation, is_context_annotation, resolve_annotation,
+};
 pub(crate) use fan_out::{
     MappedResultsIter, collect_mapped_outputs, collect_mapped_stream, extract_mapping_key,
     load_fan_out_source, persist_dynamic_keys, resolve_predefined_keys,
@@ -97,11 +102,7 @@ pub(crate) use finalize::{
     extract_data_version, now_ts, register_assets_from_nodes, run_failure_hooks, run_success_hooks,
     step_retry_record, step_start_record,
 };
-pub(crate) use invoke::{
-    annotation_is, drain_failed_partitions, enumerate_params, execute_action_step, execute_step,
-    extract_config_from_annotation, extract_return_hint, get_annotations,
-    is_action_context_annotation, is_context_annotation, resolve_annotation,
-};
+pub(crate) use invoke::{drain_failed_partitions, execute_action_step, execute_step};
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,
     load_self_dependency, load_step_output, map_partition_key_for_upstream,
