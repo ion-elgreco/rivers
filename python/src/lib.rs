@@ -147,8 +147,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<result_types::PyObservation>()?;
     m.add_class::<result_types::PyMaterialization>()?;
     m.add_class::<result_types::PyDynamicOutput>()?;
-    m.add_class::<executor::parallel::worker::PyFuncRef>()?;
-    m.add_class::<executor::parallel::worker::PyIOHandlerRef>()?;
+    m.add_class::<executor::parallel::refs::PyFuncRef>()?;
+    m.add_class::<executor::parallel::refs::PyIOHandlerRef>()?;
     m.add_class::<executor::parallel::worker::PyIOLoadSpec>()?;
     m.add_class::<executor::parallel::worker::PyCollectLoadSpec>()?;
     m.add_class::<executor::parallel::worker::PyCollectStreamLoadSpec>()?;
@@ -161,27 +161,27 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_retry_policy, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(retry::_reconstruct_backoff, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_func_ref,
+        executor::parallel::refs::_reconstruct_func_ref,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_io_handler_ref,
+        executor::parallel::refs::_reconstruct_io_handler_ref,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_partition_key,
+        executor::parallel::refs::_reconstruct_partition_key,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_partitions_definition,
+        executor::parallel::refs::_reconstruct_partitions_definition,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_partition_mapping,
+        executor::parallel::refs::_reconstruct_partition_mapping,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        executor::parallel::worker::_reconstruct_partition_context,
+        executor::parallel::refs::_reconstruct_partition_context,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(

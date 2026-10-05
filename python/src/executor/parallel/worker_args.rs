@@ -331,13 +331,13 @@ pub(crate) fn extract_module_qualname(py: Python, func: &Py<PyAny>) -> PyResult<
 /// call, and loky fails every pending step when that raises, not only this one.
 pub(crate) fn make_func_ref(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
-    let found = super::worker::_reconstruct_func_ref(py, module.clone(), qualname.clone())?;
+    let found = super::refs::_reconstruct_func_ref(py, module.clone(), qualname.clone())?;
     if !same_callable(found.bind(py), func.bind(py)) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "module path does not reach this callable; ship it by value",
         ));
     }
-    Ok(Py::new(py, super::worker::PyFuncRef::new(module, qualname))?.into_any())
+    Ok(Py::new(py, super::refs::PyFuncRef::new(module, qualname))?.into_any())
 }
 
 /// loky's own method reducer rebuilds a bound method as
@@ -357,7 +357,7 @@ fn func_by_value(py: Python, func: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     if by_name.is_ok_and(|found| same_callable(&found, f)) {
         return Ok(func.clone_ref(py));
     }
-    let method = super::worker::PyBoundMethod::new(inner.unbind(), owner.unbind());
+    let method = super::refs::PyBoundMethod::new(inner.unbind(), owner.unbind());
     Ok(Py::new(py, method)?.into_any())
 }
 
@@ -388,9 +388,9 @@ pub(super) fn make_io_handler_ref(
     expected: &Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let (module, qualname) = extract_module_qualname(py, func)?;
-    match super::worker::resolve_handler_from_path(py, &module, &qualname) {
+    match super::refs::resolve_handler_from_path(py, &module, &qualname) {
         Some(found) if found.bind(py).is(expected.bind(py)) => {
-            Ok(Py::new(py, super::worker::PyIOHandlerRef::new(module, qualname))?.into_any())
+            Ok(Py::new(py, super::refs::PyIOHandlerRef::new(module, qualname))?.into_any())
         }
         _ => Err(pyo3::exceptions::PyValueError::new_err(
             "module path does not reach this node's io_handler; ship raw handler",
