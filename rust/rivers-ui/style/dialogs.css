@@ -1082,3 +1082,32 @@ code {
 .config-editor-hint { margin-top: 0.5rem; font-size: var(--fs-sm); color: var(--text-muted); }
 .config-editor-hint-fields { font-family: var(--font-mono); color: var(--text); }
 .config-editor-hint .link-btn { margin-left: 8px; }
+
+/* `rivers dev` reload control under the location switcher */
+.locations-reload {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--round-md);
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 5px 8px;
+    font: inherit;
+    font-size: var(--fs-sm);
+    text-align: left;
+    transition: color 0.15s, background 0.15s;
+}
+.locations-reload:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.locations-reload:disabled { cursor: default; }
+.locations-reload-icon svg { display: block; }
+.locations-reload-icon--busy svg { animation: locations-reload-spin 1s linear infinite; }
+@keyframes locations-reload-spin { to { transform: rotate(360deg); } }
+.locations-reload-error {
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+    padding: 0 4px;
+    overflow-wrap: anywhere;
+}

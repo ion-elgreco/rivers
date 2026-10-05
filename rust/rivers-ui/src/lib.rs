@@ -22,6 +22,8 @@ pub mod code_location_registry;
 pub mod components;
 pub mod config_schema;
 #[cfg(feature = "ssr")]
+pub mod dev_reload;
+#[cfg(feature = "ssr")]
 pub mod favicon;
 pub mod helpers;
 pub mod json_text;
@@ -201,7 +203,7 @@ mod server {
         let routes = generate_route_list(App);
 
         let is_draining = shutdown.clone();
-        let (live_tx, live_metrics) =
+        let (live_tx, live_metrics, mut live_tasks) =
             spawn_live_broadcasters(state.storage.clone(), shutdown.clone());
         let debug_metrics = live_metrics.clone();
         let app = Router::new()
@@ -294,6 +296,12 @@ mod server {
         )
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
+        // The broadcasters close their live queries on the shutdown token;
+        // return only once they have, so the caller may close storage.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while live_tasks.join_next().await.is_some() {}
+        })
+        .await;
         tracing::info!(target: "rivers::ui", "UI server stopped");
         Ok(())
     }

@@ -42,6 +42,11 @@ fn format_with_commas(n: usize) -> String {
 #[component]
 pub fn AutomationPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["automation", "assets"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let (active_tab, set_active_tab) = use_query_param("tab", "schedules");
     let (sort_by, set_sort_by) = use_query_param("sort", "name");
     let (sort_asc_str, set_sort_asc_str) = use_query_param("asc", "true");
@@ -60,11 +65,11 @@ pub fn AutomationPage() -> impl IntoView {
         move || (refresh_tick.get(), loc.get()),
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
     );
-    // Job definitions are static for the session; they say which job a
-    // schedule or sensor runs as an action.
+    // Job definitions change only when the code location reloads; they say
+    // which job a schedule or sensor runs as an action.
     let jobs = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_jobs(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_jobs(ns, name).await },
     );
     let job_actions = move || -> HashMap<String, String> {
         jobs.get()
@@ -212,11 +217,6 @@ pub fn AutomationPage() -> impl IntoView {
         }
     });
 
-    let live_status = use_live_kick(
-        &["automation", "assets"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     view! {
         <Topbar
@@ -242,7 +242,7 @@ pub fn AutomationPage() -> impl IntoView {
             }
         >
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

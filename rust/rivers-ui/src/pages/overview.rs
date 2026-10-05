@@ -18,6 +18,11 @@ use crate::server_fns::runs::{get_runs, get_runs_summary};
 #[component]
 pub fn OverviewPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["runs", "assets", "backfills", "automation"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let loc = use_current_location();
 
     let stats = Resource::new(move || refresh_tick.get(), |_| get_runs_summary());
@@ -35,20 +40,15 @@ pub fn OverviewPage() -> impl IntoView {
         |(_tick, (ns, name))| async move { get_sensors(ns, name).await },
     );
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
 
-    let live_status = use_live_kick(
-        &["runs", "assets", "backfills", "automation"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     view! {
         <Topbar title="Overview">
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

@@ -7,10 +7,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
-use rivers_core::assets::graph::GraphTopology;
 use rivers_core::storage::surrealdb_backend::{Capability, SurrealStorage};
 use rivers_ui::code_location_registry::Registry;
-use rivers_ui::synthetic::{generate_synthetic_graph, parse_node_count};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -108,26 +106,10 @@ async fn main() {
     // every code location. In production the standalone UI is multi-CL
     // and reads the active CL's topology from storage on each request —
     // there is no global topology to pre-load.
-    let graph = args.synthetic.as_ref().map(|scale| {
-        let n = parse_node_count(scale);
-        let g = generate_synthetic_graph(n);
-        Arc::new(GraphTopology {
-            nodes: g
-                .nodes
-                .into_iter()
-                .map(|n| rivers_core::assets::graph::TopologyNode {
-                    name: n.name,
-                    kind: n
-                        .kind
-                        .parse()
-                        .expect("synthetic graph produced invalid NodeKind"),
-                    group: n.group,
-                    parent_graph: n.parent_graph,
-                })
-                .collect(),
-            edges: g.edges,
-        })
-    });
+    let graph = args
+        .synthetic
+        .as_deref()
+        .map(|scale| Arc::new(rivers_ui::synthetic::core_topology(scale)));
 
     let registry = match (args.registry_url, args.registry_token) {
         (Some(url), Some(token)) if !token.is_empty() => {

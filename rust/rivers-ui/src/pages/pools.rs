@@ -61,7 +61,7 @@ pub fn PoolsPage() -> impl IntoView {
         },
     );
 
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["pools", "runs"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -70,7 +70,7 @@ pub fn PoolsPage() -> impl IntoView {
     view! {
         <Topbar title="Pools" subtitle=|| "Concurrency slots across the cluster">
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

@@ -3,6 +3,19 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::time::timeout;
 
+// The mock streams have no server-side query to end.
+impl LiveStream for futures_util::stream::Empty<()> {
+    fn close(self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+}
+
+impl<S: ?Sized + futures_core::Stream<Item = ()> + Send> LiveStream for std::pin::Pin<Box<S>> {
+    fn close(self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+}
+
 /// Collect up to `n` events with a per-event timeout. Returns what was
 /// received so far on timeout — callers assert on the collected set.
 async fn collect_n<S: futures_core::Stream<Item = &'static str> + Unpin>(
@@ -210,7 +223,7 @@ async fn axum_graceful_shutdown_completes_with_open_sse_client() {
             .unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let (tx, _metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (tx, _metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
 
     let app = Router::new().route(
         "/api/events",
@@ -338,7 +351,7 @@ async fn every_channel_delivers_sse_events_over_http() {
             .expect("build in-memory SurrealStorage"),
     );
     let shutdown = CancellationToken::new();
-    let (tx, _metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (tx, _metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
 
     let app = Router::new().route(
         "/api/events",
@@ -627,7 +640,7 @@ async fn metrics_advance_after_write() {
             .expect("build in-memory SurrealStorage"),
     );
     let shutdown = CancellationToken::new();
-    let (_tx, metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (_tx, metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
 
     // At startup every channel is zeroed.
     for snap in metrics.snapshot() {
@@ -722,7 +735,7 @@ async fn multiple_sse_clients_receive_same_event() {
             .unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let (tx, _metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (tx, _metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
 
     let app = Router::new().route(
         "/api/events",
@@ -835,7 +848,7 @@ async fn sse_client_isolation_across_channels() {
             .unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let (tx, _metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (tx, _metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
 
     let app = Router::new().route(
         "/api/events",
@@ -983,7 +996,7 @@ async fn debug_live_http_endpoint_serves_valid_json() {
             .unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let (_tx, metrics) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
+    let (_tx, metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
     let debug_metrics = metrics.clone();
 
     let app = Router::new().route(
@@ -1234,4 +1247,35 @@ async fn channel_loop_honors_shutdown_on_active_stream() {
         .await
         .expect("channel_loop did not exit within 500ms of shutdown")
         .expect("channel_loop task panicked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kick_ticks_the_channel_for_subscribers() {
+    use std::time::{Duration, Instant};
+
+    let storage = Arc::new(
+        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+            .await
+            .unwrap(),
+    );
+    let shutdown = CancellationToken::new();
+    let (_tx, _metrics, _tasks) = spawn_live_broadcasters(storage, shutdown.clone());
+
+    // Another test may install its own sender in between; retry on a fresh
+    // subscription until the kick lands.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tx = crate::live::kick_sender().expect("spawn_live_broadcasters installs the sender");
+        let mut rx = tx.subscribe();
+        crate::live::kick("code_location");
+        if let Ok(Ok(channel)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            assert_eq!(channel, "code_location");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the kick never reached the subscriber"
+        );
+    }
+    shutdown.cancel();
 }

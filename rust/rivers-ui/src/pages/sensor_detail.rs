@@ -21,6 +21,11 @@ pub fn SensorDetailPage() -> impl IntoView {
     let loc = use_current_location();
 
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["automation", "runs"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let sensor = Resource::new(
         move || {
             params.track();
@@ -29,8 +34,8 @@ pub fn SensorDetailPage() -> impl IntoView {
         |(_n, _t, (ns, lname))| async move { get_sensors(ns, lname).await },
     );
     let jobs = Resource::new(
-        move || loc.get(),
-        |(ns, lname)| async move { get_jobs(ns, lname).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, lname), _)| async move { get_jobs(ns, lname).await },
     );
     let ticks = Resource::new(
         move || {
@@ -47,11 +52,6 @@ pub fn SensorDetailPage() -> impl IntoView {
     });
     let eval_pending = eval_action.pending();
 
-    let live_status = use_live_kick(
-        &["automation", "runs"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     let (ns_t, name_t) = loc.get_untracked();
     let auto_href = loc_path(&ns_t, &name_t, "automation?tab=sensors");
@@ -61,7 +61,7 @@ pub fn SensorDetailPage() -> impl IntoView {
             Crumb::new(name()).mono(),
         ]>
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
             <button

@@ -10,10 +10,11 @@
 //!   handler subscribes, filters by client-requested channels, and emits
 //!   `event: {channel}-changed\ndata: 1` events.
 //!
-//! **Python-write guarantee.** All backend writes flow through the same
-//! `Arc<SurrealStorage>` (Python daemon via PyO3 in `rivers dev`, or a
-//! shared remote SurrealDB in K8s), so the live queries here see every
-//! mutation regardless of which process wrote it.
+//! **Write guarantee.** Every process writes to the one SurrealDB the UI
+//! reads (the embedded server of `rivers dev`, or a shared remote SurrealDB
+//! in K8s), so the live queries here see every mutation regardless of which
+//! process wrote it. A change with no table behind it (a reloaded code
+//! location) is ticked in-process through [`kick`].
 
 use axum::extract::Query;
 use axum::response::IntoResponse;
@@ -21,9 +22,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// One UI-facing channel plus the set of tables whose notifications feed it.
@@ -72,11 +74,19 @@ pub const LIVE_CHANNELS: &[LiveChannel] = &[
     },
     // Subscribers on this channel care about which assets light up on the
     // DAG (materialization / staleness changes), not the topology itself —
-    // topology comes from the code-location gRPC and is static per session.
+    // that changes only when the code location reloads (`code_location`).
     LiveChannel {
         name: "lineage",
         event_name: "lineage-changed",
         tables: &["assets", "asset_partitions"],
+    },
+    // No table feeds this channel: the `rivers dev` host kicks it once a
+    // reloaded code location is serving, so pages refetch definitions after
+    // the new gRPC backend is up rather than during its resolve.
+    LiveChannel {
+        name: "code_location",
+        event_name: "code_location-changed",
+        tables: &[],
     },
 ];
 
@@ -146,53 +156,68 @@ pub struct ChannelSnapshot {
 }
 
 /// Spawn one background task per `(channel, table)` pair. Every task holds
-/// a LIVE query open for the process lifetime, reconnects on DB hiccups,
-/// and forwards each notification as a broadcast tick tagged with the
-/// channel name. Returns the shared sender plus a [`LiveMetrics`] handle
-/// the diagnostic endpoint reads from.
+/// a LIVE query open until `shutdown` fires, reconnects on DB hiccups, and
+/// forwards each notification as a broadcast tick tagged with the channel
+/// name. Returns the shared sender, a [`LiveMetrics`] handle the diagnostic
+/// endpoint reads from, and the tasks: join them after `shutdown` so every
+/// live query is closed while storage is still reachable.
 pub fn spawn_live_broadcasters(
     storage: Arc<SurrealStorage>,
     shutdown: CancellationToken,
-) -> (broadcast::Sender<&'static str>, LiveMetrics) {
+) -> (broadcast::Sender<&'static str>, LiveMetrics, JoinSet<()>) {
     let (tx, _rx) = broadcast::channel::<&'static str>(256);
+    *KICK_TX.lock().unwrap() = Some(tx.clone());
     let metrics = LiveMetrics::new();
+    let mut tasks = JoinSet::new();
     for channel in LIVE_CHANNELS {
         for table in channel.tables {
-            spawn_one(
-                storage.clone(),
-                shutdown.clone(),
-                tx.clone(),
-                channel.name,
-                table,
-                metrics.clone(),
-            );
+            let storage = storage.clone();
+            let shutdown = shutdown.clone();
+            let tx = tx.clone();
+            let metrics = metrics.clone();
+            tasks.spawn(async move {
+                channel_loop(
+                    move || {
+                        let storage = storage.clone();
+                        async move { storage.subscribe_table(table).await }
+                    },
+                    shutdown,
+                    tx,
+                    channel.name,
+                    Some(table),
+                    metrics,
+                )
+                .await;
+            });
         }
     }
-    (tx, metrics)
+    (tx, metrics, tasks)
 }
 
-fn spawn_one(
-    storage: Arc<SurrealStorage>,
-    shutdown: CancellationToken,
-    tx: broadcast::Sender<&'static str>,
-    channel_name: &'static str,
-    table: &'static str,
-    metrics: LiveMetrics,
-) {
-    tokio::spawn(async move {
-        channel_loop(
-            move || {
-                let storage = storage.clone();
-                async move { storage.subscribe_table(table).await }
-            },
-            shutdown,
-            tx,
-            channel_name,
-            Some(table),
-            metrics,
-        )
-        .await;
-    });
+static KICK_TX: Mutex<Option<broadcast::Sender<&'static str>>> = Mutex::new(None);
+
+/// Tick `channel` for every subscribed client, as a table notification would.
+pub(crate) fn kick(channel: &'static str) {
+    if let Some(tx) = KICK_TX.lock().unwrap().as_ref() {
+        let _ = tx.send(channel);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn kick_sender() -> Option<broadcast::Sender<&'static str>> {
+    KICK_TX.lock().unwrap().clone()
+}
+
+/// A table's change stream. The broadcaster closes it on shutdown so the live
+/// query behind it ends while storage is still reachable.
+pub trait LiveStream: futures_core::Stream<Item = ()> + Unpin + Send {
+    fn close(self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl LiveStream for rivers_core::storage::surrealdb_backend::LiveTable {
+    fn close(self) -> impl std::future::Future<Output = ()> + Send {
+        rivers_core::storage::surrealdb_backend::LiveTable::close(self)
+    }
 }
 
 /// Extracted broadcaster policy: repeatedly calls `subscribe` to obtain a
@@ -216,7 +241,7 @@ async fn channel_loop<F, Fut, S>(
 ) where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<S>>,
-    S: futures_core::Stream<Item = ()> + Unpin,
+    S: LiveStream,
 {
     use futures_util::StreamExt;
 
@@ -274,16 +299,19 @@ async fn channel_loop<F, Fut, S>(
         first_attempt = false;
         let opened_at = std::time::Instant::now();
 
-        while let Some(()) = stream.next().await {
-            if shutdown.is_cancelled() {
-                break;
-            }
+        loop {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = shutdown.cancelled() => break,
+            };
+            let Some(()) = next else { break };
             channel_metrics
                 .last_event_unix_ms
                 .store(now_unix_ms(), Ordering::Relaxed);
             let _ = tx.send(channel_name);
         }
         if shutdown.is_cancelled() {
+            stream.close().await;
             break;
         }
         if opened_at.elapsed().as_millis() >= MIN_HEALTHY_MS {

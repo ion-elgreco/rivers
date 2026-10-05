@@ -16,7 +16,7 @@ pub fn DeploymentPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| async move { get_deployment_info(ns, name).await },
     );
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["runs"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -25,7 +25,7 @@ pub fn DeploymentPage() -> impl IntoView {
     view! {
         <Topbar title="Deployment">
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

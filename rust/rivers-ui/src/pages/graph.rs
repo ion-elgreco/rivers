@@ -104,9 +104,14 @@ fn apply_node_click(selected: &[String], node: &str, additive: bool) -> Vec<Stri
 pub fn GraphPage() -> impl IntoView {
     let (center_layers, set_center_layers) = signal(false);
     let (expanded_graphs, set_expanded_graphs) = signal(std::collections::HashSet::<String>::new());
-    // SSE kicks only drive node-status refetches — the DAG layout and
-    // topology come from the code-location gRPC and don't change mid-session.
+    // Kicks drive node-status refetches; the topology, the definitions and
+    // the layout refetch only when the code location reloads.
     let (refresh_tick, set_refresh_tick) = signal(0u64);
+    let live = use_live_kick(
+        &["lineage"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let loc = use_current_location();
     let (filter_kind, set_filter_kind) = use_query_param_list("kind");
     let (filter_group, set_filter_group) = use_query_param_list("group");
@@ -121,30 +126,26 @@ pub fn GraphPage() -> impl IntoView {
                 filter_kind.get(),
                 filter_group.get(),
                 expanded,
+                live.definitions.get(),
             )
         },
-        |(cl, (ns, name), kinds, groups, expanded)| async move {
+        |(cl, (ns, name), kinds, groups, expanded, _)| async move {
             get_graph_layout(ns, name, cl, kinds, groups, expanded).await
         },
     );
     let topology = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_graph_topology(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
 
-    let live_status = use_live_kick(
-        &["lineage"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
     // Multi-selection in click order; the last entry is the focused node.
     let (selected_nodes, set_selected_nodes) = signal(Vec::<String>::new());
     let focused_node = Signal::derive(move || selected_nodes.get().last().cloned());
@@ -447,8 +448,11 @@ pub fn GraphPage() -> impl IntoView {
     view! {
         <Topbar title="Lineage">
             <LiveStatusChip
-                status=live_status
-                on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
+                status=live.status
+                on_refresh=Callback::new(move |_| {
+                    live.definitions.update(|t| *t += 1);
+                    set_refresh_tick.update(|t| *t += 1);
+                })
             />
         </Topbar>
 

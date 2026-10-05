@@ -1,8 +1,7 @@
-"""``rivers dev`` CLI tests up to the server-boot seam.
+"""``rivers dev`` CLI tests up to the host seam.
 
-The happy path is covered by stubbing ``_serve_dev`` — everything before it
-(flat CLI args → nested ``RiversConfig``, cwd module import, repo resolve
-against storage) runs for real.
+The happy path stubs ``_serve_dev``: everything before it (flat CLI args →
+nested ``RiversConfig``, the cwd module lookup) runs for real.
 """
 
 from typer.testing import CliRunner
@@ -47,9 +46,9 @@ def test_dev_without_module_reports_missing_config(resolved_tmp_path):
     assert "no module configured" in result.output
 
 
-def test_dev_reaches_server_seam_with_flags_applied(resolved_tmp_path, monkeypatch):
-    """A valid cwd-relative module gets through config parsing, import, and
-    resolve, and the CLI flags arrive in the config handed to the servers."""
+def test_dev_reaches_host_seam_with_flags_applied(resolved_tmp_path, monkeypatch):
+    """A valid cwd-relative module gets through config parsing and the module
+    lookup, and the CLI flags arrive in the config handed to the host."""
     (resolved_tmp_path / "dev_seam_mod.py").write_text(REPO_MODULE)
     # dev() exports these; pre-set via monkeypatch so teardown restores them.
     monkeypatch.setenv("RIVERS_DEPLOYMENT", "")
@@ -59,7 +58,7 @@ def test_dev_reaches_server_seam_with_flags_applied(resolved_tmp_path, monkeypat
     monkeypatch.setattr(
         rivers.cli.server,
         "_serve_dev",
-        lambda cfg, repo_obj, storage: served.update(cfg=cfg, repo=repo_obj),
+        lambda cfg, module: served.update(cfg=cfg, module=module),
     )
 
     result = runner.invoke(
@@ -79,6 +78,7 @@ def test_dev_reaches_server_seam_with_flags_applied(resolved_tmp_path, monkeypat
     )
     assert result.exit_code == 0, result.output
 
+    assert served["module"] == "dev_seam_mod"
     cfg = served["cfg"]
     assert cfg.module.path == "dev_seam_mod"
     assert cfg.module.repo_var == "repo"
@@ -86,4 +86,3 @@ def test_dev_reaches_server_seam_with_flags_applied(resolved_tmp_path, monkeypat
     assert cfg.server.port == 3210
     assert cfg.server.grpc_port == 3211
     assert cfg.storage.path == str(resolved_tmp_path / "storage")
-    assert served["repo"] is not None

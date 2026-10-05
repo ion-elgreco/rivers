@@ -219,7 +219,7 @@ pub fn RunsListPage() -> impl IntoView {
         |_| async move { get_runs_summary().await },
     );
 
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["runs"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -265,7 +265,7 @@ pub fn RunsListPage() -> impl IntoView {
             }
         >
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| reload.run(()))
             />
         </Topbar>

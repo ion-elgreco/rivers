@@ -23,6 +23,11 @@ use crate::types::AssetRecord;
 #[component]
 pub fn AssetsListPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["assets"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
     let (filter_tags, set_filter_tags) = use_query_param_list("tag");
     let (filter_kinds, set_filter_kinds) = use_query_param_list("kind");
     let (filter_groups, set_filter_groups) = use_query_param_list("group");
@@ -49,15 +54,10 @@ pub fn AssetsListPage() -> impl IntoView {
         |(_tick, (ns, name))| async move { get_assets_info(ns, name).await },
     );
     let graph = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_graph_topology(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
 
-    let live_status = use_live_kick(
-        &["assets"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     let all_records =
         move || -> Vec<AssetRecord> { all_assets.get().and_then(|r| r.ok()).unwrap_or_default() };
@@ -363,7 +363,7 @@ pub fn AssetsListPage() -> impl IntoView {
             }
         >
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
             <Show when=move || !selected.get().is_empty()>
