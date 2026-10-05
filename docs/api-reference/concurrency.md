@@ -97,7 +97,7 @@ Launches each run as a Kubernetes Job and each step as a worker pod (when paired
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `image` | `str \| None` | running image | Container image for run/worker pods. With a [git-sourced CodeLocation](../installation/kubernetes.md#git-sourced-codelocations), build it `FROM` the runtime image. |
+| `image` | `str \| None` | running image | Container image for run/worker pods. With a [git-sourced CodeLocation](../installation/git-code-locations.md#runtime-image), build it `FROM` the runtime image. |
 | `namespace` | `str \| None` | pod's own namespace | Target namespace. |
 | `service_account` | `str` | `"rivers-executor"` | Service account bound to the pods. |
 | `run_cpu` | `str` | `"500m"` | CPU request/limit for the run pod. |

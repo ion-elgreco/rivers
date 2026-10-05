@@ -127,8 +127,10 @@ pub struct CodeLocationSpec {
     #[serde(default = "default_module")]
     pub module: String,
 
-    /// Number of code-location pod replicas.
+    /// Number of code-location pod replicas, 0 or 1: code locations do not
+    /// scale out yet.
     #[serde(default = "default_replicas")]
+    #[schemars(extend("minimum" = 0, "maximum" = 1))]
     pub replicas: i32,
 
     /// How often the operator re-polls the registry. Accepts duration
@@ -775,6 +777,16 @@ mod tests {
         for refused in ["5GB", "-1Gi", "abc", "0", "0.0Gi", "", " 10Gi", "1e"] {
             assert!(!pattern.is_match(refused), "{refused}");
         }
+    }
+
+    #[test]
+    fn crd_schema_caps_replicas_at_one() {
+        let crd = serde_json::to_value(CodeLocation::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let replicas = &spec["properties"]["replicas"];
+        assert_eq!(replicas["default"], 1, "{replicas}");
+        assert_eq!(replicas["minimum"], 0.0, "{replicas}");
+        assert_eq!(replicas["maximum"], 1.0, "{replicas}");
     }
 
     #[test]

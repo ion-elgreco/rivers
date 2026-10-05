@@ -52,7 +52,7 @@ executor = rs.Executor.kubernetes(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `worker_image` | `str \| None` | controlling-pod image | Container image for worker pods. With a [git-sourced CodeLocation](../installation/kubernetes.md#git-sourced-codelocations), build it `FROM` the runtime image. |
+| `worker_image` | `str \| None` | controlling-pod image | Container image for worker pods. With a [git-sourced CodeLocation](../installation/git-code-locations.md#runtime-image), build it `FROM` the runtime image. |
 | `max_concurrent_steps` | `int \| None` | unbounded | Cap on concurrent step pods. |
 | `namespace` | `str \| None` | current namespace | Namespace pods are launched in. |
 | `service_account` | `str` | `"rivers-executor"` | Service account bound to worker pods. |

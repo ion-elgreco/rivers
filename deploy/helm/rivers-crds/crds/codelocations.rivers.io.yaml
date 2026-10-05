@@ -322,8 +322,12 @@ spec:
                 type: string
               replicas:
                 default: 1
-                description: Number of code-location pod replicas.
+                description: |-
+                  Number of code-location pod replicas, 0 or 1: code locations do not
+                  scale out yet.
                 format: int32
+                maximum: 1.0
+                minimum: 0.0
                 type: integer
               resources:
                 description: |-
