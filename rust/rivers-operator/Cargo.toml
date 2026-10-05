@@ -59,7 +59,7 @@ gix-packetline = "0.22"
 # that works in the distroless operator image (no ssh binary) without
 # pulling OpenSSL in via libssh2. `ring` matches the workspace's rustls
 # provider; `rsa`/`flate2` cover common deploy keys and transport compression.
-russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
 # HMAC-SHA1 of hashed (`|1|`) known_hosts entries: russh matches those only
 # in files, and the operator keeps the git Secret in memory.
 ring = "0.17"
