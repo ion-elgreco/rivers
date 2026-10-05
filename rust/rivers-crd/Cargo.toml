@@ -17,7 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 # Workspace keys: a fixed hash, so that the operator and the run pods (maybe
 # another rivers version) agree.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 regex.workspace = true
