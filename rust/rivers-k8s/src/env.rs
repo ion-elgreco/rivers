@@ -71,7 +71,7 @@ pub fn detect_code_location_id() -> Option<String> {
 }
 
 /// `RIVERS_DEPLOYMENT` value the rivers CLI sets from every K8s entry point
-/// (`serve`, `execute`, `execute-step`). Mirrors `python/rivers/cli.py`.
+/// (`serve`, `execute`, `execute-step`). Mirrors `python/rivers/cli/server.py` and `run.py`.
 pub const DEPLOYMENT_CLOUD: &str = "cloud";
 
 /// True iff `RIVERS_DEPLOYMENT == DEPLOYMENT_CLOUD`. Canonical signal for

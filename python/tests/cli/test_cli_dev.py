@@ -7,7 +7,7 @@ against storage) runs for real.
 
 from typer.testing import CliRunner
 
-import rivers.cli
+import rivers.cli.server
 from rivers.cli import app
 
 runner = CliRunner()
@@ -57,7 +57,7 @@ def test_dev_reaches_server_seam_with_flags_applied(resolved_tmp_path, monkeypat
 
     served = {}
     monkeypatch.setattr(
-        rivers.cli,
+        rivers.cli.server,
         "_serve_dev",
         lambda cfg, repo_obj, storage: served.update(cfg=cfg, repo=repo_obj),
     )
