@@ -118,6 +118,17 @@ operator:
   # should leave this false. When false, CodeLocations against an HTTP-only
   # registry must pre-set spec.digest to skip the probe.
   allowInsecureRegistry: false
+  # Git-sourced CodeLocations.
+  git:
+    # Hosts spec.git.url may point at. Empty admits any host; the admission
+    # webhook rejects CRs pointing elsewhere.
+    allowedHosts: []
+    # Allow http:// git urls: code and git credentials travel unencrypted.
+    # Only for a git host on a trusted network.
+    allowInsecure: false
+    # Ref-resolution timeout per poll: whole seconds above 0; the operator
+    # does not start otherwise.
+    timeoutSeconds: 30
   registry:
     # gRPC port for the CodeLocationRegistry service.
     port: 50052
@@ -235,6 +246,37 @@ ui:
           - path:
               type: PathPrefix
               value: /
+
+codeLocation:
+  runtime:
+    # Default runtime for git-sourced CodeLocations that don't set spec.image:
+    # repo:tag or repo@sha256:... (no tag means latest). Empty resolves to
+    #   ghcr.io/ion-elgreco/rivers-runtime:{appVersion}-py{pythonVersion}.
+    # Point at an internal mirror for air-gapped clusters; pair with
+    # spec.imagePullSecrets on the CodeLocation.
+    image: ""
+    # Interpreter variant the default tag selects. A CodeLocation's spec.tag
+    # (e.g. 0.5.0-py3.11) or spec.digest replaces the default's tag/digest.
+    pythonVersion: "3.12"
+  workspace:
+    # Shared workspace: one RWX PVC per git CodeLocation; trees (code+venv)
+    # built once and reused. Needs an RWX storage class — measure network
+    # filesystems first (a venv is tens of thousands of small files).
+    shared:
+      enabled: false
+      storageClass: ""
+      # PVC request per CL; spec.git.workspaceSize overrides it.
+      size: 20Gi
+    # emptyDir cap in fallback mode; spec.git.workspaceSize overrides per CL.
+    # size and sizeLimit: Kubernetes quantities above 0, like 20Gi or 500M;
+    # the operator does not start otherwise.
+    sizeLimit: 2Gi
+    # Trees always retained by recency, regardless of the keep-set.
+    keepRevisions: 3
+    # A tree is never deleted before this age — closes the
+    # admission-vs-commit-change race independently of commit rate.
+    # Whole number with s, m or h; the operator does not start otherwise.
+    minTreeAge: 1h
 
 # OpenTelemetry trace export from code-location, run, and step pods.
 otel:

@@ -1,0 +1,25 @@
+[package]
+name = "rivers-crd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# The CRD types, shared by the operator, the run pods (through rivers-k8s)
+# and rivers-runtime — which must stay small: no rivers-core here.
+kube-derive.workspace = true
+kube-core = { workspace = true, features = ["schema"] }
+k8s-openapi = { workspace = true, features = ["schemars"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Workspace keys: a fixed hash, so that the operator and the run pods (maybe
+# another rivers version) agree.
+sha2 = "0.10"
+
+[dev-dependencies]
+regex.workspace = true
+serde_yaml.workspace = true
+kube-client.workspace = true

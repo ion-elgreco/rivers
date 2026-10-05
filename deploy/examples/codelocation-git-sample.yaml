@@ -1,0 +1,39 @@
+# Git-sourced CodeLocation.
+#
+# The operator resolves `git.ref` to a pinned commit and shows it under
+# `kubectl get rcl` as e.g. `main@9f3c1ab`. The pods run the chart's default
+# runtime image unless `spec.image` (e.g. a private mirror) or `spec.tag` /
+# `spec.digest` (e.g. a different Python variant) says otherwise.
+apiVersion: rivers.io/v1alpha1
+kind: CodeLocation
+metadata:
+  name: analytics
+spec:
+  git:
+    url: https://github.com/acme/pipelines.git
+    # Over SSH the url must name the user (`git` on most git hosts):
+    # url: ssh://git@github.com/acme/pipelines.git
+    # Exactly one of branch | tag | commit.
+    ref:
+      branch: main
+    # Subdirectory holding the project; becomes the working directory.
+    path: analytics
+    # Secret keys: username/password (HTTPS) or identity + known_hosts (SSH).
+    # secretRef:
+    #   name: git-creds
+    # How often the operator re-resolves the ref (default 5m, min 60s).
+    # pollInterval: 2m
+    dependencies:
+      # auto, in `path`: uv.lock ⇒ uv sync --locked; requirements.txt ⇒
+      # uv pip install; pyproject.toml of a uv workspace member ⇒ uv sync
+      # --locked with the workspace root's uv.lock; none of these ⇒ install
+      # nothing.
+      mode: auto
+  module: analytics.pipeline
+  replicas: 1
+  # Optional runtime-image override (defaults to the chart's rivers-runtime):
+  # image: harbor.acme.internal/rivers/rivers-runtime
+  # tag: 0.5.0-py3.11
+  env:
+    - name: UV_INDEX_URL
+      value: https://pypi.internal.acme/simple

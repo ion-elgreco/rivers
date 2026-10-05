@@ -166,6 +166,7 @@ impl KubernetesBackend {
             .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
 
         let config = rivers_k8s::executor::K8sStepExecutorConfig {
+            workspace: None,
             worker_image,
             namespace: self.namespace.clone(),
             service_account: self.service_account.clone(),
@@ -180,7 +181,8 @@ impl KubernetesBackend {
             code_location_id: self.code_location_id.clone(),
             extra_env,
             partition_key,
-        };
+        }
+        .with_detected_workspace();
         Ok((client, config))
     }
 }

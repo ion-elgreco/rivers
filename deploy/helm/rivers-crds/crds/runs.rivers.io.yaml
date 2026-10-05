@@ -143,6 +143,94 @@ spec:
               serviceAccountName:
                 default: rivers-executor
                 type: string
+              source:
+                description: |-
+                  Git provenance for runs against a git-sourced CodeLocation.
+                  Stamped on CREATE by the admission webhook from the CL's
+                  status, or, for a digest-pinned `image`, by the code-location pod
+                  that launches the run (its own tree); immutable after; absent for
+                  image-mode runs. In shared workspace mode nothing downstream fetches
+                  from these coordinates: the commit, runtime image, path and
+                  dependencies name the tree to mount, the rest is the run's
+                  provenance record.
+                nullable: true
+                properties:
+                  dependencies:
+                    default:
+                      mode: auto
+                    properties:
+                      extras:
+                        description: '`uvSync` mode: `--extra` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      files:
+                        description: '`requirements` mode: files relative to `path`. Default `requirements.txt`.'
+                        items:
+                          type: string
+                        type: array
+                      groups:
+                        description: '`uvSync` mode: `--group` passthrough.'
+                        items:
+                          type: string
+                        type: array
+                      mode:
+                        default: auto
+                        description: |-
+                          `auto` reads `path`: `uvSync` when `uv.lock` exists, else
+                          `requirements` when `requirements.txt` exists, else, with a
+                          `pyproject.toml`, `uvSync` when the workspace root uv reports for the
+                          project (`uv workspace dir`) is inside the checkout and has `uv.lock`;
+                          a project with no lock of its own under a `uv.lock` that uv does not
+                          count it in (missing from `members`, `exclude`d, or the lock of a
+                          plain project) fails the build; else installs nothing. Detection
+                          happens in the workspace pod — the operator never reads repo contents.
+                        enum:
+                        - auto
+                        - uvSync
+                        - requirements
+                        - none
+                        type: string
+                      timeoutSeconds:
+                        description: Wall-clock budget for fetch + install. Default 600s.
+                        format: uint64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  git:
+                    properties:
+                      commit:
+                        description: Full commit SHA in lowercase — the pin.
+                        pattern: ^[0-9a-f]{40}$
+                        type: string
+                      path:
+                        nullable: true
+                        type: string
+                      ref:
+                        description: Matched ref (`refs/heads/main`) — fetch fallback + display.
+                        nullable: true
+                        type: string
+                      secretName:
+                        description: Credentials Secret name, mounted by every pod that builds the tree.
+                        nullable: true
+                        type: string
+                      url:
+                        type: string
+                    required:
+                    - commit
+                    - url
+                    type: object
+                  runtimeImage:
+                    description: |-
+                      Digest-pinned runtime image the tree's venv is built with — the
+                      CodeLocation's resolved runtime image. It runs the workspace init
+                      container; `spec.image` runs only the main container.
+                    type: string
+                required:
+                - git
+                - runtimeImage
+                type: object
               surrealEndpoint:
                 default: ws://surrealdb.rivers.svc:8000
                 type: string

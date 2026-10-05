@@ -9,6 +9,13 @@ name: release-python
 # Platforms: linux-gnu/{x86_64, aarch64} (manylinux_2_28),
 # linux-musl/{x86_64, aarch64} (musllinux_1_2), macos/{x86_64, arm64},
 # windows/x86_64.
+#
+# The linux-gnu wheels also go into the rivers-runtime image, the default
+# image of git-sourced CodeLocations. One multi-arch (amd64 + arm64) tag per
+# Python version: ghcr.io/<owner>/rivers-runtime:<version>-py<python>.
+# One-time setup: after the first push, make the rivers-runtime package
+# public (Settings → Packages), or clusters cannot read it without
+# credentials.
 
 on:
   push:
@@ -396,3 +403,206 @@ jobs:
         with:
           command: upload
           args: --non-interactive --skip-existing dist/*
+
+  # One single-arch rivers-runtime image per (Python, arch), built on a
+  # native runner from this release's glibc wheel; runtime-manifest stitches
+  # each Python version into one multi-arch tag.
+  build-runtime:
+    name: Build rivers-runtime (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read       # checkout sources
+
+    strategy:
+      fail-fast: true
+      matrix:
+        # Static musl binaries, built natively on each arch: the runtime
+        # image copies them whatever its libc.
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        uses: ./.github/actions/set-release-version
+        with:
+          version: ${{ steps.version.outputs.version }}
+
+      - name: Setup environment (no cache — release builds run from fresh state)
+        uses: ./.github/actions/setup-env
+        with:
+          cache: "false"
+
+      - name: Add the musl target
+        run: rustup target add "${TARGET}"
+
+      - name: Build rivers-runtime
+        run: cargo build --release -p rivers-runtime --target "${TARGET}"
+
+      - name: Upload rivers-runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rivers-runtime-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/rivers-runtime
+          if-no-files-found: error
+          retention-days: 1
+
+  build-runtime-images:
+    name: Build & push rivers-runtime py${{ matrix.python }} (${{ matrix.platform.arch }})
+    needs: [build-linux, build-runtime]
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read       # checkout Dockerfile.runtime
+      packages: write      # push images to ghcr.io
+      id-token: write      # OIDC for Sigstore signing via attest-build-provenance
+      attestations: write  # publish SLSA provenance to repo attestation log
+
+    strategy:
+      fail-fast: true
+      matrix:
+        # Keep in sync with runtime-manifest, the Dockerfile.runtime header,
+        # and the chart's codeLocation.runtime.pythonVersion default.
+        python: ["3.11", "3.12", "3.13"]
+        platform:
+          - arch: amd64
+            runner: ubuntu-latest
+            wheel: wheel-linux-gnu-x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            wheel: wheel-linux-gnu-aarch64
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: rivers-runtime
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the glibc wheel for this arch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.platform.wheel }}
+          path: staging/wheels/
+
+      - name: Download rivers-runtime for this arch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rivers-runtime-${{ matrix.platform.arch }}
+          path: staging/
+
+      - name: Resolve image ref
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+          PYTHON: ${{ matrix.python }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          version="${REF_NAME#v}"
+          repo="${REGISTRY}/${owner_lc}/${IMAGE_NAME}"
+          {
+            echo "repo=${repo}"
+            echo "version=${version}"
+            echo "arch_tag=${repo}:${version}-py${PYTHON}-${ARCH}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: staging
+          file: deploy/docker/Dockerfile.runtime
+          platforms: linux/${{ matrix.platform.arch }}
+          push: true
+          tags: ${{ steps.ref.outputs.arch_tag }}
+          build-args: |
+            PYTHON_VERSION=${{ matrix.python }}
+            RIVERS_VERSION=${{ steps.ref.outputs.version }}
+            RIVERS_REVISION=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ steps.ref.outputs.repo }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  runtime-manifest:
+    name: Multi-arch manifest (rivers-runtime py${{ matrix.python }})
+    needs: build-runtime-images
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write  # push the multi-arch index manifest to ghcr.io
+
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: rivers-runtime
+
+    steps:
+      - name: Resolve refs
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+          PYTHON: ${{ matrix.python }}
+        run: |
+          owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "repo=${REGISTRY}/${owner_lc}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${REF_NAME#v}-py${PYTHON}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        env:
+          REPO: ${{ steps.ref.outputs.repo }}
+          TAG: ${{ steps.ref.outputs.tag }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REPO}:${TAG}" \
+            "${REPO}:${TAG}-amd64" \
+            "${REPO}:${TAG}-arm64"

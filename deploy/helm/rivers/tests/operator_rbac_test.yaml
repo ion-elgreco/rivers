@@ -1,0 +1,22 @@
+suite: operator RBAC
+templates:
+  - templates/operator-rbac.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: lets the operator delete the workspace of a code location that leaves git
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get", "list", "watch", "create", "delete"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

@@ -137,9 +137,10 @@ impl K8sParams {
                  RunBackendConfig.kubernetes()",
             )
         })?;
-        // `code_location_name` is operator-stamped into the daemon pod's env
-        // by the CodeLocation reconciler — not a user-facing knob, so it's
-        // read at the boundary rather than threaded through the Python API.
+        // `code_location_name` and `source` are operator-stamped into the
+        // daemon pod's env by the CodeLocation reconciler — not user-facing
+        // knobs, so they're read at the boundary rather than threaded
+        // through the Python API.
         let code_location_name = rivers_k8s::env::detect_code_location_name().unwrap_or_default();
         Ok(rivers_k8s::run_backend::K8sRunBackendConfig {
             image,
@@ -154,6 +155,7 @@ impl K8sParams {
             labels: BTreeMap::default(),
             code_location_name,
             code_location_id,
+            source: rivers_k8s::env::detect_run_source(),
         })
     }
 }

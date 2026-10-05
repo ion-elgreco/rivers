@@ -46,6 +46,13 @@ impl LeaderGate {
         }
     }
 
+    #[cfg(test)]
+    pub fn leading() -> Self {
+        let gate = Self::new();
+        gate.is_leader.store(true, Ordering::SeqCst);
+        gate
+    }
+
     /// `true` if this process currently holds the lease. Stale by at most
     /// [`LEASE_RENEW_INTERVAL`] in the worst case.
     pub fn is_leader(&self) -> bool {

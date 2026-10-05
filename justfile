@@ -10,6 +10,8 @@ profile := env_var_or_default("PROFILE", "dev")
 # profile (release, ci, ...) outputs to `target/<triple>/<profile>/`.
 
 profile_dir := if profile == "dev" { "debug" } else { profile }
+# The pod-side binary the k8s tests run (python/tests/k8s), built by `_runtime-bin`.
+runtime_bin := justfile_directory() + "/target/" + profile_dir + "/rivers-runtime"
 
 # Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
 # behavior. Keep in sync with the pipx install in .github/actions/setup-env.
@@ -43,32 +45,36 @@ wasm-dev:
     wasm-bindgen target/wasm32-unknown-unknown/{{ profile_dir }}/rivers_ui.wasm --out-dir rust/rivers-ui/pkg --target web --no-typescript
 
 # Build and install rivers as editable (release WASM — use for UI work or shipping)
-develop: venv wasm
+develop: venv wasm _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # Faster develop for non-UI work — dev-profile WASM build (preserves panic symbols, larger blob; don't use for k8s/release)
-develop-fast: venv wasm-dev
+develop-fast: venv wasm-dev _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # develop-fast for free-threaded Python (3.14t), into .venv-ft
-develop-ft: venv-ft wasm-dev
+develop-ft: venv-ft wasm-dev _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv-ft' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --profile {{ profile }}
 
 # Build and install rivers as editable (release mode, stripped WASM)
-develop-release: venv wasm
+develop-release: venv wasm _runtime-bin
     cd python && VIRTUAL_ENV='{{ justfile_directory() }}/.venv' uvx --from 'maturin[zig]' --with 'ziglang=={{ ziglang_version }}' maturin develop --release
 
+# rivers-runtime for the host, as `just test` runs it; the profile follows PROFILE like maturin's.
+_runtime-bin:
+    cargo build -p rivers-runtime --profile {{ profile }}
+
 # Run Python tests
-test:
-    uv run --no-sync pytest python/
+test: _runtime-bin
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest python/
 
 # Run Python tests on free-threaded Python; an import that turns the GIL back on fails
-test-ft:
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
+test-ft: _runtime-bin
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
 
 # Run Python tests (excluding spark tests)
-test-dev:
-    uv run --no-sync pytest -m "not spark_test" python/
+test-dev: _runtime-bin
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "not spark_test" python/
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
@@ -104,7 +110,7 @@ pre-commit-check:
     uv run --no-sync rumdl check . --flavor mkdocs --fail-on never --disable MD013,MD033,MD041
     uv run --no-sync ruff check python/
     uv run --no-sync ruff format --check --diff python/
-    uv run --no-sync typos python/
+    uv run --no-sync typos .
     cd python && uv run --no-sync pyright .
 
 # Start the example project dev UI (optionally with a synthetic graph: just demo 1k)
@@ -189,6 +195,8 @@ site-deploy push="--push":
 # === K8s Integration Testing ===
 
 linux_target := "aarch64-unknown-linux-gnu"
+# rivers-runtime is static: the runtime image copies it whatever its libc.
+linux_musl_target := "aarch64-unknown-linux-musl"
 cluster_name := env_var_or_default("RIVERS_K3D_CLUSTER", "rivers-test")
 
 # Regenerate CRD YAML from Rust types (source of truth) into the rivers-crds Helm chart
@@ -214,6 +222,10 @@ k8s-build: _k8s-compile
     cp python/pyproject.toml deploy/staging/pyproject.toml
     cp -r dev/k3d/k8s_test_pipeline deploy/staging/k8s_test_pipeline
     docker build -f dev/k3d/Dockerfile.code-location -t rivers-code-location:latest deploy/staging
+    # rivers-runtime: the git-sourced CodeLocation base image.
+    mkdir -p deploy/staging/wheels && cp dist/*.whl deploy/staging/wheels/
+    cp target/{{ linux_musl_target }}/debug/rivers-runtime deploy/staging/
+    docker build -f deploy/docker/Dockerfile.runtime -t rivers-runtime:latest deploy/staging
     if [ "${RIVERS_K8S_SKIP_DEMO:-}" != "1" ]; then
         cp -r examples/demo_project deploy/staging/demo_project
         docker build -f dev/k3d/Dockerfile.demo -t rivers-demo:latest deploy/staging
@@ -228,6 +240,8 @@ _k8s-compile: wasm _k8s-wheel
     #!/usr/bin/env bash
     set -euo pipefail
     cargo zigbuild -p rivers-operator --target {{ linux_target }}
+    rustup target add {{ linux_musl_target }} >/dev/null
+    cargo zigbuild -p rivers-runtime --target {{ linux_musl_target }}
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
     fi

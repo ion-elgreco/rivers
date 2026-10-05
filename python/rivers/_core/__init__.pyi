@@ -114,6 +114,8 @@ class RunBackendConfig:
 
         Args:
             image: Container image for run/worker pods (defaults to the running image).
+                With a git-sourced CodeLocation it runs the code location's tree,
+                so build it ``FROM`` the runtime image.
             namespace: K8s namespace; falls back to the pod's own namespace.
             service_account: Service account bound to the pods.
             run_cpu: CPU request/limit for the run pod.

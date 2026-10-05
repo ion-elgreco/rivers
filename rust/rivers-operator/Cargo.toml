@@ -28,7 +28,7 @@ rustls.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 jiff.workspace = true
 uuid.workspace = true
 futures-util = { workspace = true }
@@ -51,6 +51,19 @@ axum-server.workspace = true
 json-patch = "4"
 jsonptr = "0.7"
 mimalloc = "0.1"
+# git ref→commit resolution: pkt-line framing for the v0 ref
+# advertisement, decoded as it arrives — same matcher for the HTTPS and SSH
+# transports.
+gix-packetline = "0.22"
+# In-process SSH for `git-upload-pack` polling — the only transport shape
+# that works in the distroless operator image (no ssh binary) without
+# pulling OpenSSL in via libssh2. `ring` matches the workspace's rustls
+# provider; `rsa`/`flate2` cover common deploy keys and transport compression.
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+# HMAC-SHA1 of hashed (`|1|`) known_hosts entries: russh matches those only
+# in files, and the operator keeps the git Secret in memory.
+ring = "0.17"
+url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

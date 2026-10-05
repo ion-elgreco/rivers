@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
-use k8s_openapi::api::core::v1::{Pod, PodStatus};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, PodStatus, Secret};
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
-use rivers_k8s::crd::run::{Run, RunCrdStatus, RunSpec};
+use rivers_k8s::crd::run::{Run, RunCrdStatus, RunSource, RunSpec};
 
 use super::reconcile::Context;
 use crate::codelocation::DirectoryState;
@@ -26,8 +27,25 @@ pub struct ApiRequest {
 
 #[derive(Clone)]
 pub struct MockApiState {
+    /// A LIST answers the pods of its namespace that have every label of
+    /// its `labelSelector`.
     pub pods: BTreeMap<String, Pod>,
     pub code_locations: BTreeMap<String, CodeLocation>,
+    /// An apply replaces only `spec`: the seeded `metadata.generation` and
+    /// `status` stand for what the Deployment controller reports.
+    pub deployments: BTreeMap<String, Deployment>,
+    /// What a GET of each Secret answers: the Secret, or an API error. A
+    /// Secret not listed is not found.
+    pub secrets: BTreeMap<String, Result<Secret, kube_core::Status>>,
+    /// The ConfigMaps, by name: an apply replaces one, a GET answers it, a
+    /// DELETE removes it.
+    pub config_maps: BTreeMap<String, ConfigMap>,
+    /// The PVCs, by name: a create adds one, a GET answers it, a DELETE
+    /// removes it.
+    pub pvcs: BTreeMap<String, PersistentVolumeClaim>,
+    /// Writes the API server refuses, by `<plural>/<name>` of the object: a
+    /// create or apply of it answers this Status and changes nothing.
+    pub refused: BTreeMap<String, kube_core::Status>,
     pub requests: Vec<ApiRequest>,
 }
 
@@ -44,6 +62,11 @@ impl Default for MockApiState {
         Self {
             pods: BTreeMap::new(),
             code_locations,
+            deployments: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+            config_maps: BTreeMap::new(),
+            pvcs: BTreeMap::new(),
+            refused: BTreeMap::new(),
             requests: Vec::new(),
         }
     }
@@ -55,6 +78,7 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
         async move {
             let method = req.method().to_string();
             let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or_default().to_string();
 
             let body_bytes = req.into_body().collect().await.ok().map(|b| b.to_bytes());
             let body_json: Option<serde_json::Value> = body_bytes
@@ -65,12 +89,22 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
             s.requests.push(ApiRequest {
                 method: method.clone(),
                 path: path.clone(),
-                body: body_json,
+                body: body_json.clone(),
             });
 
+            if let Some(status) = written_object(&method, &path, body_json.as_ref())
+                .and_then(|object| s.refused.get(&object))
+            {
+                return Ok(json_response(
+                    status.code,
+                    &serde_json::to_value(status).unwrap(),
+                ));
+            }
             let response = match method.as_str() {
                 "GET" => {
-                    if path.contains("/pods/") {
+                    if path.ends_with("/pods") {
+                        json_response(200, &pod_list(&s.pods, &path, &query))
+                    } else if path.contains("/pods/") {
                         let pod_name = path.rsplit('/').next().unwrap_or("");
                         if let Some(pod) = s.pods.get(pod_name) {
                             json_response(200, &serde_json::to_value(pod).unwrap())
@@ -84,9 +118,44 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                         } else {
                             json_response(404, &not_found_status())
                         }
+                    } else if let Some(name) = object_name(&path, "deployments") {
+                        match s.deployments.get(name) {
+                            Some(d) => json_response(200, &serde_json::to_value(d).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
+                    } else if let Some(name) = object_name(&path, "secrets") {
+                        match s.secrets.get(name) {
+                            Some(Ok(secret)) => {
+                                json_response(200, &serde_json::to_value(secret).unwrap())
+                            }
+                            Some(Err(status)) => {
+                                json_response(status.code, &serde_json::to_value(status).unwrap())
+                            }
+                            None => json_response(404, &not_found_status()),
+                        }
+                    } else if let Some(name) = object_name(&path, "persistentvolumeclaims") {
+                        match s.pvcs.get(name) {
+                            Some(pvc) => json_response(200, &serde_json::to_value(pvc).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
+                    } else if let Some(name) = object_name(&path, "configmaps") {
+                        match s.config_maps.get(name) {
+                            Some(cm) => json_response(200, &serde_json::to_value(cm).unwrap()),
+                            None => json_response(404, &not_found_status()),
+                        }
                     } else {
                         json_response(200, &serde_json::json!({}))
                     }
+                }
+                "POST" if path.ends_with("/persistentvolumeclaims") => {
+                    let pvc: PersistentVolumeClaim = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok())
+                        .unwrap_or_default();
+                    let response = json_response(201, &serde_json::to_value(&pvc).unwrap());
+                    s.pvcs
+                        .insert(pvc.metadata.name.clone().unwrap_or_default(), pvc);
+                    response
                 }
                 "POST" => {
                     let body = body_bytes.map(|b| b.to_vec()).unwrap_or_default();
@@ -100,6 +169,10 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                     if path.contains("/pods/") {
                         let pod_name = path.rsplit('/').next().unwrap_or("");
                         s.pods.remove(pod_name);
+                    } else if let Some(name) = object_name(&path, "persistentvolumeclaims") {
+                        s.pvcs.remove(name);
+                    } else if let Some(name) = object_name(&path, "configmaps") {
+                        s.config_maps.remove(name);
                     }
                     json_response(
                         200,
@@ -111,6 +184,43 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
                             "code": 200
                         }),
                     )
+                }
+                "PATCH" if object_name(&path, "deployments").is_some() => {
+                    let name = object_name(&path, "deployments").unwrap();
+                    let applied: Option<Deployment> = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok());
+                    let stored = s.deployments.entry(name.to_string()).or_default();
+                    if let Some(applied) = applied {
+                        stored.spec = applied.spec;
+                    }
+                    json_response(200, &serde_json::to_value(&*stored).unwrap())
+                }
+                "PATCH" if object_name(&path, "configmaps").is_some() => {
+                    let name = object_name(&path, "configmaps").unwrap();
+                    let applied: ConfigMap = body_json
+                        .as_ref()
+                        .and_then(|b| serde_json::from_value(b.clone()).ok())
+                        .unwrap_or_default();
+                    let response = json_response(200, &serde_json::to_value(&applied).unwrap());
+                    s.config_maps.insert(name.to_string(), applied);
+                    response
+                }
+                "PATCH" if path.contains("/services/") => {
+                    json_response(200, body_json.as_ref().unwrap_or(&serde_json::json!({})))
+                }
+                "PATCH" if object_name(&path, "codelocations").is_some() => {
+                    let name = object_name(&path, "codelocations").unwrap();
+                    let status = body_json.as_ref().and_then(|b| b.get("status")).cloned();
+                    match s.code_locations.get_mut(name) {
+                        Some(cl) => {
+                            if let Some(status) = status {
+                                cl.status = serde_json::from_value(status).ok();
+                            }
+                            json_response(200, &serde_json::to_value(&*cl).unwrap())
+                        }
+                        None => json_response(404, &not_found_status()),
+                    }
                 }
                 "PATCH" => {
                     let run_json = serde_json::json!({
@@ -137,6 +247,55 @@ pub fn mock_client(state: Arc<Mutex<MockApiState>>) -> kube_client::Client {
     kube_client::Client::new(service, "default")
 }
 
+/// The pods of `path`'s namespace with every `k=v` label of `query`'s
+/// `labelSelector`, as a PodList.
+fn pod_list(pods: &BTreeMap<String, Pod>, path: &str, query: &str) -> serde_json::Value {
+    let namespace = path
+        .split("/namespaces/")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next());
+    let selector: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == "labelSelector")
+        .flat_map(|(_, terms)| {
+            terms
+                .split(',')
+                .filter_map(|term| {
+                    let (key, value) = term.split_once('=')?;
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let items: Vec<&Pod> = pods
+        .values()
+        .filter(|pod| namespace.is_none() || pod.metadata.namespace.as_deref() == namespace)
+        .filter(|pod| {
+            selector.iter().all(|(key, value)| {
+                pod.metadata.labels.as_ref().and_then(|l| l.get(key)) == Some(value)
+            })
+        })
+        .collect();
+    serde_json::json!({ "apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": items })
+}
+
+/// `<plural>/<name>` of the object that a create (POST) or an apply (PATCH)
+/// writes.
+fn written_object(method: &str, path: &str, body: Option<&serde_json::Value>) -> Option<String> {
+    let mut parts = path.split("/namespaces/").nth(1)?.split('/').skip(1);
+    let plural = parts.next()?;
+    let name = match method {
+        "POST" => body?.pointer("/metadata/name")?.as_str()?,
+        "PATCH" => parts.next()?,
+        _ => return None,
+    };
+    Some(format!("{plural}/{name}"))
+}
+
+/// `x` in `…/<plural>/x` or `…/<plural>/x/status`.
+fn object_name<'a>(path: &'a str, plural: &str) -> Option<&'a str> {
+    path.split(&format!("/{plural}/")).nth(1)?.split('/').next()
+}
+
 fn json_response(status: u16, body: &serde_json::Value) -> Response<http_body_util::Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -157,6 +316,66 @@ fn not_found_status() -> serde_json::Value {
         "reason": "NotFound",
         "code": 404
     })
+}
+
+const GIT_URL: &str = "https://forge.example/acme/pipelines.git";
+
+/// `demo` as a git CodeLocation; `workspace_size` sets `spec.git.workspaceSize`.
+pub fn git_code_location(workspace_size: Option<&str>) -> CodeLocation {
+    let spec = serde_json::from_value(serde_json::json!({
+        "git": {
+            "url": GIT_URL,
+            "ref": { "branch": "main" },
+            "workspaceSize": workspace_size,
+        },
+    }))
+    .unwrap();
+    CodeLocation::new("demo", spec)
+}
+
+/// The source of a run of [`git_code_location`].
+pub fn git_run_source() -> RunSource {
+    serde_json::from_value(serde_json::json!({
+        "git": {
+            "url": GIT_URL,
+            "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+            "ref": "refs/heads/main",
+        },
+        "dependencies": { "mode": "auto" },
+        "runtimeImage": format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a2b3c4d".repeat(8)),
+    }))
+    .unwrap()
+}
+
+/// The body of the last pod create request.
+pub fn created_pod(state: &MockApiState) -> Pod {
+    let create = state
+        .requests
+        .iter()
+        .rev()
+        .find(|r| r.method == "POST" && r.path.ends_with("/pods"))
+        .expect("no pod create request");
+    serde_json::from_value(create.body.clone().expect("pod create has no body")).unwrap()
+}
+
+/// A git-mode pod's `emptyDir` cap: on its `workspace` volume, and in the
+/// `RIVERS_WORKSPACE_EMPTYDIR_LIMIT` it hands to the step Jobs it launches.
+pub fn emptydir_limits(pod: &Pod) -> (Option<String>, Option<String>) {
+    let spec = pod.spec.as_ref().expect("pod has a spec");
+    let volume = spec
+        .volumes
+        .iter()
+        .flatten()
+        .find(|v| v.name == rivers_k8s::workspace::WORKSPACE_VOLUME)
+        .and_then(|v| v.empty_dir.as_ref()?.size_limit.as_ref())
+        .map(|q| q.0.clone());
+    let env = spec.containers[0]
+        .env
+        .iter()
+        .flatten()
+        .find(|e| e.name == rivers_k8s::env::ENV_WORKSPACE_EMPTYDIR_LIMIT)
+        .and_then(|e| e.value.clone());
+    (volume, env)
 }
 
 pub fn test_run_spec() -> RunSpec {
@@ -225,6 +444,7 @@ pub fn make_context(client: kube_client::Client, storage: Arc<SurrealStorage>) -
         namespace: "default".to_string(),
         storage,
         directory: Arc::new(DirectoryState::new()),
+        workspace: crate::codelocation::WorkspaceConfig::default(),
         surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig::default(),
         otel_pod_cfg: rivers_k8s::env::OtelPodConfig::default(),
     }

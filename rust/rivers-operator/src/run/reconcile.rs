@@ -7,7 +7,7 @@ use kube_client::{Api, ResourceExt};
 use kube_runtime::controller::Action;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{RunOutcome, RunStatus, StorageBackend};
-use rivers_k8s::crd::code_location::CodeLocation;
+use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
 use rivers_k8s::crd::run::{CONDITION_EXECUTOR_READY, Run, RunCondition, RunCrdStatus, RunPhase};
 
 use super::cancel;
@@ -29,10 +29,13 @@ pub struct Context {
     pub namespace: String,
     pub storage: Arc<SurrealStorage>,
     /// Shared CodeLocation cache fed by `codelocation::run_watcher`. The
-    /// run reconciler reads `spec.env` from here on every Pending → Running
-    /// transition; on cache miss (startup window before the watcher syncs)
-    /// `fetch_cl_env` falls back to a live API GET.
+    /// run reconciler reads the owning CL's spec from here whenever it
+    /// creates an executor pod; on cache miss (startup window before the
+    /// watcher syncs) `fetch_cl_spec` falls back to a live API GET.
     pub directory: Arc<DirectoryState>,
+    /// Chart-level workspace settings, needed to mount git-mode runs'
+    /// trees onto their executor pods.
+    pub workspace: crate::codelocation::WorkspaceConfig,
     /// SurrealDB connection bundle stamped onto every Run pod the operator
     /// creates.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
@@ -81,25 +84,26 @@ pub async fn reconcile(run: Arc<Run>, ctx: Arc<Context>) -> Result<Action, Error
     }
 }
 
-/// Look up a Run's owning CodeLocation and return its `spec.env`. Reads from
-/// the operator's shared cache (populated by `codelocation::run_watcher`)
-/// and falls back to a live API GET on miss — covers the brief startup
-/// window before the watcher's initial sync. Errors (CR missing, no RBAC,
-/// transient API failure) bubble up so the reconciler requeues; we never
-/// want to launch a run pod with a partial env list and silently lose
-/// user-declared `secretKeyRef`s.
-pub(crate) async fn fetch_cl_env(
+/// Look up a Run's owning CodeLocation and return its spec. Reads from the
+/// operator's shared cache (populated by `codelocation::run_watcher`) and
+/// falls back to a live API GET on miss — covers the brief startup window
+/// before the watcher's initial sync. Errors (CR missing, no RBAC, transient
+/// API failure) bubble up so the reconciler requeues; we never want to
+/// launch a run pod with a partial env list (silently losing user-declared
+/// `secretKeyRef`s) or a workspace sized without the CL's
+/// `spec.git.workspaceSize`.
+pub(crate) async fn fetch_cl_spec(
     ctx: &Context,
     run: &Run,
-) -> Result<Vec<k8s_openapi::api::core::v1::EnvVar>, Error> {
+) -> Result<Arc<CodeLocationSpec>, Error> {
     let namespace = run.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let cl_name = &run.spec.code_location_ref.name;
     if let Some(spec) = ctx.directory.lookup_spec(&namespace, cl_name).await {
-        return Ok(spec.env.clone());
+        return Ok(spec);
     }
     let cls_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), &namespace);
     let cl = cls_api.get(cl_name).await?;
-    Ok(cl.spec.env)
+    Ok(Arc::new(cl.spec))
 }
 
 /// Phase-specific retry tuning lives inside `reconcile()`; this is the
@@ -139,15 +143,16 @@ async fn reconcile_pending(
     let run_id = status.run_id.as_deref().unwrap();
     let pod_name = executor_pod_name(name);
 
-    let cl_env = fetch_cl_env(ctx, run).await?;
+    let cl_spec = fetch_cl_spec(ctx, run).await?;
     let pod = build_executor_pod(
         run,
         &pod_name,
         run_id,
         false,
-        &cl_env,
+        &cl_spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
+        &ctx.workspace,
     );
     match pods_api.create(&PostParams::default(), &pod).await {
         Ok(_) => {
@@ -580,5 +585,33 @@ mod tests {
         assert_eq!(c.reason.as_deref(), Some("TestReason"));
         assert!(c.last_transition_time.is_some());
         assert!(c.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_git_run_pod_gets_its_code_locations_workspace_size() {
+        use crate::run::test_helpers::*;
+        use std::sync::Mutex;
+
+        let mut api = MockApiState::default();
+        api.code_locations
+            .insert("demo".to_string(), git_code_location(Some("10Gi")));
+        let api_state = Arc::new(Mutex::new(api));
+        let client = mock_client(api_state.clone());
+        let runs_api: Api<Run> = Api::namespaced(client.clone(), "default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), "default");
+        let ctx = make_context(client, memory_storage().await);
+        let mut run = test_run_running("run-1", None);
+        run.status.as_mut().unwrap().phase = Some(RunPhase::Pending);
+        run.spec.source = Some(git_run_source());
+
+        reconcile_pending(&runs_api, &pods_api, &ctx, &run, "test-run")
+            .await
+            .unwrap();
+
+        let pod = created_pod(&api_state.lock().unwrap());
+        assert_eq!(
+            emptydir_limits(&pod),
+            (Some("10Gi".to_string()), Some("10Gi".to_string()))
+        );
     }
 }

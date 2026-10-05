@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, WWW_AUTHENTICATE,
+    ACCEPT, AUTHORIZATION, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER,
+    WWW_AUTHENTICATE,
 };
 use reqwest::{Method, StatusCode};
 use thiserror::Error;
@@ -159,7 +160,7 @@ impl RegistryClient {
     /// passes the value parsed from `RIVERS_ALLOW_INSECURE_REGISTRY`.
     pub fn with_insecure(allow_insecure: bool) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("rivers-operator/", env!("CARGO_PKG_VERSION")))
+            .user_agent(super::USER_AGENT)
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builds with default TLS");
@@ -494,13 +495,20 @@ fn interpret_response(response: reqwest::Response) -> Result<HeadOutcome, Regist
     Ok(HeadOutcome::Fresh { digest, etag })
 }
 
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get("retry-after")?.to_str().ok()?;
-    if let Ok(secs) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    // HTTP-date format — we don't bother parsing it; fall back to the default.
-    None
+/// `Retry-After` as a wait: delta-seconds, or an HTTP-date from now. `None`
+/// when absent, unreadable, or asking for no wait.
+pub(super) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let wait = match raw.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => {
+            let at = jiff::fmt::rfc2822::DateTimeParser::new()
+                .parse_timestamp(raw)
+                .ok()?;
+            Duration::try_from(at.duration_since(jiff::Timestamp::now())).ok()?
+        }
+    };
+    (!wait.is_zero()).then_some(wait)
 }
 
 fn base_accept_headers() -> HeaderMap {
@@ -539,12 +547,51 @@ fn apply_auth(headers: &mut HeaderMap, auth: &RegistryAuth) {
     }
 }
 
-fn exponential_backoff(consecutive_errors: u32, cap: Duration) -> Duration {
+pub(super) fn exponential_backoff(consecutive_errors: u32, cap: Duration) -> Duration {
     let base = Duration::from_secs(60);
     // 1, 2, 4, 8, 16 ... minutes, capped.
     let shift = consecutive_errors.saturating_sub(1).min(12);
     let scaled = base.saturating_mul(1u32 << shift);
     std::cmp::min(scaled, cap)
+}
+
+/// `[host[:port]/]path[:tag][@sha256:<hex>]`: only a `:` after the last `/`
+/// starts a tag.
+static IMAGE_REF_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"^(?P<repository>(?:[^/:@\s]+(?::[0-9]+)?/)?[^/:@\s]+(?:/[^/:@\s]+)*)",
+        r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?",
+        r"(?:@(?P<digest>sha256:[0-9a-f]{64}))?$",
+    ))
+    .unwrap()
+});
+
+/// An image reference split into its repository (registry host included),
+/// tag and digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRef {
+    pub repository: String,
+    pub tag: Option<String>,
+    pub digest: Option<String>,
+}
+
+impl std::str::FromStr for ImageRef {
+    type Err = anyhow::Error;
+
+    fn from_str(reference: &str) -> anyhow::Result<Self> {
+        let parts = IMAGE_REF_RE.captures(reference).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{reference}' is not an image reference \
+                 (repository[:tag][@sha256:<64 lowercase hex>])"
+            )
+        })?;
+        let part = |name| parts.name(name).map(|m| m.as_str().to_string());
+        Ok(Self {
+            repository: parts["repository"].to_string(),
+            tag: part("tag"),
+            digest: part("digest"),
+        })
+    }
 }
 
 /// Parse `image` into `(registry, repository)`. Docker-style shorthand
@@ -656,6 +703,83 @@ mod tests {
     }
 
     #[test]
+    fn image_ref_splits_repository_tag_and_digest() {
+        let digest = format!("sha256:{}", "0a".repeat(32));
+        let pinned = format!("ghcr.io/acme/rt@{digest}");
+        let tagged_and_pinned = format!("localhost:5111/rt:dev@{digest}");
+        let cases = [
+            (
+                "ghcr.io/ion-elgreco/rivers-runtime:0.5.0-py3.12",
+                "ghcr.io/ion-elgreco/rivers-runtime",
+                Some("0.5.0-py3.12"),
+                None,
+            ),
+            (
+                rivers_k8s::defaults::RUNTIME_IMAGE,
+                "ghcr.io/ion-elgreco/rivers-runtime",
+                Some(concat!(env!("CARGO_PKG_VERSION"), "-py3.12")),
+                None,
+            ),
+            (
+                "localhost:5111/rivers-runtime:dev",
+                "localhost:5111/rivers-runtime",
+                Some("dev"),
+                None,
+            ),
+            (
+                "localhost:5111/rivers-runtime",
+                "localhost:5111/rivers-runtime",
+                None,
+                None,
+            ),
+            ("rivers-runtime", "rivers-runtime", None, None),
+            (&pinned, "ghcr.io/acme/rt", None, Some(digest.as_str())),
+            (
+                &tagged_and_pinned,
+                "localhost:5111/rt",
+                Some("dev"),
+                Some(digest.as_str()),
+            ),
+        ];
+        for (reference, repository, tag, digest) in cases {
+            let expected = ImageRef {
+                repository: repository.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.map(str::to_string),
+            };
+            assert_eq!(
+                reference.parse::<ImageRef>().unwrap(),
+                expected,
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_ref_rejects_malformed_references() {
+        let short_digest = "ghcr.io/acme/rt@sha256:abc".to_string();
+        let upper_digest = format!("ghcr.io/acme/rt@sha256:{}", "AB".repeat(32));
+        let sha512 = format!("ghcr.io/acme/rt@sha512:{}", "ab".repeat(64));
+        for reference in [
+            "",
+            "ghcr.io/acme/rt:",
+            "ghcr.io/acme/rt/",
+            "ghcr.io//rt",
+            "ghcr.io/acme/rt:a:b",
+            "ghcr.io/acme/rt latest",
+            &short_digest,
+            &upper_digest,
+            &sha512,
+        ] {
+            let err = reference.parse::<ImageRef>().unwrap_err();
+            assert!(
+                err.to_string().contains("is not an image reference"),
+                "{reference}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn bearer_challenge_parses() {
         let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#;
         let c = BearerChallenge::parse(header).unwrap();
@@ -672,6 +796,37 @@ mod tests {
         assert_eq!(exponential_backoff(3, cap), Duration::from_secs(240));
         // Ramps up to 1h and then stays there.
         assert_eq!(exponential_backoff(20, cap), cap);
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        let headers = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        let in_secs = |secs: i64| {
+            jiff::fmt::rfc2822::DateTimePrinter::new()
+                .timestamp_to_rfc9110_string(
+                    &(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(secs)),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(
+            parse_retry_after(&headers("120")),
+            Some(Duration::from_secs(120))
+        );
+        let date = parse_retry_after(&headers(&in_secs(900))).expect("an HTTP-date");
+        assert!(
+            (Duration::from_secs(898)..=Duration::from_secs(900)).contains(&date),
+            "{date:?}"
+        );
+        // No wait asked for, or nothing readable: the caller's default applies.
+        for value in ["0", &in_secs(-60), "soon", ""] {
+            assert_eq!(parse_retry_after(&headers(value)), None, "{value:?}");
+        }
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
     }
 
     #[test]

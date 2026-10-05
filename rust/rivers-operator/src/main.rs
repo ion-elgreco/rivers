@@ -43,6 +43,7 @@ const WEBHOOK_DISABLED_ENV: &str = "RIVERS_WEBHOOK_DISABLED";
 // HTTPS. Only useful for trusted in-cluster or local-dev registries
 // (e.g. k3d's HTTP-only local registry). Default is HTTPS.
 const ALLOW_INSECURE_REGISTRY_ENV: &str = "RIVERS_ALLOW_INSECURE_REGISTRY";
+const RUNTIME_IMAGE_ENV: &str = "RIVERS_RUNTIME_IMAGE";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let workspace_cfg = codelocation::WorkspaceConfig::from_env()?;
+    let git_cfg = codelocation::git::GitConfig::from_env()?;
 
     let client = Client::try_default().await?;
     let namespace = rivers_k8s::env::detect_namespace();
@@ -88,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         namespace: namespace.clone(),
         storage,
         directory: directory_state.clone(),
+        workspace: workspace_cfg.clone(),
         surreal_pod_cfg: surreal_pod_cfg.clone(),
         otel_pod_cfg: otel_pod_cfg.clone(),
     });
@@ -109,6 +114,17 @@ async fn main() -> anyhow::Result<()> {
             ALLOW_INSECURE_REGISTRY_ENV
         );
     }
+    if git_cfg.allow_insecure {
+        tracing::warn!("operator.git.allowInsecure is set; http:// git urls are allowed");
+    }
+
+    let runtime_image = std::env::var(RUNTIME_IMAGE_ENV)
+        .unwrap_or_else(|_| rivers_k8s::defaults::RUNTIME_IMAGE.to_string())
+        .parse::<codelocation::ImageRef>()
+        .map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
+
+    let run_controller =
+        Controller::new(runs, WatcherConfig::default()).owns(pods, WatcherConfig::default());
 
     let cl_ctx = Arc::new(codelocation::Context {
         client: client.clone(),
@@ -116,6 +132,13 @@ async fn main() -> anyhow::Result<()> {
         registry: Arc::new(codelocation::RegistryClient::with_insecure(
             allow_insecure_registry,
         )),
+        git: Arc::new(codelocation::git::GitResolver::new(
+            git_cfg.timeout,
+            git_cfg.allow_insecure,
+        )),
+        runtime_image: runtime_image.clone(),
+        workspace: workspace_cfg,
+        runs: run_controller.store(),
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
@@ -134,12 +157,19 @@ async fn main() -> anyhow::Result<()> {
         directory_state.clone(),
         Some(synced.clone()),
     )?;
-    spawn_webhook_server(client.clone(), namespace.clone(), directory_state, synced).await?;
+    spawn_webhook_server(
+        client.clone(),
+        namespace.clone(),
+        directory_state,
+        runtime_image,
+        git_cfg,
+        synced,
+    )
+    .await?;
 
     tracing::info!(%pod_identity, "starting rivers-operator");
 
-    let run_controller = Controller::new(runs, WatcherConfig::default())
-        .owns(pods, WatcherConfig::default())
+    let run_controller = run_controller
         .run(run::reconcile, run::error_policy, run_ctx)
         .for_each(|res| async move {
             match res {
@@ -230,6 +260,8 @@ async fn spawn_webhook_server(
     client: Client,
     namespace: String,
     directory: Arc<codelocation::DirectoryState>,
+    runtime_image: codelocation::ImageRef,
+    git: codelocation::git::GitConfig,
     synced: webhook::Synced,
 ) -> anyhow::Result<()> {
     if std::env::var(WEBHOOK_DISABLED_ENV).as_deref() == Ok("1") {
@@ -262,6 +294,8 @@ async fn spawn_webhook_server(
             key_path,
             server_directory,
             code_locations_api,
+            runtime_image,
+            git,
             synced,
         )
         .await

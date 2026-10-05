@@ -7,17 +7,16 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Direct kube subcrate deps — `kube` umbrella replaced with the layers we
-# actually use. `kube-core` needs `schema` for `kube-derive`'s CustomResource
-# expansion. No `kube-runtime`: this crate doesn't run controllers itself
-# (the operator does).
+# The CRD types live in rivers-crd (also linked by rivers-runtime, which
+# must stay small). Direct kube subcrate deps — `kube` umbrella replaced with
+# the layers we actually use. No `kube-runtime`: this crate doesn't run
+# controllers itself (the operator does).
+rivers-crd = { path = "../rivers-crd" }
 kube-client.workspace = true
-kube-derive.workspace = true
 kube-core = { workspace = true, features = ["schema"] }
 k8s-openapi = { workspace = true, features = ["schemars"] }
 kube_quantity.workspace = true
 rust_decimal.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

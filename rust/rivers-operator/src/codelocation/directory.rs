@@ -47,21 +47,22 @@ impl EntryKey {
 }
 
 /// In-memory directory of known CodeLocations, plus a broadcast channel for
-/// live updates. All mutations go through [`DirectoryState::upsert`] /
+/// live updates. All mutations go through
+/// [`DirectoryState::upsert_code_location`] / [`DirectoryState::upsert`] /
 /// [`DirectoryState::delete`] so every observable change emits exactly one
 /// event.
 ///
 /// Two parallel maps:
 /// - `entries` carries the gRPC-projected, status-dependent shape consumed
-///   by the admission webhook and the UI registry stream. Only populated
-///   once a CR has a status (so its `resolved_image` / `grpc_endpoint` are
-///   meaningful).
-/// - `specs` carries the full `CodeLocationSpec` for every CR the watcher
-///   has seen, regardless of status. Used by the run reconciler to resolve
-///   `spec.env` without an extra kube API GET per reconcile.
+///   by the UI registry stream. Only populated once a CR has a status (so
+///   its `resolved_image` / `grpc_endpoint` are meaningful).
+/// - `code_locations` carries every CR the watcher has seen, as one watch
+///   event showed it, regardless of status. The admission webhook reads a
+///   CR's spec and status from it together; the run reconciler resolves
+///   `spec.env` from it without an extra kube API GET per reconcile.
 pub struct DirectoryState {
     entries: RwLock<BTreeMap<EntryKey, CodeLocationEntry>>,
-    specs: RwLock<BTreeMap<EntryKey, Arc<CodeLocationSpec>>>,
+    code_locations: RwLock<BTreeMap<EntryKey, Arc<CodeLocation>>>,
     tx: broadcast::Sender<CodeLocationEvent>,
 }
 
@@ -76,7 +77,7 @@ impl DirectoryState {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             entries: RwLock::new(BTreeMap::new()),
-            specs: RwLock::new(BTreeMap::new()),
+            code_locations: RwLock::new(BTreeMap::new()),
             tx,
         }
     }
@@ -101,23 +102,26 @@ impl DirectoryState {
         }
     }
 
-    /// O(log n) lookup by `(namespace, name)`. Used by the admission webhook
-    /// to resolve a Run's `codeLocationRef` without scanning the snapshot.
-    /// Returns `None` if the entry isn't in the cache; callers may then fall
-    /// back to a live API server `GET` to cover the brief startup window
-    /// where a follower's reflector hasn't seen the CR yet.
-    pub async fn lookup(&self, namespace: &str, name: &str) -> Option<CodeLocationEntry> {
+    /// The CR as the watcher last saw it. Used by the admission webhook to
+    /// resolve a Run's `codeLocationRef`. Returns `None` if the CR isn't in
+    /// the cache; callers may then fall back to a live API server `GET` to
+    /// cover the window where a replica's reflector hasn't seen the CR yet.
+    pub async fn lookup_code_location(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<Arc<CodeLocation>> {
         let key = EntryKey::new(namespace, name);
-        self.entries.read().await.get(&key).cloned()
+        self.code_locations.read().await.get(&key).cloned()
     }
 
-    /// Lookup the cached `CodeLocationSpec` by `(namespace, name)`. Populated
-    /// by the watcher for every observed CR (status-independent), so this is
-    /// the path the run reconciler uses when resolving `spec.env`. Returns
-    /// `None` only during the brief startup window before the watcher syncs.
+    /// The cached CR's spec — the path the run reconciler uses when
+    /// resolving `spec.env`. Returns `None` only during the brief startup
+    /// window before the watcher syncs.
     pub async fn lookup_spec(&self, namespace: &str, name: &str) -> Option<Arc<CodeLocationSpec>> {
-        let key = EntryKey::new(namespace, name);
-        self.specs.read().await.get(&key).cloned()
+        self.lookup_code_location(namespace, name)
+            .await
+            .map(|cl| Arc::new(cl.spec.clone()))
     }
 
     /// Insert or update an entry. Emits `ADDED` on first sight, `MODIFIED` on
@@ -144,15 +148,18 @@ impl DirectoryState {
         });
     }
 
-    /// Cache the full spec for `(namespace, name)`. Silent — no broadcast
-    /// event, since spec-level changes don't affect the gRPC consumers that
-    /// subscribe to the entry stream.
-    pub async fn upsert_spec(&self, namespace: &str, name: &str, spec: Arc<CodeLocationSpec>) {
-        let key = EntryKey::new(namespace, name);
-        self.specs.write().await.insert(key, spec);
+    /// Record `cl` as a watch event shows it, and [`Self::upsert`] its entry
+    /// once it has a status.
+    pub async fn upsert_code_location(&self, cl: CodeLocation) {
+        let key = EntryKey::new(cl.namespace().unwrap_or_default(), cl.name_any());
+        let entry = project_entry(&cl);
+        self.code_locations.write().await.insert(key, Arc::new(cl));
+        if let Some(entry) = entry {
+            self.upsert(entry).await;
+        }
     }
 
-    /// Drop the entry and its cached spec, emitting a `DELETED` event if the
+    /// Drop the entry and the cached CR, emitting a `DELETED` event if the
     /// entry was present. Silent for unknown `(namespace, name)` pairs.
     pub async fn delete(&self, namespace: &str, name: &str) {
         let key = EntryKey::new(namespace, name);
@@ -160,7 +167,7 @@ impl DirectoryState {
             let mut map = self.entries.write().await;
             map.remove(&key)
         };
-        self.specs.write().await.remove(&key);
+        self.code_locations.write().await.remove(&key);
         if let Some(entry) = removed {
             let _ = self.tx.send(CodeLocationEvent {
                 r#type: EventType::Deleted as i32,
@@ -189,14 +196,7 @@ pub async fn run_watcher(
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(Event::Apply(obj)) | Ok(Event::InitApply(obj)) => {
-                let ns = obj.namespace().unwrap_or_default();
-                let name = obj.name_any();
-                state
-                    .upsert_spec(&ns, &name, Arc::new(obj.spec.clone()))
-                    .await;
-                if let Some(entry) = project_entry(&obj) {
-                    state.upsert(entry).await;
-                }
+                state.upsert_code_location(obj).await;
             }
             Ok(Event::Delete(obj)) => {
                 let ns = obj.namespace().unwrap_or_default();
@@ -221,9 +221,8 @@ pub async fn run_watcher(
 
 /// Project a CR into the gRPC-facing entry shape. Returns `None` before the
 /// reconciler has produced a status — we don't want to publish entries whose
-/// `resolved_image` / `grpc_endpoint` are still empty. Visible to the
-/// admission webhook which calls it on the live-GET fallback path.
-pub(crate) fn project_entry(cl: &CodeLocation) -> Option<CodeLocationEntry> {
+/// `resolved_image` / `grpc_endpoint` are still empty.
+fn project_entry(cl: &CodeLocation) -> Option<CodeLocationEntry> {
     let status = cl.status.as_ref()?;
     let namespace = cl.namespace()?;
     Some(CodeLocationEntry {
@@ -239,6 +238,8 @@ pub(crate) fn project_entry(cl: &CodeLocation) -> Option<CodeLocationEntry> {
             .to_string(),
         observed_generation: status.observed_generation.unwrap_or_default(),
         identity: cl.spec.identity.clone(),
+        resolved_commit: status.resolved_commit.clone().unwrap_or_default(),
+        resolved_ref: status.resolved_ref.clone().unwrap_or_default(),
     })
 }
 
@@ -410,6 +411,8 @@ mod tests {
             phase: phase.into(),
             observed_generation: 1,
             identity: format!("id-{name}"),
+            resolved_commit: String::new(),
+            resolved_ref: String::new(),
         }
     }
 
@@ -435,6 +438,47 @@ mod tests {
 
         let third = rx.recv().await.unwrap();
         assert_eq!(third.entry.as_ref().unwrap().name, "sentinel");
+    }
+
+    #[tokio::test]
+    async fn upsert_code_location_keeps_the_cr_and_publishes_its_entry_once_it_has_a_status() {
+        let state = DirectoryState::new();
+        let spec = serde_json::json!({ "image": "repo", "module": "pkg.mod" });
+        let mut cl = CodeLocation::new("a", serde_json::from_value(spec).unwrap());
+        cl.metadata.namespace = Some("ns".into());
+
+        state.upsert_code_location(cl.clone()).await;
+        assert_eq!(state.snapshot("").await, vec![]);
+        let spec = state.lookup_spec("ns", "a").await.unwrap();
+        assert_eq!(spec.image.as_deref(), Some("repo"));
+
+        let status = serde_json::json!({ "phase": "Ready", "resolvedImage": "repo@sha256:a" });
+        cl.status = Some(serde_json::from_value(status).unwrap());
+        state.upsert_code_location(cl).await;
+        let cached = state.lookup_code_location("ns", "a").await.unwrap();
+        assert_eq!(
+            cached.status.as_ref().unwrap().resolved_image.as_deref(),
+            Some("repo@sha256:a")
+        );
+        assert_eq!(
+            state.snapshot("").await,
+            vec![CodeLocationEntry {
+                namespace: "ns".into(),
+                name: "a".into(),
+                grpc_endpoint: String::new(),
+                image: "repo@sha256:a".into(),
+                module: "pkg.mod".into(),
+                phase: "Ready".into(),
+                observed_generation: 0,
+                identity: String::new(),
+                resolved_commit: String::new(),
+                resolved_ref: String::new(),
+            }]
+        );
+
+        state.delete("ns", "a").await;
+        assert!(state.lookup_code_location("ns", "a").await.is_none());
+        assert_eq!(state.snapshot("").await, vec![]);
     }
 
     #[tokio::test]

@@ -15,29 +15,38 @@ use jsonptr::PointerBuf;
 use kube_client::Api;
 use kube_core::DynamicObject;
 use kube_core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview, Operation};
-use rivers_api::CodeLocationEntry;
-use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase};
-use rivers_k8s::crd::run::{Run, is_digest_reference};
+use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationPhase, validate_commit};
+use rivers_k8s::crd::run::{GitCoordinates, Run, RunSource, is_digest_reference};
 use uuid::Uuid;
 
-use crate::codelocation::DirectoryState;
+use crate::codelocation::git::ssh::with_git_user;
+use crate::codelocation::git::{self, GitConfig, GitError};
+use crate::codelocation::reconcile::wanted_image;
+use crate::codelocation::{DirectoryState, ImageRef};
 
 /// Bundle of the kube/cache handles the admission handler reads from. The
-/// `code_locations` API is `Option` because tests don't have a kube `Client`
-/// and exercise only the cache-hit + immutability paths; production wiring
-/// always passes `Some`.
+/// `code_locations` API is `Option` so tests can run cache-only; production
+/// wiring always passes `Some`.
 #[derive(Clone)]
 pub(super) struct AdmissionDeps {
     pub directory: Arc<DirectoryState>,
     pub code_locations: Option<Api<CodeLocation>>,
+    /// Default runtime image for git CLs that don't set `spec.image` — the
+    /// operator's `RIVERS_RUNTIME_IMAGE`.
+    pub runtime_image: ImageRef,
+    /// The rules for git urls: `http://` and the allowed hosts.
+    pub git: GitConfig,
 }
 
 impl AdmissionDeps {
+    /// No live `GET`; the chart's default runtime image.
     #[cfg(test)]
     pub fn cache_only(directory: Arc<DirectoryState>) -> Self {
         Self {
             directory,
             code_locations: None,
+            runtime_image: rivers_k8s::defaults::RUNTIME_IMAGE.parse().unwrap(),
+            git: GitConfig::default(),
         }
     }
 }
@@ -48,11 +57,13 @@ impl AdmissionDeps {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum RunOutcome {
     /// CREATE that was allowed and produced a JSON Patch stamping
-    /// `image`, `module`, and `codeLocationRef.identity`.
+    /// `image`, `module`, `codeLocationRef.identity`, and — for
+    /// git-sourced CodeLocations — `spec.source`.
     Mutated {
         image: String,
         module: String,
         identity: String,
+        source: Option<RunSource>,
     },
     /// CREATE accepted without modification — escape-hatch path: caller
     /// pre-set `image` to a digest. Identity isn't stamped from the CL
@@ -114,7 +125,7 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
     };
 
     // Escape hatch: user pre-set image to a digest. Validate format and
-    // accept without consulting the CodeLocation — the user has explicitly
+    // accept without resolving from the CodeLocation — the user has explicitly
     // bypassed CL resolution. Identity stamping is skipped on this path:
     // `Run.codeLocationRef.identity` is observability-only metadata, and
     // the executor pod scopes its storage from the operator-injected
@@ -128,11 +139,27 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
                 run.spec.image
             ));
         }
+        // The code-location pod (`K8sRunBackend`) dispatches runs with a
+        // pre-set digest AND the source of its own tree.
+        if let Some(source) = &run.spec.source
+            && let Err(message) = check_self_stamped_source(source, ref_ns, ref_name, deps).await
+        {
+            return RunOutcome::Rejected(message);
+        }
         return RunOutcome::AcceptedAsIs;
     }
 
-    let entry = match lookup_with_fallback(deps, ref_ns, ref_name).await {
-        Ok(Some(e)) => e,
+    // Normal path: the webhook is the sole author of spec.source.
+    if run.spec.source.is_some() {
+        return RunOutcome::Rejected(
+            "spec.source is stamped by the webhook from the CodeLocation — remove it \
+             (pre-set spec.image to a digest for the self-stamped escape hatch)"
+                .into(),
+        );
+    }
+
+    let cl = match lookup_code_location_with_fallback(deps, ref_ns, ref_name).await {
+        Ok(Some(cl)) => cl,
         Ok(None) => {
             return RunOutcome::Rejected(format!(
                 "codeLocation '{ref_name}' not found in namespace '{ref_ns}'"
@@ -145,13 +172,32 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
         }
     };
 
-    if entry.phase != CodeLocationPhase::Ready.as_str() {
+    let Some(status) = cl
+        .status
+        .as_ref()
+        .filter(|s| s.phase == Some(CodeLocationPhase::Ready))
+    else {
+        let phase = cl.status.as_ref().and_then(|s| s.phase.as_ref());
         return RunOutcome::Rejected(format!(
             "codeLocation '{ref_ns}/{ref_name}' is not Ready (phase={})",
-            entry.phase
+            phase.map_or("Unknown", CodeLocationPhase::as_str)
+        ));
+    };
+
+    // Runs get the serving tree, whatever the spec says now: it changes only
+    // once a tree has fully rolled out, so it needs no generation check.
+    let source = status.run_source.clone();
+    if source.is_none() && cl.spec.git.is_some() {
+        return RunOutcome::Rejected(format!(
+            "codeLocation '{ref_ns}/{ref_name}' has no rolled-out git tree yet; \
+             status.runSource is empty — retry once its rollout finishes"
         ));
     }
-    if entry.image.is_empty() {
+    let image = match &source {
+        Some(source) => source.runtime_image.clone(),
+        None => status.resolved_image.clone().unwrap_or_default(),
+    };
+    if image.is_empty() {
         return RunOutcome::Rejected(format!(
             "codeLocation '{ref_ns}/{ref_name}' has no resolved image yet; \
              status.resolvedImage is empty"
@@ -159,10 +205,155 @@ async fn mutate_run_on_create(req: &AdmissionRequest<Run>, deps: &AdmissionDeps)
     }
 
     RunOutcome::Mutated {
-        image: entry.image,
-        module: entry.module,
-        identity: entry.identity,
+        image,
+        module: cl.spec.module.clone(),
+        identity: cl.spec.identity.clone(),
+        source,
     }
+}
+
+/// Escape-hatch provenance: commit, ref, path and dependencies are the
+/// caller's own (e.g. a pod still serving the previous commit), but the url
+/// and Secret must be the CodeLocation's ([`check_git_remote`]) — a
+/// fallback-mode run pod mounts that Secret and sends its credentials to
+/// that url — and so must the runtime image's repository, since that image
+/// runs the init container that mounts the Secret: the serving tree's
+/// (`status.resolvedImage`) or the one the CL's pods move to (`spec.image`,
+/// else the chart default). Any digest is accepted, as during a rollout.
+async fn check_self_stamped_source(
+    source: &RunSource,
+    namespace: &str,
+    name: &str,
+    deps: &AdmissionDeps,
+) -> Result<(), String> {
+    let git = &source.git;
+    validate_commit("spec.source.git.commit", &git.commit)?;
+    if git.url.is_empty() {
+        return Err("spec.source.git.url is empty".into());
+    }
+    validate_git_url("spec.source.git.url", &git.url, &deps.git)?;
+    if let Some(path) = &git.path {
+        validate_git_path("spec.source.git.path", path)?;
+    }
+    let runtime = source
+        .runtime_image
+        .parse::<ImageRef>()
+        .ok()
+        .filter(|image| image.digest.is_some())
+        .ok_or_else(|| {
+            format!(
+                "spec.source.runtimeImage '{}' is not a digest reference \
+                 (must be of the form 'registry/repo@sha256:...')",
+                source.runtime_image
+            )
+        })?;
+
+    let cl = match lookup_code_location_with_fallback(deps, namespace, name).await {
+        Ok(Some(cl)) => cl,
+        Ok(None) => {
+            return Err(format!(
+                "codeLocation '{name}' not found in namespace '{namespace}'"
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "live lookup of codeLocation '{namespace}/{name}' failed: {e}"
+            ));
+        }
+    };
+    check_git_remote(git, &cl, namespace, name)?;
+    let mut repositories: Vec<String> = cl
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved_image.as_deref())
+        .and_then(|image| image.parse::<ImageRef>().ok())
+        .map(|image| image.repository)
+        .into_iter()
+        .collect();
+    let wanted = wanted_image(&cl.spec, &deps.runtime_image).repository;
+    if !repositories.contains(&wanted) {
+        repositories.push(wanted);
+    }
+    if !repositories.contains(&runtime.repository) {
+        let quoted: Vec<String> = repositories.iter().map(|r| format!("'{r}'")).collect();
+        return Err(format!(
+            "spec.source.runtimeImage '{}' is not in the runtime image repository {} \
+             of codeLocation '{namespace}/{name}'",
+            source.runtime_image,
+            quoted.join(" or "),
+        ));
+    }
+    Ok(())
+}
+
+/// A git url and the Secret whose credentials go to it, as the fields of a
+/// CodeLocation name them.
+struct GitRemote<'a> {
+    url: &'a str,
+    secret: Option<&'a str>,
+    url_field: &'static str,
+    secret_field: &'static str,
+}
+
+/// `source`'s url and Secret must be a pair that `cl` names: in `spec.git`,
+/// or in the serving tree (`status.runSource`), whose pods stamp it until a
+/// change of url or Secret has rolled out.
+fn check_git_remote(
+    source: &GitCoordinates,
+    cl: &CodeLocation,
+    namespace: &str,
+    name: &str,
+) -> Result<(), String> {
+    let mut remotes: Vec<GitRemote> = Vec::new();
+    if let Some(git) = &cl.spec.git {
+        remotes.push(GitRemote {
+            url: &git.url,
+            secret: git.secret_ref.as_ref().map(|s| s.name.as_str()),
+            url_field: "spec.git.url",
+            secret_field: "spec.git.secretRef",
+        });
+    }
+    if let Some(serving) = cl.status.as_ref().and_then(|s| s.run_source.as_ref()) {
+        let remote = GitRemote {
+            url: &serving.git.url,
+            secret: serving.git.secret_name.as_deref(),
+            url_field: "status.runSource.git.url",
+            secret_field: "status.runSource.git.secretName",
+        };
+        if !remotes
+            .iter()
+            .any(|r| (r.url, r.secret) == (remote.url, remote.secret))
+        {
+            remotes.push(remote);
+        }
+    }
+    if remotes.is_empty() {
+        return Err(format!(
+            "codeLocation '{namespace}/{name}' is not git-sourced; remove spec.source"
+        ));
+    }
+    let same_url: Vec<&GitRemote> = remotes.iter().filter(|r| r.url == source.url).collect();
+    if same_url.is_empty() {
+        let fields: Vec<&str> = remotes.iter().map(|r| r.url_field).collect();
+        return Err(format!(
+            "spec.source.git.url does not match {} of codeLocation '{namespace}/{name}'",
+            fields.join(" or ")
+        ));
+    }
+    let secret = source.secret_name.as_deref();
+    if !same_url.iter().any(|r| r.secret == secret) {
+        let show = |s: Option<&str>| s.map_or_else(|| "none".to_string(), |s| format!("'{s}'"));
+        let wanted: Vec<String> = same_url
+            .iter()
+            .map(|r| format!("{} {}", r.secret_field, show(r.secret)))
+            .collect();
+        return Err(format!(
+            "spec.source.git.secretName {} does not match {} of codeLocation '{namespace}/{name}'",
+            show(secret),
+            wanted.join(" or "),
+        ));
+    }
+    Ok(())
 }
 
 fn check_run_update(req: &AdmissionRequest<Run>) -> RunOutcome {
@@ -179,6 +370,9 @@ fn check_run_update(req: &AdmissionRequest<Run>) -> RunOutcome {
     if new.spec.code_location_ref != old.spec.code_location_ref {
         return RunOutcome::Rejected("spec.codeLocationRef is immutable after creation".into());
     }
+    if new.spec.source != old.spec.source {
+        return RunOutcome::Rejected("spec.source is immutable after creation".into());
+    }
     RunOutcome::UpdateAllowed
 }
 
@@ -189,13 +383,13 @@ fn run_response_for(req: &AdmissionRequest<Run>, outcome: RunOutcome) -> Admissi
             image,
             module,
             identity,
+            source,
         } => {
-            // `replace` for fields the admission request always carries
-            // (the existing Phase-4 wiring); `add` for the new identity field
-            // since `codeLocationRef.identity` may be absent from a user's
-            // raw apply payload — `add` both creates and overwrites, while
-            // `replace` would fail if the path doesn't exist.
-            let patch = Patch(vec![
+            // `replace` for fields the admission request always carries;
+            // `add` for fields that may be absent from a user's raw apply
+            // payload — `add` both creates and overwrites, while `replace`
+            // would fail on a missing path.
+            let mut ops = vec![
                 PatchOperation::Replace(ReplaceOperation {
                     path: PointerBuf::from_tokens(["spec", "image"]),
                     value: serde_json::Value::String(image),
@@ -208,8 +402,14 @@ fn run_response_for(req: &AdmissionRequest<Run>, outcome: RunOutcome) -> Admissi
                     path: PointerBuf::from_tokens(["spec", "codeLocationRef", "identity"]),
                     value: serde_json::Value::String(identity),
                 }),
-            ]);
-            base.with_patch(patch)
+            ];
+            if let Some(source) = source {
+                ops.push(PatchOperation::Add(AddOperation {
+                    path: PointerBuf::from_tokens(["spec", "source"]),
+                    value: serde_json::to_value(&source).expect("RunSource serializes to JSON"),
+                }));
+            }
+            base.with_patch(Patch(ops))
                 .expect("RFC 6902 Patch serializes to JSON")
         }
         RunOutcome::AcceptedAsIs | RunOutcome::UpdateAllowed => base,
@@ -231,6 +431,7 @@ pub(super) enum CodeLocationOutcome {
 
 pub(super) async fn handle_codelocation_admission(
     review: AdmissionReview<CodeLocation>,
+    git: &GitConfig,
 ) -> AdmissionReview<DynamicObject> {
     let request: AdmissionRequest<CodeLocation> = match review.try_into() {
         Ok(r) => r,
@@ -239,16 +440,20 @@ pub(super) async fn handle_codelocation_admission(
                 .into_review();
         }
     };
-    let outcome = mutate_codelocation(&request);
+    let outcome = mutate_codelocation(&request, git);
     codelocation_response_for(&request, outcome).into_review()
 }
 
 /// Pure decision logic for CodeLocation admission. No external lookups —
-/// everything we need is in the request payload.
-pub(super) fn mutate_codelocation(req: &AdmissionRequest<CodeLocation>) -> CodeLocationOutcome {
+/// everything we need is in the request payload and the operator's `git`
+/// settings.
+pub(super) fn mutate_codelocation(
+    req: &AdmissionRequest<CodeLocation>,
+    git: &GitConfig,
+) -> CodeLocationOutcome {
     match req.operation {
-        Operation::Create => mutate_codelocation_on_create(req),
-        Operation::Update => check_codelocation_update(req),
+        Operation::Create => mutate_codelocation_on_create(req, git),
+        Operation::Update => check_codelocation_update(req, git),
         ref op => CodeLocationOutcome::Rejected(format!(
             "operator webhook received unexpected operation '{op:?}'; \
              webhook is configured for CREATE/UPDATE only"
@@ -256,10 +461,19 @@ pub(super) fn mutate_codelocation(req: &AdmissionRequest<CodeLocation>) -> CodeL
     }
 }
 
-fn mutate_codelocation_on_create(req: &AdmissionRequest<CodeLocation>) -> CodeLocationOutcome {
+fn mutate_codelocation_on_create(
+    req: &AdmissionRequest<CodeLocation>,
+    git: &GitConfig,
+) -> CodeLocationOutcome {
     let Some(cl) = req.object.as_ref() else {
         return CodeLocationOutcome::Rejected("CREATE admission request missing object".into());
     };
+
+    // Source validation MUST precede identity stamping — the stamp path
+    // returns early, and stamping an invalid CR would accept it.
+    if let Err(message) = validate_git_source(cl, git) {
+        return CodeLocationOutcome::Rejected(message);
+    }
 
     let identity = cl.spec.identity.trim();
     if identity.is_empty() {
@@ -277,7 +491,14 @@ fn mutate_codelocation_on_create(req: &AdmissionRequest<CodeLocation>) -> CodeLo
     CodeLocationOutcome::AcceptedAsIs
 }
 
-fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocationOutcome {
+/// The source rules apply only when `spec.git` or `spec.image` changes, and
+/// not while the object is being deleted: a CodeLocation that predates a
+/// stricter rule still takes other updates, such as labels or the garbage
+/// collector's finalizer removal.
+fn check_codelocation_update(
+    req: &AdmissionRequest<CodeLocation>,
+    git: &GitConfig,
+) -> CodeLocationOutcome {
     let (Some(new), Some(old)) = (req.object.as_ref(), req.old_object.as_ref()) else {
         return CodeLocationOutcome::Rejected(
             "UPDATE admission request missing object or oldObject".into(),
@@ -289,7 +510,107 @@ fn check_codelocation_update(req: &AdmissionRequest<CodeLocation>) -> CodeLocati
             old.spec.identity, new.spec.identity
         ));
     }
+    let source_changed = new.spec.git != old.spec.git || new.spec.image != old.spec.image;
+    let deleting = new.metadata.deletion_timestamp.is_some();
+    if source_changed
+        && !deleting
+        && let Err(message) = validate_git_source(new, git)
+    {
+        return CodeLocationOutcome::Rejected(message);
+    }
     CodeLocationOutcome::UpdateAllowed
+}
+
+/// Validate the source shape: at least one of `image`/`git`
+/// (re-checked here for API servers whose CEL support predates the CRD
+/// rule), a well-formed one-of `git.ref`, the url rules of
+/// [`validate_git_url`], a `path` inside the repository and a workspace size
+/// the API server takes.
+fn validate_git_source(cl: &CodeLocation, git_config: &GitConfig) -> Result<(), String> {
+    if cl.spec.image.is_none() && cl.spec.git.is_none() {
+        return Err("one of spec.image or spec.git must be set".to_string());
+    }
+    let Some(git) = &cl.spec.git else {
+        return Ok(());
+    };
+    git.r#ref.validate()?;
+    validate_git_url("spec.git.url", &git.url, git_config)?;
+    if let Some(path) = &git.path {
+        validate_git_path("spec.git.path", path)?;
+    }
+    if let Some(size) = git
+        .workspace_size
+        .as_ref()
+        .filter(|size| !rivers_k8s::quantity::is_positive(&size.0))
+    {
+        return Err(format!(
+            "spec.git.workspaceSize '{}' must be a Kubernetes quantity more than zero, like 10Gi \
+             or 500M",
+            size.0
+        ));
+    }
+    Ok(())
+}
+
+/// The pods build and run the project at `$SRC/<path>`: `path` names a
+/// directory of the checkout in one spelling, so that one directory gets one
+/// workspace tree. A trailing `/` is fine; empty is the repository root.
+fn validate_git_path(field: &str, path: &str) -> Result<(), String> {
+    if path.starts_with('/') {
+        return Err(format!(
+            "{field} '{path}' must be relative to the repository root, like analytics or \
+             services/analytics — remove the leading '/'"
+        ));
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    let segments: Vec<&str> = path.strip_suffix('/').unwrap_or(path).split('/').collect();
+    if segments.contains(&"..") {
+        return Err(format!(
+            "{field} '{path}' must stay inside the repository — remove the '..'"
+        ));
+    }
+    if segments.iter().any(|s| s.is_empty() || *s == ".") {
+        return Err(format!(
+            "{field} '{path}' has an empty or '.' segment — write it like analytics or \
+             services/analytics, or leave it out for the repository root"
+        ));
+    }
+    Ok(())
+}
+
+/// The operator's url rules ([`git::check_url`]) and host allowlist. `field`
+/// names the url in messages, which never repeat the url: it may hold a
+/// password.
+fn validate_git_url(field: &str, raw: &str, git_config: &GitConfig) -> Result<(), String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("{field} is not a valid url: {e}"))?;
+    match git::check_url(raw, git_config.allow_insecure) {
+        Ok(_) => {}
+        // Without a user, the pods' ssh logs in as their own account.
+        Err(GitError::AuthFailed(_)) if url.scheme() == "ssh" && url.username().is_empty() => {
+            return Err(format!(
+                "{field} must name the ssh user — use {}, or the user your git host expects",
+                with_git_user(&url)
+            ));
+        }
+        Err(GitError::InvalidUrl(problem)) => return Err(format!("{field}: {problem}")),
+        Err(e) => return Err(format!("{field}: {e}")),
+    }
+    let Some(host) = url.host_str() else {
+        return Err(format!("{field} has no host"));
+    };
+    if !host_allowed(host, &git_config.allowed_hosts) {
+        return Err(format!(
+            "git host '{host}' is not in the operator's allowed list — \
+             adjust operator.git.allowedHosts or use an approved host"
+        ));
+    }
+    Ok(())
+}
+
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    allowed.is_empty() || allowed.iter().any(|a| a.eq_ignore_ascii_case(host))
 }
 
 fn codelocation_response_for(
@@ -324,31 +645,35 @@ fn is_uuid_v4(s: &str) -> bool {
     uuid.get_version_num() == 4
 }
 
-/// Cache lookup with one-shot live `GET` fallback. The live `GET` MUST be a
-/// quorum read against etcd — kube's default `GetParams` (no resource_version
-/// set) does exactly that, bypassing the API server's watch cache. A stale
-/// watch cache could otherwise mirror the same not-found the local reflector
-/// saw, defeating the fallback.
-async fn lookup_with_fallback(
+/// The CodeLocation as the watcher last saw it with a status, else as one
+/// live `GET` ([`live_get`]) returns it: spec and status of one object.
+async fn lookup_code_location_with_fallback(
     deps: &AdmissionDeps,
     namespace: &str,
     name: &str,
-) -> anyhow::Result<Option<CodeLocationEntry>> {
-    if let Some(entry) = deps.directory.lookup(namespace, name).await {
-        return Ok(Some(entry));
+) -> anyhow::Result<Option<Arc<CodeLocation>>> {
+    if let Some(cl) = deps
+        .directory
+        .lookup_code_location(namespace, name)
+        .await
+        .filter(|cl| cl.status.is_some())
+    {
+        return Ok(Some(cl));
     }
+    Ok(live_get(deps, name).await?.map(Arc::new))
+}
+
+/// The live `GET` MUST be a quorum read against etcd — kube's default
+/// `GetParams` (no resource_version set) does exactly that, bypassing the API
+/// server's watch cache. A stale watch cache could otherwise mirror the same
+/// not-found the local reflector saw, defeating the fallback.
+async fn live_get(deps: &AdmissionDeps, name: &str) -> anyhow::Result<Option<CodeLocation>> {
     let Some(api) = deps.code_locations.as_ref() else {
         return Ok(None);
     };
-    let cl = match api
-        .get_opt(name)
+    api.get_opt(name)
         .await
-        .map_err(|e| anyhow::Error::new(e).context("live GET on CodeLocation (quorum read)"))?
-    {
-        Some(cl) => cl,
-        None => return Ok(None),
-    };
-    Ok(crate::codelocation::directory::project_entry(&cl))
+        .map_err(|e| anyhow::Error::new(e).context("live GET on CodeLocation (quorum read)"))
 }
 
 #[cfg(test)]
@@ -457,22 +782,651 @@ mod tests {
         Run::new("test-run", spec)
     }
 
-    fn ready_entry(
-        ns: &str,
-        name: &str,
-        image: &str,
-        module: &str,
-        identity: &str,
-    ) -> CodeLocationEntry {
-        CodeLocationEntry {
-            namespace: ns.to_string(),
-            name: name.to_string(),
-            grpc_endpoint: "grpc://example:50051".to_string(),
-            image: image.to_string(),
-            module: module.to_string(),
-            phase: CodeLocationPhase::Ready.as_str().to_string(),
-            observed_generation: 1,
-            identity: identity.to_string(),
+    /// `team-data/analytics` with `spec` and `status`.
+    fn code_location(spec: serde_json::Value, status: serde_json::Value) -> CodeLocation {
+        let mut cl = CodeLocation::new("analytics", serde_json::from_value(spec).unwrap());
+        cl.metadata.namespace = Some("team-data".to_string());
+        cl.status = Some(serde_json::from_value(status).unwrap());
+        cl
+    }
+
+    /// The webhook of an operator replica whose directory watcher has seen
+    /// `cl`.
+    async fn watching(cl: CodeLocation) -> AdmissionDeps {
+        let directory = Arc::new(DirectoryState::new());
+        directory.upsert_code_location(cl).await;
+        AdmissionDeps::cache_only(directory)
+    }
+
+    /// The operator's git settings with `operator.git.allowedHosts` = `hosts`.
+    fn allowing_hosts(hosts: &[&str]) -> GitConfig {
+        GitConfig {
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            ..GitConfig::default()
+        }
+    }
+
+    type MockApi = Arc<std::sync::Mutex<crate::run::test_helpers::MockApiState>>;
+
+    /// The webhook of a replica whose watcher has not seen `cl`: the API
+    /// server answers its live `GET`.
+    fn reading_live(cl: CodeLocation) -> (AdmissionDeps, MockApi) {
+        use crate::run::test_helpers::{MockApiState, mock_client};
+        let api_state: MockApi = Arc::new(std::sync::Mutex::new(MockApiState::default()));
+        api_state
+            .lock()
+            .unwrap()
+            .code_locations
+            .insert(cl.metadata.name.clone().unwrap(), cl);
+        let deps = AdmissionDeps {
+            code_locations: Some(Api::namespaced(mock_client(api_state.clone()), "team-data")),
+            ..AdmissionDeps::cache_only(Arc::new(DirectoryState::new()))
+        };
+        (deps, api_state)
+    }
+
+    const ANALYTICS_URL: &str =
+        "/apis/rivers.io/v1alpha1/namespaces/team-data/codelocations/analytics";
+
+    /// Paths of the `GET`s the API server answered.
+    fn live_gets(api_state: &MockApi) -> Vec<String> {
+        api_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Status of a git CodeLocation whose pods all run `tree` and are ready.
+    fn serving(tree: &RunSource) -> serde_json::Value {
+        serde_json::json!({
+            "phase": "Ready",
+            "resolvedImage": tree.runtime_image,
+            "resolvedCommit": tree.git.commit,
+            "resolvedRef": tree.git.r#ref,
+            "runSource": tree,
+        })
+    }
+
+    /// A git CodeLocation serving the tree of its spec,
+    /// [`expected_run_source`].
+    fn git_cl() -> CodeLocation {
+        code_location(git_spec(), serving(&expected_run_source()))
+    }
+
+    /// `spec`, Ready on runtime image `runtime('a')`, without `runSource`.
+    fn ready_cl(spec: serde_json::Value) -> CodeLocation {
+        code_location(
+            spec,
+            serde_json::json!({ "phase": "Ready", "resolvedImage": runtime('a') }),
+        )
+    }
+
+    const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+    const IDENTITY: &str = "11111111-1111-4111-8111-111111111111";
+    /// Repository of the chart's default runtime image, which a git CL
+    /// without `spec.image` runs ([`AdmissionDeps::cache_only`]).
+    fn runtime_repository() -> String {
+        rivers_k8s::defaults::RUNTIME_IMAGE
+            .parse::<ImageRef>()
+            .unwrap()
+            .repository
+    }
+
+    /// Runtime image digest `c` — `runtime('a')` is the CL's resolved one.
+    fn runtime(c: char) -> String {
+        format!(
+            "{}@sha256:{}",
+            runtime_repository(),
+            c.to_string().repeat(64)
+        )
+    }
+
+    /// Unrelated to any CL's runtime image.
+    fn gpu_worker() -> String {
+        format!("ghcr.io/acme/gpu-worker@sha256:{}", "f".repeat(64))
+    }
+
+    fn with_runtime_image(image: &str) -> RunSource {
+        RunSource {
+            runtime_image: image.to_string(),
+            ..expected_run_source()
+        }
+    }
+
+    async fn expect_accepted(run: &Run, deps: &AdmissionDeps) {
+        let req = admission_request_create("uid-hatch", "team-data", run);
+        assert_eq!(mutate_run(&req, deps).await, RunOutcome::AcceptedAsIs);
+    }
+
+    fn git_spec() -> serde_json::Value {
+        serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "ref": { "branch": "main" },
+                "path": "analytics",
+                "secretRef": { "name": "git-creds" },
+                "dependencies": { "mode": "uvSync" },
+            },
+            "module": "analytics.pipeline",
+            "identity": IDENTITY,
+        })
+    }
+
+    /// Digest-pinned Run carrying its own `spec.source` (escape hatch).
+    fn self_stamped_run(source: RunSource) -> Run {
+        let mut run = build_run("analytics", &format!("ghcr.io/x@sha256:{}", "a".repeat(64)));
+        run.spec.source = Some(source);
+        run
+    }
+
+    async fn expect_rejected(run: &Run, deps: &AdmissionDeps) -> String {
+        let req = admission_request_create("uid-hatch", "team-data", run);
+        match mutate_run(&req, deps).await {
+            RunOutcome::Rejected(msg) => msg,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    fn expected_run_source() -> RunSource {
+        RunSource {
+            git: rivers_k8s::crd::run::GitCoordinates {
+                url: "https://forge.example/acme/pipelines.git".to_string(),
+                commit: COMMIT.to_string(),
+                r#ref: Some("refs/heads/main".to_string()),
+                path: Some("analytics".to_string()),
+                secret_name: Some("git-creds".to_string()),
+            },
+            dependencies: serde_json::from_value(serde_json::json!({ "mode": "uvSync" })).unwrap(),
+            runtime_image: runtime('a'),
+        }
+    }
+
+    /// What a Run without `image` gets from the webhook of `deps`.
+    async fn create(deps: &AdmissionDeps) -> RunOutcome {
+        let req = admission_request_create("uid-create", "team-data", &build_run("analytics", ""));
+        mutate_run(&req, deps).await
+    }
+
+    /// What the webhook stamps on a Run that gets `tree`: the tree, its
+    /// runtime image, and the module and identity of [`git_spec`].
+    fn stamped(tree: RunSource) -> RunOutcome {
+        RunOutcome::Mutated {
+            image: tree.runtime_image.clone(),
+            module: "analytics.pipeline".to_string(),
+            identity: IDENTITY.to_string(),
+            source: Some(tree),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_stamps_source_for_git_cl() {
+        assert_eq!(
+            create(&watching(git_cl()).await).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reads_the_serving_tree_with_one_live_get_on_a_cache_miss() {
+        let (deps, api_state) = reading_live(git_cl());
+        assert_eq!(create(&deps).await, stamped(expected_run_source()));
+        assert_eq!(live_gets(&api_state), vec![ANALYTICS_URL]);
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_serving_tree_while_a_spec_change_rolls_out() {
+        // A new url, ref, path, Secret, dependencies and runtime image,
+        // whose pods are not all ready yet.
+        let spec = serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines-v2.git",
+                "ref": { "branch": "release" },
+                "path": "services/analytics",
+                "secretRef": { "name": "git-creds-v2" },
+                "dependencies": { "mode": "requirements", "files": ["requirements.lock"] },
+            },
+            "image": MIRROR,
+            "module": "analytics.pipeline",
+            "identity": IDENTITY,
+        });
+        let cl = code_location(spec, serving(&expected_run_source()));
+        assert_eq!(
+            create(&watching(cl.clone()).await).await,
+            stamped(expected_run_source())
+        );
+        assert_eq!(
+            create(&reading_live(cl).0).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_runtime_image_of_the_tree_it_stamps() {
+        // spec.image runs the tree's venv, so it comes with the tree, not
+        // from status.resolvedImage.
+        let mut status = serving(&expected_run_source());
+        status["resolvedImage"] = serde_json::json!(runtime('b'));
+        assert_eq!(
+            create(&watching(code_location(git_spec(), status)).await).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_ready_git_cl_without_a_serving_tree() {
+        let retry = RunOutcome::Rejected(
+            "codeLocation 'team-data/analytics' has no rolled-out git tree yet; \
+             status.runSource is empty — retry once its rollout finishes"
+                .to_string(),
+        );
+        for status in [
+            // Published before status.runSource existed.
+            serde_json::json!({
+                "phase": "Ready",
+                "resolvedImage": runtime('a'),
+                "resolvedCommit": COMMIT,
+                "resolvedRef": "refs/heads/main",
+            }),
+            // The image-mode status of a CodeLocation that just moved to git.
+            serde_json::json!({
+                "phase": "Ready",
+                "resolvedImage": format!("ghcr.io/acme/pipeline@sha256:{}", "c".repeat(64)),
+            }),
+        ] {
+            let cl = code_location(git_spec(), status);
+            assert_eq!(create(&watching(cl.clone()).await).await, retry);
+            assert_eq!(create(&reading_live(cl).0).await, retry);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_serving_git_tree_until_image_mode_takes_over() {
+        // spec.git removed; the operator has not reconciled the change yet.
+        let spec = serde_json::json!({
+            "image": "ghcr.io/acme/pipeline",
+            "tag": "v2",
+            "module": "analytics.pipeline",
+            "identity": IDENTITY,
+        });
+        let cl = code_location(spec, serving(&expected_run_source()));
+        assert_eq!(
+            create(&watching(cl).await).await,
+            stamped(expected_run_source())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_hand_set_source_on_the_normal_path() {
+        let mut run = build_run("analytics", "");
+        run.spec.source = Some(expected_run_source());
+        let req = admission_request_create("uid-git-3", "team-data", &run);
+        match mutate_run(&req, &watching(git_cl()).await).await {
+            RunOutcome::Rejected(msg) => assert!(msg.contains("webhook"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_daemon_stamped_source() {
+        // Daemon-dispatched runs pre-set a digest image AND their own
+        // provenance — the daemon pins the commit its own code runs.
+        let digest_image = format!("ghcr.io/x@sha256:{}", "a".repeat(64));
+        let deps = watching(git_cl()).await;
+        let mut run = build_run("analytics", &digest_image);
+        run.spec.source = Some(expected_run_source());
+        let req = admission_request_create("uid-git-4", "team-data", &run);
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+
+        // …but a malformed pin is still rejected.
+        let mut bad = build_run("analytics", &digest_image);
+        let mut src = expected_run_source();
+        src.git.commit = "not-a-sha".to_string();
+        bad.spec.source = Some(src);
+        let req = admission_request_create("uid-git-5", "team-data", &bad);
+        assert!(matches!(
+            mutate_run(&req, &deps).await,
+            RunOutcome::Rejected(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_the_serving_trees_url_and_secret_while_a_change_rolls_out() {
+        // The pods of the serving tree stamp its url and Secret until the
+        // new spec's pods are all ready.
+        const OLD_URL: &str = "https://forge.example/acme/pipelines.git";
+        const NEW_URL: &str = "https://forge.example/acme/pipelines-v2.git";
+        let mut spec = git_spec();
+        spec["git"]["url"] = serde_json::json!(NEW_URL);
+        spec["git"]["secretRef"] = serde_json::json!({ "name": "git-creds-v2" });
+        let deps = watching(code_location(spec, serving(&expected_run_source()))).await;
+        let source = |url: &str, secret: &str| RunSource {
+            git: GitCoordinates {
+                url: url.to_string(),
+                secret_name: Some(secret.to_string()),
+                ..expected_run_source().git
+            },
+            ..expected_run_source()
+        };
+
+        expect_accepted(&self_stamped_run(source(OLD_URL, "git-creds")), &deps).await;
+        expect_accepted(&self_stamped_run(source(NEW_URL, "git-creds-v2")), &deps).await;
+
+        let other_url = source("https://attacker.example/acme/pipelines.git", "git-creds");
+        assert_eq!(
+            expect_rejected(&self_stamped_run(other_url), &deps).await,
+            "spec.source.git.url does not match spec.git.url or status.runSource.git.url \
+             of codeLocation 'team-data/analytics'"
+        );
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source(OLD_URL, "db-credentials")), &deps).await,
+            "spec.source.git.secretName 'db-credentials' does not match \
+             status.runSource.git.secretName 'git-creds' of codeLocation 'team-data/analytics'"
+        );
+        // Each url only with its own Secret: the credentials of one host
+        // never go to the other.
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source(NEW_URL, "git-creds")), &deps).await,
+            "spec.source.git.secretName 'git-creds' does not match \
+             spec.git.secretRef 'git-creds-v2' of codeLocation 'team-data/analytics'"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_an_uppercase_commit() {
+        let deps = watching(git_cl()).await;
+        let mut source = expected_run_source();
+        source.git.commit = UPPERCASE_COMMIT.to_string();
+        assert_eq!(
+            expect_rejected(&self_stamped_run(source), &deps).await,
+            uppercase_commit_rejection("spec.source.git.commit")
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_other_repo_url() {
+        // The source url is where a fallback run pod sends the CL's
+        // credentials.
+        let deps = watching(git_cl()).await;
+        let mut source = expected_run_source();
+        source.git.url = "https://attacker.example/acme/pipelines.git".to_string();
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(
+            msg.contains("spec.source.git.url does not match spec.git.url"),
+            "{msg}"
+        );
+        assert!(msg.contains("'team-data/analytics'"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_other_secret_name() {
+        // The source secretName is the Secret a fallback run pod mounts.
+        let deps = watching(git_cl()).await;
+        let mut source = expected_run_source();
+        source.git.secret_name = Some("db-credentials".to_string());
+        let msg = expect_rejected(&self_stamped_run(source.clone()), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName 'db-credentials' does not match \
+                 spec.git.secretRef 'git-creds'"
+            ),
+            "{msg}"
+        );
+
+        source.git.secret_name = None;
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName none does not match spec.git.secretRef 'git-creds'"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_secret_when_codelocation_has_none() {
+        let deps = watching(ready_cl(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "ref": { "branch": "main" },
+            },
+        })))
+        .await;
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert!(
+            msg.contains(
+                "spec.source.git.secretName 'git-creds' does not match spec.git.secretRef none"
+            ),
+            "{msg}"
+        );
+
+        // Neither side naming a Secret is a match.
+        let mut source = expected_run_source();
+        source.git.secret_name = None;
+        let req =
+            admission_request_create("uid-hatch-nosecret", "team-data", &self_stamped_run(source));
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_host_outside_allowed_hosts() {
+        let deps = watching(git_cl()).await;
+        let allowing = |hosts: &[&str]| AdmissionDeps {
+            git: allowing_hosts(hosts),
+            ..deps.clone()
+        };
+        let source = expected_run_source();
+        let listed = allowing(&["Forge.Example"]);
+        check_self_stamped_source(&source, "team-data", "analytics", &listed)
+            .await
+            .unwrap();
+        let unlisted = allowing(&["github.com"]);
+        let err = check_self_stamped_source(&source, "team-data", "analytics", &unlisted)
+            .await
+            .unwrap_err();
+        assert!(err.contains("git host 'forge.example'"), "{err}");
+        assert!(err.contains("allowedHosts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_ssh_source_url_without_a_user() {
+        /// A self-stamped run on `url`, which is also the code location's
+        /// own url (as admitted before ssh urls had to name the user).
+        async fn on_url(url: &str) -> RunOutcome {
+            let deps = watching(ready_cl(serde_json::json!({
+                "git": {
+                    "url": url,
+                    "ref": { "branch": "main" },
+                    "secretRef": { "name": "git-creds" },
+                },
+            })))
+            .await;
+            let mut source = expected_run_source();
+            source.git.url = url.to_string();
+            let req =
+                admission_request_create("uid-hatch-ssh", "team-data", &self_stamped_run(source));
+            mutate_run(&req, &deps).await
+        }
+
+        assert_eq!(
+            on_url("ssh://github.com/acme/r.git").await,
+            RunOutcome::Rejected(
+                "spec.source.git.url must name the ssh user — use \
+                 ssh://git@github.com/acme/r.git, or the user your git host expects"
+                    .to_string()
+            )
+        );
+        for url in [
+            "ssh://git@github.com/acme/r.git",
+            "https://github.com/acme/r.git",
+        ] {
+            assert_eq!(on_url(url).await, RunOutcome::AcceptedAsIs, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_for_image_mode_codelocation() {
+        let deps = watching(ready_cl(serde_json::json!({
+            "image": "ghcr.io/acme/pipeline",
+            "tag": "v1",
+        })))
+        .await;
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert!(
+            msg.contains("codeLocation 'team-data/analytics' is not git-sourced"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_source_when_codelocation_missing() {
+        let deps = AdmissionDeps::cache_only(Arc::new(DirectoryState::new()));
+        let msg = expect_rejected(&self_stamped_run(expected_run_source()), &deps).await;
+        assert_eq!(
+            msg,
+            "codeLocation 'analytics' not found in namespace 'team-data'"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_own_repo_at_another_commit_and_path() {
+        // A pod still serving the previous commit during a rollout stamps
+        // that commit; ref, path and dependencies follow the commit.
+        let deps = watching(git_cl()).await;
+        let mut source = expected_run_source();
+        source.git.commit = "b".repeat(40);
+        source.git.r#ref = Some("refs/heads/release".to_string());
+        source.git.path = Some("legacy/analytics".to_string());
+        source.dependencies =
+            serde_json::from_value(serde_json::json!({ "mode": "none" })).unwrap();
+        let req =
+            admission_request_create("uid-hatch-other", "team-data", &self_stamped_run(source));
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_builds_trees_only_with_the_code_locations_runtime_repository() {
+        // The source's runtime image runs the sync init container, which
+        // mounts the CodeLocation's git Secret in fallback mode.
+        let deps = watching(git_cl()).await;
+
+        // Another digest of the same repository: a runtime image rollout.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+
+        let other = gpu_worker();
+        assert_eq!(
+            expect_rejected(&self_stamped_run(with_runtime_image(&other)), &deps).await,
+            format!(
+                "spec.source.runtimeImage '{other}' is not in the runtime image repository \
+                 '{}' of codeLocation 'team-data/analytics'",
+                runtime_repository()
+            )
+        );
+        let tagged = format!("{}:0.5.0-py3.12", runtime_repository());
+        assert_eq!(
+            expect_rejected(&self_stamped_run(with_runtime_image(&tagged)), &deps).await,
+            format!(
+                "spec.source.runtimeImage '{tagged}' is not a digest reference \
+                 (must be of the form 'registry/repo@sha256:...')"
+            )
+        );
+    }
+
+    /// A git CL whose pods are up before its first rollout completed: a
+    /// status without `resolvedImage`.
+    async fn before_the_first_rollout() -> AdmissionDeps {
+        watching(code_location(
+            git_spec(),
+            serde_json::json!({ "phase": "Deploying" }),
+        ))
+        .await
+    }
+
+    const MIRROR: &str = "harbor.internal/rivers/rivers-runtime";
+
+    /// A git CL whose `spec.image` moved to [`MIRROR`] while runs still get
+    /// the tree built with the chart's default runtime image.
+    async fn while_spec_image_moves_to_the_mirror() -> AdmissionDeps {
+        let mut spec = git_spec();
+        spec["image"] = serde_json::json!(MIRROR);
+        watching(ready_cl(spec)).await
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_the_wanted_runtime_repository_before_the_first_rollout() {
+        let deps = before_the_first_rollout().await;
+
+        // No spec.image: the chart's default runtime image.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_accepts_both_runtime_repositories_while_spec_image_changes() {
+        let deps = while_spec_image_moves_to_the_mirror().await;
+
+        // Pods still on the previous repository, and those of the new one.
+        expect_accepted(&self_stamped_run(with_runtime_image(&runtime('b'))), &deps).await;
+        let new = format!("{MIRROR}@sha256:{}", "c".repeat(64));
+        expect_accepted(&self_stamped_run(with_runtime_image(&new)), &deps).await;
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_rejects_runtime_images_outside_the_runtime_repositories() {
+        let run = self_stamped_run(with_runtime_image(&gpu_worker()));
+        for (deps, repositories) in [
+            (
+                before_the_first_rollout().await,
+                format!("'{}'", runtime_repository()),
+            ),
+            (
+                while_spec_image_moves_to_the_mirror().await,
+                format!("'{}' or '{MIRROR}'", runtime_repository()),
+            ),
+        ] {
+            assert_eq!(
+                expect_rejected(&run, &deps).await,
+                format!(
+                    "spec.source.runtimeImage '{}' is not in the runtime image repository \
+                     {repositories} of codeLocation 'team-data/analytics'",
+                    gpu_worker()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_hatch_reads_codelocation_with_live_get_on_cache_miss() {
+        let (deps, api_state) = reading_live(git_cl());
+
+        let mut source = expected_run_source();
+        source.git.secret_name = Some("db-credentials".to_string());
+        let msg = expect_rejected(&self_stamped_run(source), &deps).await;
+        assert!(msg.contains("'db-credentials'"), "{msg}");
+
+        let req = admission_request_create(
+            "uid-hatch-live",
+            "team-data",
+            &self_stamped_run(expected_run_source()),
+        );
+        assert_eq!(mutate_run(&req, &deps).await, RunOutcome::AcceptedAsIs);
+
+        assert_eq!(live_gets(&api_state), vec![ANALYTICS_URL; 2]);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_source_change() {
+        let mut old = build_run("analytics", "ghcr.io/x@sha256:aaaa");
+        old.spec.source = Some(expected_run_source());
+        let mut new = old.clone();
+        new.spec.source.as_mut().unwrap().git.commit =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let req = admission_request_update("uid-git-6", "team-data", &new, &old);
+        match check_run_update(&req) {
+            RunOutcome::Rejected(msg) => assert!(msg.contains("source"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
         }
     }
 
@@ -496,29 +1450,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_mutates_when_codelocation_ready_and_image_unset() {
-        let state = Arc::new(DirectoryState::new());
-        state
-            .upsert(ready_entry(
-                "team-data",
-                "analytics",
-                "ghcr.io/x@sha256:aaaa",
-                "my.module",
-                "11111111-1111-4111-8111-111111111111",
-            ))
-            .await;
-
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-1", "team-data", &run);
-
-        let outcome = mutate_run(&req, &AdmissionDeps::cache_only(state)).await;
-        assert_eq!(
-            outcome,
-            RunOutcome::Mutated {
-                image: "ghcr.io/x@sha256:aaaa".to_string(),
-                module: "my.module".to_string(),
-                identity: "11111111-1111-4111-8111-111111111111".to_string(),
-            }
+        let cl = code_location(
+            serde_json::json!({
+                "image": "ghcr.io/x",
+                "module": "my.module",
+                "identity": IDENTITY,
+            }),
+            serde_json::json!({ "phase": "Ready", "resolvedImage": "ghcr.io/x@sha256:aaaa" }),
         );
+        let image_mode = RunOutcome::Mutated {
+            image: "ghcr.io/x@sha256:aaaa".to_string(),
+            module: "my.module".to_string(),
+            identity: IDENTITY.to_string(),
+            source: None,
+        };
+        assert_eq!(create(&watching(cl.clone()).await).await, image_mode);
+        assert_eq!(create(&reading_live(cl).0).await, image_mode);
     }
 
     #[tokio::test]
@@ -539,22 +1486,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_when_codelocation_not_ready() {
-        let state = Arc::new(DirectoryState::new());
-        let mut entry = ready_entry(
-            "team-data",
-            "analytics",
-            "ghcr.io/x@sha256:cc",
-            "m",
-            "22222222-2222-4222-8222-222222222222",
+        let cl = code_location(
+            serde_json::json!({ "image": "ghcr.io/x", "module": "m" }),
+            serde_json::json!({ "phase": "Failed", "resolvedImage": "ghcr.io/x@sha256:cc" }),
         );
-        entry.phase = CodeLocationPhase::Failed.as_str().to_string();
-        state.upsert(entry).await;
-
-        let run = build_run("analytics", "");
-        let req = admission_request_create("uid-4", "team-data", &run);
-
-        let outcome = mutate_run(&req, &AdmissionDeps::cache_only(state)).await;
-        match outcome {
+        match create(&watching(cl).await).await {
             RunOutcome::Rejected(msg) => {
                 assert!(msg.contains("not Ready"));
                 assert!(msg.contains("Failed"));
@@ -684,16 +1620,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_admission_emits_jsonpatch_for_mutated_create() {
-        let state = Arc::new(DirectoryState::new());
-        state
-            .upsert(ready_entry(
-                "team-data",
-                "analytics",
-                "ghcr.io/x@sha256:dd",
-                "m",
-                "44444444-4444-4444-8444-444444444444",
-            ))
-            .await;
+        let deps = watching(code_location(
+            serde_json::json!({
+                "image": "ghcr.io/x",
+                "module": "m",
+                "identity": "44444444-4444-4444-8444-444444444444",
+            }),
+            serde_json::json!({ "phase": "Ready", "resolvedImage": "ghcr.io/x@sha256:dd" }),
+        ))
+        .await;
         let run = build_run("analytics", "");
         let req = admission_request_create("uid-pat", "team-data", &run);
         let review = AdmissionReview {
@@ -705,7 +1640,7 @@ mod tests {
             response: None,
         };
 
-        let resp = handle_run_admission(review, &AdmissionDeps::cache_only(state)).await;
+        let resp = handle_run_admission(review, &deps).await;
         let r = resp.response.unwrap();
         assert!(r.allowed);
         let patch_bytes = r.patch.expect("mutation produced a JSON Patch");
@@ -726,7 +1661,7 @@ mod tests {
     fn cl_create_stamps_uuid_when_identity_empty() {
         let cl = build_cl("analytics", "");
         let req = cl_admission_request_create("uid-cl-1", "team-data", &cl);
-        match mutate_codelocation(&req) {
+        match mutate_codelocation(&req, &GitConfig::default()) {
             CodeLocationOutcome::IdentityStamped(uuid) => {
                 assert!(is_uuid_v4(&uuid), "stamped uuid {uuid} is not v4");
             }
@@ -738,14 +1673,17 @@ mod tests {
     fn cl_create_accepts_valid_user_supplied_uuid() {
         let cl = build_cl("analytics", "550e8400-e29b-41d4-a716-446655440000");
         let req = cl_admission_request_create("uid-cl-2", "team-data", &cl);
-        assert_eq!(mutate_codelocation(&req), CodeLocationOutcome::AcceptedAsIs);
+        assert_eq!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::AcceptedAsIs
+        );
     }
 
     #[test]
     fn cl_create_rejects_non_uuid_identity() {
         let cl = build_cl("analytics", "garbage");
         let req = cl_admission_request_create("uid-cl-3", "team-data", &cl);
-        match mutate_codelocation(&req) {
+        match mutate_codelocation(&req, &GitConfig::default()) {
             CodeLocationOutcome::Rejected(msg) => {
                 assert!(msg.contains("not a valid UUID v4"));
             }
@@ -758,7 +1696,7 @@ mod tests {
         // UUID v1 (time-based) — well-formed but wrong version.
         let cl = build_cl("analytics", "550e8400-e29b-11d4-a716-446655440000");
         let req = cl_admission_request_create("uid-cl-3b", "team-data", &cl);
-        match mutate_codelocation(&req) {
+        match mutate_codelocation(&req, &GitConfig::default()) {
             CodeLocationOutcome::Rejected(msg) => {
                 assert!(msg.contains("UUID v4"));
             }
@@ -771,7 +1709,7 @@ mod tests {
         let old = build_cl("analytics", "550e8400-e29b-41d4-a716-446655440000");
         let new = build_cl("analytics", "11111111-1111-4111-8111-111111111111");
         let req = cl_admission_request_update("uid-cl-4", "team-data", &new, &old);
-        match mutate_codelocation(&req) {
+        match mutate_codelocation(&req, &GitConfig::default()) {
             CodeLocationOutcome::Rejected(msg) => {
                 assert!(msg.contains("immutable"));
             }
@@ -786,9 +1724,638 @@ mod tests {
         new.spec.tag = Some("v2".to_string());
         let req = cl_admission_request_update("uid-cl-5", "team-data", &new, &old);
         assert_eq!(
-            mutate_codelocation(&req),
+            mutate_codelocation(&req, &GitConfig::default()),
             CodeLocationOutcome::UpdateAllowed
         );
+    }
+
+    fn build_git_cl(git_spec: serde_json::Value) -> CodeLocation {
+        let spec = serde_json::from_value(serde_json::json!({ "git": git_spec })).unwrap();
+        CodeLocation::new("analytics", spec)
+    }
+
+    #[test]
+    fn cl_source_validation_requires_image_or_git() {
+        let spec = serde_json::from_value(serde_json::json!({ "module": "m" })).unwrap();
+        let cl = CodeLocation::new("bare", spec);
+        let err = validate_git_source(&cl, &GitConfig::default()).unwrap_err();
+        assert!(err.contains("spec.image or spec.git"));
+    }
+
+    #[test]
+    fn cl_git_ref_one_of_enforced_at_admission() {
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main", "tag": "v1" }
+        }));
+        let err = validate_git_source(&cl, &GitConfig::default()).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn cl_git_url_schemes_validated() {
+        let ok = build_git_cl(serde_json::json!({
+            "url": "ssh://git@forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        validate_git_source(&ok, &GitConfig::default()).unwrap();
+
+        let scp_style = build_git_cl(serde_json::json!({
+            "url": "git@forge.example:acme/r.git",
+            "ref": { "branch": "main" }
+        }));
+        assert!(validate_git_source(&scp_style, &GitConfig::default()).is_err());
+
+        let ftp = build_git_cl(serde_json::json!({
+            "url": "ftp://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let err = validate_git_source(&ftp, &GitConfig::default()).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    const USERLESS_SSH_REJECTION: &str = "spec.git.url must name the ssh user — use \
+        ssh://git@github.com/acme/r.git, or the user your git host expects";
+
+    #[test]
+    fn cl_create_rejects_ssh_url_without_a_user() {
+        let cl = |url: &str| {
+            build_git_cl(serde_json::json!({ "url": url, "ref": { "branch": "main" } }))
+        };
+        let create = |url: &str| {
+            mutate_codelocation(
+                &cl_admission_request_create("uid-cl-ssh", "team-data", &cl(url)),
+                &GitConfig::default(),
+            )
+        };
+
+        assert_eq!(
+            create("ssh://github.com/acme/r.git"),
+            CodeLocationOutcome::Rejected(USERLESS_SSH_REJECTION.to_string())
+        );
+        for url in [
+            "ssh://git@github.com/acme/r.git",
+            "https://github.com/acme/r.git",
+        ] {
+            assert!(
+                matches!(create(url), CodeLocationOutcome::IdentityStamped(_)),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_rejects_ssh_url_without_a_user() {
+        let old = build_git_cl(serde_json::json!({
+            "url": "ssh://git@github.com/acme/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/r.git".to_string();
+        let req = cl_admission_request_update("uid-cl-ssh-update", "team-data", &new, &old);
+        assert_eq!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::Rejected(USERLESS_SSH_REJECTION.to_string())
+        );
+
+        let req = cl_admission_request_update("uid-cl-ssh-update", "team-data", &old, &old);
+        assert_eq!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// A CodeLocation admitted before ssh urls had to name the user.
+    fn userless_ssh_cl() -> CodeLocation {
+        build_git_cl(serde_json::json!({
+            "url": "ssh://github.com/acme/r.git",
+            "ref": { "branch": "main" }
+        }))
+    }
+
+    fn cl_update(new: &CodeLocation, old: &CodeLocation) -> CodeLocationOutcome {
+        mutate_codelocation(
+            &cl_admission_request_update("uid-cl-source-update", "team-data", new, old),
+            &GitConfig::default(),
+        )
+    }
+
+    #[test]
+    fn cl_update_that_keeps_the_source_skips_source_validation() {
+        let old = userless_ssh_cl();
+        let mut new = old.clone();
+        new.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+    }
+
+    #[test]
+    fn cl_update_of_a_deleting_code_location_skips_source_validation() {
+        let mut old = userless_ssh_cl();
+        old.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-10-03T12:00:00Z".parse().unwrap(),
+            ));
+        old.metadata.finalizers = Some(vec!["foregroundDeletion".to_string()]);
+        // The garbage collector removes its finalizer.
+        let mut new = old.clone();
+        new.metadata.finalizers = None;
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+
+        // Also with a changed source.
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/other.git".to_string();
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+    }
+
+    #[test]
+    fn cl_update_that_changes_the_source_validates_it() {
+        let old = userless_ssh_cl();
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().url = "ssh://github.com/acme/other.git".to_string();
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(
+                "spec.git.url must name the ssh user — use ssh://git@github.com/acme/other.git, \
+                 or the user your git host expects"
+                    .to_string()
+            )
+        );
+
+        new.spec.git.as_mut().unwrap().url = "ssh://git@github.com/acme/r.git".to_string();
+        assert_eq!(cl_update(&new, &old), CodeLocationOutcome::UpdateAllowed);
+
+        // A change of spec.image alone is a source change too.
+        let old = build_cl("analytics", "");
+        let mut new = old.clone();
+        new.spec.image = None;
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected("one of spec.image or spec.git must be set".to_string())
+        );
+    }
+
+    const UPPERCASE_COMMIT: &str = "9F3C1AB8D2E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8";
+
+    /// The rejection of [`UPPERCASE_COMMIT`] in `field`.
+    fn uppercase_commit_rejection(field: &str) -> String {
+        format!(
+            "{field} '{UPPERCASE_COMMIT}' has uppercase letters — use the lowercase SHA '{COMMIT}'"
+        )
+    }
+
+    fn pinned_cl(commit: &str) -> CodeLocation {
+        build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "commit": commit }
+        }))
+    }
+
+    #[test]
+    fn cl_create_rejects_an_uppercase_commit() {
+        let create = |commit: &str| {
+            mutate_codelocation(
+                &cl_admission_request_create("uid-cl-commit", "team-data", &pinned_cl(commit)),
+                &GitConfig::default(),
+            )
+        };
+        assert_eq!(
+            create(UPPERCASE_COMMIT),
+            CodeLocationOutcome::Rejected(uppercase_commit_rejection("git.ref.commit"))
+        );
+        assert!(matches!(
+            create(COMMIT),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_rejects_a_change_to_an_uppercase_commit() {
+        let old = pinned_cl(COMMIT);
+        let new = pinned_cl(UPPERCASE_COMMIT);
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(uppercase_commit_rejection("git.ref.commit"))
+        );
+
+        // One admitted before this rule keeps taking updates that leave its
+        // source alone; the operator fails it instead.
+        let mut labelled = new.clone();
+        labelled.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(
+            cl_update(&labelled, &new),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// What the webhook answers for a new git CodeLocation whose `spec.git`
+    /// also has `fields`.
+    fn created_with(fields: serde_json::Value) -> CodeLocationOutcome {
+        let mut git = serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" },
+        });
+        git.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        mutate_codelocation(
+            &cl_admission_request_create("uid-cl-git-fields", "team-data", &build_git_cl(git)),
+            &GitConfig::default(),
+        )
+    }
+
+    fn size_rejection(size: &str) -> String {
+        format!(
+            "spec.git.workspaceSize '{size}' must be a Kubernetes quantity more than zero, like \
+             10Gi or 500M"
+        )
+    }
+
+    #[test]
+    fn cl_create_takes_only_a_workspace_size_more_than_zero() {
+        use serde_json::json;
+        for (size, shown) in [
+            (json!("5GB"), "5GB"),
+            (json!("-1Gi"), "-1Gi"),
+            (json!("abc"), "abc"),
+            (json!("0"), "0"),
+            (json!("0.0Gi"), "0.0Gi"),
+            (json!(" 10Gi"), " 10Gi"),
+            (json!(0), "0"),
+            (json!(-1), "-1"),
+        ] {
+            assert_eq!(
+                created_with(json!({ "workspaceSize": size })),
+                CodeLocationOutcome::Rejected(size_rejection(shown)),
+                "{size}"
+            );
+        }
+        for size in [
+            json!("10Gi"),
+            json!("500M"),
+            json!("1e9"),
+            json!("1.5Gi"),
+            json!(5_000_000_000_u64),
+        ] {
+            assert!(
+                matches!(
+                    created_with(json!({ "workspaceSize": size })),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{size}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_to_a_workspace_size_the_api_server_does_not_take_is_rejected() {
+        let old = git_cl_on("https://forge.example/r.git");
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().workspace_size = Some(
+            k8s_openapi::apimachinery::pkg::api::resource::Quantity("5GB".to_string()),
+        );
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(size_rejection("5GB"))
+        );
+
+        // One admitted before this rule keeps taking updates that leave its
+        // source alone; its pods show the API server's answer instead.
+        let mut labelled = new.clone();
+        labelled.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(
+            cl_update(&labelled, &new),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    /// What the webhook answers for a self-stamped run of [`git_cl`] whose
+    /// source has `path`.
+    async fn self_stamped_at(path: &str) -> RunOutcome {
+        let mut source = expected_run_source();
+        source.git.path = Some(path.to_string());
+        let req =
+            admission_request_create("uid-hatch-path", "team-data", &self_stamped_run(source));
+        mutate_run(&req, &watching(git_cl()).await).await
+    }
+
+    #[tokio::test]
+    async fn paths_outside_the_repository_or_in_another_spelling_are_rejected() {
+        let outside = "must stay inside the repository — remove the '..'";
+        let absolute = "must be relative to the repository root, like analytics or \
+                        services/analytics — remove the leading '/'";
+        let spelling = "has an empty or '.' segment — write it like analytics or \
+                        services/analytics, or leave it out for the repository root";
+        for (path, problem) in [
+            ("../x", outside),
+            ("a/../../b", outside),
+            ("analytics/..", outside),
+            ("/abs", absolute),
+            ("/", absolute),
+            ("./analytics", spelling),
+            ("services//analytics", spelling),
+            ("analytics//", spelling),
+            (".", spelling),
+        ] {
+            assert_eq!(
+                created_with(serde_json::json!({ "path": path })),
+                CodeLocationOutcome::Rejected(format!("spec.git.path '{path}' {problem}")),
+                "{path}"
+            );
+            assert_eq!(
+                self_stamped_at(path).await,
+                RunOutcome::Rejected(format!("spec.source.git.path '{path}' {problem}")),
+                "{path}"
+            );
+        }
+        for path in [
+            "analytics",
+            "services/analytics",
+            "analytics/",
+            ".config/app",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    created_with(serde_json::json!({ "path": path })),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{path}"
+            );
+            assert_eq!(
+                self_stamped_at(path).await,
+                RunOutcome::AcceptedAsIs,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_update_to_a_path_outside_the_repository_is_rejected() {
+        let old = git_cl_on("https://forge.example/r.git");
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().path = Some("../shared".to_string());
+        assert_eq!(
+            cl_update(&new, &old),
+            CodeLocationOutcome::Rejected(
+                "spec.git.path '../shared' must stay inside the repository — remove the '..'"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn cl_git_host_allowlist() {
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        // Empty list admits any host.
+        validate_git_source(&cl, &GitConfig::default()).unwrap();
+        // Listed host, case-insensitively.
+        validate_git_source(&cl, &allowing_hosts(&["Forge.Example"])).unwrap();
+        // Unlisted host rejected with the knob named.
+        let err = validate_git_source(&cl, &allowing_hosts(&["github.com"])).unwrap_err();
+        assert!(err.contains("allowedHosts"), "{err}");
+    }
+
+    const HTTP_URL: &str = "http://gitea.internal/acme/r.git";
+
+    /// The operator's git settings with `operator.git.allowInsecure`.
+    fn allowing_http() -> GitConfig {
+        GitConfig {
+            allow_insecure: true,
+            ..GitConfig::default()
+        }
+    }
+
+    /// A git CodeLocation on `url`.
+    fn git_cl_on(url: &str) -> CodeLocation {
+        build_git_cl(serde_json::json!({ "url": url, "ref": { "branch": "main" } }))
+    }
+
+    /// What the webhook, under the operator's `git` settings, answers for a
+    /// new git CodeLocation on `url`.
+    fn created_on(url: &str, git: &GitConfig) -> CodeLocationOutcome {
+        mutate_codelocation(
+            &cl_admission_request_create("uid-cl-url", "team-data", &git_cl_on(url)),
+            git,
+        )
+    }
+
+    /// What the webhook, under the operator's `git` settings, answers for a
+    /// self-stamped run on `url`, which is also its code location's url.
+    async fn self_stamped_on(url: &str, git: GitConfig) -> RunOutcome {
+        let cl = ready_cl(serde_json::json!({
+            "git": {
+                "url": url,
+                "ref": { "branch": "main" },
+                "secretRef": { "name": "git-creds" },
+            },
+        }));
+        let deps = AdmissionDeps {
+            git,
+            ..watching(cl).await
+        };
+        let mut source = expected_run_source();
+        source.git.url = url.to_string();
+        let req = admission_request_create("uid-hatch-url", "team-data", &self_stamped_run(source));
+        mutate_run(&req, &deps).await
+    }
+
+    /// The rejection of an `http://` url in `field` without
+    /// `operator.git.allowInsecure`.
+    fn http_rejection(field: &str) -> String {
+        format!(
+            "{field}: http:// sends the code and the git Secret's credentials unencrypted — use \
+             https://, or set operator.git.allowInsecure to true for a git host on a trusted \
+             network"
+        )
+    }
+
+    #[tokio::test]
+    async fn http_urls_need_the_operators_opt_in() {
+        assert_eq!(
+            created_on(HTTP_URL, &GitConfig::default()),
+            CodeLocationOutcome::Rejected(http_rejection("spec.git.url"))
+        );
+        assert_eq!(
+            self_stamped_on(HTTP_URL, GitConfig::default()).await,
+            RunOutcome::Rejected(http_rejection("spec.source.git.url"))
+        );
+
+        assert!(matches!(
+            created_on(HTTP_URL, &allowing_http()),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+        assert_eq!(
+            self_stamped_on(HTTP_URL, allowing_http()).await,
+            RunOutcome::AcceptedAsIs
+        );
+    }
+
+    #[test]
+    fn cl_update_to_an_http_url_needs_the_operators_opt_in() {
+        let update = |new: &CodeLocation, old: &CodeLocation, git: &GitConfig| {
+            mutate_codelocation(
+                &cl_admission_request_update("uid-cl-http-update", "team-data", new, old),
+                git,
+            )
+        };
+        let old = git_cl_on("https://gitea.internal/acme/r.git");
+        let new = git_cl_on(HTTP_URL);
+        assert_eq!(
+            update(&new, &old, &GitConfig::default()),
+            CodeLocationOutcome::Rejected(http_rejection("spec.git.url"))
+        );
+        assert_eq!(
+            update(&new, &old, &allowing_http()),
+            CodeLocationOutcome::UpdateAllowed
+        );
+
+        // One admitted before the rule keeps taking updates that leave its
+        // source alone; the operator fails it instead.
+        let mut labelled = new.clone();
+        labelled.metadata.labels = Some([("team".to_string(), "data".to_string())].into());
+        assert_eq!(
+            update(&labelled, &new, &GitConfig::default()),
+            CodeLocationOutcome::UpdateAllowed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_in_the_url_is_rejected_without_repeating_it() {
+        const TOKEN: &str = "ghp_8f1c2dS3cr3t";
+        for url in [
+            format!("https://bot:{TOKEN}@github.com/acme/r.git"),
+            format!("ssh://git:{TOKEN}@github.com/acme/r.git"),
+        ] {
+            let rejection = |field: &str| {
+                format!(
+                    "{field}: the url has a password — put the credentials in the git Secret \
+                     (spec.git.secretRef)"
+                )
+            };
+            assert_eq!(
+                created_on(&url, &allowing_http()),
+                CodeLocationOutcome::Rejected(rejection("spec.git.url")),
+                "{url}"
+            );
+            assert_eq!(
+                self_stamped_on(&url, allowing_http()).await,
+                RunOutcome::Rejected(rejection("spec.source.git.url")),
+                "{url}"
+            );
+            assert!(!rejection("spec.git.url").contains(TOKEN));
+        }
+
+        // A user alone is no secret: ssh urls must name one.
+        for url in [
+            "https://bot@github.com/acme/r.git",
+            "ssh://git@github.com/acme/r.git",
+        ] {
+            assert!(
+                matches!(
+                    created_on(url, &GitConfig::default()),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{url}"
+            );
+            assert_eq!(
+                self_stamped_on(url, GitConfig::default()).await,
+                RunOutcome::AcceptedAsIs,
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_git_reads_with_another_host_is_rejected() {
+        // Each url names `allowed.example` to the `url` crate, but git (and
+        // the ssh or curl it runs) connects to `evil.example`.
+        let git = allowing_hosts(&["allowed.example"]);
+        let fragment = "the ssh url has '?' or '#' before its path, which git reads as part of \
+                        the host";
+        let cases = [
+            ("ssh://git@allowed.example#@evil.example/r.git", fragment),
+            ("ssh://git@allowed.example?@evil.example/r.git", fragment),
+            (
+                "ssh://evil.example%2F@allowed.example/r.git",
+                "the ssh url has an escaped '/' before its path, where git ends the host",
+            ),
+            (
+                "https://allowed.example\\@evil.example/r.git",
+                "the url has a '\\', which git and the operator read differently — use '/'",
+            ),
+        ];
+        for (url, problem) in cases {
+            assert_eq!(
+                created_on(url, &git),
+                CodeLocationOutcome::Rejected(format!("spec.git.url: {problem}")),
+                "{url}"
+            );
+            assert_eq!(
+                self_stamped_on(url, git.clone()).await,
+                RunOutcome::Rejected(format!("spec.source.git.url: {problem}")),
+                "{url}"
+            );
+        }
+
+        for url in [
+            "ssh://git@allowed.example/r.git",
+            "https://allowed.example/r.git",
+        ] {
+            assert!(
+                matches!(
+                    created_on(url, &git),
+                    CodeLocationOutcome::IdentityStamped(_)
+                ),
+                "{url}"
+            );
+            assert_eq!(
+                self_stamped_on(url, git.clone()).await,
+                RunOutcome::AcceptedAsIs,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cl_create_validates_git_before_stamping_identity() {
+        // Invalid git + empty identity: must reject, not stamp-and-accept.
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": {}
+        }));
+        let req = cl_admission_request_create("uid-cl-git-1", "team-data", &cl);
+        match mutate_codelocation(&req, &GitConfig::default()) {
+            CodeLocationOutcome::Rejected(msg) => assert!(msg.contains("exactly one"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Valid git + empty identity still stamps.
+        let cl = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let req = cl_admission_request_create("uid-cl-git-2", "team-data", &cl);
+        assert!(matches!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::IdentityStamped(_)
+        ));
+    }
+
+    #[test]
+    fn cl_update_rejects_git_going_invalid() {
+        let old = build_git_cl(serde_json::json!({
+            "url": "https://forge.example/r.git",
+            "ref": { "branch": "main" }
+        }));
+        let mut new = old.clone();
+        new.spec.git.as_mut().unwrap().r#ref.tag = Some("v1".to_string());
+        let req = cl_admission_request_update("uid-cl-git-3", "team-data", &new, &old);
+        assert!(matches!(
+            mutate_codelocation(&req, &GitConfig::default()),
+            CodeLocationOutcome::Rejected(_)
+        ));
     }
 
     #[tokio::test]
@@ -803,7 +2370,7 @@ mod tests {
             request: Some(req),
             response: None,
         };
-        let resp = handle_codelocation_admission(review).await;
+        let resp = handle_codelocation_admission(review, &GitConfig::default()).await;
         let r = resp.response.unwrap();
         assert!(r.allowed);
         let patch_bytes = r.patch.expect("CREATE produced a JSON Patch");

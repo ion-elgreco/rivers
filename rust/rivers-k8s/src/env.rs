@@ -234,6 +234,47 @@ pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     env
 }
 
+/// Git-workspace envs on every pod that runs from a tree (code-location
+/// pod, run executor pod, step Jobs), read back in-pod so the Runs and step
+/// Jobs it launches get the same tree. `RIVERS_RUN_SOURCE`
+/// carries the tree's `RunSource` as JSON — one typed channel instead of a
+/// fan of `RIVERS_GIT_*` vars.
+pub use rivers_crd::workspace::ENV_RUN_SOURCE;
+/// Shared-mode PVC claim name; unset/empty means emptyDir fallback.
+pub const ENV_WORKSPACE_PVC: &str = "RIVERS_WORKSPACE_PVC";
+pub const ENV_WORKSPACE_EMPTYDIR_LIMIT: &str = "RIVERS_WORKSPACE_EMPTYDIR_LIMIT";
+
+/// Git provenance of the tree this pod runs. `None` in image mode (no
+/// `RIVERS_RUN_SOURCE`).
+pub fn detect_run_source() -> Option<crate::crd::run::RunSource> {
+    let source_json = env_nonempty(ENV_RUN_SOURCE)?;
+    match serde_json::from_str(&source_json) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            // A malformed value is an operator/pod version skew bug — fail
+            // loudly rather than silently running image-mode.
+            panic!("{ENV_RUN_SOURCE} is not valid RunSource JSON: {e}");
+        }
+    }
+}
+
+/// Rehydrate the git workspace coordinates inside a pod that runs from a
+/// tree. `None` in image mode (no `RIVERS_RUN_SOURCE`).
+pub fn detect_git_workspace() -> Option<(
+    crate::crd::run::RunSource,
+    crate::workspace::WorkspaceVolume,
+)> {
+    let source = detect_run_source()?;
+    let volume = match env_nonempty(ENV_WORKSPACE_PVC) {
+        Some(claim_name) => crate::workspace::WorkspaceVolume::SharedPvc { claim_name },
+        None => crate::workspace::WorkspaceVolume::EmptyDir {
+            size_limit: env_nonempty(ENV_WORKSPACE_EMPTYDIR_LIMIT)
+                .map(k8s_openapi::apimachinery::pkg::api::resource::Quantity),
+        },
+    };
+    Some((source, volume))
+}
+
 /// OTLP export settings for pods that run Python code. The headers Secret is
 /// referenced by coordinate, like the SurrealDB credentials, so the token
 /// never lands in a pod spec. An empty endpoint emits nothing.
@@ -537,6 +578,318 @@ mod tests {
             pairs,
             vec![("A", "1"), ("B", "user"), ("C", "3"), ("D", "last")]
         );
+    }
+
+    #[test]
+    fn code_location_pod_env_hands_its_tree_to_what_it_launches() {
+        use crate::crd::code_location::{Dependencies, DependencyMode};
+        use crate::crd::run::{GitCoordinates, RunSource};
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, builder_pod_pieces};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let source = RunSource {
+            git: GitCoordinates {
+                url: "https://forge.example/acme/pipelines.git".to_string(),
+                commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
+                r#ref: Some("refs/heads/main".to_string()),
+                path: Some("analytics".to_string()),
+                secret_name: Some("git-creds".to_string()),
+            },
+            dependencies: Dependencies {
+                mode: DependencyMode::Requirements,
+                files: vec!["requirements/prod.txt".to_string()],
+                extras: vec![],
+                groups: vec![],
+                timeout_seconds: Some(900),
+            },
+            runtime_image: "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff".to_string(),
+        };
+        for volume in [
+            WorkspaceVolume::SharedPvc {
+                claim_name: "analytics-workspace".to_string(),
+            },
+            WorkspaceVolume::EmptyDir {
+                size_limit: Some(Quantity("5Gi".to_string())),
+            },
+        ] {
+            let pod_env = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: source.clone(),
+                    volume: volume.clone(),
+                    extra_env: vec![],
+                },
+                &prune(),
+            )
+            .main_env;
+            let vars = workspace_vars(&pod_env);
+
+            assert_eq!(
+                with_vars(&vars, detect_git_workspace),
+                Some((source.clone(), volume))
+            );
+            assert_eq!(with_vars(&vars, detect_run_source), Some(source.clone()));
+        }
+        assert_eq!(
+            with_vars(&[(ENV_RUN_SOURCE, None)], detect_run_source),
+            None
+        );
+    }
+
+    #[test]
+    fn run_pod_env_hands_its_workspace_volume_to_its_step_jobs() {
+        use crate::crd::run::RunSource;
+        use crate::executor::build_step_job;
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, consumer_pod_pieces};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        use serde_json::json;
+
+        let image = "ghcr.io/acme/rivers-runtime@sha256:1a2b3c4dffff";
+        let source: RunSource = serde_json::from_value(json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+            },
+            "dependencies": { "mode": "auto" },
+            "runtimeImage": image,
+        }))
+        .unwrap();
+
+        for (volume, step_volumes) in [
+            (
+                WorkspaceVolume::EmptyDir {
+                    size_limit: Some(Quantity("10Gi".to_string())),
+                },
+                json!([{ "name": "workspace", "emptyDir": { "sizeLimit": "10Gi" } }]),
+            ),
+            (
+                WorkspaceVolume::SharedPvc {
+                    claim_name: "analytics-workspace".to_string(),
+                },
+                json!([{ "name": "workspace", "persistentVolumeClaim": {
+                    "claimName": "analytics-workspace", "readOnly": true } }]),
+            ),
+        ] {
+            // The run executor pod's workspace env, as the operator builds it.
+            let run_pod = consumer_pod_pieces(&WorkspaceSpec {
+                source: source.clone(),
+                volume,
+                extra_env: vec![],
+            });
+
+            // What the in-pod Kubernetes step executor does with that env.
+            let config = with_vars(&workspace_vars(&run_pod.main_env), || {
+                step_config(image).with_detected_workspace()
+            });
+            let job = build_step_job(&config, "parse_document");
+
+            let step_pod = job.spec.unwrap().template.spec.unwrap();
+            assert_eq!(
+                serde_json::to_value(&step_pod.volumes).unwrap(),
+                step_volumes
+            );
+            assert_eq!(step_pod.volumes.unwrap(), run_pod.volumes);
+        }
+    }
+
+    /// The code-location pod's prune under the chart's default floors.
+    fn prune() -> crate::workspace::Prune {
+        crate::workspace::Prune {
+            keep_config_map: "analytics-workspace-keep".to_string(),
+            keep_revisions: 3,
+            min_tree_age: std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// The workspace env a pod hands to the pods it launches.
+    fn workspace_vars(env: &[EnvVar]) -> Vec<(&'static str, Option<&str>)> {
+        [
+            ENV_RUN_SOURCE,
+            ENV_WORKSPACE_PVC,
+            ENV_WORKSPACE_EMPTYDIR_LIMIT,
+        ]
+        .into_iter()
+        .map(|name| {
+            let value = env
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref());
+            (name, value)
+        })
+        .collect()
+    }
+
+    fn step_config(worker_image: &str) -> crate::executor::K8sStepExecutorConfig {
+        crate::executor::K8sStepExecutorConfig {
+            worker_image: worker_image.to_string(),
+            namespace: "rivers".to_string(),
+            service_account: "rivers-step-worker".to_string(),
+            worker_cpu: "1".to_string(),
+            worker_memory: "2Gi".to_string(),
+            module: "analytics.pipeline".to_string(),
+            surreal_pod_cfg: SurrealPodConfig::default(),
+            otel_pod_cfg: OtelPodConfig::default(),
+            run_id: "run-1".to_string(),
+            run_cr_name: "run-1".to_string(),
+            run_cr_uid: "uid-1".to_string(),
+            code_location_id: "cl-1".to_string(),
+            extra_env: vec![],
+            partition_key: None,
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn code_location_run_and_step_pods_mount_one_tree() {
+        use crate::crd::run::RunSource;
+        use crate::executor::build_step_job;
+        use crate::workspace::{
+            WorkspaceSpec, WorkspaceVolume, builder_pod_pieces, consumer_pod_pieces,
+        };
+        use k8s_openapi::api::core::v1::VolumeMount;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let source: RunSource = serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "path": "analytics/",
+                "secretName": "git-creds",
+            },
+            "dependencies": { "mode": "uvSync", "extras": ["gpu"], "groups": ["test"] },
+            "runtimeImage": format!("ghcr.io/acme/rivers-runtime@sha256:{}", "1a2b3c4d".repeat(8)),
+        }))
+        .unwrap();
+        let sub_paths = |mounts: &[VolumeMount]| {
+            mounts
+                .iter()
+                .map(|m| m.sub_path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for volume in [
+            WorkspaceVolume::SharedPvc {
+                claim_name: "analytics-workspace".to_string(),
+            },
+            WorkspaceVolume::EmptyDir {
+                size_limit: Some(Quantity("5Gi".to_string())),
+            },
+        ] {
+            let cl_pod = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: source.clone(),
+                    volume: volume.clone(),
+                    extra_env: vec![],
+                },
+                &prune(),
+            );
+            // A run that the code-location pod launches carries its source.
+            let run_source = with_vars(&workspace_vars(&cl_pod.main_env), detect_run_source)
+                .expect("the code-location pod hands on its source");
+            let run_pod = consumer_pod_pieces(&WorkspaceSpec {
+                source: run_source,
+                volume,
+                extra_env: vec![],
+            });
+            let config = with_vars(&workspace_vars(&run_pod.main_env), || {
+                step_config("ghcr.io/acme/rivers-runtime:0.5.0").with_detected_workspace()
+            });
+            let step_pod = build_step_job(&config, "train")
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap();
+
+            let tree = vec![Some(source.workspace_key())];
+            assert_eq!(sub_paths(&cl_pod.main_mounts), tree);
+            assert_eq!(sub_paths(&run_pod.main_mounts), tree);
+            assert_eq!(
+                sub_paths(step_pod.containers[0].volume_mounts.as_deref().unwrap()),
+                tree
+            );
+        }
+    }
+
+    #[test]
+    fn step_jobs_run_their_worker_image_on_the_tree_the_runtime_image_built() {
+        use crate::crd::run::{GitCoordinates, RunSource};
+        use crate::executor::build_step_job;
+        use crate::workspace::{WorkspaceSpec, WorkspaceVolume, builder_pod_pieces};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let commit = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+        let runtime = format!(
+            "ghcr.io/acme/rivers-runtime@sha256:{}",
+            "1a2b3c4d".repeat(8)
+        );
+        // Executor.kubernetes(worker_image=...)
+        let worker = format!("ghcr.io/acme/gpu-worker@sha256:{}", "ffee0011".repeat(8));
+
+        for (volume, step_init_images) in [
+            (
+                WorkspaceVolume::SharedPvc {
+                    claim_name: "analytics-workspace".to_string(),
+                },
+                vec![],
+            ),
+            (
+                WorkspaceVolume::EmptyDir {
+                    size_limit: Some(Quantity("5Gi".to_string())),
+                },
+                vec![Some(runtime.clone())],
+            ),
+        ] {
+            let cl_pod = builder_pod_pieces(
+                &WorkspaceSpec {
+                    source: RunSource {
+                        git: GitCoordinates {
+                            url: "https://forge.example/acme/pipelines.git".to_string(),
+                            commit: commit.to_string(),
+                            r#ref: Some("refs/heads/main".to_string()),
+                            path: Some("analytics".to_string()),
+                            secret_name: Some("git-creds".to_string()),
+                        },
+                        dependencies: Default::default(),
+                        runtime_image: runtime.clone(),
+                    },
+                    volume,
+                    extra_env: vec![],
+                },
+                &prune(),
+            );
+
+            let config = with_vars(&workspace_vars(&cl_pod.main_env), || {
+                step_config(&worker).with_detected_workspace()
+            });
+            let step_pod = build_step_job(&config, "train")
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap();
+
+            let step = &step_pod.containers[0];
+            assert_eq!(step.image.as_deref(), Some(worker.as_str()));
+            let sub_paths = |mounts: &[k8s_openapi::api::core::v1::VolumeMount]| {
+                mounts
+                    .iter()
+                    .map(|m| m.sub_path.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                sub_paths(step.volume_mounts.as_deref().unwrap_or_default()),
+                sub_paths(&cl_pod.main_mounts),
+                "step Jobs mount the tree the code-location pod built"
+            );
+            let init_images: Vec<_> = step_pod
+                .init_containers
+                .iter()
+                .flatten()
+                .map(|c| c.image.clone())
+                .collect();
+            assert_eq!(init_images, step_init_images);
+        }
     }
 
     #[test]

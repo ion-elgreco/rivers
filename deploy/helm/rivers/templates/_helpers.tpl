@@ -16,6 +16,19 @@ ghcr.io/ion-elgreco/rivers-operator:{{ .Chart.AppVersion }}
 ghcr.io/ion-elgreco/rivers-ui:{{ .Chart.AppVersion }}
 {{- end -}}
 
+{{/*
+Default runtime image for git-sourced CodeLocations, parsed by the
+operator at startup. A CodeLocation without spec.image runs this tag unless
+it sets spec.tag or spec.digest.
+*/}}
+{{- define "rivers.runtimeImage" -}}
+{{- if .Values.codeLocation.runtime.image -}}
+{{ .Values.codeLocation.runtime.image }}
+{{- else -}}
+ghcr.io/ion-elgreco/rivers-runtime:{{ .Chart.AppVersion }}-py{{ .Values.codeLocation.runtime.pythonVersion }}
+{{- end -}}
+{{- end -}}
+
 {{- define "rivers.surrealEndpoint" -}}
 {{- if .Values.surrealdb.enabled -}}
 ws://surrealdb.{{ include "rivers.namespace" . }}.svc:{{ .Values.surrealdb.service.port }}

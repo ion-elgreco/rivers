@@ -4,12 +4,33 @@ use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec, ResourceRequir
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube_client::ResourceExt;
+use rivers_k8s::crd::code_location::CodeLocationSpec;
 use rivers_k8s::crd::run::Run;
+use rivers_k8s::workspace::{self, WorkspaceSpec};
+
+use crate::codelocation::WorkspaceConfig;
+
+/// Consumer-side workspace for a git-mode run, or `None` for image mode.
+/// Derived from the Run's stamped `spec.source`, its CodeLocation's spec and
+/// the chart config; the same spec shape the step-Job builder rebuilds
+/// in-pod from `RIVERS_RUN_SOURCE`. `spec.image` runs on that tree.
+fn run_workspace_spec(
+    run: &Run,
+    workspace_cfg: &WorkspaceConfig,
+    cl_spec: &CodeLocationSpec,
+) -> Option<WorkspaceSpec> {
+    run.spec.source.as_ref().map(|source| WorkspaceSpec {
+        source: source.clone(),
+        volume: workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
+        extra_env: cl_spec.env.clone(),
+    })
+}
 
 /// `resume = true` flips the `rivers execute` invocation to resume mode
-/// (skip already-completed steps); `cl_env` is the parent
-/// `CodeLocation.spec.env` forwarded onto the pod so `secretKeyRef` /
-/// `configMapKeyRef` / `fieldRef` semantics are preserved.
+/// (skip already-completed steps); `cl_spec` is the owning CodeLocation's
+/// spec: its `env` is forwarded onto the pod so `secretKeyRef` /
+/// `configMapKeyRef` / `fieldRef` semantics are preserved, and in git mode
+/// it sizes the workspace.
 /// `surreal_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
 /// stamped on every rivers pod — sourced from the operator's own env, so the
 /// auth-secret coordinates the run pod re-emits onto step pods stay
@@ -20,13 +41,17 @@ pub fn build_executor_pod(
     pod_name: &str,
     run_id: &str,
     resume: bool,
-    cl_env: &[EnvVar],
+    cl_spec: &CodeLocationSpec,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
+    workspace_cfg: &WorkspaceConfig,
 ) -> Pod {
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
+    let pieces = run_workspace_spec(run, workspace_cfg, cl_spec)
+        .as_ref()
+        .map(workspace::consumer_pod_pieces);
 
     Pod {
         metadata: ObjectMeta {
@@ -53,11 +78,29 @@ pub fn build_executor_pod(
         spec: Some(PodSpec {
             service_account_name: Some(spec.service_account_name.clone()),
             restart_policy: Some("Never".to_string()),
+            security_context: pieces.as_ref().map(|p| p.pod_security_context.clone()),
+            init_containers: pieces
+                .as_ref()
+                .filter(|p| !p.init_containers.is_empty())
+                .map(|p| p.init_containers.clone()),
+            volumes: pieces
+                .as_ref()
+                .filter(|p| !p.volumes.is_empty())
+                .map(|p| p.volumes.clone()),
             containers: vec![Container {
                 name: "executor".to_string(),
                 image: Some(spec.image.clone()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
-                command: Some(vec!["rivers".to_string()]),
+                command: Some(
+                    pieces
+                        .as_ref()
+                        .map_or_else(|| vec!["rivers".to_string()], |p| p.main_command.clone()),
+                ),
+                working_dir: pieces.as_ref().map(|p| p.main_working_dir.clone()),
+                volume_mounts: pieces
+                    .as_ref()
+                    .filter(|p| !p.main_mounts.is_empty())
+                    .map(|p| p.main_mounts.clone()),
                 args: Some(build_execute_args(spec, run_id, resume)),
                 resources: Some(ResourceRequirements {
                     requests: Some(BTreeMap::from([
@@ -125,8 +168,11 @@ pub fn build_executor_pod(
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
+                    if let Some(pieces) = &pieces {
+                        env.extend(pieces.main_env.iter().cloned());
+                    }
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
-                    rivers_k8s::env::merge_env(env, cl_env.iter().cloned())
+                    rivers_k8s::env::merge_env(env, cl_spec.env.iter().cloned())
                 }),
                 ..Default::default()
             }],
@@ -170,6 +216,7 @@ fn build_execute_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::test_helpers::{emptydir_limits, git_code_location};
     use rivers_k8s::crd::run::{CodeLocationRef, Executor, ResourceSpec, RunSpec};
 
     fn test_run() -> Run {
@@ -191,6 +238,7 @@ mod tests {
             timeout_seconds: None,
             max_restarts: 3,
             cancel_grace_period_seconds: 300,
+            source: None,
             run_resources: ResourceSpec {
                 cpu: "500m".to_string(),
                 memory: "512Mi".to_string(),
@@ -212,10 +260,390 @@ mod tests {
             pod_name,
             run_id,
             resume,
-            cl_env,
+            &CodeLocationSpec {
+                env: cl_env.to_vec(),
+                ..Default::default()
+            },
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &WorkspaceConfig::default(),
         )
+    }
+
+    const RUNTIME: &str = "ghcr.io/acme/rivers-runtime@sha256:\
+                           1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d";
+    const COMMIT: &str = "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8";
+
+    fn git_run() -> Run {
+        let mut run = test_run();
+        run.spec.source = Some(
+            serde_json::from_value(serde_json::json!({
+                "git": {
+                    "url": "https://forge.example/acme/pipelines.git",
+                    "commit": COMMIT,
+                    "ref": "refs/heads/main",
+                    "path": "analytics",
+                },
+                "dependencies": { "mode": "uvSync" },
+                "runtimeImage": RUNTIME,
+            }))
+            .unwrap(),
+        );
+        run
+    }
+
+    #[test]
+    fn git_run_executor_pod_runs_its_image_on_the_tree_its_runtime_image_built() {
+        // RunBackendConfig.kubernetes(image=...) in a git CodeLocation: the
+        // run carries the code-location pod's source and another image.
+        let image = format!("ghcr.io/acme/gpu-worker@sha256:{}", "ffee0011".repeat(8));
+        let mut run = git_run();
+        run.spec.image = image.clone();
+
+        for (shared_enabled, init_images) in
+            [(true, vec![]), (false, vec![Some(RUNTIME.to_string())])]
+        {
+            let pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &CodeLocationSpec::default(),
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig {
+                    shared_enabled,
+                    ..Default::default()
+                },
+            );
+            let pod_spec = pod.spec.unwrap();
+            let c = &pod_spec.containers[0];
+
+            assert_eq!(c.image.as_deref(), Some(image.as_str()));
+            let sub_paths: Vec<_> = c
+                .volume_mounts
+                .iter()
+                .flatten()
+                .map(|m| m.sub_path.clone())
+                .collect();
+            assert_eq!(
+                sub_paths,
+                vec![Some(run.spec.source.as_ref().unwrap().workspace_key())],
+                "shared_enabled={shared_enabled}"
+            );
+            let inits: Vec<_> = pod_spec
+                .init_containers
+                .iter()
+                .flatten()
+                .map(|c| c.image.clone())
+                .collect();
+            assert_eq!(inits, init_images, "shared_enabled={shared_enabled}");
+            // …and hands the same tree to its step Jobs.
+            let hop = c
+                .env
+                .iter()
+                .flatten()
+                .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)
+                .and_then(|e| e.value.as_deref())
+                .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap());
+            assert_eq!(
+                hop.map(|source| source["runtimeImage"].clone()),
+                Some(serde_json::json!(RUNTIME)),
+                "shared_enabled={shared_enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_run_executor_pod_mounts_shared_tree_and_stamps_the_hop() {
+        let run = git_run();
+        let shared = WorkspaceConfig {
+            shared_enabled: true,
+            ..Default::default()
+        };
+        let pod = build_executor_pod(
+            &run,
+            "p",
+            "run-123",
+            false,
+            &CodeLocationSpec::default(),
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &shared,
+        );
+        let pieces = workspace::consumer_pod_pieces(
+            &run_workspace_spec(&run, &shared, &CodeLocationSpec::default()).unwrap(),
+        );
+        let pod_spec = pod.spec.unwrap();
+        assert!(pod_spec.init_containers.is_none(), "shared consumer");
+        let c = &pod_spec.containers[0];
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let all_env = c.env.as_ref().unwrap();
+        assert!(
+            pieces.main_env.iter().all(|v| all_env.contains(v)),
+            "{all_env:?}"
+        );
+
+        let env: std::collections::HashMap<&str, &str> = all_env
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
+            .collect();
+        // The hop: the in-pod step-job builder rebuilds the workspace from
+        // these two.
+        assert_eq!(env["RIVERS_WORKSPACE_PVC"], "demo-workspace");
+        let hop: rivers_k8s::crd::run::RunSource =
+            serde_json::from_str(env["RIVERS_RUN_SOURCE"]).unwrap();
+        assert_eq!(hop, run.spec.source.clone().unwrap());
+
+        let mounts = serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap();
+        assert!(mounts.to_string().contains("\"readOnly\":true"), "{mounts}");
+    }
+
+    #[test]
+    fn git_run_fallback_carries_init_container_and_emptydir_limit() {
+        let run = git_run();
+        let pod = build_executor_pod(
+            &run,
+            "p",
+            "run-123",
+            false,
+            &CodeLocationSpec::default(),
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &WorkspaceConfig::default(), // shared_enabled: false
+        );
+        let pod_spec = pod.spec.unwrap();
+        assert_eq!(pod_spec.init_containers.as_ref().unwrap().len(), 1);
+        let env: std::collections::HashMap<&str, &str> = pod_spec.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or("")))
+            .collect();
+        assert!(!env.contains_key("RIVERS_WORKSPACE_PVC"));
+        assert_eq!(env["RIVERS_WORKSPACE_EMPTYDIR_LIMIT"], "2Gi");
+    }
+
+    #[test]
+    fn git_run_fallback_caps_the_workspace_at_the_code_locations_size() {
+        for (workspace_size, limit) in [(Some("10Gi"), "10Gi"), (None, "2Gi")] {
+            let pod = build_executor_pod(
+                &git_run(),
+                "p",
+                "run-123",
+                false,
+                &git_code_location(workspace_size).spec,
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig::default(), // fallback, sizeLimit 2Gi
+            );
+
+            assert_eq!(
+                emptydir_limits(&pod),
+                (Some(limit.to_string()), Some(limit.to_string())),
+                "workspaceSize {workspace_size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_run_shared_mode_ignores_the_workspace_size() {
+        let pod = build_executor_pod(
+            &git_run(),
+            "p",
+            "run-123",
+            false,
+            &git_code_location(Some("10Gi")).spec,
+            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &WorkspaceConfig {
+                shared_enabled: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_value(&pod.spec.as_ref().unwrap().volumes).unwrap(),
+            serde_json::json!([{ "name": "workspace", "persistentVolumeClaim": {
+                "claimName": "demo-workspace", "readOnly": true } }])
+        );
+        assert_eq!(emptydir_limits(&pod), (None, None));
+    }
+
+    #[test]
+    fn git_run_executor_pod_sets_the_runtime_fs_group() {
+        let mut run = git_run();
+        run.spec.source.as_mut().unwrap().git.secret_name = Some("git-creds".to_string());
+        for (shared_enabled, secret_modes) in [(true, vec![]), (false, vec![Some(0o440)])] {
+            let pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &CodeLocationSpec::default(),
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                &WorkspaceConfig {
+                    shared_enabled,
+                    ..Default::default()
+                },
+            );
+            let pod_spec = pod.spec.unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&pod_spec.security_context).unwrap(),
+                serde_json::json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "shared_enabled={shared_enabled}"
+            );
+            let modes: Vec<_> = pod_spec
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.name == "git-credentials")
+                .map(|v| v.secret.unwrap().default_mode)
+                .collect();
+            assert_eq!(modes, secret_modes, "shared_enabled={shared_enabled}");
+        }
+    }
+
+    /// What a main container runs, from where, and its `PYTHONPATH` entries.
+    fn launch(c: &Container) -> (Option<&[String]>, Option<&str>, Vec<Option<&str>>) {
+        let pythonpath = c
+            .env
+            .iter()
+            .flatten()
+            .filter(|e| e.name == "PYTHONPATH")
+            .map(|e| e.value.as_deref())
+            .collect();
+        (c.command.as_deref(), c.working_dir.as_deref(), pythonpath)
+    }
+
+    #[test]
+    fn code_location_run_and_step_pods_start_the_tree_alike() {
+        use crate::codelocation::resources::build_deployment;
+        use rivers_k8s::executor::{K8sStepExecutorConfig, build_step_job};
+
+        let run = git_run();
+        let source = run.spec.source.clone().unwrap();
+        let user_pythonpath = EnvVar {
+            name: "PYTHONPATH".to_string(),
+            value: Some("/opt/team-libs".to_string()),
+            ..Default::default()
+        };
+        for (shared_enabled, user_env) in [
+            (true, vec![]),
+            (false, vec![]),
+            (true, vec![user_pythonpath.clone()]),
+            (false, vec![user_pythonpath]),
+        ] {
+            let shape = format!("shared_enabled={shared_enabled}, spec.env={user_env:?}");
+            let workspace_cfg = WorkspaceConfig {
+                shared_enabled,
+                ..Default::default()
+            };
+            let mut cl = git_code_location(None);
+            cl.spec.git.as_mut().unwrap().path = source.git.path.clone();
+            cl.spec.env = user_env.clone();
+            let volume = workspace_cfg.volume(&cl.name_any(), &cl.spec);
+            let tree = || WorkspaceSpec {
+                source: source.clone(),
+                volume: volume.clone(),
+                extra_env: cl.spec.env.clone(),
+            };
+
+            // The code-location pod that built the tree the run is stamped with.
+            let cl_pod = build_deployment(
+                &cl,
+                &source.runtime_image,
+                "rivers-code-location",
+                &Default::default(),
+                &Default::default(),
+                Some(&workspace::builder_pod_pieces(
+                    &tree(),
+                    &workspace_cfg.prune(&cl.name_any()),
+                )),
+            )
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+            let run_pod = build_executor_pod(
+                &run,
+                "p",
+                "run-123",
+                false,
+                &cl.spec,
+                &Default::default(),
+                &Default::default(),
+                &workspace_cfg,
+            )
+            .spec
+            .unwrap();
+            // What the run pod's Kubernetes executor builds from its env.
+            let step_pod = build_step_job(
+                &K8sStepExecutorConfig {
+                    worker_image: run.spec.image.clone(),
+                    namespace: "default".to_string(),
+                    service_account: "rivers-step-worker".to_string(),
+                    worker_cpu: "1".to_string(),
+                    worker_memory: "2Gi".to_string(),
+                    module: run.spec.module.clone(),
+                    surreal_pod_cfg: Default::default(),
+                    otel_pod_cfg: Default::default(),
+                    run_id: "run-123".to_string(),
+                    run_cr_name: run.name_any(),
+                    run_cr_uid: String::new(),
+                    code_location_id: run.spec.code_location_ref.identity.clone(),
+                    extra_env: cl.spec.env.clone(),
+                    partition_key: None,
+                    workspace: Some(tree()),
+                },
+                "train",
+            )
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+            let cl_launch = launch(&cl_pod.containers[0]);
+            assert_eq!(
+                launch(&run_pod.containers[0]),
+                cl_launch,
+                "run pod, {shape}"
+            );
+            assert_eq!(
+                launch(&step_pod.containers[0]),
+                cl_launch,
+                "step pod, {shape}"
+            );
+            // The project directory, unless spec.env sets its own.
+            let pythonpath = user_env.first().map_or(cl_launch.1, |e| e.value.as_deref());
+            assert_eq!(cl_launch.2, vec![pythonpath], "{shape}");
+        }
+    }
+
+    #[test]
+    fn image_mode_executor_pod_untouched_by_workspace_wiring() {
+        let run = test_run();
+        let pod = build(&run, "p", "run-123", false, &[]);
+        let pod_spec = pod.spec.unwrap();
+        assert!(pod_spec.security_context.is_none());
+        assert!(pod_spec.init_containers.is_none());
+        assert!(pod_spec.volumes.is_none());
+        let c = &pod_spec.containers[0];
+        assert_eq!(c.command.as_ref().unwrap(), &vec!["rivers".to_string()]);
+        assert!(c.working_dir.is_none());
+        assert!(
+            !c.env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "RIVERS_RUN_SOURCE")
+        );
     }
 
     fn env_secret_ref(env: &[EnvVar], name: &str) -> Option<(String, String)> {
@@ -234,13 +662,14 @@ mod tests {
             "test-pod",
             "run-123",
             false,
-            &[],
+            &CodeLocationSpec::default(),
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
                 headers_secret_name: "otel-headers".to_string(),
                 headers_secret_key: "headers".to_string(),
             },
+            &WorkspaceConfig::default(),
         );
         let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
 
@@ -446,12 +875,16 @@ mod tests {
             "test-pod",
             "run-123",
             false,
-            &cl_env,
+            &CodeLocationSpec {
+                env: cl_env,
+                ..Default::default()
+            },
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
                 ..Default::default()
             },
+            &WorkspaceConfig::default(),
         );
         let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
 

@@ -1,0 +1,55 @@
+# rivers-runtime — base image for git-sourced CodeLocations.
+#
+# Carries python, uv, git, CA certs, the rivers CLI and `rivers-runtime`,
+# whose `workspace-sync` command builds the trees. Published per Python
+# version for linux/amd64 and linux/arm64 by the release-python workflow:
+#   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13
+#
+# Build context must contain the rivers wheel under wheels/ and the static
+# rivers-runtime binary of the image's arch (the release stages both;
+# `just k8s-build` stages local builds).
+#
+# Not distroless: python, git and ssh come from Debian packages here;
+# rivers-runtime is static (musl) and nothing in the image needs a shell. Hardening: slim Debian
+# base, non-root user, no build toolchain. Not pinned: the python base tag and
+# uv:latest follow upstream at build time. CI does not scan the image for
+# CVEs.
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# UV_PYTHON_DOWNLOADS=0 is load-bearing: the image's interpreter is
+# authoritative, which is what makes the runtime-image digest a complete
+# description of the environment (and the workspace key sound).
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git openssh-client ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY wheels/*.whl /tmp/wheels/
+RUN uv pip install --system --no-cache /tmp/wheels/*.whl && rm -rf /tmp/wheels
+
+COPY rivers-runtime /usr/local/bin/rivers-runtime
+RUN chmod 0755 /usr/local/bin/rivers-runtime
+
+ARG RIVERS_VERSION=dev
+ARG RIVERS_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="rivers-runtime" \
+      org.opencontainers.image.description="Runtime image for git-sourced Rivers code locations" \
+      org.opencontainers.image.source="https://github.com/ion-elgreco/rivers" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${RIVERS_VERSION}" \
+      org.opencontainers.image.revision="${RIVERS_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+# Non-root by default. The operator sets this GID as fsGroup on git-mode pods
+# (rivers_k8s::workspace::RUNTIME_GID); change both together.
+RUN groupadd -g 65532 rivers && useradd -u 65532 -g 65532 -m rivers
+USER 65532:65532
+
+ENTRYPOINT ["rivers"]

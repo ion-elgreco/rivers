@@ -35,6 +35,27 @@ pub struct K8sStepExecutorConfig {
     /// `configMapKeyRef` / `fieldRef` semantics are preserved end-to-end.
     pub extra_env: Vec<EnvVar>,
     pub partition_key: Option<String>,
+    /// Git-mode workspace: when set, each step Job mounts the
+    /// materialized tree (read-only in shared mode; built per pod in
+    /// fallback mode) and runs the venv's `rivers` from the checkout.
+    pub workspace: Option<crate::workspace::WorkspaceSpec>,
+}
+
+impl K8sStepExecutorConfig {
+    /// Git mode: step Jobs mount the tree this pod runs, from the
+    /// `RIVERS_RUN_SOURCE` and workspace volume env the operator stamped on
+    /// it; `worker_image` runs on that tree. Image mode leaves `workspace`
+    /// unset.
+    pub fn with_detected_workspace(mut self) -> Self {
+        self.workspace = crate::env::detect_git_workspace().map(|(source, volume)| {
+            crate::workspace::WorkspaceSpec {
+                source,
+                volume,
+                extra_env: self.extra_env.clone(),
+            }
+        });
+        self
+    }
 }
 
 /// Sanitize a string into a valid K8s label value:
@@ -192,6 +213,11 @@ fn build_job_inner(
         args.extend(["--mapping-key".to_string(), key.to_string()]);
     }
 
+    let workspace_pieces = config
+        .workspace
+        .as_ref()
+        .map(crate::workspace::consumer_pod_pieces);
+
     Job {
         metadata: ObjectMeta {
             name: Some(job_name.to_string()),
@@ -222,11 +248,32 @@ fn build_job_inner(
                 spec: Some(PodSpec {
                     service_account_name: Some(config.service_account.clone()),
                     restart_policy: Some("Never".to_string()),
+                    security_context: workspace_pieces
+                        .as_ref()
+                        .map(|p| p.pod_security_context.clone()),
+                    init_containers: workspace_pieces
+                        .as_ref()
+                        .filter(|p| !p.init_containers.is_empty())
+                        .map(|p| p.init_containers.clone()),
+                    volumes: workspace_pieces
+                        .as_ref()
+                        .filter(|p| !p.volumes.is_empty())
+                        .map(|p| p.volumes.clone()),
                     containers: vec![Container {
                         name: "step".to_string(),
                         image: Some(config.worker_image.clone()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(vec!["rivers".to_string()]),
+                        command: Some(workspace_pieces.as_ref().map_or_else(
+                            || vec!["rivers".to_string()],
+                            |p| p.main_command.clone(),
+                        )),
+                        working_dir: workspace_pieces
+                            .as_ref()
+                            .map(|p| p.main_working_dir.clone()),
+                        volume_mounts: workspace_pieces
+                            .as_ref()
+                            .filter(|p| !p.main_mounts.is_empty())
+                            .map(|p| p.main_mounts.clone()),
                         args: Some(args),
                         resources: Some({
                             let cpu = overrides
@@ -289,6 +336,9 @@ fn build_job_inner(
                                 },
                             ];
                             env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
+                            if let Some(pieces) = &workspace_pieces {
+                                env.extend(pieces.main_env.iter().cloned());
+                            }
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             crate::env::merge_env(env, config.extra_env.iter().cloned())
                         }),
@@ -324,7 +374,135 @@ mod tests {
             code_location_id: "demo-id".to_string(),
             extra_env: vec![],
             partition_key: None,
+            workspace: None,
         }
+    }
+
+    fn git_workspace(volume: crate::workspace::WorkspaceVolume) -> crate::workspace::WorkspaceSpec {
+        let source: crate::crd::run::RunSource = serde_json::from_value(serde_json::json!({
+            "git": {
+                "url": "https://forge.example/acme/pipelines.git",
+                "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                "ref": "refs/heads/main",
+                "path": "analytics",
+                "secretName": "git-creds",
+            },
+            "dependencies": { "mode": "uvSync" },
+            "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dffff",
+        }))
+        .unwrap();
+        crate::workspace::WorkspaceSpec {
+            source,
+            volume,
+            extra_env: vec![],
+        }
+    }
+
+    #[test]
+    fn git_step_job_shared_mounts_readonly_without_init() {
+        let mut config = test_config();
+        config.workspace = Some(git_workspace(
+            crate::workspace::WorkspaceVolume::SharedPvc {
+                claim_name: "analytics-workspace".to_string(),
+            },
+        ));
+        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let job = build_step_job(&config, "parse_document");
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        assert!(pod.init_containers.is_none(), "shared consumers never sync");
+        let vols = serde_json::to_value(pod.volumes.as_ref().unwrap()).unwrap();
+        assert!(
+            !vols.to_string().contains("git-credentials"),
+            "no creds on consumers: {vols}"
+        );
+        let c = &pod.containers[0];
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let env = c.env.as_ref().unwrap();
+        assert!(pieces.main_env.iter().all(|v| env.contains(v)), "{env:?}");
+        let mounts = serde_json::to_value(c.volume_mounts.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            mounts,
+            serde_json::json!([{
+                "name": "workspace",
+                "mountPath": "/workspace",
+                "subPath": "9f3c1ab8d2e4-1a2b3c4d-f2180cfa",
+                "readOnly": true,
+            }])
+        );
+    }
+
+    #[test]
+    fn git_step_job_fallback_builds_its_own_tree() {
+        let mut config = test_config();
+        config.workspace = Some(git_workspace(crate::workspace::WorkspaceVolume::EmptyDir {
+            size_limit: None,
+        }));
+        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let job = build_step_job(&config, "parse_document");
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let inits = pod.init_containers.as_ref().unwrap();
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0].name, "workspace");
+        let vols = serde_json::to_value(pod.volumes.as_ref().unwrap()).unwrap();
+        assert!(vols.to_string().contains("git-credentials"), "{vols}");
+        let c = &pod.containers[0];
+        assert_eq!(c.command.as_ref(), Some(&pieces.main_command));
+        assert_eq!(c.working_dir.as_ref(), Some(&pieces.main_working_dir));
+        let env = c.env.as_ref().unwrap();
+        assert!(pieces.main_env.iter().all(|v| env.contains(v)), "{env:?}");
+    }
+
+    #[test]
+    fn git_step_job_sets_the_runtime_fs_group() {
+        for (shape, volume, secret_modes) in [
+            (
+                "shared",
+                crate::workspace::WorkspaceVolume::SharedPvc {
+                    claim_name: "analytics-workspace".to_string(),
+                },
+                vec![],
+            ),
+            (
+                "fallback",
+                crate::workspace::WorkspaceVolume::EmptyDir { size_limit: None },
+                vec![Some(0o440)],
+            ),
+        ] {
+            let mut config = test_config();
+            config.workspace = Some(git_workspace(volume));
+            let job = build_step_job(&config, "parse_document");
+            let pod = job.spec.unwrap().template.spec.unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&pod.security_context).unwrap(),
+                serde_json::json!({ "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch" }),
+                "{shape}"
+            );
+            let modes: Vec<_> = pod
+                .volumes
+                .unwrap()
+                .into_iter()
+                .filter(|v| v.name == "git-credentials")
+                .map(|v| v.secret.unwrap().default_mode)
+                .collect();
+            assert_eq!(modes, secret_modes, "{shape}");
+        }
+    }
+
+    #[test]
+    fn image_mode_step_job_is_untouched_by_workspace_wiring() {
+        let job = build_step_job(&test_config(), "parse_document");
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert!(pod.security_context.is_none());
+        assert!(pod.init_containers.is_none());
+        assert!(pod.volumes.is_none());
+        let c = &pod.containers[0];
+        assert_eq!(c.command.as_ref().unwrap(), &vec!["rivers".to_string()]);
+        assert!(c.working_dir.is_none());
+        assert!(c.volume_mounts.is_none());
     }
 
     #[test]
