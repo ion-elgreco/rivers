@@ -19,19 +19,19 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
-    "pyright>=1.1.411",
-    "ruff>=0.15.22",
-    "typos>=1.48.0",
+    "pyright>=1.1.414",
+    "ruff>=0.16.9",
+    "typos>=1.50.3",
     "cryptography>=48.0.1",
     "kr8s>=0.20",
     "pyyaml>=6.0",
-    "rumdl>=0.2.37",
+    "rumdl>=0.2.77",
     # Memory sampling for the comparison benchmark in bench/.
     "psutil>=7.0",
 ]
 # gRPC client for the API tests. No free-threaded (3.14t) wheels yet, so
 # `just venv-ft` leaves this group out.
 grpc = [
-    "grpcio>=1.82.1",
-    "grpcio-tools>=1.82.1",
+    "grpcio>=1.84.0",
+    "grpcio-tools>=1.84.0",
 ]
