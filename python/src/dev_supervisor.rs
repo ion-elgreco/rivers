@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::repository::PyCodeRepository;
+use crate::shutdown::TerminateSignals;
 
 const CHILD_ENTRY: &str = "import rivers._core as c; c.serve_dev_code_location()";
 const ENV_MODULE: &str = "RIVERS_MODULE";
@@ -46,7 +47,7 @@ pub(crate) struct ChildSpec {
 }
 
 struct Generation {
-    /// Matches the UI's reload counter: the first generation is 0.
+    /// Spawn order, from 0; the UI reports the number of the serving one.
     number: u64,
     child: Child,
 }
@@ -76,12 +77,8 @@ impl Supervisor {
 
     /// Spawn the first generation and wait until it serves.
     pub(crate) async fn start(&mut self) -> Outcome {
-        let mut signals = match Signals::new() {
-            Ok(signals) => signals,
-            Err(e) => {
-                eprintln!("Error: cannot listen for signals: {e}");
-                return Outcome::Down;
-            }
+        let Some(mut signals) = Signals::listen() else {
+            return Outcome::Down;
         };
         self.spawn_and_wait(&mut signals).await
     }
@@ -89,12 +86,8 @@ impl Supervisor {
     /// Supervise until a terminate signal. A UI request reloads; retired
     /// generations are reaped as they finish.
     pub(crate) async fn run(&mut self) {
-        let mut signals = match Signals::new() {
-            Ok(signals) => signals,
-            Err(e) => {
-                eprintln!("Error: cannot listen for signals: {e}");
-                return;
-            }
+        let Some(mut signals) = Signals::listen() else {
+            return;
         };
         loop {
             tokio::select! {
@@ -124,7 +117,7 @@ impl Supervisor {
         for generation in &live {
             terminate(&generation.child);
         }
-        let mut signals = Signals::new().ok();
+        let mut signals = Signals::listen();
         tokio::select! {
             _ = join_all(live.iter_mut().map(|g| g.child.wait())) => {}
             _ = sleep(STOP_TIMEOUT) => {}
@@ -152,11 +145,7 @@ impl Supervisor {
         }
         let outcome = self.spawn_and_wait(signals).await;
         match outcome {
-            Outcome::Up => {
-                rivers_ui::dev_reload::reloaded();
-                rivers_ui::live::kick("code_location");
-                println!("Code location reloaded.");
-            }
+            Outcome::Up => println!("Code location reloaded."),
             Outcome::Down => {
                 rivers_ui::dev_reload::failed(
                     "the code location did not come back; fix the error and reload".into(),
@@ -219,11 +208,10 @@ impl Supervisor {
                 return Outcome::Down;
             }
             if port_open(&host, port).await {
-                self.active = Some(Generation {
-                    number: self.generations,
-                    child,
-                });
+                let number = self.generations;
                 self.generations += 1;
+                self.active = Some(Generation { number, child });
+                rivers_ui::dev_reload::serving(number);
                 return Outcome::Up;
             }
             if Instant::now() >= deadline {
@@ -273,9 +261,7 @@ impl Supervisor {
     }
 
     fn report_exit(&mut self, status: std::io::Result<ExitStatus>) {
-        let Some(_) = self.active.take() else {
-            return;
-        };
+        self.active = None;
         let code = status.as_ref().map(exit_code).unwrap_or(-1);
         rivers_ui::dev_reload::failed(format!("the code location exited with code {code}"));
         eprintln!("Code location exited with code {code}; fix the error and reload from the UI.");
@@ -364,61 +350,39 @@ async fn port_free(host: &str, port: u16) -> bool {
     tokio::net::TcpListener::bind((host, port)).await.is_ok()
 }
 
-/// The signals that stop the host; a hangup counts, so a closed terminal
-/// still stops every generation.
-#[cfg(unix)]
+/// The signals that stop the host: the terminate signals and, on unix, a
+/// hangup, so a closed terminal still stops every generation.
 struct Signals {
+    terminate: TerminateSignals,
+    #[cfg(unix)]
     hangup: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
-    interrupt: tokio::signal::unix::Signal,
 }
 
-#[cfg(unix)]
 impl Signals {
     fn new() -> std::io::Result<Self> {
-        use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
-            hangup: signal(SignalKind::hangup())?,
-            terminate: signal(SignalKind::terminate())?,
-            interrupt: signal(SignalKind::interrupt())?,
+            terminate: TerminateSignals::try_new()?,
+            #[cfg(unix)]
+            hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
         })
     }
 
+    /// Listen, or print why the signals cannot be registered.
+    fn listen() -> Option<Self> {
+        Self::new()
+            .map_err(|e| eprintln!("Error: cannot listen for signals: {e}"))
+            .ok()
+    }
+
     async fn terminated(&mut self) {
+        #[cfg(unix)]
         tokio::select! {
-            _ = self.hangup.recv() => {}
             _ = self.terminate.recv() => {}
-            _ = self.interrupt.recv() => {}
+            _ = self.hangup.recv() => {}
         }
-    }
-}
-
-#[cfg(windows)]
-struct Signals {
-    ctrl_c: tokio::signal::windows::CtrlC,
-    ctrl_break: tokio::signal::windows::CtrlBreak,
-    ctrl_close: tokio::signal::windows::CtrlClose,
-    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
-}
-
-#[cfg(windows)]
-impl Signals {
-    fn new() -> std::io::Result<Self> {
-        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
-        Ok(Self {
-            ctrl_c: ctrl_c()?,
-            ctrl_break: ctrl_break()?,
-            ctrl_close: ctrl_close()?,
-            ctrl_shutdown: ctrl_shutdown()?,
-        })
-    }
-
-    async fn terminated(&mut self) {
-        tokio::select! {
-            _ = self.ctrl_c.recv() => {}
-            _ = self.ctrl_break.recv() => {}
-            _ = self.ctrl_close.recv() => {}
-            _ = self.ctrl_shutdown.recv() => {}
+        #[cfg(not(unix))]
+        {
+            self.terminate.recv().await;
         }
     }
 }

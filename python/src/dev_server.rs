@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use rivers_core::assets::graph::{GraphTopology, TopologyNode};
 use tokio_util::sync::CancellationToken;
 
 use crate::dev_supervisor::{ChildSpec, Outcome, Supervisor};
@@ -46,29 +45,30 @@ impl PyDevHost {
         storage_path: Option<String>,
         endpoint: Option<String>,
     ) -> PyResult<Self> {
-        if let Some(endpoint) = endpoint {
-            return Ok(Self {
-                storage: Mutex::new(None),
-                ui: Mutex::new(None),
-                supervisor: Mutex::new(None),
-                endpoint,
-            });
-        }
-        let Some(path) = storage_path else {
-            return Err(PyValueError::new_err(
-                "pass a storage path to serve, or the endpoint of a SurrealDB server",
-            ));
+        let (storage, endpoint) = match (endpoint, storage_path) {
+            (Some(endpoint), _) => (None, endpoint),
+            (None, None) => {
+                return Err(PyValueError::new_err(
+                    "pass a storage path to serve, or the endpoint of a SurrealDB server",
+                ));
+            }
+            (None, Some(path)) => {
+                std::fs::create_dir_all(&path).map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create storage dir: {e}"))
+                })?;
+                let (server, addr) = py.detach(|| storage_server::start(&path)).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "embedded storage server failed to start: {e:#}"
+                    ))
+                })?;
+                (Some(server), format!("ws://{addr}"))
+            }
         };
-        std::fs::create_dir_all(&path)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create storage dir: {e}")))?;
-        let (server, addr) = py.detach(|| storage_server::start(&path)).map_err(|e| {
-            PyRuntimeError::new_err(format!("embedded storage server failed to start: {e:#}"))
-        })?;
         Ok(Self {
-            storage: Mutex::new(Some(server)),
+            storage: Mutex::new(storage),
             ui: Mutex::new(None),
             supervisor: Mutex::new(None),
-            endpoint: format!("ws://{addr}"),
+            endpoint,
         })
     }
 
@@ -88,7 +88,10 @@ impl PyDevHost {
         synthetic: Option<String>,
     ) {
         let storage_arc = Arc::clone(storage.backend());
-        let graph = synthetic.as_deref().map(synthetic_graph).map(Arc::new);
+        let graph = synthetic
+            .as_deref()
+            .map(rivers_ui::synthetic::core_topology)
+            .map(Arc::new);
         let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
         let registry = rivers_ui::code_location_registry::Registry::dev_single(grpc_url, module);
         rivers_ui::dev_reload::enable();
@@ -194,27 +197,6 @@ fn swallow_interrupt(py: Python<'_>) -> PyResult<()> {
     }
 }
 
-fn synthetic_graph(scale: &str) -> GraphTopology {
-    let n = rivers_ui::synthetic::parse_node_count(scale);
-    let g = rivers_ui::synthetic::generate_synthetic_graph(n);
-    GraphTopology {
-        nodes: g
-            .nodes
-            .into_iter()
-            .map(|n| TopologyNode {
-                name: n.name,
-                kind: n
-                    .kind
-                    .parse()
-                    .expect("synthetic graph produced invalid NodeKind"),
-                group: n.group,
-                parent_graph: n.parent_graph,
-            })
-            .collect(),
-        edges: g.edges,
-    }
-}
-
 #[cfg(feature = "dev-server")]
 mod storage_server {
     //! The SurrealDB server over the local RocksDB store, assembled from
@@ -290,17 +272,16 @@ mod storage_server {
             })
             .context("spawning the storage server thread")?;
 
-        match addr_rx.recv_timeout(BIND_TIMEOUT) {
-            Ok(Ok(addr)) => Ok((StorageServer { stop, thread }, addr)),
-            Ok(Err(e)) => {
-                StorageServer { stop, thread }.stop();
+        let server = StorageServer { stop, thread };
+        let bound = addr_rx
+            .recv_timeout(BIND_TIMEOUT)
+            .map_err(|_| "timed out waiting for the embedded storage server to bind".to_string())
+            .and_then(|result| result);
+        match bound {
+            Ok(addr) => Ok((server, addr)),
+            Err(e) => {
+                server.stop();
                 Err(anyhow::anyhow!(e))
-            }
-            Err(_) => {
-                StorageServer { stop, thread }.stop();
-                Err(anyhow::anyhow!(
-                    "timed out waiting for the embedded storage server to bind"
-                ))
             }
         }
     }

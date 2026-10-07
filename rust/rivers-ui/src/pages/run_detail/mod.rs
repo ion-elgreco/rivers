@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::icons::{IconChevronRight, IconCopy, IconRetry, IconStop, IconTrash};
-use crate::components::live::{LiveStatusChip, use_live_kick};
+use crate::components::live::{LiveStatusChip, use_definitions, use_live_kick};
 use crate::components::rerun_dialog::RerunConfigDialog;
 use crate::components::traceback::RunFailures;
 use crate::components::ui_kit::{Crumb, SplitButton, StatusChip, Topbar};
@@ -72,9 +72,10 @@ pub fn RunDetailPage() -> impl IntoView {
         Signal::derive(move || run_logs.get().and_then(|r| r.ok()).unwrap_or_default());
     // Read outside the step events' Transition, so through the effect-filled copy.
     let step_events_value = crate::helpers::resource_value(step_events);
+    let definitions = use_definitions();
     let topology = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { crate::server_fns::graph::get_graph_topology(ns, name).await },
+        move || (loc.get(), definitions.get()),
+        |((ns, name), _)| async move { crate::server_fns::graph::get_graph_topology(ns, name).await },
     );
     let locations = Resource::new(|| (), |_| list_code_locations());
 

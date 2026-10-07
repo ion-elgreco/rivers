@@ -58,7 +58,6 @@ pub fn AssetsListPage() -> impl IntoView {
         |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
 
-
     let all_records =
         move || -> Vec<AssetRecord> { all_assets.get().and_then(|r| r.ok()).unwrap_or_default() };
 
