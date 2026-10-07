@@ -71,12 +71,23 @@ pub enum LiveStatus {
 pub struct Live {
     /// Connection health for the topbar chip.
     pub status: ReadSignal<LiveStatus>,
-    /// Moves when the code location reloads; key definition resources on it.
+    /// The shell's definitions tick, see [`use_definitions`].
     pub definitions: RwSignal<u32>,
 }
 
+/// The definitions tick the shell provides: it moves when the code location
+/// reloads, so a resource keyed on it refetches definitions (assets info,
+/// jobs, schedules, sensors, topology, layout) only then.
+#[derive(Clone, Copy)]
+pub struct DefinitionsTick(pub RwSignal<u32>);
+
+/// The shell's definitions tick, or a private one outside the shell.
+pub fn use_definitions() -> RwSignal<u32> {
+    use_context::<DefinitionsTick>().map_or_else(|| RwSignal::new(0), |tick| tick.0)
+}
+
 /// The channel the `rivers dev` host ticks once a reloaded code location serves.
-const DEFINITIONS_CHANNEL: &str = "code_location";
+pub(crate) const DEFINITIONS_CHANNEL: &str = "code_location";
 
 /// Safety-net refresh cadence — forces a refetch every 5 minutes regardless
 /// of SSE state. See module docs. Only referenced from the hydrate-feature
@@ -134,7 +145,7 @@ pub fn use_live_kick(
     // Initial status: Reconnecting. Transitions to Live on the first `open`
     // event, or Stale on a terminal `error`.
     let (status, set_status) = signal(LiveStatus::Reconnecting);
-    let definitions = RwSignal::new(0u32);
+    let definitions = use_definitions();
     let live = Live {
         status,
         definitions,
@@ -462,7 +473,7 @@ pub fn use_live_kick(
     let (status, _) = signal(LiveStatus::Reconnecting);
     Live {
         status,
-        definitions: RwSignal::new(0),
+        definitions: use_definitions(),
     }
 }
 

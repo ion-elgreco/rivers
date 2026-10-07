@@ -53,15 +53,16 @@ pub async fn requested() {
     }
 }
 
-/// The host reports the code location that came back up as `generation`.
-pub fn reloaded(generation: u64) {
+/// The host reports the code location serving as `generation` (the first
+/// is 0); subscribed tabs refetch their definitions.
+pub fn serving(generation: u64) {
     {
         let mut state = STATE.lock().unwrap();
         state.generation = generation;
         state.error = None;
     }
     SETTLED.notify_waiters();
-    crate::live::kick("code_location");
+    crate::live::kick(crate::components::live::DEFINITIONS_CHANNEL);
 }
 
 /// The host reports a code location that did not come back up.
@@ -110,7 +111,11 @@ mod tests {
         let _turn = lock();
         disable();
         assert!(request().is_none());
-        assert!(timeout(Duration::from_millis(10), requested()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), requested())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -119,8 +124,16 @@ mod tests {
         enable();
         assert!(request().is_some());
         assert!(request().is_some());
-        assert!(timeout(Duration::from_millis(10), requested()).await.is_ok());
-        assert!(timeout(Duration::from_millis(10), requested()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), requested())
+                .await
+                .is_ok()
+        );
+        assert!(
+            timeout(Duration::from_millis(10), requested())
+                .await
+                .is_err()
+        );
         disable();
     }
 
@@ -144,7 +157,7 @@ mod tests {
         assert_eq!(state().error.as_deref(), Some("exit code 1"));
         assert_eq!(request(), Some(before));
         assert_eq!(state().error, None, "a new attempt clears the verdict");
-        reloaded(before + 1);
+        serving(before + 1);
         let after = state();
         assert_eq!(after.generation, before + 1);
         assert_eq!(after.error, None);
@@ -161,8 +174,11 @@ mod tests {
         let before = request().unwrap();
         let waiter = tokio::spawn(settled(before));
         sleep(Duration::from_millis(50)).await;
-        reloaded(before + 1);
-        let verdict = timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+        serving(before + 1);
+        let verdict = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(verdict.generation, before + 1);
         assert_eq!(verdict.error, None);
 
@@ -170,14 +186,20 @@ mod tests {
         let waiter = tokio::spawn(settled(before));
         sleep(Duration::from_millis(50)).await;
         failed("boom".into());
-        let verdict = timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+        let verdict = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(verdict.error.as_deref(), Some("boom"));
 
         let before = request().unwrap();
         let waiter = tokio::spawn(settled(before));
         sleep(Duration::from_millis(50)).await;
         disable();
-        let verdict = timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+        let verdict = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!verdict.enabled);
     }
 }

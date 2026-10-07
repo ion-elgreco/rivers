@@ -4,15 +4,15 @@ storage server, the web UI and this host process stay up."""
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from _polling import free_port, wait_for
 
 pytest.importorskip("grpc")
 pytest.importorskip("grpc_tools")
@@ -123,21 +123,6 @@ repo = rs.CodeRepository(
 """
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _wait_for(predicate, timeout: float, what: str):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.25)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
 class DevHostProcess:
     """A ``rivers dev`` process on free ports, with its logs in files."""
 
@@ -146,8 +131,8 @@ class DevHostProcess:
     ) -> None:
         self.tmp_path = tmp_path
         self.pb2, self.pb2_grpc = stubs
-        self.ui_port = _free_port()
-        self.grpc_port = _free_port()
+        self.ui_port = free_port()
+        self.grpc_port = free_port()
         self.storage_dir = tmp_path / "storage"
         self.out_path = tmp_path / "dev.out"
         self.err_path = tmp_path / "dev.err"
@@ -179,29 +164,23 @@ class DevHostProcess:
             stderr=self.err_file,
         )
 
-    @property
-    def pid(self) -> int:
-        return self.proc.pid
-
+    @contextmanager
     def _stub(self):
-        channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
-        return channel, self.pb2_grpc.CodeLocationServiceStub(channel)
+        """A gRPC stub on the code location, closed with the block."""
+        with grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}") as channel:
+            yield self.pb2_grpc.CodeLocationServiceStub(channel)
 
     def materialize(self, asset: str) -> str:
         """Start a run of ``asset`` over gRPC; returns its run id."""
-        channel, stub = self._stub()
-        try:
+        with self._stub() as stub:
             resp = stub.Materialize(
                 self.pb2.MaterializeRequest(selection=[asset]), timeout=10
             )
-        finally:
-            channel.close()
         assert resp.run_id, resp
         return resp.run_id
 
     def launch_backfill(self, asset: str, keys: list[str]) -> str:
-        channel, stub = self._stub()
-        try:
+        with self._stub() as stub:
             resp = stub.LaunchBackfill(
                 self.pb2.LaunchBackfillRequest(
                     selection=[asset],
@@ -216,18 +195,13 @@ class DevHostProcess:
                 ),
                 timeout=10,
             )
-        finally:
-            channel.close()
         return resp.backfill_id
 
     def backfill_status(self, backfill_id: str):
-        channel, stub = self._stub()
-        try:
+        with self._stub() as stub:
             return stub.GetBackfillStatus(
                 self.pb2.GetBackfillStatusRequest(backfill_id=backfill_id), timeout=10
             )
-        finally:
-            channel.close()
 
     def ui_up(self) -> bool:
         try:
@@ -240,22 +214,19 @@ class DevHostProcess:
 
     def asset_names(self) -> set[str] | None:
         """Names the code location serves over gRPC; ``None`` while it is down."""
-        channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
         try:
-            stub = self.pb2_grpc.CodeLocationServiceStub(channel)
-            resp = stub.GetAssetsInfo(self.pb2.GetAssetsInfoRequest(), timeout=5)
-            return {a.asset_key for a in resp.assets}
+            with self._stub() as stub:
+                resp = stub.GetAssetsInfo(self.pb2.GetAssetsInfoRequest(), timeout=5)
         except grpc.RpcError:
             return None
-        finally:
-            channel.close()
+        return {a.asset_key for a in resp.assets}
 
     def wait_ready(self) -> None:
         def up():
             assert self.proc.poll() is None, f"rivers dev exited early:\n{self.logs()}"
             return self.ui_up() and self.asset_names() is not None
 
-        _wait_for(up, 120, "the dev host and its code location")
+        wait_for(up, 120, "the dev host and its code location")
 
     def _post(self, path: str) -> object:
         request = urllib.request.Request(
@@ -334,13 +305,13 @@ def test_reload_serves_the_edited_module(dev_host, tmp_path):
     (tmp_path / "pipe_mod.py").write_text(MODULE_V2)
     dev_host.reload_via_http()
 
-    _wait_for(
+    wait_for(
         lambda: dev_host.asset_names() == {"first", "second"},
         120,
         "the reloaded code location to serve both assets",
     )
     assert dev_host.ui_up(), "the UI never went down"
-    _wait_for(
+    wait_for(
         lambda: dev_host.reload_state()["generation"] == 1,
         30,
         "the host to report the reload",
@@ -356,11 +327,11 @@ def test_reload_serves_the_edited_module(dev_host, tmp_path):
 
 def test_a_broken_edit_keeps_the_session_alive(dev_host, tmp_path):
     dev_host.wait_ready()
-    host_pid = dev_host.pid
+    host_pid = dev_host.proc.pid
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_BROKEN)
     dev_host.reload_via_http()
-    _wait_for(
+    wait_for(
         lambda: dev_host.reload_state()["error"] is not None,
         120,
         "the host to report the failed reload",
@@ -371,19 +342,19 @@ def test_a_broken_edit_keeps_the_session_alive(dev_host, tmp_path):
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_V2)
     dev_host.reload_via_http()
-    _wait_for(
+    wait_for(
         lambda: dev_host.asset_names() == {"first", "second"},
         120,
         "the fixed module to be served",
     )
-    _wait_for(
+    wait_for(
         lambda: (
             dev_host.reload_state() == {"enabled": True, "generation": 1, "error": None}
         ),
         30,
         "the host to clear the error",
     )
-    assert dev_host.pid == host_pid
+    assert dev_host.proc.pid == host_pid
 
     code = dev_host.stop()
     assert code == 0, dev_host.logs()
@@ -397,7 +368,7 @@ def test_the_child_entry_reports_a_missing_module(tmp_path):
             "RIVERS_MODULE": "nonexistent_module_xyz",
             "RIVERS_DEV_REPO_VAR": "repo",
             "RIVERS_DEV_HOST": "127.0.0.1",
-            "RIVERS_DEV_GRPC_PORT": str(_free_port()),
+            "RIVERS_DEV_GRPC_PORT": str(free_port()),
             "RIVERS_SURREAL_ENDPOINT": "ws://127.0.0.1:1",
             "RIVERS_DEV_NO_DAEMON": "1",
         }
@@ -427,7 +398,7 @@ def test_a_run_in_flight_finishes_in_the_retired_generation(start_dev_host, tmp_
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_BLOCKING_V2)
     dev_host.reload_via_http()
-    _wait_for(
+    wait_for(
         lambda: dev_host.asset_names() == {"first", "blocking", "second"},
         120,
         "the reloaded code location to serve the edited module",
@@ -436,8 +407,8 @@ def test_a_run_in_flight_finishes_in_the_retired_generation(start_dev_host, tmp_
     assert "Generation 0 finished." not in dev_host.logs()
 
     release.write_text("go")
-    _wait_for(marker.exists, 30, "the run to finish in the retired generation")
-    _wait_for(
+    wait_for(marker.exists, 30, "the run to finish in the retired generation")
+    wait_for(
         lambda: "Generation 0 finished." in dev_host.logs(),
         30,
         "the retired generation to exit on its own",
@@ -459,14 +430,14 @@ def test_a_backfill_completes_across_a_reload(start_dev_host, tmp_path):
     )
     dev_host.wait_ready()
     backfill_id = dev_host.launch_backfill("part", ["p1", "p2", "p3", "p4"])
-    _wait_for(
+    wait_for(
         lambda: len(dev_host.backfill_status(backfill_id).run_ids) == 4,
         60,
         "the daemon to submit the backfill's runs",
     )
 
     dev_host.reload_via_http()
-    _wait_for(
+    wait_for(
         lambda: dev_host.reload_state()["generation"] == 1,
         120,
         "the host to report the reload",
@@ -474,7 +445,7 @@ def test_a_backfill_completes_across_a_reload(start_dev_host, tmp_path):
     assert dev_host.backfill_status(backfill_id).completed_partitions == 0
 
     release.write_text("go")
-    _wait_for(
+    wait_for(
         lambda: dev_host.backfill_status(backfill_id).status.startswith("Completed"),
         120,
         "the backfill to complete in the new generation",
@@ -483,7 +454,7 @@ def test_a_backfill_completes_across_a_reload(start_dev_host, tmp_path):
     assert status.status == "CompletedSuccess", status
     assert status.completed_partitions == 4, status
     assert status.failed_partitions == 0, status
-    _wait_for(
+    wait_for(
         lambda: "Generation 0 finished." in dev_host.logs(),
         30,
         "the retired generation to exit on its own",

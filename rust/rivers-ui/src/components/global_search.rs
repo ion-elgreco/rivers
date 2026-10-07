@@ -2,6 +2,7 @@
 
 use leptos::prelude::*;
 
+use crate::components::live::use_definitions;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
 use crate::server_fns::automation::{get_jobs, get_schedules, get_sensors};
@@ -33,10 +34,13 @@ pub fn GlobalSearch(#[prop(optional)] open: RwSignal<bool>) -> impl IntoView {
     });
 
     // Search index loads client-side only (no SSR needed for an interactive overlay).
-    // Re-fetches on location switch — every gRPC-backed search source is per-location.
+    // Re-fetches on location switch — every gRPC-backed search source is
+    // per-location — and when the code location reloads.
     let loc = use_current_location();
+    let definitions = use_definitions();
     let search_index = LocalResource::new(move || {
         let (ns, name) = loc.get();
+        definitions.track();
         async move {
             let mut entries = Vec::new();
 

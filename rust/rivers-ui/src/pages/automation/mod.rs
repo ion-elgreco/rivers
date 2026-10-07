@@ -217,7 +217,6 @@ pub fn AutomationPage() -> impl IntoView {
         }
     });
 
-
     view! {
         <Topbar
             title="Automation"

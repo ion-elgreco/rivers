@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 
 use crate::components::global_search::GlobalSearch;
+use crate::components::live::DefinitionsTick;
 use crate::components::location_switcher::LocationSwitcher;
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::dev::{get_dev_reload_state, reload_code_location};
@@ -218,6 +219,8 @@ pub fn Shell(children: Children) -> impl IntoView {
     let collapsed = RwSignal::new(false);
     let search_open = RwSignal::new(false);
     let collapsed_signal = Signal::derive(move || collapsed.get());
+    // One definitions tick for every page and component under the shell.
+    provide_context(DefinitionsTick(RwSignal::new(0u32)));
 
     // Populated once per Shell mount. Registry state is long-lived on the
     // server side; a full `Watch` subscription is follow-up work.

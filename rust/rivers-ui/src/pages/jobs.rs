@@ -68,7 +68,6 @@ pub fn JobsListPage() -> impl IntoView {
         |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
 
-
     let navigate = leptos_router::hooks::use_navigate();
 
     let show_dialog = RwSignal::new(false);

@@ -55,7 +55,6 @@ pub fn ScheduleDetailPage() -> impl IntoView {
     });
     let eval_pending = eval_action.pending();
 
-
     let (ns_t, name_t) = loc.get_untracked();
     let auto_href = loc_path(&ns_t, &name_t, "automation?tab=schedules");
     view! {

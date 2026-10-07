@@ -44,7 +44,6 @@ pub fn OverviewPage() -> impl IntoView {
         |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
 
-
     view! {
         <Topbar title="Overview">
             <LiveStatusChip

@@ -45,9 +45,9 @@ pub fn JobDetailPage() -> impl IntoView {
     let jobs = Resource::new(
         move || {
             params.track();
-            (name(), loc.get())
+            (name(), loc.get(), live.definitions.get())
         },
-        |(_n, (ns, lname))| async move { get_jobs(ns, lname).await },
+        |(_n, (ns, lname), _)| async move { get_jobs(ns, lname).await },
     );
 
     let runs_page_res = Resource::new(
@@ -88,7 +88,6 @@ pub fn JobDetailPage() -> impl IntoView {
         move || (loc.get(), live.definitions.get()),
         |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
-
 
     let (exec_pending, set_exec_pending) = signal(false);
     let (exec_error, set_exec_error) = signal::<Option<String>>(None);

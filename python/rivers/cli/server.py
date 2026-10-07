@@ -94,11 +94,18 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
     if cfg.storage.endpoint is None:
         atexit.register(_cleanup_storage, cfg.storage.path)
 
-    storage = None
     try:
         storage = _open_or_prompt_migrate(
             lambda: Storage.connect(host.endpoint),
             lambda: Storage.migrate_remote(host.endpoint),
+        )
+        # The UI comes up while the code location imports and resolves.
+        host.start_ui(
+            storage,
+            cfg.server.host,
+            cfg.server.port,
+            f"http://{cfg.server.host}:{cfg.server.grpc_port}",
+            cfg.synthetic.size,
         )
         if not host.start_code_location(
             sys.executable,
@@ -109,13 +116,6 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
             cfg.daemon.no_daemon,
         ):
             raise typer.Exit(1)
-        host.start_ui(
-            storage,
-            cfg.server.host,
-            cfg.server.port,
-            f"http://{cfg.server.host}:{cfg.server.grpc_port}",
-            cfg.synthetic.size,
-        )
         typer.echo(f"Code location {module} is up; reload it from the UI.")
         host.run()
     finally:
@@ -181,19 +181,9 @@ def _import_repo(module: str, repo_var: str):
 
 
 def _serve_code_location(
-    repo_obj,
-    storage,
-    host: str,
-    grpc_port: int,
-    no_daemon: bool,
-    retire: bool = False,
+    repo_obj, storage, host: str, grpc_port: int, no_daemon: bool
 ) -> None:
-    """Start the gRPC backend and the automation daemon, then block.
-
-    With ``retire``, the first terminate signal stops scheduling, releases the
-    gRPC port and lets in-flight runs finish without a cap: how ``rivers dev``
-    replaces a code location.
-    """
+    """Start the gRPC backend and the automation daemon, then block."""
     actual_port = repo_obj._start_grpc_server(host, grpc_port)
     if actual_port != grpc_port:
         typer.echo(
@@ -209,4 +199,4 @@ def _serve_code_location(
 
     from rivers._core import wait_for_exit
 
-    wait_for_exit(retire=retire)
+    wait_for_exit()
