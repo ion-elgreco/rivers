@@ -1399,7 +1399,7 @@ requires-dist = [
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyarrow'" },
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyspark'" },
     { name = "rivers", extras = ["pyspark"], marker = "extra == 'delta-pyspark'" },
-    { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.45.0" },
+    { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.10.0" },
     { name = "typer", specifier = ">=0.27.0" },
 ]
 provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack"]
