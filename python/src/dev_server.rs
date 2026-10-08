@@ -15,6 +15,7 @@ use crate::storage::PyStorage;
 
 /// Open client connections hold a graceful shutdown; past this the listener
 /// is dropped.
+#[cfg(feature = "dev-server")]
 const STOP_GRACE: Duration = Duration::from_secs(5);
 /// A dropped live query sends its kill afterwards; the wire gets this long
 /// before the caller closes the connection.

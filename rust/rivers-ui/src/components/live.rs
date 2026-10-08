@@ -87,6 +87,7 @@ pub fn use_definitions() -> RwSignal<u32> {
 }
 
 /// The channel the `rivers dev` host ticks once a reloaded code location serves.
+#[cfg(any(feature = "hydrate", feature = "ssr"))]
 pub(crate) const DEFINITIONS_CHANNEL: &str = "code_location";
 
 /// Safety-net refresh cadence — forces a refetch every 5 minutes regardless

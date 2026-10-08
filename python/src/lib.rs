@@ -4,6 +4,7 @@
 //! configures OpenTelemetry export and `pyo3-pylogger` bridge, then registers all
 //! submodules (assets, executor, storage, daemon, etc.) into the `rivers._core` package.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
+#![recursion_limit = "256"]
 
 #[cfg(not(target_os = "macos"))]
 #[global_allocator]
