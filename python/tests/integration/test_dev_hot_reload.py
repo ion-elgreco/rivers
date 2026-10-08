@@ -228,7 +228,7 @@ class DevHostProcess:
 
         wait_for(up, 120, "the dev host and its code location")
 
-    def _post(self, path: str) -> object:
+    def _post(self, path: str, timeout: float = 5) -> object:
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.ui_port}{path}",
             data=b"",
@@ -238,15 +238,20 @@ class DevHostProcess:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
-        with urllib.request.urlopen(request, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             body = resp.read()
         return json.loads(body) if body else None
 
     def reload_state(self) -> dict:
         return self._post("/api/dev/reload-state")
 
-    def reload_via_http(self) -> None:
-        self._post("/api/dev/reload")
+    def reload_via_http(self) -> str | None:
+        """Reload and wait for the verdict; return the host's error, if any."""
+        try:
+            self._post("/api/dev/reload", timeout=120)
+        except urllib.error.HTTPError as e:
+            return e.read().decode(errors="replace")
+        return None
 
     def logs(self) -> str:
         for f in (self.out_file, self.err_file):
@@ -330,12 +335,8 @@ def test_a_broken_edit_keeps_the_session_alive(dev_host, tmp_path):
     host_pid = dev_host.proc.pid
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_BROKEN)
-    dev_host.reload_via_http()
-    wait_for(
-        lambda: dev_host.reload_state()["error"] is not None,
-        120,
-        "the host to report the failed reload",
-    )
+    assert dev_host.reload_via_http() is not None, "a broken edit reports an error"
+    assert dev_host.reload_state()["error"] is not None
     assert dev_host.proc.poll() is None, "the host survives a broken edit"
     assert dev_host.ui_up()
     assert dev_host.reload_state()["generation"] == 0
