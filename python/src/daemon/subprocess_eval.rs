@@ -20,7 +20,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use super::parse::assemble_call_args;
+use super::run_status::call_each;
 use super::{precompute_args, types::PrecomputedArgs};
+use crate::context::run_status::RunStatusEvent;
 use crate::context::schedule::PyScheduleEvaluationContext;
 use crate::context::sensor::PySensorEvaluationContext;
 
@@ -60,7 +62,7 @@ fn rebuild_resources<'py>(
 
 /// Invoke `eval_fn`; if the return value is a coroutine, drive it to
 /// completion via `asyncio.run`. Returns the raw Python result.
-fn invoke_eval_fn(
+pub(super) fn invoke_eval_fn(
     py: Python,
     eval_fn: &Py<PyAny>,
     call_args: Vec<Py<PyAny>>,
@@ -87,36 +89,36 @@ fn teardown_resources(py: Python, resources: &[Py<PyAny>]) {
     }
 }
 
-/// Resolve config + resource args via the shared precompute path, then call
-/// `eval_fn` with `[ctx, *resource_args]` and tear down. Returns the raw
-/// Python result (RunRequest / SkipReason / SensorResult / list / None).
+/// Rebuild the resources, resolve config + resource args via the shared
+/// precompute path, run `f`, and tear down on ANY exit — a failure would
+/// otherwise leak setup resources in the reused loky worker.
+fn with_resources<T>(
+    py: Python,
+    eval_fn: &Py<PyAny>,
+    resource_specs: &Bound<'_, PyList>,
+    f: impl FnOnce(PrecomputedArgs) -> PyResult<T>,
+) -> PyResult<T> {
+    let (resources, ordered) = rebuild_resources(py, resource_specs)?;
+    let result = precompute_args(py, eval_fn, &resources)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+        .and_then(f);
+    teardown_resources(py, &ordered);
+    result
+}
+
+/// Call `eval_fn` with `[ctx, *resource_args]`. Returns the raw Python result
+/// (RunRequest / SkipReason / SensorResult / list / None).
 fn run_eval(
     py: Python,
     eval_fn: Py<PyAny>,
     resource_specs: &Bound<'_, PyList>,
     build_ctx: impl FnOnce(Python, Option<Py<PyAny>>) -> PyResult<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    let (resources, ordered) = rebuild_resources(py, resource_specs)?;
-
-    // Tear down on ANY exit — a failure below would otherwise leak setup
-    // resources in the reused loky worker.
-    let result = (|| {
-        let PrecomputedArgs {
-            config_instance,
-            resource_args,
-        } = precompute_args(py, &eval_fn, &resources)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-
-        let ctx = build_ctx(py, config_instance)?;
-        let pre = PrecomputedArgs {
-            config_instance: None,
-            resource_args,
-        };
-        let call_args = assemble_call_args(py, ctx, &pre);
-        invoke_eval_fn(py, &eval_fn, call_args)
-    })();
-    teardown_resources(py, &ordered);
-    result
+    with_resources(py, &eval_fn, resource_specs, |pre| {
+        let config = pre.config_instance.as_ref().map(|c| c.clone_ref(py));
+        let ctx = build_ctx(py, config)?;
+        invoke_eval_fn(py, &eval_fn, assemble_call_args(py, ctx, &pre))
+    })
 }
 
 /// Subprocess wrapper for schedule evaluation. Submitted to loky with a
@@ -137,6 +139,27 @@ pub fn eval_schedule_in_subprocess(
                 .with_config(config),
         )?
         .into_any())
+    })
+}
+
+/// Subprocess wrapper for a run-status sensor tick: calls `eval_fn` once per
+/// JSON-encoded run. Returns one entry per run: `None` on success, else the
+/// error message.
+#[pyfunction]
+pub fn eval_run_status_sensor_in_subprocess(
+    py: Python,
+    eval_fn: Py<PyAny>,
+    sensor_name: String,
+    events: Vec<String>,
+    resource_specs: Bound<'_, PyList>,
+) -> PyResult<Vec<Option<String>>> {
+    let events = events
+        .iter()
+        .map(|raw| serde_json::from_str::<RunStatusEvent>(raw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    with_resources(py, &eval_fn, &resource_specs, |pre| {
+        Ok(call_each(py, &eval_fn, &sensor_name, events, &pre))
     })
 }
 

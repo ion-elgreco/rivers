@@ -57,6 +57,9 @@ Dagster snippets below assume `import dagster as dg`; rivers snippets assume `im
 | `dg.RunRequest(run_key=, partition_key=, tags=)` | same (no `run_config=`) |
 | `dg.SkipReason("…")` | `rs.SkipReason("…")` |
 | `dg.DefaultSensorStatus.RUNNING` | `rs.SensorStatus.Running` |
+| `@dg.run_status_sensor(run_status=DagsterRunStatus.SUCCESS)` | `@rs.Sensor.run_status(rs.RunStatus.Success)`; the function returns `None` |
+| `@dg.run_failure_sensor` | `@rs.Sensor.run_failure` |
+| `context.dagster_run` / `context.get_step_failure_events()` | `context.run` / `context.step_failures` |
 | **Infrastructure** | |
 | `dg.ConfigurableIOManager` | `rs.BaseIOHandler` (same `handle_output`/`load_input`) |
 | `io_manager_key="x"` + `resources={"x": …}` | `io_handler=handler_instance` or `io_handler="x"` + `resources={"x": …}` |
@@ -293,8 +296,8 @@ Each of these produces code that looks correct and is not.
 Report these to the user rather than approximating:
 
 - **Asset checks** (`@dg.asset_check`, `AssetCheckResult`) — no rivers counterpart. Options: fold the assertion into the asset body (fails the materialization), or drop it and note the lost signal.
-- **Integrations** — `dagster-dbt`, `dagster-dlt`, `dagster-aws`, and the rest of the integration library have no rivers ports. dbt models must be driven by a `BashTask` or a custom asset.
+- **Integrations** — `dagster-dbt`, `dagster-dlt`, `dagster-aws`, and the rest of the integration library have no rivers ports. dbt models must be driven by a `BashTask` or a custom asset. The exception is `dagster-slack`: port it to `rivers.integrations.slack` (`slack_on_failure` → `slack.failure_hook`, `slack_on_success` → `slack.success_hook`, `make_slack_on_run_failure_sensor` → `slack.run_failure_sensor`, where `slack = SlackResource(...)`).
 - **Dagster+ features** — Insights, alerts, branch deployments, the Dagster+ agent.
 - **`RunConfig` at launch** — rivers takes per-asset config dicts (`config={"asset": {...}}`), not a structured `RunConfig` object.
-- **`@dg.run_status_sensor` / `@dg.asset_sensor`** — write an ordinary `rs.Sensor` that reads run/materialization state from `repo.storage`, or flag it as unported.
+- **`@dg.asset_sensor`** — write an ordinary `rs.Sensor` that reads materialization state from `repo.storage`, or flag it as unported. (`@dg.run_status_sensor` / `@dg.run_failure_sensor` do port: see `rs.Sensor.run_status` / `rs.Sensor.run_failure`.)
 - **`dg.DynamicOut` / `DynamicOutput` in ops** — rivers has `rs.DynamicOutput` for fan-out inside graph assets, but the mapping/collect API differs (`InvokedNodeOutput.map(...).collect()`); re-derive rather than transliterate.

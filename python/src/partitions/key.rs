@@ -92,6 +92,11 @@ impl PyPartitionKey {
         Ok(Self::Multi { keys: result })
     }
 
+    /// The canonical display form: `a,b`, `dim=v|dim=v`, or set members joined by `, `.
+    fn __str__(&self) -> String {
+        rivers_core::storage::PartitionKey::from(self).to_display()
+    }
+
     pub fn __repr__(&self) -> String {
         match self {
             Self::Single { key } => {

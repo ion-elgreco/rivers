@@ -305,9 +305,7 @@ def _rivers(cwd, *args, env=None):
 
 def _assert_events_p1_purged(storage):
     assert storage.get_materialized_partitions("events") == []
-    assert [str(k) for k in storage.get_materialized_partitions("rollup")] == [
-        'PartitionKey("p1")'
-    ]
+    assert [str(k) for k in storage.get_materialized_partitions("rollup")] == ["p1"]
     runs = [r for r in storage.get_runs() if r.action == "purge"]
     assert [(r.status, r.node_names) for r in runs] == [("Success", ["events"])]
     events = storage.get_events_for_run(runs[0].run_id)

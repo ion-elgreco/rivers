@@ -324,7 +324,7 @@ def test_keyed_action_job_on_partitioned_asset_runs():
     assert result.success
     assert purged == ["p1"]
     remaining = {str(k) for k in repo.storage.get_materialized_partitions("orders")}
-    assert remaining == {'PartitionKey("p2")'}
+    assert remaining == {"p2"}
 
 
 def test_keyless_observe_job_on_partitioned_observable_is_allowed():

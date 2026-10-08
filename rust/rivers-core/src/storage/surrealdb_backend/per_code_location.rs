@@ -1235,6 +1235,40 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(runs)
     }
 
+    async fn get_runs_ended_since(
+        &self,
+        code_location_id: &str,
+        since: i64,
+        status: RunStatus,
+        job_names: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>> {
+        let job_filter = if job_names.is_some() {
+            " AND job_name IN $jobs"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT * FROM runs \
+                 WHERE code_location_id = $cl AND end_time >= $since AND status = $status{job_filter} \
+                 ORDER BY end_time ASC LIMIT $limit"
+        );
+        retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(query.as_str())
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("since", since))
+                .bind(("status", status.clone()))
+                .bind(("jobs", job_names.map(<[String]>::to_vec)))
+                .bind(("limit", limit))
+                .await?;
+            let runs: Vec<RunRecord> = result.take(0)?;
+            Ok(runs)
+        })
+        .await
+    }
+
     async fn get_condition_eval_state(
         &self,
         code_location_id: &str,

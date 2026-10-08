@@ -7,6 +7,7 @@ pub mod condition;
 pub mod execution;
 pub mod repo;
 pub mod run_backend;
+pub mod sensor;
 pub mod staleness;
 pub mod storage;
 pub mod task;

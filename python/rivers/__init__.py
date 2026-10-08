@@ -87,16 +87,19 @@ from rivers._core.schedule import (
     SkipReason,
 )
 from rivers._core.sensor import (
+    RunStatusSensorContext,
     Sensor,
     SensorEvaluationContext,
     SensorResult,
     SensorStatus,
     SensorTickResult,
+    StepFailure,
 )
 from rivers._core.storage import (
     AssetRecord,
     LaunchedBy,
     RunRecord,
+    RunStatus,
     StaleCause,
     Storage,
     StorageType,
@@ -164,6 +167,7 @@ __all__ = [
     "PickleIOHandler",
     "LaunchedBy",
     "RunRecord",
+    "RunStatus",
     "RunBackendConfig",
     "RunQueueConfig",
     "SelfDependency",
@@ -186,6 +190,8 @@ __all__ = [
     "SensorResult",
     "SensorStatus",
     "SensorTickResult",
+    "RunStatusSensorContext",
+    "StepFailure",
     "AutomationCondition",
     "EvalMode",
 ]

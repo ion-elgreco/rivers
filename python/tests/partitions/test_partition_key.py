@@ -18,6 +18,28 @@ def test_multi():
     assert repr(key) == 'PartitionKey({"date": "2024-01-15", "region": "us-east"})'
 
 
+@pytest.mark.parametrize(
+    ("key", "text"),
+    [
+        (rs.PartitionKey.single("2024-01-15"), "2024-01-15"),
+        (rs.PartitionKey.single(["a", "b"]), "a,b"),
+        (
+            rs.PartitionKey.multi({"region": "us-east", "date": "2024-01-15"}),
+            "date=2024-01-15|region=us-east",
+        ),
+        (
+            rs.PartitionKey.from_json(
+                '{"set": [{"single": ["a"]}, {"single": ["b"]}]}'
+            ),
+            "a, b",
+        ),
+    ],
+)
+def test_str_is_the_display_form(key, text):
+    """``str()`` gives the format the UI and gRPC show."""
+    assert str(key) == text
+
+
 def test_equality():
     """PartitionKey equality and hashing."""
     k1 = rs.PartitionKey.single("a")

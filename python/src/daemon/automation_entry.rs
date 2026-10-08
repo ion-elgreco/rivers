@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use jiff::{SignedDuration, Timestamp};
 use croner::Cron;
+use jiff::{SignedDuration, Timestamp};
 use rivers_core::storage::LaunchedBy;
 
 use super::schedule::ScheduleInfo;
@@ -194,6 +194,7 @@ impl AutomationEntry {
                 launched_by,
                 tags: info.tags.clone(),
                 precomputed: info.precomputed.clone(),
+                run_status: None,
             },
             AutomationEntry::Sensor {
                 info,
@@ -214,6 +215,7 @@ impl AutomationEntry {
                 launched_by,
                 tags: info.tags.clone(),
                 precomputed: info.precomputed.clone(),
+                run_status: info.run_status.clone(),
             },
         }
     }

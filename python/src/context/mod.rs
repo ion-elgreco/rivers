@@ -3,6 +3,7 @@ pub mod action;
 pub mod asset;
 pub mod hook;
 pub mod io;
+pub mod run_status;
 pub mod schedule;
 pub mod sensor;
 pub mod task;

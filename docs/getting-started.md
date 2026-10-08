@@ -13,6 +13,7 @@ pip install rivers[delta]     # Delta Lake IO handler
 pip install rivers[pyarrow]   # PyArrow Tables / RecordBatchReaders for Delta
 pip install rivers[polars]    # Polars DataFrames / LazyFrames for Delta
 pip install rivers[otel]      # OpenTelemetry instrumentation
+pip install rivers[slack]     # Slack alerts (hooks and a run-failure sensor)
 ```
 
 rivers also runs on free-threaded Python (3.14t and later). See [Free-threaded Python](installation/free-threading.md).

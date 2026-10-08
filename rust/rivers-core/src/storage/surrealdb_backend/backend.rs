@@ -1295,6 +1295,24 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
+    async fn get_run_failure_events(&self, run_id: &str) -> Result<Vec<StoredEvent>> {
+        retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(
+                    "SELECT * FROM events \
+                         WHERE run_id = $run_id \
+                         AND event_type IN ['StepFailure', 'RunLaunchFailed'] \
+                         ORDER BY timestamp ASC, sort_order ASC, id ASC",
+                )
+                .bind(("run_id", run_id.to_string()))
+                .await?;
+            let events: Vec<DbStoredEvent> = result.take(0)?;
+            Ok(events.into_iter().map(|e| e.into_stored_event()).collect())
+        })
+        .await
+    }
+
     async fn get_completed_step_keys(&self, run_id: &str) -> Result<HashSet<String>> {
         retry::with_retry(&self.retry_config, || async {
             let mut result = self

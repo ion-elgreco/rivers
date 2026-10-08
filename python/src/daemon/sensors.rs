@@ -8,6 +8,7 @@ use crate::automation::parse_sensor_result;
 use crate::automation::sensor::PySensorStatus;
 use crate::repository::PyCodeRepository;
 
+use super::run_status::RunStatusSpec;
 use super::{
     BoxedPyFuture, PY_EVAL_PERMITS, PrecomputedArgs, ResolvedEvalMode, SensorOutcome,
     assemble_call_args, extract_sensor_outcome_from_parts, precompute_args, resolve_eval_mode,
@@ -24,6 +25,8 @@ pub(super) struct SensorInfo {
     pub(super) eval_timeout: std::time::Duration,
     pub(super) eval_fn: Option<Arc<Py<PyAny>>>,
     pub(super) precomputed: Option<Arc<PrecomputedArgs>>,
+    /// `Some` for a run-status sensor.
+    pub(super) run_status: Option<RunStatusSpec>,
 }
 
 impl PyCodeRepository {
@@ -80,6 +83,10 @@ impl PyCodeRepository {
                             .unwrap_or(std::time::Duration::from_secs(300)),
                         eval_fn,
                         precomputed,
+                        run_status: sens.monitored_status.map(|status| RunStatusSpec {
+                            status: status.into(),
+                            monitored_jobs: sens.monitored_jobs.clone(),
+                        }),
                     })
                 } else {
                     None

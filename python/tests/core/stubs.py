@@ -103,6 +103,27 @@ sens_plain = rs.Sensor(name="my_sensor")
 reveal_type(sens_plain)
 
 
+# Run-status sensors: bare, with arguments, and for a chosen status
+@rs.Sensor.run_failure
+def run_fail_bare(context: rs.RunStatusSensorContext) -> None:
+    reveal_type(context.step_failures)
+
+
+@rs.Sensor.run_failure(name="on_fail", monitored_jobs=["my_job"])
+def run_fail_args(context: rs.RunStatusSensorContext) -> None:
+    pass
+
+
+@rs.Sensor.run_status(rs.RunStatus.Success)
+def run_ok(context: rs.RunStatusSensorContext) -> None:
+    reveal_type(context.run)
+
+
+reveal_type(run_fail_bare)
+reveal_type(run_fail_args)
+reveal_type(run_ok)
+
+
 class TuneConfig(BaseModel):
     target_size_mb: int = 128
 

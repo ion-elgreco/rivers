@@ -21,6 +21,7 @@ mod observations;
 mod pools;
 mod run_progress;
 mod run_queue;
+mod run_status;
 mod ui_queries;
 
 async fn make_storage() -> SurrealStorage {

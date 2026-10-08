@@ -400,6 +400,24 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
         .await
     }
 
+    pub async fn get_runs_ended_since(
+        &self,
+        since: i64,
+        status: RunStatus,
+        job_names: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>> {
+        PerCodeLocationStorage::get_runs_ended_since(
+            self.backend,
+            self.code_location_id,
+            since,
+            status,
+            job_names,
+            limit,
+        )
+        .await
+    }
+
     pub async fn get_condition_eval_state(
         &self,
     ) -> Result<Option<crate::condition::ConditionEvalState>> {

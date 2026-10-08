@@ -209,6 +209,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
+        daemon::eval_run_status_sensor_in_subprocess,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
         shutdown::py_install_signal_handler,
         m
     )?)?;

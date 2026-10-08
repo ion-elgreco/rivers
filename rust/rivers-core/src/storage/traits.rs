@@ -331,6 +331,17 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         order: SortOrder,
     ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
 
+    /// Runs of this code location that ended at or after `since` with
+    /// `status`, oldest end first. `job_names` keeps only runs of those jobs.
+    fn get_runs_ended_since(
+        &self,
+        code_location_id: &str,
+        since: i64,
+        status: RunStatus,
+        job_names: Option<&[String]>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<RunRecord>>> + Send;
+
     /// Read the persisted condition-daemon eval state for this CL.
     fn get_condition_eval_state(
         &self,
@@ -610,6 +621,12 @@ pub trait StorageBackend: PerCodeLocationStorage {
         &self,
         run_id: &str,
         step_key: &str,
+    ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
+
+    /// A run's `StepFailure` and `RunLaunchFailed` events, oldest first.
+    fn get_run_failure_events(
+        &self,
+        run_id: &str,
     ) -> impl Future<Output = Result<Vec<StoredEvent>>> + Send;
 
     /// Get the set of step keys that completed successfully in a run.

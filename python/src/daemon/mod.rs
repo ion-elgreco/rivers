@@ -28,6 +28,7 @@ mod batch_writer;
 mod dispatchers;
 mod eval_dispatcher;
 mod parse;
+mod run_status;
 mod schedule;
 mod sensors;
 mod subdaemons;
@@ -35,7 +36,9 @@ mod subprocess_eval;
 mod tick_processing;
 mod types;
 
-pub use subprocess_eval::{eval_schedule_in_subprocess, eval_sensor_in_subprocess};
+pub use subprocess_eval::{
+    eval_run_status_sensor_in_subprocess, eval_schedule_in_subprocess, eval_sensor_in_subprocess,
+};
 
 use automation_condition::{
     ConditionEvalLoopConfig, build_condition_engine, condition_eval_loop, extract_asset_conditions,
@@ -360,7 +363,12 @@ pub(crate) fn precompute_args(
 
     let sensor_ctx = crate::context::sensor::PySensorEvaluationContext::type_object(py);
     let schedule_ctx = crate::context::schedule::PyScheduleEvaluationContext::type_object(py);
-    let ctx_types = [sensor_ctx.as_any(), schedule_ctx.as_any()];
+    let run_status_ctx = crate::context::run_status::PyRunStatusSensorContext::type_object(py);
+    let ctx_types = [
+        sensor_ctx.as_any(),
+        schedule_ctx.as_any(),
+        run_status_ctx.as_any(),
+    ];
 
     let mut config_instance = None;
     let mut resource_args: Vec<Py<PyAny>> = Vec::new();
@@ -523,7 +531,11 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         Arc::clone(&repo),
         gil_threads.clone(),
     ));
-    let eval_dispatcher = Arc::new(EvalDispatcher::new(loky_executor, resources));
+    let eval_dispatcher = Arc::new(EvalDispatcher::new(
+        loky_executor,
+        resources,
+        handle.clone(),
+    ));
 
     if !asset_conditions.is_empty() {
         let max_evals_retained: Option<usize> = std::env::var("RIVERS_MAX_CONDITION_EVALS")
