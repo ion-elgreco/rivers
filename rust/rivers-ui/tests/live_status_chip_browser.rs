@@ -111,6 +111,6 @@ fn use_live_kick_under_csr_returns_reconnecting() {
     let owner = leptos::reactive::owner::Owner::new();
     owner.with(|| {
         let s = use_live_kick(&["runs", "events"], 500, Callback::new(|_| {}));
-        assert_eq!(s.get_untracked(), LiveStatus::Reconnecting);
+        assert_eq!(s.status.get_untracked(), LiveStatus::Reconnecting);
     });
 }
