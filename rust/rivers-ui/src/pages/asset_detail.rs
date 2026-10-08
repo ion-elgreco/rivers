@@ -5,7 +5,7 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::icons::IconPlay;
-use crate::components::live::{LiveStatusChip, use_live_kick};
+use crate::components::live::{LiveStatusChip, use_definitions, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
 use crate::components::traceback::TracebackView;
@@ -127,6 +127,11 @@ pub fn AssetDetailPage() -> impl IntoView {
     let loc = use_current_location();
 
     let (refresh_tick, set_refresh_tick) = signal(0u32);
+    let live = use_live_kick(
+        &["assets", "events"],
+        300,
+        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
+    );
 
     let asset = Resource::new(
         move || {
@@ -150,12 +155,12 @@ pub fn AssetDetailPage() -> impl IntoView {
         |((ns, name), key, _)| get_runs_for_asset(ns, name, key, Some(10)),
     );
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
     let graph = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_graph_topology(ns, name).await },
+        move || (loc.get(), live.definitions.get()),
+        |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
@@ -224,12 +229,6 @@ pub fn AssetDetailPage() -> impl IntoView {
                 .unwrap_or(false),
         );
     });
-
-    let live_status = use_live_kick(
-        &["assets", "events"],
-        300,
-        Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
-    );
 
     let observe_key = key();
     let observe_action = Action::new(move |_: &()| {
@@ -312,7 +311,7 @@ pub fn AssetDetailPage() -> impl IntoView {
             Crumb::new(key()).mono(),
         ]>
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
             {move || observe_action.value().get().map(|result| match result {
@@ -1015,9 +1014,10 @@ fn AutomationTicksTab(asset_key: String, #[prop(into)] refresh_tick: Signal<u32>
         move || (loc.get(), key.clone(), refresh_tick.get()),
         |((ns, name), key, _)| get_condition_evals(ns, name, key, Some(50)),
     );
+    let definitions = use_definitions();
     let assets_info = Resource::new(
-        move || loc.get(),
-        |(ns, name)| async move { get_assets_info(ns, name).await },
+        move || (loc.get(), definitions.get()),
+        |((ns, name), _)| async move { get_assets_info(ns, name).await },
     );
     let (preselect_tick_id, _) = use_query_param("tick_id", "");
     let (selected_idx, set_selected_idx) = signal(0usize);

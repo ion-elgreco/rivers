@@ -114,6 +114,9 @@ struct AutomationDaemon {
     /// `stop()` / `Drop` await this so we don't return until the runtime is
     /// genuinely free of our work.
     done: CancellationToken,
+    /// Cancelled once every subdaemon has joined and nothing dispatches any
+    /// more, before in-flight runs are drained.
+    scheduling_stopped: CancellationToken,
     /// RUNNING once `start()` spawns `daemon_main_loop`. `stop()` and `Drop`
     /// wait on `done` only then — otherwise the token never fires.
     state: AtomicU8,
@@ -135,6 +138,7 @@ impl AutomationDaemon {
             storage: DetachOnClose::new(storage),
             cancel: crate::shutdown::drain_token().child_token(),
             done: CancellationToken::new(),
+            scheduling_stopped: CancellationToken::new(),
             state: AtomicU8::new(IDLE),
             max_ticks_retained: Some(100),
             is_memory_storage,
@@ -262,6 +266,7 @@ impl AutomationDaemon {
             repo: Arc::new(self.repo.clone_ref(py)),
             storage: self.storage.clone(),
             cancel: self.cancel.clone(),
+            scheduling_stopped: self.scheduling_stopped.clone(),
             loky_executor,
             resources,
             max_ticks_retained: self.max_ticks_retained,
@@ -282,7 +287,11 @@ impl AutomationDaemon {
             // `daemon_main_loop`. `stop()` awaits this token.
             done.cancel();
         });
-        crate::shutdown::register_daemon_handle(handle, self.cancel.clone());
+        crate::shutdown::register_daemon_handle(
+            handle,
+            self.cancel.clone(),
+            self.scheduling_stopped.clone(),
+        );
     }
 
     fn stop(&self, py: Python<'_>) {
@@ -391,6 +400,7 @@ struct DaemonLoopConfig {
     repo: Arc<Py<PyCodeRepository>>,
     storage: Arc<SurrealStorage>,
     cancel: CancellationToken,
+    scheduling_stopped: CancellationToken,
     loky_executor: Option<Arc<Py<PyAny>>>,
     /// Registered resources, threaded to the eval dispatcher for subprocess
     /// transport. Same handles `precompute_args` saw at extraction time.
@@ -415,6 +425,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         repo,
         storage,
         cancel,
+        scheduling_stopped,
         loky_executor,
         resources,
         max_ticks_retained,
@@ -585,6 +596,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         let _ = h.await;
         tracing::trace!(target: "rivers::dbg::daemon", subdaemon_idx = i, "daemon_main_loop: subdaemon joined");
     }
+    scheduling_stopped.cancel();
 
     // Subdaemon loops are the only spawners and have all exited, so draining now
     // is race-free. On `spawn_blocking` because `drain()` joins (blocks).

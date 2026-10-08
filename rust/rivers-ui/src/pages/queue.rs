@@ -47,7 +47,7 @@ pub fn QueuePage() -> impl IntoView {
     let loc = use_current_location();
     let queued = Resource::new(move || refresh_tick.get(), |_| get_queued_runs());
 
-    let live_status = use_live_kick(
+    let live = use_live_kick(
         &["runs"],
         300,
         Callback::new(move |_| set_refresh_tick.update(|t| *t += 1)),
@@ -56,7 +56,7 @@ pub fn QueuePage() -> impl IntoView {
     view! {
         <Topbar title="Queue" subtitle=|| "Runs waiting on a resource">
             <LiveStatusChip
-                status=live_status
+                status=live.status
                 on_refresh=Callback::new(move |_| set_refresh_tick.update(|t| *t += 1))
             />
         </Topbar>

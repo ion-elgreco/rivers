@@ -1,7 +1,8 @@
-"""Polling helpers — wait for storage to reach a state."""
+"""Polling helpers — wait for storage, a server or a process to reach a state."""
 
 from __future__ import annotations
 
+import socket
 import time
 
 
@@ -13,6 +14,19 @@ def wait_until(predicate, timeout: float = 10.0):
             return True
         time.sleep(0.2)
     return predicate()
+
+
+def wait_for(predicate, timeout: float, what: str) -> None:
+    """Poll until ``predicate()`` is truthy; fail naming ``what`` on timeout."""
+    if not wait_until(predicate, timeout):
+        raise AssertionError(f"timed out waiting for {what}")
+
+
+def free_port() -> int:
+    """A loopback TCP port that was free a moment ago, for a server a test starts."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def wait_for_runs(storage, min_count: int = 1, timeout: float = 10.0, status=None):

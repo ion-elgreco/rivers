@@ -4,6 +4,7 @@
 //! configures OpenTelemetry export and `pyo3-pylogger` bridge, then registers all
 //! submodules (assets, executor, storage, daemon, etc.) into the `rivers._core` package.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
+#![recursion_limit = "256"]
 
 #[cfg(not(target_os = "macos"))]
 #[global_allocator]
@@ -25,6 +26,8 @@ pub mod concurrency;
 mod config;
 pub mod context;
 pub mod daemon;
+mod dev_server;
+mod dev_supervisor;
 pub mod errors;
 pub mod executor;
 pub(crate) mod gil_threads;
@@ -210,6 +213,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(shutdown::py_wait_for_exit, m)?)?;
+    m.add_class::<dev_server::PyDevHost>()?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        dev_supervisor::serve_dev_code_location,
+        m
+    )?)?;
 
     Ok(())
 }

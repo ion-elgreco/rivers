@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod automation;
 pub mod backfills;
+pub mod dev;
 pub mod graph;
 pub mod locations;
 pub mod mutations;

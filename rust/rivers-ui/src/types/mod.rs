@@ -49,6 +49,16 @@ pub(crate) fn display_name<'a>(
         .unwrap_or(subject)
 }
 
+/// Whether the host can reload its code location, and how the last reload went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevReloadState {
+    pub enabled: bool,
+    /// Counts code locations that came back up; a reload is done once it moves.
+    pub generation: u64,
+    /// Why the last attempt did not come back up; cleared by the next attempt.
+    pub error: Option<String>,
+}
+
 /// The signed-in user as exposed to the shell; `None` means auth mode
 /// `none`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
