@@ -58,7 +58,7 @@ Dagster maps closely — rivers uses the same asset model, so most definitions h
 The skill is written to report gaps instead of approximating them. Expect it to flag:
 
 - **Asset checks** — no rivers equivalent; assertions must move into the asset body
-- **Integration packages** — `dagster-dbt`, `dagster-dlt` and friends have no rivers ports
+- **Integration packages** — `dagster-dbt`, `dagster-dlt` and friends have no rivers ports; `dagster-slack` maps to [`rivers.integrations.slack`](slack.md)
 - **Prefect caching** — `cache_policy` / `cache_key_fn` have no direct analog; rivers uses materialization state, `code_version`, and `data_version` instead
 - **Dynamic control flow** — Prefect flows whose shape depends on runtime data do not fit a declarative DAG
 - **Cloud-only features** — Dagster+ and Prefect Cloud functionality

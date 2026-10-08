@@ -44,6 +44,10 @@ rs.PartitionKey.multi({"date": "2024-01-15", "region": ["us", "eu"]})
 |-----------|------|
 | `keys` | `dict[str, list[str]]` |
 
+### String form
+
+`str(key)` gives the canonical display form the UI and gRPC show: `2024-01-15` or `a,b` for a single key, `date=2024-01-15|region=us,eu` for a multi key (dimensions sorted).
+
 ---
 
 ## `PartitionsDefinition`

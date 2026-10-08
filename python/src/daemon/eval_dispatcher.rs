@@ -20,9 +20,12 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
+use rivers_core::storage::ScopedStorageHandle;
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use tracing::Instrument;
 
 use super::parse::{extract_sensor_outcome_from_parts, extract_tick_outcome_from_parts};
+use super::run_status;
 use super::schedule::{evaluate_schedule_async, evaluate_schedule_sync};
 use super::sensors::{evaluate_sensor_async, evaluate_sensor_sync};
 use super::types::{
@@ -45,22 +48,28 @@ pub(crate) struct EvalDispatcher {
     /// time into `(name, class, json_data)` triples so the subprocess wrapper
     /// can rebuild + `setup()` them before invoking the eval function.
     resources: Arc<HashMap<String, Py<PyAny>>>,
+    /// Run-status sensors read finished runs from storage before they call Python.
+    handle: ScopedStorageHandle<SurrealStorage>,
 }
 
 impl EvalDispatcher {
     pub(crate) fn new(
         loky_executor: Option<Arc<Py<PyAny>>>,
         resources: Arc<HashMap<String, Py<PyAny>>>,
+        handle: ScopedStorageHandle<SurrealStorage>,
     ) -> Self {
         Self {
             loky_executor,
             resources,
+            handle,
         }
     }
 
     /// Spawn each due eval as a task on the caller's `join_set`. Subprocess
     /// evals are batch-submitted in one GIL acquisition before their wait
-    /// tasks are spawned; in-process evals are spawned individually.
+    /// tasks are spawned; in-process evals are spawned individually. A
+    /// run-status sensor reads storage and then calls Python once per run in
+    /// its own eval mode, so it runs as one task whatever the mode.
     pub(crate) async fn spawn_due(
         &self,
         due: Vec<DueEval>,
@@ -70,10 +79,28 @@ impl EvalDispatcher {
         let mut subprocess_items: Vec<DueEval> = Vec::new();
 
         for d in due {
-            if matches!(d.params.eval_mode, ResolvedEvalMode::Subprocess) {
+            if let Some(spec) = d.params.run_status.clone() {
+                let cursor = d.prev_cursor.clone();
+                let handle = self.handle.clone();
+                let loky = self.loky_executor.clone();
+                let resources = self.resources.clone();
+                spawn_eval(join_set, d, dispatched_at, |params| async move {
+                    run_status::evaluate(
+                        &params,
+                        &spec,
+                        cursor.as_deref(),
+                        &handle,
+                        loky.as_ref(),
+                        &resources,
+                    )
+                    .await
+                });
+            } else if matches!(d.params.eval_mode, ResolvedEvalMode::Subprocess) {
                 subprocess_items.push(d);
             } else {
-                self.spawn_in_process(d, join_set, dispatched_at);
+                spawn_eval(join_set, d, dispatched_at, |params| async move {
+                    run_in_process_eval(&params).await
+                });
             }
         }
 
@@ -81,37 +108,6 @@ impl EvalDispatcher {
             self.spawn_subprocess_batch(subprocess_items, join_set, dispatched_at)
                 .await;
         }
-    }
-
-    fn spawn_in_process(
-        &self,
-        due: DueEval,
-        join_set: &mut tokio::task::JoinSet<TickResult>,
-        dispatched_at: Timestamp,
-    ) {
-        let DueEval {
-            index,
-            params,
-            prev_cursor,
-        } = due;
-        let span = tracing::info_span!(
-            target: "rivers::daemon",
-            "eval",
-            automation_type = automation_type_str(&params.kind),
-            name = %params.name,
-        );
-        join_set.spawn(
-            async move {
-                let result = run_in_process_eval(&params).await;
-                TickResult {
-                    index,
-                    result,
-                    prev_cursor,
-                    dispatched_at,
-                }
-            }
-            .instrument(span),
-        );
     }
 
     async fn spawn_subprocess_batch(
@@ -128,66 +124,56 @@ impl EvalDispatcher {
         let submitted = batch_submit_subprocess(&items, loky, &self.resources).await;
 
         for (due, submit_result) in items.into_iter().zip(submitted.into_iter()) {
-            let DueEval {
-                index,
-                params,
-                prev_cursor,
-            } = due;
-            let span = tracing::info_span!(
-                target: "rivers::daemon",
-                "eval",
-                automation_type = automation_type_str(&params.kind),
-                name = %params.name,
-            );
-
-            match submit_result {
-                Ok(py_future) => {
-                    let timeout = params.timeout;
-                    let name = params.name.clone();
-                    let kind = params.kind.clone();
-                    let default_job_name = params.default_job_name.clone();
-                    let default_asset_selection = params.default_asset_selection.clone();
-                    let launched_by = params.launched_by.clone();
-                    let tags = params.tags.clone();
-                    join_set.spawn(
-                        async move {
-                            let result = wait_subprocess_result(
-                                py_future,
-                                timeout,
-                                &kind,
-                                &name,
-                                default_job_name.as_deref(),
-                                default_asset_selection.as_deref(),
-                                &launched_by,
-                                &tags,
-                            )
-                            .await;
-                            TickResult {
-                                index,
-                                result,
-                                prev_cursor,
-                                dispatched_at,
-                            }
-                        }
-                        .instrument(span),
-                    );
-                }
-                Err(e) => {
-                    join_set.spawn(
-                        async move {
-                            TickResult {
-                                index,
-                                result: Err(e),
-                                prev_cursor,
-                                dispatched_at,
-                            }
-                        }
-                        .instrument(span),
-                    );
-                }
-            }
+            spawn_eval(join_set, due, dispatched_at, |params| async move {
+                wait_subprocess_result(
+                    submit_result?,
+                    params.timeout,
+                    &params.kind,
+                    &params.name,
+                    params.default_job_name.as_deref(),
+                    params.default_asset_selection.as_deref(),
+                    &params.launched_by,
+                    &params.tags,
+                )
+                .await
+            });
         }
     }
+}
+
+/// Spawn one eval on `join_set`, in a span naming its automation.
+fn spawn_eval<F, Fut>(
+    join_set: &mut tokio::task::JoinSet<TickResult>,
+    due: DueEval,
+    dispatched_at: Timestamp,
+    eval: F,
+) where
+    F: FnOnce(EvalParams) -> Fut,
+    Fut: Future<Output = Result<EvalOutcome, String>> + Send + 'static,
+{
+    let DueEval {
+        index,
+        params,
+        prev_cursor,
+    } = due;
+    let span = tracing::info_span!(
+        target: "rivers::daemon",
+        "eval",
+        automation_type = automation_type_str(&params.kind),
+        name = %params.name,
+    );
+    let result = eval(params);
+    join_set.spawn(
+        async move {
+            TickResult {
+                index,
+                result: result.await,
+                prev_cursor,
+                dispatched_at,
+            }
+        }
+        .instrument(span),
+    );
 }
 
 fn automation_type_str(kind: &AutomationKind) -> &'static str {
@@ -312,7 +298,7 @@ async fn run_in_process_eval(params: &EvalParams) -> Result<EvalOutcome, String>
 /// Build `[(name, class, json_data), ...]` for every registered resource —
 /// subprocess workers rebuild instances via `cls.model_validate_json` before
 /// `precompute_args` looks them up by parameter name.
-fn build_resource_specs<'py>(
+pub(super) fn build_resource_specs<'py>(
     py: Python<'py>,
     resources: &HashMap<String, Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyList>> {
@@ -443,6 +429,43 @@ async fn batch_submit_subprocess(
     results
 }
 
+/// Wait on a blocking thread for a loky future. Loky's own deadline reads as
+/// "<label> subprocess eval timed out after Ns".
+pub(super) async fn wait_loky_result(
+    py_future: Py<PyAny>,
+    timeout: std::time::Duration,
+    label: String,
+) -> Result<Py<PyAny>, String> {
+    tokio::task::spawn_blocking(move || {
+        Python::try_attach(|py| -> Result<Py<PyAny>, String> {
+            match py_future
+                .bind(py)
+                .call_method1("result", (timeout.as_secs_f64(),))
+            {
+                Ok(r) => Ok(r.unbind()),
+                Err(e) => {
+                    let is_timeout = py
+                        .import("concurrent.futures")
+                        .and_then(|m| m.getattr("TimeoutError"))
+                        .map(|te| e.is_instance(py, &te))
+                        .unwrap_or(false);
+                    Err(if is_timeout {
+                        format!(
+                            "{label} subprocess eval timed out after {}s",
+                            timeout.as_secs()
+                        )
+                    } else {
+                        e.to_string()
+                    })
+                }
+            }
+        })
+        .unwrap_or_else(|| Err("Python not attached".into()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Phase 2 (no GIL): wait for the loky future. Phase 3 (brief GIL): parse the
 /// returned PyO3 result (RunRequest / SkipReason / SensorResult / list / None)
 /// using the same `parse_schedule_result` / `parse_sensor_result` path as
@@ -464,37 +487,9 @@ async fn wait_subprocess_result(
     let tags = tags.clone();
     let kind = kind.clone();
     let name = name.to_string();
-    let timeout_secs = timeout.as_secs_f64();
     let kind_label = automation_type_str(&kind);
 
-    let raw_result = tokio::task::spawn_blocking(move || {
-        Python::try_attach(|py| -> Result<Py<PyAny>, String> {
-            match py_future.bind(py).call_method1("result", (timeout_secs,)) {
-                Ok(r) => Ok(r.unbind()),
-                // Distinguish loky's deadline from a genuine eval failure
-                Err(e) => {
-                    let is_timeout = py
-                        .import("concurrent.futures")
-                        .and_then(|m| m.getattr("TimeoutError"))
-                        .map(|te| e.is_instance(py, &te))
-                        .unwrap_or(false);
-                    Err(if is_timeout {
-                        format!(
-                            "{} '{}' subprocess eval timed out after {}s",
-                            kind_label,
-                            name,
-                            timeout.as_secs()
-                        )
-                    } else {
-                        e.to_string()
-                    })
-                }
-            }
-        })
-        .unwrap_or_else(|| Err("Python not attached".into()))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let raw_result = wait_loky_result(py_future, timeout, format!("{kind_label} '{name}'")).await?;
 
     let _permit = PY_EVAL_PERMITS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {

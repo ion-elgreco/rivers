@@ -176,7 +176,7 @@ def test_delete_of_a_key_a_parallel_step_wrote_is_not_undone(tmp_path):
     assert deleted.success
     assert int(fast_ran.read_text()) != os.getpid(), "fast did not run in a worker"
     assert _materialized_keys(repo, "fast") == []
-    assert _materialized_keys(repo, "slow") == ['PartitionKey("p1")']
+    assert _materialized_keys(repo, "slow") == ["p1"]
     [materialized] = _events(repo, mat["r"].run_id, "Materialization", "fast")
     [deletion] = _events(repo, deleted.run_id, "Deletion", "fast")
     assert materialized.timestamp < deletion.timestamp
@@ -229,7 +229,7 @@ def test_materialize_of_a_key_an_async_delete_cleared_is_not_undone():
 
     assert act["r"].success
     assert rematerialized.success
-    assert _materialized_keys(repo, "fast_table") == ['PartitionKey("p1")']
+    assert _materialized_keys(repo, "fast_table") == ["p1"]
     assert _materialized_keys(repo, "slow_table") == []
     [deletion] = _events(repo, act["r"].run_id, "Deletion", "fast_table")
     [materialized] = _events(

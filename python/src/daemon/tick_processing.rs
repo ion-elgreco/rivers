@@ -34,6 +34,24 @@ pub(crate) async fn process_tick_result(
     let auto_name = entry.name().to_string();
     let auto_type = entry.automation_type_str();
     let timestamp = now_ts();
+    let record = |status: &str, timestamp: i64, cursor: Option<String>| TickRecord {
+        code_location_id: handle.code_location_id().to_string(),
+        automation_name: auto_name.clone(),
+        automation_type: auto_type.into(),
+        status: status.into(),
+        timestamp,
+        run_ids: vec![],
+        backfill_ids: vec![],
+        skip_reason: None,
+        error: None,
+        cursor,
+    };
+    let send = |record: TickRecord| {
+        let _ = tick_tx.send(TickWriteMsg {
+            record,
+            max_ticks_retained,
+        });
+    };
 
     match result {
         Ok(
@@ -90,26 +108,17 @@ pub(crate) async fn process_tick_result(
             // A dropped request is a failed tick — silence here means a run
             // the automation intended simply never exists.
             let (status, error) = if dispatch_errors.is_empty() {
-                ("Success".to_string(), None)
+                ("Success", None)
             } else {
-                ("Failed".to_string(), Some(dispatch_errors.join("; ")))
+                ("Failed", Some(dispatch_errors.join("; ")))
             };
             let failed = error.is_some();
-            let _ = tick_tx.send(TickWriteMsg {
-                record: TickRecord {
-                    code_location_id: handle.code_location_id().to_string(),
-                    automation_name: auto_name.clone(),
-                    automation_type: auto_type.into(),
-                    status,
-                    // Stamp at emit time — dispatch above awaits, so a pre-dispatch capture drifts.
-                    timestamp: now_ts(),
-                    run_ids,
-                    backfill_ids,
-                    skip_reason: None,
-                    error,
-                    cursor: final_cursor,
-                },
-                max_ticks_retained,
+            send(TickRecord {
+                run_ids,
+                backfill_ids,
+                error,
+                // Stamp at emit time — dispatch above awaits, so a pre-dispatch capture drifts.
+                ..record(status, now_ts(), final_cursor)
             });
             entry.complete_eval(outcome);
             if !failed {
@@ -123,21 +132,9 @@ pub(crate) async fn process_tick_result(
             }
         }
         Ok(ref outcome @ EvalOutcome::Skipped { ref reason, .. }) => {
-            let final_cursor = outcome.cursor_or(prev_cursor);
-            let _ = tick_tx.send(TickWriteMsg {
-                record: TickRecord {
-                    code_location_id: handle.code_location_id().to_string(),
-                    automation_name: auto_name.clone(),
-                    automation_type: auto_type.into(),
-                    status: "Skipped".into(),
-                    timestamp,
-                    run_ids: vec![],
-                    backfill_ids: vec![],
-                    skip_reason: Some(reason.clone()),
-                    error: None,
-                    cursor: final_cursor,
-                },
-                max_ticks_retained,
+            send(TickRecord {
+                skip_reason: Some(reason.clone()),
+                ..record("Skipped", timestamp, outcome.cursor_or(prev_cursor))
             });
             entry.complete_eval(outcome);
             tracing::debug!(
@@ -148,21 +145,33 @@ pub(crate) async fn process_tick_result(
                 "tick skipped"
             );
         }
+        Ok(ref outcome @ EvalOutcome::Handled { ref error, .. }) => {
+            let status = if error.is_some() { "Failed" } else { "Success" };
+            send(TickRecord {
+                error: error.clone(),
+                ..record(status, timestamp, outcome.cursor_or(prev_cursor))
+            });
+            entry.complete_eval(outcome);
+            match error {
+                None => tracing::info!(
+                    target: "rivers::daemon",
+                    automation_type = auto_type,
+                    name = %auto_name,
+                    "run-status tick succeeded"
+                ),
+                Some(error) => tracing::error!(
+                    target: "rivers::daemon",
+                    automation_type = auto_type,
+                    name = %auto_name,
+                    error = %error,
+                    "run-status sensor function failed"
+                ),
+            }
+        }
         Err(e) => {
-            let _ = tick_tx.send(TickWriteMsg {
-                record: TickRecord {
-                    code_location_id: handle.code_location_id().to_string(),
-                    automation_name: auto_name.clone(),
-                    automation_type: auto_type.into(),
-                    status: "Failed".into(),
-                    timestamp,
-                    run_ids: vec![],
-                    backfill_ids: vec![],
-                    skip_reason: None,
-                    error: Some(e.clone()),
-                    cursor: prev_cursor,
-                },
-                max_ticks_retained,
+            send(TickRecord {
+                error: Some(e.clone()),
+                ..record("Failed", timestamp, prev_cursor)
             });
             entry.complete_eval_on_error();
             tracing::error!(

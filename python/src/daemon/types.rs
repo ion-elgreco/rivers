@@ -163,14 +163,20 @@ pub(crate) enum EvalOutcome {
         reason: String,
         cursor: Option<String>,
     },
+    /// A run-status sensor called its function for some runs; `error` joins
+    /// the failed calls. The cursor moves past every run.
+    Handled {
+        cursor: Option<String>,
+        error: Option<String>,
+    },
 }
 
 impl EvalOutcome {
     pub(crate) fn cursor_or(&self, fallback: Option<String>) -> Option<String> {
         match self {
-            EvalOutcome::RunRequests { cursor, .. } | EvalOutcome::Skipped { cursor, .. } => {
-                cursor.clone().or(fallback)
-            }
+            EvalOutcome::RunRequests { cursor, .. }
+            | EvalOutcome::Skipped { cursor, .. }
+            | EvalOutcome::Handled { cursor, .. } => cursor.clone().or(fallback),
         }
     }
 }
@@ -239,6 +245,8 @@ pub(crate) struct EvalParams {
     pub(crate) launched_by: rivers_core::storage::LaunchedBy,
     pub(crate) tags: Option<HashMap<String, String>>,
     pub(crate) precomputed: Option<Arc<PrecomputedArgs>>,
+    /// `Some` for a run-status sensor, which reads finished runs before calling Python.
+    pub(crate) run_status: Option<super::run_status::RunStatusSpec>,
 }
 
 pub(crate) struct TickResult {

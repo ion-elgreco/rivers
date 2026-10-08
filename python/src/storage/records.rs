@@ -1,12 +1,44 @@
 use pyo3::prelude::*;
 
 use rivers_core::storage::{
-    AssetRecord, LaunchedBy, RunRecord, StoredEvent, StoredLog, StoredTick,
+    AssetRecord, LaunchedBy, RunRecord, RunStatus, StoredEvent, StoredLog, StoredTick,
 };
 
 use crate::partitions::PyPartitionKey;
 
 use super::format_run_status;
+
+/// Lifecycle status of a run.
+#[pyclass(
+    name = "RunStatus",
+    frozen,
+    eq,
+    eq_int,
+    from_py_object,
+    module = "rivers._core"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PyRunStatus {
+    Queued,
+    NotStarted,
+    Started,
+    Success,
+    Failure,
+    Canceled,
+}
+
+impl From<PyRunStatus> for RunStatus {
+    fn from(s: PyRunStatus) -> Self {
+        match s {
+            PyRunStatus::Queued => RunStatus::Queued,
+            PyRunStatus::NotStarted => RunStatus::NotStarted,
+            PyRunStatus::Started => RunStatus::Started,
+            PyRunStatus::Success => RunStatus::Success,
+            PyRunStatus::Failure => RunStatus::Failure,
+            PyRunStatus::Canceled => RunStatus::Canceled,
+        }
+    }
+}
 
 #[pyclass(
     name = "StoredEvent",

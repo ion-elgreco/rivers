@@ -636,7 +636,7 @@ async fn test_v10_rewrites_run_config_into_the_launch_document() {
     let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
     assert_eq!(
         (stamps.version, stamps.min_reader, stamps.min_writer),
-        (10, 2, 10)
+        (SCHEMA_VERSION, 2, 10)
     );
     assert!(check_compatibility(stamps, Capability::Read, 9).is_ok());
     assert!(check_compatibility(stamps, Capability::ReadWrite, 9).is_err());

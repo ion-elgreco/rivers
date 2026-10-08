@@ -27,6 +27,7 @@ delta-datafusion = ["rivers[datafusion]", "rivers[delta]", "deltalake>=1.6.0"]
 delta-pandas = ["rivers[pandas]", "rivers[delta]"]
 delta-pyspark = ["rivers[pyspark]", "rivers[pyarrow]", "rivers[delta]", "delta-spark>=3.0.0"]
 otel = ["opentelemetry-api>=1.0"]
+slack = ["slack-sdk>=3.45.0"]
 
 [project.scripts]
 rivers = "rivers.cli:main"

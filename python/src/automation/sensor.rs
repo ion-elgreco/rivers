@@ -11,6 +11,7 @@ use crate::context::sensor::PySensorEvaluationContext;
 use crate::errors::{
     ConfigurationError, ExecutionError, ResultDefinitionError, SensorDefinitionError,
 };
+use crate::storage::PyRunStatus;
 
 /// Default status for a sensor.
 #[pyclass(
@@ -165,6 +166,10 @@ pub struct PySensorDefinition {
     pub(crate) eval_mode: PyEvalMode,
     /// Timeout for evaluation as a human-readable duration (e.g. `"5m"`); `None` means no limit.
     pub(crate) eval_timeout: Option<String>,
+    /// Run status a run-status sensor watches; `None` for a plain sensor.
+    pub(crate) monitored_status: Option<PyRunStatus>,
+    /// Jobs a run-status sensor watches; `None` watches every run of the code location.
+    pub(crate) monitored_jobs: Option<Vec<String>>,
 }
 
 #[pymethods]
@@ -222,7 +227,115 @@ impl PySensorDefinition {
             asset_selection,
             eval_mode,
             eval_timeout,
+            monitored_status: None,
+            monitored_jobs: None,
         })
+    }
+
+    /// A sensor that calls its function once for each run of this code
+    /// location that reaches `status`. Use as a decorator:
+    /// `@Sensor.run_status(RunStatus.Success)`.
+    #[classmethod]
+    #[pyo3(signature = (
+        status,
+        *,
+        name = None,
+        monitored_jobs = None,
+        minimum_interval = None,
+        default_status = PySensorStatus::default(),
+        description = None,
+        tags = None,
+        eval_mode = PyEvalMode::Auto,
+        eval_timeout = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_status(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        status: PyRunStatus,
+        name: Option<String>,
+        monitored_jobs: Option<Vec<String>>,
+        minimum_interval: Option<String>,
+        default_status: PySensorStatus,
+        description: Option<String>,
+        tags: Option<HashMap<String, String>>,
+        eval_mode: PyEvalMode,
+        eval_timeout: Option<String>,
+    ) -> PyResult<Self> {
+        if !matches!(
+            status,
+            PyRunStatus::Success | PyRunStatus::Failure | PyRunStatus::Canceled
+        ) {
+            return Err(SensorDefinitionError::new_err(format!(
+                "a run-status sensor watches Success, Failure or Canceled; got {status:?}"
+            )));
+        }
+        if monitored_jobs.as_ref().is_some_and(Vec::is_empty) {
+            return Err(SensorDefinitionError::new_err(
+                "monitored_jobs is empty; pass None to watch every run",
+            ));
+        }
+        let mut sensor = Self::new(
+            cls.py(),
+            None,
+            name,
+            None,
+            minimum_interval,
+            default_status,
+            description,
+            tags,
+            None,
+            eval_mode,
+            eval_timeout,
+        )?;
+        sensor.monitored_status = Some(status);
+        sensor.monitored_jobs = monitored_jobs;
+        Ok(sensor)
+    }
+
+    /// `Sensor.run_status(RunStatus.Failure, ...)`; also usable as a bare
+    /// decorator: `@Sensor.run_failure`.
+    #[classmethod]
+    #[pyo3(signature = (
+        func = None,
+        *,
+        name = None,
+        monitored_jobs = None,
+        minimum_interval = None,
+        default_status = PySensorStatus::default(),
+        description = None,
+        tags = None,
+        eval_mode = PyEvalMode::Auto,
+        eval_timeout = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_failure(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        func: Option<Py<PyAny>>,
+        name: Option<String>,
+        monitored_jobs: Option<Vec<String>>,
+        minimum_interval: Option<String>,
+        default_status: PySensorStatus,
+        description: Option<String>,
+        tags: Option<HashMap<String, String>>,
+        eval_mode: PyEvalMode,
+        eval_timeout: Option<String>,
+    ) -> PyResult<Self> {
+        let sensor = Self::run_status(
+            cls,
+            PyRunStatus::Failure,
+            name,
+            monitored_jobs,
+            minimum_interval,
+            default_status,
+            description,
+            tags,
+            eval_mode,
+            eval_timeout,
+        )?;
+        match func {
+            Some(f) => sensor.__call__(cls.py(), f),
+            None => Ok(sensor),
+        }
     }
 
     /// When used as `@Sensor(job_name=...)` (without func),
@@ -244,11 +357,19 @@ impl PySensorDefinition {
             asset_selection: self.asset_selection.clone(),
             eval_mode: self.eval_mode.clone(),
             eval_timeout: self.eval_timeout.clone(),
+            monitored_status: self.monitored_status,
+            monitored_jobs: self.monitored_jobs.clone(),
         })
     }
 
     fn __repr__(&self) -> String {
-        format!("Sensor(name='{}', job_name={:?})", self.name, self.job_name)
+        match self.monitored_status {
+            Some(status) => format!(
+                "Sensor(name='{}', monitored_status={:?})",
+                self.name, status
+            ),
+            None => format!("Sensor(name='{}', job_name={:?})", self.name, self.job_name),
+        }
     }
 }
 
@@ -292,6 +413,12 @@ pub(crate) fn evaluate_sensor(
     last_tick_time: Option<f64>,
     resources: &HashMap<String, ResourceVariant>,
 ) -> PyResult<PySensorTickResult> {
+    if sensor_def.monitored_status.is_some() {
+        return Err(SensorDefinitionError::new_err(format!(
+            "Run-status sensor '{}' is evaluated by the daemon only",
+            sensor_def.name
+        )));
+    }
     let eval_fn = sensor_def
         .evaluation_fn
         .as_ref()
@@ -478,6 +605,8 @@ pub(crate) fn parse_sensor_result(
 pub fn register_sensor_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule!(parent_module, "sensor", [
         PySensorEvaluationContext as "SensorEvaluationContext",
+        crate::context::run_status::PyRunStatusSensorContext as "RunStatusSensorContext",
+        crate::context::run_status::PyStepFailure as "StepFailure",
         PySensorStatus as "SensorStatus",
         PySensorResult as "SensorResult",
         PySensorDefinition as "Sensor",

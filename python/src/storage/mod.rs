@@ -1289,6 +1289,7 @@ pub fn register_storage_module(parent_module: &Bound<'_, PyModule>) -> PyResult<
         PyUserRef,
         PyLaunchedBy,
         PyRunRecord,
+        PyRunStatus,
         PyPoolLimit,
         PyPoolInfo,
         PyPoolBlockDetail,

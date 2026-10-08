@@ -597,6 +597,19 @@ pub(super) fn validate_sensor_run_targets(
 ) -> PyResult<()> {
     for (name, sensor) in sensors {
         let s = sensor.borrow(py);
+        // A run-status sensor launches nothing; only its watched jobs must exist.
+        if s.monitored_status.is_some() {
+            for job_name in s.monitored_jobs.iter().flatten() {
+                if !job_names.contains(job_name.as_str()) {
+                    return Err(crate::errors::SensorDefinitionError::new_err(format!(
+                        "Sensor '{}' monitors unknown job '{}'. Define the job and \
+                         add it to `CodeRepository(jobs=...)`.",
+                        name, job_name
+                    )));
+                }
+            }
+            continue;
+        }
         let has_job = s.job_name.as_ref().is_some_and(|j| !j.is_empty());
         let has_selection = s.asset_selection.as_ref().is_some_and(|a| !a.is_empty());
         if !has_job && !has_selection {

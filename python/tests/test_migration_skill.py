@@ -164,6 +164,30 @@ def test_sensor_context_has_no_update_cursor():
     assert not hasattr(rs.SensorEvaluationContext, "update_cursor")
 
 
+def test_run_status_sensors_port_from_dagster():
+    """The skill maps `@dg.run_status_sensor` / `@dg.run_failure_sensor` here."""
+
+    @rs.Sensor.run_failure
+    def on_fail(context: rs.RunStatusSensorContext) -> None:
+        pass
+
+    assert on_fail.monitored_status == rs.RunStatus.Failure
+    assert (
+        rs.Sensor.run_status(rs.RunStatus.Success).monitored_status
+        == rs.RunStatus.Success
+    )
+
+
+def test_dagster_slack_maps_to_slack_resource_methods():
+    pytest.importorskip("slack_sdk")
+    from rivers.integrations.slack import SlackResource
+
+    slack = SlackResource(token="xoxb-test")
+    assert isinstance(slack.failure_hook("#c"), rs.Hook)
+    assert isinstance(slack.success_hook("#c"), rs.Hook)
+    assert slack.run_failure_sensor("#c").monitored_status == rs.RunStatus.Failure
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

@@ -681,3 +681,112 @@ def test_sensor_context_pickle_roundtrip():
     assert restored.sensor_name == "my_sensor"
     assert restored.cursor == "c1"
     assert restored.last_tick_time == 1234567890.0
+
+
+# ---------------------------------------------------------------------------
+# Run-status sensor definitions
+# ---------------------------------------------------------------------------
+
+
+class _Notifier(rs.Resource):
+    channel: str = "#alerts"
+
+
+class TestRunStatusSensorDefinition:
+    def test_run_failure_bare_decorator(self):
+        @rs.Sensor.run_failure
+        def on_fail(context: rs.RunStatusSensorContext) -> None:
+            pass
+
+        assert on_fail.name == "on_fail"
+        assert on_fail.monitored_status == rs.RunStatus.Failure
+        assert on_fail.monitored_jobs is None
+        assert on_fail.job_name is None
+        assert on_fail.asset_selection is None
+        assert on_fail.default_status == rs.SensorStatus.Stopped
+        assert repr(on_fail) == "Sensor(name='on_fail', monitored_status=Failure)"
+
+    def test_run_failure_with_arguments(self):
+        @rs.Sensor.run_failure(
+            name="alerts",
+            monitored_jobs=["nightly"],
+            minimum_interval="10s",
+            default_status=rs.SensorStatus.Running,
+            eval_mode=rs.EvalMode.Subprocess,
+        )
+        def on_fail(context: rs.RunStatusSensorContext) -> None:
+            pass
+
+        assert on_fail.name == "alerts"
+        assert on_fail.monitored_status == rs.RunStatus.Failure
+        assert on_fail.monitored_jobs == ["nightly"]
+        assert on_fail.minimum_interval == "10s"
+        assert on_fail.default_status == rs.SensorStatus.Running
+        assert on_fail.eval_mode == rs.EvalMode.Subprocess
+        assert on_fail.evaluation_fn is not None
+
+    @pytest.mark.parametrize(
+        "status", [rs.RunStatus.Success, rs.RunStatus.Failure, rs.RunStatus.Canceled]
+    )
+    def test_run_status_accepts_finished_statuses(self, status):
+        @rs.Sensor.run_status(status)
+        def watch(context: rs.RunStatusSensorContext) -> None:
+            pass
+
+        assert watch.name == "watch"
+        assert watch.monitored_status == status
+
+    @pytest.mark.parametrize(
+        "status", [rs.RunStatus.Queued, rs.RunStatus.NotStarted, rs.RunStatus.Started]
+    )
+    def test_run_status_rejects_unfinished_statuses(self, status):
+        with pytest.raises(SensorDefinitionError, match="Success, Failure or Canceled"):
+            rs.Sensor.run_status(status)
+
+    def test_rejects_empty_monitored_jobs(self):
+        with pytest.raises(SensorDefinitionError, match="monitored_jobs is empty"):
+            rs.Sensor.run_failure(monitored_jobs=[])
+
+    def test_resolves_without_job_or_selection(self):
+        @rs.Asset
+        def a() -> int:
+            return 1
+
+        @rs.Sensor.run_failure
+        def on_fail(context: rs.RunStatusSensorContext, notifier: _Notifier) -> None:
+            pass
+
+        repo = rs.CodeRepository(
+            assets=[a], sensors=[on_fail], resources={"notifier": _Notifier()}
+        )
+        repo.resolve()
+        assert repo.get_sensor("on_fail").monitored_status == rs.RunStatus.Failure
+
+    def test_rejects_unknown_monitored_job(self):
+        @rs.Asset
+        def a() -> int:
+            return 1
+
+        @rs.Sensor.run_failure(monitored_jobs=["missing_job"])
+        def on_fail(context: rs.RunStatusSensorContext) -> None:
+            pass
+
+        repo = rs.CodeRepository(assets=[a], sensors=[on_fail])
+        with pytest.raises(
+            SensorDefinitionError,
+            match=r"Sensor 'on_fail' monitors unknown job 'missing_job'",
+        ):
+            repo.resolve()
+
+    def test_evaluate_sensor_is_daemon_only(self):
+        @rs.Asset
+        def a() -> int:
+            return 1
+
+        @rs.Sensor.run_failure
+        def on_fail(context: rs.RunStatusSensorContext) -> None:
+            pass
+
+        repo = rs.CodeRepository(assets=[a], sensors=[on_fail])
+        with pytest.raises(SensorDefinitionError, match="evaluated by the daemon only"):
+            repo.evaluate_sensor("on_fail")
