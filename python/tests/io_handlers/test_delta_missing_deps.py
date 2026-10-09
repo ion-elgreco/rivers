@@ -162,6 +162,37 @@ def test_missing_pyarrow_recordbatchreader_error(tmp_path):
             handler.load_input(ctx)
 
 
+def test_missing_duckdb_input_error(tmp_path):
+    """Loading as a DuckDB relation without the handler suggests rivers[duckdb]."""
+    duckdb = pytest.importorskip("duckdb")
+
+    handler = _handler_without_extras(tmp_path)
+    ctx = rs.InputContext(
+        asset_name="tbl", downstream_asset="x", type_hint=duckdb.DuckDBPyRelation
+    )
+
+    with patch.object(
+        type(handler), "type_handlers", staticmethod(lambda *args, **kwargs: {})
+    ):
+        with pytest.raises(TypeError, match=r"pip install rivers\[duckdb\]"):
+            handler.load_input(ctx)
+
+
+def test_duckdb_handler_skipped_without_duckdb(monkeypatch):
+    """Without duckdb the Delta handler still loads, minus the relation type."""
+    duckdb = pytest.importorskip("duckdb")
+    for name in list(sys.modules):
+        if name.startswith(
+            ("rivers.integrations.duckdb", "rivers.io_handlers.delta.duckdb")
+        ):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "duckdb", None)
+
+    handlers = rs.DeltaIOHandler.type_handlers()
+    assert duckdb.DuckDBPyRelation not in handlers
+    assert handlers
+
+
 def test_unknown_type_generic_error(tmp_path):
     """Unknown types get a generic error listing supported types."""
     handler = _handler_without_extras(tmp_path)

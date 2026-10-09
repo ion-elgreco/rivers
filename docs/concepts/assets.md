@@ -269,6 +269,7 @@ def events():
 |--------|---------|----------|
 | `rivers/` | rivers engine | `rivers/executor` — override the executor for this asset (`"in_process"` or `"parallel"`); `rivers/node/executor` — override for a graph asset's internal task; `rivers/schema` — Arrow schema attached as `MetadataValue.Schema` |
 | `delta/` | `DeltaIOHandler` | `delta/mode`, `delta/schema_mode`, `delta/partition_expr`, `delta/root_name`, `delta/columns`, `delta/version`, `delta/merge_predicate`, `delta/writer_properties`, `delta/commit_properties`, `delta/table_configuration` |
+| `duckdb/`, `ducklake/` | `DuckDBIOHandler` | `duckdb/schema`, `duckdb/table`, `duckdb/mode`, `duckdb/partition_expr`, `duckdb/columns`, `duckdb/version`, `ducklake/options` |
 
 Custom IO handlers can define their own prefixed keys following the same convention.
 
