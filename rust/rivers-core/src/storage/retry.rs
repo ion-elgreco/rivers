@@ -104,9 +104,7 @@ pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
     use surrealdb::types::{ErrorDetails, NotFoundError, QueryError};
     match e.details() {
         ErrorDetails::Query(Some(
-            QueryError::TimedOut { .. }
-            | QueryError::NotExecuted
-            | QueryError::TransactionConflict,
+            QueryError::TimedOut { .. } | QueryError::NotExecuted | QueryError::TransactionConflict,
         )) => true,
         ErrorDetails::NotFound(Some(NotFoundError::Session { .. })) => true,
         ErrorDetails::Internal => {

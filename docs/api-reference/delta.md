@@ -25,7 +25,7 @@ io = DeltaIOHandler(
 | `commit_properties` | `CommitProperties \| None` | `None` | Delta commit settings. |
 | `table_config` | `dict[str, str] \| None` | `None` | Delta table properties. |
 | `merge_config` | `MergeConfig \| None` | `None` | Merge configuration (required when `mode="merge"`). |
-| `handler_config` | `dict[str, Any] \| None` | `None` | Useful to pass handler-related custom config (e.g. a pre-initialized `SparkSession` object) |
+| `handler_config` | `dict[str, Any] \| None` | `None` | Useful to pass handler-related custom config (e.g. a pre-initialized `SparkSession` object, or a `DuckDBResource` as `{"duckdb": ...}`) |
 
 **Asset metadata overrides:**
 
@@ -237,6 +237,7 @@ class MyTypeHandler(ArrowDeltaTypeHandler[MyType]):
 | `PolarsTypeHandler` | `rivers.io_handlers.delta.polars` | `polars.DataFrame`, `polars.LazyFrame` |
 | `PandasTypeHandler` | `rivers.io_handlers.delta.pandas` | `pandas.DataFrame` |
 | `DataFusionTypeHandler` | `rivers.io_handlers.delta.datafusion` | `datafusion.DataFrame` |
+| `DuckDBTypeHandler` | `rivers.io_handlers.delta.duckdb` | `duckdb.DuckDBPyRelation` |
 
 ## `PySparkDeltaTypeHandler`
 

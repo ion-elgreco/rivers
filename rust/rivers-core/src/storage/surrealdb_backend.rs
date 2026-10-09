@@ -366,7 +366,10 @@ impl SurrealStorage {
         use std::sync::Arc;
         use surrealdb::Notification;
         use surrealdb::types::{Action, Uuid, Value};
-        let mut response = self.db.query(format!("LIVE SELECT id FROM {table}")).await?;
+        let mut response = self
+            .db
+            .query(format!("LIVE SELECT id FROM {table}"))
+            .await?;
         let id = response
             .take::<Option<Uuid>>(0)?
             .context("LIVE SELECT returned no query id")?;
@@ -427,9 +430,7 @@ impl LiveTable {
         if let Err(e) = killed {
             tracing::debug!(target: "rivers::storage", id = %self.id, error = %e, "live query kill failed");
         }
-        let drained = async {
-            while self.changes.next().await.is_some() {}
-        };
+        let drained = async { while self.changes.next().await.is_some() {} };
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drained).await;
     }
 }
