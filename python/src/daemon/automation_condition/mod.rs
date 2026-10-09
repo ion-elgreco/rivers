@@ -61,10 +61,7 @@ fn partition_info_from_node(
 }
 
 /// Watermark the per-tick refresh resumes from.
-fn seeded_watermark(
-    def: &PartitionsDefinition,
-    now: civil::DateTime,
-) -> civil::DateTime {
+fn seeded_watermark(def: &PartitionsDefinition, now: civil::DateTime) -> civil::DateTime {
     match def {
         PartitionsDefinition::TimeWindow { end: Some(e), .. } => (*e).min(now),
         _ => now,
@@ -72,10 +69,7 @@ fn seeded_watermark(
 }
 
 /// How `def`'s key universe evolves after extraction.
-fn partition_universe_for(
-    def: &PartitionsDefinition,
-    now: civil::DateTime,
-) -> PartitionUniverse {
+fn partition_universe_for(def: &PartitionsDefinition, now: civil::DateTime) -> PartitionUniverse {
     match def {
         PartitionsDefinition::Static { .. } => PartitionUniverse::Frozen,
         PartitionsDefinition::TimeWindow { .. } => match def.time_grid() {
