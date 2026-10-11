@@ -84,6 +84,7 @@ def drop_last_handles(holder):
     print(json.dumps({"dropped": dropped, "longest_pause": pauses[0]}))
 
 
+@pytest.mark.serial
 @pytest.mark.parametrize("holder", HOLDERS)
 def test_dropping_the_last_storage_handle_does_not_pause_other_threads(
     tmp_path, holder
