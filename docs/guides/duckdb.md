@@ -42,11 +42,10 @@ Fields that you do not give are read from `DUCKDB_*` environment variables, for 
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `database` | `":memory:"` | A file path, `":memory:"`, or `"md:<database>"` for MotherDuck. |
+| `database` | `":memory:"` | A file path, `":memory:"`, `"md:<database>"` for MotherDuck, or a [`DuckLake`](#ducklake) catalog. |
 | `connection_config` | `{}` | [DuckDB settings](https://duckdb.org/docs/current/configuration/overview) for `duckdb.connect(config=...)`, e.g. `{"threads": 4}`. |
 | `extensions` | `[]` | Extensions to install and load on each connection. |
 | `secrets` | `{}` | [Secrets](https://duckdb.org/docs/current/configuration/secrets_manager) to create on each connection: name to `CREATE SECRET` parameters. |
-| `ducklake` | `None` | A [DuckLake catalog](#ducklake) to attach. |
 
 ### MotherDuck
 
@@ -156,13 +155,13 @@ A DuckDB file allows one read-write process. With the parallel executor or Kuber
 
 ## DuckLake
 
-Give the resource a `DuckLake` catalog. The IO handler then writes DuckLake tables:
+Pass a `DuckLake` catalog as the resource's `database`. The IO handler then writes DuckLake tables:
 
 ```python
 from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource, DuckLake
 
 lake = DuckDBResource(
-    ducklake=DuckLake(
+    database=DuckLake(
         metadata="postgres:dbname=lake host=pg",
         data_path="s3://bucket/lake/",
         options={"expire_older_than": "7 days", "delete_older_than": "7 days"},

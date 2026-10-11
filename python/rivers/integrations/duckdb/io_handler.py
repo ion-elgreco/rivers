@@ -35,7 +35,7 @@ class DuckDBWriteMode(StrEnum):
 class DuckDBIOHandler(BaseIOHandler):
     """Stores each asset as a table: ``<schema>.<asset name>``.
 
-    With a ``DuckDBResource(ducklake=...)``, tables are DuckLake tables:
+    With ``DuckDBResource(database=DuckLake(...))``, tables are DuckLake tables:
     partitioned assets get partitioned tables, each write registers the
     snapshot id as the data version, and ``duckdb/version`` reads an older
     snapshot.
@@ -113,7 +113,7 @@ class DuckDBIOHandler(BaseIOHandler):
 
         table_options = json.loads(meta.get("ducklake/options", "{}"))
         if table_options and ducklake is None:
-            raise ValueError("ducklake/options needs a DuckDBResource with ducklake")
+            raise ValueError("ducklake/options needs a DuckLake database")
 
         predicate = None
         partition_by: list[str] = []
@@ -173,7 +173,7 @@ class DuckDBIOHandler(BaseIOHandler):
         if (version := meta.get("duckdb/version")) is not None:
             if self.resource.ducklake is None:
                 raise ValueError(
-                    "duckdb/version needs a DuckDBResource with ducklake; "
+                    "duckdb/version needs a DuckLake database; "
                     "a DuckDB database keeps no old versions"
                 )
             source += f" AT (VERSION => {int(version)})"

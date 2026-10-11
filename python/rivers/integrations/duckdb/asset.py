@@ -109,8 +109,7 @@ class DuckLakeAsset(DuckDBAsset):
         handler = cls._handler(ctx)
         if handler.resource.ducklake is None:
             raise TypeError(
-                f"'{ctx.asset_name}': DuckLakeAsset actions need a DuckDBResource "
-                "with ducklake"
+                f"'{ctx.asset_name}': DuckLakeAsset actions need a DuckLake database"
             )
         return handler, handler.resource.ducklake.name
 

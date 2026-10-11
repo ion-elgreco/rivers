@@ -29,7 +29,7 @@ _BY_REGION = {"duckdb/partition_expr": "region"}
 
 def _resource(tmp_path, **kwargs) -> DuckDBResource:
     return DuckDBResource(
-        ducklake=DuckLake(
+        database=DuckLake(
             metadata=str(tmp_path / "meta.ducklake"),
             data_path=str(tmp_path / "data") + "/",
             attach_options={"DATA_INLINING_ROW_LIMIT": 0},

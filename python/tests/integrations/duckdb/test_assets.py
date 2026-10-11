@@ -28,7 +28,7 @@ def _file_handler(tmp_path) -> DuckDBIOHandler:
 def lake_handler(tmp_path):
     handler = DuckDBIOHandler(
         resource=DuckDBResource(
-            ducklake=DuckLake(
+            database=DuckLake(
                 metadata=str(tmp_path / "meta.ducklake"),
                 data_path=str(tmp_path / "data") + "/",
                 attach_options={"DATA_INLINING_ROW_LIMIT": 0},
@@ -223,7 +223,7 @@ def test_optimize_merges_small_files(storage, lake_handler):
 def _overwritten_three_times(tmp_path, storage, options: dict):
     handler = DuckDBIOHandler(
         resource=DuckDBResource(
-            ducklake=DuckLake(
+            database=DuckLake(
                 metadata=str(tmp_path / "meta.ducklake"),
                 data_path=str(tmp_path / "data") + "/",
                 attach_options={"DATA_INLINING_ROW_LIMIT": 0},
@@ -285,7 +285,7 @@ def test_ducklake_verbs_need_a_ducklake_resource(tmp_path, verb):
     ctx = rs.ActionContext(
         asset_name="users", action=verb, io_handler=_file_handler(tmp_path)
     )
-    with pytest.raises(TypeError, match="need a DuckDBResource with ducklake"):
+    with pytest.raises(TypeError, match="need a DuckLake database"):
         getattr(DuckLakeAsset, verb)(ctx)
 
 

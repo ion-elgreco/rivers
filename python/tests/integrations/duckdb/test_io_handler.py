@@ -117,9 +117,7 @@ def test_read_errors(tmp_path):
         _load(handler, "t", dict)
     with pytest.raises(duckdb.CatalogException, match="no DuckDB table main.missing"):
         _load(handler, "missing", pa.Table)
-    with pytest.raises(
-        ValueError, match="duckdb/version needs a DuckDBResource with ducklake"
-    ):
+    with pytest.raises(ValueError, match="duckdb/version needs a DuckLake database"):
         _load(handler, "t", pa.Table, asset_metadata={"duckdb/version": "1"})
 
 

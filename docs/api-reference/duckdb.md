@@ -153,7 +153,7 @@ class Events(DuckLakeAsset):
 
 The verbs take no config: set table options with the `ducklake/options` metadata key,
 and lake-wide options with `DuckLake(options=...)`. A verb requires the handler's
-resource to have `ducklake` — otherwise it fails the step with a `TypeError`. On a
+resource to have a `DuckLake` database — otherwise it fails the step with a `TypeError`. On a
 table that does not exist yet, `optimize` reports `ActionResult.unchanged()`.
 
 ---
@@ -173,11 +173,10 @@ warehouse = DuckDBResource(database="warehouse.duckdb", extensions=["spatial"])
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `database` | `str` | `":memory:"` | A file path, `":memory:"`, or `"md:<database>"` for MotherDuck. |
+| `database` | `str \| DuckLake` | `":memory:"` | A file path, `":memory:"`, `"md:<database>"` for MotherDuck, or a `DuckLake` catalog. In `DUCKDB_DATABASE`, a `DuckLake` is a JSON object. |
 | `connection_config` | `dict[str, str \| bool \| int \| float \| list[str]]` | `{}` | DuckDB settings passed to `duckdb.connect(config=...)`. |
 | `extensions` | `list[str]` | `[]` | Extensions to install and load on each connection. |
 | `secrets` | `dict[str, dict[str, str \| int \| bool]]` | `{}` | Secret name to `CREATE SECRET` parameters, created on each connection. |
-| `ducklake` | `DuckLake \| None` | `None` | A DuckLake catalog to attach. Needs `database=":memory:"`. |
 
 Opening a file that another process holds is retried 10 times, with a delay of 0.1 s
 that doubles each time. After the last try the `duckdb.IOException` is raised; for a
@@ -198,7 +197,7 @@ with warehouse.get_connection() as con:
 #### `connect()`
 
 Returns a new connection. The caller closes it, or a relation keeps it open. With
-`ducklake`, it is a cursor whose default database is the catalog.
+a `DuckLake` database, it is a cursor whose default database is the catalog.
 
 #### `shared_connection()`
 
@@ -229,7 +228,7 @@ A DuckLake catalog, attached once per process to every connection of a
 from rivers.integrations.duckdb import DuckDBResource, DuckLake
 
 lake = DuckDBResource(
-    ducklake=DuckLake(
+    database=DuckLake(
         metadata="postgres:dbname=lake host=pg",
         data_path="s3://bucket/lake/",
         options={"expire_older_than": "7 days"},

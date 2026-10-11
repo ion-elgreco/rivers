@@ -1,6 +1,7 @@
 """DuckDBResource: connections, extensions, secrets, lock retry, and DuckLake."""
 
 import importlib
+import json
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ from rivers.integrations.duckdb.resource import set_lake_options  # noqa: E402
 
 def _lake(tmp_path, **kwargs) -> DuckDBResource:
     return DuckDBResource(
-        ducklake=DuckLake(
+        database=DuckLake(
             metadata=str(tmp_path / "meta.ducklake"),
             data_path=str(tmp_path / "data") + "/",
             **kwargs,
@@ -99,12 +100,13 @@ def test_fields_from_env(monkeypatch, tmp_path):
         assert con.sql("SELECT current_database()").fetchone() == ("env",)
 
 
-def test_ducklake_needs_memory_database(tmp_path):
-    with pytest.raises(ValueError, match="ducklake needs database=':memory:'"):
-        DuckDBResource(
-            database=str(tmp_path / "w.duckdb"),
-            ducklake=DuckLake(metadata=str(tmp_path / "meta.ducklake")),
-        )
+def test_database_from_env_can_be_a_ducklake(monkeypatch, tmp_path):
+    metadata = str(tmp_path / "meta.ducklake")
+    monkeypatch.setenv("DUCKDB_DATABASE", json.dumps({"metadata": metadata}))
+    db = DuckDBResource()
+    assert db.database == DuckLake(metadata=metadata)
+    assert db.ducklake == DuckLake(metadata=metadata)
+    assert DuckDBResource(database="w.duckdb").ducklake is None
 
 
 def test_connect_waits_for_another_process(tmp_path):

@@ -10,7 +10,7 @@ from time import sleep
 from typing import TypeVar
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict
 from pydantic_settings import SettingsConfigDict
 
 from rivers.integrations.duckdb._sql import quote_ident, render_attach, render_secret
@@ -41,7 +41,7 @@ _ONE_PROCESS_HINT = (
 
 
 class DuckLake(BaseModel):
-    """A DuckLake catalog attached to every connection of a :class:`DuckDBResource`.
+    """A DuckLake catalog, used as ``DuckDBResource(database=DuckLake(...))``.
 
     Args:
         metadata: The catalog database: a DuckDB file (``"meta.ducklake"``, one
@@ -65,11 +65,11 @@ class DuckLake(BaseModel):
 
 
 class DuckDBResource(Resource):
-    """Opens DuckDB connections, with extensions, secrets, and an optional DuckLake catalog.
+    """Opens DuckDB connections to a database or a DuckLake catalog, with extensions and secrets.
 
     A database file or ``md:`` database gets a new connection per call; DuckDB
     shares one instance per file in a process and releases the file when the
-    last connection closes. With ``ducklake``, the catalog is attached once per
+    last connection closes. A :class:`DuckLake` catalog is attached once per
     process to an in-memory database, and each call gets a cursor on it. That
     root connection stays open until :meth:`teardown` and until the last
     cursor made from it is gone. Resources with equal fields share it.
@@ -80,14 +80,14 @@ class DuckDBResource(Resource):
     Fields are read from ``DUCKDB_*`` environment variables when not given.
 
     Args:
-        database: A file path, ``":memory:"``, or ``"md:<database>"`` for MotherDuck.
+        database: A file path, ``":memory:"``, ``"md:<database>"`` for MotherDuck,
+            or a :class:`DuckLake` catalog.
         connection_config: DuckDB settings passed to ``duckdb.connect(config=...)``,
             e.g. ``{"threads": 4, "ducklake_max_retry_count": 20}``.
         extensions: Extensions to install and load on each connection.
         secrets: Secrets to create on each connection: name to
             ``CREATE SECRET`` parameters, e.g.
             ``{"s3": {"type": "s3", "provider": "credential_chain"}}``.
-        ducklake: A DuckLake catalog to attach. Needs ``database=":memory:"``.
 
     Example::
 
@@ -101,20 +101,15 @@ class DuckDBResource(Resource):
 
     model_config = SettingsConfigDict(env_prefix="DUCKDB_")
 
-    database: str = ":memory:"
+    database: str | DuckLake = ":memory:"
     connection_config: dict[str, str | bool | int | float | list[str]] = {}
     extensions: list[str] = []
     secrets: dict[str, dict[str, str | int | bool]] = {}
-    ducklake: DuckLake | None = None
 
-    @model_validator(mode="after")
-    def _ducklake_in_memory(self) -> DuckDBResource:
-        if self.ducklake is not None and self.database != ":memory:":
-            raise ValueError(
-                "ducklake needs database=':memory:': the catalog is attached "
-                "to an in-memory database"
-            )
-        return self
+    @property
+    def ducklake(self) -> DuckLake | None:
+        """The DuckLake catalog, or ``None`` for a DuckDB database."""
+        return self.database if isinstance(self.database, DuckLake) else None
 
     @contextmanager
     def get_connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -129,18 +124,19 @@ class DuckDBResource(Resource):
     def connect(self) -> duckdb.DuckDBPyConnection:
         """A new connection. The caller closes it, or lets a relation keep it.
 
-        With ``ducklake``, the connection is a cursor with the catalog as the
-        default database.
+        With a :class:`DuckLake`, the connection is a cursor with the catalog as
+        the default database.
         """
-        if self.ducklake is None:
-            con = _retry_on_lock(
-                lambda: duckdb.connect(self.database, config=self.connection_config)
-            )
-            self._prepare(con)
+        if isinstance(self.database, DuckLake):
+            con = self._ducklake_root(self.database).cursor()
+            con.execute(f"USE {quote_ident(self.database.name)}")
             return con
 
-        con = self._ducklake_root(self.ducklake).cursor()
-        con.execute(f"USE {quote_ident(self.ducklake.name)}")
+        database = self.database
+        con = _retry_on_lock(
+            lambda: duckdb.connect(database, config=self.connection_config)
+        )
+        self._prepare(con)
         return con
 
     def shared_connection(self) -> duckdb.DuckDBPyConnection:
