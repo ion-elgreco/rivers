@@ -90,6 +90,10 @@ io = DeltaIOHandler(table_uri="/data/delta")
 
 See the [Delta Lake guide](../guides/delta-lake.md) for full details.
 
+### DuckDBIOHandler
+
+Stores each asset as a table in a DuckDB database or a DuckLake catalog. Requires `pip install rivers[duckdb]`. See the [DuckDB guide](../guides/duckdb.md).
+
 ## Writing a custom handler
 
 Subclass `BaseIOHandler` (which extends `pydantic_settings.BaseSettings`). Configuration fields can be resolved from environment variables, `.env` files, or explicit kwargs:

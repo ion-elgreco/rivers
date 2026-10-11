@@ -27,7 +27,7 @@ If your code imports an extension module that does not support free-threading, P
 
 These extras work on 3.14t: `pyarrow`, `pandas`, `datafusion`, and `otel`.
 
-The `delta`, `delta-*`, and `polars` extras do not install yet: `deltalake` and `polars` have no free-threaded wheels.
+The `delta`, `delta-*`, `polars`, and `duckdb` extras do not install yet: `deltalake`, `polars`, and `duckdb` have no free-threaded wheels.
 
 On 3.15t, only `otel` installs for now: `pyarrow` and `datafusion` have no 3.15t wheels yet.
 

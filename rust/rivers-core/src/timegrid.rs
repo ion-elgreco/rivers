@@ -81,11 +81,7 @@ impl TimeGrid {
     }
 
     /// Enumerate the grid keys in `[from, to]` (inclusive).
-    pub fn keys_in_range(
-        &self,
-        from: civil::DateTime,
-        to: civil::DateTime,
-    ) -> Result<Vec<String>> {
+    pub fn keys_in_range(&self, from: civil::DateTime, to: civil::DateTime) -> Result<Vec<String>> {
         let mut out = Vec::new();
         if to < from {
             return Ok(out);

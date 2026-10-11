@@ -28,6 +28,8 @@ delta-pandas = ["rivers[pandas]", "rivers[delta]"]
 delta-pyspark = ["rivers[pyspark]", "rivers[pyarrow]", "rivers[delta]", "delta-spark>=3.0.0"]
 otel = ["opentelemetry-api>=1.0"]
 slack = ["slack-sdk>=3.10.0"]
+duckdb = ["duckdb>=1.5.2"]
+delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
 
 [project.scripts]
 rivers = "rivers.cli:main"

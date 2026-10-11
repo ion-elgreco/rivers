@@ -875,7 +875,9 @@ pub fn line_indent(text: &str, offset: usize) -> &str {
 
 /// The textarea's offset (UTF-16 code units) of a byte offset.
 pub fn byte_to_utf16(text: &str, byte: usize) -> u32 {
-    text[..text.floor_char_boundary(byte)].encode_utf16().count() as u32
+    text[..text.floor_char_boundary(byte)]
+        .encode_utf16()
+        .count() as u32
 }
 
 /// The byte offset of a textarea offset (UTF-16 code units).

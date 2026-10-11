@@ -41,7 +41,10 @@ pub(crate) fn validate_run_config(
     let value: Value =
         serde_json::from_str(json).map_err(|e| anyhow!("config is not valid JSON: {e}"))?;
     let Value::Object(mut root) = value else {
-        bail!("config must be a JSON object of sections ({})", SECTIONS.join(", "));
+        bail!(
+            "config must be a JSON object of sections ({})",
+            SECTIONS.join(", ")
+        );
     };
     for key in root.keys() {
         if !SECTIONS.contains(&key.as_str()) {

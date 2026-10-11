@@ -5,19 +5,35 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from pydantic import BaseModel
+
 from rivers._core.partitions import PartitionContext, PartitionKey, PartitionsDefinition
-from rivers.io_handlers.delta.config import PartitionExpr
-
-DELTA_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def _resolve_partition_expr(meta: dict[str, Any]) -> PartitionExpr | None:
-    """Decode a ``delta/partition_expr`` asset metadata entry into a :class:`PartitionExpr`.
+class PartitionExpr(BaseModel):
+    """Maps partition dimensions to table column names.
+
+    For single-partition assets, ``expr`` is a column name string.
+    For multi-partition assets, ``expr`` is a dict mapping dimension names to column names.
+    """
+
+    expr: str | dict[str, str]
+
+    @property
+    def partition_columns(self) -> list[str]:
+        """Flatten ``expr`` into the list of physical column names used to partition the table."""
+        if isinstance(self.expr, str):
+            return [self.expr]
+        return list(self.expr.values())
+
+
+def _resolve_partition_expr(meta: dict[str, Any], key: str) -> PartitionExpr | None:
+    """Decode the ``key`` metadata entry (e.g. ``delta/partition_expr``) into a :class:`PartitionExpr`.
 
     Accepts either a JSON-encoded mapping (multi-dim) or a plain string column
-    name (single-dim). Returns ``None`` when the key is absent.
+    name (single-dim). Returns ``None`` when ``key`` is absent.
     """
-    raw = meta.get("delta/partition_expr")
+    raw = meta.get(key)
     if raw is None:
         return None
     try:

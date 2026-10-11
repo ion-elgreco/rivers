@@ -14,12 +14,10 @@ before quoting any number here. Two of them matter most:
 - `starved` is not a crash. The daemon keeps running and reports itself healthy
   while some sensors stop firing on time. That is the failure mode to watch for.
 
-
 ## Summary
 
 One row per topic. `n/a` means the framework has no equivalent feature, or
 that part was not measured in this run.
-
 
 | Topic | Measurement | rivers | Dagster | Prefect | Best |
 |---|---|---:|---:|---:|---|
@@ -46,7 +44,6 @@ that part was not measured in this run.
 | Read path | answer a UI page over 10,000 runs | **2.0 ms** | 21.1 ms | 48.3 ms | rivers |
 | Logs | write and read 100,000 lines | **291 ms** | 1,150 ms | 75,525 ms | rivers |
 
-
 ## Kubernetes startup
 
 | Orchestrator | Control plane ready | Code location ready | Pods | Images on disk | Memory at idle | Runs |
@@ -65,13 +62,11 @@ that part was not measured in this run.
 - **Prefect:** A worker is installed separately; the server alone cannot run a flow.
 - **Prefect:** Prefect has no code location object; flows reach workers through deployments.
 
-
 ## Cold start — process launch to a servable code location, milliseconds
 
 Includes interpreter start, framework import, and building the definitions.
 rivers also writes its graph topology to storage here; Dagster and Prefect
 keep theirs in memory and persist nothing at load time.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -81,13 +76,11 @@ keep theirs in memory and persist nothing at load time.
 | 10,000 | 779.4 | 3,022.1 | 1,107.5 |
 | 50,000 | 3,512.5 | 15,094.6 | 3,529.3 |
 
-
 ## Code location load — build the graph in a warm process, milliseconds
 
 Same caveat: rivers' figure includes the storage write, so this is not a
 like-for-like graph-build comparison. The pure in-memory graph build is
 reported as `build_ms` in the raw JSON.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -97,10 +90,8 @@ reported as `build_ms` in the raw JSON.
 | 50,000 | 3,370.6 | 17,885.5 | 3,175.9 |
 | 100,000 | 6,934.0 | 35,062.2 | 6,287.5 |
 
-
 Graph build only, in milliseconds. rivers' storage write is excluded here;
 the other two never had one to exclude. This is the like-for-like row.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -110,13 +101,11 @@ the other two never had one to exclude. This is the like-for-like row.
 | 50,000 | 361.6 | 17,885.5 | 3,175.9 |
 | 100,000 | 718.5 | 35,062.2 | 6,287.5 |
 
-
 ## Single run latency — one no-op asset, median milliseconds
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 1 | 2.8 | 95.4 | 1,094.9 |
-
 
 ## Run throughput — no-op runs per second
 
@@ -124,12 +113,10 @@ the other two never had one to exclude. This is the like-for-like row.
 |---:|---:|---:|---:|
 | 200 | 365.3 | 10.2 | 0.9 |
 
-
 ## Sensor pass, tuned — milliseconds to tick every sensor once
 
 Every framework is held to a 1-second interval. A value near 1,000 means the
 daemon keeps up. A higher value is the real cost of one pass.
-
 
 | Sensors | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -141,10 +128,8 @@ daemon keeps up. A higher value is the real cost of one pass.
 | 1,000 | 1,062.7 | 24,545.6* | not supported |
 | 2,000 | 1,018.3 | no pass | not supported |
 
-
 `*` marks a starved run: the daemon kept running but some sensors missed
 their interval. Coverage is the share of promised passes actually delivered.
-
 
 | Sensors | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -156,12 +141,10 @@ their interval. Coverage is the share of promised passes actually delivered.
 | 1,000 | 94% | 4%* | not supported |
 | 2,000 | 98% | 0%* | not supported |
 
-
 ## Sensor pass, shipped defaults — 30-second interval
 
 Both rivers and Dagster default to evaluating a sensor at most every 30 seconds.
 This is how each behaves out of the box.
-
 
 | Sensors | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -169,16 +152,13 @@ This is how each behaves out of the box.
 | 500 | 31,697.0 | 32,496.8 | not supported |
 | 2,000 | 31,755.5 | 99,853.5* | not supported |
 
-
 Coverage at the shipped interval.
-
 
 | Sensors | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 100 | 95% | 94% | not supported |
 | 500 | 95% | 92% | not supported |
 | 2,000 | 94% | 30%* | not supported |
-
 
 ## Partitions — define and load, milliseconds
 
@@ -190,7 +170,6 @@ Coverage at the shipped interval.
 | 500,000 | 37.5 | 231.8 | not supported |
 | 1,000,000 | 80.1 | 532.4 | not supported |
 
-
 ## Partition operations — using the keys, milliseconds
 
 What a partitioned asset costs once it holds this many keys:
@@ -199,7 +178,6 @@ Registering a fixed block of dynamic keys is reported separately as
 `add_dynamic_ms` in the raw JSON, because it does not scale with the
 column.
 
-
 | Partitions | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 1,000 | 3.4 | 103.6 | not supported |
@@ -207,9 +185,7 @@ column.
 | 100,000 | 10.9 | 126.6 | not supported |
 | 1,000,000 | 92.9 | 414.7 | not supported |
 
-
 Materializing one key out of that many, in milliseconds.
-
 
 | Partitions | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -218,14 +194,12 @@ Materializing one key out of that many, in milliseconds.
 | 100,000 | 10.6 | 121.4 | not supported |
 | 1,000,000 | 92.5 | 409.6 | not supported |
 
-
 ## Backfill — partitions per second until every one is terminal
 
 rivers runs each partition in the calling process; Dagster launches a
 run process per partition and drives two daemons to do it. That is an
 architectural difference, not a tuning one, and `bench/README.md`
 spells it out before this number is quoted.
-
 
 | Partitions | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -234,14 +208,12 @@ spells it out before this number is quoted.
 | 200 | 198.8 | 1.6 | not supported |
 | 1,000 | 104.7 | 1.5 | not supported |
 
-
 ## Graph with dependencies — build and load, milliseconds
 
 `graph_load` wires no edges at all, which is the easiest graph a
 resolver can be handed. Here every asset depends on two assets in the
 layer above it. Prefect builds no graph before a run, so its column
 repeats what `graph_load` measured.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -250,9 +222,7 @@ repeats what `graph_load` measured.
 | 10,000 | 645.6 | 4,869.8 | 706.9 |
 | 50,000 | 3,358.8 | 32,814.5 | 3,888.9 |
 
-
 Graph build only, in milliseconds. rivers' storage write is excluded.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -261,13 +231,11 @@ Graph build only, in milliseconds. rivers' storage write is excluded.
 | 10,000 | 73.5 | 4,869.8 | 706.9 |
 | 50,000 | 370.0 | 32,814.5 | 3,888.9 |
 
-
 ## Selection — resolve one asset plus its upstream, milliseconds
 
 A fixed chain of ten assets is selected out of a graph of this size, so
 the executed work does not grow with the column and the number is about
 resolving the selection.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -275,13 +243,11 @@ resolving the selection.
 | 1,000 | 7.5 | 340.0 | not supported |
 | 10,000 | 7.9 | 960.1 | not supported |
 
-
 ## Steps in one run — milliseconds per step
 
 Every other run benchmark executes a single asset, which measures
 launching a run rather than executing one. This is what a pipeline of
 this many steps pays per step.
-
 
 | Steps | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -289,7 +255,6 @@ this many steps pays per step.
 | 100 | 0.5 | 16.3 | 11.0 |
 | 1,000 | 0.5 | 17.0 | 21.3 |
 | 5,000 | 0.5 | 25.5 | timed out |
-
 
 ## Parallel execution — wall clock for the same sleeping work
 
@@ -305,7 +270,6 @@ ships no pooled executor, so that is a property of its architecture and
 not a setting left untuned. Most of Dagster's figure below is process
 start, not scheduling.
 
-
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 8 | 122.9 | 1,833.6 | 4,659.8 |
@@ -313,9 +277,7 @@ start, not scheduling.
 | 128 | 1,865.5 | 32,650.8 | 9,764.3 |
 | 512 | 8,392.3 | 156,042.3 | 27,707.4 |
 
-
 Efficiency against the ideal. 100% means no scheduling cost at all.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -324,13 +286,11 @@ Efficiency against the ideal. 100% means no scheduling cost at all.
 | 128 | 86% | 5% | 16% |
 | 512 | 76% | 4% | 23% |
 
-
 ## Read path — answering a UI page against a store of this size
 
 Recent runs, latest materialization, asset records and asset events,
 added up. Seeding the store is untimed and uses each framework's
 cheapest path, so what is compared is reading at equal data volume.
-
 
 | Runs | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -338,13 +298,11 @@ cheapest path, so what is compared is reading at equal data volume.
 | 1,000 | 1.7 | 19.4 | 38.7 |
 | 10,000 | 2.0 | 21.1 | 48.3 |
 
-
 ## Concurrency limits — claims per second against four slots
 
 Prefect queues a claimant it cannot serve; rivers and Dagster refuse it.
 A framework that ever held more than four slots fails the measurement
 outright, however fast it was.
-
 
 | Claims | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -352,16 +310,13 @@ outright, however fast it was.
 | 1,000 | 1,200.0 | 96.0 | timed out |
 | 10,000 | 753.4 | 101.0 | timed out |
 
-
 Claims granted, of those attempted.
-
 
 | Claims | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 100 | 100 | 100 | 100 |
 | 1,000 | 1,000 | 1,000 | timed out |
 | 10,000 | 10,000 | 10,000 | timed out |
-
 
 ## Log capture — write this many lines and read them back, milliseconds
 
@@ -376,14 +331,12 @@ whole. Prefect has no stream capture: it writes one structured log
 record per line and ships each to its API, which is the larger reason
 for its figure at 100,000 lines.
 
-
 | Log lines | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 100 | 251.5 | 1,209.1 | 1,912.2 |
 | 1,000 | 259.5 | 1,191.9 | 2,148.6 |
 | 10,000 | 266.5 | 1,166.6 | 9,461.3 |
 | 100,000 | 290.9 | 1,150.1 | 75,525.3 |
-
 
 The same measurement with the run launch subtracted, in milliseconds.
 Launching a run costs rivers about 250 ms and the other two about a
@@ -392,7 +345,6 @@ lines. Each framework's own launch is timed separately by running the
 same job with no output. A zero means the per-line cost is smaller than
 the launch varies between runs.
 
-
 | Log lines | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 100 | 0.0 | 6.1 | 793.0 |
@@ -400,14 +352,12 @@ the launch varies between runs.
 | 10,000 | 5.2 | 11.9 | 8,349.7 |
 | 100,000 | 30.7 | 0.0 | 74,422.0 |
 
-
 ## Automation conditions — milliseconds to evaluate every condition once
 
 Both evaluators are held to a 1-second interval, the same way the sensor
 benchmark holds both daemons. rivers dispatches one run per pass;
 Dagster's evaluation returns its requests without launching them, so it
 does one run less work per pass.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -419,9 +369,7 @@ does one run less work per pass.
 | 10,000 | 1,000.5 | 1,059.1 | not supported |
 | 20,000 | 1,000.2 | 2,229.8* | not supported |
 
-
 Coverage: the share of promised passes actually delivered.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -433,13 +381,11 @@ Coverage: the share of promised passes actually delivered.
 | 10,000 | 100% | 94% | not supported |
 | 20,000 | 100% | 45%* | not supported |
 
-
 ## Schedules — milliseconds to evaluate every schedule once
 
 The cron interval is deliberately not measured. Dagster accepts no cron
 finer than one minute, so a windowed run would report that floor rather
 than what a tick costs.
-
 
 | Schedules | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -449,17 +395,14 @@ than what a tick costs.
 | 250 | 0.2 | 1.3 | not supported |
 | 500 | 0.4 | 2.2 | not supported |
 
-
 ## Cancellation — milliseconds from request to a terminal run
 
 The run is launched the way each framework's own deployment launches
 one, because an inline call never watches for a cancellation request.
 
-
 | Runs | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 1 | 1.2 | 582.1 | not supported |
-
 
 ## Reload — loading a code location that is already loaded
 
@@ -467,19 +410,16 @@ A code location is loaded once at startup and again on every change.
 rivers writes over topology that is already stored; the other two keep
 theirs in memory and pay nothing for the second load.
 
-
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
 | 100 | 8.7 | 29.8 | 7.5 |
 | 1,000 | 76.7 | 289.1 | 56.5 |
 | 10,000 | 797.2 | 3,522.2 | 594.9 |
 
-
 ## Memory — resident megabytes while holding the graph
 
 Peak resident memory of the measuring process and its children, taken
 during the code-location load.
-
 
 | Assets | rivers | Dagster | Prefect |
 |---:|---:|---:|---:|
@@ -488,7 +428,6 @@ during the code-location load.
 | 10,000 | 217.5 | 228.9 | 138.8 |
 | 50,000 | 443.0 | 848.9 | 296.2 |
 | 100,000 | 724.7 | 1,616.1 | 494.1 |
-
 
 ## Where each system stops working
 
@@ -499,11 +438,9 @@ during the code-location load.
 | run_steps | Prefect | 5,000 | timed out |
 | sensor_pass | Dagster | 100 | starved |
 
-
 ## Where rivers is slower
 
 Every measurement where rivers takes at least 1.5 times the best rival's
 time. Read this before quoting anything above.
-
 
 _rivers is within 1.5x of the best rival on every measurement._

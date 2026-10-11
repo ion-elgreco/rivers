@@ -16,6 +16,13 @@ from pydantic_settings import SettingsConfigDict
 
 from rivers._core import InputContext, OutputContext
 from rivers._core.partitions import PartitionContext
+from rivers.io_handlers._partition_sql import (
+    Filter,
+    PartitionExpr,
+    _build_partition_filters,
+    _build_predicate,
+    _resolve_partition_expr,
+)
 from rivers.io_handlers.base import BaseIOHandler
 from rivers.io_handlers.delta.asset import DeltaAsset, OptimizeConfig, VacuumConfig
 from rivers.io_handlers.delta.base import (
@@ -27,7 +34,6 @@ from rivers.io_handlers.delta.base import (
 from rivers.io_handlers.delta.config import (
     MergeConfig,
     MergeOperationsConfig,
-    PartitionExpr,
     WhenMatchedDelete,
     WhenMatchedUpdate,
     WhenMatchedUpdateAll,
@@ -35,12 +41,6 @@ from rivers.io_handlers.delta.config import (
     WhenNotMatchedBySourceUpdate,
     WhenNotMatchedInsert,
     WhenNotMatchedInsertAll,
-)
-from rivers.io_handlers.delta.predicate import (
-    Filter,
-    _build_partition_filters,
-    _build_predicate,
-    _resolve_partition_expr,
 )
 
 __all__: list[str] = [
@@ -71,13 +71,14 @@ _MODULE_TO_EXTRA: dict[str, str] = {
     "pandas": "pandas",
     "datafusion": "datafusion",
     "pyspark": "pyspark",
+    "_duckdb": "duckdb",
 }
 
 
 def _build_type_handler_map(
     handler_config: dict[str, Any] | None,
 ) -> dict[type, DeltaTypeHandler]:
-    """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, pyspark).
+    """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, duckdb, pyspark).
 
     Returns a mapping from supported Python type to its handler. Missing optional
     dependencies are silently skipped — the handler is only registered when its
@@ -89,6 +90,7 @@ def _build_type_handler_map(
         ("rivers.io_handlers.delta.polars", "PolarsTypeHandler", []),
         ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler", []),
         ("rivers.io_handlers.delta.pandas", "PandasTypeHandler", []),
+        ("rivers.io_handlers.delta.duckdb", "DuckDBTypeHandler", ["duckdb"]),
         (
             "rivers.io_handlers.delta.pyspark",
             "PySparkDeltaTypeHandler",
@@ -249,7 +251,9 @@ class DeltaIOHandler(BaseIOHandler):
                 "has no partition key, so there is no predicate to build — "
                 "operate on the whole table instead"
             )
-        partition_expr = _resolve_partition_expr(asset_metadata or {})
+        partition_expr = _resolve_partition_expr(
+            asset_metadata or {}, "delta/partition_expr"
+        )
         return _build_predicate(partition, partition_expr)
 
     def partition_filters(
@@ -278,7 +282,9 @@ class DeltaIOHandler(BaseIOHandler):
                 "partition_filters needs a partition context; this action run "
                 "has no partition key — operate on the whole table instead"
             )
-        partition_expr = _resolve_partition_expr(asset_metadata or {})
+        partition_expr = _resolve_partition_expr(
+            asset_metadata or {}, "delta/partition_expr"
+        )
         return _build_partition_filters(partition, partition_expr)
 
     def _resolve_write_request(self, context: OutputContext) -> DeltaWriteRequest:
@@ -289,7 +295,7 @@ class DeltaIOHandler(BaseIOHandler):
         schema_mode: DeltaSchemaMode | None = meta.get(
             "delta/schema_mode", self.schema_mode
         )  # type: ignore[assignment]
-        partition_expr = _resolve_partition_expr(meta)
+        partition_expr = _resolve_partition_expr(meta, "delta/partition_expr")
         partition_by = (
             partition_expr.partition_columns
             if partition_expr and context.partition
@@ -350,7 +356,7 @@ class DeltaIOHandler(BaseIOHandler):
         ``context.type_hint`` (which must be set on the consumer side).
         """
         meta = context.asset_metadata or {}
-        partition_expr = _resolve_partition_expr(meta)
+        partition_expr = _resolve_partition_expr(meta, "delta/partition_expr")
         predicate = (
             _build_predicate(context.partition, partition_expr)
             if context.partition is not None

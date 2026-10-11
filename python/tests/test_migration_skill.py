@@ -188,6 +188,18 @@ def test_dagster_slack_maps_to_slack_resource_methods():
     assert slack.run_failure_sensor("#c").monitored_status == rs.RunStatus.Failure
 
 
+def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
+    pytest.importorskip("duckdb")
+    from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource
+
+    handler = DuckDBIOHandler(
+        resource=DuckDBResource(database=str(tmp_path / "w.duckdb"))
+    )
+    meta = {"duckdb/schema": "analytics", "duckdb/partition_expr": "day"}
+    assert handler.table_name("users", meta) == ("analytics", "users")
+    assert handler.table_name("users", None) == ("main", "users")
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

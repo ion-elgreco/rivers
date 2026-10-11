@@ -73,6 +73,7 @@ nav:
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
       - Delta Lake: guides/delta-lake.md
+      - DuckDB: guides/duckdb.md
       - Slack: guides/slack.md
       - Authentication: guides/authentication.md
   - API Reference:
@@ -92,6 +93,7 @@ nav:
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
       - Delta Lake: api-reference/delta.md
+      - DuckDB: api-reference/duckdb.md
       - MetadataValue: api-reference/metadata.md
       - Schema: api-reference/schema.md
       - Storage: api-reference/storage.md

@@ -12,6 +12,7 @@ pip install rivers[pyarrow]
 pip install rivers[polars]
 pip install rivers[pandas]
 pip install rivers[datafusion]
+pip install rivers[duckdb]
 pip install rivers[pyspark]
 ```
 
@@ -68,6 +69,7 @@ In above cases, the handler creates a Delta table at `/data/delta/users/`.
 | `polars.LazyFrame` | `rivers[polars]` | Arrow |
 | `pandas.DataFrame` | `rivers[pandas]` | Arrow |
 | `datafusion.DataFrame` | `rivers[datafusion]` | Arrow |
+| `duckdb.DuckDBPyRelation` | `rivers[duckdb]` | Arrow |
 | `pyspark.sql.DataFrame` | `rivers[pyspark]` | Spark |
 
 The type is detected automatically from the object passed to `handle_output`, and `load_input` uses the `type_hint` from the downstream parameter annotation.
@@ -84,6 +86,37 @@ def enriched(users: datafusion.DataFrame, orders: datafusion.DataFrame) -> dataf
 ```
 
 The backing `SessionContext` is attached to the returned frame as `rivers_ctx`. Reach for it only when you want the session handle itself — for example, to register an extra table and query it by name with `ctx.sql(...)`.
+
+### Read with DuckDB
+
+A `duckdb.DuckDBPyRelation` input reads the table with DuckDB's [`delta_scan`](https://duckdb.org/docs/current/core_extensions/delta). The relation is lazy. `delta/columns`, the partition predicate, and file statistics prune the files that DuckDB reads, and `delta/version` reads an older version. A relation output streams into delta-rs, which writes the table.
+
+```python
+import duckdb
+import rivers as rs
+
+@rs.Asset
+def summary(orders: duckdb.DuckDBPyRelation, users: duckdb.DuckDBPyRelation) -> duckdb.DuckDBPyRelation:
+    return orders.join(users, "user_id").aggregate("country, sum(amount) AS total")
+```
+
+Inputs that one step reads share one DuckDB connection per thread, so the step can join them. To set extensions, secrets, or settings, pass a [`DuckDBResource`](duckdb.md#resource):
+
+```python
+from rivers.integrations.duckdb import DuckDBResource
+
+io = DeltaIOHandler(
+    table_uri="s3://bucket/delta",
+    storage_options={"AWS_REGION": "eu-west-1"},
+    handler_config={"duckdb": DuckDBResource(connection_config={"threads": 8})},
+)
+```
+
+The handler turns `storage_options` into a DuckDB secret for the table's bucket or container:
+
+- S3: the access key, secret, session token, region, and endpoint. Without a key, DuckDB uses the AWS credential chain.
+- Azure: an account key, a SAS token, or a service principal. Without one, DuckDB uses the Azure credential chain.
+- GCS: not supported. DuckDB reads GCS only with HMAC keys; set them with `DuckDBResource(secrets=...)`.
 
 ## Write modes
 

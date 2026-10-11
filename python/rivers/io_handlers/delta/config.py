@@ -1,27 +1,10 @@
-"""Pydantic models describing Delta IO partitioning and MERGE configuration."""
+"""Pydantic models describing Delta MERGE configuration."""
 
 from __future__ import annotations
 
 from typing import Literal
 
 from pydantic import BaseModel
-
-
-class PartitionExpr(BaseModel):
-    """Maps partition dimensions to Delta table column names.
-
-    For single-partition assets, ``expr`` is a column name string.
-    For multi-partition assets, ``expr`` is a dict mapping dimension names to column names.
-    """
-
-    expr: str | dict[str, str]
-
-    @property
-    def partition_columns(self) -> list[str]:
-        """Flatten ``expr`` into the list of physical column names used to partition the table."""
-        if isinstance(self.expr, str):
-            return [self.expr]
-        return list(self.expr.values())
 
 
 _MergeType = Literal[
