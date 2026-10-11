@@ -39,6 +39,10 @@ from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
 from .helpers import make_daily_partition, make_multi_partition, make_partition
 
 
+# One xdist worker runs this module, so the tests share one SparkSession.
+pytestmark = pytest.mark.xdist_group("spark")
+
+
 @pytest.fixture(scope="module")
 def spark() -> SparkSession:  # type: ignore[return]
     """Module scoped SparkSession with the Delta Lake extensions enabled.

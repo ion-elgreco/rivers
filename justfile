@@ -13,6 +13,10 @@ profile_dir := if profile == "dev" { "debug" } else { profile }
 # The pod-side binary the k8s tests run (python/tests/k8s), built by `_runtime-bin`.
 runtime_bin := justfile_directory() + "/target/" + profile_dir + "/rivers-runtime"
 
+# pytest-xdist: one worker per CPU. `xdist_group` keeps a group's tests on one worker;
+# the test recipes run `serial` tests alone afterwards.
+xdist := "-n logical --dist loadgroup"
+
 # Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
 # behavior. Keep in sync with the pipx install in .github/actions/setup-env.
 
@@ -66,15 +70,18 @@ _runtime-bin:
 
 # Run Python tests
 test: _runtime-bin
-    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m serial python/
 
 # Run Python tests on free-threaded Python; an import that turns the GIL back on fails
 test-ft: _runtime-bin
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest {{ xdist }} -m "not serial" python/
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest -m serial python/
 
 # Run Python tests (excluding spark tests)
 test-dev: _runtime-bin
-    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "not spark_test" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not spark_test and not serial" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "serial and not spark_test" python/
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
