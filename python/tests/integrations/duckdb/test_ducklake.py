@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -129,7 +130,7 @@ def test_partitioned_table_and_one_snapshot_per_overwrite(lake):
         "ON pc.column_id = col.column_id AND col.end_snapshot IS NULL",
     ) == [("region",)]
     files = _rows(lake, "SELECT data_file FROM ducklake_list_files('lake', 't')")
-    assert sorted(f.split("/")[-2] for (f,) in files) == ["region=r0", "region=r1"]
+    assert sorted(Path(f).parent.name for (f,) in files) == ["region=r0", "region=r1"]
 
 
 def test_existing_table_is_not_repartitioned(lake):

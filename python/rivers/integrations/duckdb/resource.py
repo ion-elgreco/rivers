@@ -34,6 +34,13 @@ class _Shared(threading.local):
 _shared = _Shared()
 
 _LOCK_RETRIES = 10
+# DuckDB's error when another process holds the file: a POSIX lock, or a
+# Windows sharing violation (DuckDB names the holder when it can find it).
+_LOCK_MESSAGES = (
+    "Could not set lock",
+    "being used by another process",
+    "File is already open in",
+)
 _ONE_PROCESS_HINT = (
     "A DuckLake catalog in a DuckDB file allows one process. Use a PostgreSQL "
     "catalog with the parallel executor or Kubernetes."
@@ -265,4 +272,4 @@ def _retry_on_lock(fn: Callable[[], _T], hint: str | None = None) -> _T:
 
 
 def _is_lock_error(e: duckdb.IOException) -> bool:
-    return "Could not set lock" in str(e)
+    return any(message in str(e) for message in _LOCK_MESSAGES)
