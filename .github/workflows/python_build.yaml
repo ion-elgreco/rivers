@@ -7,11 +7,13 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel superseded runs on the same ref (PR pushes, force-pushes, rapid main
-# commits). Release workflows opt out of this — see release-*.yaml.
+# Cancel superseded PR runs (pushes, force-pushes). Runs on main finish, since
+# a cancelled run skips the cache save that PR runs restore from; a newer main
+# push waits for the running one. Release workflows opt out of this — see
+# release-*.yaml.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Default to no permissions; each job opts in to whatever it actually needs.
 # Limits the blast radius if a step (or a transitively-pulled action) is ever
@@ -205,7 +207,16 @@ jobs:
           cross_compile: "true"
           # The zigbuild/maturin target dirs share only the registry with the
           # arm64 test job — keep a dedicated primer tarball, don't race it.
-          cache-shared-key: "k8s"
+          # The maturin pin below is part of the key: see "Install maturin".
+          cache-shared-key: "k8s-maturin-1.15.0"
+
+      # maturin's zig wrappers live in a directory named after the maturin
+      # executable's path, and cargo rebuilds every crate of the wheel when
+      # that path changes. `uvx` unpacks maturin to a new path each run; the
+      # justfile's `uvx maturin` reuses this install, whose path is fixed. A
+      # new version moves the wrappers too, so bump the cache key with it.
+      - name: Install maturin
+        run: uv tool install 'maturin[zig]==1.15.0' --with 'ziglang==0.16.0'
 
       # k3d + helmfile + helm + kubectl at the exact versions mise.toml /
       # mise.lock pin for local dev — one source of truth instead of
