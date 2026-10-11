@@ -22,6 +22,8 @@ from rivers.integrations.duckdb._sql import (  # noqa: E402
 )
 from rivers.integrations.duckdb.resource import set_lake_options  # noqa: E402
 
+from _polling import wait_for  # noqa: E402
+
 
 def _lake(tmp_path, **kwargs) -> DuckDBResource:
     return DuckDBResource(
@@ -125,12 +127,40 @@ def test_connect_gives_up_after_the_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(resource_module, "sleep", delays.append)
     holder = _hold_lock(path, 30)
     try:
-        with pytest.raises(duckdb.IOException, match="Could not set lock"):
+        with pytest.raises(
+            duckdb.IOException, match="Could not set lock|being used by another process"
+        ):
             DuckDBResource(database=path).connect()
     finally:
         holder.kill()
         holder.wait()
     assert delays == [0.1 * 2**i for i in range(10)]
+
+
+@pytest.mark.parametrize(
+    ("message", "locked"),
+    [
+        (
+            'IO Error: Could not set lock on file "w.duckdb": Conflicting lock is '
+            "held in /usr/bin/python3.11 (PID 3533)",
+            True,
+        ),
+        (
+            'IO Error: Cannot open file "C:\\w.duckdb": The process cannot access the '
+            "file because it is being used by another process.\r\n\nFile is already "
+            "open in \nC:\\python.exe (PID 4160)",
+            True,
+        ),
+        (
+            'IO Error: Cannot open file "C:\\w.duckdb": Der Prozess kann nicht auf '
+            "die Datei zugreifen.\r\n\nFile is already open in \nC:\\python.exe (PID 1)",
+            True,
+        ),
+        ('IO Error: Cannot open file "w.duckdb": Permission denied', False),
+    ],
+)
+def test_lock_errors_on_each_platform(message, locked):
+    assert resource_module._is_lock_error(duckdb.IOException(message)) is locked
 
 
 def test_shared_connection_lives_while_its_relations_do(tmp_path):
@@ -161,6 +191,9 @@ def test_ducklake_threads_share_one_catalog(tmp_path):
     lake = _lake(tmp_path)
     with lake.get_connection() as con:
         con.execute("CREATE TABLE t (i INTEGER)")
+    # The first insert creates the table's data directory. DuckDB 1.5 on Windows
+    # fails when two threads create it at once (it accepts EEXIST only on POSIX).
+    (tmp_path / "data" / "main" / "t").mkdir(parents=True, exist_ok=True)
     errors: list[BaseException] = []
 
     def insert(i: int) -> None:
@@ -277,11 +310,23 @@ def test_relations_outlive_teardown(tmp_path):
     assert rel.fetchall() == [(1,)]
 
     del rel
-    attach = (
-        "import duckdb, sys; duckdb.connect().execute("
-        f"\"ATTACH 'ducklake:{tmp_path / 'meta.ducklake'}' AS lake\")"
-    )
-    subprocess.run([sys.executable, "-c", attach], check=True)
+    attach = [
+        sys.executable,
+        "-c",
+        "import duckdb, sys\n"
+        "duckdb.connect().execute(f\"ATTACH 'ducklake:{sys.argv[1]}' AS lake\")",
+        str(tmp_path / "meta.ducklake"),
+    ]
+
+    def closed() -> bool:
+        proc = subprocess.run(attach, capture_output=True, text=True)
+        locked = any(m in proc.stderr for m in resource_module._LOCK_MESSAGES)
+        assert proc.returncode == 0 or locked, proc.stderr
+        return proc.returncode == 0
+
+    # CI once saw the lock still held right after `del rel` (cause unknown); a
+    # catalog that stays open still fails.
+    wait_for(closed, timeout=10, what="the catalog to close")
 
 
 def test_render_secret_quotes_names_and_values():
