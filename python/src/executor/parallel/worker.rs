@@ -399,7 +399,6 @@ pub fn worker_execute_step(
                     py,
                     &raw_result,
                     return_hint.as_ref(),
-                    ctx_obj.is_some(),
                     ctx_obj.as_ref(),
                     &step_name,
                 )?)
@@ -459,7 +458,6 @@ pub fn worker_execute_step(
                 py,
                 &raw_result,
                 return_hint.as_ref(),
-                ctx_obj.is_some(),
                 ctx_obj.as_ref(),
                 &step_name,
             )?;

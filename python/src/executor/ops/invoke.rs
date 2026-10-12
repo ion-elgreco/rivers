@@ -30,7 +30,6 @@ pub(crate) struct BuiltStepArgs {
     pub args: Vec<Py<PyAny>>,
     pub return_hint: Option<Py<PyAny>>,
     pub config_instance: Option<Py<PyAny>>,
-    pub context_injected: bool,
     /// The context object (first arg) if context was injected.
     pub ctx_ref: Option<Py<PyAny>>,
 }
@@ -63,7 +62,6 @@ pub(crate) fn build_step_args(
         .map(|obj| obj.bind(py).cast::<PyDict>())
         .transpose()?;
     let mut is_first_param = true;
-    let mut context_injected = false;
     let mut config_instance: Option<Py<PyAny>> = None;
     let mut ctx_ref: Option<Py<PyAny>> = None;
     let mut args: Vec<Py<PyAny>> = Vec::new();
@@ -126,7 +124,6 @@ pub(crate) fn build_step_args(
                 };
                 ctx_ref = Some(ctx_obj.clone_ref(py));
                 args.push(ctx_obj);
-                context_injected = true;
                 continue;
             }
         } else if is_ctx {
@@ -201,7 +198,6 @@ pub(crate) fn build_step_args(
         args,
         return_hint,
         config_instance,
-        context_injected,
         ctx_ref,
     })
 }
@@ -227,7 +223,6 @@ pub(crate) fn process_raw_result(
     py: Python,
     raw_result: &Py<PyAny>,
     return_hint: Option<&Py<PyAny>>,
-    context_injected: bool,
     ctx_ref: Option<&Py<PyAny>>,
     step_name: &str,
 ) -> PyResult<ProcessedResult> {
@@ -249,17 +244,11 @@ pub(crate) fn process_raw_result(
 
     let checked = validate_return_type(py, &actual_result, return_hint, step_name)?;
 
-    let (context_metadata, context_data_version) = if context_injected {
-        if let Some(first) = ctx_ref {
-            if let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>() {
-                let ctx = ctx.borrow();
-                (ctx.drain_output_metadata(py), ctx.drain_data_version())
-            } else {
-                (Vec::new(), None)
-            }
-        } else {
-            (Vec::new(), None)
-        }
+    let (context_metadata, context_data_version) = if let Some(first) = ctx_ref
+        && let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>()
+    {
+        let ctx = ctx.borrow();
+        (ctx.drain_output_metadata(py), ctx.drain_data_version())
     } else {
         (Vec::new(), None)
     };
@@ -387,7 +376,6 @@ pub(crate) fn execute_step(
             py,
             &raw_result,
             built.return_hint.as_ref(),
-            built.context_injected,
             built.ctx_ref.as_ref(),
             &step.name,
         )?;
