@@ -7,7 +7,7 @@ import pytest
 
 import rivers as rs
 
-from _helpers import DictIOHandler
+from _helpers import EXECUTORS, MP, DictIOHandler
 
 
 @pytest.fixture(params=["in_process", "parallel"])
@@ -967,3 +967,164 @@ def test_async_dict_multi_asset_parallel(tmp_path):
 
     assert load("ad_p") == 100
     assert load("ad_q") == 200
+
+
+# ── Partial failure: the same on every executor ──────────────────────
+
+
+def _step_events(storage, run_id):
+    """``{asset: [(event_type, partition, error)]}`` of the run's step
+    events, oldest first."""
+    events: dict[str, list] = {}
+    for e in storage.get_events_for_run(run_id):
+        if e.event_type in (
+            "StepStart",
+            "Materialization",
+            "StepSuccess",
+            "StepFailure",
+        ):
+            partition = e.partition_key and e.partition_key.to_json()
+            error = dict(e.metadata).get("error")
+            events.setdefault(e.asset_key, []).append((e.event_type, partition, error))
+    return events
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("first", ["output", "materialization"])
+@pytest.mark.parametrize("partitioned", [False, True], ids=["whole", "partitioned"])
+def test_generator_error_keeps_outputs_yielded_before_it(
+    executor, is_async, first, partitioned, tmp_path, storage
+):
+    """Outputs a generator yields before it raises keep their materialization
+    and value; only the outputs after the error fail."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"]) if partitioned else None
+    key = rs.PartitionKey.single("p1") if partitioned else None
+    p1 = key and key.to_json()
+
+    def first_yield():
+        if first == "output":
+            return rs.Output(5, output_name="pa")
+        return rs.Materialization(output_name="pa")
+
+    output_defs = [rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=output_defs, partitions_def=pd)
+        async def multi():
+            yield first_yield()
+            raise RuntimeError("pb broke")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs, partitions_def=pd)
+        def multi():
+            yield first_yield()
+            raise RuntimeError("pb broke")
+
+    @rs.Asset(io_handler=io, partitions_def=pd)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(
+        ["pa", "pb", "sibling"], partition_key=key, raise_on_error=False
+    )
+
+    error = "RuntimeError: pb broke"
+    pb_failures = [("StepFailure", None, error)]
+    if partitioned:
+        pb_failures.insert(0, ("StepFailure", p1, error))
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", p1, None),
+        ("StepSuccess", None, None),
+    ]
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": [("StepStart", None, None), *pb_failures],
+        "sibling": succeeded,
+    }
+    if first == "output":
+        assert repo.load_node("pa", partition_key=key) == 5
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_generator_output_never_yielded_fails(executor, tmp_path, storage):
+    """An output the generator ends without yielding fails; the rest succeed."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    )
+    def multi():
+        yield rs.Output(5, output_name="pa")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["pa", "pb", "sibling"], raise_on_error=False)
+
+    error = "ExecutionError: Generator multi-asset did not yield output 'pb'"
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", None, None),
+        ("StepSuccess", None, None),
+    ]
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": [("StepStart", None, None), ("StepFailure", None, error)],
+        "sibling": succeeded,
+    }
+    assert result.failed_assets == [("pb", error)]
+    assert repo.load_node("pa") == 5
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_multi_asset_output_kept_in_memory(executor, tmp_path, storage):
+    """In a worker, an output kept in memory fails alone; the output the
+    worker completed before it keeps its materialization."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb")]
+    )
+    def multi():
+        yield rs.Output(1, output_name="pa")
+        yield rs.Output(2, output_name="pb")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["pa", "pb", "sibling"], raise_on_error=False)
+
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", None, None),
+        ("StepSuccess", None, None),
+    ]
+    in_memory_error = (
+        "ExecutionError: Asset 'pb' uses InMemoryIOHandler which cannot work with "
+        "parallel execution. InMemoryIOHandler stores data in process-local memory "
+        "that is not accessible from subprocesses. Use PickleIOHandler or "
+        "DeltaIOHandler instead, or switch to Executor.in_process()."
+    )
+    pb = (
+        [("StepStart", None, None), ("StepFailure", None, in_memory_error)]
+        if executor is MP
+        else succeeded
+    )
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": pb,
+        "sibling": succeeded,
+    }
+    assert repo.load_node("pa") == 1

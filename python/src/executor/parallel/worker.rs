@@ -91,9 +91,9 @@ impl PyCollectStreamLoadSpec {
 ///
 /// `outputs` is a Python list of 4-tuples
 /// `(name: str, kind: int, metadata: list[tuple[str, MetadataValue]], data_version: str | None)`.
-/// For multi-asset, one tuple per selected output. For single-output, one
-/// tuple with `name = ""` (the consumer substitutes the dispatch-side
-/// `step_name` for non-mapped runs and the instance name for mapped fan-out).
+/// For multi-asset, one tuple per output the step completed. For
+/// single-output, one tuple named after the step (the instance for mapped
+/// fan-out).
 ///
 /// `captured_logs` carries `(stdout, stderr, rust_logs)` from the worker's
 /// per-step capture. None when the user code didn't run (pre-spawn failures
@@ -123,12 +123,17 @@ pub struct PyWorkerResult {
     /// The exception the graph's io_handler raised on that write.
     #[pyo3(get)]
     pub graph_error: Option<Py<PyAny>>,
+    /// A multi-asset's failure after it completed the `outputs` above: the
+    /// orchestrator fails only its other outputs. The [`WorkerStepError`] a
+    /// failed step raises, without the logs (`captured_logs` has them).
+    #[pyo3(get)]
+    pub error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyWorkerResult {
     #[new]
-    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None))]
+    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None, error=None))]
     fn new(
         outputs: Py<PyAny>,
         captured_logs: Option<(String, String, String)>,
@@ -136,6 +141,7 @@ impl PyWorkerResult {
         failed_partitions: Vec<(String, String)>,
         graph_written: bool,
         graph_error: Option<Py<PyAny>>,
+        error: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             outputs,
@@ -144,6 +150,7 @@ impl PyWorkerResult {
             failed_partitions,
             graph_written,
             graph_error,
+            error,
         }
     }
 
@@ -159,6 +166,7 @@ impl PyWorkerResult {
             Vec<(String, String)>,
             bool,
             Option<Py<PyAny>>,
+            Option<Py<PyAny>>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
@@ -171,6 +179,7 @@ impl PyWorkerResult {
                 self.failed_partitions.clone(),
                 self.graph_written,
                 self.graph_error.as_ref().map(|e| e.clone_ref(py)),
+                self.error.as_ref().map(|e| e.clone_ref(py)),
             ),
         ))
     }
@@ -209,7 +218,9 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::WorkerStepError;
+use crate::executor::dispatch::CapturedLogs;
 use crate::executor::ops::{self, OutOfProcess, write_output};
+use crate::executor::traceback;
 use crate::metadata::MetadataValue;
 
 /// Self-contained step execution for loky subprocess.
@@ -305,17 +316,19 @@ pub fn worker_execute_step(
     let mut graph_written = false;
     let mut graph_error: Option<Py<PyAny>> = None;
 
-    // Execute with resource teardown guarantee. Closure returns the outputs
-    // list plus any single-output `dynamic_keys` (multi-asset can't carry
-    // DynamicOutputs). The wrapping `PyWorkerResult` is built outside so it
-    // can carry the captured logs alongside.
-    let outputs_or_err = (|| -> PyResult<(Py<PyAny>, Option<Vec<String>>)> {
+    // Output items shipped back to the orchestrator, one tuple per output the
+    // step completed (see `PyWorkerResult`). Kept outside the closure: a
+    // multi-asset that fails partway still reports the outputs before it.
+    let outputs_list = PyList::empty(py);
+
+    // Execute with resource teardown guarantee. Closure returns any
+    // single-output `dynamic_keys` (multi-asset can't carry DynamicOutputs).
+    // The wrapping `PyWorkerResult` is built outside so it can carry the
+    // captured logs alongside.
+    let outputs_or_err = (|| -> PyResult<Option<Vec<String>>> {
         let args_tuple = PyTuple::new(py, &resolved)?;
         let raw_result = func.call1(py, args_tuple)?;
 
-        // Output items list shipped back to the orchestrator. One tuple per
-        // selected output: (name, is_observation, metadata_dict_or_none, dv).
-        let outputs_list = PyList::empty(py);
         let mut single_dynamic_keys: Option<Vec<String>> = None;
 
         if let Some(ref specs) = multi_output_specs {
@@ -512,7 +525,7 @@ pub fn worker_execute_step(
             })?;
         }
 
-        Ok((outputs_list.unbind().into_any(), single_dynamic_keys))
+        Ok(single_dynamic_keys)
     })();
 
     // Teardown unconditionally, including on failure.
@@ -534,25 +547,30 @@ pub fn worker_execute_step(
         }
     });
 
-    match outputs_or_err {
-        Ok((outputs, dynamic_keys)) => {
-            let failed_partitions = drain_ctx_failed_partitions(py, ctx_obj.as_ref());
-            let wr = PyWorkerResult {
-                outputs,
-                captured_logs,
-                dynamic_keys,
-                failed_partitions,
-                graph_written,
-                graph_error,
-            };
-            Ok(Py::new(py, wr)?.into_any())
-        }
+    let (dynamic_keys, error) = match outputs_or_err {
+        Ok(dynamic_keys) => (dynamic_keys, None),
         Err(err) => {
-            let package = crate::executor::traceback::app_package(func.bind(py));
-            let traceback = crate::executor::traceback::capture_json(py, &err, package.as_deref());
-            Err(wrap_step_error(py, err, captured_logs, traceback))
+            let package = traceback::app_package(func.bind(py));
+            let tb = traceback::capture_json(py, &err, package.as_deref());
+            // Only a multi-asset completes outputs before it fails; it keeps
+            // them, as in-process.
+            if outputs_list.is_empty() {
+                return Err(wrap_step_error(py, err, captured_logs, tb));
+            }
+            let error = wrap_step_error(py, err, None, tb);
+            (None, Some(error.into_value(py).into_any()))
         }
-    }
+    };
+    let wr = PyWorkerResult {
+        outputs: outputs_list.unbind().into_any(),
+        captured_logs,
+        dynamic_keys,
+        failed_partitions: drain_ctx_failed_partitions(py, ctx_obj.as_ref()),
+        graph_written,
+        graph_error,
+        error,
+    };
+    Ok(Py::new(py, wr)?.into_any())
 }
 
 /// Wrap a failed step's exception for the trip back to the parent (see
@@ -575,6 +593,37 @@ fn wrap_step_error(
         Ok(()) => wrapper,
         Err(_) => err,
     }
+}
+
+/// The step's own exception and captured logs from a failed worker step (see
+/// [`WorkerStepError`]). The step's traceback goes back onto the exception for
+/// [`traceback::capture_json`], and loky's remote traceback becomes its cause,
+/// as loky itself sets it on a plain exception. Other errors (pre-spawn, a
+/// dead worker) pass through without logs.
+pub(crate) fn unwrap_worker_error(py: Python, error: PyErr) -> (PyErr, CapturedLogs) {
+    if !error.is_instance_of::<WorkerStepError>(py) {
+        return (error, None);
+    }
+    let wrapper = error.value(py);
+    let Ok(step_error) = wrapper.getattr("step_error") else {
+        return (error, None);
+    };
+    let captured_logs = wrapper
+        .getattr("captured_logs")
+        .ok()
+        .and_then(|logs| logs.extract().ok())
+        .flatten();
+    if let Ok(tb) = wrapper.getattr("traceback")
+        && !tb.is_none()
+    {
+        let _ = step_error.setattr(traceback::STASH_ATTR, tb);
+    }
+    if let Ok(cause) = wrapper.getattr("__cause__")
+        && !cause.is_none()
+    {
+        let _ = step_error.setattr("__cause__", cause);
+    }
+    (PyErr::from_value(step_error), captured_logs)
 }
 
 /// Drain `output_metadata` and `data_version` from a worker-side

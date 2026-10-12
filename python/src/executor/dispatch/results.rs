@@ -20,6 +20,7 @@ use crate::result_types::ResultKind;
 
 use super::super::in_step_pod;
 use super::super::ops::{self, OutOfProcess, now_ts};
+use super::super::parallel::worker::unwrap_worker_error;
 use super::super::traceback;
 use super::context::BatchContext;
 use super::types::{CapturedLogs, WorkOutcome};
@@ -305,11 +306,7 @@ pub(crate) fn process_step_result(
         } else if is_single {
             step.event_names().to_vec()
         } else {
-            step.event_names()
-                .iter()
-                .filter(|n| !yielded_names.contains(*n))
-                .cloned()
-                .collect()
+            unyielded_outputs(step, &yielded_names)
         };
         handle_failure(
             py,
@@ -322,23 +319,36 @@ pub(crate) fn process_step_result(
             failures,
         );
     } else if !is_single {
-        // Reconciliation: any selected output not yielded by the generator
-        // becomes a failure (no hooks). For dict, every output is iterated
-        // by `for_each_output_dict` so this is a no-op.
-        py.detach(|| {
-            for name in &step.outputs {
-                if !yielded_names.contains(name) {
-                    let msg = format!("Generator multi-asset did not yield output '{}'", name);
-                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
-                }
-            }
-        });
+        py.detach(|| fail_unyielded_outputs(ctx, step, &yielded_names, failures));
     }
 
     // The graph's Materialization takes this time: after this task's own
     // events, and before its claim on the graph's pool ends.
     if let Some(graph_name) = wrote_graph {
         ctx.state.graph_written_at.insert(graph_name, now_ts());
+    }
+}
+
+/// A multi-asset step's outputs not in `yielded`.
+fn unyielded_outputs(step: &ExecutionStep, yielded: &HashSet<String>) -> Vec<String> {
+    step.outputs
+        .iter()
+        .filter(|name| !yielded.contains(*name))
+        .cloned()
+        .collect()
+}
+
+/// Fail (no hooks) each output a generator multi-asset ended without
+/// yielding. A dict return covers every output, so this is a no-op for it.
+fn fail_unyielded_outputs(
+    ctx: &mut BatchContext,
+    step: &ExecutionStep,
+    yielded: &HashSet<String>,
+    failures: &mut Vec<(String, PyErr)>,
+) {
+    for name in unyielded_outputs(step, yielded) {
+        let msg = format!("Generator multi-asset did not yield output '{name}'");
+        ctx.record_failure_no_hooks(&name, ExecutionError::new_err(msg), failures);
     }
 }
 
@@ -614,11 +624,11 @@ pub(crate) fn handle_failure(
 /// Observation event."
 ///
 /// `worker_result.outputs` is a list of `(name, kind_tag, metadata, dv)`
-/// tuples — one per selected output. `kind_tag` is the `ResultKind::as_u8`
-/// discriminator. The worker is the source of truth for per-output values,
-/// so we trust the tuple's `name` over `step_name` (they should equal
-/// `step_name` for single-output non-mapped, the per-instance name for
-/// mapped, or the per-output name for multi-asset).
+/// tuples — one per output the worker completed. `kind_tag` is the
+/// `ResultKind::as_u8` discriminator. The worker is the source of truth for
+/// per-output values, so we trust the tuple's `name` over `step_name` (they
+/// should equal `step_name` for single-output non-mapped, the per-instance
+/// name for mapped, or the per-output name for multi-asset).
 pub(crate) fn process_worker_result(
     py: Python,
     ctx: &mut BatchContext,
@@ -715,6 +725,32 @@ pub(crate) fn process_worker_result(
             dynamic_keys.as_deref(),
         ) {
             ctx.record_failure_no_hooks(step_name, e, failures);
+        }
+    }
+
+    // As in `process_step_result`: a multi-asset's error fails the outputs
+    // it did not complete, and a generator that ended without yielding an
+    // output fails that output.
+    if !is_single {
+        let yielded: HashSet<String> = outputs_list
+            .iter()
+            .filter_map(|item| item.get_item(0).ok()?.extract().ok())
+            .collect();
+        match worker_result.getattr(py, "error") {
+            Ok(error) if !error.is_none(py) => {
+                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.into_bound(py)));
+                handle_failure(
+                    py,
+                    ctx,
+                    step,
+                    step_name,
+                    &unyielded_outputs(step, &yielded),
+                    error,
+                    step_config,
+                    failures,
+                );
+            }
+            _ => fail_unyielded_outputs(ctx, step, &yielded, failures),
         }
     }
 
