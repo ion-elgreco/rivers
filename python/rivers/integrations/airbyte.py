@@ -23,7 +23,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from http.client import HTTPException
 from typing import Any, Self
 
@@ -346,7 +346,7 @@ class AirbyteResource(Resource):
         streams: dict[str | None, AirbyteStream],
         context: AssetExecutionContext,
     ) -> Iterator[Materialization]:
-        enabled = self._enabled_streams(connection_id, streams, context.log)
+        enabled = self._enabled_streams(connection_id, streams.values(), context.log)
 
         job = self.sync(connection_id, log=context.log)
         stats = self._stream_stats(job.job_id, context.log)
@@ -380,12 +380,12 @@ class AirbyteResource(Resource):
     def _enabled_streams(
         self,
         connection_id: str,
-        streams: dict[str | None, AirbyteStream],
+        streams: Iterable[AirbyteStream],
         log: logging.Logger,
     ) -> set[tuple[str | None, str]]:
         """Keys of the enabled streams. Warns about streams with no outputs."""
         current = self.get_connection(connection_id).streams
-        outputs = {_key(s) for s in streams.values()}
+        outputs = {_key(s) for s in streams}
         new = [_label(s) for s in current if _key(s) not in outputs]
         if new:
             log.warning(
