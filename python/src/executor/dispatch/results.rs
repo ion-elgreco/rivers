@@ -23,7 +23,7 @@ use super::super::ops::{self, OutOfProcess, now_ts};
 use super::super::parallel::worker::unwrap_worker_error;
 use super::super::traceback;
 use super::context::BatchContext;
-use super::types::{CapturedLogs, WorkOutcome};
+use super::types::{CapturedLogs, StepCapture, WorkOutcome};
 
 /// Emit a Materialization event + run success hooks for one output. Shared
 /// by the `Output` (with IO write) and `Materialization` (no IO) paths so
@@ -108,8 +108,18 @@ pub(crate) fn process_step_result(
     step: &ExecutionStep,
     step_name: &str,
     step_result: ops::StepResult,
+    captured_logs: CapturedLogs,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    // A generator's body runs only as its outputs are drained below, after
+    // the capture around its call ended: that capture is logged with it.
+    let call_logs = if step_result.generator.is_some() {
+        captured_logs
+    } else {
+        emit_captured_logs(ctx, step_name, captured_logs);
+        None
+    };
+
     // Action runs: the verb ran against existing data — no output iteration,
     // no hooks. The runtime report decides what lands on the timeline.
     if let Some(verb) = ctx.scope.plan.action.clone() {
@@ -194,6 +204,10 @@ pub(crate) fn process_step_result(
     };
     let mut gen_marks_stashed = false;
 
+    let body_capture = step_result
+        .generator
+        .is_some()
+        .then(|| StepCapture::start(py));
     let result = ops::for_each_output(
         py,
         &step_result,
@@ -296,6 +310,17 @@ pub(crate) fn process_step_result(
             Ok(())
         },
     );
+    if let Some(capture) = body_capture {
+        let logs = match (call_logs, capture.finish()) {
+            (Some((out, err, logs)), Some(body)) => Some((
+                out + body.0.as_str(),
+                err + body.1.as_str(),
+                logs + body.2.as_str(),
+            )),
+            (call, body) => call.or(body),
+        };
+        emit_captured_logs(ctx, step_name, logs);
+    }
 
     if let Err(e) = result {
         // Failure event scope: mapped instance fails just itself; non-mapped
@@ -518,8 +543,15 @@ pub(crate) fn process_outcome(
             step_result,
             captured_logs,
         } => {
-            emit_captured_logs(ctx, step_name, captured_logs);
-            process_step_result(py, ctx, step, step_name, step_result, failures);
+            process_step_result(
+                py,
+                ctx,
+                step,
+                step_name,
+                step_result,
+                captured_logs,
+                failures,
+            );
         }
         WorkOutcome::WorkerSummary {
             worker_result,

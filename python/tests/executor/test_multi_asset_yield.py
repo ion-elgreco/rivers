@@ -1130,6 +1130,122 @@ def test_multi_asset_output_kept_in_memory(executor, tmp_path, storage):
     assert repo.load_node("pa") == 1
 
 
+# ── Captured output of generator bodies ───────────────────────────────
+
+
+def _captured(storage, run_id, step_key):
+    """``(stdout, logs)`` of the step's captured-output row."""
+    [row] = [
+        row
+        for row in storage.get_run_logs(run_id)
+        if row.step_key == step_key and row.traceback is None
+    ]
+    return row.stdout, row.logs or ""
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("lone", [True, False], ids=["lone", "with_sibling"])
+@pytest.mark.parametrize("fails", [False, True], ids=["completes", "raises"])
+def test_generator_body_output_is_captured(
+    executor, is_async, lone, fails, tmp_path, storage, monkeypatch
+):
+    """A generator body's prints and log lines reach run_logs as a plain
+    body's do: before and between its yields, and before an error."""
+    import rivers._capture as cap
+
+    # Wrap pytest's own stdout of this test.
+    monkeypatch.setattr(cap, "_installed", False)
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    output_defs = [rs.AssetDef("ga", io_handler=io), rs.AssetDef("gb", io_handler=io)]
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        async def gen(context: rs.AssetExecutionContext):
+            print("first")
+            context.log.info("log from the body")
+            yield rs.Materialization(output_name="ga")
+            print("second")
+            if fails:
+                raise RuntimeError("gb broke")
+            yield rs.Materialization(output_name="gb")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        def gen(context: rs.AssetExecutionContext):
+            print("first")
+            context.log.info("log from the body")
+            yield rs.Materialization(output_name="ga")
+            print("second")
+            if fails:
+                raise RuntimeError("gb broke")
+            yield rs.Materialization(output_name="gb")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    assets = [gen] if lone else [gen, sibling]
+    repo = rs.CodeRepository(assets=assets, default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    stdout, logs = _captured(storage, result.run_id, "ga")
+    assert stdout == "first\nsecond\n"
+    # An async body, plain or generator, logs on the event loop's thread,
+    # where no capture runs.
+    if not is_async:
+        assert "log from the body" in logs
+    assert result.success is not fails
+
+
+class _LoudPickleIOHandler(rs.PickleIOHandler):
+    """Prints each load, as a handler that reports progress does."""
+
+    def load_input(self, context):
+        print(f"loading {context.asset_name}")
+        return super().load_input(context)
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_generator_step_output_is_one_row(
+    executor, is_async, tmp_path, storage, monkeypatch
+):
+    """A generator step's input load and its body share one run_logs row, as a
+    plain step's do."""
+    import rivers._capture as cap
+
+    monkeypatch.setattr(cap, "_installed", False)
+    io = _LoudPickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset(io_handler=io)
+    def upstream() -> int:
+        return 1
+
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
+        async def gen(upstream: int):
+            print(f"body got {upstream}")
+            yield rs.Materialization(output_name="ga")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
+        def gen(upstream: int):
+            print(f"body got {upstream}")
+            yield rs.Materialization(output_name="ga")
+
+    repo = rs.CodeRepository(assets=[upstream, gen], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    stdout, _ = _captured(storage, result.run_id, "ga")
+    assert stdout == "loading upstream\nbody got 1\n"
+
+
 # ── RunResult.failed_assets names the outputs that failed ─────────────
 
 

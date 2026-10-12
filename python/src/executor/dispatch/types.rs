@@ -44,6 +44,30 @@ pub(crate) struct StepInstance {
 /// `_rivers_captured_logs` attribute (failure path).
 pub(crate) type CapturedLogs = Option<(String, String, String)>;
 
+/// What a step body writes while it runs in this process: stdout and stderr
+/// through `rivers._capture`, and this thread's Rust logs.
+pub(crate) struct StepCapture<'py>(Option<Bound<'py, PyAny>>);
+
+impl<'py> StepCapture<'py> {
+    pub(crate) fn start(py: Python<'py>) -> Self {
+        let capture = py
+            .import("rivers._capture")
+            .and_then(|m| m.getattr("StepCapture"))
+            .and_then(|cls| cls.call0())
+            .ok()
+            .inspect(|c| {
+                let _ = c.call_method0("start");
+                crate::log_capture::start();
+            });
+        Self(capture)
+    }
+
+    pub(crate) fn finish(self) -> CapturedLogs {
+        let (stdout, stderr) = self.0?.call_method0("finish").ok()?.extract().ok()?;
+        Some((stdout, stderr, crate::log_capture::take()))
+    }
+}
+
 /// Outcome of phase 4 ("run the work") of the step lifecycle. `process_outcome`
 /// in `dispatch/results.rs` interprets each variant.
 ///
