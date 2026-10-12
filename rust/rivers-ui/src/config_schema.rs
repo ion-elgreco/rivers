@@ -164,25 +164,64 @@ fn is_container(node: &Value) -> bool {
     node.get("$ref").is_none() && node.get("properties").is_some_and(Value::is_object)
 }
 
-/// Whether `node` is a secret: `writeOnly` or `"format": "password"` on it
-/// or on a branch of its `anyOf`, `oneOf` or `allOf` (`SecretStr | None`).
-fn is_secret(node: &Value) -> bool {
-    let marked = |n: &Value| {
-        n.get("writeOnly") == Some(&Value::Bool(true))
-            || n.get("format").and_then(Value::as_str) == Some("password")
-    };
-    marked(node)
-        || ["anyOf", "oneOf", "allOf"]
-            .iter()
-            .filter_map(|key| node.get(*key)?.as_array())
-            .flatten()
-            .any(marked)
+/// Whether `node` marks a secret (`writeOnly`, `"format": "password"`),
+/// itself or anywhere below: a branch of a union, a list's items, a dict's
+/// values, a model's fields behind a `$ref` into `root`. A `default` is a
+/// value, not a schema, so the walk does not enter it.
+fn holds_secret(root: &Value, node: &Value) -> bool {
+    fn walk<'a>(root: &'a Value, node: &'a Value, seen: &mut Vec<&'a str>) -> bool {
+        match node {
+            Value::Object(map) => {
+                if map.get("writeOnly") == Some(&Value::Bool(true))
+                    || map.get("format").and_then(Value::as_str) == Some("password")
+                {
+                    return true;
+                }
+                if let Some(reference) = map.get("$ref").and_then(Value::as_str)
+                    && !seen.contains(&reference)
+                {
+                    seen.push(reference);
+                    let target = reference.strip_prefix('#').and_then(|p| root.pointer(p));
+                    if target.is_some_and(|t| walk(root, t, seen)) {
+                        return true;
+                    }
+                }
+                map.iter()
+                    .any(|(key, child)| key != "default" && walk(root, child, seen))
+            }
+            Value::Array(items) => items.iter().any(|item| walk(root, item, seen)),
+            _ => false,
+        }
+    }
+    walk(root, node, &mut Vec::new())
+}
+
+/// `schema` without the `default` of any node that holds a secret: pydantic
+/// masks the secret there, and the mask must never be offered as a value.
+pub fn drop_secret_defaults(schema: &mut Value) {
+    fn walk(root: &Value, node: &mut Value) {
+        if node.get("default").is_some()
+            && holds_secret(root, node)
+            && let Some(map) = node.as_object_mut()
+        {
+            map.remove("default");
+        }
+        match node {
+            Value::Object(map) => map
+                .iter_mut()
+                .filter(|(key, _)| *key != "default")
+                .for_each(|(_, child)| walk(root, child)),
+            Value::Array(items) => items.iter_mut().for_each(|item| walk(root, item)),
+            _ => {}
+        }
+    }
+    let root = schema.clone();
+    walk(&root, schema);
 }
 
 /// `schema_json` placed at `path` (property names, unescaped) in a larger
 /// schema: its `$defs` stay with it and its `#/$defs/...` references point
-/// there. A secret loses its `default`, which pydantic masks: the mask must
-/// never be offered as a value.
+/// there. A secret loses its `default` (see [`drop_secret_defaults`]).
 pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
     let mut value: Value = serde_json::from_str(schema_json).ok()?;
     if !value.is_object() {
@@ -192,16 +231,12 @@ pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
         .iter()
         .map(|seg| format!("/{}", seg.replace('~', "~0").replace('/', "~1")))
         .collect();
+    drop_secret_defaults(&mut value);
     rebase_refs(&mut value, &base);
     Some(value)
 }
 
 fn rebase_refs(value: &mut Value, base: &str) {
-    if is_secret(value)
-        && let Some(map) = value.as_object_mut()
-    {
-        map.remove("default");
-    }
     match value {
         Value::Object(map) => {
             if let Some(Value::String(reference)) = map.get_mut("$ref") {
@@ -234,10 +269,9 @@ pub fn template(schema: &Schema) -> Value {
 }
 
 fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
-    if is_secret(node) {
-        return None;
-    }
-    if let Some(default) = schema.default_of(node) {
+    if let Some(default) = schema.default_of(node)
+        && !holds_secret(&schema.root, node)
+    {
         return Some(default.clone());
     }
     if !is_container(node) {
@@ -1227,24 +1261,27 @@ mod tests {
         );
         assert_eq!(type_label(&doc, doc.at(&[key("a/b")]).unwrap()), "Cfg");
         assert_eq!(inline("[1]", &["x"]), None);
-        // A secret's masked default is dropped.
-        let secret = r#"{"properties":{"token":{"default":"**********","format":"password","type":"string","writeOnly":true}},"type":"object"}"#;
-        assert_eq!(
-            inline(secret, &["s"])
-                .unwrap()
-                .pointer("/properties/token/default"),
-            None
-        );
     }
 
     #[test]
-    fn a_secret_in_a_union_branch_is_never_prefilled() {
-        // `SecretStr | None`: pydantic marks the branch, and the mask sits
-        // next to the union. A `format: password` string is a secret too.
-        let class = r#"{"properties":{"token":{"anyOf":[{"format":"password","type":"string","writeOnly":true},{"type":"null"}],"default":"**********","title":"Token"},"pin":{"default":"**********","format":"password","type":"string"},"dsn":{"default":"x","type":"string"}},"type":"object"}"#;
+    fn a_secret_is_never_prefilled_at_any_depth() {
+        // pydantic masks a secret's default: on the field, next to a union
+        // (`SecretStr | None`), and inside a model's or a list's default. A
+        // `format: password` string is a secret too.
+        let class = r##"{"$defs":{"Login":{"properties":{"user":{"default":"me","type":"string"},"password":{"default":"**********","format":"password","type":"string","writeOnly":true}},"type":"object"}},"properties":{"token":{"anyOf":[{"format":"password","type":"string","writeOnly":true},{"type":"null"}],"default":"**********","title":"Token"},"pin":{"default":"**********","format":"password","type":"string"},"login":{"$ref":"#/$defs/Login","default":{"user":"me","password":"**********"}},"logins":{"default":[{"user":"me","password":"**********"}],"items":{"$ref":"#/$defs/Login"},"type":"array"},"dsn":{"default":"x","type":"string"}},"type":"object"}"##;
         let placed = inline(class, &["s"]).unwrap();
-        assert_eq!(placed.pointer("/properties/token/default"), None);
-        assert_eq!(placed.pointer("/properties/pin/default"), None);
+        for field in ["token", "pin", "login", "logins"] {
+            let pointer = format!("/properties/{field}/default");
+            assert_eq!(placed.pointer(&pointer), None, "{field}");
+        }
+        assert_eq!(
+            placed.pointer("/$defs/Login/properties/password/default"),
+            None
+        );
+        assert_eq!(
+            placed.pointer("/$defs/Login/properties/user/default"),
+            Some(&serde_json::json!("me"))
+        );
         assert_eq!(
             placed.pointer("/properties/dsn/default"),
             Some(&serde_json::json!("x"))

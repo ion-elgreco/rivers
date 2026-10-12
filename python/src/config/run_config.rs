@@ -15,6 +15,7 @@ use std::fmt;
 use anyhow::{anyhow, bail};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyTuple, PyType};
+use rivers_ui::config_schema::drop_secret_defaults;
 use serde_json::{Map, Value};
 
 use crate::config::ResourceVariant;
@@ -628,60 +629,6 @@ fn set_current_defaults(schema: &mut Value, inst: &Bound<'_, PyAny>) -> PyResult
 fn parse_json(text: &str) -> PyResult<Value> {
     serde_json::from_str(text)
         .map_err(|e| ConfigurationError::new_err(format!("invalid JSON: {e}")))
-}
-
-/// `schema` without the `default` of any node that holds a secret.
-fn drop_secret_defaults(schema: &mut Value) {
-    fn walk(root: &Value, node: &mut Value) {
-        if node.get("default").is_some()
-            && holds_secret(root, node)
-            && let Some(map) = node.as_object_mut()
-        {
-            map.remove("default");
-        }
-        match node {
-            Value::Object(map) => map
-                .iter_mut()
-                .filter(|(key, _)| *key != "default")
-                .for_each(|(_, child)| walk(root, child)),
-            Value::Array(items) => items.iter_mut().for_each(|item| walk(root, item)),
-            _ => {}
-        }
-    }
-    let root = schema.clone();
-    walk(&root, schema);
-}
-
-/// Whether `schema` marks a secret (`writeOnly`, `"format": "password"`),
-/// itself or anywhere below: a branch of a union, a list's items, a dict's
-/// values, a model's fields behind a `$ref`. A `default` is a value, not a
-/// schema, so the walk does not enter it.
-fn holds_secret(root: &Value, schema: &Value) -> bool {
-    fn walk<'a>(root: &'a Value, node: &'a Value, seen: &mut Vec<&'a str>) -> bool {
-        match node {
-            Value::Object(map) => {
-                if map.get("writeOnly") == Some(&Value::Bool(true))
-                    || map.get("format").and_then(Value::as_str) == Some("password")
-                {
-                    return true;
-                }
-                if let Some(reference) = map.get("$ref").and_then(Value::as_str)
-                    && !seen.contains(&reference)
-                {
-                    seen.push(reference);
-                    let target = reference.strip_prefix('#').and_then(|p| root.pointer(p));
-                    if target.is_some_and(|t| walk(root, t, seen)) {
-                        return true;
-                    }
-                }
-                map.iter()
-                    .any(|(key, child)| key != "default" && walk(root, child, seen))
-            }
-            Value::Array(items) => items.iter().any(|item| walk(root, item, seen)),
-            _ => false,
-        }
-    }
-    walk(root, schema, &mut Vec::new())
 }
 
 /// pydantic's secret types, whose values JSON mode masks.
