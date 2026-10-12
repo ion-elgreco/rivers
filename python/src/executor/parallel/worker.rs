@@ -10,6 +10,7 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::config::rebuild_resource;
 use crate::context::io::{PyInputContext, PyOutputContext};
 use crate::result_types::{self, ResultKind};
 
@@ -293,12 +294,7 @@ pub fn worker_execute_step(
 
     let mut deserialized_resources: Vec<Py<PyAny>> = Vec::new();
     for item in resource_specs.iter() {
-        let tuple: &Bound<PyTuple> = item.cast()?;
-        let param_idx: usize = tuple.get_item(0)?.extract()?;
-        let cls = tuple.get_item(1)?;
-        let fields = tuple.get_item(2)?;
-        let resource = cls.call_method1("model_validate", (&fields,))?;
-        resource.call_method0("setup")?;
+        let (param_idx, resource) = rebuild_resource::<usize>(&item)?;
         deserialized_resources.push(resource.clone().unbind());
         resolved[param_idx] = resource.unbind();
     }

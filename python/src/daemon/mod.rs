@@ -181,7 +181,7 @@ impl AutomationDaemon {
 
     fn loop_config(&self, py: Python<'_>) -> PyResult<DaemonLoopConfig> {
         // Wrapped in `Arc` because the eval dispatcher reuses them per subprocess
-        // submit (rebuilt as `(name, class, json_data)` triples in the worker).
+        // submit (rebuilt from resource specs in the worker).
         let state = self.repo.get().state.get_attached(py);
         let resources: Arc<HashMap<String, Py<PyAny>>> = Arc::new({
             state

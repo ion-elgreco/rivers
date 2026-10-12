@@ -2,7 +2,7 @@
 pub(crate) mod run_config;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyType};
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 
 use crate::errors::ConfigurationError;
 
@@ -209,12 +209,32 @@ fn lay_over(
     Ok(())
 }
 
+/// `(key, class, fields)`: what a worker process rebuilds `resource` from
+/// with [`rebuild_resource`].
+pub(crate) fn resource_spec<'py>(
+    key: impl IntoPyObject<'py>,
+    resource: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    (key, resource.get_type(), resource_fields(resource)?).into_pyobject(resource.py())
+}
+
+/// The key and the resource of a [`resource_spec`], rebuilt by its class
+/// and set up.
+pub(crate) fn rebuild_resource<'py, K: FromPyObjectOwned<'py>>(
+    spec: &Bound<'py, PyAny>,
+) -> PyResult<(K, Bound<'py, PyAny>)> {
+    let (key, cls, fields): (K, Bound<'py, PyAny>, Bound<'py, PyAny>) = spec.extract()?;
+    let resource = cls.call_method1("model_validate", (fields,))?;
+    resource.call_method0("setup")?;
+    Ok((key, resource))
+}
+
 /// The fields `resource`'s class rebuilds it from, for a run or in a worker
 /// process. Python mode keeps each secret a `SecretStr` that pickles with
 /// its value, where JSON mode would give pydantic's mask; `round_trip`
 /// dumps a `Json` field as the text it validates from and leaves computed
 /// fields out.
-pub(crate) fn resource_fields<'py>(resource: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn resource_fields<'py>(resource: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let kwargs = PyDict::new(resource.py());
     kwargs.set_item("round_trip", true)?;
     resource.call_method("model_dump", (), Some(&kwargs))

@@ -10,8 +10,8 @@
 //!
 //! Subprocess transport mirrors the multiprocess executor: the user's eval
 //! function crosses as a `FuncRef(module, qualname)` (imported in the worker,
-//! not pickled), and registered resources cross as `(name, class, fields)`
-//! triples (re-instantiated via `cls.model_validate` in the worker).
+//! not pickled), and registered resources cross as resource specs keyed by
+//! name (see [`resource_spec`]).
 //! `_FuncRef.__reduce__` returns the resolved callable directly, so the
 //! Rust wrapper in `subprocess_eval` receives the eval function unwrapped.
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::PyList;
 use rivers_core::storage::ScopedStorageHandle;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use tracing::Instrument;
@@ -32,7 +32,7 @@ use super::types::{
     AutomationKind, EvalOutcome, EvalParams, PY_EVAL_PERMITS, ResolvedEvalMode, TickResult,
 };
 use crate::automation::{parse_schedule_result, parse_sensor_result};
-use crate::config::resource_fields;
+use crate::config::resource_spec;
 use crate::executor::parallel::worker_args::make_func_ref;
 
 /// One automation that's due to evaluate this iteration. Carries the per-item
@@ -46,8 +46,8 @@ pub(crate) struct DueEval {
 pub(crate) struct EvalDispatcher {
     loky_executor: Option<Arc<Py<PyAny>>>,
     /// Registered resources (name → Pydantic instance). Serialized at submit
-    /// time into `(name, class, fields)` triples so the subprocess wrapper
-    /// can rebuild + `setup()` them before invoking the eval function.
+    /// time into resource specs so the subprocess wrapper can rebuild +
+    /// `setup()` them before invoking the eval function.
     resources: Arc<HashMap<String, Py<PyAny>>>,
     /// Run-status sensors read finished runs from storage before they call Python.
     handle: ScopedStorageHandle<SurrealStorage>,
@@ -296,24 +296,16 @@ async fn run_in_process_eval(params: &EvalParams) -> Result<EvalOutcome, String>
     }
 }
 
-/// Build `[(name, class, fields), ...]` for every registered resource —
-/// subprocess workers rebuild instances via `cls.model_validate` before
-/// `precompute_args` looks them up by parameter name.
+/// A [`resource_spec`] keyed by name for every registered resource —
+/// subprocess workers rebuild the instances before `precompute_args` looks
+/// them up by parameter name.
 pub(super) fn build_resource_specs<'py>(
     py: Python<'py>,
     resources: &HashMap<String, Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyList>> {
     let specs = PyList::empty(py);
     for (name, resource) in resources {
-        let resource = resource.bind(py);
-        specs.append(PyTuple::new(
-            py,
-            [
-                name.into_pyobject(py)?.into_any(),
-                resource.get_type().into_any(),
-                resource_fields(resource)?,
-            ],
-        )?)?;
+        specs.append(resource_spec(name, resource.bind(py))?)?;
     }
     Ok(specs)
 }
