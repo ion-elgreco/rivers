@@ -209,7 +209,7 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::WorkerStepError;
-use crate::executor::ops::{self, write_output};
+use crate::executor::ops::{self, OutOfProcess, write_output};
 use crate::metadata::MetadataValue;
 
 /// Self-contained step execution for loky subprocess.
@@ -322,12 +322,13 @@ pub fn worker_execute_step(
             // Multi-asset: build a synthetic StepResult and drive the shared
             // iterator. Per-yield ctx peek/drain happens inside
             // `for_each_output_generator`; for dict we drain once up-front.
-            let mut spec_map: HashMap<String, (Py<PyAny>, Py<PyAny>)> = HashMap::new();
+            // A `None` handler marks an output kept in memory.
+            let mut spec_map: HashMap<String, (Option<Py<PyAny>>, Py<PyAny>)> = HashMap::new();
             let mut selected_outputs: Vec<String> = Vec::new();
             for spec in specs.iter() {
                 let spec_tuple: &Bound<PyTuple> = spec.cast()?;
                 let name: String = spec_tuple.get_item(0)?.extract()?;
-                let handler = spec_tuple.get_item(1)?.unbind();
+                let handler: Option<Py<PyAny>> = spec_tuple.get_item(1)?.extract()?;
                 let kwargs = spec_tuple.get_item(2)?.unbind();
                 spec_map.insert(name.clone(), (handler, kwargs));
                 selected_outputs.push(name);
@@ -381,6 +382,9 @@ pub fn worker_execute_step(
                             let (handler, out_kwargs) = match spec_map.get(&name) {
                                 Some(s) => s,
                                 None => return Ok(()),
+                            };
+                            let Some(handler) = handler else {
+                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
                             };
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
@@ -473,18 +477,16 @@ pub fn worker_execute_step(
                         data_version,
                     } => {
                         let (final_dv, kind) = if let Some(value) = value {
-                            let final_dv = if let (Some(handler), Some(out_kwargs)) =
+                            let (Some(handler), Some(out_kwargs)) =
                                 (&io_handler, &output_context_kwargs)
-                            {
-                                let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
-                                let out_ctx =
-                                    Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                                let written = write_output(py, handler, &out_ctx, &value)?;
-                                ops::merge_metadata(&mut metadata, &written.metadata);
-                                written.data_version.or(data_version)
-                            } else {
-                                data_version
+                            else {
+                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
                             };
+                            let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
+                            let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
+                            let written = write_output(py, handler, &out_ctx, &value)?;
+                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            let final_dv = written.data_version.or(data_version);
                             if let Some((graph_handler, graph_kwargs)) = &graph_output {
                                 let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;
                                 let graph_ctx =

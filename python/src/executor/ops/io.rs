@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::assets::self_dependency::PySelfDependency;
 use crate::context::io::{PyInputContext, PyOutputContext};
-use crate::errors::PartitionValidationError;
+use crate::errors::{ExecutionError, PartitionValidationError};
 use crate::metadata::MetadataValue;
 use crate::partitions::mapping::UpstreamKeyResolution;
 use crate::partitions::{PartitionContext, PartitionMapping, PyPartitionKey};
@@ -153,6 +153,9 @@ pub(crate) fn load_upstream_input(
     };
 
     let handler = registry.for_upstream_input(py, downstream_node, upstream_node, param_name);
+    if crate::executor::in_step_pod() {
+        OutOfProcess::Kubernetes.check_handler(py, param_name, &handler)?;
+    }
     let metadata = downstream_node
         .input_metadata(param_name)
         .or_else(|| upstream_node.metadata());
@@ -255,4 +258,54 @@ pub(crate) fn handle_step_output(
         ),
     )?;
     write_output(py, &handler, &ctx, result)
+}
+
+/// An executor that runs steps outside the orchestrator's process.
+#[derive(Clone, Copy)]
+pub(crate) enum OutOfProcess {
+    Parallel,
+    Kubernetes,
+}
+
+impl OutOfProcess {
+    /// `asset`'s value would have to cross into or out of a step's process
+    /// through an `InMemoryIOHandler`.
+    pub(crate) fn in_memory_error(self, asset: &str) -> PyErr {
+        let (executor, processes, alternative) = match self {
+            Self::Parallel => (
+                "parallel",
+                "subprocesses",
+                ", or switch to Executor.in_process()",
+            ),
+            Self::Kubernetes => ("Kubernetes", "step pods", ""),
+        };
+        ExecutionError::new_err(format!(
+            "Asset '{asset}' uses InMemoryIOHandler which cannot work with {executor} \
+             execution. InMemoryIOHandler stores data in process-local memory that is not \
+             accessible from {processes}. Use PickleIOHandler or DeltaIOHandler \
+             instead{alternative}."
+        ))
+    }
+
+    /// Fails when `handler`, which moves `asset`'s value between processes,
+    /// is an `InMemoryIOHandler`.
+    pub(crate) fn check_handler(
+        self,
+        py: Python,
+        asset: &str,
+        handler: &Py<PyAny>,
+    ) -> PyResult<()> {
+        if is_in_memory(py, handler)? {
+            return Err(self.in_memory_error(asset));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `handler` keeps its values in this process's memory.
+pub(crate) fn is_in_memory(py: Python, handler: &Py<PyAny>) -> PyResult<bool> {
+    let memory_cls = py
+        .import("rivers.io_handlers.memory")?
+        .getattr("InMemoryIOHandler")?;
+    handler.bind(py).is_instance(&memory_cls)
 }

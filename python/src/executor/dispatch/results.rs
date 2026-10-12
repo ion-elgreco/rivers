@@ -18,7 +18,8 @@ use crate::errors::ExecutionError;
 use crate::metadata::MetadataValue;
 use crate::result_types::ResultKind;
 
-use super::super::ops::{self, now_ts};
+use super::super::in_step_pod;
+use super::super::ops::{self, OutOfProcess, now_ts};
 use super::super::traceback;
 use super::context::BatchContext;
 use super::types::{CapturedLogs, WorkOutcome};
@@ -229,6 +230,10 @@ pub(crate) fn process_step_result(
                     // value.is_some() => Output(v): write via IO handler.
                     // value.is_none() => Materialization(...): user-managed.
                     let resolved_dv = if let Some(value) = &value {
+                        if in_step_pod() {
+                            let handler = ctx.repo.io_handler_registry.for_output(py, node);
+                            OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
+                        }
                         let written = ops::handle_step_output(
                             py,
                             &name,

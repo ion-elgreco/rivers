@@ -3,7 +3,8 @@
 //! parallel-pool backends.
 //!
 //! Phase shape:
-//!   1. (parallel/k8s only — caller's responsibility) IO compatibility check
+//!   1. (parallel only — caller's responsibility) check the worker's inputs
+//!      can leave this process
 //!   2. (optional) Pool-claim / semaphore acquisition
 //!   3. Emit `StepStart` events
 //!   4. Run the work — supplied by the backend via [`SyncWorker`] / [`AsyncWorker`]

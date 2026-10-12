@@ -7,7 +7,11 @@ mixed configurations, and per-asset executor overrides.
 
 import datetime
 import json
+import os
 import pickle
+import subprocess
+import sys
+import textwrap
 
 import obstore
 import obstore.store
@@ -1958,8 +1962,158 @@ def test_mp_in_memory_io_rejected_in_collecting():
     assets = [cm_a, cm_b]
     repo = rs.CodeRepository(assets=assets, default_executor=MP)
     result = repo.materialize(raise_on_error=False)
-    assert len(result.failed_assets) > 0
-    assert any("InMemoryIOHandler" in msg for _, msg in result.failed_assets)
+    assert sorted(result.failed_assets) == [
+        ("cm_a", _in_memory_error("cm_a")),
+        ("cm_b", _in_memory_error("cm_b")),
+    ]
+
+
+def _in_memory_error(asset):
+    return (
+        f"ExecutionError: Asset '{asset}' uses InMemoryIOHandler which cannot work "
+        "with parallel execution. InMemoryIOHandler stores data in process-local "
+        "memory that is not accessible from subprocesses. Use PickleIOHandler or "
+        "DeltaIOHandler instead, or switch to Executor.in_process()."
+    )
+
+
+def _materializations(storage, run_id):
+    """``{(asset, partition): metadata}`` of every Materialization in the run."""
+    return {
+        (e.asset_key, e.partition_key and e.partition_key.to_json()): dict(e.metadata)
+        for e in storage.get_events_for_run(run_id)
+        if e.event_type == "Materialization"
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_materialization_only_assets_need_no_io_handler(executor, is_async, storage):
+    """Assets that persist their own output run without an IO handler."""
+    if is_async:
+
+        @rs.Asset
+        async def mat_x() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 1})
+
+        @rs.Asset
+        async def mat_y() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 2})
+
+    else:
+
+        @rs.Asset
+        def mat_x() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 1})
+
+        @rs.Asset
+        def mat_y() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 2})
+
+    repo = rs.CodeRepository(assets=[mat_x, mat_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["mat_x", "mat_y"])
+
+    assert result.success
+    assert _materializations(storage, result.run_id) == {
+        ("mat_x", None): {"rows": '{"Int":{"value":1}}'},
+        ("mat_y", None): {"rows": '{"Int":{"value":2}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_materialization_only_multi_asset_needs_no_io_handler(
+    executor, is_async, storage
+):
+    """A generator multi-asset without annotations that yields only
+    Materializations runs without an IO handler, next to a sibling step."""
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("load_a"), rs.AssetDef("load_b")])
+        async def load():
+            yield rs.Materialization(output_name="load_a", metadata={"rows": 1})
+            yield rs.Materialization(output_name="load_b", metadata={"rows": 2})
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("load_a"), rs.AssetDef("load_b")])
+        def load():
+            yield rs.Materialization(output_name="load_a", metadata={"rows": 1})
+            yield rs.Materialization(output_name="load_b", metadata={"rows": 2})
+
+    @rs.Asset
+    def sibling():
+        return rs.Materialization(metadata={"rows": 3})
+
+    repo = rs.CodeRepository(assets=[load, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["load_a", "load_b", "sibling"])
+
+    assert result.success
+    assert _materializations(storage, result.run_id) == {
+        ("load_a", None): {"rows": '{"Int":{"value":1}}'},
+        ("load_b", None): {"rows": '{"Int":{"value":2}}'},
+        ("sibling", None): {"rows": '{"Int":{"value":3}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_materialization_only_partitioned_assets_need_no_io_handler(executor, storage):
+    """Partitioned assets that persist their own output need no IO handler."""
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+    @rs.Asset(partitions_def=pd)
+    def part_x(context: rs.AssetExecutionContext) -> rs.Materialization:
+        return rs.Materialization(metadata={"key": context.partition_key})
+
+    @rs.Asset(partitions_def=pd)
+    def part_y(context: rs.AssetExecutionContext) -> rs.Materialization:
+        return rs.Materialization(metadata={"key": context.partition_key})
+
+    repo = rs.CodeRepository(assets=[part_x, part_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(partition_key=rs.PartitionKey.single("p2"))
+
+    assert result.success
+    p2 = rs.PartitionKey.single("p2").to_json()
+    assert _materializations(storage, result.run_id) == {
+        ("part_x", p2): {"key": '{"Text":{"value":"p2"}}'},
+        ("part_y", p2): {"key": '{"Text":{"value":"p2"}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_in_memory_value_for_a_worker_consumer(executor, tmp_path):
+    """A value on the in-memory default cannot reach a consumer in a worker,
+    even when its producer ran in this process."""
+    handler = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset
+    def source() -> int:
+        return 1
+
+    @rs.Asset(io_handler=handler)
+    def plus_one(source: int) -> int:
+        return source + 1
+
+    @rs.Asset(io_handler=handler)
+    def plus_two(source: int) -> int:
+        return source + 2
+
+    repo = rs.CodeRepository(
+        assets=[source, plus_one, plus_two], default_executor=executor
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    if executor is MP:
+        assert sorted(result.failed_assets) == [
+            ("plus_one", _in_memory_error("source")),
+            ("plus_two", _in_memory_error("source")),
+        ]
+    else:
+        assert result.failed_assets == []
+        assert repo.load_node("plus_two") == 3
 
 
 @pytest.mark.parametrize("name", rs.exceptions.__all__)
@@ -1972,6 +2126,66 @@ def test_rivers_exceptions_pickle_as_their_class(name):
 
     assert type(restored) is cls
     assert restored.args == ("boom",)
+
+
+def test_in_memory_values_in_a_kubernetes_step_pod(tmp_path):
+    """A K8s step pod runs its step in-process and applies the same rule: a
+    step that persists its own output runs, an in-memory value cannot leave
+    or enter the pod. Subprocess because the step-pod flag is read once per
+    process."""
+    script = textwrap.dedent(
+        f"""
+        import json
+
+        import obstore.store
+        import rivers as rs
+        from rivers.testing import memory_storage
+
+        handler = rs.PickleIOHandler(store=obstore.store.LocalStore({str(tmp_path)!r}))
+
+        @rs.Asset
+        def own_output() -> rs.Materialization:
+            return rs.Materialization()
+
+        @rs.Asset(io_handler=rs.InMemoryIOHandler())
+        def in_memory() -> int:
+            return 1
+
+        @rs.Asset(io_handler=handler)
+        def consumer(in_memory: int) -> int:
+            return in_memory + 1
+
+        repo = rs.CodeRepository(
+            assets=[own_output, in_memory, consumer],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=memory_storage())
+        for step in ("own_output", "in_memory", "consumer"):
+            result = repo.materialize(selection=[step], raise_on_error=False)
+            print(json.dumps(result.failed_assets))
+        """
+    )
+    env = dict(os.environ, RIVERS_STEP_POD="1")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    error = (
+        "ExecutionError: Asset 'in_memory' uses InMemoryIOHandler which cannot "
+        "work with Kubernetes execution. InMemoryIOHandler stores data in "
+        "process-local memory that is not accessible from step pods. Use "
+        "PickleIOHandler or DeltaIOHandler instead."
+    )
+    assert [json.loads(line) for line in proc.stdout.splitlines()] == [
+        [],
+        [["in_memory", error]],
+        [["consumer", error]],
+    ]
 
 
 # ---------------------------------------------------------------------------

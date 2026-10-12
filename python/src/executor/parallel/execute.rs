@@ -14,7 +14,7 @@ use pyo3::types::{PyDict, PySet, PyTuple};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::errors::{ExecutionError, WorkerStepError};
+use crate::errors::WorkerStepError;
 use crate::runtime::rt;
 
 use super::super::dispatch::{
@@ -23,7 +23,6 @@ use super::super::dispatch::{
 };
 use super::super::ops::{self, now_ts};
 use super::super::traceback;
-use super::validate_not_in_memory_io;
 use super::worker_args::{build_worker_submit_args, resolve_worker_args};
 
 /// The step's own exception and captured logs from a failed worker step (see
@@ -253,23 +252,6 @@ impl ParallelBackend {
             .callable(py)
             .expect("node must have a callable — validated at plan build time");
 
-        if let Err(e) = validate_not_in_memory_io(py, &step_name, node) {
-            ctx.record_failure_no_hooks(&step_name, e, failures);
-            return None;
-        }
-        // For mapped instances, only validate the step itself — mapped fan-out
-        // is single-output (no multi-asset), matching prior behaviour.
-        if instance.fan_out.is_none() {
-            for out_name in &step.outputs {
-                if let Some(out_node) = ctx.repo.node_map.get(out_name)
-                    && let Err(e) = validate_not_in_memory_io(py, out_name, out_node)
-                {
-                    ctx.record_failure_no_hooks(&step_name, e, failures);
-                    return None;
-                }
-            }
-        }
-
         let empty_overrides: HashMap<String, Py<PyAny>> = HashMap::new();
         let no_outputs: &[String] = &[];
         let (input_overrides, outputs_for_meta) = if instance.fan_out.is_some() {
@@ -286,8 +268,8 @@ impl ParallelBackend {
                 ctx.state.mapped_instance_keys,
             ) {
                 Ok(ov) => ov,
-                Err(msg) => {
-                    ctx.record_failure_no_hooks(&step_name, ExecutionError::new_err(msg), failures);
+                Err(e) => {
+                    ctx.record_failure_no_hooks(&step_name, e, failures);
                     return None;
                 }
             };
@@ -333,14 +315,10 @@ impl ParallelBackend {
             }
         };
 
-        // The worker writes a graph's output with its final task's. A graph
-        // kept in memory is written here instead, after the task's output
-        // is loaded back (`process_worker_result`).
         let graph = if instance.fan_out.is_none()
             && step.outputs.is_empty()
             && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step_name)
             && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-            && validate_not_in_memory_io(py, graph_name, graph_node).is_ok()
         {
             Some((graph_name.as_str(), graph_node))
         } else {

@@ -83,7 +83,7 @@ Stores outputs in a Python dictionary. No persistence across runs. **This is the
 io = rs.InMemoryIOHandler()
 ```
 
-No constructor parameters. Cannot survive a process boundary — switch to `PickleIOHandler` or `DeltaIOHandler` if you use `Executor.parallel()` or `Executor.kubernetes()`.
+No constructor parameters. Cannot survive a process boundary — with `Executor.parallel()` or `Executor.kubernetes()`, switch to `PickleIOHandler` or `DeltaIOHandler` for values that go to or come from a step in another process.
 
 **Output metadata:** `{"storage": "memory", "size_bytes": <int>}`
 
