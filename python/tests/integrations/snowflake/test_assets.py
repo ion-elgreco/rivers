@@ -31,20 +31,6 @@ def _deletions(storage, name: str) -> int:
     return sum(e.event_type == "Deletion" for e in storage.get_events_for_asset(name))
 
 
-def _regional_events(handler, meta=None):
-    class Events(SnowflakeAsset):
-        name = "events"
-        io_handler = handler
-        partitions_def = _REGIONS
-        metadata = {"snowflake/partition_expr": "region"} if meta is None else meta
-
-        @classmethod
-        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
-            return pa.table({"region": [context.partition_key] * 2, "v": [1, 2]})
-
-    return Events
-
-
 def _users(handler):
     class Users(SnowflakeAsset):
         name = "users"
@@ -62,15 +48,25 @@ def _action_context(handler, partition=None, meta=None) -> rs.ActionContext:
         asset_name="events",
         action="delete",
         io_handler=handler,
-        asset_metadata=meta or {},
+        asset_metadata=meta,
         partition=partition,
     )
 
 
 def test_keyed_delete_removes_one_partition(storage, executor_env, warehouse):
     executor, _ = executor_env
-    events = _regional_events(SnowflakeIOHandler(resource=warehouse))
-    repo = make_repo([events], storage, executor=executor)
+
+    class Events(SnowflakeAsset):
+        name = "events"
+        io_handler = SnowflakeIOHandler(resource=warehouse)
+        partitions_def = _REGIONS
+        metadata = {"snowflake/partition_expr": "region"}
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
+            return pa.table({"region": [context.partition_key] * 2, "v": [1, 2]})
+
+    repo = make_repo([Events], storage, executor=executor)
     for region in ("us", "eu"):
         repo.materialize(partition_key=rs.PartitionKey.single(region))
 
