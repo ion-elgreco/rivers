@@ -3,14 +3,6 @@
 Install with ``pip install rivers[pandera]``, next to the extra of your frame
 library: ``rivers[pandas]`` or ``rivers[polars]``.
 
-rivers validates an asset's return value when its return hint holds a pandera
-schema: ``pandera.typing.DataFrame[Model]`` (pandas),
-``pandera.typing.polars.DataFrame[Model]`` or ``LazyFrame[Model]`` (polars),
-or ``Annotated[frame type, schema]`` for a ``DataFrameSchema``. Validation is
-lazy, so a failure lists every failed check. rivers stores the frame that
-pandera returns, with coercion applied, and records the schema on the
-materialization as ``pandera/schema`` metadata.
-
 Example::
 
     import pandas as pd
