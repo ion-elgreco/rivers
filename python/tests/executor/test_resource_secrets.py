@@ -11,81 +11,21 @@ import pickle
 
 import obstore.store
 import pytest
-from pydantic import BaseModel, ConfigDict, SecretBytes, SecretStr
 
 import rivers as rs
 from rivers._core import AutomationDaemon
 
+from _helpers import VAULT_SECRETS, VAULT_VALUES, Vault, make_vault, reveal
 from _polling import wait_until
-
-
-class Login(BaseModel):
-    user: str
-    password: SecretStr
-
-
-class Connection(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    name: str
-    url: SecretStr | None = None
-    password: SecretStr | None = None
-
-
-class Vault(rs.Resource):
-    region: str = "eu"
-    token: SecretStr
-    maybe: SecretStr | None = None
-    raw: SecretBytes
-    login: Login
-    connections: list[Connection] = []
 
 
 class Sink(rs.Resource):
     path: str
 
 
-def _vault() -> Vault:
-    return Vault(
-        token="t0ken",
-        maybe="m4ybe",
-        raw=b"r4w\xff",
-        login=Login(user="me", password="l0gin"),
-        connections=[
-            Connection(name="pg", url="postgres://u:c0nn@h/db", password="c0nn")
-        ],
-    )
-
-
-SECRETS = ["t0ken", "m4ybe", "r4w", "l0gin", "c0nn"]
-
-EXPECTED = {
-    "region": "eu",
-    "token": "t0ken",
-    "maybe": "m4ybe",
-    "raw": b"r4w\xff",
-    "login": ("me", "l0gin"),
-    "connections": [("pg", "postgres://u:c0nn@h/db", "c0nn")],
-}
-
-
-def _revealed(secret: SecretStr | None) -> str | None:
-    return secret.get_secret_value() if secret is not None else None
-
-
 def _reveal(vault: Vault) -> dict:
     """What `vault` holds, secrets revealed, and the process that saw it."""
-    return {
-        "pid": os.getpid(),
-        "region": vault.region,
-        "token": vault.token.get_secret_value(),
-        "maybe": _revealed(vault.maybe),
-        "raw": vault.raw.get_secret_value(),
-        "login": (vault.login.user, vault.login.password.get_secret_value()),
-        "connections": [
-            (c.name, _revealed(c.url), _revealed(c.password)) for c in vault.connections
-        ],
-    }
+    return {"pid": os.getpid(), **reveal(vault)}
 
 
 def _asset(name: str, handler: rs.BaseIOHandler, is_async: bool):
@@ -138,7 +78,7 @@ def test_secrets_reach_the_asset_body(storage, tmp_path, executor, is_async):
     )
     repo = rs.CodeRepository(
         assets=[_asset(n, handler, is_async) for n in ("left", "right")],
-        resources={"vault": _vault()},
+        resources={"vault": make_vault()},
         default_executor=_executor(executor),
     )
     repo.resolve(storage=storage)
@@ -149,11 +89,11 @@ def test_secrets_reach_the_asset_body(storage, tmp_path, executor, is_async):
     for name in ("left", "right"):
         seen = repo.load_node(name)
         assert (seen.pop("pid") != os.getpid()) == in_worker
-        assert seen == EXPECTED
+        assert seen == VAULT_VALUES
 
     stored = _stored_text(storage, result.run_id)
     assert stored.count("token=SecretStr('**********')") == 2, stored
-    assert [s for s in SECRETS if s in stored] == []
+    assert [s for s in VAULT_SECRETS if s in stored] == []
 
 
 def test_a_runs_rebuilt_resource_keeps_its_secrets_in_workers(storage, tmp_path):
@@ -164,7 +104,7 @@ def test_a_runs_rebuilt_resource_keeps_its_secrets_in_workers(storage, tmp_path)
     )
     repo = rs.CodeRepository(
         assets=[_asset(n, handler, False) for n in ("left", "right")],
-        resources={"vault": _vault()},
+        resources={"vault": make_vault()},
         default_executor=rs.Executor.parallel(max_workers=2),
     )
     repo.resolve(storage=storage)
@@ -175,7 +115,7 @@ def test_a_runs_rebuilt_resource_keeps_its_secrets_in_workers(storage, tmp_path)
     for name in ("left", "right"):
         seen = repo.load_node(name)
         assert seen.pop("pid") != os.getpid()
-        assert seen == {**EXPECTED, "region": "us"}
+        assert seen == {**VAULT_VALUES, "region": "us"}
     assert storage.get_run(result.run_id).config == document
 
 
@@ -235,7 +175,7 @@ def test_secrets_reach_a_subprocess_evaluation(storage, tmp_path, kind):
         jobs=[rs.Job(name="j", assets=[a])],
         sensors=sensors,
         schedules=schedules,
-        resources={"vault": _vault(), "sink": Sink(path=str(seen_file))},
+        resources={"vault": make_vault(), "sink": Sink(path=str(seen_file))},
     )
     repo.resolve(storage=storage)
 
@@ -251,4 +191,4 @@ def test_secrets_reach_a_subprocess_evaluation(storage, tmp_path, kind):
     with open(seen_file, "rb") as fh:
         seen = pickle.load(fh)
     assert seen.pop("pid") != os.getpid()
-    assert seen == EXPECTED
+    assert seen == VAULT_VALUES

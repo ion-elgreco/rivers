@@ -16,8 +16,9 @@ import os
 
 import grpc
 import rivers as rs
+from _helpers import VAULT_SECRETS, VAULT_VALUES, Vault, make_vault, reveal
 from _polling import wait_for_run_terminal
-from pydantic import BaseModel, ConfigDict, Field, Json, SecretStr, field_validator
+from pydantic import BaseModel, Field, Json, SecretStr, field_validator
 from pydantic_settings import BaseSettings
 from rivers._core import AutomationDaemon
 
@@ -82,52 +83,6 @@ class DbResource(rs.Resource):
     pool_size: int = Field(2, ge=1)
     token: SecretStr = SecretStr("s3cret")
     options: Json[dict] = '{"retries": 3}'
-
-
-class Login(BaseModel):
-    user: str = "me"
-    password: SecretStr
-
-
-class Connection(BaseModel):
-    """A list item holding secrets, as an integration's connections do."""
-
-    model_config = ConfigDict(extra="allow")
-
-    name: str
-    url: SecretStr | None = None
-    password: SecretStr | None = None
-    api_key: SecretStr = SecretStr("c0nn-key")
-
-
-class VaultResource(rs.Resource):
-    """Secrets at each depth a field can hold them."""
-
-    region: str = "eu"
-    token: SecretStr = SecretStr("t0ken")
-    maybe: SecretStr | None = SecretStr("m4ybe")
-    login: Login = Login(password=SecretStr("l0gin"))
-    connections: list[Connection] = [
-        Connection(
-            name="pg",
-            url=SecretStr("postgres://u:c0nn@h/db"),
-            password=SecretStr("c0nn"),
-        )
-    ]
-
-
-VAULT_SECRETS = ["t0ken", "m4ybe", "l0gin", "c0nn"]
-VAULT_VALUES = {
-    "region": "eu",
-    "token": "t0ken",
-    "maybe": "m4ybe",
-    "login": ("me", "l0gin"),
-    "connections": [("pg", "postgres://u:c0nn@h/db", "c0nn")],
-}
-
-
-def _revealed(secret: SecretStr | None) -> str | None:
-    return secret.get_secret_value() if secret is not None else None
 
 
 def _build_repo(tmp_path, run_queue=None):
@@ -204,17 +159,8 @@ def _build_repo(tmp_path, run_queue=None):
         return f"{db.dsn}/{db.pool_size}/{db.token.get_secret_value()}"
 
     @rs.Asset(io_handler=handler)
-    def uses_vault(vault: VaultResource):
-        return {
-            "region": vault.region,
-            "token": vault.token.get_secret_value(),
-            "maybe": _revealed(vault.maybe),
-            "login": (vault.login.user, vault.login.password.get_secret_value()),
-            "connections": [
-                (c.name, _revealed(c.url), _revealed(c.password))
-                for c in vault.connections
-            ],
-        }
+    def uses_vault(vault: Vault):
+        return reveal(vault)
 
     # A bash task has no function, so no config class.
     shell = rs.BashTask(name="shell", command="true")
@@ -238,7 +184,7 @@ def _build_repo(tmp_path, run_queue=None):
         ],
         tasks=[tidy, shell],
         jobs=[job, tidy_job, shell_job],
-        resources={"db": DbResource(), "vault": VaultResource(), "store": handler},
+        resources={"db": DbResource(), "vault": make_vault(), "store": handler},
         default_executor=rs.Executor.in_process(),
         run_queue=run_queue,
     )
