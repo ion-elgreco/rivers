@@ -15,7 +15,16 @@ import pytest
 import rivers as rs
 from rivers._core import AutomationDaemon
 
-from _helpers import VAULT_SECRETS, VAULT_VALUES, Vault, make_vault, reveal
+from _helpers import (
+    EXECUTORS,
+    MP,
+    VAULT_SECRETS,
+    VAULT_VALUES,
+    Vault,
+    make_repo,
+    make_vault,
+    reveal,
+)
 from _polling import wait_until
 
 
@@ -30,25 +39,25 @@ def _reveal(vault: Vault) -> dict:
 
 def _asset(name: str, handler: rs.BaseIOHandler, is_async: bool):
     """An asset that prints `vault` (masked) and returns what it holds."""
-    if is_async:
 
-        async def body(vault: Vault) -> dict:
-            print(vault)
-            return _reveal(vault)
+    def body(vault: Vault) -> dict:
+        print(vault)
+        return _reveal(vault)
 
-    else:
+    async def async_body(vault: Vault) -> dict:
+        return body(vault)
 
-        def body(vault: Vault) -> dict:
-            print(vault)
-            return _reveal(vault)
-
-    return rs.Asset(name=name, io_handler=handler)(body)
+    return rs.Asset(name=name, io_handler=handler)(async_body if is_async else body)
 
 
-def _executor(kind: str):
-    if kind == "parallel":
-        return rs.Executor.parallel(max_workers=2)
-    return rs.Executor.in_process()
+def _repo(storage, tmp_path, executor, is_async=False) -> rs.CodeRepository:
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+    assets = [_asset(name, handler, is_async) for name in ("left", "right")]
+    return make_repo(
+        assets, storage, executor=executor, resources={"vault": make_vault()}
+    )
 
 
 def _stored_text(storage, run_id: str) -> str:
@@ -65,7 +74,7 @@ def _stored_text(storage, run_id: str) -> str:
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("executor", ["in_process", "parallel"])
+@pytest.mark.parametrize("executor", EXECUTORS)
 def test_secrets_reach_the_asset_body(storage, tmp_path, executor, is_async):
     """Two steps, so the parallel executor sends sync ones to loky workers;
     it runs async steps in this process."""
@@ -73,19 +82,11 @@ def test_secrets_reach_the_asset_body(storage, tmp_path, executor, is_async):
 
     cap._installed = False  # capture this test's stdout, which pytest swapped
 
-    handler = rs.PickleIOHandler(
-        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
-    )
-    repo = rs.CodeRepository(
-        assets=[_asset(n, handler, is_async) for n in ("left", "right")],
-        resources={"vault": make_vault()},
-        default_executor=_executor(executor),
-    )
-    repo.resolve(storage=storage)
+    repo = _repo(storage, tmp_path, executor, is_async)
     result = repo.materialize()
     assert result.success
 
-    in_worker = executor == "parallel" and not is_async
+    in_worker = executor is MP and not is_async
     for name in ("left", "right"):
         seen = repo.load_node(name)
         assert (seen.pop("pid") != os.getpid()) == in_worker
@@ -99,15 +100,7 @@ def test_secrets_reach_the_asset_body(storage, tmp_path, executor, is_async):
 def test_a_runs_rebuilt_resource_keeps_its_secrets_in_workers(storage, tmp_path):
     """A launch document that sets one field rebuilds the resource with every
     other value, secrets included, and the workers get that copy."""
-    handler = rs.PickleIOHandler(
-        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
-    )
-    repo = rs.CodeRepository(
-        assets=[_asset(n, handler, False) for n in ("left", "right")],
-        resources={"vault": make_vault()},
-        default_executor=rs.Executor.parallel(max_workers=2),
-    )
-    repo.resolve(storage=storage)
+    repo = _repo(storage, tmp_path, MP)
     document = {"resources": {"vault": {"region": "us"}}}
     result = repo.materialize(config=document)
     assert result.success
@@ -119,22 +112,13 @@ def test_a_runs_rebuilt_resource_keeps_its_secrets_in_workers(storage, tmp_path)
     assert storage.get_run(result.run_id).config == document
 
 
-def _record(sink: Sink, vault: Vault) -> None:
+def _record(context, vault: Vault, sink: Sink):
     """Write what `vault` holds for the test to read; the rename keeps a
     reader from seeing half a file."""
     partial = f"{sink.path}.partial"
     with open(partial, "wb") as fh:
         pickle.dump(_reveal(vault), fh)
     os.replace(partial, sink.path)
-
-
-def _sensor_fn(context: rs.SensorEvaluationContext, vault: Vault, sink: Sink):
-    _record(sink, vault)
-    return rs.SkipReason("recorded")
-
-
-def _schedule_fn(context: rs.ScheduleEvaluationContext, vault: Vault, sink: Sink):
-    _record(sink, vault)
     return rs.SkipReason("recorded")
 
 
@@ -147,37 +131,38 @@ def test_secrets_reach_a_subprocess_evaluation(storage, tmp_path, kind):
         return 1
 
     if kind == "sensor":
-        sensors = [
-            rs.Sensor(
-                _sensor_fn,
-                name="watch",
-                asset_selection=["a"],
-                minimum_interval="1s",
-                default_status=rs.SensorStatus.Running,
-                eval_mode=rs.EvalMode.Subprocess,
-            )
-        ]
-        schedules = []
+        triggers = {
+            "sensors": [
+                rs.Sensor(
+                    _record,
+                    name="watch",
+                    asset_selection=["a"],
+                    minimum_interval="1s",
+                    default_status=rs.SensorStatus.Running,
+                    eval_mode=rs.EvalMode.Subprocess,
+                )
+            ]
+        }
     else:
-        sensors = []
-        schedules = [
-            rs.Schedule(
-                _schedule_fn,
-                name="watch",
-                cron_schedule="* * * * * *",
-                job_name="j",
-                default_status=rs.ScheduleStatus.Running,
-                eval_mode=rs.EvalMode.Subprocess,
-            )
-        ]
-    repo = rs.CodeRepository(
-        assets=[a],
+        triggers = {
+            "schedules": [
+                rs.Schedule(
+                    _record,
+                    name="watch",
+                    cron_schedule="* * * * * *",
+                    job_name="j",
+                    default_status=rs.ScheduleStatus.Running,
+                    eval_mode=rs.EvalMode.Subprocess,
+                )
+            ]
+        }
+    repo = make_repo(
+        [a],
+        storage,
         jobs=[rs.Job(name="j", assets=[a])],
-        sensors=sensors,
-        schedules=schedules,
         resources={"vault": make_vault(), "sink": Sink(path=str(seen_file))},
+        **triggers,
     )
-    repo.resolve(storage=storage)
 
     daemon = AutomationDaemon(repo=repo, storage=storage)
     daemon.start()
