@@ -17,7 +17,7 @@ import os
 import grpc
 import rivers as rs
 from _polling import wait_for_run_terminal
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, Json, SecretStr, field_validator
 from pydantic_settings import BaseSettings
 from rivers._core import AutomationDaemon
 
@@ -81,6 +81,7 @@ class DbResource(rs.Resource):
     dsn: str = "memory://"
     pool_size: int = Field(2, ge=1)
     token: SecretStr = SecretStr("s3cret")
+    options: Json[dict] = '{"retries": 3}'
 
 
 class Login(BaseModel):
@@ -351,8 +352,8 @@ def _resource_schemas(stub, pb2) -> dict[str, str]:
 
 def test_get_assets_info_exposes_resource_schemas(direct):
     """Each overridable resource with its class schema: an instance's current
-    values as the defaults, no field required, a secret's value left out.
-    An IO handler is not listed."""
+    values as the defaults (a `Json` field's as its text), no field required,
+    a secret's value left out. An IO handler is not listed."""
     stub, pb2, _ = direct
     resources = {
         key: json.loads(text) for key, text in _resource_schemas(stub, pb2).items()
@@ -363,6 +364,7 @@ def test_get_assets_info_exposes_resource_schemas(direct):
     assert "required" not in schema
     assert schema["properties"]["dsn"]["default"] == "memory://"
     assert schema["properties"]["pool_size"]["default"] == 2
+    assert schema["properties"]["options"]["default"] == '{"retries":3}'
     assert schema["properties"]["token"]["writeOnly"] is True
     assert "default" not in schema["properties"]["token"]
 

@@ -126,10 +126,9 @@ impl ResourceVariant {
     }
 
     /// The class and the keyword arguments a run builds this resource from
-    /// with `overrides`: an instance's own fields (`model_dump`, so a secret
-    /// keeps its value) with the overrides laid over them, a class's the
-    /// overrides alone. An IO handler cannot be overridden: nodes hold it
-    /// through the registry.
+    /// with `overrides`: an instance's own fields ([`resource_fields`]) with
+    /// the overrides laid over them, a class's the overrides alone. An IO
+    /// handler cannot be overridden: nodes hold it through the registry.
     pub fn run_kwargs<'py>(
         &self,
         py: Python<'py>,
@@ -144,7 +143,7 @@ impl ResourceVariant {
             }
             ResourceVariant::PydanticModelInstance(inst) | ResourceVariant::Resource(inst) => {
                 let inst = inst.bind(py);
-                let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
+                let fields = resource_fields(inst)?.cast_into::<PyDict>()?;
                 lay_over(inst, &fields, overrides)?;
                 Ok((inst.get_type(), fields))
             }
@@ -210,10 +209,11 @@ fn lay_over(
     Ok(())
 }
 
-/// The fields a worker process rebuilds `resource` from with
-/// `model_validate`. Python mode keeps each secret a `SecretStr` that
-/// pickles with its value, where JSON mode would ship pydantic's mask;
-/// `round_trip` dumps a `Json` field as the text it validates from.
+/// The fields `resource`'s class rebuilds it from, for a run or in a worker
+/// process. Python mode keeps each secret a `SecretStr` that pickles with
+/// its value, where JSON mode would give pydantic's mask; `round_trip`
+/// dumps a `Json` field as the text it validates from and leaves computed
+/// fields out.
 pub(crate) fn resource_fields<'py>(resource: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let kwargs = PyDict::new(resource.py());
     kwargs.set_item("round_trip", true)?;

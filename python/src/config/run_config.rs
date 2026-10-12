@@ -18,7 +18,7 @@ use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyTuple, PyType};
 use rivers_ui::config_schema::drop_secret_defaults;
 use serde_json::{Map, Value};
 
-use crate::config::ResourceVariant;
+use crate::config::{ResourceVariant, resource_fields};
 use crate::errors::{ConfigurationError, ExecutionError};
 use crate::executor::ops::{
     enumerate_params, is_action_context_annotation, is_context_annotation, resolve_annotation,
@@ -591,15 +591,17 @@ fn class_schema(
 }
 
 /// `schema` with no field `required` and each field's `default` set to the
-/// value `inst` holds, except a field whose value holds a secret: it gets
-/// no `default`, so a launch leaves it out and the run keeps the value.
+/// value `inst` holds, in the form its class validates back (a `Json` field
+/// as its text), except a field whose value holds a secret: it gets no
+/// `default`, so a launch leaves it out and the run keeps the value.
 fn set_current_defaults(schema: &mut Value, inst: &Bound<'_, PyAny>) -> PyResult<()> {
-    let Value::Object(mut current) =
-        parse_json(&inst.call_method0("model_dump_json")?.extract::<String>()?)?
-    else {
+    let round_trip = PyDict::new(inst.py());
+    round_trip.set_item("round_trip", true)?;
+    let current = inst.call_method("model_dump_json", (), Some(&round_trip))?;
+    let Value::Object(mut current) = parse_json(&current.extract::<String>()?)? else {
         return Ok(());
     };
-    let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
+    let fields = resource_fields(inst)?.cast_into::<PyDict>()?;
     let secret_types = secret_types(inst.py())?;
 
     let Some(map) = schema.as_object_mut() else {
