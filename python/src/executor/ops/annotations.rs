@@ -226,13 +226,7 @@ fn check_hint(py: Python, value: &Py<PyAny>, hint: &Bound<PyAny>) -> PyResult<Hi
     }
 
     let class = if origin.is_none() { hint } else { &origin };
-    let matches = py
-        .import("builtins")?
-        .getattr("isinstance")?
-        .call1((value, class))
-        .and_then(|r| r.is_truthy())
-        .unwrap_or(false);
-    Ok(if matches {
+    Ok(if value.bind(py).is_instance(class).unwrap_or(false) {
         HintMatch::Yes(CheckedOutput::unchanged(py, value))
     } else {
         HintMatch::No(None)
