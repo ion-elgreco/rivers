@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
-pytest.importorskip("snowflake.connector")
+snowflake_connector = pytest.importorskip("snowflake.connector")
 pytest.importorskip("fakesnow")
 
 import pyarrow as pa  # noqa: E402
@@ -15,7 +15,6 @@ from rivers.integrations.snowflake import (  # noqa: E402
     SnowflakeIOHandler,
     SnowflakeResource,
 )
-from rivers.integrations.snowflake import io_handler as io_module  # noqa: E402
 
 _REGIONS = rs.PartitionsDefinition.static_(["us", "eu"])
 
@@ -161,20 +160,20 @@ def test_delete_runs_in_the_handler_session(warehouse, monkeypatch):
     )
 
     opened = []
-    get_connection = SnowflakeResource.get_connection
+    connect = snowflake_connector.connect
 
-    def recording(self, **overrides):
-        opened.append(overrides)
-        return get_connection(self, **overrides)
+    def recording(**kwargs):
+        opened.append(kwargs)
+        return connect(**kwargs)
 
-    monkeypatch.setattr(SnowflakeResource, "get_connection", recording)
+    monkeypatch.setattr(snowflake_connector, "connect", recording)
     partition = rs.PartitionContext(
         keys=[rs.PartitionKey.single("us")], definition=_REGIONS
     )
     meta = {"snowflake/partition_expr": "region"}
     SnowflakeAsset.delete(_action_context(handler, partition, meta))
 
-    assert opened == [io_module._SESSION]
+    assert [kwargs["timezone"] for kwargs in opened] == ["UTC"]
     assert _rows(warehouse, 'SELECT COUNT(*) FROM "PUBLIC"."EVENTS"') == [(0,)]
 
 

@@ -16,7 +16,6 @@ from rivers._core.assets import (
     action,
 )
 from rivers.integrations.snowflake.io_handler import (
-    _SESSION,
     SnowflakeIOHandler,
     _quote_table,
     _table_columns,
@@ -70,8 +69,7 @@ class SnowflakeAsset(Asset):
             predicate = handler.partition_predicate(ctx.asset_metadata, ctx.partition)
             where = f" WHERE {predicate}"
 
-        # the handler's session: partition bounds are UTC times
-        with handler.resource.get_connection(**_SESSION) as con:
+        with handler.get_connection() as con:
             cur = con.cursor()
             if not _table_columns(cur, schema, table):
                 ctx.log.info(

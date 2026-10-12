@@ -5,6 +5,7 @@ import json
 import sys
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from enum import StrEnum
 from functools import cache
 from time import monotonic
@@ -12,6 +13,7 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from snowflake.connector import SnowflakeConnection
 from snowflake.connector.cursor import SnowflakeCursor
 
 from rivers._core import InputContext, MetadataValue, OutputContext
@@ -98,6 +100,14 @@ class SnowflakeIOHandler(BaseIOHandler):
 
         return _build_predicate(partition, expr)
 
+    def get_connection(self) -> AbstractContextManager[SnowflakeConnection]:
+        """A connection in the handler's session, closed when the block exits.
+
+        The session uses UTC, the time zone of partition bounds, and fetches
+        ``NUMBER`` columns with a scale as decimals.
+        """
+        return self.resource.get_connection(**_SESSION)
+
     def handle_output(self, context: OutputContext, obj: object) -> None:
         """Write ``obj`` to the asset's table and record table metadata.
 
@@ -139,7 +149,7 @@ class SnowflakeIOHandler(BaseIOHandler):
         stage = _quote_table(schema, f"RIVERS_STAGE_{uuid.uuid4().hex}")
 
         start = monotonic()
-        with self.resource.get_connection(**_SESSION) as con:
+        with self.get_connection() as con:
             cur = con.cursor()
             exists = _prepare_table(cur, schema, table, reader.schema.names)
             cur.execute(f"CREATE TEMPORARY STAGE {stage}")
@@ -186,7 +196,7 @@ class SnowflakeIOHandler(BaseIOHandler):
         if context.partition is not None:
             sql += f" WHERE {self.partition_predicate(meta, context.partition)}"
 
-        with self.resource.get_connection(**_SESSION) as con:
+        with self.get_connection() as con:
             cur = con.cursor()
             cur.execute(sql)
             result = cur.fetch_arrow_all(force_return_table=True)

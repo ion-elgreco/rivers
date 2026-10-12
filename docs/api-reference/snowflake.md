@@ -63,7 +63,11 @@ These metadata keys override handler defaults per-asset:
 
 ### Methods for action bodies
 
-An [action](../concepts/actions.md) receives the asset's resolved handler as `ctx.io_handler`. These methods expose the table and partition resolution that the write path uses.
+An [action](../concepts/actions.md) receives the asset's resolved handler as `ctx.io_handler`. These methods expose the session, table, and partition resolution that the write path uses.
+
+#### `get_connection()`
+
+Context manager: a connection in the handler's session, closed when the block exits. The session uses UTC, the time zone of daily and hourly partition bounds, and fetches `NUMBER` columns with a scale as decimals, as reads do.
 
 #### `table_name(asset_name, asset_metadata)`
 
@@ -74,7 +78,7 @@ Returns the uppercased `(schema, table)` pair, honoring `snowflake/schema` and `
 @classmethod
 def truncate(cls, ctx: rs.ActionContext) -> None:
     schema, table = ctx.io_handler.table_name(ctx.asset_name, ctx.asset_metadata)
-    with ctx.io_handler.resource.get_connection() as con:
+    with ctx.io_handler.get_connection() as con:
         con.cursor().execute(f'TRUNCATE TABLE IF EXISTS "{schema}"."{table}"')
 ```
 
@@ -82,7 +86,7 @@ def truncate(cls, ctx: rs.ActionContext) -> None:
 
 Returns a SQL predicate covering the partition(s), honoring `snowflake/partition_expr`. Pass `ctx.asset_metadata` and `ctx.partition`. Raises `ValueError` without `snowflake/partition_expr`.
 
-Daily and hourly bounds are UTC times. Open the connection with `timezone="UTC"`, as the handler does: in another time zone, the predicate selects other rows of a `TIMESTAMP_LTZ` column.
+Daily and hourly bounds are UTC times: run the predicate on `ctx.io_handler.get_connection()`. In another time zone, it selects other rows of a `TIMESTAMP_LTZ` column.
 
 ```python
 @rs.action(outcome=rs.Outcome.Unmaterialize)
@@ -90,7 +94,7 @@ Daily and hourly bounds are UTC times. Open the connection with `timezone="UTC"`
 def delete(cls, ctx: rs.ActionContext) -> None:
     schema, table = ctx.io_handler.table_name(ctx.asset_name, ctx.asset_metadata)
     predicate = ctx.io_handler.partition_predicate(ctx.asset_metadata, ctx.partition)
-    with ctx.io_handler.resource.get_connection(timezone="UTC") as con:
+    with ctx.io_handler.get_connection() as con:
         con.cursor().execute(f'DELETE FROM "{schema}"."{table}" WHERE {predicate}')
 ```
 
