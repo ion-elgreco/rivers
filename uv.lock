@@ -273,6 +273,23 @@ wheels = [
 ]
 
 [[package]]
+name = "dataframely"
+version = "3.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "polars" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/de/c3c9dafe0c22ef72c93c5ab41a5e2521a45bcd2949f20d1f5e5bc069f010/dataframely-3.1.2.tar.gz", hash = "sha256:a8954ed64dfc3a9f1d09f5b20462aca5ed7d62ab13976d5809c317734afbb2cb", size = 437270, upload-time = "2026-09-20T05:48:59.217Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/9f/3b9e01d09883b34b00e9fe21ee8feb95f6610fa76331c84d6b4805474937/dataframely-3.1.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:8c99fa0400555d24b4d2ebe365a3223efd3936b6c6fb8bc5e35445e3cc8bfbd8", size = 8401940, upload-time = "2026-09-20T05:48:49.879Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/bc/45d256444170490489fbf29f45e7624669d8e2892a9fd61dec196f689b61/dataframely-3.1.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7c6e6fd641248ad0c109b11bc2ee6f3a18cb9a35d038770f8180a7fb3244a98f", size = 7864251, upload-time = "2026-09-20T05:48:51.851Z" },
+    { url = "https://files.pythonhosted.org/packages/93/d8/afc9f53c3f533193f9e2de78e096fb281b1e3e0e3e47a0b4c78a72eef729/dataframely-3.1.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2afe6aa8ab560f735c1d5eb2b1b86106a184db65859b71bd993001ffb2599711", size = 8208342, upload-time = "2026-09-20T05:48:53.493Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/fb/e0330e19d7d3e8ece05d5714ee4f716c5b7ede18432c1a0c7c79fec31422/dataframely-3.1.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4099869e93dd6f89270e3153d5d57c57b70fdb0ee5bdabe2da75fcb3e9e3a3ca", size = 8749313, upload-time = "2026-09-20T05:48:55.305Z" },
+    { url = "https://files.pythonhosted.org/packages/93/2e/6fd1584220cd6ec7830e24f790a6776ae581f3c027a4db5dca8735667b82/dataframely-3.1.2-cp310-abi3-win_amd64.whl", hash = "sha256:e5eae3b035b4f975e8594c1418a981d129318383b555627682d8ea8372f98756", size = 8861634, upload-time = "2026-09-20T05:48:57.225Z" },
+]
+
+[[package]]
 name = "datafusion"
 version = "53.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1382,6 +1399,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dataframely = [
+    { name = "dataframely" },
+]
 datafusion = [
     { name = "datafusion" },
 ]
@@ -1444,6 +1464,7 @@ slack = [
 
 [package.metadata]
 requires-dist = [
+    { name = "dataframely", marker = "extra == 'dataframely'", specifier = ">=3.0.0" },
     { name = "datafusion", marker = "extra == 'datafusion'", specifier = ">=53" },
     { name = "delta-spark", marker = "extra == 'delta-pyspark'", specifier = ">=3.0.0" },
     { name = "deltalake", marker = "extra == 'delta'", specifier = ">=0.25.0" },
@@ -1477,7 +1498,7 @@ requires-dist = [
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.10.0" },
     { name = "typer", specifier = ">=0.27.0" },
 ]
-provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "delta-duckdb", "pandera"]
+provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "delta-duckdb", "pandera", "dataframely"]
 
 [[package]]
 name = "rivers-workspace"

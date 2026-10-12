@@ -72,6 +72,7 @@ nav:
       - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
+      - dataframely: guides/dataframely.md
       - Delta Lake: guides/delta-lake.md
       - DuckDB: guides/duckdb.md
       - pandera: guides/pandera.md
@@ -93,6 +94,7 @@ nav:
       - Partitions: api-reference/partitions.md
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
+      - dataframely: api-reference/dataframely.md
       - Delta Lake: api-reference/delta.md
       - DuckDB: api-reference/duckdb.md
       - pandera: api-reference/pandera.md

@@ -31,6 +31,7 @@ slack = ["slack-sdk>=3.10.0"]
 duckdb = ["duckdb>=1.5.2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
 pandera = ["pandera>=0.20.2,!=0.30.0"]
+dataframely = ["dataframely>=3.0.0"]
 
 [project.scripts]
 rivers = "rivers.cli:main"
