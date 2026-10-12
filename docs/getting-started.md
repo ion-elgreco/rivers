@@ -16,6 +16,8 @@ pip install rivers[otel]      # OpenTelemetry instrumentation
 pip install rivers[slack]     # Slack alerts (hooks and a run-failure sensor)
 pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler
 pip install rivers[datadog]   # Datadog events and metrics (hooks, a run-failure sensor, DogStatsD)
+pip install rivers[pandera]   # Validate asset outputs against pandera schemas
+pip install rivers[dataframely]  # Validate polars asset outputs against dataframely schemas
 ```
 
 The [Airbyte integration](guides/airbyte.md) needs no extra.

@@ -248,6 +248,25 @@ How it works:
 
 This composes with normal `deps`: `self: SelfDependency[T]` only handles the self-load, leaving every other parameter free to bind to upstream assets / resources / config as usual.
 
+## Return type checks
+
+rivers checks the value an asset returns against its return annotation. A mismatch fails the step with `AssetOutputValidationError`, and the value is not stored:
+
+```python
+@rs.Asset
+def row_count() -> int:
+    return "12"  # Asset 'row_count' returned value of type 'str' but expected '<class 'int'>'
+```
+
+- A class is checked with `isinstance`. A generic such as `list[int]` is checked by its origin, `list`, not by its items.
+- `Any`, `None`, and the `Output`, `Observation` and `Materialization` types are not checked. The value inside a returned `Output` is checked.
+- A union such as `int | None` passes when the value matches one member.
+- `Annotated[T, ...]` is checked against `T`.
+- A pandera or dataframely schema in the annotation validates the frame itself. See [pandera](../guides/pandera.md) and [dataframely](../guides/dataframely.md).
+- With `from __future__ import annotations`, rivers evaluates the annotation in the asset's module. A name that is imported only under `TYPE_CHECKING` fails the step.
+
+Every executor runs the same check. The parallel executor runs it in the worker process.
+
 ## Asset metadata
 
 Attach static metadata to an asset via the `metadata` parameter. Metadata serves three purposes:
