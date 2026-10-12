@@ -5,6 +5,8 @@ DAG shapes, error handling, collecting mode, IO handlers (Pickle, Delta),
 mixed configurations, and per-asset executor overrides.
 """
 
+import datetime
+import json
 import pickle
 
 import obstore
@@ -16,11 +18,11 @@ from pydantic import BaseModel
 import rivers as rs
 from rivers.exceptions import ConfigurationError
 
+from _helpers import EXECUTORS, MP
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-MP = rs.Executor.parallel(max_workers=2)
 
 
 def _job_repo(assets, executor=MP, resources=None):
@@ -573,6 +575,255 @@ def test_mp_output_metadata_multiple_keys():
 
     repo = _run([rich_meta])
     assert repo.load_node("rich_meta") == "done"
+
+
+_SCHEMA = pa.schema([("a", pa.int64())])
+
+
+def _typed_metadata():
+    """One entry per MetadataValue variant; ``version`` sets the data version."""
+    m = rs.MetadataValue
+    return {
+        "text": m.text("hello"),
+        "int": m.int(7),
+        "float": m.float_(1.5),
+        "bool": m.bool_(True),
+        "url": m.url("https://example.com/run/1"),
+        "file": m.path("/data/x.parquet"),
+        "json": m.json('{"a": 1}'),
+        "md": m.md("# Title"),
+        "timestamp": m.timestamp(1700000000.5),
+        "null": m.null(),
+        "bytes": m.bytes(2048),
+        "duration": m.duration(1.5),
+        "sql": m.sql("SELECT 1", dialect="postgres"),
+        "code": m.code_block("print(1)", language="python"),
+        "image": m.image("https://example.com/a.png"),
+        "percentage": m.percentage(12.5),
+        "list": m.list_([m.int(1), m.text("a")]),
+        "date_range": m.date_range(
+            datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2, 3, 4, 5, 6)
+        ),
+        "schema": m.schema(_SCHEMA),
+        "version": m.data_version("v1"),
+    }
+
+
+# How storage keeps `_typed_metadata()`; `version` is the event's data version.
+_TYPED_METADATA_JSON = {
+    "text": '{"Text":{"value":"hello"}}',
+    "int": '{"Int":{"value":7}}',
+    "float": '{"Float":{"value":1.5}}',
+    "bool": '{"Bool":{"value":true}}',
+    "url": '{"Url":{"value":"https://example.com/run/1"}}',
+    "file": '{"Path":{"value":"/data/x.parquet"}}',
+    "json": '{"Json":{"value":"{\\"a\\": 1}"}}',
+    "md": '{"Markdown":{"value":"# Title"}}',
+    "timestamp": '{"Timestamp":{"value":1700000000.5}}',
+    "null": '{"Null":{}}',
+    "bytes": '{"Bytes":{"value":2048}}',
+    "duration": '{"Duration":{"value":1.5}}',
+    "sql": '{"Sql":{"query":"SELECT 1","dialect":"postgres"}}',
+    "code": '{"CodeBlock":{"code":"print(1)","language":"python"}}',
+    "image": '{"Image":{"value":"https://example.com/a.png"}}',
+    "percentage": '{"Percentage":{"value":12.5}}',
+    "list": '{"List":{"values":[{"Int":{"value":1}},{"Text":{"value":"a"}}]}}',
+    "date_range": (
+        '{"DateRange":{"start":"2024-01-01T00:00:00","end":"2024-01-02T03:04:05.000006"}}'
+    ),
+    "schema": json.dumps(
+        {"Schema": {"ipc_bytes": list(rs.MetadataValue.schema(_SCHEMA).ipc_bytes)}},
+        separators=(",", ":"),
+    ),
+}
+
+
+def _with_location(asset):
+    """`_TYPED_METADATA_JSON` plus what `_TypedMetadataIOHandler` adds for `asset`."""
+    location = f'{{"Url":{{"value":"https://example.com/{asset}"}}}}'
+    return {**_TYPED_METADATA_JSON, "location": location}
+
+
+class _TypedMetadataIOHandler(rs.BaseIOHandler):
+    """Keeps no values; reports a typed location for each write."""
+
+    def handle_output(self, context, obj):
+        context.add_output_metadata(
+            {
+                "location": rs.MetadataValue.url(
+                    f"https://example.com/{context.asset_name}"
+                )
+            }
+        )
+
+    def load_input(self, context):
+        raise NotImplementedError
+
+
+def _stored(storage, run_id):
+    """``{(event_type, asset, partition): (metadata, data_version)}`` of the
+    run's Materialization and Observation events."""
+    return {
+        (
+            e.event_type,
+            e.asset_key,
+            e.partition_key and e.partition_key.to_json(),
+        ): (dict(e.metadata), e.data_version)
+        for e in storage.get_events_for_run(run_id)
+        if e.event_type in ("Materialization", "Observation")
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_materialization_metadata_keeps_its_type(executor, storage):
+    """Every MetadataValue variant on a returned Materialization is stored as itself."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset(io_handler=handler)
+    def typed_x() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_y() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Materialization", "typed_y", None): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_output_metadata_keeps_its_type(executor, storage):
+    """Output metadata and the IO handler's metadata are stored as their variants."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset(io_handler=handler)
+    def typed_x():
+        return rs.Output(1, metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_y():
+        return rs.Output(2, metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", None): (_with_location("typed_x"), "v1"),
+        ("Materialization", "typed_y", None): (_with_location("typed_y"), "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_multi_asset_metadata_keeps_its_type(executor, storage):
+    """Metadata on each yield of a multi-asset is stored as its variants."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("m_output", io_handler=handler),
+            rs.AssetDef("m_materialization", io_handler=handler),
+            rs.AssetDef("m_observation", io_handler=handler),
+        ]
+    )
+    def typed_multi():
+        yield rs.Output(1, output_name="m_output", metadata=_typed_metadata())
+        yield rs.Materialization(
+            output_name="m_materialization", metadata=_typed_metadata()
+        )
+        yield rs.Observation(output_name="m_observation", metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_sibling() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(
+        assets=[typed_multi, typed_sibling], default_executor=executor
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "m_output", None): (_with_location("m_output"), "v1"),
+        ("Materialization", "m_materialization", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Observation", "m_observation", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Materialization", "typed_sibling", None): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_partitioned_metadata_keeps_its_type(executor, storage):
+    """A partitioned step's metadata is stored as its variants."""
+    handler = _TypedMetadataIOHandler()
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def typed_x():
+        return rs.Output(1, metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def typed_y() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(partition_key=rs.PartitionKey.single("p1"))
+
+    p1 = rs.PartitionKey.single("p1").to_json()
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", p1): (_with_location("typed_x"), "v1"),
+        ("Materialization", "typed_y", p1): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@rs.Task
+def _typed_double(x: int):
+    return rs.Output(x * 2, metadata=_typed_metadata())
+
+
+@rs.Task
+def _total(values: list) -> int:
+    return sum(values)
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_mapped_metadata_keeps_its_type(executor, storage, tmp_path):
+    """Each mapped instance's metadata is stored as its variants."""
+    handler = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset(io_handler=handler)
+    def numbers() -> list:
+        return [1, 2]
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def doubled():
+        return _total(numbers().map(_typed_double).collect())
+
+    repo = rs.CodeRepository(
+        assets=[numbers, doubled],
+        tasks=[_typed_double, _total],
+        default_executor=executor,
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    # The PickleIOHandler's own entries (path, size, timing) are left out.
+    instances = {
+        asset: ({k: v for k, v in metadata.items() if k in _TYPED_METADATA_JSON}, dv)
+        for (_, asset, _), (metadata, dv) in _stored(storage, result.run_id).items()
+        if asset.startswith("doubled/_typed_double__")
+    }
+    assert instances == {
+        "doubled/_typed_double__0": (_TYPED_METADATA_JSON, "v1"),
+        "doubled/_typed_double__1": (_TYPED_METADATA_JSON, "v1"),
+    }
+    assert repo.load_node("doubled") == 6
 
 
 # ---------------------------------------------------------------------------

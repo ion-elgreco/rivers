@@ -11,11 +11,11 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyList, PyTuple};
 use rivers_core::execution::plan::ExecutionStep;
 
 use crate::errors::ExecutionError;
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::MetadataValue;
 use crate::result_types::ResultKind;
 
 use super::super::ops::{self, now_ts};
@@ -795,10 +795,8 @@ fn process_one_worker_item(
     let name: String = tuple.get_item(0)?.extract()?;
     let kind_tag: u8 = tuple.get_item(1)?.extract()?;
     let kind = ResultKind::from_u8(kind_tag)?;
-    let metadata_py = tuple.get_item(2)?;
+    let metadata: Vec<(String, MetadataValue)> = tuple.get_item(2)?.extract()?;
     let data_version: Option<String> = tuple.get_item(3)?.extract()?;
-
-    let metadata = decode_worker_metadata(py, &metadata_py)?;
 
     if matches!(kind, ResultKind::Observation) {
         ctx.emit_observation(&name, &metadata, data_version.clone(), end_ts);
@@ -856,25 +854,4 @@ fn process_one_worker_item(
         );
     }
     Ok(())
-}
-
-/// Decode the per-output metadata dict shipped by the worker. The worker
-/// emits raw Python values via `metadata_to_pickle_safe_dict` (calling
-/// `MetadataValue.raw_value()` to unwrap), so we re-coerce per-value to
-/// recover the original `MetadataValue` variant (Int, Float, Bool, Text...).
-fn decode_worker_metadata(
-    py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<Vec<(String, MetadataValue)>> {
-    if obj.is_none() {
-        return Ok(Vec::new());
-    }
-    let dict: &Bound<PyDict> = obj.cast()?;
-    let mut result = Vec::with_capacity(dict.len());
-    for (k, v) in dict.iter() {
-        let key: String = k.extract()?;
-        let val = coerce_to_metadata_value(py, &v)?;
-        result.push((key, val));
-    }
-    Ok(result)
 }

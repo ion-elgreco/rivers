@@ -62,6 +62,17 @@ meta.raw_value()  # None
 
 **Return type:** `str | int | float | bool | None | list[MetadataValue] | tuple[datetime, datetime] | Schema`
 
+## Pickling
+
+A `MetadataValue` pickles as its variant, so it keeps its type in another process. This is how metadata set in an `Executor.parallel()` worker reaches storage unchanged:
+
+```python
+import pickle
+
+meta = rs.MetadataValue.url("https://example.com")
+assert pickle.loads(pickle.dumps(meta)) == meta
+```
+
 ## Automatic conversion
 
 When passing values to `context.add_output_metadata()`, primitive types are automatically converted:

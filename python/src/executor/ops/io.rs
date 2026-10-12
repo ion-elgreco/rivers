@@ -6,7 +6,6 @@
 //! Python methods. Handles partition key mapping for upstream dependencies
 //! via `PartitionMapping`.
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::assets::self_dependency::PySelfDependency;
@@ -256,27 +255,4 @@ pub(crate) fn handle_step_output(
         ),
     )?;
     write_output(py, &handler, &ctx, result)
-}
-
-/// Convert metadata values to pickle-safe raw Python values.
-/// MetadataValue objects get unwrapped via `raw_value()`; unpicklable values
-/// fall back to `repr()`. Used when metadata must cross process boundaries.
-pub(crate) fn metadata_to_pickle_safe_dict(
-    py: Python,
-    meta: &Bound<'_, PyDict>,
-) -> PyResult<Py<PyAny>> {
-    let pickle = py.import("pickle")?;
-    let result = PyDict::new(py);
-    for (k, v) in meta.iter() {
-        if let Ok(raw_value_method) = v.getattr("raw_value") {
-            let raw = raw_value_method.call0()?;
-            match pickle.call_method1("dumps", (&raw,)) {
-                Ok(_) => result.set_item(&k, &raw)?,
-                Err(_) => result.set_item(&k, raw.repr()?)?,
-            }
-        } else {
-            result.set_item(&k, &v)?;
-        }
-    }
-    Ok(result.unbind().into_any())
 }

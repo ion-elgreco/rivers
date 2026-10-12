@@ -90,7 +90,7 @@ impl PyCollectStreamLoadSpec {
 /// metadata + data_version are preserved; values stay in IO).
 ///
 /// `outputs` is a Python list of 4-tuples
-/// `(name: str, is_observation: bool, metadata: dict | None, data_version: str | None)`.
+/// `(name: str, kind: int, metadata: list[tuple[str, MetadataValue]], data_version: str | None)`.
 /// For multi-asset, one tuple per selected output. For single-output, one
 /// tuple with `name = ""` (the consumer substitutes the dispatch-side
 /// `step_name` for non-mapped runs and the instance name for mapped fan-out).
@@ -209,23 +209,8 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::WorkerStepError;
-use crate::executor::ops::{self, metadata_to_pickle_safe_dict, write_output};
+use crate::executor::ops::{self, write_output};
 use crate::metadata::MetadataValue;
-
-/// Returns None if metadata is empty.
-fn metadata_vec_to_pickle_safe(
-    py: Python,
-    metadata: &[(String, crate::metadata::MetadataValue)],
-) -> PyResult<Option<Py<PyAny>>> {
-    if metadata.is_empty() {
-        return Ok(None);
-    }
-    let d = PyDict::new(py);
-    for (k, v) in metadata {
-        d.set_item(k, v.clone().into_pyobject(py)?)?;
-    }
-    Ok(Some(metadata_to_pickle_safe_dict(py, &d)?))
-}
 
 /// Self-contained step execution for loky subprocess.
 ///
@@ -405,21 +390,18 @@ pub fn worker_execute_step(
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
-                        append_output_tuple(py, &outputs_list, &name, kind, meta_py, final_dv)?;
+                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
                     }
                     ops::OutputItem::Observation {
                         name,
                         metadata,
                         data_version,
                     } => {
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
                         append_output_tuple(
-                            py,
                             &outputs_list,
                             &name,
                             ResultKind::Observation,
-                            meta_py,
+                            metadata,
                             data_version,
                         )?;
                     }
@@ -516,8 +498,7 @@ pub fn worker_execute_step(
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
-                        append_output_tuple(py, &outputs_list, &name, kind, meta_py, final_dv)?;
+                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
                     }
                     ops::OutputItem::Observation { .. } => {
                         // External-asset observations route through a separate
@@ -627,32 +608,18 @@ fn drain_ctx_failed_partitions(py: Python, ctx_obj: Option<&Py<PyAny>>) -> Vec<(
     Vec::new()
 }
 
-/// Append `(name, kind_tag, metadata_or_none, dv_or_none)` to the
-/// outputs list shipped back over IPC. `kind_tag` is the `ResultKind::as_u8`
+/// Append `(name, kind_tag, metadata, dv_or_none)` to the outputs list
+/// shipped back over IPC. `kind_tag` is the `ResultKind::as_u8`
 /// discriminator: 0 = Output (IO write happened in worker, just emit
 /// Materialization on orchestrator), 1 = Observation, 2 = Materialization
-/// (no IO write happened, emit Materialization).
+/// (no IO write happened, emit Materialization). The metadata stays
+/// `MetadataValue`s, which pickle with their variant.
 fn append_output_tuple(
-    py: Python,
     outputs_list: &Bound<'_, PyList>,
     name: &str,
     kind: ResultKind,
-    metadata_py: Option<Py<PyAny>>,
+    metadata: Vec<(String, MetadataValue)>,
     data_version: Option<String>,
 ) -> PyResult<()> {
-    let dv_py: Py<PyAny> = match data_version {
-        Some(s) => s.into_pyobject(py)?.into_any().unbind(),
-        None => py.None(),
-    };
-    let tuple = PyTuple::new(
-        py,
-        [
-            name.into_pyobject(py)?.into_any().unbind(),
-            kind.as_u8().into_pyobject(py)?.into_any().unbind(),
-            metadata_py.unwrap_or_else(|| py.None()),
-            dv_py,
-        ],
-    )?;
-    outputs_list.append(tuple)?;
-    Ok(())
+    outputs_list.append((name, kind.as_u8(), metadata, data_version))
 }
