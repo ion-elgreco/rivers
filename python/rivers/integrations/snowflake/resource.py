@@ -3,11 +3,13 @@
 import base64
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 from typing import Any, Self
 
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from pydantic import SecretStr, model_validator
 from pydantic_settings import SettingsConfigDict
 
@@ -115,8 +117,7 @@ class SnowflakeResource(Resource):
             **self.connection_args,
         }
 
-    def _private_key(self) -> bytes | None:
-        """The private key as unencrypted PKCS#8 DER, the form the connector takes."""
+    def _private_key(self) -> PrivateKeyTypes | None:
         if self.private_key is not None:
             pem = self.private_key.get_secret_value().encode()
             if not pem.lstrip().startswith(b"-----BEGIN"):
@@ -126,15 +127,18 @@ class SnowflakeResource(Resource):
         else:
             return None
 
-        password = _reveal(self.private_key_password)
-        key = serialization.load_pem_private_key(
-            pem, password=password.encode() if password is not None else None
-        )
-        return key.private_bytes(
-            serialization.Encoding.DER,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
+        return _load_key(pem, _reveal(self.private_key_password))
+
+
+@cache
+def _load_key(pem: bytes, password: str | None) -> PrivateKeyTypes:
+    """``pem`` as a key object, which the connector takes as is.
+
+    Cached: loading checks the key, which takes over 100 ms for an RSA key.
+    """
+    return serialization.load_pem_private_key(
+        pem, password=password.encode() if password is not None else None
+    )
 
 
 def _reveal(secret: SecretStr | None) -> str | None:

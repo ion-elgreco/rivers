@@ -132,12 +132,14 @@ def test_key_pair_auth(connect, rsa_key, tmp_path, source, password):
         key_fields["private_key_password"] = password.decode()
 
     resource = SnowflakeResource(account="acct", user="ETL", **key_fields)
-    with resource.get_connection():
-        pass
+    for _ in range(2):
+        with resource.get_connection():
+            pass
 
-    assert [c.kwargs for c in connect] == [
-        {"account": "acct", "user": "ETL", "private_key": _der(rsa_key)}
-    ]
+    first, second = (c.kwargs for c in connect)
+    assert first["private_key"] is second["private_key"]
+    assert _der(first.pop("private_key")) == _der(rsa_key)
+    assert first == {"account": "acct", "user": "ETL"}
 
 
 def test_authenticator_without_secrets(connect):
