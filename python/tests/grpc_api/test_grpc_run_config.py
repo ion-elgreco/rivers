@@ -253,11 +253,31 @@ def _single(pb2, key):
 # ── Schemas ──
 
 
-def test_get_assets_info_exposes_config_schemas(direct):
-    stub, pb2, _ = direct
-    by_key = {
+def _assets_info(stub, pb2) -> dict:
+    return {
         a.asset_key: a for a in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).assets
     }
+
+
+def _resource_schemas(stub, pb2) -> dict[str, str]:
+    return {
+        r.key: r.config_schema
+        for r in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).resources
+    }
+
+
+def _defaults(schema: dict) -> dict:
+    """The schema's top-level fields that have a `default`, with it."""
+    return {
+        name: prop["default"]
+        for name, prop in schema["properties"].items()
+        if "default" in prop
+    }
+
+
+def test_get_assets_info_exposes_config_schemas(direct):
+    stub, pb2, _ = direct
+    by_key = _assets_info(stub, pb2)
 
     schema = json.loads(by_key["configured"].config_schema)
     assert schema["title"] == "ThresholdConfig"
@@ -279,21 +299,11 @@ def test_config_schema_holds_no_secret_default(direct):
     """A config class's secret default reaches the schema as pydantic's mask;
     the schema leaves it out so a launch never sends the mask as a value."""
     stub, pb2, _ = direct
-    by_key = {
-        a.asset_key: a for a in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).assets
-    }
-    text = by_key["keyed"].config_schema
+    text = _assets_info(stub, pb2)["keyed"].config_schema
     assert "**********" not in text
     properties = json.loads(text)["properties"]
     assert properties["region"]["default"] == "eu"
     assert "default" not in properties["api_key"]
-
-
-def _resource_schemas(stub, pb2) -> dict[str, str]:
-    return {
-        r.key: r.config_schema
-        for r in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).resources
-    }
 
 
 def test_get_assets_info_exposes_resource_schemas(direct):
@@ -324,12 +334,7 @@ def test_resource_schema_holds_no_secret(direct):
     text = _resource_schemas(stub, pb2)["vault"]
     assert [s for s in [*VAULT_SECRETS, "**********"] if s in text] == []
     schema = json.loads(text)
-    defaults = {
-        name: prop["default"]
-        for name, prop in schema["properties"].items()
-        if "default" in prop
-    }
-    assert defaults == {"region": "eu"}
+    assert _defaults(schema) == {"region": "eu"}
     assert schema["$defs"]["Login"]["properties"]["user"]["default"] == "me"
     assert "default" not in schema["$defs"]["Connection"]["properties"]["api_key"]
 
@@ -350,12 +355,7 @@ def test_a_launch_of_the_schema_defaults_keeps_the_secrets(direct):
     changed, rebuilds the resource with the real secrets."""
     stub, pb2, repo = direct
     schema = json.loads(_resource_schemas(stub, pb2)["vault"])
-    fields = {
-        name: prop["default"]
-        for name, prop in schema["properties"].items()
-        if "default" in prop
-    }
-    document = {"resources": {"vault": {**fields, "region": "us"}}}
+    document = {"resources": {"vault": {**_defaults(schema), "region": "us"}}}
     assert _validate(stub, pb2, document, ["uses_vault"]) == []
     assert _launch_vault(stub, pb2, repo, document) == {**VAULT_VALUES, "region": "us"}
 
