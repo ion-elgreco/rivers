@@ -98,6 +98,17 @@ def test_password_auth(connect):
     }
 
 
+def test_connector_cannot_change_connection_args(connect):
+    """The connector writes session parameters into the dict that it gets."""
+    resource = SnowflakeResource(
+        connection_args={"session_parameters": {"QUERY_TAG": "etl"}}
+    )
+    with resource.get_connection(timezone="UTC") as con:
+        con.kwargs["session_parameters"]["TIMEZONE"] = "UTC"
+
+    assert resource.connection_args == {"session_parameters": {"QUERY_TAG": "etl"}}
+
+
 def test_overrides_replace_the_resource_args(connect):
     resource = SnowflakeResource(
         account="acct", user="ETL", password="pw", warehouse="SMALL_WH"

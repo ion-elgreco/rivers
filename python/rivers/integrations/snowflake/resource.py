@@ -1,6 +1,7 @@
 """Snowflake connections with password, key-pair, or other authentication."""
 
 import base64
+import copy
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cache
@@ -112,9 +113,10 @@ class SnowflakeResource(Resource):
             "warehouse": self.warehouse,
             "role": self.role,
         }
+        # a copy: the connector writes session parameters into the dicts it gets
         return {
             **{key: value for key, value in args.items() if value is not None},
-            **self.connection_args,
+            **copy.deepcopy(self.connection_args),
         }
 
     def _private_key(self) -> PrivateKeyTypes | None:
