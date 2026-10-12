@@ -14,6 +14,7 @@ pytest.importorskip("pandera")
 pd = pytest.importorskip("pandas")
 
 import pandera.pandas as pa  # noqa: E402
+from _helpers import materialize_beside_sibling  # noqa: E402
 from pandera.errors import SchemaErrors  # noqa: E402
 from pandera.typing import DataFrame, Series  # noqa: E402
 
@@ -36,28 +37,19 @@ def test_string_hint_validates_the_frame(storage, executor_env):
     def bad_orders() -> DataFrame[Orders]:
         return bad
 
-    repo = rs.CodeRepository(assets=[orders, bad_orders], default_executor=executor)
-    repo.resolve(storage=storage)
-    result = repo.materialize(raise_on_error=False)
+    _, result = materialize_beside_sibling(
+        storage, executor, io_factory(), orders, bad_orders
+    )
 
     assert not result.success
-    [materialization] = [
-        e
-        for e in storage.get_events_for_asset("orders")
-        if e.event_type == "Materialization"
-    ]
+    materialization = storage.get_latest_materialization("orders")
     [(_, payload)] = json.loads(
         dict(materialization.metadata)["pandera/schema"]
     ).items()
     assert json.loads(payload["value"])["name"] == "Orders"
-    [failure] = [
-        e
-        for e in storage.get_events_for_asset("bad_orders")
-        if e.event_type == "StepFailure"
-    ]
     with pytest.raises(SchemaErrors) as report:
         Orders.validate(bad, lazy=True)
-    assert dict(failure.metadata)["error"] == (
+    assert dict(result.failed_assets)["bad_orders"] == (
         "AssetOutputValidationError: Asset 'bad_orders' returned a value that does "
         f"not match '{DataFrame[Orders]}': {report.value}"
     )

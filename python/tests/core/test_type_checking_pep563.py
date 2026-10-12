@@ -9,36 +9,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from _helpers import materialize_beside_sibling
+
 import rivers as rs
 
 if TYPE_CHECKING:
     from decimal import Decimal
 
 
-def run(storage, executor_env, *assets) -> rs.CodeRepository:
-    """Materialize ``assets`` next to a sibling step: the parallel executor
-    runs a lone step in-process."""
-    executor, io_factory = executor_env
-
-    @rs.Asset(io_handler=io_factory())
-    def sibling() -> int:
-        return 1
-
-    repo = rs.CodeRepository(assets=[*assets, sibling], default_executor=executor)
-    repo.resolve(storage=storage)
-    repo.materialize(raise_on_error=False)
-    return repo
-
-
-def step_error(storage, asset: str) -> str:
-    [failure] = [
-        e for e in storage.get_events_for_asset(asset) if e.event_type == "StepFailure"
-    ]
-    return dict(failure.metadata)["error"]
-
-
 def test_string_return_annotation_is_evaluated(storage, executor_env):
-    _, io_factory = executor_env
+    executor, io_factory = executor_env
 
     @rs.Asset(io_handler=io_factory())
     def good() -> list[int]:
@@ -48,25 +28,27 @@ def test_string_return_annotation_is_evaluated(storage, executor_env):
     def bad() -> list[int]:
         return "oops"  # type: ignore
 
-    repo = run(storage, executor_env, good, bad)
+    repo, result = materialize_beside_sibling(
+        storage, executor, io_factory(), good, bad
+    )
 
     assert repo.load_node("good") == [1, 2]
-    assert step_error(storage, "bad") == (
+    assert dict(result.failed_assets)["bad"] == (
         "AssetOutputValidationError: Asset 'bad' returned value of type 'str' "
         "but expected 'list[int]'"
     )
 
 
 def test_return_annotation_that_does_not_evaluate_fails_the_step(storage, executor_env):
-    _, io_factory = executor_env
+    executor, io_factory = executor_env
 
     @rs.Asset(io_handler=io_factory())
     def price() -> Decimal:
         return 1  # type: ignore
 
-    run(storage, executor_env, price)
+    _, result = materialize_beside_sibling(storage, executor, io_factory(), price)
 
-    assert step_error(storage, "price") == (
+    assert dict(result.failed_assets)["price"] == (
         "AssetOutputValidationError: Cannot evaluate the return annotation "
         "'Decimal': NameError: name 'Decimal' is not defined"
     )

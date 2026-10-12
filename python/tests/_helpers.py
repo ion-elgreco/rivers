@@ -114,6 +114,20 @@ def make_repo(assets, storage=None, *, executor=None, **kwargs) -> rs.CodeReposi
     return repo
 
 
+def materialize_beside_sibling(
+    storage, executor, io_handler, *assets
+) -> tuple[rs.CodeRepository, rs.RunResult]:
+    """Materialize ``assets`` next to a sibling step that succeeds: the
+    parallel executor runs a lone step in-process."""
+
+    @rs.Asset(io_handler=io_handler)
+    def sibling() -> int:
+        return 1
+
+    repo = make_repo([*assets, sibling], storage, executor=executor)
+    return repo, repo.materialize(raise_on_error=False)
+
+
 def observation_metadata(repo, run_id: str | None = None) -> dict:
     """{asset_key: {meta_key: raw_value}} from Observation events.
 

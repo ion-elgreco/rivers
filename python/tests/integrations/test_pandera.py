@@ -19,8 +19,8 @@ pytest.importorskip("pandera")
 pd = pytest.importorskip("pandas")
 pl = pytest.importorskip("polars")
 
-import obstore.store  # noqa: E402
 import pandera.pandas as pa  # noqa: E402
+from _helpers import materialize_beside_sibling  # noqa: E402
 import pandera.polars as pap  # noqa: E402
 from pandas.testing import assert_frame_equal as assert_pandas_equal  # noqa: E402
 from pandera.errors import SchemaErrors  # noqa: E402
@@ -168,33 +168,23 @@ def expected_schema(backend: str) -> dict:
 @dataclass
 class Env:
     storage: rs.Storage
-    handler: rs.PickleIOHandler
     executor: rs.Executor
-    parallel: bool
+    handler: rs.BaseIOHandler
+
+    @property
+    def parallel(self) -> bool:
+        return isinstance(self.executor, rs.Executor.Parallel)
 
     def materialize(self, *assets) -> tuple[rs.CodeRepository, rs.RunResult]:
-        """Materialize ``assets`` next to a sibling step: the parallel executor
-        runs a lone step in-process."""
-
-        @rs.Asset(io_handler=self.handler)
-        def sibling() -> int:
-            return 1
-
-        repo = rs.CodeRepository(
-            assets=[*assets, sibling], default_executor=self.executor
+        return materialize_beside_sibling(
+            self.storage, self.executor, self.handler, *assets
         )
-        repo.resolve(storage=self.storage)
-        return repo, repo.materialize(raise_on_error=False)
 
 
-@pytest.fixture(params=["in_process", "parallel"])
-def env(request, storage, tmp_path):
-    store = obstore.store.LocalStore(str(tmp_path / "io"), mkdir=True)
-    parallel = request.param == "parallel"
-    executor = (
-        rs.Executor.parallel(max_workers=2) if parallel else rs.Executor.in_process()
-    )
-    return Env(storage, rs.PickleIOHandler(store=store), executor, parallel)
+@pytest.fixture
+def env(storage, executor_env):
+    executor, io_factory = executor_env
+    return Env(storage, executor, io_factory())
 
 
 def orders_asset(env: Env, hint, value, *, is_async=False, pid_file=None):
@@ -216,15 +206,9 @@ def orders_asset(env: Env, hint, value, *, is_async=False, pid_file=None):
     return orders
 
 
-def events(storage, asset: str, event_type: str) -> list:
-    return [
-        e for e in storage.get_events_for_asset(asset) if e.event_type == event_type
-    ]
-
-
 def stored_schema(env: Env, asset: str) -> dict:
     """The ``pandera/schema`` entry of ``asset``'s materialization, decoded."""
-    [materialization] = events(env.storage, asset, "Materialization")
+    materialization = env.storage.get_latest_materialization(asset)
     [(variant, payload)] = json.loads(
         dict(materialization.metadata)["pandera/schema"]
     ).items()
@@ -233,11 +217,6 @@ def stored_schema(env: Env, asset: str) -> dict:
     if not env.parallel:
         assert variant == "Json"
     return json.loads(payload["value"])
-
-
-def step_error(storage, asset: str) -> str:
-    [failure] = events(storage, asset, "StepFailure")
-    return dict(failure.metadata)["error"]
 
 
 def assert_frames_equal(left, right):
@@ -279,7 +258,7 @@ def test_invalid_frame_fails_with_the_pandera_report(env, case, is_async):
     assert not result.success
     with pytest.raises(SchemaErrors) as report:
         schema.validate(frame, lazy=True)
-    error = step_error(env.storage, "orders")
+    error = dict(result.failed_assets)["orders"]
     assert error == (
         "AssetOutputValidationError: Asset 'orders' returned a value that does "
         f"not match '{hint}': {report.value}"
@@ -287,7 +266,7 @@ def test_invalid_frame_fails_with_the_pandera_report(env, case, is_async):
     # Lazy validation: the report lists every failed check, not the first.
     for check in ("greater_than_or_equal_to(0)", "greater_than(0)", "isin("):
         assert check in error
-    assert events(env.storage, "orders", "Materialization") == []
+    assert env.storage.get_latest_materialization("orders") is None
 
 
 @pytest.mark.parametrize("backend", ["pandas", "polars"])
@@ -332,7 +311,7 @@ def test_lazy_frame_is_checked_against_the_schema_only(env):
     assert stored_schema(env, "lazy_orders") == expected_schema("polars")
     with pytest.raises(SchemaErrors) as report:
         PolarsOrders.validate(good.drop("status").lazy(), lazy=True)
-    assert step_error(env.storage, "lazy_missing_column") == (
+    assert dict(result.failed_assets)["lazy_missing_column"] == (
         "AssetOutputValidationError: Asset 'lazy_missing_column' returned a value "
         f"that does not match '{LazyFrame[PolarsOrders]}': {report.value}"
     )
@@ -342,7 +321,7 @@ def test_value_that_is_not_a_frame_fails_like_any_hint(env):
     _, result = env.materialize(orders_asset(env, DataFrame[Orders], GOOD_ROWS))
 
     assert not result.success
-    assert step_error(env.storage, "orders") == (
+    assert dict(result.failed_assets)["orders"] == (
         "AssetOutputValidationError: Asset 'orders' returned value of type 'dict' "
         f"but expected '{DataFrame[Orders]}'"
     )
@@ -360,11 +339,11 @@ def test_optional_hint_accepts_none_and_reports_a_bad_frame(env):
 
     assert not result.success
     assert repo.load_node("no_orders") is None
-    [materialization] = events(env.storage, "no_orders", "Materialization")
+    materialization = env.storage.get_latest_materialization("no_orders")
     assert "pandera/schema" not in dict(materialization.metadata)
     with pytest.raises(SchemaErrors) as report:
         Orders.validate(bad, lazy=True)
-    assert step_error(env.storage, "orders") == (
+    assert dict(result.failed_assets)["orders"] == (
         "AssetOutputValidationError: Asset 'orders' returned a value that does "
         f"not match '{hint}': {report.value}"
     )
@@ -379,7 +358,7 @@ def test_metadata_the_asset_sets_wins_over_the_schema_entry(env):
     _, result = env.materialize(orders)
 
     assert result.success
-    [materialization] = events(env.storage, "orders", "Materialization")
+    materialization = env.storage.get_latest_materialization("orders")
     metadata = {k: json.loads(v) for k, v in materialization.metadata}
     assert metadata["pandera/schema"] == {"Text": {"value": "see the data contract"}}
     assert metadata["rows"] == {"Int": {"value": 2}}

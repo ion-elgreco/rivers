@@ -3,6 +3,7 @@
 from typing import Annotated, Any, Optional, Union
 
 import pytest
+from _helpers import materialize_beside_sibling
 
 import rivers as rs
 from rivers.exceptions import AssetOutputValidationError
@@ -468,8 +469,7 @@ class TestDependencyChains:
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 def test_every_executor_checks_the_return_type(storage, executor_env, is_async):
-    """The parallel executor checks a sync step in its loky worker; a lone
-    step runs in-process, so a sibling step keeps this one in the worker."""
+    """The parallel executor checks a sync step in its loky worker."""
     executor, io_factory = executor_env
 
     if is_async:
@@ -485,19 +485,10 @@ def test_every_executor_checks_the_return_type(storage, executor_env, is_async):
         def bad() -> int:
             return "oops"  # type: ignore
 
-    @rs.Asset(io_handler=io_factory())
-    def sibling() -> int:
-        return 1
-
-    repo = rs.CodeRepository(assets=[bad, sibling], default_executor=executor)
-    repo.resolve(storage=storage)
-    result = repo.materialize(raise_on_error=False)
+    _, result = materialize_beside_sibling(storage, executor, io_factory(), bad)
 
     assert not result.success
-    [failure] = [
-        e for e in storage.get_events_for_asset("bad") if e.event_type == "StepFailure"
-    ]
-    assert dict(failure.metadata)["error"] == (
+    assert dict(result.failed_assets)["bad"] == (
         "AssetOutputValidationError: Asset 'bad' returned value of type 'str' "
         "but expected '<class 'int'>'"
     )
