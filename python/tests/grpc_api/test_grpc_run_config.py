@@ -16,8 +16,9 @@ import os
 
 import grpc
 import rivers as rs
+from _helpers import VAULT_SECRETS, VAULT_VALUES, Vault, make_vault, reveal
 from _polling import wait_for_run_terminal
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, Json, SecretStr, field_validator
 from pydantic_settings import BaseSettings
 from rivers._core import AutomationDaemon
 
@@ -43,6 +44,13 @@ class ThresholdConfig(BaseModel):
 
 class CompactConfig(BaseModel):
     target_size_mb: int = 128
+
+
+class KeyedConfig(BaseModel):
+    """A secret default, which pydantic's schema shows masked."""
+
+    region: str = "eu"
+    api_key: SecretStr | None = SecretStr("cfg-s3cret")
 
 
 class StrictConfig(BaseModel):
@@ -74,6 +82,7 @@ class DbResource(rs.Resource):
     dsn: str = "memory://"
     pool_size: int = Field(2, ge=1)
     token: SecretStr = SecretStr("s3cret")
+    options: Json[dict] = '{"retries": 3}'
 
 
 def _build_repo(tmp_path, run_queue=None):
@@ -123,6 +132,10 @@ def _build_repo(tmp_path, run_queue=None):
     def tagged(context: rs.AssetExecutionContext):
         return dict(context.asset_metadata or {})
 
+    @rs.Asset(io_handler=handler)
+    def keyed(context: rs.AssetExecutionContext[KeyedConfig]):
+        return context.config.region
+
     # A picklable handler: a `rivers/executor` override may move these
     # steps to a worker process (two of them: a lone step stays in-process).
     pickled = rs.PickleIOHandler(
@@ -145,6 +158,10 @@ def _build_repo(tmp_path, run_queue=None):
     def uses_db(db: DbResource):
         return f"{db.dsn}/{db.pool_size}/{db.token.get_secret_value()}"
 
+    @rs.Asset(io_handler=handler)
+    def uses_vault(vault: Vault):
+        return reveal(vault)
+
     # A bash task has no function, so no config class.
     shell = rs.BashTask(name="shell", command="true")
 
@@ -159,13 +176,15 @@ def _build_repo(tmp_path, run_queue=None):
             strict,
             from_env,
             tagged,
+            keyed,
             pid,
             pid2,
             uses_db,
+            uses_vault,
         ],
         tasks=[tidy, shell],
         jobs=[job, tidy_job, shell_job],
-        resources={"db": DbResource(), "store": handler},
+        resources={"db": DbResource(), "vault": make_vault(), "store": handler},
         default_executor=rs.Executor.in_process(),
         run_queue=run_queue,
     )
@@ -234,11 +253,31 @@ def _single(pb2, key):
 # ── Schemas ──
 
 
-def test_get_assets_info_exposes_config_schemas(direct):
-    stub, pb2, _ = direct
-    by_key = {
+def _assets_info(stub, pb2) -> dict:
+    return {
         a.asset_key: a for a in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).assets
     }
+
+
+def _resource_schemas(stub, pb2) -> dict[str, str]:
+    return {
+        r.key: r.config_schema
+        for r in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).resources
+    }
+
+
+def _defaults(schema: dict) -> dict:
+    """The schema's top-level fields that have a `default`, with it."""
+    return {
+        name: prop["default"]
+        for name, prop in schema["properties"].items()
+        if "default" in prop
+    }
+
+
+def test_get_assets_info_exposes_config_schemas(direct):
+    stub, pb2, _ = direct
+    by_key = _assets_info(stub, pb2)
 
     schema = json.loads(by_key["configured"].config_schema)
     assert schema["title"] == "ThresholdConfig"
@@ -256,23 +295,105 @@ def test_get_assets_info_exposes_config_schemas(direct):
     }
 
 
+def test_config_schema_holds_no_secret_default(direct):
+    """A config class's secret default reaches the schema as pydantic's mask;
+    the schema leaves it out so a launch never sends the mask as a value."""
+    stub, pb2, _ = direct
+    text = _assets_info(stub, pb2)["keyed"].config_schema
+    assert "**********" not in text
+    properties = json.loads(text)["properties"]
+    assert properties["region"]["default"] == "eu"
+    assert "default" not in properties["api_key"]
+
+
 def test_get_assets_info_exposes_resource_schemas(direct):
     """Each overridable resource with its class schema: an instance's current
-    values as the defaults, no field required, a secret's value left out.
-    An IO handler is not listed."""
+    values as the defaults (a `Json` field's as its text), no field required,
+    a secret's value left out. An IO handler is not listed."""
     stub, pb2, _ = direct
     resources = {
-        r.key: json.loads(r.config_schema)
-        for r in stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()).resources
+        key: json.loads(text) for key, text in _resource_schemas(stub, pb2).items()
     }
-    assert list(resources) == ["db"]
+    assert list(resources) == ["db", "vault"]
     schema = resources["db"]
     assert schema["title"] == "DbResource"
     assert "required" not in schema
     assert schema["properties"]["dsn"]["default"] == "memory://"
     assert schema["properties"]["pool_size"]["default"] == 2
+    assert schema["properties"]["options"]["default"] == '{"retries":3}'
     assert schema["properties"]["token"]["writeOnly"] is True
     assert "default" not in schema["properties"]["token"]
+
+
+def test_resource_schema_holds_no_secret(direct):
+    """No secret reaches the launch schema, as its value or as pydantic's
+    mask: a field that holds one in a union branch, a nested model or a
+    list's items gets no default, and neither do the secrets of the class
+    schemas under `$defs`."""
+    stub, pb2, _ = direct
+    text = _resource_schemas(stub, pb2)["vault"]
+    assert [s for s in [*VAULT_SECRETS, "**********"] if s in text] == []
+    schema = json.loads(text)
+    assert _defaults(schema) == {"region": "eu"}
+    assert schema["$defs"]["Login"]["properties"]["user"]["default"] == "me"
+    assert "default" not in schema["$defs"]["Connection"]["properties"]["api_key"]
+
+
+def _launch_vault(stub, pb2, repo, document):
+    """Materialize `uses_vault` with `document`; return what the asset saw."""
+    resp = stub.Materialize(
+        pb2.MaterializeRequest(selection=["uses_vault"], config=json.dumps(document))
+    )
+    run = wait_for_run_terminal(repo.storage, resp.run_id)
+    assert run.status == "Success"
+    assert run.config == document
+    return _STORE["uses_vault"]
+
+
+def test_a_launch_of_the_schema_defaults_keeps_the_secrets(direct):
+    """The document the launch dialog fills from the schema, one value
+    changed, rebuilds the resource with the real secrets."""
+    stub, pb2, repo = direct
+    schema = json.loads(_resource_schemas(stub, pb2)["vault"])
+    document = {"resources": {"vault": {**_defaults(schema), "region": "us"}}}
+    assert _validate(stub, pb2, document, ["uses_vault"]) == []
+    assert _launch_vault(stub, pb2, repo, document) == {**VAULT_VALUES, "region": "us"}
+
+
+def test_a_nested_override_keeps_the_secrets_beside_it(direct):
+    """A nested model takes the document's values field by field, so the
+    secret next to the one set keeps its value."""
+    stub, pb2, repo = direct
+    document = {"resources": {"vault": {"login": {"user": "you"}}}}
+    assert _validate(stub, pb2, document, ["uses_vault"]) == []
+    assert _launch_vault(stub, pb2, repo, document) == {
+        **VAULT_VALUES,
+        "login": ("you", "l0gin"),
+    }
+
+
+def test_slack_token_never_reaches_the_launch_schema(grpc_stubs):
+    pytest.importorskip("slack_sdk")
+    from rivers.integrations.slack import SlackResource
+
+    @rs.Asset
+    def plain():
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[plain], resources={"slack": SlackResource(token="xoxb-s3cret")}
+    )
+    channel, stub, pb2 = _connect(repo, grpc_stubs)
+    try:
+        text = _resource_schemas(stub, pb2)["slack"]
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+    assert "xoxb-s3cret" not in text
+    assert "**********" not in text
+    token = json.loads(text)["properties"]["token"]
+    assert token["writeOnly"] is True
+    assert "default" not in token
 
 
 # ── Materialize ──

@@ -51,6 +51,8 @@ runs:
         # Honor the composite's `cache` input. With cache: false we get
         # release-safe (no cross-run uv cache) builds.
         enable-cache: ${{ inputs.cache }}
+        # PRs restore main's cache but never save their own copies
+        save-cache: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Install Python ${{ inputs.python-version }}
       shell: bash
@@ -63,6 +65,15 @@ runs:
     - name: Setup sccache
       if: inputs.cache == 'true' && inputs.rust-cache == 'true'
       uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+    # rust-cache puts every installed toolchain in its key. The runner image's
+    # preinstalled `stable` changes with each image release, so runners on two
+    # image versions get two keys and one of them builds cold. Ours is pinned
+    # in rust-toolchain.toml.
+    - name: Remove the runner's preinstalled stable Rust
+      if: inputs.cache == 'true' && inputs.rust-cache == 'true'
+      shell: bash
+      run: rustup toolchain uninstall stable
 
     - name: Setup Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0

@@ -48,7 +48,7 @@ Each sensor and schedule can specify an `eval_mode` that controls how the evalua
 |------|-------------|
 | `EvalMode.Auto` | **(default)** Auto-detects async vs sync. Async functions run automatically on the Python event loop managed from Rust. Sync functions run in-process on a dedicated thread. |
 | `EvalMode.InProcess` | Always run in the daemon process. Async functions run on the Python event loop managed from Rust; sync functions run on a dedicated thread. |
-| `EvalMode.Subprocess` | Run in a loky subprocess for true parallelism. Requires `pip install loky`. Config injection and resources are not available in subprocess mode. |
+| `EvalMode.Subprocess` | Run in a loky subprocess for true parallelism. Requires `pip install loky`. The subprocess rebuilds the resources from their field values, secrets included. |
 
 ### Example
 
@@ -123,7 +123,7 @@ At daemon startup, each eval function is classified:
 - Combined with the user's `eval_mode` setting, this determines the dispatch:
     - **Async in-process**: the coroutine runs automatically on the Python event loop managed from Rust. Other evaluations run while it waits at `await` points.
     - **Sync in-process**: the function runs on a dedicated tokio blocking thread. Up to four sensor and schedule evaluations run at once.
-    - **Subprocess**: the eval function and context data are submitted to a loky process pool. The subprocess reconstructs the context from primitives and calls the function (no resources / config injection available across the boundary).
+    - **Subprocess**: the eval function and context data are submitted to a loky process pool. The subprocess reconstructs the context from primitives, rebuilds the resources from their field values (secrets included) and calls the function.
 
 ## API
 

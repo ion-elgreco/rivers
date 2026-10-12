@@ -257,8 +257,61 @@ def test_no_retries_surface_the_conflict(tmp_path, monkeypatch):
     handler.resource.teardown()
     assert len(errors) == 1
     assert isinstance(errors[0], duckdb.TransactionException)
-    # DuckLake reports the clash as a conflict or as a duplicate snapshot id.
-    assert "exceeded the maximum retry count of 0" in str(errors[0]).lower()
+    assert io_module._is_conflict(errors[0])
+
+
+class _FailingCommit:
+    """A connection whose first commit raises ``error``."""
+
+    def __init__(self, error: BaseException):
+        self.errors = [error]
+
+    def begin(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def commit(self):
+        if self.errors:
+            raise self.errors.pop()
+
+
+# How DuckLake reports a commit that lost a race, depending on the timing and on
+# the catalog database (DuckDB, SQLite, PostgreSQL).
+_LOST_RACES = [
+    'Transaction conflict - attempting to insert into table with index "1" - but '
+    "another transaction has deleted from it",
+    "Failed to flush changes into DuckLake: Conflict on update!",
+    'Failed to append: Duplicate key "data_file_id: 1" violates primary key constraint.',
+    "UNIQUE constraint failed: ducklake_snapshot.snapshot_id",
+    "could not serialize access due to concurrent update",
+]
+
+
+@pytest.mark.parametrize("cause", _LOST_RACES)
+def test_a_commit_that_lost_a_race_is_retried(cause, monkeypatch):
+    monkeypatch.setattr(io_module, "sleep", lambda _: None)
+    con = _FailingCommit(
+        duckdb.TransactionException(f"Failed to commit DuckLake transaction.\n{cause}")
+    )
+    writes: list[int] = []
+
+    io_module._commit_with_retry(con, lambda: writes.append(1), ducklake=False)
+    assert len(writes) == 2
+
+
+def test_other_commit_errors_are_not_retried():
+    con = _FailingCommit(
+        duckdb.TransactionException(
+            "Failed to commit DuckLake transaction.\nIO Error: No space left on device"
+        )
+    )
+    writes: list[int] = []
+
+    with pytest.raises(duckdb.TransactionException, match="No space left"):
+        io_module._commit_with_retry(con, lambda: writes.append(1), ducklake=False)
+    assert len(writes) == 1
 
 
 def test_async_backfill_runs_write_partitions_of_one_table(storage, lake):

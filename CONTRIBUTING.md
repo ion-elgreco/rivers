@@ -46,7 +46,7 @@ After the first build, the editable wheel is installed into `.venv`. Re-run `jus
 ## Running tests
 
 ```bash
-just test          # Python test suite (pytest)
+just test          # Python test suite (pytest, one worker per CPU)
 just test-rust     # Rust workspace tests
 just pre-commit    # ruff (lint + format) + pyright
 ```
