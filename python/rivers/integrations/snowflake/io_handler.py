@@ -134,7 +134,7 @@ class SnowflakeIOHandler(BaseIOHandler):
                 f"got {raw_mode!r}"
             ) from None
 
-        target = _quote_table(schema, table)
+        target = quote_table(schema, table)
         delete = None
         if mode is SnowflakeWriteMode.OVERWRITE:
             delete = f"DELETE FROM {target}"
@@ -146,7 +146,7 @@ class SnowflakeIOHandler(BaseIOHandler):
             f"{_quote(field.name)} {_snowflake_type(field.type)}"
             for field in reader.schema
         )
-        stage = _quote_table(schema, f"RIVERS_STAGE_{uuid.uuid4().hex}")
+        stage = quote_table(schema, f"RIVERS_STAGE_{uuid.uuid4().hex}")
 
         start = monotonic()
         with self.get_connection() as con:
@@ -192,7 +192,7 @@ class SnowflakeIOHandler(BaseIOHandler):
         schema, table = self.table_name(context.asset_name, meta)
         columns = json.loads(meta.get("snowflake/columns", "null"))
         select = ", ".join(map(_quote, columns)) if columns else "*"
-        sql = f"SELECT {select} FROM {_quote_table(schema, table)}"
+        sql = f"SELECT {select} FROM {quote_table(schema, table)}"
         if context.partition is not None:
             sql += f" WHERE {self.partition_predicate(meta, context.partition)}"
 
@@ -209,11 +209,11 @@ def _quote(name: str) -> str:
     return '"' + name.upper().replace('"', '""') + '"'
 
 
-def _quote_table(schema: str, table: str) -> str:
+def quote_table(schema: str, table: str) -> str:
     return f"{_quote(schema)}.{_quote(table)}"
 
 
-def _table_columns(cur: SnowflakeCursor, schema: str, table: str) -> set[str]:
+def table_columns(cur: SnowflakeCursor, schema: str, table: str) -> set[str]:
     """The uppercased column names of ``schema.table``, empty if the table does not exist."""
     cur.execute(
         "SELECT column_name FROM information_schema.columns "
@@ -234,7 +234,7 @@ def _prepare_table(
     Raises:
         ValueError: If the table exists without a column in ``names``.
     """
-    if existing := _table_columns(cur, schema, table):
+    if existing := table_columns(cur, schema, table):
         if missing := [name for name in names if name.upper() not in existing]:
             raise ValueError(
                 f"table {schema}.{table} has no column {', '.join(missing)}: add it "

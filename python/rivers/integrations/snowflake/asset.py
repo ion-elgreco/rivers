@@ -17,8 +17,8 @@ from rivers._core.assets import (
 )
 from rivers.integrations.snowflake.io_handler import (
     SnowflakeIOHandler,
-    _quote_table,
-    _table_columns,
+    quote_table,
+    table_columns,
 )
 
 __all__ = ["SnowflakeAsset"]
@@ -71,13 +71,13 @@ class SnowflakeAsset(Asset):
 
         with handler.get_connection() as con:
             cur = con.cursor()
-            if not _table_columns(cur, schema, table):
+            if not table_columns(cur, schema, table):
                 ctx.log.info(
                     "[delete] no table %s.%s — clearing state only", schema, table
                 )
                 return None
 
-            cur.execute(f"DELETE FROM {_quote_table(schema, table)}{where}")
+            cur.execute(f"DELETE FROM {quote_table(schema, table)}{where}")
             deleted = cur.rowcount
 
         ctx.log.info("[delete] %s.%s: deleted %d rows%s", schema, table, deleted, where)

@@ -488,7 +488,7 @@ def test_append_mode_and_name_overrides(warehouse):
 
 
 def test_names_are_uppercased_and_quoted():
-    assert io_module._quote_table("graph", 'task/"odd" name') == (
+    assert io_module.quote_table("graph", 'task/"odd" name') == (
         '"GRAPH"."TASK/""ODD"" NAME"'
     )
 
