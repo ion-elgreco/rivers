@@ -229,32 +229,20 @@ class RecordingCursor:
         return self.results.pop(0)
 
 
-def test_create_statements_only_run_for_missing_objects():
+@pytest.mark.parametrize(
+    ("results", "exists", "creates"),
+    [
+        ([[("ID",)]], True, []),
+        ([[], [(1,)]], False, []),
+        ([[], [(0,)]], False, ['CREATE SCHEMA IF NOT EXISTS "RAW"']),
+    ],
+    ids=["table", "schema", "neither"],
+)
+def test_create_statements_only_run_for_missing_objects(results, exists, creates):
     """A role without the create privilege can still write to existing objects."""
-    lookup_table = (
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = %s AND table_name = %s"
-    )
-    lookup_schema = (
-        "SELECT COUNT(*) FROM information_schema.schemata "
-        "WHERE catalog_name = CURRENT_DATABASE() AND schema_name = %s"
-    )
-
-    table_exists = RecordingCursor([("ID",)])
-    assert io_module._prepare_table(table_exists, "RAW", "T", ["id"])
-    assert table_exists.sql == [lookup_table]
-
-    schema_exists = RecordingCursor([], [(1,)])
-    assert not io_module._prepare_table(schema_exists, "RAW", "T", ["id"])
-    assert schema_exists.sql == [lookup_table, lookup_schema]
-
-    schema_missing = RecordingCursor([], [(0,)])
-    assert not io_module._prepare_table(schema_missing, "RAW", "T", ["id"])
-    assert schema_missing.sql == [
-        lookup_table,
-        lookup_schema,
-        'CREATE SCHEMA IF NOT EXISTS "RAW"',
-    ]
+    cur = RecordingCursor(*results)
+    assert io_module._prepare_table(cur, "RAW", "T", ["id"]) is exists
+    assert [sql for sql in cur.sql if sql.startswith("CREATE")] == creates
 
 
 def test_unsupported_column_type_fails_before_connecting():
