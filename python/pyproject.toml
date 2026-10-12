@@ -30,6 +30,7 @@ otel = ["opentelemetry-api>=1.0"]
 slack = ["slack-sdk>=3.10.0"]
 duckdb = ["duckdb>=1.5.2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
+sling = ["sling>=1.4.3.post1", "pyyaml>=6.0.1"]
 
 [project.scripts]
 rivers = "rivers.cli:main"
