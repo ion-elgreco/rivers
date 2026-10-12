@@ -257,7 +257,8 @@ def test_no_retries_surface_the_conflict(tmp_path, monkeypatch):
     handler.resource.teardown()
     assert len(errors) == 1
     assert isinstance(errors[0], duckdb.TransactionException)
-    assert "conflict" in str(errors[0]).lower()
+    # DuckLake reports the clash as a conflict or as a duplicate snapshot id.
+    assert "exceeded the maximum retry count of 0" in str(errors[0]).lower()
 
 
 def test_async_backfill_runs_write_partitions_of_one_table(storage, lake):
