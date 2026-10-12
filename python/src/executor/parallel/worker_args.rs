@@ -10,7 +10,7 @@ use crate::errors::ExecutionError;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
 
-use super::super::ops::{self, is_context_annotation};
+use super::super::ops::{self, OutOfProcess, is_context_annotation};
 
 pub(super) struct WorkerArgs {
     /// Function arguments (direct values loaded in parent, or placeholders for resources).
@@ -233,6 +233,7 @@ fn build_io_load_spec(
 ) -> PyResult<Py<PyAny>> {
     let (handler, source) =
         registry.for_upstream_input_with_source(py, downstream_node, upstream_node, param_name);
+    OutOfProcess::Parallel.check_handler(py, param_name, &handler)?;
 
     // Pickle-safe transport. Only wrap with `IOHandlerRef` (which reconstructs
     // by re-importing `module.qualname.io_handler` in the subprocess) when the
@@ -405,23 +406,27 @@ pub(super) fn make_io_handler_ref(
 /// - `Definition` → wrap via `task_func` (worker re-imports `module.qualname.io_handler`).
 /// - `GraphOverride` → wrap via the parent graph asset's callable
 ///   (worker re-imports `parent_graph.qualname.node_io_handler`).
-/// - `Default` → ship the registry default raw (it's a process-shared instance).
 ///
 /// Each wrap step falls back to the raw handler when `make_io_handler_ref`
 /// fails (callables defined inside `<locals>`, e.g. test closures).
+///
+/// `None` for an `InMemoryIOHandler` (the registry default included): a value
+/// the worker writes there never reaches this process.
 pub(super) fn resolve_io_handler_ref(
     py: Python,
     step_name: &str,
     task_func: &Py<PyAny>,
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
-) -> Py<PyAny> {
-    let node = match node_map.get(step_name) {
-        Some(n) => n,
-        None => return registry.default_handler(py),
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(node) = node_map.get(step_name) else {
+        return Ok(None);
     };
     let (handler, source) = registry.for_output_with_source(py, node);
-    match source {
+    if ops::is_in_memory(py, &handler)? {
+        return Ok(None);
+    }
+    let handler = match source {
         IOHandlerSource::GraphOverride => {
             // Reconstructed from the parent graph asset's `node_io_handler`.
             // Look up by typed `parent_graph_name` rather than splitting the
@@ -438,7 +443,8 @@ pub(super) fn resolve_io_handler_ref(
             make_io_handler_ref(py, task_func, &handler).unwrap_or(handler)
         }
         IOHandlerSource::Default | IOHandlerSource::InputOverride => handler,
-    }
+    };
+    Ok(Some(handler))
 }
 
 /// Build submit args for loky using _worker_execute_step.
@@ -562,6 +568,9 @@ impl WorkerIOSpec {
     }
 }
 
+/// The handler is `None` for an output kept in memory: the worker fails the
+/// step when it returns a value, and runs it when it returns a
+/// `Materialization`.
 fn build_single_output_spec(
     py: Python,
     output_name: &str,
@@ -572,33 +581,25 @@ fn build_single_output_spec(
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
 ) -> PyResult<WorkerIOSpec> {
-    let io_handler = node.io_handler(py);
-    let has_io = io_handler.is_some();
-    let output_context_kwargs: Py<PyAny> = if has_io {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("asset_name", output_name)?;
-        kwargs.set_item("asset_metadata", node.metadata())?;
-        let partition = ops::build_partition_context(node, partition_key)?;
-        kwargs.set_item("partition", partition)?;
-        let return_hint = ops::extract_return_hint(py, func)?;
-        kwargs.set_item("type_hint", return_hint)?;
-        kwargs.unbind().into_any()
-    } else {
-        py.None()
-    };
-    let handler = if has_io {
-        resolve_io_handler_ref(py, step_name, func, node_map, registry)
-    } else {
-        py.None()
-    };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("asset_name", output_name)?;
+    kwargs.set_item("asset_metadata", node.metadata())?;
+    kwargs.set_item(
+        "partition",
+        ops::build_partition_context(node, partition_key)?,
+    )?;
+    kwargs.set_item("type_hint", ops::extract_return_hint(py, func)?)?;
+    let handler = resolve_io_handler_ref(py, step_name, func, node_map, registry)?;
     Ok(WorkerIOSpec::Single {
-        io_handler: handler,
-        output_context_kwargs,
+        io_handler: handler.unwrap_or_else(|| py.None()),
+        output_context_kwargs: kwargs.unbind().into_any(),
     })
 }
 
 /// `(handler, output_context_kwargs)` for the graph's output. The type hint is
-/// the final task's, as on the in-process write.
+/// the final task's, as on the in-process write. `None` for a graph kept in
+/// memory: this process writes it from the task's output loaded back
+/// (`process_worker_result`).
 fn build_graph_output_spec(
     py: Python,
     graph_name: &str,
@@ -611,7 +612,10 @@ fn build_graph_output_spec(
     let graph_func = graph_node
         .callable(py)
         .unwrap_or_else(|_| task_func.clone_ref(py));
-    let handler = resolve_io_handler_ref(py, graph_name, &graph_func, node_map, registry);
+    let Some(handler) = resolve_io_handler_ref(py, graph_name, &graph_func, node_map, registry)?
+    else {
+        return Ok(py.None());
+    };
     let kwargs = PyDict::new(py);
     kwargs.set_item("asset_name", graph_name)?;
     kwargs.set_item("asset_metadata", graph_node.metadata())?;
@@ -642,7 +646,8 @@ fn build_multi_output_specs(
                 out_name
             ))
         })?;
-        let handler_ref = resolve_io_handler_ref(py, out_name, func, node_map, registry);
+        let handler_ref = resolve_io_handler_ref(py, out_name, func, node_map, registry)?
+            .unwrap_or_else(|| py.None());
         let kwargs = PyDict::new(py);
         kwargs.set_item("asset_name", out_name)?;
         kwargs.set_item("asset_metadata", out_node.metadata())?;

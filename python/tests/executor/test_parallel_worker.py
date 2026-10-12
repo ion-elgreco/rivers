@@ -5,6 +5,14 @@ DAG shapes, error handling, collecting mode, IO handlers (Pickle, Delta),
 mixed configurations, and per-asset executor overrides.
 """
 
+import datetime
+import json
+import os
+import pickle
+import subprocess
+import sys
+import textwrap
+
 import obstore
 import obstore.store
 import pyarrow as pa
@@ -14,11 +22,11 @@ from pydantic import BaseModel
 import rivers as rs
 from rivers.exceptions import ConfigurationError
 
+from _helpers import EXECUTORS, MP
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-MP = rs.Executor.parallel(max_workers=2)
 
 
 def _job_repo(assets, executor=MP, resources=None):
@@ -571,6 +579,255 @@ def test_mp_output_metadata_multiple_keys():
 
     repo = _run([rich_meta])
     assert repo.load_node("rich_meta") == "done"
+
+
+_SCHEMA = pa.schema([("a", pa.int64())])
+
+
+def _typed_metadata():
+    """One entry per MetadataValue variant; ``version`` sets the data version."""
+    m = rs.MetadataValue
+    return {
+        "text": m.text("hello"),
+        "int": m.int(7),
+        "float": m.float_(1.5),
+        "bool": m.bool_(True),
+        "url": m.url("https://example.com/run/1"),
+        "file": m.path("/data/x.parquet"),
+        "json": m.json('{"a": 1}'),
+        "md": m.md("# Title"),
+        "timestamp": m.timestamp(1700000000.5),
+        "null": m.null(),
+        "bytes": m.bytes(2048),
+        "duration": m.duration(1.5),
+        "sql": m.sql("SELECT 1", dialect="postgres"),
+        "code": m.code_block("print(1)", language="python"),
+        "image": m.image("https://example.com/a.png"),
+        "percentage": m.percentage(12.5),
+        "list": m.list_([m.int(1), m.text("a")]),
+        "date_range": m.date_range(
+            datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2, 3, 4, 5, 6)
+        ),
+        "schema": m.schema(_SCHEMA),
+        "version": m.data_version("v1"),
+    }
+
+
+# How storage keeps `_typed_metadata()`; `version` is the event's data version.
+_TYPED_METADATA_JSON = {
+    "text": '{"Text":{"value":"hello"}}',
+    "int": '{"Int":{"value":7}}',
+    "float": '{"Float":{"value":1.5}}',
+    "bool": '{"Bool":{"value":true}}',
+    "url": '{"Url":{"value":"https://example.com/run/1"}}',
+    "file": '{"Path":{"value":"/data/x.parquet"}}',
+    "json": '{"Json":{"value":"{\\"a\\": 1}"}}',
+    "md": '{"Markdown":{"value":"# Title"}}',
+    "timestamp": '{"Timestamp":{"value":1700000000.5}}',
+    "null": '{"Null":{}}',
+    "bytes": '{"Bytes":{"value":2048}}',
+    "duration": '{"Duration":{"value":1.5}}',
+    "sql": '{"Sql":{"query":"SELECT 1","dialect":"postgres"}}',
+    "code": '{"CodeBlock":{"code":"print(1)","language":"python"}}',
+    "image": '{"Image":{"value":"https://example.com/a.png"}}',
+    "percentage": '{"Percentage":{"value":12.5}}',
+    "list": '{"List":{"values":[{"Int":{"value":1}},{"Text":{"value":"a"}}]}}',
+    "date_range": (
+        '{"DateRange":{"start":"2024-01-01T00:00:00","end":"2024-01-02T03:04:05.000006"}}'
+    ),
+    "schema": json.dumps(
+        {"Schema": {"ipc_bytes": list(rs.MetadataValue.schema(_SCHEMA).ipc_bytes)}},
+        separators=(",", ":"),
+    ),
+}
+
+
+def _with_location(asset):
+    """`_TYPED_METADATA_JSON` plus what `_TypedMetadataIOHandler` adds for `asset`."""
+    location = f'{{"Url":{{"value":"https://example.com/{asset}"}}}}'
+    return {**_TYPED_METADATA_JSON, "location": location}
+
+
+class _TypedMetadataIOHandler(rs.BaseIOHandler):
+    """Keeps no values; reports a typed location for each write."""
+
+    def handle_output(self, context, obj):
+        context.add_output_metadata(
+            {
+                "location": rs.MetadataValue.url(
+                    f"https://example.com/{context.asset_name}"
+                )
+            }
+        )
+
+    def load_input(self, context):
+        raise NotImplementedError
+
+
+def _stored(storage, run_id):
+    """``{(event_type, asset, partition): (metadata, data_version)}`` of the
+    run's Materialization and Observation events."""
+    return {
+        (
+            e.event_type,
+            e.asset_key,
+            e.partition_key and e.partition_key.to_json(),
+        ): (dict(e.metadata), e.data_version)
+        for e in storage.get_events_for_run(run_id)
+        if e.event_type in ("Materialization", "Observation")
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_materialization_metadata_keeps_its_type(executor, storage):
+    """Every MetadataValue variant on a returned Materialization is stored as itself."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset(io_handler=handler)
+    def typed_x() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_y() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Materialization", "typed_y", None): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_output_metadata_keeps_its_type(executor, storage):
+    """Output metadata and the IO handler's metadata are stored as their variants."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset(io_handler=handler)
+    def typed_x():
+        return rs.Output(1, metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_y():
+        return rs.Output(2, metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", None): (_with_location("typed_x"), "v1"),
+        ("Materialization", "typed_y", None): (_with_location("typed_y"), "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_multi_asset_metadata_keeps_its_type(executor, storage):
+    """Metadata on each yield of a multi-asset is stored as its variants."""
+    handler = _TypedMetadataIOHandler()
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("m_output", io_handler=handler),
+            rs.AssetDef("m_materialization", io_handler=handler),
+            rs.AssetDef("m_observation", io_handler=handler),
+        ]
+    )
+    def typed_multi():
+        yield rs.Output(1, output_name="m_output", metadata=_typed_metadata())
+        yield rs.Materialization(
+            output_name="m_materialization", metadata=_typed_metadata()
+        )
+        yield rs.Observation(output_name="m_observation", metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler)
+    def typed_sibling() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(
+        assets=[typed_multi, typed_sibling], default_executor=executor
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "m_output", None): (_with_location("m_output"), "v1"),
+        ("Materialization", "m_materialization", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Observation", "m_observation", None): (_TYPED_METADATA_JSON, "v1"),
+        ("Materialization", "typed_sibling", None): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_partitioned_metadata_keeps_its_type(executor, storage):
+    """A partitioned step's metadata is stored as its variants."""
+    handler = _TypedMetadataIOHandler()
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def typed_x():
+        return rs.Output(1, metadata=_typed_metadata())
+
+    @rs.Asset(io_handler=handler, partitions_def=pd)
+    def typed_y() -> rs.Materialization:
+        return rs.Materialization(metadata=_typed_metadata())
+
+    repo = rs.CodeRepository(assets=[typed_x, typed_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(partition_key=rs.PartitionKey.single("p1"))
+
+    p1 = rs.PartitionKey.single("p1").to_json()
+    assert _stored(storage, result.run_id) == {
+        ("Materialization", "typed_x", p1): (_with_location("typed_x"), "v1"),
+        ("Materialization", "typed_y", p1): (_TYPED_METADATA_JSON, "v1"),
+    }
+
+
+@rs.Task
+def _typed_double(x: int):
+    return rs.Output(x * 2, metadata=_typed_metadata())
+
+
+@rs.Task
+def _total(values: list) -> int:
+    return sum(values)
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_mapped_metadata_keeps_its_type(executor, storage, tmp_path):
+    """Each mapped instance's metadata is stored as its variants."""
+    handler = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset(io_handler=handler)
+    def numbers() -> list:
+        return [1, 2]
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def doubled():
+        return _total(numbers().map(_typed_double).collect())
+
+    repo = rs.CodeRepository(
+        assets=[numbers, doubled],
+        tasks=[_typed_double, _total],
+        default_executor=executor,
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    # The PickleIOHandler's own entries (path, size, timing) are left out.
+    instances = {
+        asset: ({k: v for k, v in metadata.items() if k in _TYPED_METADATA_JSON}, dv)
+        for (_, asset, _), (metadata, dv) in _stored(storage, result.run_id).items()
+        if asset.startswith("doubled/_typed_double__")
+    }
+    assert instances == {
+        "doubled/_typed_double__0": (_TYPED_METADATA_JSON, "v1"),
+        "doubled/_typed_double__1": (_TYPED_METADATA_JSON, "v1"),
+    }
+    assert repo.load_node("doubled") == 6
 
 
 # ---------------------------------------------------------------------------
@@ -1705,8 +1962,230 @@ def test_mp_in_memory_io_rejected_in_collecting():
     assets = [cm_a, cm_b]
     repo = rs.CodeRepository(assets=assets, default_executor=MP)
     result = repo.materialize(raise_on_error=False)
-    assert len(result.failed_assets) > 0
-    assert any("InMemoryIOHandler" in msg for _, msg in result.failed_assets)
+    assert sorted(result.failed_assets) == [
+        ("cm_a", _in_memory_error("cm_a")),
+        ("cm_b", _in_memory_error("cm_b")),
+    ]
+
+
+def _in_memory_error(asset):
+    return (
+        f"ExecutionError: Asset '{asset}' uses InMemoryIOHandler which cannot work "
+        "with parallel execution. InMemoryIOHandler stores data in process-local "
+        "memory that is not accessible from subprocesses. Use PickleIOHandler or "
+        "DeltaIOHandler instead, or switch to Executor.in_process()."
+    )
+
+
+def _materializations(storage, run_id):
+    """``{(asset, partition): metadata}`` of every Materialization in the run."""
+    return {
+        (e.asset_key, e.partition_key and e.partition_key.to_json()): dict(e.metadata)
+        for e in storage.get_events_for_run(run_id)
+        if e.event_type == "Materialization"
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_materialization_only_assets_need_no_io_handler(executor, is_async, storage):
+    """Assets that persist their own output run without an IO handler."""
+    if is_async:
+
+        @rs.Asset
+        async def mat_x() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 1})
+
+        @rs.Asset
+        async def mat_y() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 2})
+
+    else:
+
+        @rs.Asset
+        def mat_x() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 1})
+
+        @rs.Asset
+        def mat_y() -> rs.Materialization:
+            return rs.Materialization(metadata={"rows": 2})
+
+    repo = rs.CodeRepository(assets=[mat_x, mat_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["mat_x", "mat_y"])
+
+    assert result.success
+    assert _materializations(storage, result.run_id) == {
+        ("mat_x", None): {"rows": '{"Int":{"value":1}}'},
+        ("mat_y", None): {"rows": '{"Int":{"value":2}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_materialization_only_multi_asset_needs_no_io_handler(
+    executor, is_async, storage
+):
+    """A generator multi-asset without annotations that yields only
+    Materializations runs without an IO handler, next to a sibling step."""
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("load_a"), rs.AssetDef("load_b")])
+        async def load():
+            yield rs.Materialization(output_name="load_a", metadata={"rows": 1})
+            yield rs.Materialization(output_name="load_b", metadata={"rows": 2})
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("load_a"), rs.AssetDef("load_b")])
+        def load():
+            yield rs.Materialization(output_name="load_a", metadata={"rows": 1})
+            yield rs.Materialization(output_name="load_b", metadata={"rows": 2})
+
+    @rs.Asset
+    def sibling():
+        return rs.Materialization(metadata={"rows": 3})
+
+    repo = rs.CodeRepository(assets=[load, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["load_a", "load_b", "sibling"])
+
+    assert result.success
+    assert _materializations(storage, result.run_id) == {
+        ("load_a", None): {"rows": '{"Int":{"value":1}}'},
+        ("load_b", None): {"rows": '{"Int":{"value":2}}'},
+        ("sibling", None): {"rows": '{"Int":{"value":3}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_materialization_only_partitioned_assets_need_no_io_handler(executor, storage):
+    """Partitioned assets that persist their own output need no IO handler."""
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+    @rs.Asset(partitions_def=pd)
+    def part_x(context: rs.AssetExecutionContext) -> rs.Materialization:
+        return rs.Materialization(metadata={"key": context.partition_key})
+
+    @rs.Asset(partitions_def=pd)
+    def part_y(context: rs.AssetExecutionContext) -> rs.Materialization:
+        return rs.Materialization(metadata={"key": context.partition_key})
+
+    repo = rs.CodeRepository(assets=[part_x, part_y], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(partition_key=rs.PartitionKey.single("p2"))
+
+    assert result.success
+    p2 = rs.PartitionKey.single("p2").to_json()
+    assert _materializations(storage, result.run_id) == {
+        ("part_x", p2): {"key": '{"Text":{"value":"p2"}}'},
+        ("part_y", p2): {"key": '{"Text":{"value":"p2"}}'},
+    }
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_in_memory_value_for_a_worker_consumer(executor, tmp_path):
+    """A value on the in-memory default cannot reach a consumer in a worker,
+    even when its producer ran in this process."""
+    handler = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset
+    def source() -> int:
+        return 1
+
+    @rs.Asset(io_handler=handler)
+    def plus_one(source: int) -> int:
+        return source + 1
+
+    @rs.Asset(io_handler=handler)
+    def plus_two(source: int) -> int:
+        return source + 2
+
+    repo = rs.CodeRepository(
+        assets=[source, plus_one, plus_two], default_executor=executor
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    if executor is MP:
+        assert sorted(result.failed_assets) == [
+            ("plus_one", _in_memory_error("source")),
+            ("plus_two", _in_memory_error("source")),
+        ]
+    else:
+        assert result.failed_assets == []
+        assert repo.load_node("plus_two") == 3
+
+
+@pytest.mark.parametrize("name", rs.exceptions.__all__)
+def test_rivers_exceptions_pickle_as_their_class(name):
+    """A rivers exception raised in a worker reaches the caller as the class
+    it catches, not as a copy of that class."""
+    cls = getattr(rs.exceptions, name)
+
+    restored = pickle.loads(pickle.dumps(cls("boom")))
+
+    assert type(restored) is cls
+    assert restored.args == ("boom",)
+
+
+def test_in_memory_values_in_a_kubernetes_step_pod(tmp_path):
+    """A K8s step pod runs its step in-process and applies the same rule: a
+    step that persists its own output runs, an in-memory value cannot leave
+    or enter the pod. Subprocess because the step-pod flag is read once per
+    process."""
+    script = textwrap.dedent(
+        f"""
+        import json
+
+        import obstore.store
+        import rivers as rs
+        from rivers.testing import memory_storage
+
+        handler = rs.PickleIOHandler(store=obstore.store.LocalStore({str(tmp_path)!r}))
+
+        @rs.Asset
+        def own_output() -> rs.Materialization:
+            return rs.Materialization()
+
+        @rs.Asset(io_handler=rs.InMemoryIOHandler())
+        def in_memory() -> int:
+            return 1
+
+        @rs.Asset(io_handler=handler)
+        def consumer(in_memory: int) -> int:
+            return in_memory + 1
+
+        repo = rs.CodeRepository(
+            assets=[own_output, in_memory, consumer],
+            default_executor=rs.Executor.in_process(),
+        )
+        repo.resolve(storage=memory_storage())
+        for step in ("own_output", "in_memory", "consumer"):
+            result = repo.materialize(selection=[step], raise_on_error=False)
+            print(json.dumps(result.failed_assets))
+        """
+    )
+    env = dict(os.environ, RIVERS_STEP_POD="1")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    error = (
+        "ExecutionError: Asset 'in_memory' uses InMemoryIOHandler which cannot "
+        "work with Kubernetes execution. InMemoryIOHandler stores data in "
+        "process-local memory that is not accessible from step pods. Use "
+        "PickleIOHandler or DeltaIOHandler instead."
+    )
+    assert [json.loads(line) for line in proc.stdout.splitlines()] == [
+        [],
+        [["in_memory", error]],
+        [["consumer", error]],
+    ]
 
 
 # ---------------------------------------------------------------------------

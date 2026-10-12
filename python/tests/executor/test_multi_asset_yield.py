@@ -7,7 +7,7 @@ import pytest
 
 import rivers as rs
 
-from _helpers import DictIOHandler
+from _helpers import EXECUTORS, MP, DictIOHandler
 
 
 @pytest.fixture(params=["in_process", "parallel"])
@@ -967,3 +967,319 @@ def test_async_dict_multi_asset_parallel(tmp_path):
 
     assert load("ad_p") == 100
     assert load("ad_q") == 200
+
+
+# ── Partial failure: the same on every executor ──────────────────────
+
+
+def _step_events(storage, run_id):
+    """``{asset: [(event_type, partition, error)]}`` of the run's step
+    events, oldest first."""
+    events: dict[str, list] = {}
+    for e in storage.get_events_for_run(run_id):
+        if e.event_type in (
+            "StepStart",
+            "Materialization",
+            "StepSuccess",
+            "StepFailure",
+        ):
+            partition = e.partition_key and e.partition_key.to_json()
+            error = dict(e.metadata).get("error")
+            events.setdefault(e.asset_key, []).append((e.event_type, partition, error))
+    return events
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("first", ["output", "materialization"])
+@pytest.mark.parametrize("partitioned", [False, True], ids=["whole", "partitioned"])
+def test_generator_error_keeps_outputs_yielded_before_it(
+    executor, is_async, first, partitioned, tmp_path, storage
+):
+    """Outputs a generator yields before it raises keep their materialization
+    and value; only the outputs after the error fail."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    pd = rs.PartitionsDefinition.static_(["p1", "p2"]) if partitioned else None
+    key = rs.PartitionKey.single("p1") if partitioned else None
+    p1 = key and key.to_json()
+
+    def first_yield():
+        if first == "output":
+            return rs.Output(5, output_name="pa")
+        return rs.Materialization(output_name="pa")
+
+    output_defs = [rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=output_defs, partitions_def=pd)
+        async def multi():
+            yield first_yield()
+            raise RuntimeError("pb broke")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs, partitions_def=pd)
+        def multi():
+            yield first_yield()
+            raise RuntimeError("pb broke")
+
+    @rs.Asset(io_handler=io, partitions_def=pd)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(
+        ["pa", "pb", "sibling"], partition_key=key, raise_on_error=False
+    )
+
+    error = "RuntimeError: pb broke"
+    pb_failures = [("StepFailure", None, error)]
+    if partitioned:
+        pb_failures.insert(0, ("StepFailure", p1, error))
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", p1, None),
+        ("StepSuccess", None, None),
+    ]
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": [("StepStart", None, None), *pb_failures],
+        "sibling": succeeded,
+    }
+    if first == "output":
+        assert repo.load_node("pa", partition_key=key) == 5
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_generator_output_never_yielded_fails(executor, tmp_path, storage):
+    """An output the generator ends without yielding fails; the rest succeed."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    )
+    def multi():
+        yield rs.Output(5, output_name="pa")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["pa", "pb", "sibling"], raise_on_error=False)
+
+    error = "ExecutionError: Generator multi-asset did not yield output 'pb'"
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", None, None),
+        ("StepSuccess", None, None),
+    ]
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": [("StepStart", None, None), ("StepFailure", None, error)],
+        "sibling": succeeded,
+    }
+    assert result.failed_assets == [("pb", error)]
+    assert repo.load_node("pa") == 5
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_multi_asset_output_kept_in_memory(executor, tmp_path, storage):
+    """In a worker, an output kept in memory fails alone; the output the
+    worker completed before it keeps its materialization."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb")]
+    )
+    def multi():
+        yield rs.Output(1, output_name="pa")
+        yield rs.Output(2, output_name="pb")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(["pa", "pb", "sibling"], raise_on_error=False)
+
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", None, None),
+        ("StepSuccess", None, None),
+    ]
+    in_memory_error = (
+        "ExecutionError: Asset 'pb' uses InMemoryIOHandler which cannot work with "
+        "parallel execution. InMemoryIOHandler stores data in process-local memory "
+        "that is not accessible from subprocesses. Use PickleIOHandler or "
+        "DeltaIOHandler instead, or switch to Executor.in_process()."
+    )
+    pb = (
+        [("StepStart", None, None), ("StepFailure", None, in_memory_error)]
+        if executor is MP
+        else succeeded
+    )
+    assert _step_events(storage, result.run_id) == {
+        "pa": succeeded,
+        "pb": pb,
+        "sibling": succeeded,
+    }
+    assert repo.load_node("pa") == 1
+
+
+# ── Captured output of generator bodies ───────────────────────────────
+
+
+def _captured(storage, run_id, step_key):
+    """``(stdout, logs)`` of the step's captured-output row."""
+    [row] = [
+        row
+        for row in storage.get_run_logs(run_id)
+        if row.step_key == step_key and row.traceback is None
+    ]
+    return row.stdout, row.logs or ""
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("lone", [True, False], ids=["lone", "with_sibling"])
+@pytest.mark.parametrize("fails", [False, True], ids=["completes", "raises"])
+def test_generator_body_output_is_captured(
+    executor, is_async, lone, fails, tmp_path, storage, monkeypatch
+):
+    """A generator body's prints and log lines reach run_logs as a plain
+    body's do: before and between its yields, and before an error."""
+    import rivers._capture as cap
+
+    # Wrap pytest's own stdout of this test.
+    monkeypatch.setattr(cap, "_installed", False)
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    output_defs = [rs.AssetDef("ga", io_handler=io), rs.AssetDef("gb", io_handler=io)]
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        async def gen(context: rs.AssetExecutionContext):
+            print("first")
+            context.log.info("log from the body")
+            yield rs.Materialization(output_name="ga")
+            print("second")
+            if fails:
+                raise RuntimeError("gb broke")
+            yield rs.Materialization(output_name="gb")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        def gen(context: rs.AssetExecutionContext):
+            print("first")
+            context.log.info("log from the body")
+            yield rs.Materialization(output_name="ga")
+            print("second")
+            if fails:
+                raise RuntimeError("gb broke")
+            yield rs.Materialization(output_name="gb")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    assets = [gen] if lone else [gen, sibling]
+    repo = rs.CodeRepository(assets=assets, default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    stdout, logs = _captured(storage, result.run_id, "ga")
+    assert stdout == "first\nsecond\n"
+    # An async body, plain or generator, logs on the event loop's thread,
+    # where no capture runs.
+    if not is_async:
+        assert "log from the body" in logs
+    assert result.success is not fails
+
+
+class _LoudPickleIOHandler(rs.PickleIOHandler):
+    """Prints each load, as a handler that reports progress does."""
+
+    def load_input(self, context):
+        print(f"loading {context.asset_name}")
+        return super().load_input(context)
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_generator_step_output_is_one_row(
+    executor, is_async, tmp_path, storage, monkeypatch
+):
+    """A generator step's input load and its body share one run_logs row, as a
+    plain step's do."""
+    import rivers._capture as cap
+
+    monkeypatch.setattr(cap, "_installed", False)
+    io = _LoudPickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset(io_handler=io)
+    def upstream() -> int:
+        return 1
+
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
+        async def gen(upstream: int):
+            print(f"body got {upstream}")
+            yield rs.Materialization(output_name="ga")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
+        def gen(upstream: int):
+            print(f"body got {upstream}")
+            yield rs.Materialization(output_name="ga")
+
+    repo = rs.CodeRepository(assets=[upstream, gen], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize()
+
+    stdout, _ = _captured(storage, result.run_id, "ga")
+    assert stdout == "loading upstream\nbody got 1\n"
+
+
+# ── RunResult.failed_assets names the outputs that failed ─────────────
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize(
+    ("yields", "failed"),
+    [
+        (0, ["pa", "pb"]),
+        (1, ["pb"]),
+        (2, ["multi"]),
+    ],
+    ids=["before_any_output", "after_one_output", "after_every_output"],
+)
+def test_failed_assets_name_the_outputs_that_failed(
+    executor, yields, failed, tmp_path, storage
+):
+    """Each output that failed is listed, and none that succeeded. An error
+    after every output completed is listed under the multi-asset's name."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    )
+    def multi():
+        for name in ["pa", "pb"][:yields]:
+            yield rs.Materialization(output_name=name)
+        raise RuntimeError("broke")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    assert result.failed_assets == [(name, "RuntimeError: broke") for name in failed]
