@@ -154,10 +154,11 @@ class SnowflakeIOHandler(BaseIOHandler):
             exists = _prepare_table(cur, schema, table, reader.schema.names)
             cur.execute(f"CREATE TEMPORARY STAGE {stage}")
             for number, parquet in enumerate(_parquet_files(reader)):
-                cur.execute(
-                    f"PUT 'file:///rivers/{number}.parquet' @{stage}",
-                    file_stream=parquet,
-                )
+                with parquet:
+                    cur.execute(
+                        f"PUT 'file:///rivers/{number}.parquet' @{stage}",
+                        file_stream=parquet,
+                    )
 
             # after the upload, so that an output that fails to read makes no table
             if not exists:
@@ -339,8 +340,9 @@ def _parquet_files(reader: pa.RecordBatchReader) -> Iterator[io.BytesIO]:
             batches.append(batch.slice(offset, rows))
             size += batches[-1].nbytes
             if size >= _FILE_SIZE:
-                yield _parquet(reader.schema, batches)
+                file = _parquet(reader.schema, batches)
                 batches, size = [], 0
+                yield file
 
     if batches:
         yield _parquet(reader.schema, batches)
