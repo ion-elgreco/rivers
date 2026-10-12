@@ -190,7 +190,7 @@ class AirbyteResource(Resource):
     poll_timeout: float | None = None
     cancel_on_interrupt: bool = True
 
-    _token: str | None = PrivateAttr(default=None)
+    _token: str = PrivateAttr(default="")
     _token_expiry: float = PrivateAttr(default=0.0)
 
     @model_validator(mode="after")
@@ -476,7 +476,7 @@ class AirbyteResource(Resource):
         if self.client_id is not None and self.client_secret is not None:
             # Wall-clock time: the parallel executor pickles the token into
             # worker processes.
-            if self._token is None or time.time() >= self._token_expiry:
+            if time.time() >= self._token_expiry:
                 token = _Token.model_validate(
                     self._request(
                         "POST",
