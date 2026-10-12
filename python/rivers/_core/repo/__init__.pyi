@@ -41,7 +41,12 @@ class RunResult:
     materialized_assets: list[str]
     """Asset keys that were attempted in this run."""
     failed_assets: list[tuple[str, str]]
-    """``(asset_key, error_message)`` pairs for steps that failed."""
+    """``(asset_key, error_message)`` pairs for the assets that failed.
+
+    Each failed output of a multi-asset is listed, and no output that
+    materialized. A multi-asset that fails after all its outputs materialized
+    is listed under its own name.
+    """
 
 class RunHandle:
     """Async handle to a submitted run — poll, wait, or cancel."""

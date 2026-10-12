@@ -566,8 +566,10 @@ pub(crate) fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: 
 
 /// Emit a `StepFailure` event for every name in `event_names`, mark each
 /// failed, run failure hooks once (scoped to `name_for_hooks`), and push the
-/// original error onto `failures` keyed by `name_for_hooks`. The original
-/// `error` is preserved so the caller-visible exception type round-trips.
+/// error onto `failures` for every name in `event_names`. A multi-asset that
+/// failed after all its outputs completed has no such name: its own name takes
+/// the error. The original `error` is preserved so the caller-visible
+/// exception type round-trips.
 ///
 /// Caller responsibilities:
 /// - Non-mapped step (single or multi-output): pass `step.event_names()` and
@@ -613,7 +615,20 @@ pub(crate) fn handle_failure(
             config_instance,
         );
     }
-    failures.push((name_for_hooks.to_string(), error));
+
+    if event_names.is_empty() {
+        let name = ctx
+            .repo
+            .node_map
+            .get(&step.name)
+            .and_then(|n| n.name().ok())
+            .unwrap_or_else(|| name_for_hooks.to_string());
+        failures.push((name, error));
+    } else {
+        for name in event_names {
+            failures.push((name.clone(), error.clone_ref(py)));
+        }
+    }
 }
 
 /// Decode worker per-output items and emit Materialization / Observation

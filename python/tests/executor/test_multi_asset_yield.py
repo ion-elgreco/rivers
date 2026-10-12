@@ -1128,3 +1128,42 @@ def test_multi_asset_output_kept_in_memory(executor, tmp_path, storage):
         "sibling": succeeded,
     }
     assert repo.load_node("pa") == 1
+
+
+# ── RunResult.failed_assets names the outputs that failed ─────────────
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize(
+    ("yields", "failed"),
+    [
+        (0, ["pa", "pb"]),
+        (1, ["pb"]),
+        (2, ["multi"]),
+    ],
+    ids=["before_any_output", "after_one_output", "after_every_output"],
+)
+def test_failed_assets_name_the_outputs_that_failed(
+    executor, yields, failed, tmp_path, storage
+):
+    """Each output that failed is listed, and none that succeeded. An error
+    after every output completed is listed under the multi-asset's name."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    )
+    def multi():
+        for name in ["pa", "pb"][:yields]:
+            yield rs.Materialization(output_name=name)
+        raise RuntimeError("broke")
+
+    @rs.Asset(io_handler=io)
+    def sibling() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(assets=[multi, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    assert result.failed_assets == [(name, "RuntimeError: broke") for name in failed]
