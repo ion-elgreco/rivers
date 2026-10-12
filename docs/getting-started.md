@@ -18,6 +18,8 @@ pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler
 pip install rivers[datadog]   # Datadog events and metrics (hooks, a run-failure sensor, DogStatsD)
 ```
 
+The [Airbyte integration](guides/airbyte.md) needs no extra.
+
 rivers also runs on free-threaded Python (3.14t and later). See [Free-threaded Python](installation/free-threading.md).
 
 ## Your first asset
