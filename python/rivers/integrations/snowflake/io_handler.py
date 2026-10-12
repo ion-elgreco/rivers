@@ -43,12 +43,12 @@ class SnowflakeIOHandler(BaseIOHandler):
     Schema, table, and column names are uppercased, the form Snowflake gives
     unquoted names. A read lowercases the column names.
 
-    A write streams the rows to a temporary stage as Parquet files of about
-    100 MB, one file in memory at a time. The first write creates the table
-    from the output's Arrow types. Then one transaction deletes the old rows
-    (overwrite) and loads the files with ``COPY INTO``. The table keeps its
-    columns, grants, and policies: an output with a column that the table
-    does not have fails.
+    A write streams the rows to a temporary stage as Parquet files, each from
+    about 100 MB of Arrow data, one file in memory at a time. The first write
+    creates the table from the output's Arrow types. Then ``COPY INTO`` loads
+    the files; an overwrite deletes the old rows first, in the same
+    transaction. The table keeps its columns, grants, and policies: an output
+    with a column that the table does not have fails.
 
     The handler's sessions use the UTC time zone: daily and hourly partition
     bounds and the timestamps that a read returns are in UTC.
