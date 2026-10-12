@@ -331,15 +331,49 @@ pub fn worker_execute_step(
         let args_tuple = PyTuple::new(py, &resolved)?;
         let raw_result = func.call1(py, args_tuple)?;
 
+        // A multi-asset generator: for_each_output_generator handles per-yield
+        // peek/drain itself, so shared state stays empty (the in_process gen
+        // path skips the return type check and ctx drain too). Worker only
+        // handles sync code (async funcs are delegated to AsyncBackend in the
+        // main process), so an async generator is impossible here. Any other
+        // result is processed like the in-process path.
+        let is_gen = multi_output_specs.is_some()
+            && py
+                .import("inspect")?
+                .call_method1("isgenerator", (&raw_result,))?
+                .is_truthy()?;
+        let synth = if is_gen {
+            ops::StepResult {
+                result: raw_result,
+                return_hint: None,
+                output_metadata: Vec::new(),
+                data_version: None,
+                config_instance: None,
+                tags: None,
+                dynamic_keys: None,
+                result_kind: ResultKind::Output,
+                failed_partitions: Vec::new(),
+                generator: Some(ops::GeneratorType::Sync {
+                    context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
+                }),
+            }
+        } else {
+            ops::process_raw_result(
+                py,
+                &raw_result,
+                return_hint.as_ref(),
+                ctx_obj.as_ref(),
+                &step_name,
+            )?
+        };
+
         // Output items list shipped back to the orchestrator. One tuple per
         // selected output: (name, is_observation, metadata_dict_or_none, dv).
         let outputs_list = PyList::empty(py);
         let mut single_dynamic_keys: Option<Vec<String>> = None;
 
         if let Some(ref specs) = multi_output_specs {
-            // Multi-asset: build a synthetic StepResult and drive the shared
-            // iterator. Per-yield ctx peek/drain happens inside
-            // `for_each_output_generator`; for dict we drain once up-front.
+            // Multi-asset: drive the shared iterator over the selected outputs.
             let mut spec_map: HashMap<String, (Py<PyAny>, Py<PyAny>)> = HashMap::new();
             let mut selected_outputs: Vec<String> = Vec::new();
             for spec in specs.iter() {
@@ -350,42 +384,6 @@ pub fn worker_execute_step(
                 spec_map.insert(name.clone(), (handler, kwargs));
                 selected_outputs.push(name);
             }
-
-            let is_gen: bool = py
-                .import("inspect")?
-                .call_method1("isgenerator", (&raw_result,))?
-                .is_truthy()?;
-
-            // Dict path: processed like the in-process path (return type
-            // check, ctx drain). Gen path: for_each_output_generator handles
-            // per-yield peek/drain itself, so shared state stays empty (the
-            // in_process gen path skips both too). Worker only handles sync
-            // code (async funcs are delegated to AsyncBackend in the main
-            // process), so an async generator is impossible here.
-            let synth = if is_gen {
-                ops::StepResult {
-                    result: raw_result,
-                    return_hint: None,
-                    output_metadata: Vec::new(),
-                    data_version: None,
-                    config_instance: None,
-                    tags: None,
-                    dynamic_keys: None,
-                    result_kind: ResultKind::Output,
-                    failed_partitions: Vec::new(),
-                    generator: Some(ops::GeneratorType::Sync {
-                        context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
-                    }),
-                }
-            } else {
-                ops::process_raw_result(
-                    py,
-                    &raw_result,
-                    return_hint.as_ref(),
-                    ctx_obj.as_ref(),
-                    &step_name,
-                )?
-            };
 
             ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
                 match item {
@@ -433,18 +431,9 @@ pub fn worker_execute_step(
                 Ok(())
             })?;
         } else {
-            // Single-output: process the raw result the same way the in-
-            // process path does (Output / Materialization wrapper extraction,
-            // return type check, ctx drain, DynamicOutput unwrap), then drive
-            // the shared iterator with an empty selected_outputs (single shape).
-            let synth = ops::process_raw_result(
-                py,
-                &raw_result,
-                return_hint.as_ref(),
-                ctx_obj.as_ref(),
-                &step_name,
-            )?;
-            // Surface to outer scope so PyWorkerResult can ship it back; the
+            // Single-output: drive the shared iterator with an empty
+            // selected_outputs (single shape). Surface the dynamic keys to the
+            // outer scope so PyWorkerResult can ship them back; the
             // orchestrator persists keys to KV after the worker returns.
             single_dynamic_keys = synth.dynamic_keys.clone();
 
