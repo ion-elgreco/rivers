@@ -67,9 +67,7 @@ class AirbyteError(Exception):
 class _ApiModel(BaseModel):
     """Reads the API's camelCase keys and the snake_case field names."""
 
-    model_config = ConfigDict(
-        alias_generator=to_camel, validate_by_name=True, validate_by_alias=True
-    )
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True)
 
 
 class AirbyteStream(_ApiModel):
