@@ -103,7 +103,7 @@ pub(crate) use finalize::{
     step_retry_record, step_start_record,
 };
 pub(crate) use invoke::{
-    ProcessedResult, drain_failed_partitions, execute_action_step, execute_step, process_raw_result,
+    drain_failed_partitions, execute_action_step, execute_step, process_raw_result,
 };
 pub(crate) use io::{
     build_mapped_partition_context, build_partition_context, handle_step_output,

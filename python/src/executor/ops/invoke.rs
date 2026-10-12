@@ -202,19 +202,7 @@ pub(crate) fn build_step_args(
     })
 }
 
-use crate::metadata::MetadataValue;
 use crate::result_types::ResultKind;
-
-/// Output of `process_raw_result` — the per-step state derived from the user
-/// function's return value, with wrappers unwrapped and metadata merged.
-pub(crate) struct ProcessedResult {
-    pub result: Py<PyAny>,
-    pub output_metadata: Vec<(String, MetadataValue)>,
-    pub data_version: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub dynamic_keys: Option<Vec<String>>,
-    pub kind: ResultKind,
-}
 
 /// Process a raw Python result by extracting Output/Observation/Materialization
 /// wrappers, validating the return type, draining context metadata, and unwrapping
@@ -225,7 +213,7 @@ pub(crate) fn process_raw_result(
     return_hint: Option<&Py<PyAny>>,
     ctx_ref: Option<&Py<PyAny>>,
     step_name: &str,
-) -> PyResult<ProcessedResult> {
+) -> PyResult<StepResult> {
     let extracted = result_types::try_extract_result_type(py, raw_result)?;
 
     let (actual_result, result_metadata, result_data_version, result_tags, result_kind) =
@@ -265,13 +253,17 @@ pub(crate) fn process_raw_result(
             None => (checked.value, None),
         };
 
-    Ok(ProcessedResult {
+    Ok(StepResult {
         result: final_result,
+        return_hint: return_hint.map(|h| h.clone_ref(py)),
         output_metadata,
         data_version,
+        config_instance: None,
         tags: result_tags,
         dynamic_keys,
-        kind: result_kind,
+        result_kind,
+        generator: None,
+        failed_partitions: Vec::new(),
     })
 }
 
@@ -380,19 +372,10 @@ pub(crate) fn execute_step(
             &step.name,
         )?;
 
-        let failed_partitions = drain_failed_partitions(py, built.ctx_ref.as_ref());
-
         Ok(StepResult {
-            result: processed.result,
-            return_hint: built.return_hint,
-            output_metadata: processed.output_metadata,
-            data_version: processed.data_version,
             config_instance: built.config_instance,
-            tags: processed.tags,
-            dynamic_keys: processed.dynamic_keys,
-            result_kind: processed.kind,
-            generator: None,
-            failed_partitions,
+            failed_partitions: drain_failed_partitions(py, built.ctx_ref.as_ref()),
+            ..processed
         })
     } else if node.is_bash_task() {
         let result = func.call0(py)?;

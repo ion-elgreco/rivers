@@ -226,23 +226,6 @@ fn metadata_vec_to_pickle_safe(
     Ok(Some(metadata_to_pickle_safe_dict(py, &d)?))
 }
 
-/// The worker has no config instance or failed partitions to report here;
-/// those travel on `PyWorkerResult`.
-fn step_result(processed: ops::ProcessedResult) -> ops::StepResult {
-    ops::StepResult {
-        result: processed.result,
-        return_hint: None,
-        output_metadata: processed.output_metadata,
-        data_version: processed.data_version,
-        config_instance: None,
-        tags: processed.tags,
-        dynamic_keys: processed.dynamic_keys,
-        result_kind: processed.kind,
-        generator: None,
-        failed_partitions: Vec::new(),
-    }
-}
-
 /// Self-contained step execution for loky subprocess.
 ///
 /// Replaces Python `_worker_execute_step`. Reuses Rust functions for
@@ -395,13 +378,13 @@ pub fn worker_execute_step(
                     }),
                 }
             } else {
-                step_result(ops::process_raw_result(
+                ops::process_raw_result(
                     py,
                     &raw_result,
                     return_hint.as_ref(),
                     ctx_obj.as_ref(),
                     &step_name,
-                )?)
+                )?
             };
 
             ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
@@ -454,7 +437,7 @@ pub fn worker_execute_step(
             // process path does (Output / Materialization wrapper extraction,
             // return type check, ctx drain, DynamicOutput unwrap), then drive
             // the shared iterator with an empty selected_outputs (single shape).
-            let processed = ops::process_raw_result(
+            let synth = ops::process_raw_result(
                 py,
                 &raw_result,
                 return_hint.as_ref(),
@@ -463,7 +446,7 @@ pub fn worker_execute_step(
             )?;
             // Surface to outer scope so PyWorkerResult can ship it back; the
             // orchestrator persists keys to KV after the worker returns.
-            single_dynamic_keys = processed.dynamic_keys.clone();
+            single_dynamic_keys = synth.dynamic_keys.clone();
 
             // Asset name from the OutputContext kwargs — the orchestrator
             // populated this with `step_name` (instance_name for mapped).
@@ -476,8 +459,6 @@ pub fn worker_execute_step(
             } else {
                 String::new()
             };
-
-            let synth = step_result(processed);
 
             ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
                 match item {
