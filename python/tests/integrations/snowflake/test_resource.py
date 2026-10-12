@@ -169,9 +169,9 @@ def test_authenticator_without_secrets(connect):
     ]
 
 
-def test_one_credential_at_a_time(rsa_key):
+def test_one_credential_at_a_time():
     with pytest.raises(ValueError, match="got password and private_key"):
-        SnowflakeResource(password="pw", private_key=_pem(rsa_key, None).decode())
+        SnowflakeResource(password="pw", private_key="pem")
     with pytest.raises(ValueError, match="got private_key and private_key_path"):
         SnowflakeResource(private_key="pem", private_key_path="rsa_key.p8")
 
