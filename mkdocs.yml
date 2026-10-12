@@ -72,6 +72,7 @@ nav:
       - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
+      - Datadog: guides/datadog.md
       - Delta Lake: guides/delta-lake.md
       - DuckDB: guides/duckdb.md
       - Slack: guides/slack.md
@@ -92,6 +93,7 @@ nav:
       - Partitions: api-reference/partitions.md
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
+      - Datadog: api-reference/datadog.md
       - Delta Lake: api-reference/delta.md
       - DuckDB: api-reference/duckdb.md
       - MetadataValue: api-reference/metadata.md
