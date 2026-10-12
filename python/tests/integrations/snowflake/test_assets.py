@@ -10,6 +10,7 @@ pytest.importorskip("fakesnow")
 import pyarrow as pa  # noqa: E402
 
 import rivers as rs  # noqa: E402
+from _helpers import make_repo  # noqa: E402
 from rivers.integrations.snowflake import (  # noqa: E402
     SnowflakeAsset,
     SnowflakeIOHandler,
@@ -24,14 +25,6 @@ def _rows(warehouse: SnowflakeResource, sql: str) -> list[tuple]:
         cur = con.cursor()
         cur.execute(sql)
         return cur.fetchall()
-
-
-def _repo(storage, *assets, executor=None) -> rs.CodeRepository:
-    repo = rs.CodeRepository(
-        assets=list(assets), default_executor=executor or rs.Executor.in_process()
-    )
-    repo.resolve(storage=storage)
-    return repo
 
 
 def _deletions(storage, name: str) -> int:
@@ -77,7 +70,7 @@ def _action_context(handler, partition=None, meta=None) -> rs.ActionContext:
 def test_keyed_delete_removes_one_partition(storage, executor_env, warehouse):
     executor, _ = executor_env
     events = _regional_events(SnowflakeIOHandler(resource=warehouse))
-    repo = _repo(storage, events, executor=executor)
+    repo = make_repo([events], storage, executor=executor)
     for region in ("us", "eu"):
         repo.materialize(partition_key=rs.PartitionKey.single(region))
 
@@ -105,7 +98,7 @@ def test_backfill_delete_removes_each_day(storage, warehouse):
         def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
             return pa.table({"day": [date.fromisoformat(context.partition_key)]})
 
-    repo = _repo(storage, Daily)
+    repo = make_repo([Daily], storage)
     keys = [rs.PartitionKey.single(f"2024-01-0{day}") for day in (1, 2, 3)]
     for key in keys:
         repo.materialize(partition_key=key)
@@ -125,7 +118,7 @@ def test_backfill_delete_removes_each_day(storage, warehouse):
 
 
 def test_keyless_delete_removes_every_row_and_keeps_the_table(storage, warehouse):
-    repo = _repo(storage, _users(SnowflakeIOHandler(resource=warehouse)))
+    repo = make_repo([_users(SnowflakeIOHandler(resource=warehouse))], storage)
     repo.materialize()
 
     assert repo.run_action("delete").success
@@ -141,7 +134,7 @@ def test_keyless_delete_removes_every_row_and_keeps_the_table(storage, warehouse
 
 
 def test_delete_on_a_missing_table_clears_state(storage, warehouse):
-    repo = _repo(storage, _users(SnowflakeIOHandler(resource=warehouse)))
+    repo = make_repo([_users(SnowflakeIOHandler(resource=warehouse))], storage)
     repo.materialize()
     _rows(warehouse, 'DROP TABLE "PUBLIC"."USERS"')
 

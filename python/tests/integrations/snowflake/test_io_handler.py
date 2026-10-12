@@ -24,6 +24,7 @@ from arro3.core import RecordBatchReader as Arro3Reader  # noqa: E402
 from polars.testing import assert_frame_equal  # noqa: E402
 
 import rivers as rs  # noqa: E402
+from _helpers import make_repo  # noqa: E402
 from rivers.integrations.snowflake import (  # noqa: E402
     SnowflakeIOHandler,
     SnowflakeResource,
@@ -658,8 +659,7 @@ def test_backfill_writes_every_key_in_one_run(storage, warehouse):
         days = [k.key[0] for k in context.partition.keys]
         return pa.table({"day": days, "n": list(range(len(days)))})
 
-    repo = rs.CodeRepository(assets=[events], default_executor=rs.Executor.in_process())
-    repo.resolve(storage=storage)
+    repo = make_repo([events], storage)
     keys = [rs.PartitionKey.single(f"2024-01-0{i}") for i in (1, 2, 3)]
     result = repo.backfill(
         selection=["events"],
@@ -761,12 +761,12 @@ def test_executors(storage, executor_env, warehouse, is_async, shape):
             }
         )
 
-    repo = rs.CodeRepository(
-        assets=[*sources, ranked, total],
-        default_executor=executor,
+    repo = make_repo(
+        [*sources, ranked, total],
+        storage,
+        executor=executor,
         resources={"warehouse": warehouse},
     )
-    repo.resolve(storage=storage)
     repo.materialize()
 
     assert _rows(
