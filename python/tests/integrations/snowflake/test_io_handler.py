@@ -482,10 +482,10 @@ def test_empty_output_creates_the_table(warehouse):
     assert read.column_names == ["id", "name"]
 
 
-def _parquet_metadata(file) -> pq.FileMetaData:
+def _parquet_file(file) -> pq.ParquetFile:
     # a BufferReader, not the BytesIO: a read from a Python file can hang the
     # interpreter at exit
-    return pq.ParquetFile(pa.BufferReader(file.getvalue())).metadata
+    return pq.ParquetFile(pa.BufferReader(file.getvalue()))
 
 
 def test_large_batches_are_sliced_into_files(monkeypatch):
@@ -495,9 +495,7 @@ def test_large_batches_are_sliced_into_files(monkeypatch):
     files = list(io_module._parquet_files(table.to_reader()))
 
     assert len(files) == -(-table.nbytes // io_module._FILE_SIZE)
-    read = pa.concat_tables(
-        pq.read_table(pa.BufferReader(file.getvalue())) for file in files
-    )
+    read = pa.concat_tables(_parquet_file(file).read() for file in files)
     assert read.equals(table)
 
 
@@ -507,7 +505,7 @@ def test_small_batches_share_a_row_group():
 
     [file] = io_module._parquet_files(reader)
 
-    metadata = _parquet_metadata(file)
+    metadata = _parquet_file(file).metadata
     assert (metadata.num_rows, metadata.num_row_groups) == (1000, 1)
 
 
@@ -530,7 +528,7 @@ def test_write_in_several_files(warehouse, monkeypatch, make):
 
     def recording(reader):
         for file in parquet_files(reader):
-            staged.append(_parquet_metadata(file).num_rows)
+            staged.append(_parquet_file(file).metadata.num_rows)
             yield file
 
     monkeypatch.setattr(io_module, "_parquet_files", recording)
