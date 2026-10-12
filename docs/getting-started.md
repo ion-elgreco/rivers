@@ -17,6 +17,8 @@ pip install rivers[slack]     # Slack alerts (hooks and a run-failure sensor)
 pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler
 ```
 
+The [Airbyte integration](guides/airbyte.md) needs no extra.
+
 rivers also runs on free-threaded Python (3.14t and later). See [Free-threaded Python](installation/free-threading.md).
 
 ## Your first asset
