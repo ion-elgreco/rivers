@@ -108,21 +108,34 @@ BAD_ROWS = {"id": [1, -1], "amount": [9.5, -3.0], "status": ["open", "lost"]}
 
 FRAMES = {"pandas": pd.DataFrame, "polars": pl.DataFrame}
 
-# (backend, form) -> (return hint, the schema it holds)
-CASES = {
-    ("pandas", "model"): (DataFrame[Orders], Orders.to_schema()),
-    ("pandas", "annotated-model"): (
+# (backend, return hint, the schema it holds)
+CASES = [
+    pytest.param("pandas", DataFrame[Orders], Orders.to_schema(), id="pandas-model"),
+    pytest.param(
+        "pandas",
         Annotated[pd.DataFrame, Orders],
         Orders.to_schema(),
+        id="pandas-annotated-model",
     ),
-    ("pandas", "schema"): (Annotated[pd.DataFrame, orders_schema], orders_schema),
-    ("polars", "model"): (PolarsDataFrame[PolarsOrders], PolarsOrders.to_schema()),
-    ("polars", "schema"): (
+    pytest.param(
+        "pandas",
+        Annotated[pd.DataFrame, orders_schema],
+        orders_schema,
+        id="pandas-schema",
+    ),
+    pytest.param(
+        "polars",
+        PolarsDataFrame[PolarsOrders],
+        PolarsOrders.to_schema(),
+        id="polars-model",
+    ),
+    pytest.param(
+        "polars",
         Annotated[pl.DataFrame, polars_orders_schema],
         polars_orders_schema,
+        id="polars-schema",
     ),
-}
-CASE_IDS = [f"{backend}-{form}" for backend, form in CASES]
+]
 
 
 def expected_schema(backend: str) -> dict:
@@ -227,10 +240,10 @@ def assert_frames_equal(left, right):
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_valid_frame_is_stored_with_its_schema(env, tmp_path, case, is_async):
-    backend, _ = case
-    hint, schema = CASES[case]
+@pytest.mark.parametrize(("backend", "hint", "schema"), CASES)
+def test_valid_frame_is_stored_with_its_schema(
+    env, tmp_path, backend, hint, schema, is_async
+):
     pid_file = tmp_path / "pid"
     frame = FRAMES[backend](GOOD_ROWS)
 
@@ -247,10 +260,10 @@ def test_valid_frame_is_stored_with_its_schema(env, tmp_path, case, is_async):
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_invalid_frame_fails_with_the_pandera_report(env, case, is_async):
-    backend, _ = case
-    hint, schema = CASES[case]
+@pytest.mark.parametrize(("backend", "hint", "schema"), CASES)
+def test_invalid_frame_fails_with_the_pandera_report(
+    env, backend, hint, schema, is_async
+):
     frame = FRAMES[backend](BAD_ROWS)
 
     _, result = env.materialize(orders_asset(env, hint, frame, is_async=is_async))
@@ -383,11 +396,8 @@ def test_multi_asset_output_carries_schema_metadata(env):
     assert stored_schema(env, "orders") == expected_schema("pandas")
 
 
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_schema_metadata_describes_model_and_schema(case):
-    backend, _ = case
-    _, schema = CASES[case]
-
+@pytest.mark.parametrize(("backend", "hint", "schema"), CASES)
+def test_schema_metadata_describes_model_and_schema(backend, hint, schema):
     [(key, value)] = schema_metadata(schema).items()
 
     assert key == "pandera/schema"
