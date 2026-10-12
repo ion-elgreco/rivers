@@ -512,6 +512,18 @@ def test_a_response_that_is_not_json_names_the_url(fake):
         make_resource(fake).get_connection(CONNECTION_ID)
 
 
+def test_a_response_with_the_wrong_shape_names_the_url(fake):
+    fake.overrides[("GET", CONNECTION_PATH)] = [(200, {"name": "Postgres"})]
+
+    with pytest.raises(AirbyteError) as e:
+        make_resource(fake).get_connection(CONNECTION_ID)
+
+    assert str(e.value).startswith(
+        f"GET {fake.url}{CONNECTION_PATH}: unexpected response: "
+        "1 validation error for AirbyteConnection\nconnectionId\n  Field required"
+    )
+
+
 # ── sync() ───────────────────────────────────────────────────────────
 
 

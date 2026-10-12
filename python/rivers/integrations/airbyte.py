@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
 from http.client import HTTPException
-from typing import Any, Self
+from typing import Any, Self, TypeVar
 
 from pydantic import (
     AliasPath,
@@ -53,6 +53,8 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+_M = TypeVar("_M", bound=BaseModel)
 
 # Job statuses that can still change.
 _RUNNING = frozenset({"pending", "queued", "running", "incomplete"})
@@ -217,8 +219,11 @@ class AirbyteResource(Resource):
         Raises:
             AirbyteError: The request failed.
         """
-        data = self._request("GET", _join(self.api_url, f"connections/{connection_id}"))
-        return AirbyteConnection.model_validate(data)
+        return self._call(
+            AirbyteConnection,
+            "GET",
+            _join(self.api_url, f"connections/{connection_id}"),
+        )
 
     def sync(
         self, connection_id: str, *, log: logging.Logger | None = None
@@ -407,13 +412,13 @@ class AirbyteResource(Resource):
     ) -> dict[tuple[str | None, str], _StreamStats]:
         """Per-stream counts. The Airbyte API has only job totals."""
         try:
-            data = self._request(
+            stats = self._call(
+                _JobStats,
                 "POST",
                 _join(self.configuration_api_url, "jobs/get_without_logs"),
                 {"id": job_id},
             )
-            stats = _JobStats.model_validate(data)
-        except (AirbyteError, ValidationError) as e:
+        except AirbyteError as e:
             log.warning("No per-stream counts for Airbyte job %d: %s", job_id, e)
             return {}
 
@@ -425,9 +430,7 @@ class AirbyteResource(Resource):
     def _job(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> AirbyteJob:
-        return AirbyteJob.model_validate(
-            self._request(method, _join(self.api_url, path), body)
-        )
+        return self._call(AirbyteJob, method, _join(self.api_url, path), body)
 
     def _cancel(self, job_id: int, log: logging.Logger) -> None:
         try:
@@ -436,6 +439,21 @@ class AirbyteResource(Resource):
             log.warning("Could not cancel Airbyte job %d: %s", job_id, e)
         else:
             log.info("Cancelled Airbyte job %d", job_id)
+
+    def _call(
+        self,
+        model: type[_M],
+        method: str,
+        url: str,
+        body: dict[str, Any] | None = None,
+        *,
+        auth: bool = True,
+    ) -> _M:
+        data = self._request(method, url, body, auth=auth)
+        try:
+            return model.model_validate(data)
+        except ValidationError as e:
+            raise AirbyteError(f"{method} {url}: unexpected response: {e}") from None
 
     def _request(
         self,
@@ -482,17 +500,16 @@ class AirbyteResource(Resource):
             # Wall-clock time: the parallel executor pickles the token into
             # worker processes.
             if time.time() >= self._token_expiry:
-                token = _Token.model_validate(
-                    self._request(
-                        "POST",
-                        _join(self.api_url, "applications/token"),
-                        {
-                            "client_id": self.client_id,
-                            "client_secret": self.client_secret.get_secret_value(),
-                            "grant-type": "client_credentials",
-                        },
-                        auth=False,
-                    )
+                token = self._call(
+                    _Token,
+                    "POST",
+                    _join(self.api_url, "applications/token"),
+                    {
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret.get_secret_value(),
+                        "grant-type": "client_credentials",
+                    },
+                    auth=False,
                 )
                 self._token = token.access_token
                 self._token_expiry = time.time() + token.expires_in - _TOKEN_MARGIN
