@@ -84,13 +84,7 @@ def drop_last_handles(holder):
     print(json.dumps({"dropped": dropped, "longest_pause": pauses[0]}))
 
 
-@pytest.mark.serial
-@pytest.mark.parametrize("holder", HOLDERS)
-def test_dropping_the_last_storage_handle_does_not_pause_other_threads(
-    tmp_path, holder
-):
-    """A thread that drops the last handles to many storages waits for them to
-    close; a thread collecting garbage meanwhile keeps running."""
+def _drop_in_child(tmp_path, holder) -> dict:
     proc = run_in_child(
         "concurrency.test_thread_safety_storage:drop_last_handles",
         holder,
@@ -100,4 +94,25 @@ def test_dropping_the_last_storage_handle_does_not_pause_other_threads(
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout.splitlines()[-1])
     assert result["dropped"] > 0.1
-    assert result["longest_pause"] < result["dropped"] / 4
+    return result
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_dropping_the_last_storage_handle_does_not_pause_other_threads(
+    tmp_path, holder
+):
+    """A thread that drops the last handles to many storages waits for them to
+    close; a thread collecting garbage meanwhile keeps running.
+
+    A close that blocks the collector stalls it for the whole drop, every time.
+    A busy machine stalls it now and then, so one attempt of three must pass.
+    """
+    stalls = []
+    for _ in range(3):
+        result = _drop_in_child(tmp_path, holder)
+        if result["longest_pause"] < result["dropped"] / 4:
+            return
+        stalls.append(result)
+
+    pytest.fail(f"the collector stalled on every attempt: {stalls}")

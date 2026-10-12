@@ -2,7 +2,7 @@
 pub(crate) mod run_config;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 
 use crate::errors::ConfigurationError;
 
@@ -126,31 +126,28 @@ impl ResourceVariant {
     }
 
     /// The class and the keyword arguments a run builds this resource from
-    /// with `overrides`: an instance's own fields (`model_dump`, so a secret
-    /// keeps its value) under the overrides, a class's the overrides alone.
-    /// An IO handler cannot be overridden: nodes hold it through the registry.
+    /// with `overrides`: an instance's own fields ([`resource_fields`]) with
+    /// the overrides laid over them, a class's the overrides alone. An IO
+    /// handler cannot be overridden: nodes hold it through the registry.
     pub fn run_kwargs<'py>(
         &self,
         py: Python<'py>,
         overrides: &Bound<'py, PyDict>,
     ) -> PyResult<(Bound<'py, PyType>, Bound<'py, PyDict>)> {
-        let (cls, kwargs) = match self {
-            ResourceVariant::IOHandler(_) => {
-                return Err(ConfigurationError::new_err(
-                    "an IO handler cannot be overridden per run",
-                ));
-            }
+        match self {
+            ResourceVariant::IOHandler(_) => Err(ConfigurationError::new_err(
+                "an IO handler cannot be overridden per run",
+            )),
             ResourceVariant::PydanticModel(cls) => {
-                (cls.bind(py).cast::<PyType>()?.clone(), PyDict::new(py))
+                Ok((cls.bind(py).cast::<PyType>()?.clone(), overrides.copy()?))
             }
             ResourceVariant::PydanticModelInstance(inst) | ResourceVariant::Resource(inst) => {
                 let inst = inst.bind(py);
-                let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
-                (inst.get_type(), fields)
+                let fields = resource_fields(inst)?.cast_into::<PyDict>()?;
+                lay_over(inst, &fields, overrides)?;
+                Ok((inst.get_type(), fields))
             }
-        };
-        kwargs.update(overrides.as_mapping())?;
-        Ok((cls, kwargs))
+        }
     }
 
     /// This resource rebuilt for one run with `overrides`, validated by its
@@ -185,4 +182,60 @@ impl ResourceVariant {
             | ResourceVariant::IOHandler(c) => c,
         }
     }
+}
+
+/// `overrides` laid over `fields`, the `model_dump` of `model`. A nested
+/// model takes its overrides field by field too, so the fields a document
+/// leaves out keep their values at any depth, secrets included.
+fn lay_over(
+    model: &Bound<'_, PyAny>,
+    fields: &Bound<'_, PyDict>,
+    overrides: &Bound<'_, PyDict>,
+) -> PyResult<()> {
+    let base_model = model.py().import("pydantic")?.getattr("BaseModel")?;
+    for (key, value) in overrides.iter() {
+        if let Ok(nested_overrides) = value.cast::<PyDict>()
+            && let Some(nested_fields) = fields.get_item(&key)?
+            && let Ok(nested_fields) = nested_fields.cast::<PyDict>()
+            && let Ok(name) = key.cast::<PyString>()
+            && let Ok(nested) = model.getattr(name)
+            && nested.is_instance(&base_model)?
+        {
+            lay_over(&nested, nested_fields, nested_overrides)?;
+        } else {
+            fields.set_item(key, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// `(key, class, fields)`: what a worker process rebuilds `resource` from
+/// with [`rebuild_resource`].
+pub(crate) fn resource_spec<'py>(
+    key: impl IntoPyObject<'py>,
+    resource: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    (key, resource.get_type(), resource_fields(resource)?).into_pyobject(resource.py())
+}
+
+/// The key and the resource of a [`resource_spec`], rebuilt by its class
+/// and set up.
+pub(crate) fn rebuild_resource<'py, K: FromPyObjectOwned<'py>>(
+    spec: &Bound<'py, PyAny>,
+) -> PyResult<(K, Bound<'py, PyAny>)> {
+    let (key, cls, fields): (K, Bound<'py, PyAny>, Bound<'py, PyAny>) = spec.extract()?;
+    let resource = cls.call_method1("model_validate", (fields,))?;
+    resource.call_method0("setup")?;
+    Ok((key, resource))
+}
+
+/// The fields `resource`'s class rebuilds it from, for a run or in a worker
+/// process. Python mode keeps each secret a `SecretStr` that pickles with
+/// its value, where JSON mode would give pydantic's mask; `round_trip`
+/// dumps a `Json` field as the text it validates from and leaves computed
+/// fields out.
+fn resource_fields<'py>(resource: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(resource.py());
+    kwargs.set_item("round_trip", true)?;
+    resource.call_method("model_dump", (), Some(&kwargs))
 }

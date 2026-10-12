@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::assets::io_handler_registry::{IOHandlerRegistry, IOHandlerSource};
-use crate::config::ResourceVariant;
+use crate::config::{ResourceVariant, resource_spec};
 use crate::errors::ExecutionError;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
@@ -471,17 +471,10 @@ pub(super) fn build_worker_submit_args(
         py_args.set_item(idx, item.bind(py))?;
     }
 
-    // (param_index, class, json_data) per resource.
+    // A resource spec per resource, keyed by its parameter index.
     let py_resource_specs = PyList::empty(py);
     for (idx, resource) in &worker_args.resource_positions {
-        let resource = resource.inner();
-        let cls = resource.getattr(py, "__class__")?;
-        let json_data: Py<PyAny> = resource.call_method0(py, "model_dump_json")?;
-        let tuple = PyTuple::new(
-            py,
-            &[idx.into_pyobject(py)?.into_any().unbind(), cls, json_data],
-        )?;
-        py_resource_specs.append(tuple)?;
+        py_resource_specs.append(resource_spec(idx, resource.inner().bind(py))?)?;
     }
 
     // Wrap func in _FuncRef for pickle-safe transport. Falls back to shipping
