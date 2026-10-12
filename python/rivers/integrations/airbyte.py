@@ -28,8 +28,10 @@ from http.client import HTTPException
 from typing import Any, Self
 
 from pydantic import (
+    AliasPath,
     BaseModel,
     ConfigDict,
+    Field,
     PrivateAttr,
     SecretStr,
     ValidationError,
@@ -97,7 +99,9 @@ class AirbyteConnection(_ApiModel):
     connection_id: str
     name: str
     prefix: str | None = None
-    streams: list[AirbyteStream] = []
+    streams: list[AirbyteStream] = Field(
+        default=[], validation_alias=AliasPath("configurations", "streams")
+    )
 
 
 class AirbyteJob(_ApiModel):
@@ -125,7 +129,9 @@ class _StreamStats(_ApiModel):
 
 
 class _JobStats(_ApiModel):
-    stream_aggregated_stats: list[_StreamStats] = []
+    stream_aggregated_stats: list[_StreamStats] = Field(
+        default=[], validation_alias=AliasPath("job", "streamAggregatedStats")
+    )
 
 
 class _Token(BaseModel):
@@ -212,8 +218,7 @@ class AirbyteResource(Resource):
             AirbyteError: The request failed.
         """
         data = self._request("GET", _join(self.api_url, f"connections/{connection_id}"))
-        streams = (data.get("configurations") or {}).get("streams") or []
-        return AirbyteConnection.model_validate({**data, "streams": streams})
+        return AirbyteConnection.model_validate(data)
 
     def sync(
         self, connection_id: str, *, log: logging.Logger | None = None
@@ -407,7 +412,7 @@ class AirbyteResource(Resource):
                 _join(self.configuration_api_url, "jobs/get_without_logs"),
                 {"id": job_id},
             )
-            stats = _JobStats.model_validate(data.get("job") or {})
+            stats = _JobStats.model_validate(data)
         except (AirbyteError, ValidationError) as e:
             log.warning("No per-stream counts for Airbyte job %d: %s", job_id, e)
             return {}
