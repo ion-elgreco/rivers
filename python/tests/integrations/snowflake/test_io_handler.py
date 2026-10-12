@@ -53,6 +53,21 @@ def _partition(definition, *keys) -> rs.PartitionContext:
     return rs.PartitionContext(keys=list(keys), definition=definition)
 
 
+_REGIONS = rs.PartitionsDefinition.static_(["us", "eu"])
+_BY_REGION = {"snowflake/partition_expr": "region"}
+
+
+def _write_region(handler, region: str, values: list) -> None:
+    handler.handle_output(
+        rs.OutputContext(
+            asset_name="t",
+            asset_metadata=_BY_REGION,
+            partition=_partition(_REGIONS, rs.PartitionKey.single(region)),
+        ),
+        pa.table({"region": [region] * len(values), "v": values}),
+    )
+
+
 @pytest.mark.parametrize(
     "make",
     [
@@ -297,22 +312,9 @@ def test_new_column_fails_and_keeps_the_rows(warehouse):
 
 def test_failed_load_rolls_back_the_delete(warehouse):
     handler = SnowflakeIOHandler(resource=warehouse)
-    definition = rs.PartitionsDefinition.static_(["us", "eu"])
-    meta = {"snowflake/partition_expr": "region"}
-
-    def write(region, values):
-        handler.handle_output(
-            rs.OutputContext(
-                asset_name="t",
-                asset_metadata=meta,
-                partition=_partition(definition, rs.PartitionKey.single(region)),
-            ),
-            pa.table({"region": [region] * len(values), "v": values}),
-        )
-
-    write("us", [1, 2])
+    _write_region(handler, "us", [1, 2])
     with pytest.raises(ProgrammingError, match="not-a-number"):
-        write("us", ["not-a-number"])
+        _write_region(handler, "us", ["not-a-number"])
     assert _rows(warehouse, 'SELECT "REGION", "V" FROM "PUBLIC"."T" ORDER BY "V"') == [
         ("us", 1),
         ("us", 2),
@@ -321,22 +323,9 @@ def test_failed_load_rolls_back_the_delete(warehouse):
 
 def test_static_partition_overwrite(warehouse):
     handler = SnowflakeIOHandler(resource=warehouse)
-    definition = rs.PartitionsDefinition.static_(["us", "eu"])
-    meta = {"snowflake/partition_expr": "region"}
-
-    def write(region, values):
-        handler.handle_output(
-            rs.OutputContext(
-                asset_name="t",
-                asset_metadata=meta,
-                partition=_partition(definition, rs.PartitionKey.single(region)),
-            ),
-            pa.table({"region": [region] * len(values), "v": values}),
-        )
-
-    write("us", [1, 2])
-    write("eu", [3])
-    write("us", [4])
+    _write_region(handler, "us", [1, 2])
+    _write_region(handler, "eu", [3])
+    _write_region(handler, "us", [4])
 
     assert _rows(warehouse, 'SELECT "REGION", "V" FROM "PUBLIC"."T" ORDER BY "V"') == [
         ("eu", 3),
@@ -346,8 +335,8 @@ def test_static_partition_overwrite(warehouse):
         handler,
         "t",
         pa.Table,
-        asset_metadata=meta,
-        partition=_partition(definition, rs.PartitionKey.single("eu")),
+        asset_metadata=_BY_REGION,
+        partition=_partition(_REGIONS, rs.PartitionKey.single("eu")),
     )
     assert eu.to_pylist() == [{"region": "eu", "v": 3}]
 
