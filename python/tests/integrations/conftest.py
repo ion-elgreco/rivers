@@ -50,10 +50,7 @@ class Env:
         """The JSON metadata entry ``key`` of ``asset``'s materialization, decoded."""
         materialization = self.storage.get_latest_materialization(asset)
         [(variant, payload)] = json.loads(dict(materialization.metadata)[key]).items()
-        # Metadata that a parallel worker sends back loses its type, so only the
-        # value is compared there.
-        if not self.parallel:
-            assert variant == "Json"
+        assert variant == "Json"
         return json.loads(payload["value"])
 
 

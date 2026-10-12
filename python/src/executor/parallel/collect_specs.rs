@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
+use crate::errors::ExecutionError;
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep, StepKind};
 
-use super::super::ops;
+use super::super::ops::{self, OutOfProcess};
 use super::execute::ParallelBackend;
 
 impl ParallelBackend {
@@ -22,7 +23,7 @@ impl ParallelBackend {
         partition_key: &Option<PyPartitionKey>,
         registry: &IOHandlerRegistry,
         mapped_instance_keys: &HashMap<String, Vec<String>>,
-    ) -> Result<HashMap<String, Py<PyAny>>, String> {
+    ) -> PyResult<HashMap<String, Py<PyAny>>> {
         let mut overrides: HashMap<String, Py<PyAny>> = HashMap::new();
         for dep_step in plan
             .steps
@@ -39,19 +40,20 @@ impl ParallelBackend {
                 continue;
             };
 
-            let io_handler_ref = node_map
+            let mapped_func = node_map
                 .get(mapped_step)
-                .and_then(|mn| mn.callable(py).ok())
-                .map(|func| {
-                    super::worker_args::resolve_io_handler_ref(
-                        py,
-                        mapped_step,
-                        &func,
-                        node_map,
-                        registry,
-                    )
-                })
-                .unwrap_or_else(|| registry.default_handler(py));
+                .and_then(|mn| mn.callable(py).ok());
+            let io_handler_ref = match mapped_func {
+                Some(func) => super::worker_args::resolve_io_handler_ref(
+                    py,
+                    mapped_step,
+                    &func,
+                    node_map,
+                    registry,
+                )?,
+                None => None,
+            }
+            .ok_or_else(|| OutOfProcess::Parallel.in_memory_error(mapped_step))?;
 
             let result = match &dep_step.kind {
                 StepKind::Collect { mapped_step } => Self::build_collect_load_spec(
@@ -74,17 +76,13 @@ impl ParallelBackend {
                 }
                 _ => unreachable!(),
             };
-            match result {
-                Ok(v) => {
-                    overrides.insert(dep_step.name.clone(), v);
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to build collect spec for '{}': {e}",
-                        dep_step.name
-                    ));
-                }
-            }
+            let spec = result.map_err(|e| {
+                ExecutionError::new_err(format!(
+                    "Failed to build collect spec for '{}': {e}",
+                    dep_step.name
+                ))
+            })?;
+            overrides.insert(dep_step.name.clone(), spec);
         }
         Ok(overrides)
     }

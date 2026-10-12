@@ -506,7 +506,8 @@ class MetadataValue:
 
     Construct via the static factory methods (:meth:`text`, :meth:`url`, …) and
     pattern-match on the variant subclasses (:class:`MetadataValue.Text`,
-    :class:`MetadataValue.Url`, …) when consuming.
+    :class:`MetadataValue.Url`, …) when consuming. A value pickles as its
+    variant.
     """
 
     # Variant types (for isinstance checks and attribute access)

@@ -23,6 +23,9 @@ _SOURCE = "_rivers_src"
 _STAGE = "_rivers_stage"
 # DuckLake's defaults for ducklake_max_retry_count / _retry_wait_ms / _retry_backoff
 _DEFAULT_RETRY = (10, 100.0, 1.5)
+# The words DuckLake retries a commit on (DuckLakeTransaction::RetryOnError): its
+# catalog reports a lost race as any of them, by the timing and the catalog database.
+_CONFLICT_MARKERS = ("conflict", "primary key", "unique", "concurrent")
 
 
 class DuckDBWriteMode(StrEnum):
@@ -306,7 +309,7 @@ def _commit_with_retry(
             return
         except duckdb.TransactionException as e:
             _rollback(con)
-            if "conflict" not in str(e).lower():
+            if not _is_conflict(e):
                 raise
             retries, wait_ms, backoff = (
                 _retry_settings(con) if ducklake else _DEFAULT_RETRY
@@ -319,6 +322,12 @@ def _commit_with_retry(
 
         sleep(wait_ms / 1000 * backoff**attempt)
         attempt += 1
+
+
+def _is_conflict(e: duckdb.TransactionException) -> bool:
+    """Whether the commit lost a race with another writer."""
+    message = str(e).lower()
+    return any(marker in message for marker in _CONFLICT_MARKERS)
 
 
 def _rollback(con: duckdb.DuckDBPyConnection) -> None:

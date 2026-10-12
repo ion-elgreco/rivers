@@ -79,6 +79,10 @@ def extract(context: rs.AssetExecutionContext):
 
 When no subsetting is requested (i.e. the whole multi-asset is materialized), `context.output_selection` contains all output names.
 
+### Partial failure
+
+When a multi-asset raises after it yields some outputs, those outputs keep their materialization and stored value. Only the outputs it did not yield fail, with the error. An output that the function ends without yielding also fails. Every executor works this way.
+
 ### Partitions on multi-assets
 
 Apply `partitions_def` at the top level to partition all outputs uniformly:

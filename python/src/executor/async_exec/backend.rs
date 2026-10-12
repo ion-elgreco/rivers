@@ -19,8 +19,8 @@ use crate::runtime::rt;
 
 use super::super::dispatch::pool_claim::PoolGuard;
 use super::super::dispatch::{
-    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepInstance, WorkOutcome,
-    process_finished_steps, run_step_async_lifecycle,
+    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepCapture, StepInstance,
+    WorkOutcome, process_finished_steps, run_step_async_lifecycle,
 };
 use super::super::event_writer::WriterMsg;
 use super::super::ops::{self};
@@ -87,15 +87,7 @@ fn execute_with_capture(
     input_overrides: &HashMap<String, Py<PyAny>>,
     locals: Option<&pyo3_async_runtimes::TaskLocals>,
 ) -> WorkOutcome {
-    let capture = py
-        .import("rivers._capture")
-        .and_then(|m| m.getattr("StepCapture"))
-        .and_then(|cls| cls.call0())
-        .ok()
-        .inspect(|c| {
-            let _ = c.call_method0("start");
-            crate::log_capture::start();
-        });
+    let capture = StepCapture::start(py);
 
     let mut resolved_config: Option<Py<PyAny>> = None;
     let result = if let Some(verb) = &shared.action {
@@ -127,16 +119,7 @@ fn execute_with_capture(
         )
     };
 
-    let captured_logs = capture.and_then(|cap| {
-        cap.call_method0("finish").ok().and_then(|out| {
-            out.extract::<(String, String)>()
-                .ok()
-                .map(|(stdout, stderr)| {
-                    let logs = crate::log_capture::take();
-                    (stdout, stderr, logs)
-                })
-        })
-    });
+    let captured_logs = capture.finish();
 
     match result {
         Ok(step_result) => WorkOutcome::FullResult {

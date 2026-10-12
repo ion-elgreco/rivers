@@ -225,6 +225,90 @@ def test_dagster_pandera_maps_to_return_hints(storage):
     assert list(schema_metadata(Orders)) == ["pandera/schema"]
 
 
+def test_dagster_airbyte_maps_to_airbyte_resource():
+    from pydantic import ValidationError
+
+    from rivers.integrations.airbyte import (
+        AirbyteConnection,
+        AirbyteResource,
+        AirbyteStream,
+    )
+
+    airbyte = AirbyteResource(
+        api_url="http://localhost:8000/api/public/v1",
+        configuration_api_url="http://localhost:8000/api/v1",
+        client_id="c",
+        client_secret="s",
+        cancel_on_interrupt=False,
+    )
+    connection = AirbyteConnection(
+        connection_id="9924bcd0-99be-453d-ba47-c2c9766f7da5",
+        name="Postgres To Snowflake",
+        prefix="pg_",
+        streams=[AirbyteStream(name="users"), AirbyteStream(name="orders")],
+    )
+
+    assets = airbyte.connection_asset(connection, group="raw")
+    assert assets.name == "airbyte_postgres_to_snowflake"
+    assert [(d.name, d.group) for d in assets.output_defs] == [
+        ("pg_users", "raw"),
+        ("pg_orders", "raw"),
+    ]
+
+    renamed = airbyte.connection_asset(
+        connection,
+        asset_def_fn=lambda connection, stream: rs.AssetDef(f"raw_{stream.name}"),
+    )
+    assert [d.name for d in renamed.output_defs] == ["raw_users", "raw_orders"]
+    assert callable(airbyte.sync) and callable(airbyte.get_connection)
+
+    with pytest.raises(ValidationError):
+        AirbyteResource(workspace_id="744cc0ed-7f05-4949-9e60-2a814f90c035")
+
+
+def test_dagster_datadog_maps_to_datadog_resource():
+    pytest.importorskip("datadog")
+    from rivers.integrations.datadog import DatadogResource
+
+    assert set(DatadogResource.model_fields) == {
+        "api_key",
+        "app_key",
+        "api_host",
+        "statsd_host",
+        "statsd_port",
+        "statsd_socket_path",
+        "constant_tags",
+    }
+
+    datadog = DatadogResource(api_key="test-key", app_key="test-app-key")
+    client = datadog.get_client()
+    dagster_client_members = [
+        "event",
+        "gauge",
+        "increment",
+        "decrement",
+        "histogram",
+        "distribution",
+        "set",
+        "service_check",
+        "timed",
+        "timing",
+        "flush",
+        "wait_for_pending",
+        "api",
+        "OK",
+        "WARNING",
+        "CRITICAL",
+        "UNKNOWN",
+    ]
+    assert [name for name in dagster_client_members if not hasattr(client, name)] == []
+    assert callable(client.api.Event.create)
+
+    assert isinstance(datadog.failure_hook(), rs.Hook)
+    assert isinstance(datadog.success_hook(), rs.Hook)
+    assert datadog.run_failure_sensor().monitored_status == rs.RunStatus.Failure
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

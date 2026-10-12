@@ -470,9 +470,9 @@ def test_step_pod_keeps_sibling_run_slots():
 
         storage = memory_storage()
 
-        @rs.Asset(io_handler=rs.InMemoryIOHandler())
-        def solo():
-            return 1
+        @rs.Asset
+        def solo() -> rs.Materialization:
+            return rs.Materialization()
 
         repo = rs.CodeRepository(
             assets=[solo], default_executor=rs.Executor.in_process()

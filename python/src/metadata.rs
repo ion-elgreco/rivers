@@ -8,7 +8,7 @@ use pyo3::exceptions::PyTypeError;
 
 use crate::errors::InvalidMetadataError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
 use url::Url;
 
 use crate::schema::{PySchemaWrapper, schema_from_ipc_bytes, schema_to_ipc_bytes};
@@ -224,6 +224,21 @@ impl MetadataValue {
             }
             Self::DataVersion { value } => Ok(value.into_pyobject(py)?.into_any().unbind()),
         }
+    }
+
+    /// Pickles as the variant's class and its fields, so the value keeps its
+    /// variant in another process.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyType>, Bound<'py, PyTuple>)> {
+        let value = slf.as_any();
+        let variant = value.get_type();
+        let fields = variant
+            .getattr("__match_args__")?
+            .try_iter()?
+            .map(|name| value.getattr(name?.cast_into::<PyString>()?))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok((variant, PyTuple::new(slf.py(), fields)?))
     }
 
     fn __repr__(&self) -> String {

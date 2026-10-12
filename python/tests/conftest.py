@@ -121,6 +121,28 @@ def grpc_stubs(tmp_path_factory):
     return pb2, pb2_grpc
 
 
+# The DuckDB extensions tests install. On Windows a worker cannot replace an
+# extension file another worker has loaded, so they are installed once,
+# before pytest-xdist starts the workers.
+_DUCKDB_EXTENSIONS = ("delta", "ducklake", "httpfs")
+
+
+def pytest_configure(config):
+    if hasattr(config, "workerinput"):
+        return
+    try:
+        import duckdb
+    except ImportError:
+        return
+
+    con = duckdb.connect()
+    for extension in _DUCKDB_EXTENSIONS:
+        try:
+            con.install_extension(extension)
+        except duckdb.Error:
+            pass  # offline: a test that needs it reports the error itself
+
+
 def pytest_runtest_setup(item):
     if item.get_closest_marker("spark_test"):
         if sys.platform == "win32":
