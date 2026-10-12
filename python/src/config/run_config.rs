@@ -540,7 +540,7 @@ pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<O
     let Some(cls) = config_class(py, func)? else {
         return Ok(None);
     };
-    let mut schema = class_schema(py, &cls)?;
+    let mut schema = class_schema(py, &cls, None)?;
     if is_settings(py, &cls)?
         && let Some(map) = schema.as_object_mut()
     {
@@ -565,39 +565,41 @@ pub(crate) fn resource_schema_json(
             (inst.get_type().into_any(), Some(inst))
         }
     };
-    let mut schema = class_schema(py, &cls)?;
-    if let Some(inst) = instance {
-        set_current_defaults(py, &mut schema, inst)?;
-    }
-    Ok(Some(schema.to_string()))
+    Ok(Some(class_schema(py, &cls, instance)?.to_string()))
 }
 
-/// `cls.model_json_schema()` without the `default` of a schema that holds a
-/// secret: pydantic masks the secret there, and a launch must never send
-/// the mask as a value.
-fn class_schema(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Value> {
+/// `cls.model_json_schema()`, with `instance`'s values as the defaults when
+/// given, and without the `default` of anything that holds a secret:
+/// pydantic masks the secret there, and a launch must never send the mask
+/// as a value.
+fn class_schema(
+    py: Python<'_>,
+    cls: &Bound<'_, PyAny>,
+    instance: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Value> {
     let text: String = py
         .import("json")?
         .call_method1("dumps", (cls.call_method0("model_json_schema")?,))?
         .extract()?;
     let mut schema = parse_json(&text)?;
-    let root = schema.clone();
-    drop_secret_defaults(&root, &mut schema);
+    if let Some(inst) = instance {
+        set_current_defaults(&mut schema, inst)?;
+    }
+    drop_secret_defaults(&mut schema);
     Ok(schema)
 }
 
 /// `schema` with no field `required` and each field's `default` set to the
-/// value `inst` holds, except a field that holds a secret anywhere: it gets
+/// value `inst` holds, except a field whose value holds a secret: it gets
 /// no `default`, so a launch leaves it out and the run keeps the value.
-fn set_current_defaults(
-    py: Python<'_>,
-    schema: &mut Value,
-    inst: &Bound<'_, PyAny>,
-) -> PyResult<()> {
-    let current = parse_json(&inst.call_method0("model_dump_json")?.extract::<String>()?)?;
+fn set_current_defaults(schema: &mut Value, inst: &Bound<'_, PyAny>) -> PyResult<()> {
+    let Value::Object(mut current) =
+        parse_json(&inst.call_method0("model_dump_json")?.extract::<String>()?)?
+    else {
+        return Ok(());
+    };
     let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
-    let secret_types = secret_types(py)?;
-    let root = schema.clone();
+    let secret_types = secret_types(inst.py())?;
 
     let Some(map) = schema.as_object_mut() else {
         return Ok(());
@@ -607,21 +609,17 @@ fn set_current_defaults(
         return Ok(());
     };
     for (name, prop) in props.iter_mut() {
-        let Some(value) = current.get(name) else {
+        let (Some(prop), Some(value)) = (prop.as_object_mut(), current.remove(name)) else {
             continue;
         };
-        let secret = holds_secret(&root, prop)
-            || match fields.get_item(name)? {
-                Some(field) => holds_secret_value(&field, &secret_types)?,
-                None => false,
-            };
-        let Some(prop) = prop.as_object_mut() else {
-            continue;
+        let secret = match fields.get_item(name)? {
+            Some(field) => holds_secret_value(&field, &secret_types)?,
+            None => false,
         };
         if secret {
             prop.remove("default");
         } else {
-            prop.insert("default".to_string(), value.clone());
+            prop.insert("default".to_string(), value);
         }
     }
     Ok(())
@@ -632,27 +630,32 @@ fn parse_json(text: &str) -> PyResult<Value> {
         .map_err(|e| ConfigurationError::new_err(format!("invalid JSON: {e}")))
 }
 
-fn drop_secret_defaults(root: &Value, node: &mut Value) {
-    if node.get("default").is_some()
-        && holds_secret(root, node)
-        && let Some(map) = node.as_object_mut()
-    {
-        map.remove("default");
+/// `schema` without the `default` of any node that holds a secret.
+fn drop_secret_defaults(schema: &mut Value) {
+    fn walk(root: &Value, node: &mut Value) {
+        if node.get("default").is_some()
+            && holds_secret(root, node)
+            && let Some(map) = node.as_object_mut()
+        {
+            map.remove("default");
+        }
+        match node {
+            Value::Object(map) => map
+                .iter_mut()
+                .filter(|(key, _)| *key != "default")
+                .for_each(|(_, child)| walk(root, child)),
+            Value::Array(items) => items.iter_mut().for_each(|item| walk(root, item)),
+            _ => {}
+        }
     }
-    match node {
-        Value::Object(map) => map
-            .values_mut()
-            .for_each(|child| drop_secret_defaults(root, child)),
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| drop_secret_defaults(root, item)),
-        _ => {}
-    }
+    let root = schema.clone();
+    walk(&root, schema);
 }
 
 /// Whether `schema` marks a secret (`writeOnly`, `"format": "password"`),
 /// itself or anywhere below: a branch of a union, a list's items, a dict's
-/// values, a model's fields behind a `$ref`.
+/// values, a model's fields behind a `$ref`. A `default` is a value, not a
+/// schema, so the walk does not enter it.
 fn holds_secret(root: &Value, schema: &Value) -> bool {
     fn walk<'a>(root: &'a Value, node: &'a Value, seen: &mut Vec<&'a str>) -> bool {
         match node {
@@ -671,7 +674,8 @@ fn holds_secret(root: &Value, schema: &Value) -> bool {
                         return true;
                     }
                 }
-                map.values().any(|child| walk(root, child, seen))
+                map.iter()
+                    .any(|(key, child)| key != "default" && walk(root, child, seen))
             }
             Value::Array(items) => items.iter().any(|item| walk(root, item, seen)),
             _ => false,
