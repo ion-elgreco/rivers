@@ -164,10 +164,25 @@ fn is_container(node: &Value) -> bool {
     node.get("$ref").is_none() && node.get("properties").is_some_and(Value::is_object)
 }
 
+/// Whether `node` is a secret: `writeOnly` or `"format": "password"` on it
+/// or on a branch of its `anyOf`, `oneOf` or `allOf` (`SecretStr | None`).
+fn is_secret(node: &Value) -> bool {
+    let marked = |n: &Value| {
+        n.get("writeOnly") == Some(&Value::Bool(true))
+            || n.get("format").and_then(Value::as_str) == Some("password")
+    };
+    marked(node)
+        || ["anyOf", "oneOf", "allOf"]
+            .iter()
+            .filter_map(|key| node.get(*key)?.as_array())
+            .flatten()
+            .any(marked)
+}
+
 /// `schema_json` placed at `path` (property names, unescaped) in a larger
 /// schema: its `$defs` stay with it and its `#/$defs/...` references point
-/// there. A secret (`writeOnly`) loses its `default`, which pydantic masks:
-/// the mask must never be offered as a value.
+/// there. A secret loses its `default`, which pydantic masks: the mask must
+/// never be offered as a value.
 pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
     let mut value: Value = serde_json::from_str(schema_json).ok()?;
     if !value.is_object() {
@@ -182,6 +197,11 @@ pub fn inline(schema_json: &str, path: &[&str]) -> Option<Value> {
 }
 
 fn rebase_refs(value: &mut Value, base: &str) {
+    if is_secret(value)
+        && let Some(map) = value.as_object_mut()
+    {
+        map.remove("default");
+    }
     match value {
         Value::Object(map) => {
             if let Some(Value::String(reference)) = map.get_mut("$ref") {
@@ -191,9 +211,6 @@ fn rebase_refs(value: &mut Value, base: &str) {
                 if let Some(rebased) = rebased {
                     *reference = rebased;
                 }
-            }
-            if map.get("writeOnly") == Some(&Value::Bool(true)) {
-                map.remove("default");
             }
             for child in map.values_mut() {
                 rebase_refs(child, base);
@@ -217,7 +234,7 @@ pub fn template(schema: &Schema) -> Value {
 }
 
 fn template_of(schema: &Schema, node: &Value) -> Option<Value> {
-    if node.get("writeOnly") == Some(&Value::Bool(true)) {
+    if is_secret(node) {
         return None;
     }
     if let Some(default) = schema.default_of(node) {
@@ -1218,6 +1235,21 @@ mod tests {
                 .pointer("/properties/token/default"),
             None
         );
+    }
+
+    #[test]
+    fn a_secret_in_a_union_branch_is_never_prefilled() {
+        // `SecretStr | None`: pydantic marks the branch, and the mask sits
+        // next to the union. A `format: password` string is a secret too.
+        let class = r#"{"properties":{"token":{"anyOf":[{"format":"password","type":"string","writeOnly":true},{"type":"null"}],"default":"**********","title":"Token"},"pin":{"default":"**********","format":"password","type":"string"},"dsn":{"default":"x","type":"string"}},"type":"object"}"#;
+        let placed = inline(class, &["s"]).unwrap();
+        assert_eq!(placed.pointer("/properties/token/default"), None);
+        assert_eq!(placed.pointer("/properties/pin/default"), None);
+        assert_eq!(
+            placed.pointer("/properties/dsn/default"),
+            Some(&serde_json::json!("x"))
+        );
+        assert_eq!(template(&schema(class)), serde_json::json!({"dsn": "x"}));
     }
 
     #[test]

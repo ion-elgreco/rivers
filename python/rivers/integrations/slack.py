@@ -21,6 +21,7 @@ Example::
 from collections.abc import Callable
 from typing import Any
 
+from pydantic import SecretStr
 from pydantic_settings import SettingsConfigDict
 
 from rivers._core.hooks import Hook, HookContext
@@ -45,16 +46,17 @@ class SlackResource(Resource):
     through this instance.
 
     Args:
-        token: Bot token (``xoxb-...``). Read from ``SLACK_TOKEN`` when not given.
+        token: Bot token (``xoxb-...``), kept as a ``SecretStr``. Read from
+            ``SLACK_TOKEN`` when not given.
     """
 
     model_config = SettingsConfigDict(env_prefix="SLACK_")
 
-    token: str
+    token: SecretStr
 
     def get_client(self) -> WebClient:
         """Return a ``slack_sdk.WebClient`` authenticated with ``token``."""
-        return WebClient(token=self.token)
+        return WebClient(token=self.token.get_secret_value())
 
     def failure_hook(
         self,

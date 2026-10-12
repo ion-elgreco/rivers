@@ -14,7 +14,7 @@ use std::fmt;
 
 use anyhow::{anyhow, bail};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyTuple, PyType};
 use serde_json::{Map, Value};
 
 use crate::config::ResourceVariant;
@@ -540,21 +540,19 @@ pub(crate) fn config_schema_json(py: Python<'_>, func: &Py<PyAny>) -> PyResult<O
     let Some(cls) = config_class(py, func)? else {
         return Ok(None);
     };
-    let schema = cls.call_method0("model_json_schema")?;
-    if is_settings(py, &cls)? {
-        schema.set_item("x-settings", true)?;
+    let mut schema = class_schema(py, &cls)?;
+    if is_settings(py, &cls)?
+        && let Some(map) = schema.as_object_mut()
+    {
+        map.insert("x-settings".to_string(), Value::Bool(true));
     }
-    let text: String = py
-        .import("json")?
-        .call_method1("dumps", (schema,))?
-        .extract()?;
-    Ok(Some(text))
+    Ok(Some(schema.to_string()))
 }
 
 /// The JSON schema a launch edits a resource by: its class's, with each
-/// field's `default` set to an instance's current value (a secret's is not
-/// shown) and nothing `required`, since the instance has every field. `None`
-/// for an IO handler, which cannot be overridden.
+/// field's `default` set to an instance's current value and nothing
+/// `required`, since the instance has every field. `None` for an IO
+/// handler, which cannot be overridden.
 pub(crate) fn resource_schema_json(
     py: Python<'_>,
     variant: &ResourceVariant,
@@ -567,43 +565,162 @@ pub(crate) fn resource_schema_json(
             (inst.get_type().into_any(), Some(inst))
         }
     };
-    let schema = cls
-        .call_method0("model_json_schema")?
-        .cast_into::<PyDict>()?;
+    let mut schema = class_schema(py, &cls)?;
     if let Some(inst) = instance {
-        if schema.contains("required")? {
-            schema.del_item("required")?;
-        }
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("mode", "json")?;
-        let current = inst
-            .call_method("model_dump", (), Some(&kwargs))?
-            .cast_into::<PyDict>()?;
-        if let Some(props) = schema.get_item("properties")? {
-            let props = props.cast_into::<PyDict>()?;
-            for (name, value) in current.iter() {
-                let Some(prop) = props.get_item(&name)? else {
-                    continue;
-                };
-                let prop = prop.cast_into::<PyDict>()?;
-                let secret = prop
-                    .get_item("writeOnly")?
-                    .is_some_and(|w| w.is_truthy().unwrap_or(true));
-                if secret {
-                    if prop.contains("default")? {
-                        prop.del_item("default")?;
-                    }
-                    continue;
-                }
-                prop.set_item("default", value)?;
-            }
-        }
+        set_current_defaults(py, &mut schema, inst)?;
     }
+    Ok(Some(schema.to_string()))
+}
+
+/// `cls.model_json_schema()` without the `default` of a schema that holds a
+/// secret: pydantic masks the secret there, and a launch must never send
+/// the mask as a value.
+fn class_schema(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Value> {
     let text: String = py
         .import("json")?
-        .call_method1("dumps", (schema,))?
+        .call_method1("dumps", (cls.call_method0("model_json_schema")?,))?
         .extract()?;
-    Ok(Some(text))
+    let mut schema = parse_json(&text)?;
+    let root = schema.clone();
+    drop_secret_defaults(&root, &mut schema);
+    Ok(schema)
+}
+
+/// `schema` with no field `required` and each field's `default` set to the
+/// value `inst` holds, except a field that holds a secret anywhere: it gets
+/// no `default`, so a launch leaves it out and the run keeps the value.
+fn set_current_defaults(
+    py: Python<'_>,
+    schema: &mut Value,
+    inst: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let current = parse_json(&inst.call_method0("model_dump_json")?.extract::<String>()?)?;
+    let fields = inst.call_method0("model_dump")?.cast_into::<PyDict>()?;
+    let secret_types = secret_types(py)?;
+    let root = schema.clone();
+
+    let Some(map) = schema.as_object_mut() else {
+        return Ok(());
+    };
+    map.remove("required");
+    let Some(Value::Object(props)) = map.get_mut("properties") else {
+        return Ok(());
+    };
+    for (name, prop) in props.iter_mut() {
+        let Some(value) = current.get(name) else {
+            continue;
+        };
+        let secret = holds_secret(&root, prop)
+            || match fields.get_item(name)? {
+                Some(field) => holds_secret_value(&field, &secret_types)?,
+                None => false,
+            };
+        let Some(prop) = prop.as_object_mut() else {
+            continue;
+        };
+        if secret {
+            prop.remove("default");
+        } else {
+            prop.insert("default".to_string(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+fn parse_json(text: &str) -> PyResult<Value> {
+    serde_json::from_str(text)
+        .map_err(|e| ConfigurationError::new_err(format!("invalid JSON: {e}")))
+}
+
+fn drop_secret_defaults(root: &Value, node: &mut Value) {
+    if node.get("default").is_some()
+        && holds_secret(root, node)
+        && let Some(map) = node.as_object_mut()
+    {
+        map.remove("default");
+    }
+    match node {
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|child| drop_secret_defaults(root, child)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| drop_secret_defaults(root, item)),
+        _ => {}
+    }
+}
+
+/// Whether `schema` marks a secret (`writeOnly`, `"format": "password"`),
+/// itself or anywhere below: a branch of a union, a list's items, a dict's
+/// values, a model's fields behind a `$ref`.
+fn holds_secret(root: &Value, schema: &Value) -> bool {
+    fn walk<'a>(root: &'a Value, node: &'a Value, seen: &mut Vec<&'a str>) -> bool {
+        match node {
+            Value::Object(map) => {
+                if map.get("writeOnly") == Some(&Value::Bool(true))
+                    || map.get("format").and_then(Value::as_str) == Some("password")
+                {
+                    return true;
+                }
+                if let Some(reference) = map.get("$ref").and_then(Value::as_str)
+                    && !seen.contains(&reference)
+                {
+                    seen.push(reference);
+                    let target = reference.strip_prefix('#').and_then(|p| root.pointer(p));
+                    if target.is_some_and(|t| walk(root, t, seen)) {
+                        return true;
+                    }
+                }
+                map.values().any(|child| walk(root, child, seen))
+            }
+            Value::Array(items) => items.iter().any(|item| walk(root, item, seen)),
+            _ => false,
+        }
+    }
+    walk(root, schema, &mut Vec::new())
+}
+
+/// pydantic's secret types, whose values JSON mode masks.
+fn secret_types(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+    let pydantic = py.import("pydantic")?;
+    PyTuple::new(
+        py,
+        [
+            pydantic.getattr("SecretStr")?,
+            pydantic.getattr("SecretBytes")?,
+            pydantic.getattr("Secret")?,
+        ],
+    )
+}
+
+/// Whether `value`, a field of a python-mode `model_dump`, holds a secret
+/// anywhere: a value whose schema does not say so, such as `Secret[str]`,
+/// a field typed `Any`, or an extra field.
+fn holds_secret_value(
+    value: &Bound<'_, PyAny>,
+    secret_types: &Bound<'_, PyTuple>,
+) -> PyResult<bool> {
+    if value.is_instance(secret_types)? {
+        return Ok(true);
+    }
+    let items = match value.cast::<PyDict>() {
+        Ok(dict) => dict.values().into_any(),
+        Err(_)
+            if value.is_instance_of::<PyList>()
+                || value.is_instance_of::<PyTuple>()
+                || value.is_instance_of::<PySet>()
+                || value.is_instance_of::<PyFrozenSet>() =>
+        {
+            value.clone()
+        }
+        Err(_) => return Ok(false),
+    };
+    for item in items.try_iter()? {
+        if holds_secret_value(&item?, secret_types)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// One step of pydantic's `loc`.

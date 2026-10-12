@@ -4,7 +4,7 @@
 //! cloudpickles the wrapper's arguments — `eval_fn` is shipped as a `FuncRef`
 //! that auto-reconstructs to the imported callable in the worker (see
 //! `executor::parallel::refs::PyFuncRef`), so the user's function is never
-//! pickled. Resources cross via `(name, class, json_data)` tuples and are
+//! pickled. Resources cross via `(name, class, fields)` tuples and are
 //! re-instantiated in the worker. Same pattern as the multiprocess executor.
 //!
 //! The flow inside the worker mirrors the in-process eval path in
@@ -26,8 +26,8 @@ use crate::context::run_status::RunStatusEvent;
 use crate::context::schedule::PyScheduleEvaluationContext;
 use crate::context::sensor::PySensorEvaluationContext;
 
-/// Reconstruct registered resources from `(name, class, json_data)` triples.
-/// Each resource is rebuilt via `cls.model_validate_json(json_data)` and gets
+/// Reconstruct registered resources from `(name, class, fields)` triples.
+/// Each resource is rebuilt via `cls.model_validate(fields)` and gets
 /// `setup()` called (matching the in-process daemon's resource lifecycle).
 fn rebuild_resources<'py>(
     py: Python<'py>,
@@ -41,8 +41,8 @@ fn rebuild_resources<'py>(
             let tuple: &Bound<PyTuple> = spec.cast()?;
             let name: String = tuple.get_item(0)?.extract()?;
             let cls = tuple.get_item(1)?;
-            let json_data = tuple.get_item(2)?;
-            let resource = cls.call_method1("model_validate_json", (&json_data,))?;
+            let fields = tuple.get_item(2)?;
+            let resource = cls.call_method1("model_validate", (&fields,))?;
             resource.call_method0("setup")?;
             Ok((name, resource.unbind()))
         })();

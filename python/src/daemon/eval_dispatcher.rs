@@ -10,8 +10,8 @@
 //!
 //! Subprocess transport mirrors the multiprocess executor: the user's eval
 //! function crosses as a `FuncRef(module, qualname)` (imported in the worker,
-//! not pickled), and registered resources cross as `(name, class, json_data)`
-//! triples (re-instantiated via `cls.model_validate_json` in the worker).
+//! not pickled), and registered resources cross as `(name, class, fields)`
+//! triples (re-instantiated via `cls.model_validate` in the worker).
 //! `_FuncRef.__reduce__` returns the resolved callable directly, so the
 //! Rust wrapper in `subprocess_eval` receives the eval function unwrapped.
 use std::collections::HashMap;
@@ -32,6 +32,7 @@ use super::types::{
     AutomationKind, EvalOutcome, EvalParams, PY_EVAL_PERMITS, ResolvedEvalMode, TickResult,
 };
 use crate::automation::{parse_schedule_result, parse_sensor_result};
+use crate::config::resource_fields;
 use crate::executor::parallel::worker_args::make_func_ref;
 
 /// One automation that's due to evaluate this iteration. Carries the per-item
@@ -45,7 +46,7 @@ pub(crate) struct DueEval {
 pub(crate) struct EvalDispatcher {
     loky_executor: Option<Arc<Py<PyAny>>>,
     /// Registered resources (name → Pydantic instance). Serialized at submit
-    /// time into `(name, class, json_data)` triples so the subprocess wrapper
+    /// time into `(name, class, fields)` triples so the subprocess wrapper
     /// can rebuild + `setup()` them before invoking the eval function.
     resources: Arc<HashMap<String, Py<PyAny>>>,
     /// Run-status sensors read finished runs from storage before they call Python.
@@ -295,8 +296,8 @@ async fn run_in_process_eval(params: &EvalParams) -> Result<EvalOutcome, String>
     }
 }
 
-/// Build `[(name, class, json_data), ...]` for every registered resource —
-/// subprocess workers rebuild instances via `cls.model_validate_json` before
+/// Build `[(name, class, fields), ...]` for every registered resource —
+/// subprocess workers rebuild instances via `cls.model_validate` before
 /// `precompute_args` looks them up by parameter name.
 pub(super) fn build_resource_specs<'py>(
     py: Python<'py>,
@@ -304,15 +305,13 @@ pub(super) fn build_resource_specs<'py>(
 ) -> PyResult<Bound<'py, PyList>> {
     let specs = PyList::empty(py);
     for (name, resource) in resources {
-        let bound = resource.bind(py);
-        let cls = bound.getattr("__class__")?;
-        let json_data = bound.call_method0("model_dump_json")?;
+        let resource = resource.bind(py);
         specs.append(PyTuple::new(
             py,
-            &[
-                name.into_pyobject(py)?.into_any().unbind(),
-                cls.unbind(),
-                json_data.unbind(),
+            [
+                name.into_pyobject(py)?.into_any(),
+                resource.get_type().into_any(),
+                resource_fields(resource)?,
             ],
         )?)?;
     }

@@ -296,8 +296,8 @@ pub fn worker_execute_step(
         let tuple: &Bound<PyTuple> = item.cast()?;
         let param_idx: usize = tuple.get_item(0)?.extract()?;
         let cls = tuple.get_item(1)?;
-        let json_data = tuple.get_item(2)?;
-        let resource = cls.call_method1("model_validate_json", (&json_data,))?;
+        let fields = tuple.get_item(2)?;
+        let resource = cls.call_method1("model_validate", (&fields,))?;
         resource.call_method0("setup")?;
         deserialized_resources.push(resource.clone().unbind());
         resolved[param_idx] = resource.unbind();
