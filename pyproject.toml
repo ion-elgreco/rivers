@@ -4,7 +4,7 @@ version = "0.0.0"
 requires-python = ">=3.11"
 
 [tool.uv]
-default-groups = ["dev", "grpc"]
+default-groups = ["dev", "grpc", "fakesnow"]
 
 [tool.uv.workspace]
 members = [
@@ -34,4 +34,10 @@ dev = [
 grpc = [
     "grpcio>=1.82.1",
     "grpcio-tools>=1.82.1",
+]
+# Snowflake emulator for the Snowflake integration tests. It runs on DuckDB,
+# which has no free-threaded (3.14t) wheels, so `just venv-ft` leaves this
+# group out.
+fakesnow = [
+    "fakesnow[server]>=0.11.21",
 ]

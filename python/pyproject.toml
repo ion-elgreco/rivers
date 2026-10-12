@@ -30,6 +30,7 @@ otel = ["opentelemetry-api>=1.0"]
 slack = ["slack-sdk>=3.10.0"]
 duckdb = ["duckdb>=1.5.2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
+snowflake = ["snowflake-connector-python>=3.7.0", "rivers[pyarrow]"]
 
 [project.scripts]
 rivers = "rivers.cli:main"

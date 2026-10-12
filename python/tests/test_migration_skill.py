@@ -200,6 +200,17 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_snowflake_maps_to_snowflake_integration():
+    pytest.importorskip("snowflake.connector")
+    from rivers.integrations.snowflake import SnowflakeIOHandler, SnowflakeResource
+
+    resource = SnowflakeResource(account="acct", user="ETL", schema_name="RAW")
+    handler = SnowflakeIOHandler(resource=resource)
+    meta = {"snowflake/schema": "analytics", "snowflake/partition_expr": "day"}
+    assert handler.table_name("users", meta) == ("ANALYTICS", "USERS")
+    assert handler.table_name("users", None) == ("PUBLIC", "USERS")
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

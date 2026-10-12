@@ -75,6 +75,7 @@ nav:
       - Delta Lake: guides/delta-lake.md
       - DuckDB: guides/duckdb.md
       - Slack: guides/slack.md
+      - Snowflake: guides/snowflake.md
       - Authentication: guides/authentication.md
   - API Reference:
       - CodeRepository: api-reference/repository.md
@@ -94,6 +95,7 @@ nav:
       - IO Handlers: api-reference/io-handlers.md
       - Delta Lake: api-reference/delta.md
       - DuckDB: api-reference/duckdb.md
+      - Snowflake: api-reference/snowflake.md
       - MetadataValue: api-reference/metadata.md
       - Schema: api-reference/schema.md
       - Storage: api-reference/storage.md
