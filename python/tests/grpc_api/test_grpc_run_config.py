@@ -367,7 +367,7 @@ def test_get_assets_info_exposes_resource_schemas(direct):
     assert "default" not in schema["properties"]["token"]
 
 
-def test_resource_schema_holds_no_secret( ):
+def test_resource_schema_holds_no_secret(direct):
     """No secret reaches the launch schema, as its value or as pydantic's
     mask: a field that holds one in a union branch, a nested model or a
     list's items gets no default, and neither do the secrets of the class
