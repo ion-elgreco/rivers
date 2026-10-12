@@ -131,13 +131,7 @@ class DatadogResource(Resource):
             ValueError: ``api_key`` is not set.
         """
         return self._hook(
-            Hook.failure,
-            "failed",
-            "error",
-            text_fn or _asset_failure_text,
-            tags,
-            ui_location_url,
-            name,
+            Hook.failure, text_fn or _asset_failure_text, tags, ui_location_url, name
         )
 
     def success_hook(
@@ -167,13 +161,7 @@ class DatadogResource(Resource):
             ValueError: ``api_key`` is not set.
         """
         return self._hook(
-            Hook.success,
-            "succeeded",
-            "success",
-            text_fn or _asset_success_text,
-            tags,
-            ui_location_url,
-            name,
+            Hook.success, text_fn or _asset_success_text, tags, ui_location_url, name
         )
 
     def run_failure_sensor(
@@ -239,8 +227,6 @@ class DatadogResource(Resource):
     def _hook(
         self,
         make_hook: Callable[..., Hook],
-        outcome: str,
-        alert_type: str,
         text_fn: Callable[[HookContext], str],
         tags: list[str] | None,
         ui_location_url: str | None,
@@ -250,10 +236,11 @@ class DatadogResource(Resource):
 
         def post(context: HookContext) -> None:
             asset, run_id = context.asset_name, context.run_id
+            failed = context.hook_type == "failure"
             self._post_event(
-                f"Asset {asset} {outcome}",
+                f"Asset {asset} {'failed' if failed else 'succeeded'}",
                 text_fn(context),
-                alert_type,
+                "error" if failed else "success",
                 run_id,
                 [f"asset:{asset}", f"run_id:{run_id}", *(tags or [])],
                 ui_location_url,
