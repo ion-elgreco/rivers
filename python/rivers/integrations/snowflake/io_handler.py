@@ -244,17 +244,20 @@ def _prepare_table(
 
 
 def _write(cur: SnowflakeCursor, target: str, stage: str, delete: str | None) -> None:
-    """Run ``delete`` and load the staged files, in one transaction."""
+    """Load the staged files. With ``delete``, run it first, in one transaction."""
+    # FORCE: Snowflake skips a file that it loaded into the table before
+    copy = (
+        f"COPY INTO {target} FROM @{stage} FILE_FORMAT = ({_FILE_FORMAT}) "
+        "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE"
+    )
+    if delete is None:
+        cur.execute(copy)
+        return
+
     cur.execute("BEGIN")
     try:
-        if delete is not None:
-            cur.execute(delete)
-
-        # FORCE: Snowflake skips a file that it loaded into the table before
-        cur.execute(
-            f"COPY INTO {target} FROM @{stage} FILE_FORMAT = ({_FILE_FORMAT}) "
-            "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE"
-        )
+        cur.execute(delete)
+        cur.execute(copy)
         cur.execute("COMMIT")
     except BaseException:
         cur.execute("ROLLBACK")
