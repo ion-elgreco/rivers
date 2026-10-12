@@ -258,6 +258,7 @@ def row_count() -> int:
 - `Any`, `None`, and the `Output`, `Observation` and `Materialization` types are not checked. The value inside a returned `Output` is checked.
 - A union such as `int | None` passes when the value matches one member.
 - `Annotated[T, ...]` is checked against `T`.
+- A pandera schema in the annotation validates the frame itself. See [pandera](../guides/pandera.md).
 - With `from __future__ import annotations`, rivers evaluates the annotation in the asset's module. A name that is imported only under `TYPE_CHECKING` fails the step.
 
 Every executor runs the same check. The parallel executor runs it in the worker process.

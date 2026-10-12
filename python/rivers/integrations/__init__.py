@@ -17,7 +17,7 @@ from typing import Any
 
 # Integrations that define ``validate_output``, keyed by the top-level module
 # of the library whose types they check.
-_OUTPUT_VALIDATORS: dict[str, str] = {}
+_OUTPUT_VALIDATORS = {"pandera": "rivers.integrations.pandera"}
 
 
 def output_validator(hint: Any) -> Callable[[Any, Any], Any] | None:

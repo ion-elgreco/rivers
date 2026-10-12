@@ -200,6 +200,31 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_pandera_maps_to_return_hints(storage):
+    """`dagster_type=pandera_schema_to_dagster_type(Model)` becomes `-> DataFrame[Model]`."""
+    pytest.importorskip("pandera")
+    pd = pytest.importorskip("pandas")
+    import pandera.pandas as pa
+    from pandera.typing import DataFrame, Series
+
+    from rivers.integrations.pandera import schema_metadata
+
+    class Orders(pa.DataFrameModel):
+        id: Series[int] = pa.Field(ge=0)
+
+    @rs.Asset
+    def orders() -> DataFrame[Orders]:
+        return pd.DataFrame({"id": [-1]})
+
+    repo = rs.CodeRepository(assets=[orders], default_executor=rs.Executor.in_process())
+    repo.resolve(storage=storage)
+    with pytest.raises(
+        rs.exceptions.AssetOutputValidationError, match="does not match"
+    ):
+        repo.materialize()
+    assert list(schema_metadata(Orders)) == ["pandera/schema"]
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()
