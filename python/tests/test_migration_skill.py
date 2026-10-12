@@ -200,6 +200,47 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_airbyte_maps_to_airbyte_resource():
+    from pydantic import ValidationError
+
+    from rivers.integrations.airbyte import (
+        AirbyteConnection,
+        AirbyteResource,
+        AirbyteStream,
+    )
+
+    airbyte = AirbyteResource(
+        api_url="http://localhost:8000/api/public/v1",
+        configuration_api_url="http://localhost:8000/api/v1",
+        client_id="c",
+        client_secret="s",
+        cancel_on_interrupt=False,
+    )
+    connection = AirbyteConnection(
+        connection_id="9924bcd0-99be-453d-ba47-c2c9766f7da5",
+        name="Postgres To Snowflake",
+        prefix="pg_",
+        streams=[AirbyteStream(name="users"), AirbyteStream(name="orders")],
+    )
+
+    assets = airbyte.connection_asset(connection, group="raw")
+    assert assets.name == "airbyte_postgres_to_snowflake"
+    assert [(d.name, d.group) for d in assets.output_defs] == [
+        ("pg_users", "raw"),
+        ("pg_orders", "raw"),
+    ]
+
+    renamed = airbyte.connection_asset(
+        connection,
+        asset_def_fn=lambda connection, stream: rs.AssetDef(f"raw_{stream.name}"),
+    )
+    assert [d.name for d in renamed.output_defs] == ["raw_users", "raw_orders"]
+    assert callable(airbyte.sync) and callable(airbyte.get_connection)
+
+    with pytest.raises(ValidationError):
+        AirbyteResource(workspace_id="744cc0ed-7f05-4949-9e60-2a814f90c035")
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()
