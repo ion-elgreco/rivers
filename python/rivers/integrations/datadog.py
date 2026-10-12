@@ -294,12 +294,9 @@ def _statsd_client(
     constant_tags: tuple[str, ...],
 ) -> DatadogClient:
     # datadogpy before 0.53 takes no None for host and port.
-    connection: dict[str, Any] = {
-        "host": host,
-        "port": port,
-        "socket_path": socket_path,
-    }
+    connection: dict[str, Any] = {"host": host, "port": port}
     return DatadogClient(
+        socket_path=socket_path,
         constant_tags=list(constant_tags),
         **{key: value for key, value in connection.items() if value is not None},
     )
