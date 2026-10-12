@@ -1,6 +1,6 @@
 """Tests for strong return type checking on assets."""
 
-from typing import Any, Optional, Union
+from typing import Annotated, Any, Optional, Union
 
 import pytest
 
@@ -260,6 +260,69 @@ class TestOptionalAndUnion:
         result = repo.materialize(["my_asset"])
         assert result.success
 
+    def test_union_of_generics_returns_a_member(self):
+        @rs.Asset
+        def my_list() -> list[int] | None:
+            return [1, 2]
+
+        @rs.Asset
+        def my_dict() -> Optional[dict[str, int]]:
+            return {"a": 1}
+
+        repo = rs.CodeRepository(
+            assets=[my_list, my_dict], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve()
+        result = repo.materialize(["my_list", "my_dict"])
+        assert result.success
+        assert repo.load_node("my_list") == [1, 2]
+        assert repo.load_node("my_dict") == {"a": 1}
+
+    def test_union_of_generics_returns_wrong_type(self):
+        @rs.Asset
+        def my_asset() -> list[int] | None:
+            return "not a list"  # type: ignore
+
+        repo = rs.CodeRepository(assets=[my_asset])
+        repo.resolve()
+        with pytest.raises(AssetOutputValidationError) as err:
+            repo.materialize(["my_asset"])
+        assert str(err.value) == (
+            "Asset 'my_asset' returned value of type 'str' but expected 'list[int] | None'"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Annotated (the value must match the annotated type)
+# ---------------------------------------------------------------------------
+
+
+class TestAnnotated:
+    def test_annotated_returns_base_type(self):
+        @rs.Asset
+        def my_asset() -> Annotated[int, "row count"]:
+            return 3
+
+        repo = rs.CodeRepository(assets=[my_asset])
+        repo.resolve()
+        result = repo.materialize(["my_asset"])
+        assert result.success
+        assert repo.load_node("my_asset") == 3
+
+    def test_annotated_returns_wrong_type(self):
+        @rs.Asset
+        def my_asset() -> Annotated[int, "row count"]:
+            return "3"  # type: ignore
+
+        repo = rs.CodeRepository(assets=[my_asset])
+        repo.resolve()
+        with pytest.raises(AssetOutputValidationError) as err:
+            repo.materialize(["my_asset"])
+        assert str(err.value) == (
+            "Asset 'my_asset' returned value of type 'str' but expected "
+            "'typing.Annotated[int, 'row count']'"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Generic container types
@@ -396,3 +459,45 @@ class TestDependencyChains:
         repo.resolve()
         with pytest.raises(AssetOutputValidationError, match="str"):
             repo.materialize(["bad_asset"])
+
+
+# ---------------------------------------------------------------------------
+# Every executor checks return types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_every_executor_checks_the_return_type(storage, executor_env, is_async):
+    """The parallel executor checks a sync step in its loky worker; a lone
+    step runs in-process, so a sibling step keeps this one in the worker."""
+    executor, io_factory = executor_env
+
+    if is_async:
+
+        @rs.Asset(name="bad", io_handler=io_factory())
+        async def bad_async() -> int:
+            return "oops"  # type: ignore
+
+        bad = bad_async
+    else:
+
+        @rs.Asset(io_handler=io_factory())
+        def bad() -> int:
+            return "oops"  # type: ignore
+
+    @rs.Asset(io_handler=io_factory())
+    def sibling() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[bad, sibling], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    assert not result.success
+    [failure] = [
+        e for e in storage.get_events_for_asset("bad") if e.event_type == "StepFailure"
+    ]
+    assert dict(failure.metadata)["error"] == (
+        "AssetOutputValidationError: Asset 'bad' returned value of type 'str' "
+        "but expected '<class 'int'>'"
+    )

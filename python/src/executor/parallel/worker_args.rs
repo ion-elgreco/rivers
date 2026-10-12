@@ -463,6 +463,7 @@ pub(super) fn build_worker_submit_args(
 ) -> PyResult<Vec<Py<PyAny>>> {
     let output_name = instance_name.unwrap_or(step_name);
     let is_multi = !multi_outputs.is_empty();
+    let return_hint = ops::extract_return_hint(py, &func)?;
 
     let worker_fn = py.import("rivers._core")?.getattr("worker_execute_step")?;
 
@@ -489,7 +490,15 @@ pub(super) fn build_worker_submit_args(
     let pickled_func = make_func_ref(py, &func).or_else(|_| func_by_value(py, &func))?;
 
     let io_spec = if is_multi {
-        build_multi_output_specs(py, multi_outputs, &func, node_map, partition_key, registry)?
+        build_multi_output_specs(
+            py,
+            multi_outputs,
+            &func,
+            return_hint.as_ref(),
+            node_map,
+            partition_key,
+            registry,
+        )?
     } else {
         build_single_output_spec(
             py,
@@ -497,6 +506,7 @@ pub(super) fn build_worker_submit_args(
             step_name,
             node,
             &func,
+            return_hint.as_ref(),
             partition_key,
             node_map,
             registry,
@@ -509,6 +519,7 @@ pub(super) fn build_worker_submit_args(
             graph_name,
             graph_node,
             &func,
+            return_hint.as_ref(),
             partition_key,
             node_map,
             registry,
@@ -519,6 +530,8 @@ pub(super) fn build_worker_submit_args(
     let submit_args = vec![
         worker_fn.unbind(),
         pickled_func,
+        step_name.into_pyobject(py)?.into_any().unbind(),
+        return_hint.unwrap_or_else(|| py.None()),
         py_args.unbind().into_any(),
         worker_args
             .context_kwargs
@@ -575,6 +588,7 @@ fn build_single_output_spec(
     step_name: &str,
     node: &ResolvedNode,
     func: &Py<PyAny>,
+    return_hint: Option<&Py<PyAny>>,
     partition_key: &Option<PyPartitionKey>,
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
@@ -587,7 +601,6 @@ fn build_single_output_spec(
         kwargs.set_item("asset_metadata", node.metadata())?;
         let partition = ops::build_partition_context(node, partition_key)?;
         kwargs.set_item("partition", partition)?;
-        let return_hint = ops::extract_return_hint(py, func)?;
         kwargs.set_item("type_hint", return_hint)?;
         kwargs.unbind().into_any()
     } else {
@@ -611,6 +624,7 @@ fn build_graph_output_spec(
     graph_name: &str,
     graph_node: &ResolvedNode,
     task_func: &Py<PyAny>,
+    task_return_hint: Option<&Py<PyAny>>,
     partition_key: &Option<PyPartitionKey>,
     node_map: &HashMap<String, ResolvedNode>,
     registry: &IOHandlerRegistry,
@@ -626,7 +640,7 @@ fn build_graph_output_spec(
         "partition",
         ops::build_partition_context(graph_node, partition_key)?,
     )?;
-    kwargs.set_item("type_hint", ops::extract_return_hint(py, task_func)?)?;
+    kwargs.set_item("type_hint", task_return_hint)?;
     Ok(PyTuple::new(py, [handler, kwargs.unbind().into_any()])?
         .unbind()
         .into_any())
@@ -636,11 +650,11 @@ fn build_multi_output_specs(
     py: Python,
     outputs: &[String],
     func: &Py<PyAny>,
+    return_hint: Option<&Py<PyAny>>,
     node_map: &HashMap<String, ResolvedNode>,
     partition_key: &Option<PyPartitionKey>,
     registry: &IOHandlerRegistry,
 ) -> PyResult<WorkerIOSpec> {
-    let return_hint = ops::extract_return_hint(py, func)?;
     let specs = PyList::empty(py);
     for out_name in outputs {
         let out_node = node_map.get(out_name).ok_or_else(|| {
@@ -655,7 +669,7 @@ fn build_multi_output_specs(
         kwargs.set_item("asset_metadata", out_node.metadata())?;
         let partition = ops::build_partition_context(out_node, partition_key)?;
         kwargs.set_item("partition", partition)?;
-        kwargs.set_item("type_hint", &return_hint)?;
+        kwargs.set_item("type_hint", return_hint)?;
         let tuple = PyTuple::new(
             py,
             &[

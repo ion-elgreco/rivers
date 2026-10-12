@@ -222,7 +222,7 @@ pub(crate) struct ProcessedResult {
 
 /// Process a raw Python result by extracting Output/Observation/Materialization
 /// wrappers, validating the return type, draining context metadata, and unwrapping
-/// DynamicOutput. Shared between `execute_step` and `finish_async_step`.
+/// DynamicOutput. Shared between `execute_step` and the parallel worker.
 pub(crate) fn process_raw_result(
     py: Python,
     raw_result: &Py<PyAny>,
@@ -247,9 +247,9 @@ pub(crate) fn process_raw_result(
             )
         };
 
-    validate_return_type(py, &actual_result, return_hint, step_name)?;
+    let checked = validate_return_type(py, &actual_result, return_hint, step_name)?;
 
-    let (mut output_metadata, context_data_version) = if context_injected {
+    let (context_metadata, context_data_version) = if context_injected {
         if let Some(first) = ctx_ref {
             if let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>() {
                 let ctx = ctx.borrow();
@@ -264,13 +264,16 @@ pub(crate) fn process_raw_result(
         (Vec::new(), None)
     };
 
+    // A validator's entries describe the hint; what the asset sets wins.
+    let mut output_metadata = checked.metadata;
+    super::merge_metadata(&mut output_metadata, &context_metadata);
     super::merge_metadata(&mut output_metadata, &result_metadata);
     let data_version = result_data_version.or(context_data_version);
 
     let (final_result, dynamic_keys) =
-        match crate::result_types::try_unwrap_dynamic_outputs(py, &actual_result)? {
+        match crate::result_types::try_unwrap_dynamic_outputs(py, &checked.value)? {
             Some((values, keys)) => (values, Some(keys)),
-            None => (actual_result, None),
+            None => (checked.value, None),
         };
 
     Ok(ProcessedResult {

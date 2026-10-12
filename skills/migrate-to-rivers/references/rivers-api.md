@@ -144,6 +144,8 @@ Declared via a `context` parameter. Generic over the config type: `rs.AssetExecu
 | `rs.Observation(metadata=, data_version=, output_name=)` | external-asset observe result |
 | `list[rs.DynamicOutput(key, value)]` | dynamic fan-out with explicit mapping keys |
 
+The return annotation is checked at run time on every executor: `isinstance` against the class (a generic by its origin, `list[int]` → `list`), a union by any member, `Annotated[T, ...]` by `T`. A mismatch fails the step with `rs.exceptions.AssetOutputValidationError`.
+
 ## Tasks
 
 `@rs.Task` wraps a callable for use inside `Asset.from_graph`. Tasks are not assets — they produce no materialization of their own.

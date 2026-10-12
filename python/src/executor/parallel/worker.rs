@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::context::io::{PyInputContext, PyOutputContext};
-use crate::result_types::{self, ResultKind};
+use crate::result_types::ResultKind;
 
 /// Describes how to load an upstream input from an IO handler in the worker.
 #[pyclass(name = "IOLoadSpec", frozen, module = "rivers._core")]
@@ -210,7 +210,6 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::WorkerStepError;
 use crate::executor::ops::{self, metadata_to_pickle_safe_dict, write_output};
-use crate::metadata::MetadataValue;
 
 /// Returns None if metadata is empty.
 fn metadata_vec_to_pickle_safe(
@@ -227,15 +226,36 @@ fn metadata_vec_to_pickle_safe(
     Ok(Some(metadata_to_pickle_safe_dict(py, &d)?))
 }
 
+/// The worker has no config instance or failed partitions to report here;
+/// those travel on `PyWorkerResult`.
+fn step_result(processed: ops::ProcessedResult) -> ops::StepResult {
+    ops::StepResult {
+        result: processed.result,
+        return_hint: None,
+        output_metadata: processed.output_metadata,
+        data_version: processed.data_version,
+        config_instance: None,
+        tags: processed.tags,
+        dynamic_keys: processed.dynamic_keys,
+        result_kind: processed.kind,
+        generator: None,
+        failed_partitions: Vec::new(),
+    }
+}
+
 /// Self-contained step execution for loky subprocess.
 ///
 /// Replaces Python `_worker_execute_step`. Reuses Rust functions for
-/// result type extraction, DynamicOutput unwrapping, and IO handling.
+/// result type extraction, return type validation, DynamicOutput unwrapping,
+/// and IO handling. `return_hint` is resolved by the orchestrator: a function
+/// shipped by value lacks the module globals a string annotation names.
 #[pyfunction]
-#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
+#[pyo3(signature = (func, step_name, return_hint, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
 pub fn worker_execute_step(
     py: Python,
     func: Py<PyAny>,
+    step_name: String,
+    return_hint: Option<Py<PyAny>>,
     args: Bound<'_, PyList>,
     context_kwargs: Option<Py<PyAny>>,
     resource_specs: Bound<'_, PyList>,
@@ -353,32 +373,36 @@ pub fn worker_execute_step(
                 .call_method1("isgenerator", (&raw_result,))?
                 .is_truthy()?;
 
-            // Dict path: drain ctx once for shared metadata + dv. Gen path:
-            // for_each_output_generator handles per-yield peek/drain itself,
-            // so we leave shared empty (matches the in_process gen path which
-            // also ignores step_result.output_metadata for generators).
-            let (shared_metadata, shared_dv) = if is_gen {
-                (Vec::new(), None)
+            // Dict path: processed like the in-process path (return type
+            // check, ctx drain). Gen path: for_each_output_generator handles
+            // per-yield peek/drain itself, so shared state stays empty (the
+            // in_process gen path skips both too). Worker only handles sync
+            // code (async funcs are delegated to AsyncBackend in the main
+            // process), so an async generator is impossible here.
+            let synth = if is_gen {
+                ops::StepResult {
+                    result: raw_result,
+                    return_hint: None,
+                    output_metadata: Vec::new(),
+                    data_version: None,
+                    config_instance: None,
+                    tags: None,
+                    dynamic_keys: None,
+                    result_kind: ResultKind::Output,
+                    failed_partitions: Vec::new(),
+                    generator: Some(ops::GeneratorType::Sync {
+                        context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
+                    }),
+                }
             } else {
-                drain_ctx_state(py, ctx_obj.as_ref())?
-            };
-
-            // Worker only handles sync code (async funcs are delegated to
-            // AsyncBackend in the main process), so an async generator is
-            // impossible here.
-            let synth = ops::StepResult {
-                result: raw_result,
-                return_hint: None,
-                output_metadata: shared_metadata,
-                data_version: shared_dv,
-                config_instance: None,
-                tags: None,
-                dynamic_keys: None,
-                result_kind: ResultKind::Output,
-                failed_partitions: Vec::new(),
-                generator: is_gen.then(|| ops::GeneratorType::Sync {
-                    context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
-                }),
+                step_result(ops::process_raw_result(
+                    py,
+                    &raw_result,
+                    return_hint.as_ref(),
+                    ctx_obj.is_some(),
+                    ctx_obj.as_ref(),
+                    &step_name,
+                )?)
             };
 
             ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
@@ -429,33 +453,19 @@ pub fn worker_execute_step(
         } else {
             // Single-output: process the raw result the same way the in-
             // process path does (Output / Materialization wrapper extraction,
-            // ctx drain, DynamicOutput unwrap), then drive the shared
-            // iterator with an empty selected_outputs (single shape).
-            let extracted = result_types::try_extract_result_type(py, &raw_result)?;
-            let (mut actual_result, result_metadata, result_dv, result_kind) =
-                if let Some(ext) = extracted {
-                    let val = ext.value.unwrap_or_else(|| py.None());
-                    (val, ext.metadata, ext.data_version, ext.kind)
-                } else {
-                    (raw_result, Vec::new(), None, ResultKind::Output)
-                };
-
-            let (mut shared_metadata, ctx_dv) = drain_ctx_state(py, ctx_obj.as_ref())?;
-            ops::merge_metadata(&mut shared_metadata, &result_metadata);
-            // result-type dv wins over ctx-set dv (matches process_raw_result
-            // in invoke.rs).
-            let shared_dv = result_dv.or(ctx_dv);
-
-            let dynamic_keys = match result_types::try_unwrap_dynamic_outputs(py, &actual_result)? {
-                Some((values, keys)) => {
-                    actual_result = values;
-                    Some(keys)
-                }
-                None => None,
-            };
+            // return type check, ctx drain, DynamicOutput unwrap), then drive
+            // the shared iterator with an empty selected_outputs (single shape).
+            let processed = ops::process_raw_result(
+                py,
+                &raw_result,
+                return_hint.as_ref(),
+                ctx_obj.is_some(),
+                ctx_obj.as_ref(),
+                &step_name,
+            )?;
             // Surface to outer scope so PyWorkerResult can ship it back; the
             // orchestrator persists keys to KV after the worker returns.
-            single_dynamic_keys = dynamic_keys.clone();
+            single_dynamic_keys = processed.dynamic_keys.clone();
 
             // Asset name from the OutputContext kwargs — the orchestrator
             // populated this with `step_name` (instance_name for mapped).
@@ -469,18 +479,7 @@ pub fn worker_execute_step(
                 String::new()
             };
 
-            let synth = ops::StepResult {
-                result: actual_result,
-                return_hint: None,
-                output_metadata: shared_metadata,
-                data_version: shared_dv,
-                config_instance: None,
-                tags: None,
-                dynamic_keys: dynamic_keys.clone(),
-                result_kind,
-                generator: None,
-                failed_partitions: Vec::new(),
-            };
+            let synth = step_result(processed);
 
             ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
                 match item {
@@ -592,23 +591,6 @@ fn wrap_step_error(
         Ok(()) => wrapper,
         Err(_) => err,
     }
-}
-
-/// Drain `output_metadata` and `data_version` from a worker-side
-/// AssetExecutionContext (if present and the right type).
-fn drain_ctx_state(
-    py: Python,
-    ctx_obj: Option<&Py<PyAny>>,
-) -> PyResult<(Vec<(String, MetadataValue)>, Option<String>)> {
-    if let Some(ctx) = ctx_obj
-        && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
-    {
-        let ctx_borrow = bound.borrow();
-        let metadata = ctx_borrow.drain_output_metadata(py);
-        let dv = ctx_borrow.drain_data_version();
-        return Ok((metadata, dv));
-    }
-    Ok((Vec::new(), None))
 }
 
 /// Drain `mark_partition_failed` marks from a worker-side context, serialized as

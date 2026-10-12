@@ -1,10 +1,11 @@
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyNone, PyString};
+use pyo3::types::{PyDict, PyString};
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::context::task::PyTaskExecutionContext;
 use crate::errors::AssetOutputValidationError;
+use crate::metadata::MetadataValue;
 use crate::result_types;
 
 pub(crate) fn annotation_is(annotation: &Bound<PyAny>, type_obj: &Bound<PyAny>) -> bool {
@@ -108,123 +109,187 @@ pub(crate) fn enumerate_params<'py>(
     Ok(out)
 }
 
+/// The function's return annotation, evaluated when it is a string (PEP 563).
 pub(crate) fn extract_return_hint(py: Python, func: &Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
     if func.bind(py).is_instance_of::<crate::task::PyBashTask>() {
         return Ok(None);
     }
     let annotations = get_annotations(py, func)?;
-    Ok(annotations.get_item("return")?.map(|v| v.unbind()))
+    let Some(hint) = annotations.get_item("return")? else {
+        return Ok(None);
+    };
+    match resolve_annotation(py, func, &hint) {
+        Ok(hint) => Ok(Some(hint.unbind())),
+        Err(cause) => {
+            let err = AssetOutputValidationError::new_err(format!(
+                "Cannot evaluate the return annotation '{hint}': {cause}"
+            ));
+            err.set_cause(py, Some(cause));
+            Err(err)
+        }
+    }
 }
 
-/// Validate that a return value matches the declared return type hint.
-/// Handles common cases: basic types, None, Any, Optional, Union, generic containers.
-/// Raises AssetOutputValidationError on mismatch.
+/// A return value that matches its hint, as rivers stores it.
+pub(crate) struct CheckedOutput {
+    pub value: Py<PyAny>,
+    /// Metadata an integration's validator adds to the materialization.
+    pub metadata: Vec<(String, MetadataValue)>,
+}
+
+impl CheckedOutput {
+    fn unchanged(py: Python, value: &Py<PyAny>) -> Self {
+        Self {
+            value: value.clone_ref(py),
+            metadata: Vec::new(),
+        }
+    }
+}
+
+enum HintMatch {
+    Yes(CheckedOutput),
+    /// `Some` holds the error an integration's validator raised.
+    No(Option<PyErr>),
+}
+
+/// Validate a return value against the declared return type hint: classes,
+/// `None`, `Any`, unions, `Annotated`, generic containers (by their origin),
+/// and hints an integration validates (`rivers.integrations.output_validator`).
+/// The checked value can differ from `result`, e.g. a frame that pandera
+/// coerced. Raises AssetOutputValidationError on mismatch.
 pub(crate) fn validate_return_type(
     py: Python,
     result: &Py<PyAny>,
     return_hint: Option<&Py<PyAny>>,
     step_name: &str,
-) -> PyResult<()> {
-    let hint = match return_hint {
-        Some(h) => h,
-        None => return Ok(()),
+) -> PyResult<CheckedOutput> {
+    let Some(hint) = return_hint.map(|h| h.bind(py)) else {
+        return Ok(CheckedOutput::unchanged(py, result));
     };
 
-    let hint_bound = hint.bind(py);
-
-    if hint_bound.is_none() {
-        return Ok(());
+    match check_hint(py, result, hint)? {
+        HintMatch::Yes(checked) => Ok(checked),
+        HintMatch::No(None) => Err(AssetOutputValidationError::new_err(format!(
+            "Asset '{}' returned value of type '{}' but expected '{}'",
+            step_name,
+            result.bind(py).get_type().qualname()?,
+            hint,
+        ))),
+        HintMatch::No(Some(cause)) => {
+            let err = AssetOutputValidationError::new_err(format!(
+                "Asset '{}' returned a value that does not match '{}': {}",
+                step_name,
+                hint,
+                cause.value(py),
+            ));
+            err.set_cause(py, Some(cause));
+            Err(err)
+        }
     }
+}
+
+fn check_hint(py: Python, value: &Py<PyAny>, hint: &Bound<PyAny>) -> PyResult<HintMatch> {
+    let typing = py.import("typing")?;
 
     // Output/Observation/Materialization hints: value was already unwrapped before validation.
-    let output_type = result_types::PyOutput::type_object(py);
-    let observation_type = result_types::PyObservation::type_object(py);
-    let materialization_type = result_types::PyMaterialization::type_object(py);
-    if hint_bound.is(&output_type)
-        || hint_bound.is(&observation_type)
-        || hint_bound.is(&materialization_type)
+    if hint.is_none()
+        || hint.is(typing.getattr("Any")?)
+        || hint.is(result_types::PyOutput::type_object(py))
+        || hint.is(result_types::PyObservation::type_object(py))
+        || hint.is(result_types::PyMaterialization::type_object(py))
     {
-        return Ok(());
+        return Ok(HintMatch::Yes(CheckedOutput::unchanged(py, value)));
     }
 
-    let typing = py.import("typing")?;
-    let isinstance = py.import("builtins")?.getattr("isinstance")?;
-
-    let any_type = typing.getattr("Any")?;
-    if hint_bound.is(&any_type) {
-        return Ok(());
+    let origin = typing.call_method1("get_origin", (hint,))?;
+    if origin.is(typing.getattr("Annotated")?) {
+        return check_annotated(py, value, hint);
     }
 
-    let result_bound = result.bind(py);
-    let get_origin = typing.getattr("get_origin")?;
-    let origin = get_origin.call1((hint_bound,))?;
-
-    if !origin.is_none() {
-        let types_union = py.import("types")?.getattr("UnionType")?;
-        let union_origin = typing.getattr("Union")?;
-        let is_union = origin.is(&union_origin) || origin.eq(&types_union).unwrap_or(false);
-
-        if is_union {
-            let get_args = typing.getattr("get_args")?;
-            let args = get_args.call1((hint_bound,))?;
-            for arg in args.try_iter()? {
-                let arg = arg?;
-                if result_bound.is_instance_of::<PyNone>() {
-                    let none_type = PyNone::get(py).get_type();
-                    if arg.eq(&none_type).unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                if isinstance
-                    .call1((result_bound, &arg))
-                    .ok()
-                    .and_then(|r| r.is_truthy().ok())
-                    .unwrap_or(false)
-                {
-                    return Ok(());
-                }
+    let is_union = origin.is(typing.getattr("Union")?)
+        || origin
+            .eq(py.import("types")?.getattr("UnionType")?)
+            .unwrap_or(false);
+    if is_union {
+        let mut cause = None;
+        for arm in typing.call_method1("get_args", (hint,))?.try_iter()? {
+            match check_hint(py, value, &arm?)? {
+                HintMatch::Yes(checked) => return Ok(HintMatch::Yes(checked)),
+                HintMatch::No(err) => cause = cause.or(err),
             }
-            return Err(AssetOutputValidationError::new_err(format!(
-                "Asset '{}' returned value of type '{}' but expected '{}'",
-                step_name,
-                result_bound.get_type().qualname()?,
-                hint_bound,
-            )));
         }
-
-        if isinstance
-            .call1((result_bound, &origin))
-            .ok()
-            .and_then(|r| r.is_truthy().ok())
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        return Err(AssetOutputValidationError::new_err(format!(
-            "Asset '{}' returned value of type '{}' but expected '{}'",
-            step_name,
-            result_bound.get_type().qualname()?,
-            hint_bound,
-        )));
+        return Ok(HintMatch::No(cause));
     }
 
-    if result_bound.is_instance_of::<PyNone>() {
-        let none_type = PyNone::get(py).get_type();
-        if hint_bound.eq(&none_type).unwrap_or(false) {
-            return Ok(());
-        }
+    if let Some(checked) = run_validator(py, value, hint)? {
+        return Ok(checked);
     }
 
-    match isinstance.call1((result_bound, hint_bound)) {
-        Ok(r) if r.is_truthy().unwrap_or(false) => Ok(()),
-        _ => Err(AssetOutputValidationError::new_err(format!(
-            "Asset '{}' returned value of type '{}' but expected '{}'",
-            step_name,
-            result_bound.get_type().qualname()?,
-            hint_bound,
-        ))),
+    let class = if origin.is_none() { hint } else { &origin };
+    let matches = py
+        .import("builtins")?
+        .getattr("isinstance")?
+        .call1((value, class))
+        .and_then(|r| r.is_truthy())
+        .unwrap_or(false);
+    Ok(if matches {
+        HintMatch::Yes(CheckedOutput::unchanged(py, value))
+    } else {
+        HintMatch::No(None)
+    })
+}
+
+/// `Annotated[T, *items]`: the value must match `T`, then pass each item an
+/// integration validates, e.g. a pandera `DataFrameSchema`.
+fn check_annotated(py: Python, value: &Py<PyAny>, hint: &Bound<PyAny>) -> PyResult<HintMatch> {
+    let mut checked = match check_hint(py, value, &hint.getattr("__origin__")?)? {
+        HintMatch::Yes(checked) => checked,
+        no => return Ok(no),
+    };
+
+    for item in hint.getattr("__metadata__")?.try_iter()? {
+        match run_validator(py, &checked.value, &item?)? {
+            Some(HintMatch::Yes(next)) => {
+                super::merge_metadata(&mut checked.metadata, &next.metadata);
+                checked.value = next.value;
+            }
+            Some(no) => return Ok(no),
+            None => {}
+        }
     }
+    Ok(HintMatch::Yes(checked))
+}
+
+/// `None` when no integration validates `hint`, or its validator returns
+/// `NotImplemented`.
+fn run_validator(
+    py: Python,
+    value: &Py<PyAny>,
+    hint: &Bound<PyAny>,
+) -> PyResult<Option<HintMatch>> {
+    let validator = py
+        .import("rivers.integrations")?
+        .call_method1("output_validator", (hint,))?;
+    if validator.is_none() {
+        return Ok(None);
+    }
+
+    let returned = match validator.call1((value, hint)) {
+        Ok(returned) => returned.unbind(),
+        Err(err) => return Ok(Some(HintMatch::No(Some(err)))),
+    };
+    if returned.is(py.NotImplemented()) {
+        return Ok(None);
+    }
+
+    let checked = match result_types::try_extract_result_type(py, &returned)? {
+        Some(output) => CheckedOutput {
+            value: output.value.unwrap_or_else(|| py.None()),
+            metadata: output.metadata,
+        },
+        None => CheckedOutput::unchanged(py, &returned),
+    };
+    Ok(Some(HintMatch::Yes(checked)))
 }
 
 /// e.g. given the annotation for `AssetExecutionContext[MyConfig]`, extracts and instantiates `MyConfig`.
