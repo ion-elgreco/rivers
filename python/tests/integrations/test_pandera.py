@@ -10,7 +10,6 @@ import importlib
 import json
 import os
 import sys
-from dataclasses import dataclass
 from typing import Annotated
 
 import pytest
@@ -20,7 +19,6 @@ pd = pytest.importorskip("pandas")
 pl = pytest.importorskip("polars")
 
 import pandera.pandas as pa  # noqa: E402
-from _helpers import materialize_beside_sibling  # noqa: E402
 import pandera.polars as pap  # noqa: E402
 from pandas.testing import assert_frame_equal as assert_pandas_equal  # noqa: E402
 from pandera.errors import SchemaErrors  # noqa: E402
@@ -178,60 +176,6 @@ def expected_schema(backend: str) -> dict:
     }
 
 
-@dataclass
-class Env:
-    storage: rs.Storage
-    executor: rs.Executor
-    handler: rs.BaseIOHandler
-
-    @property
-    def parallel(self) -> bool:
-        return isinstance(self.executor, rs.Executor.Parallel)
-
-    def materialize(self, *assets) -> tuple[rs.CodeRepository, rs.RunResult]:
-        return materialize_beside_sibling(
-            self.storage, self.executor, self.handler, *assets
-        )
-
-
-@pytest.fixture
-def env(storage, executor_env):
-    executor, io_factory = executor_env
-    return Env(storage, executor, io_factory())
-
-
-def orders_asset(env: Env, hint, value, *, is_async=False, pid_file=None):
-    """An ``orders`` asset that returns ``value`` under the return hint ``hint``."""
-    if is_async:
-
-        @rs.Asset(name="orders", io_handler=env.handler)
-        async def orders_async() -> hint:
-            return value
-
-        return orders_async
-
-    @rs.Asset(name="orders", io_handler=env.handler)
-    def orders() -> hint:
-        if pid_file is not None:
-            pid_file.write_text(str(os.getpid()))
-        return value
-
-    return orders
-
-
-def stored_schema(env: Env, asset: str) -> dict:
-    """The ``pandera/schema`` entry of ``asset``'s materialization, decoded."""
-    materialization = env.storage.get_latest_materialization(asset)
-    [(variant, payload)] = json.loads(
-        dict(materialization.metadata)["pandera/schema"]
-    ).items()
-    # Metadata that a parallel worker sends back loses its type, so only the
-    # value is compared there.
-    if not env.parallel:
-        assert variant == "Json"
-    return json.loads(payload["value"])
-
-
 def assert_frames_equal(left, right):
     if isinstance(right, pd.DataFrame):
         assert_pandas_equal(left, right)
@@ -248,7 +192,7 @@ def test_valid_frame_is_stored_with_its_schema(
     frame = FRAMES[backend](GOOD_ROWS)
 
     repo, result = env.materialize(
-        orders_asset(env, hint, frame, is_async=is_async, pid_file=pid_file)
+        env.asset(hint, frame, is_async=is_async, pid_file=pid_file)
     )
 
     assert result.success
@@ -256,7 +200,7 @@ def test_valid_frame_is_stored_with_its_schema(
         ran_in_worker = int(pid_file.read_text()) != os.getpid()
         assert ran_in_worker == env.parallel
     assert_frames_equal(repo.load_node("orders"), schema.validate(frame))
-    assert stored_schema(env, "orders") == expected_schema(backend)
+    assert env.stored_json("orders", "pandera/schema") == expected_schema(backend)
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
@@ -266,7 +210,7 @@ def test_invalid_frame_fails_with_the_pandera_report(
 ):
     frame = FRAMES[backend](BAD_ROWS)
 
-    _, result = env.materialize(orders_asset(env, hint, frame, is_async=is_async))
+    _, result = env.materialize(env.asset(hint, frame, is_async=is_async))
 
     assert not result.success
     with pytest.raises(SchemaErrors) as report:
@@ -321,7 +265,7 @@ def test_lazy_frame_is_checked_against_the_schema_only(env):
     assert_polars_equal(
         repo.load_node("lazy_bad_rows").collect(), pl.DataFrame(BAD_ROWS)
     )
-    assert stored_schema(env, "lazy_orders") == expected_schema("polars")
+    assert env.stored_json("lazy_orders", "pandera/schema") == expected_schema("polars")
     with pytest.raises(SchemaErrors) as report:
         PolarsOrders.validate(good.drop("status").lazy(), lazy=True)
     assert dict(result.failed_assets)["lazy_missing_column"] == (
@@ -331,7 +275,7 @@ def test_lazy_frame_is_checked_against_the_schema_only(env):
 
 
 def test_value_that_is_not_a_frame_fails_like_any_hint(env):
-    _, result = env.materialize(orders_asset(env, DataFrame[Orders], GOOD_ROWS))
+    _, result = env.materialize(env.asset(DataFrame[Orders], GOOD_ROWS))
 
     assert not result.success
     assert dict(result.failed_assets)["orders"] == (
@@ -348,7 +292,7 @@ def test_optional_hint_accepts_none_and_reports_a_bad_frame(env):
     def no_orders() -> hint:
         return None
 
-    repo, result = env.materialize(no_orders, orders_asset(env, hint, bad))
+    repo, result = env.materialize(no_orders, env.asset(hint, bad))
 
     assert not result.success
     assert repo.load_node("no_orders") is None
@@ -393,7 +337,7 @@ def test_multi_asset_output_carries_schema_metadata(env):
 
     assert result.success
     assert repo.load_node("order_count") == 2
-    assert stored_schema(env, "orders") == expected_schema("pandas")
+    assert env.stored_json("orders", "pandera/schema") == expected_schema("pandas")
 
 
 @pytest.mark.parametrize(("backend", "hint", "schema"), CASES)
