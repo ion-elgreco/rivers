@@ -2,40 +2,86 @@
 use pyo3::create_exception;
 use pyo3::prelude::*;
 
-create_exception!(rivers, AssetDefinitionError, pyo3::exceptions::PyException);
-create_exception!(rivers, AssetNotFoundError, pyo3::exceptions::PyException);
+// Each type names `rivers.exceptions`, its import path, as its module: an
+// exception raised in a parallel worker pickles its type by that name.
 create_exception!(
-    rivers,
+    rivers.exceptions,
+    AssetDefinitionError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    AssetNotFoundError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
     AssetOutputValidationError,
     pyo3::exceptions::PyException
 );
-create_exception!(rivers, ConfigurationError, pyo3::exceptions::PyException);
-create_exception!(rivers, ExecutionError, pyo3::exceptions::PyException);
-create_exception!(rivers, GraphValidationError, pyo3::exceptions::PyException);
-create_exception!(rivers, InvalidMetadataError, pyo3::exceptions::PyException);
-create_exception!(rivers, NodeNotFoundError, pyo3::exceptions::PyException);
 create_exception!(
-    rivers,
+    rivers.exceptions,
+    ConfigurationError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    ExecutionError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    GraphValidationError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    InvalidMetadataError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    NodeNotFoundError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
     PartitionDefinitionError,
     pyo3::exceptions::PyException
 );
 create_exception!(
-    rivers,
+    rivers.exceptions,
     PartitionValidationError,
     pyo3::exceptions::PyException
 );
-create_exception!(rivers, ResultDefinitionError, pyo3::exceptions::PyException);
 create_exception!(
-    rivers,
+    rivers.exceptions,
+    ResultDefinitionError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
     ScheduleDefinitionError,
     pyo3::exceptions::PyException
 );
-create_exception!(rivers, SensorDefinitionError, pyo3::exceptions::PyException);
-create_exception!(rivers, StorageError, pyo3::exceptions::PyException);
+create_exception!(
+    rivers.exceptions,
+    SensorDefinitionError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    StorageError,
+    pyo3::exceptions::PyException
+);
 // Subclass of StorageError so `except StorageError` still catches it; the
 // `rivers dev` prompt catches this specific type to offer `rivers db migrate`.
-create_exception!(rivers, SchemaMigrationNeededError, StorageError);
-create_exception!(rivers, TaskDefinitionError, pyo3::exceptions::PyException);
+create_exception!(rivers.exceptions, SchemaMigrationNeededError, StorageError);
+create_exception!(
+    rivers.exceptions,
+    TaskDefinitionError,
+    pyo3::exceptions::PyException
+);
 // A parallel worker raises this around a failed step's own exception. Its
 // attributes carry that exception, the step's logs, and its traceback back to
 // the parent: an exception type with its own `__reduce__` drops attributes set

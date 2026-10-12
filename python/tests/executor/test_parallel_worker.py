@@ -5,6 +5,8 @@ DAG shapes, error handling, collecting mode, IO handlers (Pickle, Delta),
 mixed configurations, and per-asset executor overrides.
 """
 
+import pickle
+
 import obstore
 import obstore.store
 import pyarrow as pa
@@ -1707,6 +1709,18 @@ def test_mp_in_memory_io_rejected_in_collecting():
     result = repo.materialize(raise_on_error=False)
     assert len(result.failed_assets) > 0
     assert any("InMemoryIOHandler" in msg for _, msg in result.failed_assets)
+
+
+@pytest.mark.parametrize("name", rs.exceptions.__all__)
+def test_rivers_exceptions_pickle_as_their_class(name):
+    """A rivers exception raised in a worker reaches the caller as the class
+    it catches, not as a copy of that class."""
+    cls = getattr(rs.exceptions, name)
+
+    restored = pickle.loads(pickle.dumps(cls("boom")))
+
+    assert type(restored) is cls
+    assert restored.args == ("boom",)
 
 
 # ---------------------------------------------------------------------------
