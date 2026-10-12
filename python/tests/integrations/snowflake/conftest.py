@@ -26,18 +26,5 @@ def warehouse(server):
     from rivers.integrations.snowflake import SnowflakeResource
 
     return SnowflakeResource(
-        account=server["account"],
-        user=server["user"],
-        password=server["password"],
-        database=f"TEST_{uuid.uuid4().hex[:12].upper()}",
-        connection_args={
-            key: server[key]
-            for key in (
-                "host",
-                "port",
-                "protocol",
-                "session_parameters",
-                "network_timeout",
-            )
-        },
+        database=f"TEST_{uuid.uuid4().hex[:12].upper()}", connection_args=server
     )
