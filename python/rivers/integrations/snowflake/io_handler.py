@@ -124,16 +124,18 @@ class SnowflakeIOHandler(BaseIOHandler):
                 f"got {raw_mode!r}"
             ) from None
 
-        predicate = None
-        if context.partition is not None and mode is SnowflakeWriteMode.OVERWRITE:
-            predicate = self.partition_predicate(meta, context.partition)
+        target = _quote_table(schema, table)
+        delete = None
+        if mode is SnowflakeWriteMode.OVERWRITE:
+            delete = f"DELETE FROM {target}"
+            if context.partition is not None:
+                delete += f" WHERE {self.partition_predicate(meta, context.partition)}"
 
         reader = _to_reader(obj)
         columns = ", ".join(
             f"{_quote(field.name)} {_snowflake_type(field.type)}"
             for field in reader.schema
         )
-        target = _quote_table(schema, table)
         stage = _quote_table(schema, f"RIVERS_STAGE_{uuid.uuid4().hex}")
 
         start = monotonic()
@@ -150,7 +152,7 @@ class SnowflakeIOHandler(BaseIOHandler):
             # after the upload, so that an output that fails to read makes no table
             if not exists:
                 cur.execute(f"CREATE TABLE IF NOT EXISTS {target} ({columns})")
-            _write(cur, target, stage, mode, predicate)
+            _write(cur, target, stage, delete)
             duration = monotonic() - start
 
             cur.execute(f"SELECT COUNT(*), CURRENT_DATABASE() FROM {target}")
@@ -241,19 +243,12 @@ def _prepare_table(
     return False
 
 
-def _write(
-    cur: SnowflakeCursor,
-    target: str,
-    stage: str,
-    mode: SnowflakeWriteMode,
-    predicate: str | None,
-) -> None:
-    """Delete the old rows (overwrite) and load the staged file, in one transaction."""
+def _write(cur: SnowflakeCursor, target: str, stage: str, delete: str | None) -> None:
+    """Run ``delete`` and load the staged files, in one transaction."""
     cur.execute("BEGIN")
     try:
-        if mode is SnowflakeWriteMode.OVERWRITE:
-            where = f" WHERE {predicate}" if predicate is not None else ""
-            cur.execute(f"DELETE FROM {target}{where}")
+        if delete is not None:
+            cur.execute(delete)
 
         # FORCE: Snowflake skips a file that it loaded into the table before
         cur.execute(
