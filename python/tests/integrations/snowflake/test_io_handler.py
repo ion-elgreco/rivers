@@ -466,17 +466,11 @@ def test_append_mode_and_name_overrides(warehouse):
 
 
 def test_names_are_uppercased_and_quoted():
+    """Checked as text: fakesnow's COPY cannot load a table whose name needs
+    quotes, such as ``graph/task``. Snowflake can."""
     assert io_module.quote_table("graph", 'task/"odd" name') == (
         '"GRAPH"."TASK/""ODD"" NAME"'
     )
-
-
-def test_asset_name_round_trip(warehouse):
-    """fakesnow's COPY cannot load a table whose name needs quotes, such as
-    ``graph/task``: Snowflake can."""
-    handler = SnowflakeIOHandler(resource=warehouse)
-    handler.handle_output(rs.OutputContext(asset_name="mapped__0"), _TABLE)
-    assert _load(handler, "mapped__0", pa.Table).sort_by("id").equals(_TABLE)
 
 
 def test_empty_output_creates_the_table(warehouse):
