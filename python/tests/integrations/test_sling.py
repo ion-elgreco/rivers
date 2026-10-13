@@ -203,7 +203,7 @@ def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, execut
     assert _values(users)["sling/rows_written"] == 2
 
 
-def test_failed_stream_fails_the_step(tmp_path, src, storage, executor_env):
+def test_failed_stream_fails_only_its_output(tmp_path, src, storage, executor_env):
     replication = SlingReplication(_replication(src, "orders", "missing", "users"))
     repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
 
@@ -217,15 +217,6 @@ def test_failed_stream_fails_the_step(tmp_path, src, storage, executor_env):
     error = dict(failure.metadata)["error"]
     assert error.startswith("SlingError: sling exited with code 1\n")
     assert f"--- {_uri(src / 'missing.csv')} ---" in error
-
-
-def test_failed_stream_keeps_the_streams_that_succeeded(
-    tmp_path, src, storage, executor_env
-):
-    replication = SlingReplication(_replication(src, "orders", "missing", "users"))
-    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
-
-    repo.materialize(raise_on_error=False)
 
     for asset, rows in (("main.orders", 3), ("main.users", 2)):
         [materialization] = _events(storage, asset, "Materialization")
