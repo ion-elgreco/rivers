@@ -53,15 +53,8 @@ from rivers._core import Materialization
 from rivers._core.assets import Asset, AssetDef, AssetExecutionContext, MultiAsset
 from rivers.resource import Resource
 
-try:
-    import yaml
-except ImportError as e:
-    raise ImportError(
-        "rivers.integrations.sling needs sling: pip install rivers[sling]"
-    ) from e
-
 # `import sling` downloads the binary, so it waits for the first replication.
-if find_spec("sling") is None:
+if find_spec("sling") is None or find_spec("yaml") is None:
     raise ImportError(
         "rivers.integrations.sling needs sling: pip install rivers[sling]"
     )
@@ -212,6 +205,8 @@ class SlingReplication:
         if isinstance(config, Mapping):
             self.config: dict[str, Any] = dict(config)
         else:
+            import yaml
+
             self.config = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
 
         translate = translator or SlingStream.output_def
