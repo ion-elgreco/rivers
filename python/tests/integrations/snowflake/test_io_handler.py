@@ -170,6 +170,34 @@ def test_values_round_trip(warehouse):
     assert read.schema.field("instant").type.tz == "UTC"
 
 
+def test_nested_values_round_trip(warehouse):
+    """Lists, structs, and maps keep the NULLs inside them; a map's keys become object keys."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table(
+            {
+                "m": pa.array(
+                    [{"k1": 1, "k2": None}], pa.map_(pa.string(), pa.int64())
+                ),
+                "s": pa.array(
+                    [{"a": 1, "b": None}],
+                    pa.struct({"a": pa.int64(), "b": pa.string()}),
+                ),
+                "l": [[1, None, 3]],
+            }
+        ),
+    )
+
+    [row] = _load(handler, "t", pa.Table).to_pylist()
+
+    assert {name: json.loads(value) for name, value in row.items()} == {
+        "m": {"k1": 1, "k2": None},
+        "s": {"a": 1, "b": None},
+        "l": [1, None, 3],
+    }
+
+
 def test_empty_read_has_the_types_of_a_read_with_rows(warehouse):
     """For no rows, the connector types the columns by its own rules, not by the table."""
     handler = SnowflakeIOHandler(resource=warehouse)
@@ -484,6 +512,20 @@ def test_column_types_that_hold_the_output(column, arrow_type, holds):
     )
     with check:
         assert io_module._prepare_table(cur, "RAW", "T", output)
+
+
+@pytest.mark.parametrize(
+    "delete", [None, 'DELETE FROM "PUBLIC"."T"'], ids=["append", "overwrite"]
+)
+def test_copy_uses_the_vectorized_scanner(delete):
+    """The statement itself: fakesnow loads nested values ideally, with any scanner."""
+    cur = RecordingCursor()
+
+    io_module._write(cur, '"PUBLIC"."T"', '"PUBLIC"."STAGE"', delete)
+
+    [copy] = [sql for sql in cur.sql if sql.startswith("COPY")]
+    [file_format] = re.findall(r"FILE_FORMAT = \(([^)]*)\)", copy)
+    assert "USE_VECTORIZED_SCANNER = TRUE" in file_format
 
 
 def test_unsupported_column_type_fails_before_connecting():

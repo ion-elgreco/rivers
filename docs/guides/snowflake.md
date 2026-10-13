@@ -142,6 +142,8 @@ The first write creates the columns from the Arrow types, as Snowflake's [ADBC d
 | `struct`, `map` | `OBJECT` |
 | dictionary | its value type |
 
+Lists, structs, and maps keep the nulls inside them, and a map's keys become the object's keys.
+
 Other Arrow types, such as `duration`, fail before the write starts.
 
 A read gives each column the Arrow type of its Snowflake type, also when no rows match. `NUMBER` columns without a scale become `int64`, and `NUMBER(p,s)` columns become `decimal128(p,s)`. In a pandas `DataFrame`, `int64` and `bool` columns have the nullable `Int64` and `boolean` dtypes. `DATE` becomes `date32`. Timestamps are in the smallest unit that holds the column's precision: `TIMESTAMP_NTZ(6)` in microseconds. `TIME` columns are too, but at most in microseconds. `ARRAY` and `OBJECT` become JSON text.

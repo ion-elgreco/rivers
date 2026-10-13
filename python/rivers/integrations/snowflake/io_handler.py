@@ -28,7 +28,12 @@ from rivers.io_handlers._partition_sql import (
 )
 from rivers.io_handlers.base import BaseIOHandler
 
-_FILE_FORMAT = "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE BINARY_AS_TEXT = FALSE"
+# USE_VECTORIZED_SCANNER: the default scanner loads a map as key-value pairs
+# and drops the NULLs inside nested values
+_FILE_FORMAT = (
+    "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE BINARY_AS_TEXT = FALSE "
+    "USE_VECTORIZED_SCANNER = TRUE"
+)
 _PRECISION = {"s": 0, "ms": 3, "us": 6, "ns": 9}
 # UTC: partition bounds are UTC times without a zone. Without the decimal
 # setting, a NUMBER column with a scale is read as float64. pyformat: the
