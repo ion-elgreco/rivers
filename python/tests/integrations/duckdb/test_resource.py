@@ -300,16 +300,24 @@ def test_equal_resources_share_the_root(tmp_path):
     lake.teardown()
 
 
+def _read_after_teardown(lake: DuckDBResource) -> list[tuple]:
+    """Read a relation made before teardown; it is gone when this returns.
+
+    On Python 3.12 and older, DuckDB's replacement scan keeps the calling
+    frame's locals until that frame returns, so the relation must not be a
+    local of the test.
+    """
+    rel = lake.connect().sql("FROM t")
+    lake.teardown()
+    return rel.fetchall()
+
+
 def test_relations_outlive_teardown(tmp_path):
     lake = _lake(tmp_path)
     with lake.get_connection() as con:
         con.execute("CREATE TABLE t AS SELECT 1 AS i")
-    rel = lake.connect().sql("FROM t")
+    assert _read_after_teardown(lake) == [(1,)]
 
-    lake.teardown()
-    assert rel.fetchall() == [(1,)]
-
-    del rel
     attach = [
         sys.executable,
         "-c",
@@ -324,8 +332,6 @@ def test_relations_outlive_teardown(tmp_path):
         assert proc.returncode == 0 or locked, proc.stderr
         return proc.returncode == 0
 
-    # CI once saw the lock still held right after `del rel` (cause unknown); a
-    # catalog that stays open still fails.
     wait_for(closed, timeout=10, what="the catalog to close")
 
 

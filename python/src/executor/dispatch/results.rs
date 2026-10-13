@@ -11,17 +11,19 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyList, PyTuple};
 use rivers_core::execution::plan::ExecutionStep;
 
 use crate::errors::ExecutionError;
-use crate::metadata::{MetadataValue, coerce_to_metadata_value};
+use crate::metadata::MetadataValue;
 use crate::result_types::ResultKind;
 
-use super::super::ops::{self, now_ts};
+use super::super::in_step_pod;
+use super::super::ops::{self, OutOfProcess, now_ts};
+use super::super::parallel::worker::unwrap_worker_error;
 use super::super::traceback;
 use super::context::BatchContext;
-use super::types::{CapturedLogs, WorkOutcome};
+use super::types::{CapturedLogs, StepCapture, WorkOutcome};
 
 /// Emit a Materialization event + run success hooks for one output. Shared
 /// by the `Output` (with IO write) and `Materialization` (no IO) paths so
@@ -106,8 +108,18 @@ pub(crate) fn process_step_result(
     step: &ExecutionStep,
     step_name: &str,
     step_result: ops::StepResult,
+    captured_logs: CapturedLogs,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    // A generator's body runs only as its outputs are drained below, after
+    // the capture around its call ended: that capture is logged with it.
+    let call_logs = if step_result.generator.is_some() {
+        captured_logs
+    } else {
+        emit_captured_logs(ctx, step_name, captured_logs);
+        None
+    };
+
     // Action runs: the verb ran against existing data — no output iteration,
     // no hooks. The runtime report decides what lands on the timeline.
     if let Some(verb) = ctx.scope.plan.action.clone() {
@@ -192,6 +204,10 @@ pub(crate) fn process_step_result(
     };
     let mut gen_marks_stashed = false;
 
+    let body_capture = step_result
+        .generator
+        .is_some()
+        .then(|| StepCapture::start(py));
     let result = ops::for_each_output(
         py,
         &step_result,
@@ -229,6 +245,10 @@ pub(crate) fn process_step_result(
                     // value.is_some() => Output(v): write via IO handler.
                     // value.is_none() => Materialization(...): user-managed.
                     let resolved_dv = if let Some(value) = &value {
+                        if in_step_pod() {
+                            let handler = ctx.repo.io_handler_registry.for_output(py, node);
+                            OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
+                        }
                         let written = ops::handle_step_output(
                             py,
                             &name,
@@ -290,6 +310,17 @@ pub(crate) fn process_step_result(
             Ok(())
         },
     );
+    if let Some(capture) = body_capture {
+        let logs = match (call_logs, capture.finish()) {
+            (Some((out, err, logs)), Some(body)) => Some((
+                out + body.0.as_str(),
+                err + body.1.as_str(),
+                logs + body.2.as_str(),
+            )),
+            (call, body) => call.or(body),
+        };
+        emit_captured_logs(ctx, step_name, logs);
+    }
 
     if let Err(e) = result {
         // Failure event scope: mapped instance fails just itself; non-mapped
@@ -300,11 +331,7 @@ pub(crate) fn process_step_result(
         } else if is_single {
             step.event_names().to_vec()
         } else {
-            step.event_names()
-                .iter()
-                .filter(|n| !yielded_names.contains(*n))
-                .cloned()
-                .collect()
+            unyielded_outputs(step, &yielded_names)
         };
         handle_failure(
             py,
@@ -317,23 +344,36 @@ pub(crate) fn process_step_result(
             failures,
         );
     } else if !is_single {
-        // Reconciliation: any selected output not yielded by the generator
-        // becomes a failure (no hooks). For dict, every output is iterated
-        // by `for_each_output_dict` so this is a no-op.
-        py.detach(|| {
-            for name in &step.outputs {
-                if !yielded_names.contains(name) {
-                    let msg = format!("Generator multi-asset did not yield output '{}'", name);
-                    ctx.record_failure_no_hooks(name, ExecutionError::new_err(msg), failures);
-                }
-            }
-        });
+        py.detach(|| fail_unyielded_outputs(ctx, step, &yielded_names, failures));
     }
 
     // The graph's Materialization takes this time: after this task's own
     // events, and before its claim on the graph's pool ends.
     if let Some(graph_name) = wrote_graph {
         ctx.state.graph_written_at.insert(graph_name, now_ts());
+    }
+}
+
+/// A multi-asset step's outputs not in `yielded`.
+fn unyielded_outputs(step: &ExecutionStep, yielded: &HashSet<String>) -> Vec<String> {
+    step.outputs
+        .iter()
+        .filter(|name| !yielded.contains(*name))
+        .cloned()
+        .collect()
+}
+
+/// Fail (no hooks) each output a generator multi-asset ended without
+/// yielding. A dict return covers every output, so this is a no-op for it.
+fn fail_unyielded_outputs(
+    ctx: &mut BatchContext,
+    step: &ExecutionStep,
+    yielded: &HashSet<String>,
+    failures: &mut Vec<(String, PyErr)>,
+) {
+    for name in unyielded_outputs(step, yielded) {
+        let msg = format!("Generator multi-asset did not yield output '{name}'");
+        ctx.record_failure_no_hooks(&name, ExecutionError::new_err(msg), failures);
     }
 }
 
@@ -503,8 +543,15 @@ pub(crate) fn process_outcome(
             step_result,
             captured_logs,
         } => {
-            emit_captured_logs(ctx, step_name, captured_logs);
-            process_step_result(py, ctx, step, step_name, step_result, failures);
+            process_step_result(
+                py,
+                ctx,
+                step,
+                step_name,
+                step_result,
+                captured_logs,
+                failures,
+            );
         }
         WorkOutcome::WorkerSummary {
             worker_result,
@@ -551,8 +598,10 @@ pub(crate) fn emit_captured_logs(ctx: &mut BatchContext, step_name: &str, logs: 
 
 /// Emit a `StepFailure` event for every name in `event_names`, mark each
 /// failed, run failure hooks once (scoped to `name_for_hooks`), and push the
-/// original error onto `failures` keyed by `name_for_hooks`. The original
-/// `error` is preserved so the caller-visible exception type round-trips.
+/// error onto `failures` for every name in `event_names`. A multi-asset that
+/// failed after all its outputs completed has no such name: its own name takes
+/// the error. The original `error` is preserved so the caller-visible
+/// exception type round-trips.
 ///
 /// Caller responsibilities:
 /// - Non-mapped step (single or multi-output): pass `step.event_names()` and
@@ -598,7 +647,20 @@ pub(crate) fn handle_failure(
             config_instance,
         );
     }
-    failures.push((name_for_hooks.to_string(), error));
+
+    if event_names.is_empty() {
+        let name = ctx
+            .repo
+            .node_map
+            .get(&step.name)
+            .and_then(|n| n.name().ok())
+            .unwrap_or_else(|| name_for_hooks.to_string());
+        failures.push((name, error));
+    } else {
+        for name in event_names {
+            failures.push((name.clone(), error.clone_ref(py)));
+        }
+    }
 }
 
 /// Decode worker per-output items and emit Materialization / Observation
@@ -609,11 +671,11 @@ pub(crate) fn handle_failure(
 /// Observation event."
 ///
 /// `worker_result.outputs` is a list of `(name, kind_tag, metadata, dv)`
-/// tuples — one per selected output. `kind_tag` is the `ResultKind::as_u8`
-/// discriminator. The worker is the source of truth for per-output values,
-/// so we trust the tuple's `name` over `step_name` (they should equal
-/// `step_name` for single-output non-mapped, the per-instance name for
-/// mapped, or the per-output name for multi-asset).
+/// tuples — one per output the worker completed. `kind_tag` is the
+/// `ResultKind::as_u8` discriminator. The worker is the source of truth for
+/// per-output values, so we trust the tuple's `name` over `step_name` (they
+/// should equal `step_name` for single-output non-mapped, the per-instance
+/// name for mapped, or the per-output name for multi-asset).
 pub(crate) fn process_worker_result(
     py: Python,
     ctx: &mut BatchContext,
@@ -713,6 +775,32 @@ pub(crate) fn process_worker_result(
         }
     }
 
+    // As in `process_step_result`: a multi-asset's error fails the outputs
+    // it did not complete, and a generator that ended without yielding an
+    // output fails that output.
+    if !is_single {
+        let yielded: HashSet<String> = outputs_list
+            .iter()
+            .filter_map(|item| item.get_item(0).ok()?.extract().ok())
+            .collect();
+        match worker_result.getattr(py, "error") {
+            Ok(error) if !error.is_none(py) => {
+                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.into_bound(py)));
+                handle_failure(
+                    py,
+                    ctx,
+                    step,
+                    step_name,
+                    &unyielded_outputs(step, &yielded),
+                    error,
+                    step_config,
+                    failures,
+                );
+            }
+            _ => fail_unyielded_outputs(ctx, step, &yielded, failures),
+        }
+    }
+
     // Same stamp as `process_step_result`: after this task's own events.
     if let Some(graph_name) = graph_name
         && graph_written
@@ -795,10 +883,8 @@ fn process_one_worker_item(
     let name: String = tuple.get_item(0)?.extract()?;
     let kind_tag: u8 = tuple.get_item(1)?.extract()?;
     let kind = ResultKind::from_u8(kind_tag)?;
-    let metadata_py = tuple.get_item(2)?;
+    let metadata: Vec<(String, MetadataValue)> = tuple.get_item(2)?.extract()?;
     let data_version: Option<String> = tuple.get_item(3)?.extract()?;
-
-    let metadata = decode_worker_metadata(py, &metadata_py)?;
 
     if matches!(kind, ResultKind::Observation) {
         ctx.emit_observation(&name, &metadata, data_version.clone(), end_ts);
@@ -856,25 +942,4 @@ fn process_one_worker_item(
         );
     }
     Ok(())
-}
-
-/// Decode the per-output metadata dict shipped by the worker. The worker
-/// emits raw Python values via `metadata_to_pickle_safe_dict` (calling
-/// `MetadataValue.raw_value()` to unwrap), so we re-coerce per-value to
-/// recover the original `MetadataValue` variant (Int, Float, Bool, Text...).
-fn decode_worker_metadata(
-    py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<Vec<(String, MetadataValue)>> {
-    if obj.is_none() {
-        return Ok(Vec::new());
-    }
-    let dict: &Bound<PyDict> = obj.cast()?;
-    let mut result = Vec::with_capacity(dict.len());
-    for (k, v) in dict.iter() {
-        let key: String = k.extract()?;
-        let val = coerce_to_metadata_value(py, &v)?;
-        result.push((key, val));
-    }
-    Ok(result)
 }

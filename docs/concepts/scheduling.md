@@ -99,7 +99,7 @@ All three triggers are evaluated by the same background process: `AutomationDaem
 |------|----------|
 | `EvalMode.Auto` (default) | Auto-detected at daemon start: async functions run automatically on the Python event loop managed from Rust; sync functions run on a dedicated thread. |
 | `EvalMode.InProcess` | Same as `Auto` today — keep the function in the daemon process. |
-| `EvalMode.Subprocess` | Run in a loky subprocess. Resources and config injection are not available. Useful when the eval function needs CPU isolation or is unsafe to run alongside the daemon. |
+| `EvalMode.Subprocess` | Run in a loky subprocess, which rebuilds the resources from their field values, secrets included. Useful when the eval function needs CPU isolation or is unsafe to run alongside the daemon. |
 
 Automation conditions don't have an eval mode — they are evaluated entirely in Rust (no user code runs unless an asset matches and gets launched).
 

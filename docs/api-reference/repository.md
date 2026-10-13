@@ -331,7 +331,7 @@ Outcome of a synchronous `materialize()` call.
 | `success` | `bool` | `True` when every requested asset materialized. |
 | `run_id` | `str` | ID of the underlying run record. |
 | `materialized_assets` | `list[str]` | Asset keys attempted in this run. |
-| `failed_assets` | `list[tuple[str, str]]` | `(asset_key, error_message)` pairs for steps that failed. |
+| `failed_assets` | `list[tuple[str, str]]` | `(asset_key, error_message)` pairs for the assets that failed: each failed output of a multi-asset, and no output that materialized. A multi-asset that fails after all its outputs materialized is listed under its own name. |
 
 To read output values, use `repo.load_node(name)`.
 

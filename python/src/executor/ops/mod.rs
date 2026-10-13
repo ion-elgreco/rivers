@@ -102,10 +102,12 @@ pub(crate) use finalize::{
     extract_data_version, now_ts, register_assets_from_nodes, run_failure_hooks, run_success_hooks,
     step_retry_record, step_start_record,
 };
-pub(crate) use invoke::{drain_failed_partitions, execute_action_step, execute_step};
+pub(crate) use invoke::{
+    drain_failed_partitions, execute_action_step, execute_step, process_raw_result,
+};
 pub(crate) use io::{
-    build_mapped_partition_context, build_partition_context, handle_step_output,
-    load_self_dependency, load_step_output, map_partition_key_for_upstream,
-    metadata_to_pickle_safe_dict, write_output,
+    OutOfProcess, build_mapped_partition_context, build_partition_context, handle_step_output,
+    is_in_memory, load_self_dependency, load_step_output, map_partition_key_for_upstream,
+    write_output,
 };
 pub(crate) use outputs::{OutputItem, for_each_output};

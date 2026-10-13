@@ -30,6 +30,9 @@ otel = ["opentelemetry-api>=1.0"]
 slack = ["slack-sdk>=3.10.0"]
 duckdb = ["duckdb>=1.5.2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
+datadog = ["datadog>=0.47.0"]
+pandera = ["pandera>=0.20.2,!=0.30.0"]
+dataframely = ["dataframely>=3.0.0"]
 sling = ["sling>=1.4.3.post1", "pyyaml>=6.0.1"]
 
 [project.scripts]
@@ -48,7 +51,8 @@ norecursedirs = ["tests/integration/kubernetes"]
 timeout = 60
 timeout_method = "thread"
 markers = [
-    "spark_test: marks tests that Spark instance (deselect with '-m \"not spark_test\"')"
+    "spark_test: marks tests that Spark instance (deselect with '-m \"not spark_test\"')",
+    "serial: timing-sensitive; the `just test` recipes run it alone, after the parallel run",
 ]
 
 [tool.pyright]

@@ -17,36 +17,12 @@ use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::errors::ExecutionError;
-use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::rt;
 
 use super::dispatch::failure::rng01;
 use super::dispatch::{BatchContext, ExecutorBackend, StepInstance};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-const K8S_IN_MEMORY_IO_ERROR: &str = "uses InMemoryIOHandler which cannot work with Kubernetes \
-     execution. InMemoryIOHandler stores data in process-local memory that is not \
-     accessible from step pods. Use PickleIOHandler or DeltaIOHandler instead.";
-
-fn validate_not_in_memory_io(py: Python, step_name: &str, node: &ResolvedNode) -> PyResult<()> {
-    match node.io_handler(py) {
-        None => Err(ExecutionError::new_err(format!(
-            "Asset '{step_name}' {K8S_IN_MEMORY_IO_ERROR}"
-        ))),
-        Some(handler) => {
-            let memory_cls = py
-                .import("rivers.io_handlers.memory")?
-                .getattr("InMemoryIOHandler")?;
-            if handler.bind(py).is_instance(&memory_cls)? {
-                return Err(ExecutionError::new_err(format!(
-                    "Asset '{step_name}' {K8S_IN_MEMORY_IO_ERROR}"
-                )));
-            }
-            Ok(())
-        }
-    }
-}
 
 pub(crate) struct KubernetesBackend {
     pub worker_image: Option<String>,
@@ -686,16 +662,8 @@ impl ExecutorBackend for KubernetesBackend {
         _max_concurrency: Option<usize>,
         failures: &mut Vec<(String, PyErr)>,
     ) {
-        for inst in &instances {
-            let step = &ctx.scope.plan.steps[inst.idx];
-            if let Some(node) = ctx.repo.node_map.get(&step.name)
-                && let Err(e) = validate_not_in_memory_io(py, &step.name, node)
-            {
-                ctx.record_failure_no_hooks(&step.name, e, failures);
-                return;
-            }
-        }
-
+        // Step pods reject an InMemoryIOHandler where a value would cross
+        // into or out of them (`OutOfProcess::Kubernetes`).
         let pk_string = ctx.scope.partition_key.as_ref().map(|pk| pk.to_json());
         let (client, config) = match py.detach(|| self.build_config(ctx.scope.run_id, pk_string)) {
             Ok(c) => c,

@@ -30,7 +30,6 @@ pub(crate) struct BuiltStepArgs {
     pub args: Vec<Py<PyAny>>,
     pub return_hint: Option<Py<PyAny>>,
     pub config_instance: Option<Py<PyAny>>,
-    pub context_injected: bool,
     /// The context object (first arg) if context was injected.
     pub ctx_ref: Option<Py<PyAny>>,
 }
@@ -63,7 +62,6 @@ pub(crate) fn build_step_args(
         .map(|obj| obj.bind(py).cast::<PyDict>())
         .transpose()?;
     let mut is_first_param = true;
-    let mut context_injected = false;
     let mut config_instance: Option<Py<PyAny>> = None;
     let mut ctx_ref: Option<Py<PyAny>> = None;
     let mut args: Vec<Py<PyAny>> = Vec::new();
@@ -126,7 +124,6 @@ pub(crate) fn build_step_args(
                 };
                 ctx_ref = Some(ctx_obj.clone_ref(py));
                 args.push(ctx_obj);
-                context_injected = true;
                 continue;
             }
         } else if is_ctx {
@@ -201,36 +198,22 @@ pub(crate) fn build_step_args(
         args,
         return_hint,
         config_instance,
-        context_injected,
         ctx_ref,
     })
 }
 
-use crate::metadata::MetadataValue;
 use crate::result_types::ResultKind;
-
-/// Output of `process_raw_result` — the per-step state derived from the user
-/// function's return value, with wrappers unwrapped and metadata merged.
-pub(crate) struct ProcessedResult {
-    pub result: Py<PyAny>,
-    pub output_metadata: Vec<(String, MetadataValue)>,
-    pub data_version: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub dynamic_keys: Option<Vec<String>>,
-    pub kind: ResultKind,
-}
 
 /// Process a raw Python result by extracting Output/Observation/Materialization
 /// wrappers, validating the return type, draining context metadata, and unwrapping
-/// DynamicOutput. Shared between `execute_step` and `finish_async_step`.
+/// DynamicOutput. Shared between `execute_step` and the parallel worker.
 pub(crate) fn process_raw_result(
     py: Python,
     raw_result: &Py<PyAny>,
     return_hint: Option<&Py<PyAny>>,
-    context_injected: bool,
     ctx_ref: Option<&Py<PyAny>>,
     step_name: &str,
-) -> PyResult<ProcessedResult> {
+) -> PyResult<StepResult> {
     let extracted = result_types::try_extract_result_type(py, raw_result)?;
 
     let (actual_result, result_metadata, result_data_version, result_tags, result_kind) =
@@ -247,39 +230,40 @@ pub(crate) fn process_raw_result(
             )
         };
 
-    validate_return_type(py, &actual_result, return_hint, step_name)?;
+    let checked = validate_return_type(py, &actual_result, return_hint, step_name)?;
 
-    let (mut output_metadata, context_data_version) = if context_injected {
-        if let Some(first) = ctx_ref {
-            if let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>() {
-                let ctx = ctx.borrow();
-                (ctx.drain_output_metadata(py), ctx.drain_data_version())
-            } else {
-                (Vec::new(), None)
-            }
-        } else {
-            (Vec::new(), None)
-        }
+    let (context_metadata, context_data_version) = if let Some(first) = ctx_ref
+        && let Ok(ctx) = first.bind(py).cast::<PyAssetExecutionContext>()
+    {
+        let ctx = ctx.borrow();
+        (ctx.drain_output_metadata(py), ctx.drain_data_version())
     } else {
         (Vec::new(), None)
     };
 
+    // A validator's entries describe the hint; what the asset sets wins.
+    let mut output_metadata = checked.metadata;
+    super::merge_metadata(&mut output_metadata, &context_metadata);
     super::merge_metadata(&mut output_metadata, &result_metadata);
     let data_version = result_data_version.or(context_data_version);
 
     let (final_result, dynamic_keys) =
-        match crate::result_types::try_unwrap_dynamic_outputs(py, &actual_result)? {
+        match crate::result_types::try_unwrap_dynamic_outputs(py, &checked.value)? {
             Some((values, keys)) => (values, Some(keys)),
-            None => (actual_result, None),
+            None => (checked.value, None),
         };
 
-    Ok(ProcessedResult {
+    Ok(StepResult {
         result: final_result,
+        return_hint: return_hint.map(|h| h.clone_ref(py)),
         output_metadata,
         data_version,
+        config_instance: None,
         tags: result_tags,
         dynamic_keys,
-        kind: result_kind,
+        result_kind,
+        generator: None,
+        failed_partitions: Vec::new(),
     })
 }
 
@@ -384,24 +368,14 @@ pub(crate) fn execute_step(
             py,
             &raw_result,
             built.return_hint.as_ref(),
-            built.context_injected,
             built.ctx_ref.as_ref(),
             &step.name,
         )?;
 
-        let failed_partitions = drain_failed_partitions(py, built.ctx_ref.as_ref());
-
         Ok(StepResult {
-            result: processed.result,
-            return_hint: built.return_hint,
-            output_metadata: processed.output_metadata,
-            data_version: processed.data_version,
             config_instance: built.config_instance,
-            tags: processed.tags,
-            dynamic_keys: processed.dynamic_keys,
-            result_kind: processed.kind,
-            generator: None,
-            failed_partitions,
+            failed_partitions: drain_failed_partitions(py, built.ctx_ref.as_ref()),
+            ..processed
         })
     } else if node.is_bash_task() {
         let result = func.call0(py)?;

@@ -17,8 +17,8 @@ use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 
 use super::dispatch::{
-    BatchContext, ExecutorBackend, StepInstance, SyncWorker, WorkOutcome, build_step_by_name,
-    resolve_collect_overrides, run_step_sync_lifecycle,
+    BatchContext, ExecutorBackend, StepCapture, StepInstance, SyncWorker, WorkOutcome,
+    build_step_by_name, resolve_collect_overrides, run_step_sync_lifecycle,
 };
 use super::ops;
 
@@ -212,15 +212,7 @@ pub(crate) fn execute_step_with_capture(
     step: &ExecutionStep,
     input_overrides: &HashMap<String, Py<PyAny>>,
 ) -> WorkOutcome {
-    let capture = py
-        .import("rivers._capture")
-        .and_then(|m| m.getattr("StepCapture"))
-        .and_then(|cls| cls.call0())
-        .ok()
-        .inspect(|c| {
-            let _ = c.call_method0("start");
-            crate::log_capture::start();
-        });
+    let capture = StepCapture::start(py);
 
     // `resolved_config` captures the config as soon as `execute_step` resolves
     // it so the Error variant can carry it to `run_failure_hooks` — same value
@@ -256,16 +248,7 @@ pub(crate) fn execute_step_with_capture(
         )
     };
 
-    let captured_logs = capture.and_then(|cap| {
-        cap.call_method0("finish").ok().and_then(|out| {
-            out.extract::<(String, String)>()
-                .ok()
-                .map(|(stdout, stderr)| {
-                    let logs = crate::log_capture::take();
-                    (stdout, stderr, logs)
-                })
-        })
-    });
+    let captured_logs = capture.finish();
 
     match result {
         Ok(step_result) => WorkOutcome::FullResult {

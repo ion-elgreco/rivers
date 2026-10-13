@@ -15,8 +15,13 @@ pip install rivers[polars]    # Polars DataFrames / LazyFrames for Delta
 pip install rivers[otel]      # OpenTelemetry instrumentation
 pip install rivers[slack]     # Slack alerts (hooks and a run-failure sensor)
 pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler
+pip install rivers[datadog]   # Datadog events and metrics (hooks, a run-failure sensor, DogStatsD)
+pip install rivers[pandera]   # Validate asset outputs against pandera schemas
+pip install rivers[dataframely]  # Validate polars asset outputs against dataframely schemas
 pip install rivers[sling]     # Sling replications as assets
 ```
+
+The [Airbyte integration](guides/airbyte.md) needs no extra.
 
 rivers also runs on free-threaded Python (3.14t and later). See [Free-threaded Python](installation/free-threading.md).
 

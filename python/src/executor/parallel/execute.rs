@@ -14,48 +14,15 @@ use pyo3::types::{PyDict, PySet, PyTuple};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::errors::{ExecutionError, WorkerStepError};
 use crate::runtime::rt;
 
 use super::super::dispatch::{
-    AsyncWorker, BatchContext, CapturedLogs, ExecutorBackend, FinishedStep, StepInstance,
-    WorkOutcome, process_finished_steps, process_outcome, run_step_async_lifecycle,
+    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepInstance, WorkOutcome,
+    process_finished_steps, process_outcome, run_step_async_lifecycle,
 };
 use super::super::ops::{self, now_ts};
-use super::super::traceback;
-use super::validate_not_in_memory_io;
+use super::worker::unwrap_worker_error;
 use super::worker_args::{build_worker_submit_args, resolve_worker_args};
-
-/// The step's own exception and captured logs from a failed worker step (see
-/// [`WorkerStepError`]). The step's traceback goes back onto the exception for
-/// [`traceback::capture_json`], and loky's remote traceback becomes its cause,
-/// as loky itself sets it on a plain exception. Other errors (pre-spawn, a
-/// dead worker) pass through without logs.
-fn unwrap_worker_error(py: Python, error: PyErr) -> (PyErr, CapturedLogs) {
-    if !error.is_instance_of::<WorkerStepError>(py) {
-        return (error, None);
-    }
-    let wrapper = error.value(py);
-    let Ok(step_error) = wrapper.getattr("step_error") else {
-        return (error, None);
-    };
-    let captured_logs = wrapper
-        .getattr("captured_logs")
-        .ok()
-        .and_then(|logs| logs.extract().ok())
-        .flatten();
-    if let Ok(tb) = wrapper.getattr("traceback")
-        && !tb.is_none()
-    {
-        let _ = step_error.setattr(traceback::STASH_ATTR, tb);
-    }
-    if let Ok(cause) = wrapper.getattr("__cause__")
-        && !cause.is_none()
-    {
-        let _ = step_error.setattr("__cause__", cause);
-    }
-    (PyErr::from_value(step_error), captured_logs)
-}
 
 pub(crate) struct ParallelBackend {
     pub max_workers: usize,
@@ -253,23 +220,6 @@ impl ParallelBackend {
             .callable(py)
             .expect("node must have a callable — validated at plan build time");
 
-        if let Err(e) = validate_not_in_memory_io(py, &step_name, node) {
-            ctx.record_failure_no_hooks(&step_name, e, failures);
-            return None;
-        }
-        // For mapped instances, only validate the step itself — mapped fan-out
-        // is single-output (no multi-asset), matching prior behaviour.
-        if instance.fan_out.is_none() {
-            for out_name in &step.outputs {
-                if let Some(out_node) = ctx.repo.node_map.get(out_name)
-                    && let Err(e) = validate_not_in_memory_io(py, out_name, out_node)
-                {
-                    ctx.record_failure_no_hooks(&step_name, e, failures);
-                    return None;
-                }
-            }
-        }
-
         let empty_overrides: HashMap<String, Py<PyAny>> = HashMap::new();
         let no_outputs: &[String] = &[];
         let (input_overrides, outputs_for_meta) = if instance.fan_out.is_some() {
@@ -286,8 +236,8 @@ impl ParallelBackend {
                 ctx.state.mapped_instance_keys,
             ) {
                 Ok(ov) => ov,
-                Err(msg) => {
-                    ctx.record_failure_no_hooks(&step_name, ExecutionError::new_err(msg), failures);
+                Err(e) => {
+                    ctx.record_failure_no_hooks(&step_name, e, failures);
                     return None;
                 }
             };
@@ -333,14 +283,10 @@ impl ParallelBackend {
             }
         };
 
-        // The worker writes a graph's output with its final task's. A graph
-        // kept in memory is written here instead, after the task's output
-        // is loaded back (`process_worker_result`).
         let graph = if instance.fan_out.is_none()
             && step.outputs.is_empty()
             && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step_name)
             && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-            && validate_not_in_memory_io(py, graph_name, graph_node).is_ok()
         {
             Some((graph_name.as_str(), graph_node))
         } else {
