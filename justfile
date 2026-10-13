@@ -14,8 +14,9 @@ profile_dir := if profile == "dev" { "debug" } else { profile }
 runtime_bin := justfile_directory() + "/target/" + profile_dir + "/rivers-runtime"
 
 # pytest-xdist: one worker per CPU. `xdist_group` keeps a group's tests on one worker;
-# the test recipes run `serial` tests alone afterwards.
-xdist := "-n logical --dist loadgroup"
+# the test recipes run `serial` tests alone afterwards. A crashed worker ends the run:
+# after a restart, loadgroup hands out the dead worker's finished tests again and waits forever.
+xdist := "-n logical --dist loadgroup --max-worker-restart=0"
 
 # Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
 # behavior. Keep in sync with the pipx install in .github/actions/setup-env
