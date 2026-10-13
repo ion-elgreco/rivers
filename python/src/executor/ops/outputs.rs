@@ -156,20 +156,23 @@ where
 }
 
 /// Checks an `Output` value against its output's type hint. Returns the value
-/// to store and the metadata of the hint's validator.
+/// to store, and `metadata` over the entries of the hint's validator.
 fn check_output(
     py: Python,
     name: &str,
     kind: ResultKind,
     value: Option<Py<PyAny>>,
     hint: Option<&Py<PyAny>>,
+    metadata: Vec<(String, MetadataValue)>,
 ) -> PyResult<(Option<Py<PyAny>>, Vec<(String, MetadataValue)>)> {
     let (ResultKind::Output, Some(hint)) = (kind, hint) else {
-        return Ok((value, Vec::new()));
+        return Ok((value, metadata));
     };
     let value = value.unwrap_or_else(|| py.None());
     let checked = validate_return_type(py, &value, Some(hint), name)?;
-    Ok((Some(checked.value), checked.metadata))
+    let mut merged = checked.metadata;
+    merge_metadata(&mut merged, &metadata);
+    Ok((Some(checked.value), merged))
 }
 
 fn for_each_output_generator<F>(
@@ -220,9 +223,6 @@ where
             continue;
         };
 
-        let (value, mut merged_metadata) =
-            check_output(py, &output_name, ext.kind, ext.value, hint)?;
-
         // Cumulative ctx-level metadata (peek, not drain) + per-yield ctx dv (drain).
         let ctx_metadata = gen_ctx
             .as_ref()
@@ -232,11 +232,13 @@ where
             .as_ref()
             .and_then(|c| c.borrow(py).drain_data_version());
 
-        // Merge precedence: per-yield > ctx > validator (overlay-wins on each
-        // merge). Note: the gen path historically does NOT incorporate
+        // Merge precedence: per-yield > ctx (overlay-wins on each merge).
+        // Note: the gen path historically does NOT incorporate
         // step_result.output_metadata as a shared layer — only ctx-set.
-        merge_metadata(&mut merged_metadata, &ctx_metadata);
+        let mut merged_metadata = ctx_metadata;
         merge_metadata(&mut merged_metadata, &ext.metadata);
+        let (value, merged_metadata) =
+            check_output(py, &output_name, ext.kind, ext.value, hint, merged_metadata)?;
         let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
 
         // dv precedence: per-yield > ctx > legacy-from-metadata.
@@ -305,12 +307,11 @@ where
                 Some(ext) => (ext.value, ext.metadata, ext.data_version, ext.kind),
                 None => (Some(sliced), Vec::new(), None, ResultKind::Output),
             };
-        let (value, mut merged_metadata) =
-            check_output(py, output_name, kind, value, hint.as_ref())?;
 
-        // Merge precedence: per-output > shared > validator.
-        merge_metadata(&mut merged_metadata, shared_metadata);
+        let mut merged_metadata = shared_metadata.clone();
         merge_metadata(&mut merged_metadata, &per_metadata);
+        let (value, merged_metadata) =
+            check_output(py, output_name, kind, value, hint.as_ref(), merged_metadata)?;
         let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
 
         // dv precedence: per-output > shared > legacy-from-metadata.
