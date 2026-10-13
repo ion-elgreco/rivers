@@ -310,7 +310,7 @@ def test_dagster_datadog_maps_to_datadog_resource():
 
 
 def test_dagster_sling_maps_to_sling_integration():
-    pytest.importorskip("rivers.integrations.sling")
+    pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
     from rivers.integrations.sling import (
         SlingConnection,
         SlingReplication,
