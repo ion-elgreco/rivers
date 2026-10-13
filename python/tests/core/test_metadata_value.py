@@ -1,5 +1,8 @@
 import datetime
+import math
+import pickle
 
+import pyarrow as pa
 import pytest
 
 import rivers as rs
@@ -394,3 +397,50 @@ def test_metadata_value_url_canonicalized():
     v1 = rs.MetadataValue.url("https://example.com")
     v2 = rs.MetadataValue.url("https://example.com/")
     assert v1 == v2
+
+
+# ---------------------------------------------------------------------------
+# Pickling
+# ---------------------------------------------------------------------------
+
+_EVERY_VARIANT = [
+    rs.MetadataValue.text("hello"),
+    rs.MetadataValue.int(7),
+    rs.MetadataValue.float_(1.5),
+    rs.MetadataValue.bool_(True),
+    rs.MetadataValue.url("https://example.com/run/1"),
+    rs.MetadataValue.path("/data/x.parquet"),
+    rs.MetadataValue.json('{"a": 1}'),
+    rs.MetadataValue.md("# Title"),
+    rs.MetadataValue.timestamp(1700000000.5),
+    rs.MetadataValue.null(),
+    rs.MetadataValue.bytes(2048),
+    rs.MetadataValue.duration(1.5),
+    rs.MetadataValue.sql("SELECT 1", dialect="postgres"),
+    rs.MetadataValue.code_block("print(1)"),
+    rs.MetadataValue.image("https://example.com/a.png"),
+    rs.MetadataValue.percentage(12.5),
+    rs.MetadataValue.list_([rs.MetadataValue.int(1), rs.MetadataValue.null()]),
+    rs.MetadataValue.date_range(
+        datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2, 3, 4, 5, 6)
+    ),
+    rs.MetadataValue.schema(pa.schema([("a", pa.int64())])),
+    rs.MetadataValue.data_version("v1"),
+]
+
+
+@pytest.mark.parametrize("value", _EVERY_VARIANT, ids=lambda v: type(v).__name__)
+def test_metadata_value_pickles_as_its_variant(value):
+    """A pickled value comes back as the same variant with the same fields."""
+    restored = pickle.loads(pickle.dumps(value))
+
+    assert type(restored) is type(value)
+    assert restored == value
+
+
+def test_metadata_value_pickles_nan():
+    """A NaN float keeps its variant (JSON has no NaN)."""
+    restored = pickle.loads(pickle.dumps(rs.MetadataValue.float_(math.nan)))
+
+    assert isinstance(restored, rs.MetadataValue.Float)
+    assert math.isnan(restored.value)

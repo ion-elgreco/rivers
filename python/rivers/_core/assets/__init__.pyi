@@ -370,6 +370,9 @@ class AssetDef:
     pool: list[tuple[str, int]]
     actions: list["AssetAction"]
     """Per-output actions — a multi-asset's verbs live here, on its outputs."""
+    type_hint: Any
+    """Type of the output's value, checked like a return hint and passed to
+    the IO handler as ``OutputContext.type_hint``."""
 
     def __init__(
         self,
@@ -386,6 +389,7 @@ class AssetDef:
         pool_slots: int | dict[str, int] | None = ...,
         deps: list["DepDef"] = ...,
         actions: list["AssetAction"] | None = ...,
+        type_hint: Any = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps.
 
@@ -394,6 +398,14 @@ class AssetDef:
         takes the attribute name, and the def's own ``name`` stays ``None``.
         Step ``compute`` and ``retry`` are declared on :meth:`Asset.from_multi`
         itself (a multi-asset runs and retries as one step), not per output.
+
+        ``type_hint`` is the type of the output's value, e.g. ``int`` or a
+        pandera ``DataFrame[Model]``. rivers checks each value that the output
+        gets against it, as it checks a return hint. ``Materialization`` and
+        ``Observation`` outputs have no value and are not checked.
+
+        Raises:
+            AssetDefinitionError: ``type_hint`` is a string.
         """
         ...
 

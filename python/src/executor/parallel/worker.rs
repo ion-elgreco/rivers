@@ -10,8 +10,9 @@ use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::config::rebuild_resource;
 use crate::context::io::{PyInputContext, PyOutputContext};
-use crate::result_types::{self, ResultKind};
+use crate::result_types::ResultKind;
 
 /// Describes how to load an upstream input from an IO handler in the worker.
 #[pyclass(name = "IOLoadSpec", frozen, module = "rivers._core")]
@@ -90,10 +91,10 @@ impl PyCollectStreamLoadSpec {
 /// metadata + data_version are preserved; values stay in IO).
 ///
 /// `outputs` is a Python list of 4-tuples
-/// `(name: str, is_observation: bool, metadata: dict | None, data_version: str | None)`.
-/// For multi-asset, one tuple per selected output. For single-output, one
-/// tuple with `name = ""` (the consumer substitutes the dispatch-side
-/// `step_name` for non-mapped runs and the instance name for mapped fan-out).
+/// `(name: str, kind: int, metadata: list[tuple[str, MetadataValue]], data_version: str | None)`.
+/// For multi-asset, one tuple per output the step completed. For
+/// single-output, one tuple named after the step (the instance for mapped
+/// fan-out).
 ///
 /// `captured_logs` carries `(stdout, stderr, rust_logs)` from the worker's
 /// per-step capture. None when the user code didn't run (pre-spawn failures
@@ -123,12 +124,17 @@ pub struct PyWorkerResult {
     /// The exception the graph's io_handler raised on that write.
     #[pyo3(get)]
     pub graph_error: Option<Py<PyAny>>,
+    /// A multi-asset's failure after it completed the `outputs` above: the
+    /// orchestrator fails only its other outputs. The [`WorkerStepError`] a
+    /// failed step raises, without the logs (`captured_logs` has them).
+    #[pyo3(get)]
+    pub error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyWorkerResult {
     #[new]
-    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None))]
+    #[pyo3(signature = (outputs, captured_logs=None, dynamic_keys=None, failed_partitions=vec![], graph_written=false, graph_error=None, error=None))]
     fn new(
         outputs: Py<PyAny>,
         captured_logs: Option<(String, String, String)>,
@@ -136,6 +142,7 @@ impl PyWorkerResult {
         failed_partitions: Vec<(String, String)>,
         graph_written: bool,
         graph_error: Option<Py<PyAny>>,
+        error: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             outputs,
@@ -144,6 +151,7 @@ impl PyWorkerResult {
             failed_partitions,
             graph_written,
             graph_error,
+            error,
         }
     }
 
@@ -159,6 +167,7 @@ impl PyWorkerResult {
             Vec<(String, String)>,
             bool,
             Option<Py<PyAny>>,
+            Option<Py<PyAny>>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
@@ -171,6 +180,7 @@ impl PyWorkerResult {
                 self.failed_partitions.clone(),
                 self.graph_written,
                 self.graph_error.as_ref().map(|e| e.clone_ref(py)),
+                self.error.as_ref().map(|e| e.clone_ref(py)),
             ),
         ))
     }
@@ -209,33 +219,24 @@ fn load_from_spec(py: Python, spec: &Py<PyAny>) -> PyResult<Py<PyAny>> {
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::WorkerStepError;
-use crate::executor::ops::{self, metadata_to_pickle_safe_dict, write_output};
+use crate::executor::dispatch::CapturedLogs;
+use crate::executor::ops::{self, OutOfProcess, write_output};
+use crate::executor::traceback;
 use crate::metadata::MetadataValue;
-
-/// Returns None if metadata is empty.
-fn metadata_vec_to_pickle_safe(
-    py: Python,
-    metadata: &[(String, crate::metadata::MetadataValue)],
-) -> PyResult<Option<Py<PyAny>>> {
-    if metadata.is_empty() {
-        return Ok(None);
-    }
-    let d = PyDict::new(py);
-    for (k, v) in metadata {
-        d.set_item(k, v.clone().into_pyobject(py)?)?;
-    }
-    Ok(Some(metadata_to_pickle_safe_dict(py, &d)?))
-}
 
 /// Self-contained step execution for loky subprocess.
 ///
 /// Replaces Python `_worker_execute_step`. Reuses Rust functions for
-/// result type extraction, DynamicOutput unwrapping, and IO handling.
+/// result type extraction, return type validation, DynamicOutput unwrapping,
+/// and IO handling. `return_hint` is resolved by the orchestrator: a function
+/// shipped by value lacks the module globals a string annotation names.
 #[pyfunction]
-#[pyo3(signature = (func, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
+#[pyo3(signature = (func, step_name, return_hint, args, context_kwargs, resource_specs, io_handler, output_context_kwargs, multi_output_specs=None, graph_output=None))]
 pub fn worker_execute_step(
     py: Python,
     func: Py<PyAny>,
+    step_name: String,
+    return_hint: Option<Py<PyAny>>,
     args: Bound<'_, PyList>,
     context_kwargs: Option<Py<PyAny>>,
     resource_specs: Bound<'_, PyList>,
@@ -293,12 +294,7 @@ pub fn worker_execute_step(
 
     let mut deserialized_resources: Vec<Py<PyAny>> = Vec::new();
     for item in resource_specs.iter() {
-        let tuple: &Bound<PyTuple> = item.cast()?;
-        let param_idx: usize = tuple.get_item(0)?.extract()?;
-        let cls = tuple.get_item(1)?;
-        let json_data = tuple.get_item(2)?;
-        let resource = cls.call_method1("model_validate_json", (&json_data,))?;
-        resource.call_method0("setup")?;
+        let (param_idx, resource) = rebuild_resource::<usize>(&item)?;
         deserialized_resources.push(resource.clone().unbind());
         resolved[param_idx] = resource.unbind();
     }
@@ -320,68 +316,73 @@ pub fn worker_execute_step(
     let mut graph_written = false;
     let mut graph_error: Option<Py<PyAny>> = None;
 
-    // Execute with resource teardown guarantee. Closure returns the outputs
-    // list plus any single-output `dynamic_keys` (multi-asset can't carry
-    // DynamicOutputs). The wrapping `PyWorkerResult` is built outside so it
-    // can carry the captured logs alongside.
-    let outputs_or_err = (|| -> PyResult<(Py<PyAny>, Option<Vec<String>>)> {
+    // Output items shipped back to the orchestrator, one tuple per output the
+    // step completed (see `PyWorkerResult`). Kept outside the closure: a
+    // multi-asset that fails partway still reports the outputs before it.
+    let outputs_list = PyList::empty(py);
+
+    // Execute with resource teardown guarantee. Closure returns any
+    // single-output `dynamic_keys` (multi-asset can't carry DynamicOutputs).
+    // The wrapping `PyWorkerResult` is built outside so it can carry the
+    // captured logs alongside.
+    let outputs_or_err = (|| -> PyResult<Option<Vec<String>>> {
         let args_tuple = PyTuple::new(py, &resolved)?;
         let raw_result = func.call1(py, args_tuple)?;
 
-        // Output items list shipped back to the orchestrator. One tuple per
-        // selected output: (name, is_observation, metadata_dict_or_none, dv).
-        let outputs_list = PyList::empty(py);
-        let mut single_dynamic_keys: Option<Vec<String>> = None;
-
-        if let Some(ref specs) = multi_output_specs {
-            // Multi-asset: build a synthetic StepResult and drive the shared
-            // iterator. Per-yield ctx peek/drain happens inside
-            // `for_each_output_generator`; for dict we drain once up-front.
-            let mut spec_map: HashMap<String, (Py<PyAny>, Py<PyAny>)> = HashMap::new();
-            let mut selected_outputs: Vec<String> = Vec::new();
-            for spec in specs.iter() {
-                let spec_tuple: &Bound<PyTuple> = spec.cast()?;
-                let name: String = spec_tuple.get_item(0)?.extract()?;
-                let handler = spec_tuple.get_item(1)?.unbind();
-                let kwargs = spec_tuple.get_item(2)?.unbind();
-                spec_map.insert(name.clone(), (handler, kwargs));
-                selected_outputs.push(name);
-            }
-
-            let is_gen: bool = py
+        // A multi-asset generator: for_each_output_generator handles per-yield
+        // peek/drain itself, so shared state stays empty (the in_process gen
+        // path skips the return type check and ctx drain too). Worker only
+        // handles sync code (async funcs are delegated to AsyncBackend in the
+        // main process), so an async generator is impossible here. Any other
+        // result is processed like the in-process path.
+        let is_gen = multi_output_specs.is_some()
+            && py
                 .import("inspect")?
                 .call_method1("isgenerator", (&raw_result,))?
                 .is_truthy()?;
-
-            // Dict path: drain ctx once for shared metadata + dv. Gen path:
-            // for_each_output_generator handles per-yield peek/drain itself,
-            // so we leave shared empty (matches the in_process gen path which
-            // also ignores step_result.output_metadata for generators).
-            let (shared_metadata, shared_dv) = if is_gen {
-                (Vec::new(), None)
-            } else {
-                drain_ctx_state(py, ctx_obj.as_ref())?
-            };
-
-            // Worker only handles sync code (async funcs are delegated to
-            // AsyncBackend in the main process), so an async generator is
-            // impossible here.
-            let synth = ops::StepResult {
+        let synth = if is_gen {
+            ops::StepResult {
                 result: raw_result,
                 return_hint: None,
-                output_metadata: shared_metadata,
-                data_version: shared_dv,
+                output_metadata: Vec::new(),
+                data_version: None,
                 config_instance: None,
                 tags: None,
                 dynamic_keys: None,
                 result_kind: ResultKind::Output,
                 failed_partitions: Vec::new(),
-                generator: is_gen.then(|| ops::GeneratorType::Sync {
+                generator: Some(ops::GeneratorType::Sync {
                     context: ctx_obj.as_ref().map(|c| c.clone_ref(py)),
                 }),
-            };
+            }
+        } else {
+            ops::process_raw_result(
+                py,
+                &raw_result,
+                return_hint.as_ref(),
+                ctx_obj.as_ref(),
+                &step_name,
+            )?
+        };
 
-            ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
+        let mut single_dynamic_keys: Option<Vec<String>> = None;
+
+        if let Some(ref specs) = multi_output_specs {
+            // Multi-asset: drive the shared iterator over the selected outputs.
+            // A `None` handler marks an output kept in memory.
+            let mut spec_map: HashMap<String, (Option<Py<PyAny>>, Py<PyAny>)> = HashMap::new();
+            let mut selected_outputs: Vec<(String, Option<Py<PyAny>>)> = Vec::new();
+            for spec in specs.iter() {
+                let spec_tuple: &Bound<PyTuple> = spec.cast()?;
+                let name: String = spec_tuple.get_item(0)?.extract()?;
+                let handler: Option<Py<PyAny>> = spec_tuple.get_item(1)?.extract()?;
+                let kwargs = spec_tuple.get_item(2)?;
+                let type_hint = kwargs.get_item("type_hint")?.extract()?;
+                spec_map.insert(name.clone(), (handler, kwargs.unbind()));
+                selected_outputs.push((name, type_hint));
+            }
+
+            ops::for_each_output(py, &synth, &selected_outputs, "", |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
@@ -397,6 +398,9 @@ pub fn worker_execute_step(
                                 Some(s) => s,
                                 None => return Ok(()),
                             };
+                            let Some(handler) = handler else {
+                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
+                            };
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
                             let written = write_output(py, handler, &out_ctx, &value)?;
@@ -405,21 +409,18 @@ pub fn worker_execute_step(
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
-                        append_output_tuple(py, &outputs_list, &name, kind, meta_py, final_dv)?;
+                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
                     }
                     ops::OutputItem::Observation {
                         name,
                         metadata,
                         data_version,
                     } => {
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
                         append_output_tuple(
-                            py,
                             &outputs_list,
                             &name,
                             ResultKind::Observation,
-                            meta_py,
+                            metadata,
                             data_version,
                         )?;
                     }
@@ -427,35 +428,11 @@ pub fn worker_execute_step(
                 Ok(())
             })?;
         } else {
-            // Single-output: process the raw result the same way the in-
-            // process path does (Output / Materialization wrapper extraction,
-            // ctx drain, DynamicOutput unwrap), then drive the shared
-            // iterator with an empty selected_outputs (single shape).
-            let extracted = result_types::try_extract_result_type(py, &raw_result)?;
-            let (mut actual_result, result_metadata, result_dv, result_kind) =
-                if let Some(ext) = extracted {
-                    let val = ext.value.unwrap_or_else(|| py.None());
-                    (val, ext.metadata, ext.data_version, ext.kind)
-                } else {
-                    (raw_result, Vec::new(), None, ResultKind::Output)
-                };
-
-            let (mut shared_metadata, ctx_dv) = drain_ctx_state(py, ctx_obj.as_ref())?;
-            ops::merge_metadata(&mut shared_metadata, &result_metadata);
-            // result-type dv wins over ctx-set dv (matches process_raw_result
-            // in invoke.rs).
-            let shared_dv = result_dv.or(ctx_dv);
-
-            let dynamic_keys = match result_types::try_unwrap_dynamic_outputs(py, &actual_result)? {
-                Some((values, keys)) => {
-                    actual_result = values;
-                    Some(keys)
-                }
-                None => None,
-            };
-            // Surface to outer scope so PyWorkerResult can ship it back; the
+            // Single-output: drive the shared iterator with an empty
+            // selected_outputs (single shape). Surface the dynamic keys to the
+            // outer scope so PyWorkerResult can ship them back; the
             // orchestrator persists keys to KV after the worker returns.
-            single_dynamic_keys = dynamic_keys.clone();
+            single_dynamic_keys = synth.dynamic_keys.clone();
 
             // Asset name from the OutputContext kwargs — the orchestrator
             // populated this with `step_name` (instance_name for mapped).
@@ -469,20 +446,7 @@ pub fn worker_execute_step(
                 String::new()
             };
 
-            let synth = ops::StepResult {
-                result: actual_result,
-                return_hint: None,
-                output_metadata: shared_metadata,
-                data_version: shared_dv,
-                config_instance: None,
-                tags: None,
-                dynamic_keys: dynamic_keys.clone(),
-                result_kind,
-                generator: None,
-                failed_partitions: Vec::new(),
-            };
-
-            ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
+            ops::for_each_output(py, &synth, &[], &asset_name, |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
@@ -491,18 +455,16 @@ pub fn worker_execute_step(
                         data_version,
                     } => {
                         let (final_dv, kind) = if let Some(value) = value {
-                            let final_dv = if let (Some(handler), Some(out_kwargs)) =
+                            let (Some(handler), Some(out_kwargs)) =
                                 (&io_handler, &output_context_kwargs)
-                            {
-                                let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
-                                let out_ctx =
-                                    Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                                let written = write_output(py, handler, &out_ctx, &value)?;
-                                ops::merge_metadata(&mut metadata, &written.metadata);
-                                written.data_version.or(data_version)
-                            } else {
-                                data_version
+                            else {
+                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
                             };
+                            let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
+                            let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
+                            let written = write_output(py, handler, &out_ctx, &value)?;
+                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            let final_dv = written.data_version.or(data_version);
                             if let Some((graph_handler, graph_kwargs)) = &graph_output {
                                 let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;
                                 let graph_ctx =
@@ -516,8 +478,7 @@ pub fn worker_execute_step(
                         } else {
                             (data_version, ResultKind::Materialization)
                         };
-                        let meta_py = metadata_vec_to_pickle_safe(py, &metadata)?;
-                        append_output_tuple(py, &outputs_list, &name, kind, meta_py, final_dv)?;
+                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
                     }
                     ops::OutputItem::Observation { .. } => {
                         // External-asset observations route through a separate
@@ -529,7 +490,7 @@ pub fn worker_execute_step(
             })?;
         }
 
-        Ok((outputs_list.unbind().into_any(), single_dynamic_keys))
+        Ok(single_dynamic_keys)
     })();
 
     // Teardown unconditionally, including on failure.
@@ -551,25 +512,30 @@ pub fn worker_execute_step(
         }
     });
 
-    match outputs_or_err {
-        Ok((outputs, dynamic_keys)) => {
-            let failed_partitions = drain_ctx_failed_partitions(py, ctx_obj.as_ref());
-            let wr = PyWorkerResult {
-                outputs,
-                captured_logs,
-                dynamic_keys,
-                failed_partitions,
-                graph_written,
-                graph_error,
-            };
-            Ok(Py::new(py, wr)?.into_any())
-        }
+    let (dynamic_keys, error) = match outputs_or_err {
+        Ok(dynamic_keys) => (dynamic_keys, None),
         Err(err) => {
-            let package = crate::executor::traceback::app_package(func.bind(py));
-            let traceback = crate::executor::traceback::capture_json(py, &err, package.as_deref());
-            Err(wrap_step_error(py, err, captured_logs, traceback))
+            let package = traceback::app_package(func.bind(py));
+            let tb = traceback::capture_json(py, &err, package.as_deref());
+            // Only a multi-asset completes outputs before it fails; it keeps
+            // them, as in-process.
+            if outputs_list.is_empty() {
+                return Err(wrap_step_error(py, err, captured_logs, tb));
+            }
+            let error = wrap_step_error(py, err, None, tb);
+            (None, Some(error.into_value(py).into_any()))
         }
-    }
+    };
+    let wr = PyWorkerResult {
+        outputs: outputs_list.unbind().into_any(),
+        captured_logs,
+        dynamic_keys,
+        failed_partitions: drain_ctx_failed_partitions(py, ctx_obj.as_ref()),
+        graph_written,
+        graph_error,
+        error,
+    };
+    Ok(Py::new(py, wr)?.into_any())
 }
 
 /// Wrap a failed step's exception for the trip back to the parent (see
@@ -594,21 +560,35 @@ fn wrap_step_error(
     }
 }
 
-/// Drain `output_metadata` and `data_version` from a worker-side
-/// AssetExecutionContext (if present and the right type).
-fn drain_ctx_state(
-    py: Python,
-    ctx_obj: Option<&Py<PyAny>>,
-) -> PyResult<(Vec<(String, MetadataValue)>, Option<String>)> {
-    if let Some(ctx) = ctx_obj
-        && let Ok(bound) = ctx.bind(py).cast::<PyAssetExecutionContext>()
-    {
-        let ctx_borrow = bound.borrow();
-        let metadata = ctx_borrow.drain_output_metadata(py);
-        let dv = ctx_borrow.drain_data_version();
-        return Ok((metadata, dv));
+/// The step's own exception and captured logs from a failed worker step (see
+/// [`WorkerStepError`]). The step's traceback goes back onto the exception for
+/// [`traceback::capture_json`], and loky's remote traceback becomes its cause,
+/// as loky itself sets it on a plain exception. Other errors (pre-spawn, a
+/// dead worker) pass through without logs.
+pub(crate) fn unwrap_worker_error(py: Python, error: PyErr) -> (PyErr, CapturedLogs) {
+    if !error.is_instance_of::<WorkerStepError>(py) {
+        return (error, None);
     }
-    Ok((Vec::new(), None))
+    let wrapper = error.value(py);
+    let Ok(step_error) = wrapper.getattr("step_error") else {
+        return (error, None);
+    };
+    let captured_logs = wrapper
+        .getattr("captured_logs")
+        .ok()
+        .and_then(|logs| logs.extract().ok())
+        .flatten();
+    if let Ok(tb) = wrapper.getattr("traceback")
+        && !tb.is_none()
+    {
+        let _ = step_error.setattr(traceback::STASH_ATTR, tb);
+    }
+    if let Ok(cause) = wrapper.getattr("__cause__")
+        && !cause.is_none()
+    {
+        let _ = step_error.setattr("__cause__", cause);
+    }
+    (PyErr::from_value(step_error), captured_logs)
 }
 
 /// Drain `mark_partition_failed` marks from a worker-side context, serialized as
@@ -627,32 +607,18 @@ fn drain_ctx_failed_partitions(py: Python, ctx_obj: Option<&Py<PyAny>>) -> Vec<(
     Vec::new()
 }
 
-/// Append `(name, kind_tag, metadata_or_none, dv_or_none)` to the
-/// outputs list shipped back over IPC. `kind_tag` is the `ResultKind::as_u8`
+/// Append `(name, kind_tag, metadata, dv_or_none)` to the outputs list
+/// shipped back over IPC. `kind_tag` is the `ResultKind::as_u8`
 /// discriminator: 0 = Output (IO write happened in worker, just emit
 /// Materialization on orchestrator), 1 = Observation, 2 = Materialization
-/// (no IO write happened, emit Materialization).
+/// (no IO write happened, emit Materialization). The metadata stays
+/// `MetadataValue`s, which pickle with their variant.
 fn append_output_tuple(
-    py: Python,
     outputs_list: &Bound<'_, PyList>,
     name: &str,
     kind: ResultKind,
-    metadata_py: Option<Py<PyAny>>,
+    metadata: Vec<(String, MetadataValue)>,
     data_version: Option<String>,
 ) -> PyResult<()> {
-    let dv_py: Py<PyAny> = match data_version {
-        Some(s) => s.into_pyobject(py)?.into_any().unbind(),
-        None => py.None(),
-    };
-    let tuple = PyTuple::new(
-        py,
-        [
-            name.into_pyobject(py)?.into_any().unbind(),
-            kind.as_u8().into_pyobject(py)?.into_any().unbind(),
-            metadata_py.unwrap_or_else(|| py.None()),
-            dv_py,
-        ],
-    )?;
-    outputs_list.append(tuple)?;
-    Ok(())
+    outputs_list.append((name, kind.as_u8(), metadata, data_version))
 }

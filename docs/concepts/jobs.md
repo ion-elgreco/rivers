@@ -66,11 +66,11 @@ repo.get_job("my_pipeline").execute(
 
 ## Executors
 
-An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Construct one through the static factories on `Executor`:
+An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Ctrl-C stops the steps that run in the process: a sync step gets `KeyboardInterrupt`, an async step `asyncio.CancelledError`. Construct one through the static factories on `Executor`:
 
 ### InProcess
 
-Runs every step serially in the calling Python process. Best for debugging and small pipelines:
+Runs sync steps one at a time in the calling Python process, and up to four async steps at the same time. Best for debugging and small pipelines:
 
 ```python
 executor = rs.Executor.in_process()
@@ -90,7 +90,7 @@ executor = rs.Executor.parallel(max_workers=4)
 | `max_async_concurrent` | unbounded | Cap on concurrent async tasks. |
 
 !!! note
-    `Executor.parallel()` does **not** cloudpickle your asset bodies. Functions and IO handlers are sent to workers as `(module, qualname)` refs and re-imported in the subprocess — they need to be importable on the worker's Python path, not pickle-friendly. Upstream inputs are loaded inside the worker via the IO handler (so input values never cross the boundary), outputs are written from the worker, and `Resource` instances ride across as JSON via Pydantic. Closures and locally-defined functions (`<locals>`) fall back to direct pickling — keep production assets at module scope.
+    `Executor.parallel()` does **not** cloudpickle your asset bodies. Functions and IO handlers are sent to workers as `(module, qualname)` refs and re-imported in the subprocess — they need to be importable on the worker's Python path, not pickle-friendly. Upstream inputs are loaded inside the worker via the IO handler (so input values never cross the boundary), outputs are written from the worker, and each `Resource` is rebuilt in the worker from its field values, secrets included, with its own `setup()` and `teardown()`. Closures and locally-defined functions (`<locals>`) fall back to direct pickling — keep production assets at module scope.
 
 ### Kubernetes
 

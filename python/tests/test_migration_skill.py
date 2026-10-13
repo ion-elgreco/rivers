@@ -200,6 +200,221 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_databricks_maps_to_databricks_resource():
+    pytest.importorskip("databricks.sdk")
+    from rivers.integrations.databricks import DatabricksResource, DatabricksRunError
+
+    assert list(DatabricksResource.model_fields) == [
+        "host",
+        "token",
+        "client_id",
+        "client_secret",
+        "azure_client_id",
+        "azure_client_secret",
+        "azure_tenant_id",
+        "poll_interval",
+        "poll_timeout",
+        "cancel_on_interrupt",
+    ]
+    databricks = DatabricksResource(host="https://dbc.example.com", token="dapi")
+
+    daily_sales = databricks.job_asset(
+        123, name="daily_sales", job_parameters={"day": "2024-01-01"}
+    )
+    sales = databricks.job_asset(456, name="sales", tasks=["orders", "refunds"])
+
+    assert daily_sales.is_single and daily_sales.kinds == ["databricks"]
+    assert [d.name for d in sales.output_defs] == ["orders", "refunds"]
+    assert databricks.poll_timeout is None
+    assert callable(databricks.run_job) and callable(databricks.submit_run)
+    assert issubclass(DatabricksRunError, Exception)
+
+
+def test_dagster_pandera_maps_to_return_hints(storage):
+    """`dagster_type=pandera_schema_to_dagster_type(Model)` becomes `-> DataFrame[Model]`,
+    and `rs.AssetDef(type_hint=DataFrame[Model])` on a multi-asset output."""
+    pytest.importorskip("pandera")
+    pd = pytest.importorskip("pandas")
+    import pandera.pandas as pa
+    from pandera.typing import DataFrame, Series
+
+    class Orders(pa.DataFrameModel):
+        id: Series[int] = pa.Field(ge=0)
+
+    @rs.Asset
+    def orders() -> DataFrame[Orders]:
+        return pd.DataFrame({"id": [-1]})
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("refunds", type_hint=DataFrame[Orders])]
+    )
+    def load():
+        yield rs.Output(pd.DataFrame({"id": [-1]}), output_name="refunds")
+
+    repo = rs.CodeRepository(
+        assets=[orders, load], default_executor=rs.Executor.in_process()
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+    failed = dict(result.failed_assets)
+    assert sorted(failed) == ["orders", "refunds"]
+    assert all("does not match" in error for error in failed.values())
+
+
+def test_dagster_airbyte_maps_to_airbyte_resource():
+    from pydantic import ValidationError
+
+    from rivers.integrations.airbyte import (
+        AirbyteConnection,
+        AirbyteResource,
+        AirbyteStream,
+    )
+
+    airbyte = AirbyteResource(
+        api_url="http://localhost:8000/api/public/v1",
+        configuration_api_url="http://localhost:8000/api/v1",
+        client_id="c",
+        client_secret="s",
+        cancel_on_interrupt=False,
+    )
+    connection = AirbyteConnection(
+        connection_id="9924bcd0-99be-453d-ba47-c2c9766f7da5",
+        name="Postgres To Snowflake",
+        prefix="pg_",
+        streams=[AirbyteStream(name="users"), AirbyteStream(name="orders")],
+    )
+
+    assets = airbyte.connection_asset(connection, group="raw")
+    assert assets.name == "airbyte_postgres_to_snowflake"
+    assert [(d.name, d.group) for d in assets.output_defs] == [
+        ("pg_users", "raw"),
+        ("pg_orders", "raw"),
+    ]
+
+    renamed = airbyte.connection_asset(
+        connection,
+        asset_def_fn=lambda connection, stream: rs.AssetDef(f"raw_{stream.name}"),
+    )
+    assert [d.name for d in renamed.output_defs] == ["raw_users", "raw_orders"]
+    assert callable(airbyte.sync) and callable(airbyte.get_connection)
+
+    with pytest.raises(ValidationError):
+        AirbyteResource(workspace_id="744cc0ed-7f05-4949-9e60-2a814f90c035")
+
+
+def test_dagster_datadog_maps_to_datadog_resource():
+    pytest.importorskip("datadog")
+    from rivers.integrations.datadog import DatadogResource
+
+    assert set(DatadogResource.model_fields) == {
+        "api_key",
+        "app_key",
+        "api_host",
+        "statsd_host",
+        "statsd_port",
+        "statsd_socket_path",
+        "constant_tags",
+    }
+
+    datadog = DatadogResource(api_key="test-key", app_key="test-app-key")
+    client = datadog.get_client()
+    dagster_client_members = [
+        "event",
+        "gauge",
+        "increment",
+        "decrement",
+        "histogram",
+        "distribution",
+        "set",
+        "service_check",
+        "timed",
+        "timing",
+        "flush",
+        "wait_for_pending",
+        "api",
+        "OK",
+        "WARNING",
+        "CRITICAL",
+        "UNKNOWN",
+    ]
+    assert [name for name in dagster_client_members if not hasattr(client, name)] == []
+    assert callable(client.api.Event.create)
+
+    assert isinstance(datadog.failure_hook(), rs.Hook)
+    assert isinstance(datadog.success_hook(), rs.Hook)
+    assert datadog.run_failure_sensor().monitored_status == rs.RunStatus.Failure
+
+
+def test_dagster_sling_maps_to_sling_integration():
+    pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
+    from rivers.integrations.sling import (
+        SlingConnection,
+        SlingReplication,
+        SlingResource,
+    )
+
+    replication = SlingReplication(
+        {"source": "PG", "target": "WAREHOUSE", "streams": {"public.users": None}},
+        asset_def_fn=lambda stream: stream.output_def(
+            deps=[rs.AssetDef.dep("pg_users")]
+        ),
+    )
+
+    @replication.assets(name="raw")
+    def raw(context: rs.AssetExecutionContext, sling: SlingResource):
+        yield from sling.replicate(context, replication)
+
+    @rs.Asset
+    def pg_users() -> None:
+        return None
+
+    assert [output.name for output in raw.output_defs] == ["public.users"]
+    sling = SlingResource(connections=[SlingConnection(name="PG", url="${PG_URL}")])
+    rs.CodeRepository(assets=[pg_users, raw], resources={"sling": sling}).validate()
+    with pytest.raises(rs.exceptions.GraphValidationError, match="'pg_users'"):
+        rs.CodeRepository(assets=[raw], resources={"sling": sling}).validate()
+
+
+def test_dagster_dlt_maps_to_dlt_integration(tmp_path):
+    dlt = pytest.importorskip("dlt")
+    pytest.importorskip("duckdb")
+    from rivers.integrations.dlt import DltSourceAssets, output_def
+
+    @dlt.source(name="github")
+    def github_source():
+        @dlt.resource
+        def issues():
+            yield {"id": 1}
+
+        return issues
+
+    # Dagster's translator and `pool=` become `asset_def_fn`.
+    github = DltSourceAssets(
+        github_source(),
+        asset_def_fn=lambda resource: output_def(resource, pool="github"),
+    )
+
+    @github.assets(name="github", group="github", partitions_def=None, hooks=None)
+    def github_assets(context: rs.AssetExecutionContext):
+        pipeline = dlt.pipeline(
+            "github",
+            pipelines_dir=str(tmp_path),
+            destination="duckdb",
+            dataset_name="github",
+        )
+        yield from github.load(context, pipeline)
+
+    [output] = github_assets.output_defs
+    assert (output.name, output.group, output.kinds) == (
+        "github_issues",
+        "github",
+        ["dlt"],
+    )
+    assert output.pool == [("github", 1)]
+    # No default upstream deps: Dagster's `github_issues` source key would not resolve.
+    rs.CodeRepository(assets=[github_assets]).validate()
+
+
 def test_dagster_dbt_maps_to_dbt_integration():
     pytest.importorskip("dbt.version")
     import inspect

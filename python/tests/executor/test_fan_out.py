@@ -567,8 +567,11 @@ class TestCollectStream:
 # (re-import from module, extract from asset definition).
 
 
+# One directory per xdist worker. The loky workers inherit the variable, so
+# they compute the same path when they re-import this module.
 _unpicklable_store_dir = os.path.join(
-    tempfile.gettempdir(), "rivers_test_unpicklable_handler"
+    tempfile.gettempdir(),
+    f"rivers_test_unpicklable_handler_{os.environ.get('PYTEST_XDIST_WORKER', 'main')}",
 )
 os.makedirs(_unpicklable_store_dir, exist_ok=True)
 _unpicklable_store = obstore.store.LocalStore(_unpicklable_store_dir, mkdir=True)

@@ -12,7 +12,7 @@ except GraphValidationError as exc:
     print("Graph could not be validated:", exc)
 ```
 
-Every class extends Python's built-in `Exception`.
+Every class extends Python's built-in `Exception`, and its module is `rivers.exceptions`: an exception raised in an `Executor.parallel()` worker reaches the caller as the same class.
 
 | Class | Raised when |
 |-------|-------------|

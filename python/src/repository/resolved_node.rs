@@ -85,6 +85,9 @@ pub(crate) struct ResolvedAsset {
     /// This output's IO handler and per-input handlers.
     pub io_handler: Option<IOHandler>,
     pub input_io_handlers: HashMap<String, IOHandler>,
+    /// For multi-asset outputs, this output's `AssetDef.type_hint`.
+    /// `None` for other asset kinds.
+    pub output_type_hint: Option<Py<PyAny>>,
     /// `AssetDef.dep` deps that are not also inputs: they order the asset
     /// but load nothing. Set by `build_unresolved_graph`.
     pub lineage_deps: HashSet<String>,
@@ -231,6 +234,9 @@ impl ResolvedAsset {
             Some(sa) => sa.metadata.clone(),
             None => asset.metadata().cloned(),
         };
+        let output_type_hint = single_for_output
+            .and_then(|sa| sa.type_hint.as_ref())
+            .map(|h| h.clone_ref(py));
         let backfill_strategy = asset.backfill_strategy().cloned();
 
         // For Multi outputs, prefer the per-output partitions_def, falling back
@@ -378,6 +384,7 @@ impl ResolvedAsset {
             actions,
             io_handler,
             input_io_handlers,
+            output_type_hint,
             lineage_deps: HashSet::new(),
         })
     }
@@ -416,6 +423,7 @@ impl ResolvedAsset {
                 .iter()
                 .map(|(k, h)| (k.clone(), h.clone_ref(py)))
                 .collect(),
+            output_type_hint: self.output_type_hint.as_ref().map(|h| h.clone_ref(py)),
             lineage_deps: self.lineage_deps.clone(),
         }
     }
@@ -908,6 +916,14 @@ impl ResolvedNode {
     pub fn metadata(&self) -> Option<HashMap<String, String>> {
         match self {
             ResolvedNode::Asset(node) => node.metadata.clone(),
+            ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => None,
+        }
+    }
+
+    /// `None` for a single asset: its type is its function's return hint.
+    pub fn output_type_hint(&self) -> Option<&Py<PyAny>> {
+        match self {
+            ResolvedNode::Asset(node) => node.output_type_hint.as_ref(),
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => None,
         }
     }

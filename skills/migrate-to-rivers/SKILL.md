@@ -29,7 +29,7 @@ Read the whole source project before porting anything. Produce a written invento
 - **Orchestration** — jobs, schedules, sensors, automation conditions/triggers
 - **Infrastructure** — executors, work pools, K8s config, concurrency limits
 - **Config & secrets** — `dg.Config` classes, `ConfigurableResource`s, Prefect Blocks, env vars
-- **Things with no rivers equivalent** — asset checks, integrations other than dbt, Slack, and DuckDB, Prefect transactions, Cloud-only features
+- **Things with no rivers equivalent** — asset checks, integrations without a rivers port, Prefect transactions, Cloud-only features
 
 Report the last group to the user early. Do not silently drop or fake them.
 

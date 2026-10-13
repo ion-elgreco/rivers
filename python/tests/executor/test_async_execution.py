@@ -2,6 +2,10 @@
 
 import asyncio
 import os
+import select
+import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -453,6 +457,72 @@ def test_async_generator_multi_asset(executor_kind):
     repo.materialize()
     assert repo.load_node("x") == 10
     assert repo.load_node("y") == 20
+
+
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_async_generator_multi_assets_run_at_the_same_time(executor_kind):
+    """Two async generator multi-assets of one level run at the same time:
+    each one waits for the other to start, which fails if they take turns."""
+    started = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    def waits_for(name: str, other: str) -> rs.MultiAsset:
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef(name)], name=f"multi_{name}")
+        async def multi():
+            started[name].set()
+            await asyncio.wait_for(started[other].wait(), timeout=5)
+            yield rs.Materialization(output_name=name)
+
+        return multi
+
+    repo = rs.CodeRepository(
+        assets=[waits_for("a", "b"), waits_for("b", "a")],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+
+    assert repo.materialize(raise_on_error=False).success
+
+
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_async_generator_context_values_apply_per_yield(executor_kind, storage):
+    """A data version or metadata set on the context between two yields
+    applies to the outputs yielded after it, as for a sync generator."""
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("a"), rs.AssetDef("b")])
+    async def multi(context: rs.AssetExecutionContext):
+        context.register_data_version("v1")
+        yield rs.Materialization(output_name="a")
+        await asyncio.sleep(0)
+        context.register_data_version("v2")
+        context.add_output_metadata({"late": "yes"})
+        yield rs.Materialization(output_name="b")
+
+    repo = rs.CodeRepository(
+        assets=[multi],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+
+    assert repo.materialize().success
+
+    [a] = [
+        e
+        for e in storage.get_events_for_asset("a")
+        if e.event_type == "Materialization"
+    ]
+    [b] = [
+        e
+        for e in storage.get_events_for_asset("b")
+        if e.event_type == "Materialization"
+    ]
+    assert (a.data_version, dict(a.metadata)) == ("v1", {})
+    assert (b.data_version, dict(b.metadata)) == (
+        "v2",
+        {"late": '{"Text":{"value":"yes"}}'},
+    )
 
 
 @pytest.mark.parametrize("executor_kind", ["default", "in_process"])
@@ -1063,6 +1133,7 @@ def test_parallel_max_async_concurrent_none_is_unbounded(tmp_path):
     )
 
 
+@pytest.mark.serial
 @pytest.mark.skipif(
     os.environ.get("CI") == "true",
     reason="Timing-sensitive: CI runners have limited vCPUs",
@@ -1342,3 +1413,120 @@ def test_async_failure_events_parallel(tmp_path, storage):
     events = storage.get_events_for_asset("par_fail_ev")
     event_types = [e.event_type for e in events]
     assert "StepFailure" in event_types
+
+
+# ── Ctrl-C ──
+
+_INTERRUPT_SCRIPT = """
+import asyncio
+import signal
+import sys
+
+import rivers as rs
+from rivers.testing import memory_storage
+
+# A child of an xdist worker can start with SIGINT ignored.
+signal.signal(signal.SIGINT, signal.default_int_handler)
+executor, kind = sys.argv[1:]
+
+
+async def wait() -> None:
+    print("started", flush=True)
+    try:
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        print("cancelled", flush=True)
+        raise
+
+
+if kind == "coroutine":
+
+    @rs.Asset(name="slow")
+    async def slow() -> rs.Materialization:
+        await wait()
+        return rs.Materialization()
+
+elif kind == "generator":
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("slow")])
+    async def slow():
+        await wait()
+        yield rs.Materialization(output_name="slow")
+
+else:
+
+    @rs.Asset(name="slow")
+    async def slow() -> rs.Materialization:
+        signal.raise_signal(signal.SIGINT)
+        return rs.Materialization()
+
+
+storage = memory_storage()
+repo = rs.CodeRepository(
+    assets=[slow],
+    default_executor=rs.Executor.in_process()
+    if executor == "in_process"
+    else rs.Executor.parallel(max_workers=2),
+)
+repo.resolve(storage=storage)
+try:
+    result = repo.materialize(raise_on_error=False)
+except KeyboardInterrupt:
+    print("interrupted", flush=True)
+    sys.exit()
+
+reasons = [
+    dict(event.metadata)["rivers/failure_reason"]
+    for event in storage.get_events_for_asset("slow")
+    if event.event_type == "StepFailure"
+]
+print("success", result.success, *reasons, flush=True)
+"""
+
+
+def _start_interrupt_script(executor_kind: str, kind: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _INTERRUPT_SCRIPT, executor_kind, kind],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _finish(proc: subprocess.Popen) -> list[str]:
+    """The lines the child prints until it exits; fails if it hangs."""
+    try:
+        out, err = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise AssertionError(f"the run hung; printed {out!r}\n{err}") from None
+    assert proc.returncode == 0, err
+    return out.splitlines()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGINT")
+@pytest.mark.parametrize("kind", ["coroutine", "generator"])
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_ctrl_c_cancels_a_running_async_step(executor_kind, kind):
+    """Ctrl-C cancels a running async step, as it interrupts a sync step:
+    the step ends with CancelledError, fails as cancelled, and the run ends."""
+    proc = _start_interrupt_script(executor_kind, kind)
+    ready, _, _ = select.select([proc.stdout], [], [], 20)
+    assert ready and proc.stdout.readline() == "started\n", proc.stderr.read()
+
+    proc.send_signal(signal.SIGINT)
+
+    assert _finish(proc) == ["cancelled", "success False cancelled"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGINT")
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_ctrl_c_as_an_async_step_ends_does_not_hang(executor_kind):
+    """A Ctrl-C that arrives as the last async step ends is still pending
+    when the run stops its event loop. It must not stop that shutdown: the
+    run ends, then the interrupt is raised. If the wait for the step sees
+    the Ctrl-C first, the step has already ended and the run succeeds."""
+    proc = _start_interrupt_script(executor_kind, "signal")
+
+    assert _finish(proc) in (["interrupted"], ["success True"])

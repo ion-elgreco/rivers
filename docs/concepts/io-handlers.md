@@ -13,7 +13,7 @@ The shared `InMemoryIOHandler` stores values in a Python dictionary within the p
 To persist outputs, assign a `PickleIOHandler` or `DeltaIOHandler` explicitly.
 
 !!! note "Subprocess / Kubernetes executors"
-    `InMemoryIOHandler` cannot survive a process boundary, since subprocesses (and K8s step pods) cannot access the parent's memory. If you use `Executor.parallel()` or `Executor.kubernetes()`, assign a persistent handler (e.g. `PickleIOHandler` or `DeltaIOHandler`) to every asset that may run out-of-process.
+    `InMemoryIOHandler` cannot survive a process boundary, since subprocesses (and K8s step pods) cannot access the parent's memory. With `Executor.parallel()` or `Executor.kubernetes()`, a step that runs out-of-process fails when it returns a value for an output kept in memory, or loads an input kept in memory. Assign a persistent handler (e.g. `PickleIOHandler` or `DeltaIOHandler`) to every asset whose value goes to or comes from such a step. Assets that [return a `Materialization`](#opting-an-asset-out-of-the-io-handler) need no handler.
 
 ## Opting an asset out of the IO handler
 
@@ -133,7 +133,7 @@ All IO handlers **must** inherit from `BaseIOHandler`. Duck-typing (objects that
 - `asset_name` — name of the asset being written
 - `asset_metadata` — static metadata from the asset definition
 - `partition` — `PartitionContext` if the asset is partitioned
-- `type_hint` — the return type annotation, if any
+- `type_hint` — the asset's return annotation, or a multi-asset output's `AssetDef(type_hint=...)`; `None` if there is none
 - `output_metadata` — `dict[str, MetadataValue]` accumulated via `add_output_metadata()`
 - `add_output_metadata(metadata)` — attach runtime metadata
 - `register_data_version(version)` — record a content-addressable data-version string for this output

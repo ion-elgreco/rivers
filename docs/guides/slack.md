@@ -17,6 +17,8 @@ slack = SlackResource()                  # token from SLACK_TOKEN
 slack = SlackResource(token="xoxb-...")  # or explicit
 ```
 
+The token is a [secret](../concepts/resources.md#secrets), a `SecretStr`: reprs and logs show `**********`, and the UI's launch dialog does not show it. `slack.token.get_secret_value()` returns it.
+
 ## Alert once per failed run
 
 `run_failure_sensor` returns a [run-status sensor](../api-reference/sensors.md#run-status-sensors) that posts one message per failed run of the code location:

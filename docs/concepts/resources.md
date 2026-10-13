@@ -22,6 +22,23 @@ class DatabaseResource(rs.Resource):
 
 `setup()` and `teardown()` are optional — only override them if your resource needs initialization or cleanup.
 
+## Secrets
+
+Declare credentials as `pydantic.SecretStr` (or `SecretBytes`). Reprs and logs show `**********`; your code reads the value with `get_secret_value()`:
+
+```python
+from pydantic import SecretStr
+
+class WarehouseResource(rs.Resource):
+    user: str
+    password: SecretStr  # explicit or from the PASSWORD env var
+
+    def setup(self):
+        self._conn = connect(self.user, self.password.get_secret_value())
+```
+
+A secret keeps its value in other processes: a [parallel](../api-reference/executors.md) worker and a sensor or schedule evaluated in a subprocess rebuild the resource from its field values, secrets included. The UI never gets a secret: in the [launch dialog](configuration.md#the-document-in-the-ui), a field that holds one at any depth (`SecretStr | None`, a nested model's field, a list's items) has no current value, and a launch that leaves it out keeps the resource's value.
+
 ## Registering resources
 
 Pass resources to `CodeRepository` as a dict:
@@ -100,7 +117,7 @@ repo.materialize(
 )
 ```
 
-The named resource is built again through its class, from the instance's current fields with these values on top (so validation runs, and a secret keeps its value). A `Resource` built this way gets `setup()` before the run's first step and `teardown()` after its last; the repository's own instance is untouched and keeps serving other runs. A class given as a resource is built once for the run with the values. An IO handler cannot be overridden this way: assets hold it through the registry. An unknown key, or a value the class rejects, is refused before a run exists.
+The named resource is built again through its class, from the instance's current fields with these values on top (so validation runs, and a secret keeps its value). A nested model takes the values field by field: `{"login": {"user": "etl"}}` keeps `login.password`. A list or dict field is replaced whole. The run record stores the document as written, so set a secret on the resource or in its environment, not in the document. A `Resource` built this way gets `setup()` before the run's first step and `teardown()` after its last; the repository's own instance is untouched and keeps serving other runs. A class given as a resource is built once for the run with the values. An IO handler cannot be overridden this way: assets hold it through the registry. An unknown key, or a value the class rejects, is refused before a run exists.
 
 ## IOHandler as resource reference
 

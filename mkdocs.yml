@@ -72,10 +72,17 @@ nav:
       - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
-      - Delta Lake: guides/delta-lake.md
-      - DuckDB: guides/duckdb.md
+      - Airbyte: guides/airbyte.md
+      - Databricks: guides/databricks.md
+      - Datadog: guides/datadog.md
+      - dataframely: guides/dataframely.md
       - dbt: guides/dbt.md
+      - Delta Lake: guides/delta-lake.md
+      - dlt: guides/dlt.md
+      - DuckDB: guides/duckdb.md
+      - pandera: guides/pandera.md
       - Slack: guides/slack.md
+      - Sling: guides/sling.md
       - Authentication: guides/authentication.md
   - API Reference:
       - CodeRepository: api-reference/repository.md
@@ -93,9 +100,16 @@ nav:
       - Partitions: api-reference/partitions.md
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
-      - Delta Lake: api-reference/delta.md
-      - DuckDB: api-reference/duckdb.md
+      - Airbyte: api-reference/airbyte.md
+      - Databricks: api-reference/databricks.md
+      - Datadog: api-reference/datadog.md
+      - dataframely: api-reference/dataframely.md
       - dbt: api-reference/dbt.md
+      - Delta Lake: api-reference/delta.md
+      - dlt: api-reference/dlt.md
+      - DuckDB: api-reference/duckdb.md
+      - pandera: api-reference/pandera.md
+      - Sling: api-reference/sling.md
       - MetadataValue: api-reference/metadata.md
       - Schema: api-reference/schema.md
       - Storage: api-reference/storage.md
