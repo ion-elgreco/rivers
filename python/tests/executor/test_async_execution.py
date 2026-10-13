@@ -459,6 +459,72 @@ def test_async_generator_multi_asset(executor_kind):
     assert repo.load_node("y") == 20
 
 
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_async_generator_multi_assets_run_at_the_same_time(executor_kind):
+    """Two async generator multi-assets of one level run at the same time:
+    each one waits for the other to start, which fails if they take turns."""
+    started = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    def waits_for(name: str, other: str) -> rs.MultiAsset:
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef(name)], name=f"multi_{name}")
+        async def multi():
+            started[name].set()
+            await asyncio.wait_for(started[other].wait(), timeout=5)
+            yield rs.Materialization(output_name=name)
+
+        return multi
+
+    repo = rs.CodeRepository(
+        assets=[waits_for("a", "b"), waits_for("b", "a")],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+
+    assert repo.materialize(raise_on_error=False).success
+
+
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_async_generator_context_values_apply_per_yield(executor_kind, storage):
+    """A data version or metadata set on the context between two yields
+    applies to the outputs yielded after it, as for a sync generator."""
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("a"), rs.AssetDef("b")])
+    async def multi(context: rs.AssetExecutionContext):
+        context.register_data_version("v1")
+        yield rs.Materialization(output_name="a")
+        await asyncio.sleep(0)
+        context.register_data_version("v2")
+        context.add_output_metadata({"late": "yes"})
+        yield rs.Materialization(output_name="b")
+
+    repo = rs.CodeRepository(
+        assets=[multi],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+
+    assert repo.materialize().success
+
+    [a] = [
+        e
+        for e in storage.get_events_for_asset("a")
+        if e.event_type == "Materialization"
+    ]
+    [b] = [
+        e
+        for e in storage.get_events_for_asset("b")
+        if e.event_type == "Materialization"
+    ]
+    assert (a.data_version, dict(a.metadata)) == ("v1", {})
+    assert (b.data_version, dict(b.metadata)) == (
+        "v2",
+        {"late": '{"Text":{"value":"yes"}}'},
+    )
+
+
 @pytest.mark.parametrize("executor_kind", ["default", "in_process"])
 def test_async_multi_asset_dict_return(executor_kind):
     """An async (non-generator) multi-asset returning a dict works under both executors."""

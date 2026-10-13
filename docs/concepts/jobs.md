@@ -70,7 +70,7 @@ An `Executor` picks how a job's steps are dispatched — for materialize runs; a
 
 ### InProcess
 
-Runs every step serially in the calling Python process. Best for debugging and small pipelines:
+Runs sync steps one at a time in the calling Python process, and up to four async steps at the same time. Best for debugging and small pipelines:
 
 ```python
 executor = rs.Executor.in_process()

@@ -381,7 +381,7 @@ pub fn worker_execute_step(
                 selected_outputs.push(name);
             }
 
-            ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
+            ops::for_each_output(py, &synth, &selected_outputs, "", |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
@@ -445,7 +445,7 @@ pub fn worker_execute_step(
                 String::new()
             };
 
-            ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
+            ops::for_each_output(py, &synth, &[], &asset_name, |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
