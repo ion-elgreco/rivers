@@ -72,10 +72,10 @@ def _replication(src: Path, *names: str) -> dict:
     }
 
 
-def _resource(tmp_path: Path, **files: str) -> SlingResource:
+def _resource(tmp_path: Path) -> SlingResource:
     return SlingResource(
         connections=[
-            SlingConnection(name="FILES", type="file", **files),
+            SlingConnection(name="FILES", type="file"),
             SlingConnection(
                 name="WAREHOUSE",
                 type="sqlite",
@@ -381,12 +381,21 @@ def test_unset_env_reference_fails_before_sling_runs(tmp_path, src, monkeypatch)
         next(resource.replicate(context, replication))
 
 
-def test_resource_round_trips_through_json(tmp_path):
-    resource = _resource(tmp_path, note="${RIVERS_TEST_SLING_SECRET}")
-    rebuilt = SlingResource.model_validate_json(resource.model_dump_json())
+def test_secret_property_reaches_sling(tmp_path, src, storage, executor_env):
+    db = SecretStr((tmp_path / "warehouse.db").as_posix())
+    resource = SlingResource(
+        connections=[
+            SlingConnection(name="FILES", type="file"),
+            SlingConnection(name="WAREHOUSE", type="sqlite", instance=db),
+        ]
+    )
+    replication = SlingReplication(_replication(src, "orders"))
+    repo = _repo(
+        tmp_path, storage, replication, executor=executor_env[0], resource=resource
+    )
 
-    assert rebuilt == resource
-    assert rebuilt.connections[0].model_extra == {"note": "${RIVERS_TEST_SLING_SECRET}"}
+    assert repo.materialize().success
+    assert _rows(tmp_path, "SELECT id, item, amount FROM orders ORDER BY id") == ORDERS
 
 
 @pytest.mark.parametrize(
