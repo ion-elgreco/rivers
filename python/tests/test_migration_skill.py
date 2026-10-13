@@ -313,11 +313,19 @@ def test_dagster_snowflake_maps_to_snowflake_integration():
     pytest.importorskip("snowflake.connector")
     from rivers.integrations.snowflake import SnowflakeIOHandler, SnowflakeResource
 
-    resource = SnowflakeResource(account="acct", user="ETL", schema_name="RAW")
-    handler = SnowflakeIOHandler(resource=resource)
+    # SnowflakePandasIOManager(database="FLOWERS", schema="IRIS", account=..., user=...)
+    resource = SnowflakeResource(account="acct", user="ETL", database="FLOWERS")
+    handler = SnowflakeIOHandler(resource=resource, schema_name="IRIS")
+    assert handler.table_name("iris_dataset", None) == ("IRIS", "IRIS_DATASET")
     meta = {"snowflake/schema": "analytics", "snowflake/partition_expr": "day"}
     assert handler.table_name("users", meta) == ("ANALYTICS", "USERS")
-    assert handler.table_name("users", None) == ("PUBLIC", "USERS")
+
+    # SnowflakeResource(schema="RAW") only sets the session's default schema
+    session_schema = SnowflakeResource(account="acct", user="ETL", schema_name="RAW")
+    assert SnowflakeIOHandler(resource=session_schema).table_name("users", None) == (
+        "PUBLIC",
+        "USERS",
+    )
 
 
 def test_automation_condition_has_no_allow_or_ignore():
