@@ -486,22 +486,31 @@ class TestBatchedPartialFailure:
         }
         self._assert_partition_failure_event(repo, "gen")
 
-    def test_single_run_partial_failure_multi_asset(self):
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    def test_single_run_partial_failure_multi_asset(self, is_async):
         # The mark is step-level, so it must apply to every output of a
         # multi-asset (lookup keyed by output name, not the step name).
         handler = rs.InMemoryIOHandler()
+        pd = _static_pd(["a", "b", "c"])
+        output_defs = [
+            rs.AssetDef("x", io_handler=handler),
+            rs.AssetDef("y", io_handler=handler),
+        ]
+        if is_async:
 
-        @rs.Asset.from_multi(
-            partitions_def=_static_pd(["a", "b", "c"]),
-            output_defs=[
-                rs.AssetDef("x", io_handler=handler),
-                rs.AssetDef("y", io_handler=handler),
-            ],
-        )
-        def multi(context: rs.AssetExecutionContext):
-            context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
-            yield rs.Output(value=1, output_name="x")
-            yield rs.Output(value=2, output_name="y")
+            @rs.Asset.from_multi(partitions_def=pd, output_defs=output_defs)
+            async def multi(context: rs.AssetExecutionContext):
+                context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+                yield rs.Output(value=1, output_name="x")
+                yield rs.Output(value=2, output_name="y")
+
+        else:
+
+            @rs.Asset.from_multi(partitions_def=pd, output_defs=output_defs)
+            def multi(context: rs.AssetExecutionContext):
+                context.mark_partition_failed(rs.PartitionKey.single("b"), error="boom")
+                yield rs.Output(value=1, output_name="x")
+                yield rs.Output(value=2, output_name="y")
 
         repo = rs.CodeRepository(
             assets=[multi], default_executor=rs.Executor.in_process()

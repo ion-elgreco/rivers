@@ -1,5 +1,6 @@
 """Tests for multi-asset generator yield protocol and subsetting."""
 
+import asyncio
 from typing import Any
 
 import obstore.store
@@ -7,7 +8,8 @@ import pytest
 
 import rivers as rs
 
-from _helpers import EXECUTORS, MP, DictIOHandler
+from _helpers import EXECUTORS, IP, MP, DictIOHandler
+from _polling import wait_for
 
 
 @pytest.fixture(params=["in_process", "parallel"])
@@ -311,9 +313,13 @@ def test_generator_multi_asset_downstream_receives_values():
     assert repo.load_node("consumer") == 30
 
 
-def test_generator_multi_asset_io_failure_aborts():
-    """IO failure on one yield aborts generator, remaining outputs fail."""
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_generator_multi_asset_io_failure_aborts(executor, is_async):
+    """IO failure on one yield aborts generator, remaining outputs fail. The
+    body does not go on past the failed write."""
     call_order = []
+    reached = []
 
     class FailOnSecondHandler(rs.BaseIOHandler):
         store: dict[str, Any] = {}
@@ -328,28 +334,34 @@ def test_generator_multi_asset_io_failure_aborts():
             return self.store.get(context.asset_name)
 
     handler = FailOnSecondHandler()
+    output_defs = [
+        rs.AssetDef("a", io_handler=handler),
+        rs.AssetDef("b", io_handler=handler),
+        rs.AssetDef("c", io_handler=handler),
+    ]
+    if is_async:
 
-    @rs.Asset.from_multi(
-        output_defs=[
-            rs.AssetDef("a", io_handler=handler),
-            rs.AssetDef("b", io_handler=handler),
-            rs.AssetDef("c", io_handler=handler),
-        ],
-    )
-    def fail_gen():
-        yield rs.Output(value=1, output_name="a")
-        yield rs.Output(value=2, output_name="b")  # IO fails here
-        yield rs.Output(value=3, output_name="c")  # should not be reached
+        @rs.Asset.from_multi(output_defs=output_defs)
+        async def fail_gen():
+            for value, name in enumerate(["a", "b", "c"], start=1):
+                reached.append(name)
+                yield rs.Output(value=value, output_name=name)
 
-    repo = rs.CodeRepository(
-        assets=[fail_gen], default_executor=rs.Executor.in_process()
-    )
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        def fail_gen():
+            for value, name in enumerate(["a", "b", "c"], start=1):
+                reached.append(name)
+                yield rs.Output(value=value, output_name=name)
+
+    repo = rs.CodeRepository(assets=[fail_gen], default_executor=executor)
     result = repo.materialize(raise_on_error=False)
 
-    assert result.success is False
-    assert "a" in call_order
-    assert "b" in call_order
-    assert "c" not in call_order  # aborted before reaching c
+    error = "RuntimeError: IO failed for b"
+    assert result.failed_assets == [("b", error), ("c", error)]
+    assert call_order == ["a", "b"]
+    assert reached == ["a", "b"]
 
 
 # ── Subsetting (output_selection) ─────────────────────────────────────
@@ -515,35 +527,43 @@ def test_dict_return_multi_asset(executor_env, storage):
 # ── Success hooks fire per-yield ──────────────────────────────────────
 
 
-def test_generator_multi_asset_success_hooks_fire_per_output():
-    """Success hooks fire per yielded output."""
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_generator_multi_asset_success_hooks_fire_per_output(executor, is_async):
+    """Success hooks fire per yielded output, before the body goes on."""
     hook_calls = []
+    seen_after_a = []
 
     @rs.Hook.success
     def on_success(context: rs.HookContext):
         hook_calls.append(context.asset_name)
 
     handler = DictIOHandler()
+    output_defs = [
+        rs.AssetDef("a", io_handler=handler),
+        rs.AssetDef("b", io_handler=handler),
+    ]
+    if is_async:
 
-    @rs.Asset.from_multi(
-        output_defs=[
-            rs.AssetDef("a", io_handler=handler),
-            rs.AssetDef("b", io_handler=handler),
-        ],
-        hooks=[on_success],
-    )
-    def gen_hooks():
-        yield rs.Output(value=1, output_name="a")
-        yield rs.Output(value=2, output_name="b")
+        @rs.Asset.from_multi(output_defs=output_defs, hooks=[on_success])
+        async def gen_hooks():
+            yield rs.Output(value=1, output_name="a")
+            seen_after_a.extend(hook_calls)
+            yield rs.Output(value=2, output_name="b")
 
-    repo = rs.CodeRepository(
-        assets=[gen_hooks], default_executor=rs.Executor.in_process()
-    )
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs, hooks=[on_success])
+        def gen_hooks():
+            yield rs.Output(value=1, output_name="a")
+            seen_after_a.extend(hook_calls)
+            yield rs.Output(value=2, output_name="b")
+
+    repo = rs.CodeRepository(assets=[gen_hooks], default_executor=executor)
     repo.materialize()
 
-    assert "a" in hook_calls
-    assert "b" in hook_calls
-    assert len(hook_calls) == 2
+    assert hook_calls == ["a", "b"]
+    assert seen_after_a == ["a"]
 
 
 # ── parallel observation yields ──────────────────────────────────
@@ -1052,15 +1072,22 @@ def test_generator_error_keeps_outputs_yielded_before_it(
 
 
 @pytest.mark.parametrize("executor", EXECUTORS)
-def test_generator_output_never_yielded_fails(executor, tmp_path, storage):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_generator_output_never_yielded_fails(executor, is_async, tmp_path, storage):
     """An output the generator ends without yielding fails; the rest succeed."""
     io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    output_defs = [rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
+    if is_async:
 
-    @rs.Asset.from_multi(
-        output_defs=[rs.AssetDef("pa", io_handler=io), rs.AssetDef("pb", io_handler=io)]
-    )
-    def multi():
-        yield rs.Output(5, output_name="pa")
+        @rs.Asset.from_multi(output_defs=output_defs)
+        async def multi():
+            yield rs.Output(5, output_name="pa")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        def multi():
+            yield rs.Output(5, output_name="pa")
 
     @rs.Asset(io_handler=io)
     def sibling() -> rs.Materialization:
@@ -1128,6 +1155,74 @@ def test_multi_asset_output_kept_in_memory(executor, tmp_path, storage):
         "sibling": succeeded,
     }
     assert repo.load_node("pa") == 1
+
+
+# ── Each output is stored as the body yields it ───────────────────────
+
+
+def _stored(storage, context, name) -> bool:
+    """Whether the run's materialization of ``name`` is in storage."""
+    event = storage.get_latest_materialization(name)
+    return event is not None and event.run_id == context.run_id
+
+
+@pytest.mark.parametrize(
+    ("executor", "is_async"),
+    [
+        pytest.param(IP, False, id="in_process-sync"),
+        pytest.param(IP, True, id="in_process-async"),
+        pytest.param(MP, True, id="parallel-async"),
+    ],
+)
+@pytest.mark.parametrize("raises", [False, True], ids=["completes", "raises"])
+def test_generator_output_is_stored_before_the_body_goes_on(
+    executor, is_async, raises, tmp_path, storage
+):
+    """An output that a generator yields is in storage before its body goes
+    on, so the outputs of a long body show while it runs. An error after it
+    keeps it. An async body runs in the run's process with both executors, so
+    it can read the storage."""
+    io = rs.PickleIOHandler(store=obstore.store.LocalStore(str(tmp_path)))
+    output_defs = [rs.AssetDef("a", io_handler=io), rs.AssetDef("b", io_handler=io)]
+    if is_async:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        async def multi(context: rs.AssetExecutionContext):
+            yield rs.Output(1, output_name="a")
+            async with asyncio.timeout(10):
+                while not _stored(storage, context, "a"):
+                    await asyncio.sleep(0.05)
+            if raises:
+                raise RuntimeError("b broke")
+            yield rs.Output(2, output_name="b")
+
+    else:
+
+        @rs.Asset.from_multi(output_defs=output_defs)
+        def multi(context: rs.AssetExecutionContext):
+            yield rs.Output(1, output_name="a")
+            wait_for(lambda: _stored(storage, context, "a"), 10, "a to be stored")
+            if raises:
+                raise RuntimeError("b broke")
+            yield rs.Output(2, output_name="b")
+
+    repo = rs.CodeRepository(assets=[multi], default_executor=executor)
+    repo.resolve(storage=storage)
+    result = repo.materialize(raise_on_error=False)
+
+    succeeded = [
+        ("StepStart", None, None),
+        ("Materialization", None, None),
+        ("StepSuccess", None, None),
+    ]
+    failed = [("StepStart", None, None), ("StepFailure", None, "RuntimeError: b broke")]
+    assert _step_events(storage, result.run_id) == {
+        "a": succeeded,
+        "b": failed if raises else succeeded,
+    }
+    assert repo.load_node("a") == 1
+    if not raises:
+        assert repo.load_node("b") == 2
 
 
 # ── Captured output of generator bodies ───────────────────────────────
@@ -1198,11 +1293,15 @@ def test_generator_body_output_is_captured(
 
 
 class _LoudPickleIOHandler(rs.PickleIOHandler):
-    """Prints each load, as a handler that reports progress does."""
+    """Prints each load and write, as a handler that reports progress does."""
 
     def load_input(self, context):
         print(f"loading {context.asset_name}")
         return super().load_input(context)
+
+    def handle_output(self, context, obj):
+        print(f"writing {context.asset_name}")
+        return super().handle_output(context, obj)
 
 
 @pytest.mark.parametrize("executor", EXECUTORS)
@@ -1210,8 +1309,8 @@ class _LoudPickleIOHandler(rs.PickleIOHandler):
 def test_generator_step_output_is_one_row(
     executor, is_async, tmp_path, storage, monkeypatch
 ):
-    """A generator step's input load and its body share one run_logs row, as a
-    plain step's do."""
+    """A generator step's input load, its body, and the write of its output
+    share one run_logs row, as a plain step's do."""
     import rivers._capture as cap
 
     monkeypatch.setattr(cap, "_installed", False)
@@ -1226,21 +1325,21 @@ def test_generator_step_output_is_one_row(
         @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
         async def gen(upstream: int):
             print(f"body got {upstream}")
-            yield rs.Materialization(output_name="ga")
+            yield rs.Output(upstream + 1, output_name="ga")
 
     else:
 
         @rs.Asset.from_multi(output_defs=[rs.AssetDef("ga", io_handler=io)])
         def gen(upstream: int):
             print(f"body got {upstream}")
-            yield rs.Materialization(output_name="ga")
+            yield rs.Output(upstream + 1, output_name="ga")
 
     repo = rs.CodeRepository(assets=[upstream, gen], default_executor=executor)
     repo.resolve(storage=storage)
     result = repo.materialize()
 
     stdout, _ = _captured(storage, result.run_id, "ga")
-    assert stdout == "loading upstream\nbody got 1\n"
+    assert stdout == "loading upstream\nbody got 1\nwriting ga\n"
 
 
 # ── RunResult.failed_assets names the outputs that failed ─────────────

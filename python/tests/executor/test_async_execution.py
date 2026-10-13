@@ -486,6 +486,48 @@ def test_async_generator_multi_assets_run_at_the_same_time(executor_kind):
 
 
 @pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_async_generator_output_is_stored_while_other_steps_run(executor_kind, storage):
+    """Two async generator multi-assets of one level each wait until the
+    other's first output is in storage: each output is stored as its body
+    yields it, while the other step still runs."""
+
+    def stored(context: rs.AssetExecutionContext, name: str) -> bool:
+        event = storage.get_latest_materialization(name)
+        return event is not None and event.run_id == context.run_id
+
+    def waits_for(name: str, other: str) -> rs.MultiAsset:
+        @rs.Asset.from_multi(
+            output_defs=[rs.AssetDef(name), rs.AssetDef(f"{name}_done")],
+            name=f"multi_{name}",
+        )
+        async def multi(context: rs.AssetExecutionContext):
+            yield rs.Materialization(output_name=name)
+            async with asyncio.timeout(10):
+                while not stored(context, other):
+                    await asyncio.sleep(0.05)
+            yield rs.Materialization(output_name=f"{name}_done")
+
+        return multi
+
+    repo = rs.CodeRepository(
+        assets=[waits_for("a", "b"), waits_for("b", "a")],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+
+    result = repo.materialize(raise_on_error=False)
+
+    assert result.failed_assets == []
+    assert sorted(
+        e.asset_key
+        for e in storage.get_events_for_run(result.run_id)
+        if e.event_type == "Materialization"
+    ) == ["a", "a_done", "b", "b_done"]
+
+
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
 def test_async_generator_context_values_apply_per_yield(executor_kind, storage):
     """A data version or metadata set on the context between two yields
     applies to the outputs yielded after it, as for a sync generator."""
