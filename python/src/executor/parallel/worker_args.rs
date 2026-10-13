@@ -660,7 +660,7 @@ fn build_multi_output_specs(
         kwargs.set_item("asset_metadata", out_node.metadata())?;
         let partition = ops::build_partition_context(out_node, partition_key)?;
         kwargs.set_item("partition", partition)?;
-        kwargs.set_item("type_hint", out_node.output_type_hint(py))?;
+        kwargs.set_item("type_hint", out_node.output_type_hint())?;
         let tuple = PyTuple::new(
             py,
             &[

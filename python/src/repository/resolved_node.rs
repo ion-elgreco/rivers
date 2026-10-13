@@ -910,10 +910,10 @@ impl ResolvedNode {
         }
     }
 
-    /// A multi-asset output's `AssetDef.type_hint`.
-    pub fn output_type_hint(&self, py: Python) -> Option<Py<PyAny>> {
+    /// `None` for a single asset: its type is its function's return hint.
+    pub fn output_type_hint(&self) -> Option<&Py<PyAny>> {
         match self {
-            ResolvedNode::Asset(node) => node.output_type_hint.as_ref().map(|h| h.clone_ref(py)),
+            ResolvedNode::Asset(node) => node.output_type_hint.as_ref(),
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => None,
         }
     }

@@ -186,8 +186,8 @@ pub(crate) fn process_step_result(
         .outputs
         .iter()
         .filter_map(|name| {
-            let hint = ctx.repo.node_map.get(name)?.output_type_hint(py)?;
-            Some((name.clone(), hint))
+            let hint = ctx.repo.node_map.get(name)?.output_type_hint()?;
+            Some((name.clone(), hint.clone_ref(py)))
         })
         .collect();
     let config_instance = step_result
@@ -261,7 +261,7 @@ pub(crate) fn process_step_result(
                         let type_hint = if is_single {
                             return_hint.as_ref()
                         } else {
-                            output_hints.get(&name)
+                            node.output_type_hint()
                         };
                         let written = ops::handle_step_output(
                             py,
