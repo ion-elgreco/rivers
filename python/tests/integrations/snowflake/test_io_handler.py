@@ -111,7 +111,7 @@ def test_read_each_type(warehouse):
     assert_frame_equal(lazy.collect().sort("id"), pl.DataFrame(_TABLE))
     pd.testing.assert_frame_equal(
         _load(handler, "t", pd.DataFrame).sort_values("id", ignore_index=True),
-        _TABLE.to_pandas(),
+        _TABLE.to_pandas().astype({"id": "Int64"}),
     )
 
 
@@ -209,6 +209,39 @@ def test_empty_read_has_the_types_of_a_read_with_rows(warehouse):
     assert us.schema.field("price").type == pa.decimal128(10, 2)
     assert us.schema.field("day").type == pa.date32()
     assert us.schema.field("instant").type.tz == "UTC"
+
+
+def test_pandas_reads_integers_and_booleans_in_nullable_dtypes(warehouse):
+    """By default, pyarrow makes an int64 column with a NULL float64, which rounds values
+    above 2**53, and a bool column with a NULL object."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    ids = [1838129736471183361, 1838129736471183362, 2**53 + 1, 2**53, None]
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table(
+            {
+                "id": pa.array(ids, pa.int64()),
+                "row": [0, 1, 2, 3, 4],
+                "flag": [True, False, None, True, False],
+                "even": [True, False, True, False, True],
+            }
+        ),
+    )
+
+    read = _load(handler, "t", pd.DataFrame).sort_values("row", ignore_index=True)
+
+    assert read.dtypes.to_dict() == {
+        "id": pd.Int64Dtype(),
+        "row": pd.Int64Dtype(),
+        "flag": pd.BooleanDtype(),
+        "even": pd.BooleanDtype(),
+    }
+    assert {name: column.tolist() for name, column in read.items()} == {
+        "id": [*ids[:-1], pd.NA],
+        "row": [0, 1, 2, 3, 4],
+        "flag": [True, False, pd.NA, True, False],
+        "even": [True, False, True, False, True],
+    }
 
 
 @pytest.mark.parametrize(

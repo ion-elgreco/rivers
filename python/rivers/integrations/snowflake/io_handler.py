@@ -218,8 +218,10 @@ class SnowflakeIOHandler(BaseIOHandler):
         """Read the asset's table as ``context.type_hint``, with lowercased column names.
 
         The rows are fetched as Arrow. Each column's Arrow type follows from
-        its Snowflake type, so a read without rows has the same types. A
-        ``RecordBatchReader`` or ``LazyFrame`` wraps the fetched rows.
+        its Snowflake type, so a read without rows has the same types. In a
+        pandas ``DataFrame``, ``int64`` and ``bool`` columns have the nullable
+        ``Int64`` and ``boolean`` dtypes. A ``RecordBatchReader`` or
+        ``LazyFrame`` wraps the fetched rows.
 
         Raises:
             TypeError: If ``context.type_hint`` is missing or not supported.
@@ -654,7 +656,12 @@ def _readers() -> list[_Reader]:
     try:
         import pandas as pd
 
-        readers.append((pd.DataFrame, lambda table: table.to_pandas()))
+        # pyarrow's default changes the dtype of a column with a NULL: int64
+        # becomes float64, which rounds values above 2**53, and bool becomes object
+        nullable = {pa.int64(): pd.Int64Dtype(), pa.bool_(): pd.BooleanDtype()}.get
+        readers.append(
+            (pd.DataFrame, lambda table: table.to_pandas(types_mapper=nullable))
+        )
     except ImportError:
         pass
 
