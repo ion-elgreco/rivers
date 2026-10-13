@@ -49,7 +49,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
 from pydantic_settings import SettingsConfigDict
 
-from rivers._core import Materialization
+from rivers._core import Materialization, MetadataValue
 from rivers._core.assets import Asset, AssetDef, AssetExecutionContext, MultiAsset
 from rivers.resource import Resource
 
@@ -288,7 +288,7 @@ class SlingResource(Resource):
         The other streams are disabled for the run. Sling's log goes to
         ``context.log``. A stream is materialized as soon as sling reports it
         succeeded, with ``sling/stream``, ``sling/object``,
-        ``sling/rows_written``, and ``sling/duration_s`` metadata when sling's
+        ``sling/rows_written``, and ``sling/duration`` metadata when sling's
         log shows them. A stream sling's log does not name (such as a wildcard
         stream) is materialized when the whole replication succeeds.
 
@@ -340,7 +340,9 @@ class SlingResource(Resource):
                 elif message.startswith("execution succeeded") and output:
                     if output not in materialized:
                         materialized.add(output)
-                        metadata["sling/duration_s"] = round(monotonic() - started, 3)
+                        metadata["sling/duration"] = MetadataValue.duration(
+                            round(monotonic() - started, 3)
+                        )
                         yield Materialization(output_name=output, metadata=metadata)
                     output = None
                 elif message.startswith("execution failed"):

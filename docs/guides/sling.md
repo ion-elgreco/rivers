@@ -91,7 +91,7 @@ Sling's log goes to the step log. Each stream is materialized as soon as sling r
 | `sling/stream` | `str` | The stream. |
 | `sling/object` | `str` | The table or file that sling wrote, e.g. `raw.app_users`. |
 | `sling/rows_written` | `int` | Rows that sling wrote for the stream in this run. |
-| `sling/duration_s` | `float` | Seconds the stream took. |
+| `sling/duration` | `MetadataValue.duration` | Seconds the stream took. |
 
 `sling/object` and `sling/rows_written` are there when sling's log shows them. A stream that sling's log does not name, such as a wildcard stream that becomes many tables, is materialized when the whole replication succeeds, with `sling/stream` only.
 

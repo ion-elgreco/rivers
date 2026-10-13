@@ -107,7 +107,7 @@ Raises `SlingError` when sling exits with an error; the streams that succeeded b
 | `sling/stream` | `str` | The stream. |
 | `sling/object` | `str` | The table or file that sling wrote. |
 | `sling/rows_written` | `int` | Rows that sling wrote for the stream in this run. |
-| `sling/duration_s` | `float` | Seconds the stream took. |
+| `sling/duration` | `MetadataValue.duration` | Seconds the stream took. |
 
 The binary comes from the `sling` package, which downloads it on first use. Set `SLING_BINARY` to use another.
 

@@ -152,8 +152,8 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
 
     [orders] = _events(storage, "main.orders", "Materialization")
     meta = _metadata(orders)
-    kind, duration = meta.pop("sling/duration_s")
-    assert kind == "Float" and duration >= 0
+    kind, duration = meta.pop("sling/duration")
+    assert kind == "Duration" and duration >= 0
     assert meta == {
         "sling/stream": ("Text", _uri(src / "orders.csv")),
         "sling/object": ("Text", "main.orders"),
