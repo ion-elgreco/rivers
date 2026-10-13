@@ -18,6 +18,7 @@ from rivers._core.assets import (
 from rivers.integrations.snowflake.io_handler import (
     SnowflakeIOHandler,
     quote_table,
+    require_partition_expr,
     table_columns,
 )
 
@@ -63,20 +64,24 @@ class SnowflakeAsset(Asset):
                 f"got {type(handler).__name__}"
             )
         schema, table = handler.table_name(ctx.asset_name, ctx.asset_metadata)
-
-        where = ""
         if ctx.partition is not None:
-            predicate = handler.partition_predicate(ctx.asset_metadata, ctx.partition)
-            where = f" WHERE {predicate}"
+            require_partition_expr(ctx.asset_metadata)  # fails before connecting
 
         with handler.get_connection() as con:
             cur = con.cursor()
-            if not table_columns(cur, schema, table):
+            columns = table_columns(cur, schema, table)
+            if not columns:
                 ctx.log.info(
                     "[delete] no table %s.%s — clearing state only", schema, table
                 )
                 return None
 
+            where = ""
+            if ctx.partition is not None:
+                predicate = handler.partition_predicate(
+                    ctx.asset_metadata, ctx.partition, columns
+                )
+                where = f" WHERE {predicate}"
             cur.execute(f"DELETE FROM {quote_table(schema, table)}{where}")
             deleted = cur.rowcount
 

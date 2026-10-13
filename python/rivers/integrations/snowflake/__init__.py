@@ -27,6 +27,7 @@ from rivers.integrations.snowflake.asset import SnowflakeAsset
 from rivers.integrations.snowflake.io_handler import (
     SnowflakeIOHandler,
     SnowflakeWriteMode,
+    table_columns,
 )
 from rivers.integrations.snowflake.resource import SnowflakeResource
 
@@ -35,4 +36,5 @@ __all__ = [
     "SnowflakeIOHandler",
     "SnowflakeResource",
     "SnowflakeWriteMode",
+    "table_columns",
 ]

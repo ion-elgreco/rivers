@@ -82,23 +82,35 @@ def truncate(cls, ctx: rs.ActionContext) -> None:
         con.cursor().execute(f'TRUNCATE TABLE IF EXISTS "{schema}"."{table}"')
 ```
 
-#### `partition_predicate(asset_metadata, partition)`
+#### `partition_predicate(asset_metadata, partition, columns=None)`
 
 Returns a SQL predicate covering the partition(s), honoring `snowflake/partition_expr`. Pass `ctx.asset_metadata` and `ctx.partition`. Raises `ValueError` without `snowflake/partition_expr`.
+
+Daily and hourly keys become ranges. Pass the table's columns from `table_columns` (below) as `columns`: a `DATE` or timestamp column then gets timestamp bounds, so the partition can use any `fmt`. Without `columns`, and on a text column or an expression, the bounds are text in the partition's `fmt`. Snowflake reads such text on a `DATE` or timestamp column in its own formats: `20240105` becomes seconds since 1970, and `05/01/2024` becomes May 1.
 
 Daily and hourly bounds are UTC times: run the predicate on `ctx.io_handler.get_connection()`. In another time zone, it selects other rows of a `TIMESTAMP_LTZ` column.
 
 ```python
+from rivers.integrations.snowflake import table_columns
+
 @rs.action(outcome=rs.Outcome.Unmaterialize)
 @classmethod
 def delete(cls, ctx: rs.ActionContext) -> None:
     schema, table = ctx.io_handler.table_name(ctx.asset_name, ctx.asset_metadata)
-    predicate = ctx.io_handler.partition_predicate(ctx.asset_metadata, ctx.partition)
     with ctx.io_handler.get_connection() as con:
-        con.cursor().execute(f'DELETE FROM "{schema}"."{table}" WHERE {predicate}')
+        cur = con.cursor()
+        columns = table_columns(cur, schema, table)
+        predicate = ctx.io_handler.partition_predicate(
+            ctx.asset_metadata, ctx.partition, columns
+        )
+        cur.execute(f'DELETE FROM "{schema}"."{table}" WHERE {predicate}')
 ```
 
 `partition` is required: reach this only from a keyed action run. [`SnowflakeAsset`](#snowflakeasset) has this `delete` built in.
+
+#### `table_columns(cur, schema, table)`
+
+A function in `rivers.integrations.snowflake`. Returns the columns of `schema.table` from `information_schema.columns` of the cursor's database, as a dict from the uppercased name to a `Column` with `type` (for example `NUMBER`, `TEXT`, `DATE`, or `TIMESTAMP_LTZ`), `precision`, and `scale`. The dict is empty if the table does not exist. The lookup binds `%s` parameters: use a cursor from `ctx.io_handler.get_connection()`.
 
 ---
 

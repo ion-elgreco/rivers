@@ -166,7 +166,7 @@ def events(context: rs.AssetExecutionContext) -> pl.DataFrame:
     ...
 ```
 
-An overwrite deletes the partition's rows and loads the new rows in one transaction. A backfill run with several keys replaces all of them. Daily and hourly keys become ranges, so the column can be text, `DATE`, or a timestamp. The range bounds are in UTC. The expression is SQL, for example `TO_DATE(created_at)`. A name without quotes in it matches the uppercased column: `day` finds `DAY`.
+An overwrite deletes the partition's rows and loads the new rows in one transaction. A backfill run with several keys replaces all of them. Daily and hourly keys become ranges, so the column can be text, `DATE`, or a timestamp. The range bounds are in UTC. A `DATE` or timestamp column gets timestamp bounds, so the partition can use any `fmt`. A text column or an expression gets the bounds as text in the partition's `fmt`. The expression is SQL, for example `TO_DATE(created_at)`. A name without quotes in it matches the uppercased column: `day` finds `DAY`.
 
 A delete locks the table until its transaction ends, so overwrites of one table run one after the other.
 

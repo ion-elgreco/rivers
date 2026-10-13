@@ -234,19 +234,19 @@ class RecordingCursor:
 
 
 @pytest.mark.parametrize(
-    ("results", "exists", "creates"),
+    ("results", "columns", "creates"),
     [
-        ([[("ID", "NUMBER", 38, 0)]], True, []),
-        ([[], [(1,)]], False, []),
-        ([[], [(0,)]], False, ['CREATE SCHEMA IF NOT EXISTS "RAW"']),
+        ([[("ID", "NUMBER", 38, 0)]], {"ID": io_module.Column("NUMBER", 38, 0)}, []),
+        ([[], [(1,)]], {}, []),
+        ([[], [(0,)]], {}, ['CREATE SCHEMA IF NOT EXISTS "RAW"']),
     ],
     ids=["table", "schema", "neither"],
 )
-def test_create_statements_only_run_for_missing_objects(results, exists, creates):
+def test_create_statements_only_run_for_missing_objects(results, columns, creates):
     """A role without the create privilege can still write to existing objects."""
     cur = RecordingCursor(*results)
     output = pa.schema([("id", pa.int64())])
-    assert io_module._prepare_table(cur, "RAW", "T", output) is exists
+    assert io_module._prepare_table(cur, "RAW", "T", output) == columns
     assert [sql for sql in cur.sql if sql.startswith("CREATE")] == creates
 
 
@@ -499,29 +499,176 @@ def test_writes_with_qmark_paramstyle(warehouse, monkeypatch, process_wide):
     ]
 
 
-def test_daily_partition_overwrite_on_a_date_column(warehouse):
+@pytest.mark.parametrize("fmt", ["%Y-%m-%d", "%Y%m%d"])
+def test_daily_partition_overwrite_on_a_date_column(warehouse, fmt):
+    """As text, Snowflake would read the key 20240101 as seconds since 1970."""
     handler = SnowflakeIOHandler(resource=warehouse)
-    definition = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+    definition = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt=fmt)
     meta = {"snowflake/partition_expr": "day"}
 
-    def write(day, value):
+    def partition(day: date) -> rs.PartitionContext:
+        return _partition(definition, rs.PartitionKey.single(day.strftime(fmt)))
+
+    def write(day: date, value: int) -> None:
         handler.handle_output(
             rs.OutputContext(
-                asset_name="t",
-                asset_metadata=meta,
-                partition=_partition(definition, rs.PartitionKey.single(day)),
+                asset_name="t", asset_metadata=meta, partition=partition(day)
             ),
-            pa.table({"day": [date.fromisoformat(day)], "v": [value]}),
+            pa.table({"day": [day], "v": [value]}),
         )
 
-    write("2024-01-01", 1)
-    write("2024-01-02", 2)
-    write("2024-01-01", 3)
+    jan1, jan2, jan3 = (date(2024, 1, day) for day in (1, 2, 3))
+    write(jan1, 1)
+    write(jan2, 2)
+    write(jan3, 3)
+    write(jan2, 4)
 
     assert _rows(warehouse, 'SELECT "DAY", "V" FROM "PUBLIC"."T" ORDER BY "DAY"') == [
-        (date(2024, 1, 1), 3),
-        (date(2024, 1, 2), 2),
+        (jan1, 1),
+        (jan2, 4),
+        (jan3, 3),
     ]
+    read = _load(handler, "t", pa.Table, asset_metadata=meta, partition=partition(jan2))
+    assert read.to_pylist() == [{"day": jan2, "v": 4}]
+
+
+@pytest.mark.parametrize("tz", [None, "UTC"], ids=["timestamp_ntz", "timestamp_ltz"])
+def test_day_first_keys_on_a_timestamp_column(warehouse, tz):
+    """As text, Snowflake would read the key 05/01/2024 (Jan 5) as May 1."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    definition = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 1, 1), fmt="%d/%m/%Y"
+    )
+    meta = {"snowflake/partition_expr": "ts"}
+    jan5 = _partition(definition, rs.PartitionKey.single("05/01/2024"))
+
+    def rows(*stamps: datetime) -> pa.Table:
+        return pa.table(
+            {
+                "ts": pa.array(stamps, pa.timestamp("us", tz=tz)),
+                "v": [stamp.month * 100 + stamp.day for stamp in stamps],
+            }
+        )
+
+    may = [datetime(2024, 5, 1, 10), datetime(2024, 5, 2, 10)]
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"), rows(datetime(2024, 1, 5, 10), *may)
+    )
+    handler.handle_output(
+        rs.OutputContext(asset_name="t", asset_metadata=meta, partition=jan5),
+        rows(datetime(2024, 1, 5, 12)),
+    )
+
+    read = _load(handler, "t", pl.DataFrame).sort("ts")
+    assert read.select(pl.col("ts").dt.strftime("%m-%d %H:%M"), "v").rows() == [
+        ("01-05 12:00", 105),
+        ("05-01 10:00", 501),
+        ("05-02 10:00", 502),
+    ]
+    read = _load(handler, "t", pl.DataFrame, asset_metadata=meta, partition=jan5)
+    assert read["v"].to_list() == [105]
+
+
+def test_first_write_types_the_bounds_of_the_table_it_creates(warehouse, monkeypatch):
+    """The statement itself: fakesnow casts no bounds on an empty table, where
+    Snowflake fails on the text 13/01/2024 (month 13)."""
+    deletes = []
+    write = io_module._write
+
+    def recording(cur, target, stage, delete):
+        deletes.append(delete)
+        write(cur, target, stage, delete)
+
+    monkeypatch.setattr(io_module, "_write", recording)
+    handler = SnowflakeIOHandler(resource=warehouse)
+    definition = rs.PartitionsDefinition.daily(
+        start=datetime(2024, 1, 1), fmt="%d/%m/%Y"
+    )
+
+    handler.handle_output(
+        rs.OutputContext(
+            asset_name="t",
+            asset_metadata={"snowflake/partition_expr": "day"},
+            partition=_partition(definition, rs.PartitionKey.single("13/01/2024")),
+        ),
+        pa.table({"day": [date(2024, 1, 13)]}),
+    )
+
+    fmt = "'YYYY-MM-DD HH24:MI:SS.FF6'"
+    assert deletes == [
+        'DELETE FROM "PUBLIC"."T" WHERE '
+        f"day >= TO_TIMESTAMP_NTZ('2024-01-13 00:00:00.000000', {fmt}) "
+        f"AND day < TO_TIMESTAMP_NTZ('2024-01-14 00:00:00.000000', {fmt})"
+    ]
+    assert _rows(warehouse, 'SELECT "DAY" FROM "PUBLIC"."T"') == [(date(2024, 1, 13),)]
+
+
+@pytest.mark.parametrize(
+    ("expr", "days"),
+    [
+        pytest.param("day", ["20240104", "20240105", "20240106"], id="varchar-column"),
+        pytest.param(
+            "TO_VARCHAR(TO_DATE(day), 'YYYYMMDD')",
+            [date(2024, 1, day) for day in (4, 5, 6)],
+            id="expression",
+        ),
+    ],
+)
+def test_text_partitions_compare_keys_in_their_format(warehouse, expr, days):
+    """A text column or an expression gets the keys as text, in the partition's format."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    definition = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt="%Y%m%d")
+    meta = {"snowflake/partition_expr": expr}
+    jan5 = _partition(definition, rs.PartitionKey.single("20240105"))
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"), pa.table({"day": days, "v": [4, 5, 6]})
+    )
+
+    handler.handle_output(
+        rs.OutputContext(asset_name="t", asset_metadata=meta, partition=jan5),
+        pa.table({"day": days[1:2], "v": [50]}),
+    )
+
+    assert _rows(warehouse, 'SELECT "DAY", "V" FROM "PUBLIC"."T" ORDER BY "DAY"') == [
+        (days[0], 4),
+        (days[1], 50),
+        (days[2], 6),
+    ]
+    read = _load(handler, "t", pa.Table, asset_metadata=meta, partition=jan5)
+    assert read.to_pylist() == [{"day": days[1], "v": 50}]
+
+
+def test_partition_bounds_on_date_and_timestamp_columns_are_typed():
+    """The SQL itself: fakesnow fails on a key such as 20240105 as a date, where
+    Snowflake reads seconds since 1970."""
+    resource = SnowflakeResource(account="unreachable", user="u", password="p")
+    handler = SnowflakeIOHandler(resource=resource)
+    definition = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt="%Y%m%d")
+    partition = _partition(definition, rs.PartitionKey.single("20240105"))
+    columns = {
+        "DAY": io_module.Column("DATE", None, None),
+        "TS": io_module.Column("TIMESTAMP_LTZ", None, None),
+        "KEY": io_module.Column("TEXT", None, None),
+    }
+
+    def predicate(expr: str, columns=columns) -> str:
+        meta = {"snowflake/partition_expr": expr}
+        return handler.partition_predicate(meta, partition, columns)
+
+    def stamp(day: int) -> str:
+        return (
+            f"TO_TIMESTAMP_NTZ('2024-01-{day:02} 00:00:00.000000', "
+            "'YYYY-MM-DD HH24:MI:SS.FF6')"
+        )
+
+    for expr in ("day", "Ts"):
+        assert predicate(expr) == f"{expr} >= {stamp(5)} AND {expr} < {stamp(6)}"
+    assert predicate("key") == "key >= '20240105' AND key < '20240106'"
+    assert predicate("TO_VARCHAR(day, 'YYYYMMDD')") == (
+        "TO_VARCHAR(day, 'YYYYMMDD') >= '20240105' "
+        "AND TO_VARCHAR(day, 'YYYYMMDD') < '20240106'"
+    )
+    assert predicate("day", columns=None) == "day >= '20240105' AND day < '20240106'"
 
 
 @pytest.mark.parametrize("tz", [None, "UTC"], ids=["timestamp_ntz", "timestamp_ltz"])
@@ -634,17 +781,18 @@ def test_multi_partition_overwrite(warehouse):
     ]
 
 
-def test_partitioned_write_needs_partition_expr(warehouse):
-    handler = SnowflakeIOHandler(resource=warehouse)
-    definition = rs.PartitionsDefinition.static_(["us"])
+def test_partitioned_write_and_read_need_partition_expr():
+    """Both fail before connecting."""
+    resource = SnowflakeResource(account="unreachable", user="u", password="p")
+    handler = SnowflakeIOHandler(resource=resource)
+    partition = _partition(_REGIONS, rs.PartitionKey.single("us"))
+
     with pytest.raises(ValueError, match="'snowflake/partition_expr' metadata key"):
         handler.handle_output(
-            rs.OutputContext(
-                asset_name="t",
-                partition=_partition(definition, rs.PartitionKey.single("us")),
-            ),
-            _TABLE,
+            rs.OutputContext(asset_name="t", partition=partition), _TABLE
         )
+    with pytest.raises(ValueError, match="'snowflake/partition_expr' metadata key"):
+        _load(handler, "t", pa.Table, partition=partition)
 
 
 def test_append_mode_and_name_overrides(warehouse):

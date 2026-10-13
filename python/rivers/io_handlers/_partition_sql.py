@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -52,10 +53,24 @@ def _sql_quote(value: str) -> str:
 Filter = tuple[str, str, Any]
 """One delta-rs partition filter: ``(column, op, value)``."""
 
+Bound = Callable[[str, datetime], str | None]
+"""SQL for a time-window bound on a column, or ``None`` for the bound as text in the key format."""
 
-def _time_window_filters(col: str, tw: tuple, fmt: str) -> list[Filter]:
+
+class _Sql(str):
+    """A filter value that :func:`_render` writes as is, not quoted."""
+
+
+def _time_window_filters(
+    col: str, tw: tuple, fmt: str, bound: Bound | None = None
+) -> list[Filter]:
     """Half-open ``col >= start AND col < end`` filters for a time window."""
-    return [(col, ">=", tw[0].strftime(fmt)), (col, "<", tw[1].strftime(fmt))]
+
+    def value(at: datetime) -> str:
+        sql = bound(col, at) if bound is not None else None
+        return at.strftime(fmt) if sql is None else _Sql(sql)
+
+    return [(col, ">=", value(tw[0])), (col, "<", value(tw[1]))]
 
 
 def _col_filters(col: str, values: list[str]) -> list[Filter]:
@@ -66,7 +81,10 @@ def _col_filters(col: str, values: list[str]) -> list[Filter]:
 
 
 def _dim_filters(
-    col: str, vals: list[str], dim_def: PartitionsDefinition | None
+    col: str,
+    vals: list[str],
+    dim_def: PartitionsDefinition | None,
+    bound: Bound | None = None,
 ) -> list[Filter]:
     """Filters for one dimension: a range for a single time-window value."""
     if len(vals) == 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
@@ -75,16 +93,20 @@ def _dim_filters(
         )
         tw = dim_ctx.time_window()
         if tw is not None:
-            return _time_window_filters(col, tw, dim_def.fmt)
+            return _time_window_filters(col, tw, dim_def.fmt, bound)
     return _col_filters(col, vals)
 
 
 def _render(filters: list[Filter], quote: Callable[[str], str]) -> str:
     """The SQL predicate for a conjunction of filters."""
+
+    def literal(value: str) -> str:
+        return value if isinstance(value, _Sql) else quote(value)
+
     return " AND ".join(
-        f"{col} IN ({', '.join(quote(v) for v in value)})"
+        f"{col} IN ({', '.join(literal(v) for v in value)})"
         if op == "in"
-        else f"{col} {op} {quote(value)}"
+        else f"{col} {op} {literal(value)}"
         for col, op, value in filters
     )
 
@@ -94,12 +116,13 @@ def _dim_predicate(
     vals: list[str],
     dim_def: PartitionsDefinition | None,
     quote: Callable[[str], str],
+    bound: Bound | None,
 ) -> str:
     """The SQL predicate for one dimension: an OR of ranges for several time windows."""
     if len(vals) > 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
-        ranges = (_render(_dim_filters(col, [v], dim_def), quote) for v in vals)
+        ranges = (_render(_dim_filters(col, [v], dim_def, bound), quote) for v in vals)
         return "(" + " OR ".join(f"({r})" for r in ranges) + ")"
-    return _render(_dim_filters(col, vals, dim_def), quote)
+    return _render(_dim_filters(col, vals, dim_def, bound), quote)
 
 
 def _dims_for_key(
@@ -150,10 +173,11 @@ def _build_predicate_for_key(
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
     quote: Callable[[str], str],
+    bound: Bound | None,
 ) -> str:
     """Build a SQL predicate for a single partition key."""
     return " AND ".join(
-        _dim_predicate(col, vals, dim_def, quote)
+        _dim_predicate(col, vals, dim_def, quote, bound)
         for col, vals, dim_def in _dims_for_key(key, definition, partition_expr)
     )
 
@@ -180,13 +204,15 @@ def _build_predicate(
     partition: PartitionContext,
     partition_expr: PartitionExpr | None,
     quote: Callable[[str], str] = _sql_quote,
+    bound: Bound | None = None,
 ) -> str:
     """Build a SQL predicate covering all partition keys in the context.
 
     For normal materialization (1 key), produces a simple predicate.
     For backfill with multiple keys, produces an OR of per-key predicates
     or an IN clause when possible. ``quote`` renders each value as a
-    string literal; the default doubles single quotes.
+    string literal; the default doubles single quotes. ``bound`` can
+    render a time window's bounds from their datetimes instead.
     """
     if partition_expr is None:
         raise ValueError(
@@ -196,7 +222,7 @@ def _build_predicate(
     keys = partition.keys
     if len(keys) == 1:
         return _build_predicate_for_key(
-            keys[0], partition.definition, partition_expr, quote
+            keys[0], partition.definition, partition_expr, quote, bound
         )
 
     # Multiple keys (backfill): try to build an efficient combined predicate
@@ -208,7 +234,9 @@ def _build_predicate(
         # Check if time-windowed — need OR of range predicates
         if isinstance(partition.definition, PartitionsDefinition.TimeWindow):
             predicates = [
-                _build_predicate_for_key(k, partition.definition, partition_expr, quote)
+                _build_predicate_for_key(
+                    k, partition.definition, partition_expr, quote, bound
+                )
                 for k in keys
             ]
             return " OR ".join(f"({p})" for p in predicates)
@@ -227,12 +255,12 @@ def _build_predicate(
         partition_expr.expr, dict
     ):
         return _build_factored_multi_predicate(
-            keys, partition.definition, partition_expr, quote
+            keys, partition.definition, partition_expr, quote, bound
         )
 
     # Fallback: OR of individual predicates
     predicates = [
-        _build_predicate_for_key(k, partition.definition, partition_expr, quote)
+        _build_predicate_for_key(k, partition.definition, partition_expr, quote, bound)
         for k in keys
     ]
     if len(predicates) == 1:
@@ -245,6 +273,7 @@ def _build_factored_multi_predicate(
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
     quote: Callable[[str], str],
+    bound: Bound | None,
 ) -> str:
     """Build an optimized predicate for multiple multi-dimension partition keys.
 
@@ -286,13 +315,14 @@ def _build_factored_multi_predicate(
     if expected_count != len(keys):
         # Not a full cartesian product — fall back to OR of individual predicates
         predicates = [
-            _build_predicate_for_key(k, definition, partition_expr, quote) for k in keys
+            _build_predicate_for_key(k, definition, partition_expr, quote, bound)
+            for k in keys
         ]
         return " OR ".join(f"({p})" for p in predicates)
 
     return " AND ".join(
         _dim_predicate(
-            partition_expr.expr[dim], dim_values[dim], dim_defs.get(dim), quote
+            partition_expr.expr[dim], dim_values[dim], dim_defs.get(dim), quote, bound
         )
         for dim in sorted(dim_values)
     )

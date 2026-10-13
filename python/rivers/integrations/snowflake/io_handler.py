@@ -4,8 +4,9 @@ import io
 import json
 import sys
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
+from datetime import datetime
 from enum import StrEnum
 from functools import cache
 from time import monotonic
@@ -19,7 +20,11 @@ from snowflake.connector.cursor import SnowflakeCursor
 from rivers._core import InputContext, MetadataValue, OutputContext
 from rivers._core.partitions import PartitionContext
 from rivers.integrations.snowflake.resource import SnowflakeResource
-from rivers.io_handlers._partition_sql import _build_predicate, _resolve_partition_expr
+from rivers.io_handlers._partition_sql import (
+    PartitionExpr,
+    _build_predicate,
+    _resolve_partition_expr,
+)
 from rivers.io_handlers.base import BaseIOHandler
 
 _FILE_FORMAT = "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE BINARY_AS_TEXT = FALSE"
@@ -91,20 +96,33 @@ class SnowflakeIOHandler(BaseIOHandler):
         self,
         asset_metadata: dict[str, str] | None,
         partition: PartitionContext,
+        columns: Mapping[str, "Column"] | None = None,
     ) -> str:
         """SQL predicate for the partition's rows, from ``snowflake/partition_expr``.
+
+        A daily or hourly key selects a range. On a ``DATE`` or timestamp
+        column in ``columns``, the range bounds are timestamps. On other
+        columns and on expressions, they are text in the partition's format.
+
+        Args:
+            asset_metadata: The asset's metadata.
+            partition: The partition keys.
+            columns: The table's columns, from :func:`table_columns`.
 
         Raises:
             ValueError: If the metadata has no ``snowflake/partition_expr``.
         """
-        expr = _resolve_partition_expr(asset_metadata or {}, "snowflake/partition_expr")
-        if expr is None:
-            raise ValueError(
-                "a partitioned Snowflake asset needs the 'snowflake/partition_expr' "
-                "metadata key to map the partition to the table's columns"
-            )
+        expr = require_partition_expr(asset_metadata)
+        times = {
+            name
+            for name, column in (columns or {}).items()
+            if column.type in _TIMESTAMP_BOUNDS
+        }
 
-        return _build_predicate(partition, expr, quote=_literal)
+        def bound(col: str, at: datetime) -> str | None:
+            return _timestamp(at) if col.upper() in times else None
+
+        return _build_predicate(partition, expr, quote=_literal, bound=bound)
 
     def get_connection(self) -> AbstractContextManager[SnowflakeConnection]:
         """A connection in the handler's session, closed when the block exits.
@@ -143,24 +161,22 @@ class SnowflakeIOHandler(BaseIOHandler):
                 f"got {raw_mode!r}"
             ) from None
 
-        target = quote_table(schema, table)
-        delete = None
-        if mode is SnowflakeWriteMode.OVERWRITE:
-            delete = f"DELETE FROM {target}"
-            if context.partition is not None:
-                delete += f" WHERE {self.partition_predicate(meta, context.partition)}"
+        overwrite = mode is SnowflakeWriteMode.OVERWRITE
+        if overwrite and context.partition is not None:
+            require_partition_expr(meta)  # fails before connecting
 
         reader = _to_reader(obj)
-        columns = ", ".join(
+        definition = ", ".join(
             f"{_quote(field.name)} {_snowflake_type(field.type)}"
             for field in reader.schema
         )
+        target = quote_table(schema, table)
         stage = quote_table(schema, f"RIVERS_STAGE_{uuid.uuid4().hex}")
 
         start = monotonic()
         with self.get_connection() as con:
             cur = con.cursor()
-            exists = _prepare_table(cur, schema, table, reader.schema)
+            columns = _prepare_table(cur, schema, table, reader.schema)
             cur.execute(f"CREATE TEMPORARY STAGE {stage}")
             for number, parquet in enumerate(_parquet_files(reader)):
                 with parquet:
@@ -170,8 +186,16 @@ class SnowflakeIOHandler(BaseIOHandler):
                     )
 
             # after the upload, so that an output that fails to read makes no table
-            if not exists:
-                cur.execute(f"CREATE TABLE IF NOT EXISTS {target} ({columns})")
+            if not columns:
+                cur.execute(f"CREATE TABLE IF NOT EXISTS {target} ({definition})")
+                columns = table_columns(cur, schema, table)
+
+            delete = None
+            if overwrite:
+                delete = f"DELETE FROM {target}"
+                if context.partition is not None:
+                    where = self.partition_predicate(meta, context.partition, columns)
+                    delete += f" WHERE {where}"
             _write(cur, target, stage, delete)
             duration = monotonic() - start
 
@@ -200,14 +224,18 @@ class SnowflakeIOHandler(BaseIOHandler):
 
         meta = context.asset_metadata or {}
         schema, table = self.table_name(context.asset_name, meta)
-        columns = json.loads(meta.get("snowflake/columns", "null"))
-        select = ", ".join(map(_quote, columns)) if columns else "*"
+        selected = json.loads(meta.get("snowflake/columns", "null"))
+        select = ", ".join(map(_quote, selected)) if selected else "*"
         sql = f"SELECT {select} FROM {quote_table(schema, table)}"
         if context.partition is not None:
-            sql += f" WHERE {self.partition_predicate(meta, context.partition)}"
+            require_partition_expr(meta)  # fails before connecting
 
         with self.get_connection() as con:
             cur = con.cursor()
+            if context.partition is not None:
+                columns = table_columns(cur, schema, table)
+                where = self.partition_predicate(meta, context.partition, columns)
+                sql += f" WHERE {where}"
             cur.execute(sql)
             result = cur.fetch_arrow_all(force_return_table=True)
 
@@ -222,6 +250,36 @@ def _quote(name: str) -> str:
 def _literal(value: str) -> str:
     """``value`` as a Snowflake string literal, in which a backslash starts an escape."""
     return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+_TIMESTAMP_BOUNDS = {"DATE", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"}
+
+
+def _timestamp(at: datetime) -> str:
+    """``at`` as a ``TIMESTAMP_NTZ``, parsed with a fixed format, not the session's.
+
+    A ``DATE`` compares as its midnight, and a ``TIMESTAMP_LTZ`` or
+    ``TIMESTAMP_TZ`` column in the session's time zone.
+    """
+    return (
+        f"TO_TIMESTAMP_NTZ('{at.isoformat(' ', 'microseconds')}', "
+        "'YYYY-MM-DD HH24:MI:SS.FF6')"
+    )
+
+
+def require_partition_expr(asset_metadata: dict[str, str] | None) -> PartitionExpr:
+    """The asset's ``snowflake/partition_expr``.
+
+    Raises:
+        ValueError: If the metadata has none.
+    """
+    expr = _resolve_partition_expr(asset_metadata or {}, "snowflake/partition_expr")
+    if expr is None:
+        raise ValueError(
+            "a partitioned Snowflake asset needs the 'snowflake/partition_expr' "
+            "metadata key to map the partition to the table's columns"
+        )
+    return expr
 
 
 def quote_table(schema: str, table: str) -> str:
@@ -246,7 +304,12 @@ class Column(NamedTuple):
 
 
 def table_columns(cur: SnowflakeCursor, schema: str, table: str) -> dict[str, Column]:
-    """The columns of ``schema.table`` by uppercased name, empty if the table does not exist."""
+    """The columns of ``schema.table`` by uppercased name, empty if the table does not exist.
+
+    Reads ``information_schema.columns`` of the cursor's database. ``cur``
+    must bind ``%s`` parameters, as the cursors of
+    :meth:`SnowflakeIOHandler.get_connection` do.
+    """
     cur.execute(
         "SELECT column_name, data_type, numeric_precision, numeric_scale "
         "FROM information_schema.columns "
@@ -258,11 +321,12 @@ def table_columns(cur: SnowflakeCursor, schema: str, table: str) -> dict[str, Co
 
 def _prepare_table(
     cur: SnowflakeCursor, schema: str, table: str, output: pa.Schema
-) -> bool:
-    """Whether ``schema.table`` exists. Check that it holds ``output``, or create a missing schema.
+) -> dict[str, Column]:
+    """The columns of ``schema.table``, empty if it does not exist.
 
-    The schema is looked up first: a ``CREATE`` statement can need the create
-    privilege even when the object exists.
+    Checks that an existing table holds ``output``, or creates a missing
+    schema. The schema is looked up first: a ``CREATE`` statement can need
+    the create privilege even when the object exists.
 
     Raises:
         ValueError: If the table exists without a column of ``output``, or
@@ -270,7 +334,7 @@ def _prepare_table(
     """
     if columns := table_columns(cur, schema, table):
         _check_columns(schema, table, columns, output)
-        return True
+        return columns
 
     cur.execute(
         "SELECT COUNT(*) FROM information_schema.schemata "
@@ -280,7 +344,7 @@ def _prepare_table(
     [(schemas,)] = cur.fetchall()
     if not schemas:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote(schema)}")
-    return False
+    return {}
 
 
 def _check_columns(

@@ -82,23 +82,28 @@ def test_keyed_delete_removes_one_partition(storage, executor_env, warehouse):
     ]
 
 
-def test_backfill_delete_removes_each_day(storage, warehouse):
-    """One run with several daily keys deletes each day's range."""
+@pytest.mark.parametrize("fmt", ["%Y-%m-%d", "%Y%m%d"])
+def test_backfill_delete_removes_each_day(storage, warehouse, fmt):
+    """One run with several daily keys deletes each day's range. As text,
+    Snowflake would read the key 20240101 as seconds since 1970."""
 
     class Daily(SnowflakeAsset):
         name = "daily"
         io_handler = SnowflakeIOHandler(resource=warehouse)
-        partitions_def = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+        partitions_def = rs.PartitionsDefinition.daily(
+            start=datetime(2024, 1, 1), fmt=fmt
+        )
         metadata = {"snowflake/partition_expr": "day"}
 
         @classmethod
         def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
-            return pa.table({"day": [date.fromisoformat(context.partition_key)]})
+            day = datetime.strptime(context.partition_key, fmt).date()
+            return pa.table({"day": [day]})
 
     repo = make_repo([Daily], storage)
-    keys = [rs.PartitionKey.single(f"2024-01-0{day}") for day in (1, 2, 3)]
+    keys = [rs.PartitionKey.single(date(2024, 1, d).strftime(fmt)) for d in (1, 2, 3)]
     for key in keys:
-        repo.materialize(partition_key=key)
+        assert repo.materialize(partition_key=key).success
 
     result = repo.backfill(
         selection=["daily"],
@@ -112,6 +117,27 @@ def test_backfill_delete_removes_each_day(storage, warehouse):
         (date(2024, 1, 2),)
     ]
     assert storage.get_materialized_partitions("daily") == [keys[1]]
+
+
+def test_keyed_delete_of_a_day_on_a_date_column(warehouse):
+    """As text, Snowflake would read the key 20240105 as seconds since 1970 and delete nothing."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    days = [date(2024, 1, day) for day in (4, 5, 6)]
+    handler.handle_output(
+        rs.OutputContext(asset_name="events"), pa.table({"day": days})
+    )
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt="%Y%m%d")
+    partition = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("20240105")], definition=daily
+    )
+
+    meta = {"snowflake/partition_expr": "day"}
+    SnowflakeAsset.delete(_action_context(handler, partition, meta))
+
+    assert _rows(warehouse, 'SELECT "DAY" FROM "PUBLIC"."EVENTS" ORDER BY 1') == [
+        (days[0],),
+        (days[2],),
+    ]
 
 
 def test_backfill_over_days_of_a_timestamp_column(storage, warehouse):

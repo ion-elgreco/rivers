@@ -3,7 +3,11 @@
 from datetime import datetime
 
 import rivers as rs
-from rivers.io_handlers._partition_sql import PartitionExpr, _build_predicate
+from rivers.io_handlers._partition_sql import (
+    PartitionExpr,
+    _build_partition_filters,
+    _build_predicate,
+)
 
 
 def test_backfill_predicate_single_static_multi_keys():
@@ -250,3 +254,61 @@ def test_a_key_with_several_days_selects_each_range():
     )
     expr = PartitionExpr(expr={"region": "region", "date": "ts"})
     assert _build_predicate(us, expr) == f"{ranges} AND region = 'us'"
+
+
+def test_bound_renders_the_time_bounds_of_its_columns():
+    """``bound`` gets each range bound as a datetime; ``None`` keeps the key format's quoted text."""
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt="%Y%m%d")
+    multi = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us", "eu"]), "date": daily}
+    )
+
+    def bound(col: str, at: datetime) -> str | None:
+        return f"<{at:%Y-%m-%d %H:%M}>" if col == "ts" else None
+
+    def predicate(definition, expr, *keys):
+        ctx = rs.PartitionContext(keys=list(keys), definition=definition)
+        return _build_predicate(ctx, PartitionExpr(expr=expr), bound=bound)
+
+    day, next_day = (
+        rs.PartitionKey.single("20240115"),
+        rs.PartitionKey.single("20240116"),
+    )
+    assert predicate(daily, "ts", day) == (
+        "ts >= <2024-01-15 00:00> AND ts < <2024-01-16 00:00>"
+    )
+    assert predicate(daily, "day_text", day) == (
+        "day_text >= '20240115' AND day_text < '20240116'"
+    )
+    assert predicate(daily, "ts", day, next_day) == (
+        "(ts >= <2024-01-15 00:00> AND ts < <2024-01-16 00:00>) OR "
+        "(ts >= <2024-01-16 00:00> AND ts < <2024-01-17 00:00>)"
+    )
+
+    dims = {"region": "region", "date": "ts"}
+    both_days = rs.PartitionKey.multi(
+        {"region": "us", "date": ["20240115", "20240116"]}
+    )
+    assert predicate(multi, dims, both_days) == (
+        "((ts >= <2024-01-15 00:00> AND ts < <2024-01-16 00:00>) OR "
+        "(ts >= <2024-01-16 00:00> AND ts < <2024-01-17 00:00>)) AND region = 'us'"
+    )
+    us, eu = (
+        rs.PartitionKey.multi({"region": region, "date": "20240115"})
+        for region in ("us", "eu")
+    )
+    assert predicate(multi, dims, us, eu) == (
+        "ts >= <2024-01-15 00:00> AND ts < <2024-01-16 00:00> AND region IN ('us', 'eu')"
+    )
+
+
+def test_partition_filters_keep_bounds_as_text():
+    """delta-rs compares the partition values, which are text in the key format."""
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1), fmt="%Y%m%d")
+    ctx = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("20240115")], definition=daily
+    )
+
+    assert _build_partition_filters(ctx, PartitionExpr(expr="day")) == [
+        [("day", ">=", "20240115"), ("day", "<", "20240116")]
+    ]
