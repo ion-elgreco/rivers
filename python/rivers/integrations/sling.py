@@ -310,7 +310,7 @@ class SlingResource(Resource):
                 that is not set.
         """
         outputs = {
-            _normalize(replication.streams[output].name): output
+            replication.streams[output].name: output
             for output in context.output_selection
         }
         env, secrets = self._environment()
@@ -334,9 +334,8 @@ class SlingResource(Resource):
                     errors.append(shown)
 
                 if start := _STREAM_START.match(message):
-                    output = outputs.get(_normalize(start[1]))
-                    stream = replication.streams[output].name if output else start[1]
-                    metadata = {"sling/stream": stream}
+                    output = outputs.get(start[1])
+                    metadata = {"sling/stream": start[1]}
                     started = monotonic()
                 elif rows := _ROWS.match(message):
                     metadata["sling/rows_written"] = int(rows[1])
@@ -458,11 +457,6 @@ def _mask(message: str, secrets: list[str]) -> str:
     for secret in filter(None, secrets):
         message = message.replace(secret, "***")
     return message
-
-
-def _normalize(stream: str) -> str:
-    """A stream name as sling compares them: no quotes, lowercase."""
-    return stream.replace('"', "").replace("`", "").lower()
 
 
 def _digest(value: Any) -> str:
