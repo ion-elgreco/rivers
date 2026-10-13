@@ -20,6 +20,7 @@ pip install rivers[pandera]   # Validate asset outputs against pandera schemas
 pip install rivers[dataframely]  # Validate polars asset outputs against dataframely schemas
 pip install rivers[sling]     # Sling replications as assets
 pip install rivers[databricks] # Databricks jobs as assets
+pip install rivers[dlt]       # dlt sources as assets, one per dlt resource
 ```
 
 The [Airbyte integration](guides/airbyte.md) needs no extra.
