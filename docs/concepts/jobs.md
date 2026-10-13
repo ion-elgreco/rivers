@@ -46,13 +46,13 @@ rs.Job(name="broken", assets=[b, c])
 
 ### Incomplete dependencies
 
-Set `allow_incomplete_deps=True` to allow missing upstream dependencies, provided they have an `io_handler` that can load data externally:
+Set `allow_incomplete_deps=True` to allow missing upstream dependencies. A missing dependency that an asset loads as an input needs an `io_handler` that can load its data. A lineage-only dependency (`AssetDef.dep`) loads nothing, so it needs none:
 
 ```python
 rs.Job(name="partial", assets=[b], allow_incomplete_deps=True)
 ```
 
-Use this when upstream assets are materialized separately and their data can be loaded via IO handlers.
+Use this when upstream assets are materialized separately. `repo.materialize(selection)` applies the same rule to the assets outside the selection.
 
 ### Partitioned execution
 

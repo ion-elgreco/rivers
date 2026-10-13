@@ -33,18 +33,29 @@ fn upstream_params(
     Ok(params)
 }
 
+/// Add the upstream parameters to `deps` and return their names.
 fn append_deps(
     py: Python,
     deps: &mut Vec<NodeRef>,
     func: &Py<PyAny>,
     resource_keys: &HashSet<&String>,
-) -> PyResult<()> {
-    deps.extend(
-        upstream_params(py, func, resource_keys)?
-            .into_iter()
-            .map(NodeRef::ByName),
-    );
-    Ok(())
+) -> PyResult<Vec<String>> {
+    let inputs = upstream_params(py, func, resource_keys)?;
+    deps.extend(inputs.iter().cloned().map(NodeRef::ByName));
+    Ok(inputs)
+}
+
+/// The `AssetDef.dep` names that are not also inputs: they order the asset
+/// but load nothing.
+fn lineage_only<'a>(
+    dep_only_names: impl IntoIterator<Item = &'a String>,
+    inputs: &[String],
+) -> HashSet<String> {
+    dep_only_names
+        .into_iter()
+        .filter(|name| !inputs.contains(name))
+        .cloned()
+        .collect()
 }
 
 pub(crate) struct UnresolvedGraph {
@@ -88,7 +99,7 @@ pub(crate) fn build_unresolved_graph(
         match inner_asset {
             Asset::Single(single_asset) => {
                 let func = single_asset.wraps.as_ref().unwrap();
-                append_deps(py, &mut deps, func, resource_keys)?;
+                let inputs = append_deps(py, &mut deps, func, resource_keys)?;
 
                 // Add lineage-only deps from explicit deps list.
                 for dep_name in &single_asset.dep_only_names {
@@ -98,19 +109,14 @@ pub(crate) fn build_unresolved_graph(
                 let asset_name = single_asset.name.clone().unwrap();
                 claim(&mut claimed, &asset_name)?;
                 unresolved_graph.insert(asset_name.clone(), deps);
-                node_map.insert(
-                    asset_name,
-                    ResolvedNode::Asset(Box::new(ResolvedAsset::new(
-                        py,
-                        decorator_py.clone_ref(py),
-                        None,
-                        partition_defs,
-                    )?)),
-                );
+                let mut resolved =
+                    ResolvedAsset::new(py, decorator_py.clone_ref(py), None, partition_defs)?;
+                resolved.lineage_deps = lineage_only(&single_asset.dep_only_names, &inputs);
+                node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
             }
             Asset::Multi(multi_asset) => {
                 let func = multi_asset.wraps.as_ref().unwrap();
-                append_deps(py, &mut deps, func, resource_keys)?;
+                let inputs = append_deps(py, &mut deps, func, resource_keys)?;
 
                 // Top-level lineage-only deps apply to every output.
                 for dep_name in &multi_asset.dep_only_names {
@@ -132,15 +138,20 @@ pub(crate) fn build_unresolved_graph(
                     }
                     claim(&mut claimed, &asset_name)?;
                     unresolved_graph.insert(asset_name.clone(), per_output_deps);
-                    node_map.insert(
-                        asset_name,
-                        ResolvedNode::Asset(Box::new(ResolvedAsset::new(
-                            py,
-                            decorator_py.clone_ref(py),
-                            Some(output_name),
-                            partition_defs,
-                        )?)),
+                    let mut resolved = ResolvedAsset::new(
+                        py,
+                        decorator_py.clone_ref(py),
+                        Some(output_name),
+                        partition_defs,
+                    )?;
+                    resolved.lineage_deps = lineage_only(
+                        multi_asset
+                            .dep_only_names
+                            .iter()
+                            .chain(&inner.dep_only_names),
+                        &inputs,
                     );
+                    node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
                 }
 
                 // Re-run the per-output compatibility check with registry
@@ -162,7 +173,7 @@ pub(crate) fn build_unresolved_graph(
             }
             Asset::Graph(graph_asset) => {
                 let func = graph_asset.wraps.as_ref().unwrap();
-                append_deps(py, &mut deps, func, resource_keys)?;
+                let inputs = append_deps(py, &mut deps, func, resource_keys)?;
 
                 // Add lineage-only deps from explicit deps list.
                 for dep_name in &graph_asset.dep_only_names {
@@ -178,15 +189,10 @@ pub(crate) fn build_unresolved_graph(
                 let asset_name = graph_asset.name.clone().unwrap();
                 claim(&mut claimed, &asset_name)?;
                 unresolved_graph.insert(asset_name.clone(), deps);
-                node_map.insert(
-                    asset_name,
-                    ResolvedNode::Asset(Box::new(ResolvedAsset::new(
-                        py,
-                        decorator_py.clone_ref(py),
-                        None,
-                        partition_defs,
-                    )?)),
-                );
+                let mut resolved =
+                    ResolvedAsset::new(py, decorator_py.clone_ref(py), None, partition_defs)?;
+                resolved.lineage_deps = lineage_only(&graph_asset.dep_only_names, &inputs);
+                node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
             }
             Asset::External(ext) => {
                 let asset_name = ext.name.clone().unwrap();

@@ -274,7 +274,7 @@ impl PyJob {
         let name_to_idx = rivers_core::assets::graph::name_to_index(graph);
 
         // Validate subgraph completeness, then apply exception rules
-        // (external assets, allow_incomplete_deps + io_handler).
+        // (external assets, allow_incomplete_deps + lineage-only or io_handler).
         if let Err(missing) =
             rivers_core::assets::graph::validate_subgraph_completeness(graph, &node_name_set_owned)
         {
@@ -292,8 +292,10 @@ impl PyJob {
                 }
 
                 if self.allow_incomplete_deps {
-                    let has_handler = dep_node.has_io_handler();
-                    if !has_handler {
+                    let lineage_only = repo_node_map
+                        .get(node.as_str())
+                        .is_some_and(|n| n.is_lineage_dep(&dep_name));
+                    if !lineage_only && !dep_node.has_io_handler() {
                         return Err(GraphValidationError::new_err(format!(
                             "Job '{}': node '{}' depends on '{}' which is not in the job \
                              and has no io_handler",
@@ -333,17 +335,19 @@ impl PyJob {
                 }
             }
             // Include deps not in the job that have io_handlers (external
-            // assets or allow_incomplete_deps).
+            // assets or allow_incomplete_deps). Lineage-only deps load nothing.
             for name in &self.node_names {
                 let node_idx = match name_to_idx.get(name.as_str()) {
                     Some(&idx) => idx,
                     None => continue, // virtual collect step — not in the graph
                 };
+                let node = repo_node_map.get(name.as_str());
                 for dep_idx in graph.neighbors_directed(node_idx, Direction::Outgoing) {
                     let dep_name = &graph[dep_idx].name;
+                    let loads_data = !node.is_some_and(|n| n.is_lineage_dep(dep_name));
                     if !subset.contains_key(dep_name.as_str())
                         && let Some(dep_node) = repo_node_map.get(dep_name.as_str())
-                        && (dep_node.is_external() || self.allow_incomplete_deps)
+                        && (dep_node.is_external() || (self.allow_incomplete_deps && loads_data))
                     {
                         subset.insert(dep_name.clone(), dep_node.clone_ref(py));
                     }

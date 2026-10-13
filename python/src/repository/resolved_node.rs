@@ -85,6 +85,9 @@ pub(crate) struct ResolvedAsset {
     /// This output's IO handler and per-input handlers.
     pub io_handler: Option<IOHandler>,
     pub input_io_handlers: HashMap<String, IOHandler>,
+    /// `AssetDef.dep` deps that are not also inputs: they order the asset
+    /// but load nothing. Set by `build_unresolved_graph`.
+    pub lineage_deps: HashSet<String>,
 }
 
 /// Composition tasks carry override fields propagated from their parent
@@ -375,6 +378,7 @@ impl ResolvedAsset {
             actions,
             io_handler,
             input_io_handlers,
+            lineage_deps: HashSet::new(),
         })
     }
 
@@ -412,6 +416,7 @@ impl ResolvedAsset {
                 .iter()
                 .map(|(k, h)| (k.clone(), h.clone_ref(py)))
                 .collect(),
+            lineage_deps: self.lineage_deps.clone(),
         }
     }
 }
@@ -555,6 +560,11 @@ impl ResolvedNode {
 
     pub fn is_observable_external(&self) -> bool {
         matches!(self, ResolvedNode::Asset(node) if node.is_observable_external)
+    }
+
+    /// Whether `dep` orders this node without loading data (`AssetDef.dep`).
+    pub fn is_lineage_dep(&self, dep: &str) -> bool {
+        matches!(self, ResolvedNode::Asset(node) if node.lineage_deps.contains(dep))
     }
 
     /// For multi-asset outputs, return the output name for this node.
