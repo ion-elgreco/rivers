@@ -56,7 +56,7 @@ def test_outputs_are_the_models_seeds_and_snapshots(shop):
         "dbt/unique_id": "model.shop.customers",
         "dbt/relation": '"warehouse"."main"."customers"',
         "dbt/materialized": "table",
-        "description": "Customers and what they paid.",
+        "dbt/description": "Customers and what they paid.",
         "duckdb/schema": "main",
         "duckdb/table": "customers",
     }

@@ -63,7 +63,7 @@ When the body runs, each argument that is a `DbtResource` is bound to the output
 | `dbt/unique_id` | The resource's unique id, e.g. `model.shop.customers`. |
 | `dbt/relation` | The relation, e.g. `"shop"."main"."customers"`. |
 | `dbt/materialized` | `table`, `view`, `incremental`, `seed`, `snapshot`, ... |
-| `description` | The resource's description, if it has one. |
+| `dbt/description` | The resource's description, if it has one. |
 | `duckdb/schema`, `duckdb/table` | With dbt-duckdb: the table, for [`DuckDBIOHandler`](duckdb.md). |
 
 ---

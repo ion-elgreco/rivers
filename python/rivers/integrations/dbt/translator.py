@@ -35,14 +35,14 @@ class DbtTranslator:
         return list(node.get("tags") or [])
 
     def metadata(self, node: dict[str, Any]) -> dict[str, str]:
-        """Definition metadata: ``dbt/unique_id``, ``dbt/relation``, ``dbt/materialized``, and ``description``."""
+        """Definition metadata: ``dbt/unique_id``, ``dbt/relation``, ``dbt/materialized``, and ``dbt/description``."""
         metadata = {"dbt/unique_id": node["unique_id"]}
         if relation := node.get("relation_name"):
             metadata["dbt/relation"] = relation
         if materialized := (node.get("config") or {}).get("materialized"):
             metadata["dbt/materialized"] = materialized
         if description := node.get("description"):
-            metadata["description"] = description
+            metadata["dbt/description"] = description
         return metadata
 
     def code_version(self, node: dict[str, Any]) -> str | None:

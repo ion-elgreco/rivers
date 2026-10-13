@@ -44,7 +44,7 @@ repo = rs.CodeRepository(
 | Group | The resource's dbt group. |
 | Tags | The resource's dbt tags. |
 | Kinds | `dbt` and the adapter, e.g. `duckdb`. |
-| Metadata | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `description`. With dbt-duckdb, also `duckdb/schema` and `duckdb/table`. |
+| Metadata | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. With dbt-duckdb, also `duckdb/schema` and `duckdb/table`. |
 
 Tests, sources, and ephemeral models are not assets.
 
@@ -224,7 +224,7 @@ Subclass `DbtTranslator` and override a method to change one setting. Each metho
 | `asset_name(node)` | `node["name"]`, with `_v<version>` for a versioned model. |
 | `group(node)` | The dbt group. `None` keeps the group of the definition. |
 | `tags(node)` | The dbt tags. |
-| `metadata(node)` | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `description`. |
+| `metadata(node)` | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. |
 | `code_version(node)` | The checksum of the resource's file. |
 | `upstream_asset(node)` | For a source: `None`, no dep. For a resource outside the selection: `asset_name(node)`. |
 
