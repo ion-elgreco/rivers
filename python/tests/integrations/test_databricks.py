@@ -4,6 +4,7 @@
 sends each request.
 """
 
+import asyncio
 import importlib
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import re
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
@@ -215,6 +217,18 @@ def make_resource(fake: FakeDatabricks, **fields: Any) -> DatabricksResource:
     )
 
 
+@pytest.fixture(params=["sync", "async"])
+def call(request) -> Callable[..., DatabricksRun]:
+    """Calls ``run_job`` or ``submit_run``, or its async version."""
+
+    def call(resource: DatabricksResource, method: str, *args, **kwargs):
+        if request.param == "sync":
+            return getattr(resource, method)(*args, **kwargs)
+        return asyncio.run(getattr(resource, f"async_{method}")(*args, **kwargs))
+
+    return call
+
+
 def make_repo(storage, executor: str, tmp_path, *assets: rs.Asset) -> rs.CodeRepository:
     """A repository with a second step, so the parallel executor uses its workers."""
 
@@ -391,11 +405,11 @@ def test_missing_sdk_names_the_extra(monkeypatch):
 # ── run_job() and submit_run() ───────────────────────────────────────
 
 
-def test_run_job_polls_until_the_run_ends(fake, caplog):
+def test_run_job_polls_until_the_run_ends(fake, caplog, call):
     fake.add(7, Run(70, job_id=7, states=[QUEUED, RUNNING, RUNNING, SUCCESS]))
     caplog.set_level(logging.INFO, logger=databricks_module.__name__)
 
-    run = make_resource(fake).run_job(7)
+    run = call(make_resource(fake), "run_job", 7)
 
     url = f"{fake.host}/jobs/7/runs/70"
     assert run == DatabricksRun(run_id=70, job_id=7, run_page_url=url, duration=12.5)
@@ -408,11 +422,15 @@ def test_run_job_polls_until_the_run_ends(fake, caplog):
     ]
 
 
-def test_run_job_sends_parameters_and_tasks(fake):
+def test_run_job_sends_parameters_and_tasks(fake, call):
     fake.add(7, Run(70, job_id=7, states=[SUCCESS]))
 
-    make_resource(fake).run_job(
-        7, job_parameters={"day": "2024-01-01"}, only=["ingest"]
+    call(
+        make_resource(fake),
+        "run_job",
+        7,
+        job_parameters={"day": "2024-01-01"},
+        only=["ingest"],
     )
 
     assert fake.bodies("run-now") == [
@@ -421,7 +439,7 @@ def test_run_job_sends_parameters_and_tasks(fake):
 
 
 @pytest.mark.parametrize("cancel", [True, False])
-def test_poll_timeout_raises(fake, cancel):
+def test_poll_timeout_raises(fake, cancel, call):
     fake.add(7, Run(70, job_id=7, states=[RUNNING]))
     databricks = make_resource(
         fake, poll_interval=0.01, poll_timeout=0.05, cancel_on_interrupt=cancel
@@ -430,7 +448,7 @@ def test_poll_timeout_raises(fake, cancel):
     with pytest.raises(
         TimeoutError, match=r"^Databricks run 70 did not end within 0.05 s$"
     ):
-        databricks.run_job(7)
+        call(databricks, "run_job", 7)
 
     assert fake.bodies("runs/cancel") == ([{"run_id": 70}] if cancel else [])
 
@@ -441,11 +459,13 @@ class _InterruptWhenRunning(logging.Logger):
             raise KeyboardInterrupt
 
 
-def test_interrupt_cancels_the_run(fake):
+def test_interrupt_cancels_the_run(fake, call):
     fake.add("adhoc", Run(70, job_id=7, states=[RUNNING]))
 
     with pytest.raises(KeyboardInterrupt):
-        make_resource(fake).submit_run(
+        call(
+            make_resource(fake),
+            "submit_run",
             [{"task_key": "main", **NOTEBOOK}],
             run_name="adhoc",
             log=_InterruptWhenRunning("databricks"),
@@ -454,12 +474,28 @@ def test_interrupt_cancels_the_run(fake):
     assert fake.bodies("runs/cancel") == [{"run_id": 70}]
 
 
-def test_failed_cancel_keeps_the_original_error(fake, caplog):
+def test_cancelling_the_async_wait_cancels_the_run(fake):
+    fake.add(7, Run(70, job_id=7, states=[RUNNING]))
+
+    async def cancel_while_running() -> None:
+        wait = asyncio.create_task(make_resource(fake).async_run_job(7))
+        while not fake.bodies("runs/get"):
+            await asyncio.sleep(0.01)
+        wait.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait
+
+    asyncio.run(cancel_while_running())
+
+    assert fake.bodies("runs/cancel") == [{"run_id": 70}]
+
+
+def test_failed_cancel_keeps_the_original_error(fake, caplog, call):
     fake.add(7, Run(70, job_id=7, states=[RUNNING]))
     fake.cancel_fails = True
 
     with pytest.raises(TimeoutError):
-        make_resource(fake, poll_interval=0.01, poll_timeout=0.05).run_job(7)
+        call(make_resource(fake, poll_interval=0.01, poll_timeout=0.05), "run_job", 7)
 
     assert fake.bodies("runs/cancel") == [{"run_id": 70}]
     assert messages(caplog)[-1] == (
@@ -467,7 +503,7 @@ def test_failed_cancel_keeps_the_original_error(fake, caplog):
     )
 
 
-def test_failure_message_has_each_failed_task(fake):
+def test_failure_message_has_each_failed_task(fake, call):
     fake.add(
         7,
         Run(
@@ -506,7 +542,7 @@ def test_failure_message_has_each_failed_task(fake):
     )
 
     with pytest.raises(DatabricksRunError) as raised:
-        make_resource(fake).run_job(7)
+        call(make_resource(fake), "run_job", 7)
 
     assert str(raised.value) == (
         "Databricks run 70 ended with FAILED: 2 tasks failed\n"
@@ -556,17 +592,17 @@ def test_failure_message_has_each_failed_task(fake):
         ),
     ],
 )
-def test_runs_that_end_without_success_raise(fake, state, message):
+def test_runs_that_end_without_success_raise(fake, state, message, call):
     fake.add(7, Run(70, job_id=7, states=[state]))
 
     with pytest.raises(DatabricksRunError) as raised:
-        make_resource(fake).run_job(7)
+        call(make_resource(fake), "run_job", 7)
 
     assert str(raised.value) == f"{message}\n{fake.host}/jobs/7/runs/70"
     assert fake.bodies("runs/cancel") == []
 
 
-def test_outputs_of_successful_notebook_tasks(fake):
+def test_outputs_of_successful_notebook_tasks(fake, call):
     fake.add(
         7,
         Run(
@@ -591,16 +627,18 @@ def test_outputs_of_successful_notebook_tasks(fake):
         ),
     )
 
-    run = make_resource(fake).run_job(7)
+    run = call(make_resource(fake), "run_job", 7)
 
     assert run.outputs == {"totals": "42"}
     assert fake.bodies("runs/get-output") == [{"run_id": "71"}, {"run_id": "72"}]
 
 
-def test_submit_run_takes_sdk_tasks_and_dicts(fake):
+def test_submit_run_takes_sdk_tasks_and_dicts(fake, call):
     fake.add("nightly", Run(80, job_id=8, states=[SUCCESS]))
 
-    run = make_resource(fake).submit_run(
+    run = call(
+        make_resource(fake),
+        "submit_run",
         [
             jobs.SubmitTask(
                 task_key="extract",

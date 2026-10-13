@@ -208,6 +208,8 @@ def customers(context: rs.AssetExecutionContext) -> rs.Materialization:
     return rs.Materialization(metadata={"databricks/run_id": run.run_id, "rows": rows})
 ```
 
+In an `async def` asset, use `async_run_job` and `async_submit_run`. They take the same arguments and wait without blocking the event loop.
+
 A task is a dict in the form of the [Jobs API](https://docs.databricks.com/api/workspace/jobs/submit), or a `databricks.sdk.service.jobs.SubmitTask`. Other keyword arguments go to `WorkspaceClient.jobs.submit`, for example `run_name`, `timeout_seconds`, `git_source`, or `environments` for serverless tasks.
 
 `get_client()` returns a [`databricks.sdk.WorkspaceClient`](https://databricks-sdk-py.readthedocs.io/en/latest/workspace/index.html) for anything else:

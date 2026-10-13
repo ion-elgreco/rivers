@@ -112,8 +112,24 @@ run = databricks.submit_run(
 )
 ```
 
-`run_job`, `submit_run` and the job assets get the state of the run every
-`poll_interval` seconds, and log each new state. They raise:
+#### `async_run_job(job_id, *, job_parameters=None, only=None, log=None)`
+
+`run_job` for async code. It takes the same arguments, returns and raises the same, and
+waits without blocking the event loop.
+
+#### `async_submit_run(tasks, *, log=None, **submit_args)`
+
+`submit_run` for async code, in the same way:
+
+```python
+@rs.Asset(kinds="databricks")
+async def customers(context: rs.AssetExecutionContext) -> rs.Materialization:
+    run = await databricks.async_submit_run(tasks, run_name="customers", log=context.log)
+    return rs.Materialization(metadata={"databricks/run_id": run.run_id})
+```
+
+These methods and the job assets get the state of the run every `poll_interval`
+seconds, and log each new state. They raise:
 
 | Exception | When |
 |-----------|------|
@@ -131,7 +147,8 @@ Returns a `databricks.sdk.WorkspaceClient` for the workspace.
 
 ## `DatabricksRun`
 
-A Databricks run that ended with `SUCCESS`. Returned by `run_job` and `submit_run`.
+A Databricks run that ended with `SUCCESS`. Returned by `run_job`, `submit_run`, and
+their async versions.
 A pydantic model.
 
 | Attribute | Type | Description |

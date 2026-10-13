@@ -17,10 +17,12 @@ Example::
     )
 """
 
+import asyncio
 import copy
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, SecretStr
@@ -236,7 +238,26 @@ class DatabricksResource(Resource):
         """
         client = self.get_client()
         run_id = _run_now(client, job_id, job_parameters, only)
-        return self._result(client, run_id, log)
+        return _result(client, run_id, self._wait(client, run_id, log or _log))
+
+    async def async_run_job(
+        self,
+        job_id: int,
+        *,
+        job_parameters: Mapping[str, str] | None = None,
+        only: Sequence[str] | None = None,
+        log: logging.Logger | None = None,
+    ) -> DatabricksRun:
+        """Run a job of the workspace and wait until the run ends, without
+        blocking the event loop.
+
+        Takes the arguments of :meth:`run_job`, and returns and raises as it
+        does.
+        """
+        client = self.get_client()
+        run_id = await asyncio.to_thread(_run_now, client, job_id, job_parameters, only)
+        run = await self._async_wait(client, run_id, log or _log)
+        return await asyncio.to_thread(_result, client, run_id, run)
 
     def submit_run(
         self,
@@ -266,16 +287,26 @@ class DatabricksResource(Resource):
             TimeoutError: The run did not end within ``poll_timeout``.
         """
         client = self.get_client()
-        run_id = client.jobs.submit(
-            tasks=[
-                jobs.SubmitTask.from_dict(dict(task))
-                if isinstance(task, Mapping)
-                else task
-                for task in tasks
-            ],
-            **submit_args,
-        ).run_id
-        return self._result(client, run_id, log)
+        run_id = _submit(client, tasks, submit_args)
+        return _result(client, run_id, self._wait(client, run_id, log or _log))
+
+    async def async_submit_run(
+        self,
+        tasks: Sequence[jobs.SubmitTask | Mapping[str, Any]],
+        *,
+        log: logging.Logger | None = None,
+        **submit_args: Any,
+    ) -> DatabricksRun:
+        """Submit a one-time run of ``tasks`` and wait until it ends, without
+        blocking the event loop.
+
+        Takes the arguments of :meth:`submit_run`, and returns and raises as
+        it does.
+        """
+        client = self.get_client()
+        run_id = await asyncio.to_thread(_submit, client, tasks, submit_args)
+        run = await self._async_wait(client, run_id, log or _log)
+        return await asyncio.to_thread(_result, client, run_id, run)
 
     def _run_tasks(
         self,
@@ -312,61 +343,66 @@ class DatabricksResource(Resource):
         if _status(run.state) != "SUCCESS":
             context.log.warning(_failure_message(client, run))
 
-    def _result(
-        self, client: WorkspaceClient, run_id: int, log: logging.Logger | None
-    ) -> DatabricksRun:
-        """Wait until run ``run_id`` ends; raise unless it ended with ``SUCCESS``."""
-        run = self._wait(client, run_id, log or _log)
-        if _status(run.state) != "SUCCESS":
-            raise DatabricksRunError(_failure_message(client, run))
-
-        outputs = {}
-        for task in run.tasks or []:
-            output = _notebook_output(client, task)
-            if output is not None:
-                outputs[task.task_key] = output
-
-        return DatabricksRun(
-            run_id=run_id,
-            job_id=run.job_id,
-            run_page_url=run.run_page_url,
-            duration=_seconds(run.start_time, run.end_time),
-            outputs=outputs,
-        )
-
     def _wait(
         self, client: WorkspaceClient, run_id: int, log: logging.Logger
     ) -> jobs.Run:
         """Poll run ``run_id`` until it ends."""
-        started = time.monotonic()
-        last = None
+        progress = _Progress(run_id, self.poll_timeout, log)
         try:
-            while True:
-                run = client.jobs.get_run(run_id)
-                status = _status(run.state)
-                if _ended(run):
-                    log.info("Databricks run %d ended with %s", run_id, status)
-                    return run
-
-                if status != last:
-                    log.info(
-                        "Databricks run %d is %s: %s", run_id, status, run.run_page_url
-                    )
-                    last = status
-
-                if (
-                    self.poll_timeout is not None
-                    and time.monotonic() - started >= self.poll_timeout
-                ):
-                    raise TimeoutError(
-                        f"Databricks run {run_id} did not end "
-                        f"within {self.poll_timeout:g} s"
-                    )
+            while not progress.ended(run := client.jobs.get_run(run_id)):
                 time.sleep(self.poll_interval)
+            return run
         except BaseException:
             if self.cancel_on_interrupt:
                 _cancel(client, run_id, log)
             raise
+
+    async def _async_wait(
+        self, client: WorkspaceClient, run_id: int, log: logging.Logger
+    ) -> jobs.Run:
+        """Poll run ``run_id`` until it ends, without blocking the event loop."""
+        progress = _Progress(run_id, self.poll_timeout, log)
+        try:
+            while not progress.ended(
+                run := await asyncio.to_thread(client.jobs.get_run, run_id)
+            ):
+                await asyncio.sleep(self.poll_interval)
+            return run
+        except BaseException:
+            if self.cancel_on_interrupt:
+                # Not awaited, so a second cancellation cannot stop it.
+                _cancel(client, run_id, log)
+            raise
+
+
+@dataclass
+class _Progress:
+    """Logs each new status of run ``run_id``, and ends the wait for it after
+    ``timeout`` seconds."""
+
+    run_id: int
+    timeout: float | None
+    log: logging.Logger
+    started: float = field(default_factory=time.monotonic)
+    last: str | None = None
+
+    def ended(self, run: jobs.Run) -> bool:
+        status = _status(run.state)
+        if _ended(run):
+            self.log.info("Databricks run %d ended with %s", self.run_id, status)
+            return True
+
+        if status != self.last:
+            self.log.info(
+                "Databricks run %d is %s: %s", self.run_id, status, run.run_page_url
+            )
+            self.last = status
+
+        if self.timeout is not None and time.monotonic() - self.started >= self.timeout:
+            raise TimeoutError(
+                f"Databricks run {self.run_id} did not end within {self.timeout:g} s"
+            )
+        return False
 
 
 def _task_outputs(
@@ -410,6 +446,21 @@ def _run_now(
     ).run_id
 
 
+def _submit(
+    client: WorkspaceClient,
+    tasks: Sequence[jobs.SubmitTask | Mapping[str, Any]],
+    submit_args: Mapping[str, Any],
+) -> int:
+    """Submit a one-time run of ``tasks``, and return the run id."""
+    return client.jobs.submit(
+        tasks=[
+            jobs.SubmitTask.from_dict(dict(task)) if isinstance(task, Mapping) else task
+            for task in tasks
+        ],
+        **submit_args,
+    ).run_id
+
+
 def _parameters(
     job_parameters: _JobParameters | None, context: AssetExecutionContext
 ) -> Mapping[str, str] | None:
@@ -434,6 +485,26 @@ def _status(state: jobs.RunState | None) -> str:
     """The result state of an ended run or task, else its life cycle state."""
     status = state and (state.result_state or state.life_cycle_state)
     return status.value if status else "UNKNOWN"
+
+
+def _result(client: WorkspaceClient, run_id: int, run: jobs.Run) -> DatabricksRun:
+    """The ended ``run``; raises unless it ended with ``SUCCESS``."""
+    if _status(run.state) != "SUCCESS":
+        raise DatabricksRunError(_failure_message(client, run))
+
+    outputs = {}
+    for task in run.tasks or []:
+        output = _notebook_output(client, task)
+        if output is not None:
+            outputs[task.task_key] = output
+
+    return DatabricksRun(
+        run_id=run_id,
+        job_id=run.job_id,
+        run_page_url=run.run_page_url,
+        duration=_seconds(run.start_time, run.end_time),
+        outputs=outputs,
+    )
 
 
 def _run_metadata(run: DatabricksRun) -> dict[str, Any]:
