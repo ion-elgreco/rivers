@@ -99,6 +99,7 @@ impl PyMultiAsset {
                     // the reconstructed view does not preserve it.
                     deps: Vec::new(),
                     actions: a.actions.iter().map(|x| x.clone_ref(py)).collect(),
+                    type_hint: a.type_hint.as_ref().map(|h| h.clone_ref(py)),
                 })
                 .collect(),
             _ => Vec::new(),

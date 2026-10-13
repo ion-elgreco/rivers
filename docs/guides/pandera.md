@@ -150,20 +150,21 @@ To turn validation off, set pandera's `PANDERA_VALIDATION_ENABLED=False`. rivers
 
 ## Multi-asset outputs
 
-Multi-asset outputs have no return hint each. Validate in the body, and attach the metadata with `schema_metadata`:
+A multi-asset has one return hint for all its outputs. Give an output its own hint with `AssetDef(type_hint=...)`. rivers validates that output's frame the same way as a returned frame:
 
 ```python
-from rivers.integrations.pandera import schema_metadata
-
-@rs.Asset.from_multi(output_defs=[rs.AssetDef("orders"), rs.AssetDef("refunds")])
+@rs.Asset.from_multi(
+    output_defs=[
+        rs.AssetDef("orders", type_hint=DataFrame[Orders]),
+        rs.AssetDef("refunds"),
+    ]
+)
 def load():
-    yield rs.Output(
-        Orders.validate(read_orders(), lazy=True),
-        output_name="orders",
-        metadata=schema_metadata(Orders),
-    )
+    yield rs.Output(read_orders(), output_name="orders")
     yield rs.Output(read_refunds(), output_name="refunds")
 ```
+
+An invalid frame fails its output. See [Return type checks](../concepts/assets.md#return-type-checks) for the other outputs.
 
 ## Inputs
 
@@ -174,6 +175,7 @@ rivers validates return values, not inputs: a frame is validated once, when its 
 | Dagster | rivers |
 |---------|--------|
 | `pandera_schema_to_dagster_type(Model)` with `@asset(dagster_type=...)` or `Out(dagster_type=...)` | Return hint `DataFrame[Model]` |
+| `AssetOut(dagster_type=...)` in `@multi_asset` | `AssetDef(name, type_hint=DataFrame[Model])` |
 | `pandera_schema_to_dagster_type(schema)` for a `DataFrameSchema` | Return hint `Annotated[pd.DataFrame, schema]` |
 | Failed `TypeCheck` | `AssetOutputValidationError` with pandera's report |
 | The type's `schema` metadata (a `TableSchema`) | `pandera/schema` metadata on each materialization |

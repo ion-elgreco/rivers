@@ -182,6 +182,15 @@ pub(crate) fn process_step_result(
     };
     let bridge = ctx.repo.bridge;
     let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
+    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
+        .outputs
+        .iter()
+        .map(|name| {
+            let node = ctx.repo.node_map.get(name);
+            let hint = node.and_then(|n| n.output_type_hint());
+            (name.clone(), hint.map(|h| h.clone_ref(py)))
+        })
+        .collect();
     let config_instance = step_result
         .config_instance
         .as_ref()
@@ -211,7 +220,7 @@ pub(crate) fn process_step_result(
     let result = ops::for_each_output(
         py,
         &step_result,
-        &step.outputs,
+        &selected_outputs,
         step_name,
         bridge,
         |py, item| {
@@ -249,13 +258,18 @@ pub(crate) fn process_step_result(
                             let handler = ctx.repo.io_handler_registry.for_output(py, node);
                             OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
                         }
+                        let type_hint = if is_single {
+                            return_hint.as_ref()
+                        } else {
+                            node.output_type_hint()
+                        };
                         let written = ops::handle_step_output(
                             py,
                             &name,
                             node,
                             value,
                             ctx.scope.partition_key,
-                            return_hint.as_ref(),
+                            type_hint,
                             metadata.clone(),
                             ctx.repo.io_handler_registry,
                         )?;

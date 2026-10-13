@@ -1,8 +1,9 @@
 """Integrations with external tools. Each module needs its extra, e.g. ``pip install rivers[slack]``.
 
-An integration can check asset return values typed with its library's types.
-rivers calls its ``validate_output(value, hint)`` when the return hint, or an
-item of an ``Annotated`` return hint, has a type from that library. The
+An integration can check asset values typed with its library's types. rivers
+calls its ``validate_output(value, hint)`` when a type hint, or an item of an
+``Annotated`` hint, has a type from that library. The type hint is an asset's
+return hint or a multi-asset output's ``AssetDef(type_hint=...)``. The
 function returns the value to store, an ``Output`` that also carries
 materialization metadata, or ``NotImplemented`` to leave the hint to the
 ``isinstance`` check. An exception fails the step with
@@ -27,9 +28,8 @@ def output_validator(hint: Any) -> Callable[[Any, Any], Any] | None:
     """Return the ``validate_output`` of the integration that checks ``hint``.
 
     Args:
-        hint: A return hint, e.g. ``pandera.typing.DataFrame[Orders]``, or an
-            item of an ``Annotated`` return hint, e.g. a pandera
-            ``DataFrameSchema``.
+        hint: A type hint, e.g. ``pandera.typing.DataFrame[Orders]``, or an
+            item of an ``Annotated`` hint, e.g. a pandera ``DataFrameSchema``.
 
     Returns:
         The integration's ``validate_output``, or ``None`` when no

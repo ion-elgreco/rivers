@@ -32,7 +32,7 @@ except ImportError as e:
         "rivers.integrations.dataframely needs dataframely: pip install rivers[dataframely]"
     ) from e
 
-__all__ = ["schema_metadata", "validate_output"]
+__all__ = ["validate_output"]
 
 _FRAME_TYPES = {dy.DataFrame: pl.DataFrame, dy.LazyFrame: pl.LazyFrame}
 
@@ -41,16 +41,17 @@ _FIELD_RULES = frozenset({"nullability", "unique"})
 
 
 def validate_output(value: Any, hint: Any) -> Any:
-    """Validate an asset's return value against the dataframely schema in ``hint``.
+    """Validate an asset's value against the dataframely schema in ``hint``.
 
-    rivers calls this for a return hint from dataframely, and for each
-    dataframely schema in an ``Annotated`` return hint. When the schema's
-    ``Config`` sets ``cast = True``, columns are cast to the schema's types
-    before they are checked. A ``LazyFrame`` is checked for its columns and
-    types now; dataframely checks its rows when the frame is collected.
+    rivers calls this for a dataframely type hint, which is a return hint or a
+    multi-asset output's ``AssetDef(type_hint=...)``, and for each dataframely
+    schema in an ``Annotated`` hint. When the schema's ``Config`` sets
+    ``cast = True``, columns are cast to the schema's types before they are
+    checked. A ``LazyFrame`` is checked for its columns and types now;
+    dataframely checks its rows when the frame is collected.
 
     Args:
-        value: The asset's return value.
+        value: The asset's return value, or the value of a multi-asset output.
         hint: A ``dy.DataFrame[Schema]`` or ``dy.LazyFrame[Schema]`` hint, or a
             ``dy.Schema`` subclass.
 
@@ -76,30 +77,11 @@ def validate_output(value: Any, hint: Any) -> Any:
     if isinstance(value, pl.LazyFrame):
         hint.validate(pl.DataFrame(schema=value.collect_schema()), cast=cast)
 
-    return Output(hint.validate(value, cast=cast), metadata=schema_metadata(hint))
+    return Output(hint.validate(value, cast=cast), metadata=_schema_metadata(hint))
 
 
-def schema_metadata(schema: type[dy.Schema]) -> dict[str, Any]:
-    """Describe a dataframely schema as the ``dataframely/schema`` metadata entry.
-
-    rivers adds this entry to every output it validates. Use it for outputs
-    that have no dataframely return hint, e.g. the outputs of a multi-asset.
-
-    Args:
-        schema: A ``dy.Schema`` subclass.
-
-    Returns:
-        ``{"dataframely/schema": MetadataValue.json(...)}``: the schema's name,
-        description, and rules, and each column's name, type, nullability,
-        primary key, uniqueness, description, and checks.
-
-    Example::
-
-        @rs.Asset.from_multi(output_defs=[rs.AssetDef("orders")])
-        def load():
-            orders = Orders.validate(read_orders())
-            yield rs.Output(orders, output_name="orders", metadata=schema_metadata(Orders))
-    """
+def _schema_metadata(schema: type[dy.Schema]) -> dict[str, Any]:
+    """The ``dataframely/schema`` metadata entry that describes ``schema``."""
     table = {
         "name": schema.__name__,
         "description": inspect.cleandoc(schema.__doc__) if schema.__doc__ else None,

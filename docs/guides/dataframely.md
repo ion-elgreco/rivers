@@ -124,20 +124,21 @@ Both executors validate the same way. The parallel executor validates a sync ste
 
 ## Multi-asset outputs
 
-Multi-asset outputs have no return hint each. Validate in the body, and attach the metadata with `schema_metadata`:
+A multi-asset has one return hint for all its outputs. Give an output its own hint with `AssetDef(type_hint=...)`. rivers validates that output's frame the same way as a returned frame:
 
 ```python
-from rivers.integrations.dataframely import schema_metadata
-
-@rs.Asset.from_multi(output_defs=[rs.AssetDef("orders"), rs.AssetDef("refunds")])
+@rs.Asset.from_multi(
+    output_defs=[
+        rs.AssetDef("orders", type_hint=dy.DataFrame[Orders]),
+        rs.AssetDef("refunds"),
+    ]
+)
 def load():
-    yield rs.Output(
-        Orders.validate(read_orders()),
-        output_name="orders",
-        metadata=schema_metadata(Orders),
-    )
+    yield rs.Output(read_orders(), output_name="orders")
     yield rs.Output(read_refunds(), output_name="refunds")
 ```
+
+An invalid frame fails its output. See [Return type checks](../concepts/assets.md#return-type-checks) for the other outputs.
 
 ## Inputs
 
