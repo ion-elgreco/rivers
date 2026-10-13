@@ -4,7 +4,7 @@
 
 ## Return hints
 
-rivers validates the return value when the return hint holds a pandera schema. The integration needs no import for this.
+rivers validates the return value when the return hint holds a pandera schema. The integration needs no import for this. For a multi-asset output, put the same hints in `AssetDef(type_hint=...)`, and rivers validates the output's value.
 
 | Return hint | Checked value | Validation |
 |-------------|---------------|------------|
@@ -43,37 +43,17 @@ The JSON object has these fields:
 
 A check is shown by its description, else its error text (e.g. `"greater_than_or_equal_to(0)"`), else its name.
 
-## `schema_metadata(schema)`
-
-```python
-def schema_metadata(
-    schema: DataFrameSchema | type[DataFrameModel],
-) -> dict[str, MetadataValue]
-```
-
-Returns `{"pandera/schema": MetadataValue.json(...)}` for a schema or a model class. Use it for outputs that have no pandera return hint, such as multi-asset outputs:
-
-```python
-from rivers.integrations.pandera import schema_metadata
-
-yield rs.Output(
-    Orders.validate(frame, lazy=True),
-    output_name="orders",
-    metadata=schema_metadata(Orders),
-)
-```
-
 ## `validate_output(value, hint)`
 
 ```python
 def validate_output(value: Any, hint: Any) -> Any
 ```
 
-The function that rivers calls for a pandera return hint, and for each pandera schema in an `Annotated` return hint.
+The function that rivers calls for a pandera return hint or `AssetDef(type_hint=...)`, and for each pandera schema in an `Annotated` hint.
 
 | Parameter | Description |
 |-----------|-------------|
-| `value` | The asset's return value. |
+| `value` | The asset's return value, or the value of a multi-asset output. |
 | `hint` | A pandera `DataFrame[Model]` or `LazyFrame[Model]` hint, a `DataFrameModel` subclass, or a `DataFrameSchema`. |
 
 **Returns:** an `Output` with the validated frame and the `pandera/schema` metadata, or `NotImplemented` when `hint` holds no schema or `value` is not the hint's frame type.

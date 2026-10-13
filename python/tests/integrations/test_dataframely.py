@@ -21,7 +21,7 @@ from polars.testing import assert_frame_equal  # noqa: E402
 
 import rivers as rs  # noqa: E402
 from rivers.integrations import output_validator  # noqa: E402
-from rivers.integrations.dataframely import schema_metadata, validate_output  # noqa: E402
+from rivers.integrations.dataframely import validate_output  # noqa: E402
 
 
 class Orders(dy.Schema):
@@ -151,10 +151,18 @@ def test_config_cast_stores_the_cast_frame(env, hint):
     def prices() -> hint:
         return pl.DataFrame({"price": [1, 2]})
 
-    repo, result = env.materialize(prices)
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("sale_prices", io_handler=env.handler, type_hint=hint)]
+    )
+    def load():
+        return {"sale_prices": pl.DataFrame({"price": [1, 2]})}
+
+    repo, result = env.materialize(prices, load)
 
     assert result.success
-    assert_frame_equal(repo.load_node("prices"), pl.DataFrame({"price": [1.0, 2.0]}))
+    expected = pl.DataFrame({"price": [1.0, 2.0]})
+    assert_frame_equal(repo.load_node("prices"), expected)
+    assert_frame_equal(repo.load_node("sale_prices"), expected)
 
 
 def test_columns_outside_the_schema_are_dropped(env):
@@ -233,42 +241,54 @@ def test_metadata_the_asset_sets_wins_over_the_schema_entry(env):
         context.add_output_metadata({"dataframely/schema": "see the data contract"})
         return rs.Output(pl.DataFrame(GOOD_ROWS), metadata={"rows": 2})
 
-    _, result = env.materialize(orders)
-
-    assert result.success
-    materialization = env.storage.get_latest_materialization("orders")
-    metadata = {k: json.loads(v) for k, v in materialization.metadata}
-    assert metadata["dataframely/schema"] == {
-        "Text": {"value": "see the data contract"}
-    }
-    assert metadata["rows"] == {"Int": {"value": 2}}
-
-
-def test_multi_asset_output_carries_schema_metadata(env):
     @rs.Asset.from_multi(
         output_defs=[
-            rs.AssetDef("orders", io_handler=env.handler),
-            rs.AssetDef("order_count", io_handler=env.handler),
+            rs.AssetDef(
+                "refunds", io_handler=env.handler, type_hint=dy.DataFrame[Orders]
+            )
+        ],
+    )
+    def load(context: rs.AssetExecutionContext):
+        context.add_output_metadata({"dataframely/schema": "see the data contract"})
+        return {"refunds": rs.Output(pl.DataFrame(GOOD_ROWS), metadata={"rows": 2})}
+
+    _, result = env.materialize(orders, load)
+
+    assert result.success
+    for name in ("orders", "refunds"):
+        materialization = env.storage.get_latest_materialization(name)
+        metadata = {k: json.loads(v) for k, v in materialization.metadata}
+        assert metadata["dataframely/schema"] == {
+            "Text": {"value": "see the data contract"}
+        }
+        assert metadata["rows"] == {"Int": {"value": 2}}
+
+
+@pytest.mark.parametrize("hint", HINTS)
+def test_multi_asset_output_is_validated_against_its_type_hint(env, hint):
+    good, bad = pl.DataFrame(GOOD_ROWS), pl.DataFrame(BAD_ROWS)
+
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("orders", io_handler=env.handler, type_hint=hint),
+            rs.AssetDef("refunds", io_handler=env.handler, type_hint=hint),
         ],
     )
     def load():
-        orders = Orders.validate(pl.DataFrame(GOOD_ROWS))
-        yield rs.Output(orders, output_name="orders", metadata=schema_metadata(Orders))
-        yield rs.Output(len(orders), output_name="order_count")
+        yield rs.Output(good, output_name="orders")
+        yield rs.Output(bad, output_name="refunds")
 
     repo, result = env.materialize(load)
 
-    assert result.success
-    assert repo.load_node("order_count") == 2
+    assert_frame_equal(repo.load_node("orders"), good)
     assert env.stored_json("orders", "dataframely/schema") == ORDERS_SCHEMA
-
-
-def test_schema_metadata_describes_the_schema():
-    [(key, value)] = schema_metadata(Orders).items()
-
-    assert key == "dataframely/schema"
-    assert isinstance(value, rs.MetadataValue.Json)
-    assert json.loads(value.value) == ORDERS_SCHEMA
+    with pytest.raises(dy.exc.ValidationError) as report:
+        Orders.validate(bad)
+    assert dict(result.failed_assets) == {
+        "refunds": "AssetOutputValidationError: Asset 'refunds' returned a value "
+        f"that does not match '{hint}': {report.value}"
+    }
+    assert env.storage.get_latest_materialization("refunds") is None
 
 
 def test_schema_metadata_shows_each_rule_with_its_bound():
@@ -278,7 +298,8 @@ def test_schema_metadata_shows_each_rule_with_its_bound():
         at = dy.Datetime(resolution="1h")
         score = dy.Int64(check={"positive": lambda x: x > 0})
 
-    columns = json.loads(schema_metadata(Mixed)["dataframely/schema"].value)["columns"]
+    out = validate_output(Mixed.create_empty(), Mixed)
+    columns = json.loads(out.metadata["dataframely/schema"].value)["columns"]
 
     assert {column["name"]: column["checks"] for column in columns} == {
         "size": ["is_in=[1, 2, 3]"],
@@ -310,7 +331,7 @@ def test_validate_output_returns_the_validated_frame_and_metadata():
 
     assert isinstance(out, rs.Output)
     assert_frame_equal(out.value, pl.DataFrame({"price": [1.0, 2.0]}))
-    assert out.metadata == schema_metadata(Prices)
+    assert list(out.metadata) == ["dataframely/schema"]
 
 
 def test_missing_dataframely_names_the_extra(monkeypatch):

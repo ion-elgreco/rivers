@@ -37,7 +37,7 @@ Passed to `handle_output()` with information about the asset being written.
 | `asset_name` | `str` | Name of the asset. |
 | `asset_metadata` | `dict[str, str] \| None` | Static metadata from asset definition. |
 | `partition` | `PartitionContext \| None` | Partition info, if partitioned. |
-| `type_hint` | `type \| None` | Return type annotation. |
+| `type_hint` | `type \| None` | The asset's return annotation, or a multi-asset output's `AssetDef(type_hint=...)`. |
 | `output_metadata` | `dict[str, MetadataValue] \| None` | Metadata attached during execution. |
 
 **Methods:**

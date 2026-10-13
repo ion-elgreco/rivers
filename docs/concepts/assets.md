@@ -265,6 +265,23 @@ def row_count() -> int:
 - A pandera or dataframely schema in the annotation validates the frame itself. See [pandera](../guides/pandera.md) and [dataframely](../guides/dataframely.md).
 - With `from __future__ import annotations`, rivers evaluates the annotation in the asset's module. A name that is imported only under `TYPE_CHECKING` fails the step.
 
+A multi-asset has one return annotation for all its outputs. Give an output its own type with `AssetDef(type_hint=...)`. rivers checks each value that the output gets, in a returned dict or a yielded `Output`, with the rules above:
+
+```python
+@rs.Asset.from_multi(
+    output_defs=[
+        rs.AssetDef("users", type_hint=list[str]),
+        rs.AssetDef("user_count", type_hint=int),
+    ]
+)
+def load():
+    users = ["ada", "grace"]
+    yield rs.Output(users, output_name="users")
+    yield rs.Output(len(users), output_name="user_count")
+```
+
+A value that fails the check fails its output with `AssetOutputValidationError`. The outputs that rivers stored before it keep their materialization, and the other outputs fail too (see [Partial failure](#partial-failure)). A `Materialization` or `Observation` output has no value, so rivers does not check it.
+
 Every executor runs the same check. The parallel executor runs it in the worker process.
 
 ## Asset metadata

@@ -371,14 +371,15 @@ pub fn worker_execute_step(
             // Multi-asset: drive the shared iterator over the selected outputs.
             // A `None` handler marks an output kept in memory.
             let mut spec_map: HashMap<String, (Option<Py<PyAny>>, Py<PyAny>)> = HashMap::new();
-            let mut selected_outputs: Vec<String> = Vec::new();
+            let mut selected_outputs: Vec<(String, Option<Py<PyAny>>)> = Vec::new();
             for spec in specs.iter() {
                 let spec_tuple: &Bound<PyTuple> = spec.cast()?;
                 let name: String = spec_tuple.get_item(0)?.extract()?;
                 let handler: Option<Py<PyAny>> = spec_tuple.get_item(1)?.extract()?;
-                let kwargs = spec_tuple.get_item(2)?.unbind();
-                spec_map.insert(name.clone(), (handler, kwargs));
-                selected_outputs.push(name);
+                let kwargs = spec_tuple.get_item(2)?;
+                let type_hint = kwargs.get_item("type_hint")?.extract()?;
+                spec_map.insert(name.clone(), (handler, kwargs.unbind()));
+                selected_outputs.push((name, type_hint));
             }
 
             ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
