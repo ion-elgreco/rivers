@@ -36,8 +36,10 @@ hidden from `repr()` and from the UI's launch dialog.
 
 #### `job_asset(job_id, *, name, tasks=None, job_parameters=None, **asset_options)`
 
-Returns an asset that runs job `job_id` of the workspace. The job is not read when the
-asset is made: a wrong job id or task key fails when the asset runs.
+Returns an asset that runs job `job_id` of the workspace. The asset's function is
+async, so its step waits for the run without holding a worker of the executor. The job
+is not read when the asset is made: a wrong job id or task key fails when the asset
+runs.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -49,7 +51,7 @@ asset is made: a wrong job id or task key fails when the asset runs.
 
 Raises `ValueError` when `tasks` is empty, or when two tasks get the same output name.
 
-Without `tasks`, the asset is a `SingleAsset`. A run calls `run_job()` and records a
+Without `tasks`, the asset is a `SingleAsset`. A run calls `async_run_job()` and records a
 [`Materialization`](assets.md#materialization) with this metadata:
 
 | Key | Type | Description |

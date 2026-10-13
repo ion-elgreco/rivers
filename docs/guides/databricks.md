@@ -160,7 +160,7 @@ Python script and wheel tasks have no exit value. Their output stays on the run 
 
 The step of a job asset only starts the run and waits for it. A Databricks cluster or serverless compute does the work: set it in the job or its tasks. On Kubernetes, [`compute=`](../concepts/compute.md) sizes the pod of the waiting step, so a small value is enough. It does not change Databricks compute, and neither does retry escalation.
 
-The waiting step holds its place in the executor's step budget, and its [pool](../concepts/concurrency.md#concurrency-pools) slots, until the run ends. To limit how many Databricks runs a backfill starts at the same time, give the assets a pool:
+The function of a job asset is async, so its step waits without holding a worker of the executor, and the job assets of one level wait at the same time: all of them with the parallel executor (`max_async_concurrent` limits them), and up to four with the in-process executor. A waiting step keeps its [pool](../concepts/concurrency.md#concurrency-pools) slots until the run ends. To limit how many Databricks runs a backfill starts at the same time, give the assets a pool:
 
 ```python
 daily_sales = databricks.job_asset(123, name="daily_sales", partitions_def=daily, pool="databricks")

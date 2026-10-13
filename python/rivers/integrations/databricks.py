@@ -21,7 +21,7 @@ import asyncio
 import copy
 import logging
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -159,8 +159,9 @@ class DatabricksResource(Resource):
         materialization; the other selected outputs fail with
         :class:`DatabricksRunError`.
 
-        The job is not read when the asset is made: a wrong job id or task key
-        fails when the asset runs.
+        The asset's function is async, so the step waits for the run without
+        holding a worker of the executor. The job is not read when the asset
+        is made: a wrong job id or task key fails when the asset runs.
 
         Args:
             job_id: The job to run.
@@ -187,8 +188,8 @@ class DatabricksResource(Resource):
         asset_options.setdefault("kinds", ["databricks"])
         if tasks is None:
 
-            def run_job(context: AssetExecutionContext) -> Materialization:
-                run = self.run_job(
+            async def run_job(context: AssetExecutionContext) -> Materialization:
+                run = await self.async_run_job(
                     job_id,
                     job_parameters=_parameters(job_parameters, context),
                     log=context.log,
@@ -199,10 +200,13 @@ class DatabricksResource(Resource):
 
         task_keys, output_defs = _task_outputs(name, tasks)
 
-        def run_tasks(context: AssetExecutionContext) -> Iterator[Materialization]:
-            yield from self._run_tasks(
+        async def run_tasks(
+            context: AssetExecutionContext,
+        ) -> AsyncIterator[Materialization]:
+            async for materialization in self._run_tasks(
                 job_id, task_keys, _parameters(job_parameters, context), context
-            )
+            ):
+                yield materialization
 
         return Asset.from_multi(
             run_tasks, output_defs=output_defs, name=name, **asset_options
@@ -308,19 +312,18 @@ class DatabricksResource(Resource):
         run = await self._async_wait(client, run_id, log or _log)
         return await asyncio.to_thread(_result, client, run_id, run)
 
-    def _run_tasks(
+    async def _run_tasks(
         self,
         job_id: int,
         task_keys: dict[str, str],
         job_parameters: Mapping[str, str] | None,
         context: AssetExecutionContext,
-    ) -> Iterator[Materialization]:
+    ) -> AsyncIterator[Materialization]:
         selected = {output: task_keys[output] for output in context.output_selection}
         only = None if len(selected) == len(task_keys) else list(selected.values())
         client = self.get_client()
-        run = self._wait(
-            client, _run_now(client, job_id, job_parameters, only), context.log
-        )
+        run_id = await asyncio.to_thread(_run_now, client, job_id, job_parameters, only)
+        run = await self._async_wait(client, run_id, context.log)
 
         tasks = {task.task_key: task for task in run.tasks or []}
         failed: list[jobs.RunTask] = []
@@ -332,16 +335,15 @@ class DatabricksResource(Resource):
             elif _status(task.state) != "SUCCESS":
                 failed.append(task)
             else:
-                yield Materialization(
-                    output_name=output, metadata=_task_metadata(client, run, task)
-                )
+                metadata = await asyncio.to_thread(_task_metadata, client, run, task)
+                yield Materialization(output_name=output, metadata=metadata)
 
         if failed or missing:
-            lines = [_failure_message(client, run, failed)]
+            lines = [await asyncio.to_thread(_failure_message, client, run, failed)]
             lines.extend(f"Task {key} is not in the run" for key in missing)
             raise DatabricksRunError("\n".join(lines))
         if _status(run.state) != "SUCCESS":
-            context.log.warning(_failure_message(client, run))
+            context.log.warning(await asyncio.to_thread(_failure_message, client, run))
 
     def _wait(
         self, client: WorkspaceClient, run_id: int, log: logging.Logger

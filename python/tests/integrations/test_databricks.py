@@ -24,7 +24,6 @@ pytest.importorskip("databricks.sdk")
 
 from databricks.sdk import WorkspaceClient  # noqa: E402
 from databricks.sdk.service import jobs  # noqa: E402
-from obstore.store import LocalStore  # noqa: E402
 
 import rivers as rs  # noqa: E402
 from rivers.integrations import databricks as databricks_module  # noqa: E402
@@ -33,7 +32,6 @@ from rivers.integrations.databricks import (  # noqa: E402
     DatabricksRun,
     DatabricksRunError,
 )
-from rivers.io_handlers import PickleIOHandler  # noqa: E402
 
 TOKEN = "dapi-test"
 START = 1_700_000_000_000  # epoch ms
@@ -55,6 +53,8 @@ class Run:
     """How the fake reports one run.
 
     ``runs/get`` returns ``states`` in order and then repeats the last one.
+    With ``waits_for``, the run stays at its first state until that run has
+    started.
     """
 
     run_id: int
@@ -62,6 +62,7 @@ class Run:
     states: list[dict]
     tasks: list[dict] = field(default_factory=list)
     outputs: dict[int, dict] = field(default_factory=dict)  # task run id -> get-output
+    waits_for: int | None = None
 
 
 class Request(NamedTuple):
@@ -143,8 +144,11 @@ class FakeDatabricks:
             return 200, self._get(self._started[run_id])
 
     def _get(self, run: Run) -> dict:
-        poll = self._polls[run.run_id] = self._polls.get(run.run_id, 0) + 1
-        state = run.states[min(poll, len(run.states)) - 1]
+        if run.waits_for is not None and run.waits_for not in self._started:
+            state = run.states[0]
+        else:
+            poll = self._polls[run.run_id] = self._polls.get(run.run_id, 0) + 1
+            state = run.states[min(poll, len(run.states)) - 1]
         if run.run_id in self._canceled:
             state = {"life_cycle_state": "TERMINATED", "result_state": "CANCELED"}
         ended = state["life_cycle_state"] in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")
@@ -229,15 +233,9 @@ def call(request) -> Callable[..., DatabricksRun]:
     return call
 
 
-def make_repo(storage, executor: str, tmp_path, *assets: rs.Asset) -> rs.CodeRepository:
-    """A repository with a second step, so the parallel executor uses its workers."""
-
-    @rs.Asset(io_handler=PickleIOHandler(store=LocalStore(str(tmp_path), mkdir=True)))
-    def pid() -> int:
-        return os.getpid()
-
+def make_repo(storage, executor: str, *assets: rs.Asset) -> rs.CodeRepository:
     repo = rs.CodeRepository(
-        assets=[*assets, pid],
+        assets=list(assets),
         default_executor=rs.Executor.in_process()
         if executor == "in_process"
         else rs.Executor.parallel(max_workers=2),
@@ -693,7 +691,7 @@ def test_submit_run_takes_sdk_tasks_and_dicts(fake, call):
 # ── job_asset() without tasks ────────────────────────────────────────
 
 
-def test_job_asset_runs_the_job(fake, storage, executor, tmp_path):
+def test_job_asset_runs_the_job(fake, storage, executor):
     fake.add(
         7,
         Run(
@@ -707,12 +705,15 @@ def test_job_asset_runs_the_job(fake, storage, executor, tmp_path):
     asset = make_resource(fake).job_asset(
         7, name="daily_sales", job_parameters={"day": "2024-01-01"}
     )
-    repo = make_repo(storage, executor, tmp_path, asset)
+    repo = make_repo(storage, executor, asset)
 
     assert repo.materialize().success
 
-    assert (repo.load_node("pid") != os.getpid()) == (executor == "parallel")
-    assert (asset.name, asset.kinds) == ("daily_sales", ["databricks"])
+    assert (asset.name, asset.kinds, asset.is_async) == (
+        "daily_sales",
+        ["databricks"],
+        True,
+    )
     assert fake.bodies("run-now") == [
         {"job_id": 7, "job_parameters": {"day": "2024-01-01"}}
     ]
@@ -727,7 +728,6 @@ def test_job_parameters_from_the_partition(fake, storage, executor):
     fake.add(8, Run(80, job_id=8, states=[SUCCESS]))
     databricks = make_resource(fake)
     days = rs.PartitionsDefinition.static_(["2024-01-01", "2024-01-02"])
-    # Two steps, so the parallel executor sends the functions to its workers.
     assets = [
         databricks.job_asset(
             job_id,
@@ -737,13 +737,7 @@ def test_job_parameters_from_the_partition(fake, storage, executor):
         )
         for job_id in (7, 8)
     ]
-    repo = rs.CodeRepository(
-        assets=assets,
-        default_executor=rs.Executor.in_process()
-        if executor == "in_process"
-        else rs.Executor.parallel(max_workers=2),
-    )
-    repo.resolve(storage=storage)
+    repo = make_repo(storage, executor, *assets)
 
     assert repo.materialize(partition_key=rs.PartitionKey.single("2024-01-02")).success
 
@@ -753,7 +747,7 @@ def test_job_parameters_from_the_partition(fake, storage, executor):
     ]
 
 
-def test_failed_job_fails_the_asset(fake, storage, executor, tmp_path):
+def test_failed_job_fails_the_asset(fake, storage, executor):
     fake.add(
         7,
         Run(
@@ -769,7 +763,6 @@ def test_failed_job_fails_the_asset(fake, storage, executor, tmp_path):
     repo = make_repo(
         storage,
         executor,
-        tmp_path,
         databricks.job_asset(7, name="orders"),
         databricks.job_asset(8, name="customers"),
     )
@@ -786,12 +779,10 @@ def test_failed_job_fails_the_asset(fake, storage, executor, tmp_path):
     assert fake.bodies("runs/cancel") == []
 
 
-def test_poll_timeout_fails_the_asset_with_reason_timeout(fake, storage, tmp_path):
+def test_poll_timeout_fails_the_asset_with_reason_timeout(fake, storage):
     fake.add(7, Run(70, job_id=7, states=[RUNNING]))
     databricks = make_resource(fake, poll_interval=0.01, poll_timeout=0.05)
-    repo = make_repo(
-        storage, "in_process", tmp_path, databricks.job_asset(7, name="orders")
-    )
+    repo = make_repo(storage, "in_process", databricks.job_asset(7, name="orders"))
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -807,7 +798,7 @@ def test_poll_timeout_fails_the_asset_with_reason_timeout(fake, storage, tmp_pat
     assert fake.bodies("runs/cancel") == [{"run_id": 70}]
 
 
-def test_job_asset_retries(fake, storage, executor, tmp_path):
+def test_job_asset_retries(fake, storage, executor):
     fake.add(
         7,
         Run(70, job_id=7, states=[FAILED]),
@@ -818,12 +809,45 @@ def test_job_asset_retries(fake, storage, executor, tmp_path):
         name="orders",
         retry=rs.RetryPolicy(max_retries=1, retry_on=[DatabricksRunError]),
     )
-    repo = make_repo(storage, executor, tmp_path, asset)
+    repo = make_repo(storage, executor, asset)
 
     assert repo.materialize().success
 
     assert fake.bodies("run-now") == [{"job_id": 7}] * 2
     assert materializations(storage, "orders") == [run_metadata(fake, 71, 7)]
+
+
+@pytest.mark.parametrize("with_tasks", [False, True], ids=["job", "tasks"])
+def test_job_assets_wait_at_the_same_time(fake, storage, executor, with_tasks):
+    """Each job's run ends only once the other job's run has started, so the
+    two assets succeed only when they wait at the same time."""
+    for job_id, other_run in ((7, 80), (8, 70)):
+        main = task("main", job_id * 10 + 1, SUCCESS)
+        fake.add(
+            job_id,
+            Run(
+                job_id * 10,
+                job_id=job_id,
+                states=[RUNNING, SUCCESS],
+                tasks=[main],
+                waits_for=other_run,
+            ),
+        )
+    databricks = make_resource(fake, poll_interval=0.01, poll_timeout=5)
+    repo = make_repo(
+        storage,
+        executor,
+        *(
+            databricks.job_asset(
+                job_id,
+                name=f"job_{job_id}",
+                tasks={"main": rs.AssetDef(f"main_{job_id}")} if with_tasks else None,
+            )
+            for job_id in (7, 8)
+        ),
+    )
+
+    assert repo.materialize().success
 
 
 # ── job_asset() with tasks ───────────────────────────────────────────
@@ -870,7 +894,7 @@ def test_bad_tasks_raise(tasks, message):
         DatabricksResource().job_asset(9, name="sales", tasks=tasks)
 
 
-def test_each_task_records_its_output(fake, storage, executor, tmp_path):
+def test_each_task_records_its_output(fake, storage, executor):
     fake.add(
         9,
         Run(
@@ -887,7 +911,7 @@ def test_each_task_records_its_output(fake, storage, executor, tmp_path):
         tasks=["orders", "refunds"],
         job_parameters={"day": "2024-01-01"},
     )
-    repo = make_repo(storage, executor, tmp_path, asset)
+    repo = make_repo(storage, executor, asset)
 
     assert repo.materialize().success
 
@@ -900,7 +924,7 @@ def test_each_task_records_its_output(fake, storage, executor, tmp_path):
     assert materializations(storage, "refunds") == [task_metadata(fake, "refunds", 92)]
 
 
-def test_subset_runs_only_the_selected_tasks(fake, storage, tmp_path):
+def test_subset_runs_only_the_selected_tasks(fake, storage):
     excluded = {"life_cycle_state": "TERMINATED", "result_state": "EXCLUDED"}
     fake.add(
         9,
@@ -912,7 +936,7 @@ def test_subset_runs_only_the_selected_tasks(fake, storage, tmp_path):
         ),
     )
     asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", tmp_path, asset)
+    repo = make_repo(storage, "in_process", asset)
 
     assert repo.materialize(selection=["refunds"]).success
 
@@ -921,7 +945,7 @@ def test_subset_runs_only_the_selected_tasks(fake, storage, tmp_path):
     assert materializations(storage, "refunds") == [task_metadata(fake, "refunds", 92)]
 
 
-def test_failed_task_fails_only_its_output(fake, storage, executor, tmp_path):
+def test_failed_task_fails_only_its_output(fake, storage, executor):
     fake.add(
         9,
         Run(
@@ -936,7 +960,7 @@ def test_failed_task_fails_only_its_output(fake, storage, executor, tmp_path):
         ),
     )
     asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, executor, tmp_path, asset)
+    repo = make_repo(storage, executor, asset)
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -949,7 +973,7 @@ def test_failed_task_fails_only_its_output(fake, storage, executor, tmp_path):
     ]
 
 
-def test_task_missing_from_the_run_fails_its_output(fake, storage, tmp_path):
+def test_task_missing_from_the_run_fails_its_output(fake, storage):
     fake.add(
         9,
         Run(
@@ -961,7 +985,7 @@ def test_task_missing_from_the_run_fails_its_output(fake, storage, tmp_path):
         ),
     )
     asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", tmp_path, asset)
+    repo = make_repo(storage, "in_process", asset)
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -973,7 +997,7 @@ def test_task_missing_from_the_run_fails_its_output(fake, storage, tmp_path):
     ]
 
 
-def test_failed_task_without_an_output_is_logged(fake, storage, tmp_path, caplog):
+def test_failed_task_without_an_output_is_logged(fake, storage, caplog):
     fake.add(
         9,
         Run(
@@ -988,7 +1012,7 @@ def test_failed_task_without_an_output_is_logged(fake, storage, tmp_path, caplog
         ),
     )
     asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", tmp_path, asset)
+    repo = make_repo(storage, "in_process", asset)
 
     assert repo.materialize().success
 
