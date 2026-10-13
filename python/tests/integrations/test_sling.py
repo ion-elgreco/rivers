@@ -166,26 +166,20 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
     assert _rows(tmp_path, "SELECT id, email FROM users ORDER BY id") == USERS
     assert repo.load_node("order_total") == 60.75
 
-    parallel = isinstance(executor_env[0], rs.Executor.Parallel)
     [orders] = _events(storage, "main.orders", "Materialization")
     meta = _metadata(orders)
     kind, duration = meta.pop("sling/duration_s")
-    assert isinstance(duration, float) and duration >= 0
-    expected = {
+    assert kind == "Float" and duration >= 0
+    assert meta == {
         "sling/stream": ("Text", _uri(src / "orders.csv")),
         "sling/object": ("Text", "main.orders"),
         "sling/rows_written": ("Int", 3),
     }
-    assert {key: value for key, (_, value) in meta.items()} == {
-        key: value for key, (_, value) in expected.items()
-    }
-    if not parallel:  # a parallel worker does not keep every metadata type yet
-        assert (meta, kind) == (expected, "Float")
     [users] = _events(storage, "main.users", "Materialization")
     assert _values(users)["sling/rows_written"] == 2
 
     in_worker = int((tmp_path / "raw.pid").read_text()) != os.getpid()
-    assert in_worker == parallel
+    assert in_worker == isinstance(executor_env[0], rs.Executor.Parallel)
 
 
 def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, executor_env):
