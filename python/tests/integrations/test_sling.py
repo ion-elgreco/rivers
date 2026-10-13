@@ -8,7 +8,6 @@ import importlib
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from contextlib import closing
 from datetime import date
@@ -17,17 +16,8 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
-
-# `import sling` downloads the sling binary on first use: skip when that fails.
-try:
-    subprocess.run(
-        [sys.executable, "-c", "import sling"],
-        check=True,
-        capture_output=True,
-        timeout=300,
-    )
-except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-    pytest.skip(f"no sling binary: {e}", allow_module_level=True)
+if not os.environ.get("SLING_BINARY"):
+    pytest.skip("no sling binary (see conftest.py)", allow_module_level=True)
 
 from pydantic import SecretStr, ValidationError  # noqa: E402
 
@@ -393,6 +383,15 @@ def test_secret_property_reaches_sling(tmp_path, src, storage, executor_env):
     repo = _repo(
         tmp_path, storage, replication, executor=executor_env[0], resource=resource
     )
+
+    assert repo.materialize().success
+    assert _rows(tmp_path, "SELECT id, item, amount FROM orders ORDER BY id") == ORDERS
+
+
+def test_sling_package_finds_the_binary(tmp_path, src, storage, monkeypatch):
+    monkeypatch.delenv("SLING_BINARY")
+    replication = SlingReplication(_replication(src, "orders"))
+    repo = _repo(tmp_path, storage, replication)
 
     assert repo.materialize().success
     assert _rows(tmp_path, "SELECT id, item, amount FROM orders ORDER BY id") == ORDERS
