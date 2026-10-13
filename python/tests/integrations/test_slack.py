@@ -44,9 +44,16 @@ def test_resource_reads_token_from_env(monkeypatch):
     monkeypatch.setenv("SLACK_TOKEN", "xoxb-from-env")
     slack = SlackResource()
     client = slack.get_client()
-    assert slack.token == "xoxb-from-env"
+    assert slack.token.get_secret_value() == "xoxb-from-env"
     assert isinstance(client, WebClient)
     assert client.token == "xoxb-from-env"
+
+
+def test_token_is_a_secret():
+    slack = SlackResource(token="xoxb-explicit")
+    assert slack.get_client().token == "xoxb-explicit"
+    assert "xoxb-explicit" not in repr(slack)
+    assert "xoxb-explicit" not in slack.model_dump_json()
 
 
 def test_missing_sdk_names_the_extra(monkeypatch):

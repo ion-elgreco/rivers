@@ -3,7 +3,7 @@
 from typing import Any, get_args, get_origin
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Json, computed_field
 from pydantic_settings import BaseSettings
 
 import rivers as rs
@@ -1934,6 +1934,28 @@ def test_resource_override_is_checked_by_the_class():
     with pytest.raises(ConfigurationError, match="no resource 'nope'"):
         repo.materialize(config={"resources": {"nope": {"size": 1}}})
     assert repo.storage.get_runs(limit=10) == []
+
+
+def test_resource_override_keeps_json_and_computed_fields():
+    """The run rebuilds the resource from the fields its class validates
+    back: a `Json` field as its text, and no computed field."""
+
+    class Client(rs.Resource):
+        region: str = "eu"
+        options: Json[dict] = '{"retries": 3}'
+
+        @computed_field
+        @property
+        def endpoint(self) -> str:
+            return f"https://{self.region}.example"
+
+    @rs.Asset
+    def used(client: Client) -> tuple:
+        return client.endpoint, client.options
+
+    repo = rs.CodeRepository(assets=[used], resources={"client": Client()})
+    repo.materialize(config={"resources": {"client": {"region": "us"}}})
+    assert repo.load_node("used") == ("https://us.example", {"retries": 3})
 
 
 def test_io_handler_resource_cannot_be_overridden():

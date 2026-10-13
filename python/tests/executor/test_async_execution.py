@@ -1063,6 +1063,7 @@ def test_parallel_max_async_concurrent_none_is_unbounded(tmp_path):
     )
 
 
+@pytest.mark.serial
 @pytest.mark.skipif(
     os.environ.get("CI") == "true",
     reason="Timing-sensitive: CI runners have limited vCPUs",

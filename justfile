@@ -13,8 +13,13 @@ profile_dir := if profile == "dev" { "debug" } else { profile }
 # The pod-side binary the k8s tests run (python/tests/k8s), built by `_runtime-bin`.
 runtime_bin := justfile_directory() + "/target/" + profile_dir + "/rivers-runtime"
 
+# pytest-xdist: one worker per CPU. `xdist_group` keeps a group's tests on one worker;
+# the test recipes run `serial` tests alone afterwards.
+xdist := "-n logical --dist loadgroup"
+
 # Pinned zig for the maturin/zigbuild builds — zig releases change bundled-clang
-# behavior. Keep in sync with the pipx install in .github/actions/setup-env.
+# behavior. Keep in sync with the pipx install in .github/actions/setup-env
+# and the maturin install in .github/workflows/python_build.yaml.
 
 ziglang_version := "0.16.0"
 
@@ -66,15 +71,18 @@ _runtime-bin:
 
 # Run Python tests
 test: _runtime-bin
-    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m serial python/
 
 # Run Python tests on free-threaded Python; an import that turns the GIL back on fails
 test-ft: _runtime-bin
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest python/
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest {{ xdist }} -m "not serial" python/
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest -m serial python/
 
 # Run Python tests (excluding spark tests)
 test-dev: _runtime-bin
-    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "not spark_test" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not spark_test and not serial" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "serial and not spark_test" python/
 
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
@@ -82,12 +90,11 @@ test-dev: _runtime-bin
 # - `rivers` (PyO3 cdylib) is excluded; its Rust unit tests need a libpython
 #   link step bare `cargo test` doesn't provide and are exercised indirectly
 #   by the Python test suite.
-# - `rivers-ui` is run separately with `--features ssr` to pull in the native
-
-# deps its non-wasm tests need (channel_loop, code_location_registry, ...).
+# - `rivers-ui/ssr` pulls in the native deps its non-wasm tests need
+#   (channel_loop, code_location_registry, ...). One invocation, so the
+#   dependencies build once, with one set of features.
 test-rust: wasm-dev
-    cargo test --profile {{ profile }} --workspace --exclude rivers --exclude rivers-ui
-    cargo test --profile {{ profile }} -p rivers-ui --features ssr
+    cargo test --profile {{ profile }} --workspace --exclude rivers --features rivers-ui/ssr
 
 # Run Helm chart unit tests (requires `helm plugin install https://github.com/helm-unittest/helm-unittest`)
 test-helm:
@@ -234,9 +241,9 @@ k8s-build: _k8s-compile
 
 # Cross-compile all artifacts for Linux (no Docker). RIVERS_K8S_SKIP_UI=1
 # skips the standalone rivers-ui server binary — the wheel still compiles the
-# rivers-ui lib and embeds its WASM, so `wasm` stays a prerequisite; only the
-# separate UI server (which the integration suite never deploys) is dropped.
-_k8s-compile: wasm _k8s-wheel
+# rivers-ui lib and embeds its WASM; only the separate UI server (which the
+# integration suite never deploys) is dropped.
+_k8s-compile: _k8s-wasm _k8s-wheel
     #!/usr/bin/env bash
     set -euo pipefail
     cargo zigbuild -p rivers-operator --target {{ linux_target }}
@@ -244,6 +251,17 @@ _k8s-compile: wasm _k8s-wheel
     cargo zigbuild -p rivers-runtime --target {{ linux_musl_target }}
     if [ "${RIVERS_K8S_SKIP_UI:-}" != "1" ]; then
         cargo zigbuild -p rivers-ui --target {{ linux_target }} --features ssr
+    fi
+
+# The WASM the wheel embeds. With RIVERS_K8S_SKIP_UI=1 nothing serves it, so
+# the faster dev build is enough.
+_k8s-wasm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${RIVERS_K8S_SKIP_UI:-}" = "1" ]; then
+        {{ just_executable() }} wasm-dev
+    else
+        {{ just_executable() }} wasm
     fi
 
 # Cross-compile just the Python wheel for Linux

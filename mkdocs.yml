@@ -72,8 +72,12 @@ nav:
       - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
+      - Airbyte: guides/airbyte.md
+      - Datadog: guides/datadog.md
+      - dataframely: guides/dataframely.md
       - Delta Lake: guides/delta-lake.md
       - DuckDB: guides/duckdb.md
+      - pandera: guides/pandera.md
       - Slack: guides/slack.md
       - Snowflake: guides/snowflake.md
       - Authentication: guides/authentication.md
@@ -93,8 +97,12 @@ nav:
       - Partitions: api-reference/partitions.md
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
+      - Airbyte: api-reference/airbyte.md
+      - Datadog: api-reference/datadog.md
+      - dataframely: api-reference/dataframely.md
       - Delta Lake: api-reference/delta.md
       - DuckDB: api-reference/duckdb.md
+      - pandera: api-reference/pandera.md
       - Snowflake: api-reference/snowflake.md
       - MetadataValue: api-reference/metadata.md
       - Schema: api-reference/schema.md

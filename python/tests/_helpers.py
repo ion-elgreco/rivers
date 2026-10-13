@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, SecretBytes, SecretStr
 
 import rivers as rs
 
@@ -114,6 +115,20 @@ def make_repo(assets, storage=None, *, executor=None, **kwargs) -> rs.CodeReposi
     return repo
 
 
+def materialize_beside_sibling(
+    storage, executor, io_handler, *assets
+) -> tuple[rs.CodeRepository, rs.RunResult]:
+    """Materialize ``assets`` next to a sibling step that succeeds: the
+    parallel executor runs a lone step in-process."""
+
+    @rs.Asset(io_handler=io_handler)
+    def sibling() -> int:
+        return 1
+
+    repo = make_repo([*assets, sibling], storage, executor=executor)
+    return repo, repo.materialize(raise_on_error=False)
+
+
 def observation_metadata(repo, run_id: str | None = None) -> dict:
     """{asset_key: {meta_key: raw_value}} from Observation events.
 
@@ -146,3 +161,70 @@ def observation_metadata(repo, run_id: str | None = None) -> dict:
                 parsed[key] = next(iter(tagged.values()))["value"]
             latest[ev.asset_key] = (ev.timestamp, parsed)
     return {key: parsed for key, (_, parsed) in latest.items()}
+
+
+class Login(BaseModel):
+    user: str = "me"
+    password: SecretStr
+
+
+class Connection(BaseModel):
+    """A list item holding secrets, as an integration's connections do."""
+
+    name: str
+    url: SecretStr | None = None
+    password: SecretStr | None = None
+    api_key: SecretStr = SecretStr("c0nn-key")
+
+
+class Vault(rs.Resource):
+    """Secrets at each depth a field can hold them."""
+
+    region: str = "eu"
+    token: SecretStr
+    maybe: SecretStr | None = None
+    raw: SecretBytes
+    login: Login
+    connections: list[Connection] = []
+
+
+def make_vault() -> Vault:
+    return Vault(
+        token="t0ken",
+        maybe="m4ybe",
+        raw=b"r4w\xff",
+        login=Login(password="l0gin"),
+        connections=[
+            Connection(name="pg", url="postgres://u:c0nn@h/db", password="c0nn")
+        ],
+    )
+
+
+VAULT_SECRETS = ["t0ken", "m4ybe", "r4w", "l0gin", "c0nn"]
+
+VAULT_VALUES = {
+    "region": "eu",
+    "token": "t0ken",
+    "maybe": "m4ybe",
+    "raw": b"r4w\xff",
+    "login": ("me", "l0gin"),
+    "connections": [("pg", "postgres://u:c0nn@h/db", "c0nn")],
+}
+
+
+def reveal(vault: Vault) -> dict:
+    """What `vault` holds, secrets revealed: `VAULT_VALUES` for `make_vault()`."""
+
+    def revealed(secret: SecretStr | None) -> str | None:
+        return secret.get_secret_value() if secret is not None else None
+
+    return {
+        "region": vault.region,
+        "token": vault.token.get_secret_value(),
+        "maybe": revealed(vault.maybe),
+        "raw": vault.raw.get_secret_value(),
+        "login": (vault.login.user, vault.login.password.get_secret_value()),
+        "connections": [
+            (c.name, revealed(c.url), revealed(c.password)) for c in vault.connections
+        ],
+    }
