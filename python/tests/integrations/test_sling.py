@@ -219,20 +219,6 @@ def test_failed_stream_fails_the_step(tmp_path, src, storage, executor_env):
     assert f"--- {_uri(src / 'missing.csv')} ---" in error
 
 
-@pytest.mark.parametrize(
-    "executor_env",
-    [
-        "in_process",
-        pytest.param(
-            "parallel",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="the parallel executor drops a multi-asset's yields when its body raises",
-            ),
-        ),
-    ],
-    indirect=True,
-)
 def test_failed_stream_keeps_the_streams_that_succeeded(
     tmp_path, src, storage, executor_env
 ):
