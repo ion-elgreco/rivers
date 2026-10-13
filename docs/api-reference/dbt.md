@@ -43,7 +43,7 @@ project.assets(
 ) -> Callable[[Callable], MultiAsset]
 ```
 
-A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The body must be a generator. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
+A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The outputs have the kind `dbt`. The body must be a generator. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
 
 | Parameter | Description |
 |-----------|-------------|

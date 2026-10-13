@@ -88,7 +88,7 @@ def build_outputs(
                 deps=[AssetDef.dep(dep) for dep in deps],
                 group=translator.group(node),
                 tags=translator.tags(node) or None,
-                kinds=["dbt", adapter] if adapter else ["dbt"],
+                kinds=["dbt"],
                 code_version=translator.code_version(node),
                 metadata=metadata,
             )

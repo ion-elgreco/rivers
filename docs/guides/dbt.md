@@ -43,7 +43,7 @@ repo = rs.CodeRepository(
 | Code version | The checksum dbt records for the resource's file. When the file changes, the asset is stale. |
 | Group | The resource's dbt group. |
 | Tags | The resource's dbt tags. |
-| Kinds | `dbt` and the adapter, e.g. `duckdb`. |
+| Kinds | `dbt`. |
 | Metadata | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. With dbt-duckdb, also `duckdb/schema` and `duckdb/table`. |
 
 Tests, sources, and ephemeral models are not assets.

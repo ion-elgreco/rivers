@@ -64,7 +64,9 @@ def test_outputs_are_the_models_seeds_and_snapshots(shop):
         customers.code_version
         == (manifest["nodes"]["model.shop.customers"]["checksum"]["checksum"])
     )
-    assert customers.kinds == ["dbt", "duckdb"]
+    assert {name: output.kinds for name, output in outputs.items()} == {
+        name: ["dbt"] for name in outputs
+    }
     assert customers.group == "marts"
     assert outputs["stg_orders"].tags == ["staging"]
     assert outputs["customers_snapshot"].metadata["duckdb/schema"] == "snapshots"
