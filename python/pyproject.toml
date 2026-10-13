@@ -33,6 +33,7 @@ delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
 datadog = ["datadog>=0.47.0"]
 pandera = ["pandera>=0.20.2,!=0.30.0"]
 dataframely = ["dataframely>=3.0.0"]
+databricks = ["databricks-sdk>=0.10.0"]
 
 [project.scripts]
 rivers = "rivers.cli:main"

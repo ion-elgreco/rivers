@@ -64,3 +64,4 @@ def sometimes_bigger(ctx): ...    # 8Gi → 16Gi → 32Gi → 64Gi
     ```
 
 - Node placement (selectors, tolerations, affinity) and accelerator types are not part of `Compute`; it is resource quantities only.
+- `compute` sizes the rivers step, not external compute. A step that runs a [Databricks](../guides/databricks.md#compute-and-retries) job only waits for it; the job or its tasks set the Databricks cluster.

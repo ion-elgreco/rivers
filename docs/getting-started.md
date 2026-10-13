@@ -18,6 +18,7 @@ pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler
 pip install rivers[datadog]   # Datadog events and metrics (hooks, a run-failure sensor, DogStatsD)
 pip install rivers[pandera]   # Validate asset outputs against pandera schemas
 pip install rivers[dataframely]  # Validate polars asset outputs against dataframely schemas
+pip install rivers[databricks] # Databricks jobs as assets
 ```
 
 The [Airbyte integration](guides/airbyte.md) needs no extra.
