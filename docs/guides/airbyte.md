@@ -110,19 +110,21 @@ airbyte.connection_asset(postgres, retry=rs.RetryPolicy(max_retries=2, retry_on=
 
 ## Change the outputs
 
-`asset_def_fn` makes the `rs.AssetDef` of each stream. Other keyword arguments go to [`rs.Asset.from_multi`](../api-reference/assets.md#assetfrom_multi), for example `group`, `hooks`, `automation_condition`, or `retry`:
+`asset_def_fn` makes the `rs.AssetDef` of each stream. It takes the `AirbyteConnection` and one of its `AirbyteStream`s. `connection.output_def(stream, ...)` returns the default output with the fields that you give. The other keyword arguments of `connection_asset` go to [`rs.Asset.from_multi`](../api-reference/assets.md#assetfrom_multi), for example `group`, `hooks`, `automation_condition`, or `retry`:
 
 ```python
 postgres_sync = airbyte.connection_asset(
     postgres,
     name="postgres_sync",
-    asset_def_fn=lambda connection, stream: rs.AssetDef(
-        f"raw/{stream.name}", kinds=["airbyte", "snowflake"]
+    asset_def_fn=lambda connection, stream: connection.output_def(
+        stream, kinds=["airbyte", "snowflake"]
     ),
     group="raw",
     automation_condition=rs.AutomationCondition.on_cron("0 2 * * *"),
 )
 ```
+
+The default output sets only the name, so it gets `group` and the kind `airbyte` from `connection_asset`. A field that `asset_def_fn` sets replaces them: above, the outputs have the kinds `airbyte` and `snowflake`.
 
 Two streams with the same name in different namespaces need an `asset_def_fn` that gives them different names, for example with `stream.namespace`.
 

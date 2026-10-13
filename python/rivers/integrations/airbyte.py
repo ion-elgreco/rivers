@@ -14,6 +14,17 @@ Example::
     postgres = airbyte.get_connection("9924bcd0-99be-453d-ba47-c2c9766f7da5")
 
     repo = rs.CodeRepository(assets=[airbyte.connection_asset(postgres)])
+
+Each output has the name of its destination table, e.g. ``pg_users``. To
+change other fields, return :meth:`AirbyteConnection.output_def` from
+``asset_def_fn``::
+
+    airbyte.connection_asset(
+        postgres,
+        asset_def_fn=lambda connection, stream: connection.output_def(
+            stream, kinds=["airbyte", "snowflake"]
+        ),
+    )
 """
 
 import base64
@@ -104,6 +115,25 @@ class AirbyteConnection(_ApiModel):
     streams: list[AirbyteStream] = Field(
         default=[], validation_alias=AliasPath("configurations", "streams")
     )
+
+    def output_def(self, stream: AirbyteStream, **fields: Any) -> AssetDef:
+        """The default output of ``stream``, with ``fields`` set or replaced.
+
+        Defaults: ``name`` is :attr:`prefix` and the stream name, the name of
+        the destination table, e.g. ``"pg_users"``. The output sets no
+        ``kinds``, so it gets the kinds of
+        :meth:`AirbyteResource.connection_asset`, ``["airbyte"]`` by default.
+        Other keyword arguments go to :class:`~rivers.AssetDef`, e.g.
+        ``group="raw"`` or ``kinds=["airbyte", "snowflake"]``.
+
+        Args:
+            stream: One of the connection's streams.
+
+        Returns:
+            The output definition.
+        """
+        defaults: dict[str, Any] = {"name": f"{self.prefix or ''}{stream.name}"}
+        return AssetDef(**(defaults | fields))
 
 
 class AirbyteJob(_ApiModel):
@@ -306,9 +336,11 @@ class AirbyteResource(Resource):
             connection: From :meth:`get_connection`, or built by hand.
             name: Asset name. Defaults to ``"airbyte_"`` and the connection
                 name in snake case.
-            asset_def_fn: Builds the output of a stream. The default names it
-                like the destination table: the connection's prefix and the
-                stream name.
+            asset_def_fn: Builds the output of a stream. Defaults to
+                :meth:`AirbyteConnection.output_def`, which names it like the
+                destination table: the connection's prefix and the stream
+                name. Return ``connection.output_def(stream, ...)`` to keep
+                that name and set other fields.
             **asset_options: Passed to ``Asset.from_multi``, e.g. ``group``,
                 ``hooks``, ``automation_condition``, or ``retry``. ``kinds``
                 defaults to ``["airbyte"]``.
@@ -320,7 +352,7 @@ class AirbyteResource(Resource):
             ValueError: The connection has no enabled streams, or two streams
                 have the same output name.
         """
-        make_def = asset_def_fn or _table_asset_def
+        make_def = asset_def_fn or AirbyteConnection.output_def
         streams: dict[str | None, AirbyteStream] = {}
         output_defs = []
         for stream in connection.streams:
@@ -544,10 +576,6 @@ def _key(stream: AirbyteStream) -> tuple[str | None, str]:
 
 def _label(stream: AirbyteStream) -> str:
     return f"{stream.namespace}.{stream.name}" if stream.namespace else stream.name
-
-
-def _table_asset_def(connection: AirbyteConnection, stream: AirbyteStream) -> AssetDef:
-    return AssetDef(f"{connection.prefix or ''}{stream.name}")
 
 
 def _asset_name(connection_name: str) -> str:

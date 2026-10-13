@@ -291,11 +291,18 @@ def test_dagster_airbyte_maps_to_airbyte_resource():
         ("pg_orders", "raw"),
     ]
 
-    renamed = airbyte.connection_asset(
+    # `get_asset_spec` becomes `connection.output_def(stream, ...)`, which keeps
+    # the default name.
+    custom = airbyte.connection_asset(
         connection,
-        asset_def_fn=lambda connection, stream: rs.AssetDef(f"raw_{stream.name}"),
+        asset_def_fn=lambda connection, stream: connection.output_def(
+            stream, kinds=["airbyte", "snowflake"]
+        ),
     )
-    assert [d.name for d in renamed.output_defs] == ["raw_users", "raw_orders"]
+    assert [(d.name, d.kinds) for d in custom.output_defs] == [
+        ("pg_users", ["airbyte", "snowflake"]),
+        ("pg_orders", ["airbyte", "snowflake"]),
+    ]
     assert callable(airbyte.sync) and callable(airbyte.get_connection)
 
     with pytest.raises(ValidationError):

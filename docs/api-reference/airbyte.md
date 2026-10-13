@@ -45,7 +45,7 @@ Returns a `MultiAsset` that syncs `connection`, with one output per enabled stre
 |-----------|------|---------|-------------|
 | `connection` | `AirbyteConnection` | required | From `get_connection()`, or built by hand. |
 | `name` | `str \| None` | `None` | Asset name. The default is `airbyte_` and the connection name in snake case. |
-| `asset_def_fn` | `(AirbyteConnection, AirbyteStream) -> AssetDef` | prefix + stream name | Makes the output of a stream. The default names it like the destination table: the connection's `prefix` and the stream name. |
+| `asset_def_fn` | `(AirbyteConnection, AirbyteStream) -> AssetDef` | `AirbyteConnection.output_def` | Makes the output of a stream. The default names it like the destination table: the connection's `prefix` and the stream name. |
 | `**asset_options` | | | Passed to [`Asset.from_multi()`](assets.md#assetfrom_multi), for example `group`, `hooks`, `automation_condition`, or `retry`. `kinds` defaults to `["airbyte"]`. |
 
 Raises `ValueError` when the connection has no enabled streams, or when two streams get the same output name.
@@ -91,6 +91,23 @@ An Airbyte connection and its enabled streams. A pydantic model: save it with `m
 | `name` | `str` | required | The connection name. |
 | `prefix` | `str \| None` | `None` | Prefix the connection adds to each table name in the destination. |
 | `streams` | `list[AirbyteStream]` | `[]` | The enabled streams. |
+
+### `output_def(stream, **fields)`
+
+Returns the default output of `stream`, one of the connection's streams, with `fields` set or replaced. The keyword arguments go to [`AssetDef`](assets.md).
+
+| Field | Default |
+|-------|---------|
+| `name` | `prefix` and the stream name, the name of the destination table, e.g. `pg_users` |
+
+The default output sets no `kinds`, so it gets the kinds of `connection_asset()`, `["airbyte"]` by default.
+
+```python
+airbyte.connection_asset(
+    connection,
+    asset_def_fn=lambda connection, stream: connection.output_def(stream, kinds=["airbyte", "snowflake"]),
+)
+```
 
 ## `AirbyteStream`
 

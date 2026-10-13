@@ -641,6 +641,27 @@ def test_connection_asset_names_outputs_like_destination_tables():
     ]
 
 
+@pytest.mark.parametrize(("prefix", "name"), [("pg_", "pg_users"), (None, "users")])
+def test_output_def_is_named_like_the_destination_table(prefix, name):
+    stream = AirbyteStream(name="users", namespace="public")
+    connection = AirbyteConnection(
+        connection_id=CONNECTION_ID, name="pg", prefix=prefix, streams=[stream]
+    )
+
+    assert connection.output_def(stream) == rs.AssetDef(name)
+
+
+def test_output_def_sets_or_replaces_fields():
+    stream = AirbyteStream(name="users", namespace="public")
+    connection = AirbyteConnection(
+        connection_id=CONNECTION_ID, name="pg", prefix="pg_", streams=[stream]
+    )
+
+    output = connection.output_def(stream, group="raw", name="x")
+
+    assert output == rs.AssetDef("x", group="raw")
+
+
 def test_asset_def_fn_and_asset_options():
     connection = AirbyteConnection(
         connection_id=CONNECTION_ID,
@@ -665,6 +686,30 @@ def test_asset_def_fn_and_asset_options():
     assert [(d.name, d.group, d.kinds) for d in asset.output_defs] == [
         ("raw/public/users", "raw", ["airbyte", "snowflake"]),
         ("raw/pg/events", "raw", ["airbyte", "snowflake"]),
+    ]
+
+
+def test_asset_def_fn_changes_fields_of_the_default_output():
+    connection = AirbyteConnection(
+        connection_id=CONNECTION_ID,
+        name="pg",
+        prefix="pg_",
+        streams=[
+            AirbyteStream(name="users", namespace="public"),
+            AirbyteStream(name="events"),
+        ],
+    )
+
+    asset = AirbyteResource().connection_asset(
+        connection,
+        asset_def_fn=lambda connection, stream: connection.output_def(
+            stream, group="raw"
+        ),
+    )
+
+    assert [(d.name, d.group, d.kinds) for d in asset.output_defs] == [
+        ("pg_users", "raw", ["airbyte"]),
+        ("pg_events", "raw", ["airbyte"]),
     ]
 
 
