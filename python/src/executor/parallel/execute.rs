@@ -661,7 +661,7 @@ impl ParallelBackend {
                 rt().handle(),
             );
         }
-        process_finished_steps(py, ctx, tasks, failures);
+        process_finished_steps(py, ctx, tasks, None, failures);
     }
 }
 

@@ -66,11 +66,11 @@ repo.get_job("my_pipeline").execute(
 
 ## Executors
 
-An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Construct one through the static factories on `Executor`:
+An `Executor` picks how a job's steps are dispatched — for materialize runs; an [action](actions.md#where-actions-run) job's steps always run in the run's own process. Ctrl-C stops the steps that run in the process: a sync step gets `KeyboardInterrupt`, an async step `asyncio.CancelledError`. Construct one through the static factories on `Executor`:
 
 ### InProcess
 
-Runs every step serially in the calling Python process. Best for debugging and small pipelines:
+Runs sync steps one at a time in the calling Python process, and up to four async steps at the same time. Best for debugging and small pipelines:
 
 ```python
 executor = rs.Executor.in_process()

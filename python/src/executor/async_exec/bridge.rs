@@ -4,10 +4,18 @@
 //! Used by both in-process and async executors to convert Python coroutines
 //! into Rust futures via `pyo3-async-runtimes`.
 
+use std::future::Future;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::prelude::*;
+use pyo3::types::PyCFunction;
 use pyo3_async_runtimes::TaskLocals;
+
+use crate::runtime::rt;
+
+const SIGNAL_CHECK: Duration = Duration::from_millis(250);
 
 pub(crate) struct AsyncBridge {
     pub(crate) task_locals: TaskLocals,
@@ -41,7 +49,59 @@ impl AsyncBridge {
         })
     }
 
+    /// Run `future` to its end with the GIL released. Python raises a Ctrl-C
+    /// only when this thread runs Python code, which it does not while it
+    /// waits; so check for one every [`SIGNAL_CHECK`], and cancel the loop's
+    /// tasks, as Ctrl-C interrupts a sync step.
+    pub(crate) fn block_on<F>(&self, py: Python, future: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        let mut future = std::pin::pin!(future);
+        loop {
+            let waited = py.detach(|| {
+                rt().block_on(async { tokio::time::timeout(SIGNAL_CHECK, &mut future).await })
+            });
+            if let Ok(output) = waited {
+                return output;
+            }
+            if py.check_signals().is_err() {
+                tracing::info!("interrupted: cancelling the running async steps");
+                if let Err(e) = self.cancel_tasks(py) {
+                    tracing::warn!(error = %e, "could not cancel the async steps");
+                }
+            }
+        }
+    }
+
+    /// Cancel every task on the loop: a running async step gets
+    /// `CancelledError` at its next `await`.
+    fn cancel_tasks(&self, py: Python) -> PyResult<()> {
+        let event_loop = self.loop_obj.clone_ref(py);
+        // `all_tasks` and `Task.cancel` must run on the loop's thread.
+        let cancel = PyCFunction::new_closure(py, None, None, move |args, _| -> PyResult<()> {
+            let py = args.py();
+            let tasks = py
+                .import("asyncio")?
+                .call_method1("all_tasks", (&event_loop,))?;
+            for task in tasks.try_iter()? {
+                task?.call_method0("cancel")?;
+            }
+            Ok(())
+        })?;
+        self.loop_obj
+            .call_method1(py, "call_soon_threadsafe", (cancel,))?;
+        Ok(())
+    }
+
     pub(crate) fn shutdown(&self, py: Python) {
+        // A pending Ctrl-C would raise inside `call_soon_threadsafe`, so
+        // `stop` would never run and the join would hang. Take it first, and
+        // raise it again once the loop has stopped.
+        let interrupted = py
+            .check_signals()
+            .is_err_and(|e| e.is_instance_of::<PyKeyboardInterrupt>(py));
         if let Ok(stop) = self.loop_obj.getattr(py, "stop") {
             let _ = self
                 .loop_obj
@@ -52,6 +112,10 @@ impl AsyncBridge {
             py.detach(|| {
                 let _ = h.join();
             });
+        }
+        if interrupted {
+            // SAFETY: async-signal-safe, and needs no attached thread state.
+            unsafe { pyo3::ffi::PyErr_SetInterrupt() };
         }
     }
 }

@@ -73,6 +73,7 @@ nav:
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
       - Airbyte: guides/airbyte.md
+      - Databricks: guides/databricks.md
       - Datadog: guides/datadog.md
       - dataframely: guides/dataframely.md
       - Delta Lake: guides/delta-lake.md
@@ -98,6 +99,7 @@ nav:
       - Backfills: api-reference/backfills.md
       - IO Handlers: api-reference/io-handlers.md
       - Airbyte: api-reference/airbyte.md
+      - Databricks: api-reference/databricks.md
       - Datadog: api-reference/datadog.md
       - dataframely: api-reference/dataframely.md
       - Delta Lake: api-reference/delta.md

@@ -200,6 +200,36 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_databricks_maps_to_databricks_resource():
+    pytest.importorskip("databricks.sdk")
+    from rivers.integrations.databricks import DatabricksResource, DatabricksRunError
+
+    assert list(DatabricksResource.model_fields) == [
+        "host",
+        "token",
+        "client_id",
+        "client_secret",
+        "azure_client_id",
+        "azure_client_secret",
+        "azure_tenant_id",
+        "poll_interval",
+        "poll_timeout",
+        "cancel_on_interrupt",
+    ]
+    databricks = DatabricksResource(host="https://dbc.example.com", token="dapi")
+
+    daily_sales = databricks.job_asset(
+        123, name="daily_sales", job_parameters={"day": "2024-01-01"}
+    )
+    sales = databricks.job_asset(456, name="sales", tasks=["orders", "refunds"])
+
+    assert daily_sales.is_single and daily_sales.kinds == ["databricks"]
+    assert [d.name for d in sales.output_defs] == ["orders", "refunds"]
+    assert databricks.poll_timeout is None
+    assert callable(databricks.run_job) and callable(databricks.submit_run)
+    assert issubclass(DatabricksRunError, Exception)
+
+
 def test_dagster_pandera_maps_to_return_hints(storage):
     """`dagster_type=pandera_schema_to_dagster_type(Model)` becomes `-> DataFrame[Model]`,
     and `rs.AssetDef(type_hint=DataFrame[Model])` on a multi-asset output."""

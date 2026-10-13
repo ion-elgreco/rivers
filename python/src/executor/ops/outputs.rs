@@ -32,14 +32,16 @@
 
 use std::collections::HashMap;
 
+use pyo3::exceptions::{PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
+use pyo3_async_runtimes::TaskLocals;
 
 use crate::context::asset::PyAssetExecutionContext;
 use crate::errors::ExecutionError;
 use crate::metadata::MetadataValue;
 use crate::result_types::{self, ResultKind};
+use crate::runtime::rt;
 
-use super::super::async_exec::AsyncBridge;
 use super::StepResult;
 use super::annotations::validate_return_type;
 use super::extract_data_version;
@@ -74,6 +76,33 @@ pub(crate) enum OutputItem {
         metadata: Vec<(String, MetadataValue)>,
         data_version: Option<String>,
     },
+}
+
+impl OutputItem {
+    fn clone_ref(&self, py: Python) -> Self {
+        match self {
+            Self::Materialization {
+                name,
+                value,
+                metadata,
+                data_version,
+            } => Self::Materialization {
+                name: name.clone(),
+                value: value.as_ref().map(|v| v.clone_ref(py)),
+                metadata: metadata.clone(),
+                data_version: data_version.clone(),
+            },
+            Self::Observation {
+                name,
+                metadata,
+                data_version,
+            } => Self::Observation {
+                name: name.clone(),
+                metadata: metadata.clone(),
+                data_version: data_version.clone(),
+            },
+        }
+    }
 }
 
 /// Build an `OutputItem` from the discriminator. The mapping is the same in
@@ -124,30 +153,22 @@ fn item_for_kind(
 /// name for mapped fan-out (single-output only — multi-asset is never
 /// mapped). Multi-asset paths ignore `step_name`.
 ///
-/// On `Err` from `on_item` (or from a generator's `__next__` / `__anext__`),
-/// iteration short-circuits and the error propagates.
-///
-/// `bridge` is required for async generators; pass `None` for sync paths.
+/// On `Err` from `on_item` (or from a generator), iteration short-circuits
+/// and the error propagates.
 pub(crate) fn for_each_output<F>(
     py: Python,
     step_result: &StepResult,
     selected_outputs: &[(String, Option<Py<PyAny>>)],
     step_name: &str,
-    bridge: Option<&AsyncBridge>,
     mut on_item: F,
 ) -> PyResult<()>
 where
     F: FnMut(Python, OutputItem) -> PyResult<()>,
 {
     match &step_result.generator {
-        Some(kind) => for_each_output_generator(
-            py,
-            step_result,
-            selected_outputs,
-            kind,
-            bridge,
-            &mut on_item,
-        ),
+        Some(kind) => {
+            for_each_output_generator(py, step_result, selected_outputs, kind, &mut on_item)
+        }
         None if !selected_outputs.is_empty() => {
             for_each_output_dict(py, step_result, selected_outputs, &mut on_item)
         }
@@ -180,7 +201,63 @@ fn for_each_output_generator<F>(
     step_result: &StepResult,
     selected_outputs: &[(String, Option<Py<PyAny>>)],
     kind: &super::GeneratorType,
-    bridge: Option<&AsyncBridge>,
+    on_item: &mut F,
+) -> PyResult<()>
+where
+    F: FnMut(Python, OutputItem) -> PyResult<()>,
+{
+    match kind {
+        super::GeneratorType::Sync { context } => {
+            let generator = &step_result.result;
+            let next = |py: Python| match generator.call_method0(py, "__next__") {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.is_instance_of::<PyStopIteration>(py) => Ok(None),
+                Err(e) => Err(e),
+            };
+            for_each_yield(py, selected_outputs, context.as_ref(), next, on_item)
+        }
+        super::GeneratorType::Async { outputs, error, .. } => {
+            for item in outputs {
+                on_item(py, item.clone_ref(py))?;
+            }
+            error.as_ref().map_or(Ok(()), |e| Err(e.clone_ref(py)))
+        }
+    }
+}
+
+/// Run an async generator to its end on this thread, the step's worker: the
+/// outputs it yielded, then the error it raised.
+pub(crate) fn run_async_generator(
+    py: Python,
+    generator: &Py<PyAny>,
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
+    context: Option<&Py<PyAny>>,
+    locals: &TaskLocals,
+) -> (Vec<OutputItem>, Option<PyErr>) {
+    let next = |py: Python| {
+        let anext = generator.call_method0(py, "__anext__")?;
+        let future = pyo3_async_runtimes::into_future_with_locals(locals, anext.into_bound(py))?;
+        match py.detach(|| rt().block_on(future)) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.is_instance_of::<PyStopAsyncIteration>(py) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    let mut outputs = Vec::new();
+    let error = for_each_yield(py, selected_outputs, context, next, &mut |_, item| {
+        outputs.push(item);
+        Ok(())
+    })
+    .err();
+    (outputs, error)
+}
+
+/// One item per selected output a generator yields, as `next` returns them.
+fn for_each_yield<F>(
+    py: Python,
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
+    context: Option<&Py<PyAny>>,
+    mut next: impl FnMut(Python) -> PyResult<Option<Py<PyAny>>>,
     on_item: &mut F,
 ) -> PyResult<()>
 where
@@ -190,25 +267,14 @@ where
         .iter()
         .map(|(name, hint)| (name.as_str(), hint.as_ref()))
         .collect();
-    let generator = &step_result.result;
-    let (is_async_gen, ctx_obj) = match kind {
-        super::GeneratorType::Sync { context } => (false, context.as_ref()),
-        super::GeneratorType::Async { context } => (true, context.as_ref()),
-    };
-
-    let gen_ctx = ctx_obj.and_then(|c| {
+    let gen_ctx = context.and_then(|c| {
         c.bind(py)
             .cast::<PyAssetExecutionContext>()
             .ok()
             .map(|bound| bound.clone().unbind())
     });
 
-    loop {
-        let yielded = match next_yield(py, generator, is_async_gen, bridge)? {
-            Some(v) => v,
-            None => break,
-        };
-
+    while let Some(yielded) = next(py)? {
         let extracted = result_types::try_extract_result_type(py, &yielded)?;
         let ext = extracted.ok_or_else(|| {
             ExecutionError::new_err(
@@ -255,35 +321,6 @@ where
         on_item(py, item)?;
     }
     Ok(())
-}
-
-fn next_yield(
-    py: Python,
-    generator: &Py<PyAny>,
-    is_async_gen: bool,
-    bridge: Option<&AsyncBridge>,
-) -> PyResult<Option<Py<PyAny>>> {
-    if is_async_gen {
-        let anext_coro = generator.call_method0(py, "__anext__")?;
-        let locals = bridge.map(|b| &b.task_locals).ok_or_else(|| {
-            ExecutionError::new_err(
-                "Async generator requires TaskLocals — this is an internal error",
-            )
-        })?;
-        let future =
-            pyo3_async_runtimes::into_future_with_locals(locals, anext_coro.into_bound(py))?;
-        match py.detach(|| crate::runtime::rt().block_on(future)) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) => Ok(None),
-            Err(e) => Err(e),
-        }
-    } else {
-        match generator.call_method0(py, "__next__") {
-            Ok(v) => Ok(Some(v)),
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 fn for_each_output_dict<F>(
