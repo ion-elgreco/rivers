@@ -5,7 +5,6 @@ binary, so no other tool is downloaded.
 """
 
 import importlib
-import importlib.util
 import json
 import os
 import sqlite3
@@ -17,9 +16,7 @@ from pathlib import Path
 
 import pytest
 
-if importlib.util.find_spec("sling") is None:
-    pytest.skip("needs sling: pip install rivers[sling]", allow_module_level=True)
-pytest.importorskip("yaml")
+pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
 
 # `import sling` downloads the sling binary on first use: skip when that fails.
 try:
