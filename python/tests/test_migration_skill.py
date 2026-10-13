@@ -339,6 +339,46 @@ def test_dagster_sling_maps_to_sling_integration():
         rs.CodeRepository(assets=[raw], resources={"sling": sling}).validate()
 
 
+def test_dagster_dlt_maps_to_dlt_integration(tmp_path):
+    dlt = pytest.importorskip("dlt")
+    pytest.importorskip("duckdb")
+    from rivers.integrations.dlt import DltSourceAssets, output_def
+
+    @dlt.source(name="github")
+    def github_source():
+        @dlt.resource
+        def issues():
+            yield {"id": 1}
+
+        return issues
+
+    # Dagster's translator and `pool=` become `asset_def_fn`.
+    github = DltSourceAssets(
+        github_source(),
+        asset_def_fn=lambda resource: output_def(resource, pool="github"),
+    )
+
+    @github.assets(name="github", group="github", partitions_def=None, hooks=None)
+    def github_assets(context: rs.AssetExecutionContext):
+        pipeline = dlt.pipeline(
+            "github",
+            pipelines_dir=str(tmp_path),
+            destination="duckdb",
+            dataset_name="github",
+        )
+        yield from github.load(context, pipeline)
+
+    [output] = github_assets.output_defs
+    assert (output.name, output.group, output.kinds) == (
+        "github_issues",
+        "github",
+        ["dlt"],
+    )
+    assert output.pool == [("github", 1)]
+    # No default upstream deps: Dagster's `github_issues` source key would not resolve.
+    rs.CodeRepository(assets=[github_assets]).validate()
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

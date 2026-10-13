@@ -76,6 +76,7 @@ nav:
       - Datadog: guides/datadog.md
       - dataframely: guides/dataframely.md
       - Delta Lake: guides/delta-lake.md
+      - dlt: guides/dlt.md
       - DuckDB: guides/duckdb.md
       - pandera: guides/pandera.md
       - Slack: guides/slack.md
@@ -101,6 +102,7 @@ nav:
       - Datadog: api-reference/datadog.md
       - dataframely: api-reference/dataframely.md
       - Delta Lake: api-reference/delta.md
+      - dlt: api-reference/dlt.md
       - DuckDB: api-reference/duckdb.md
       - pandera: api-reference/pandera.md
       - Sling: api-reference/sling.md
