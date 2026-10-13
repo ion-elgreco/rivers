@@ -439,13 +439,12 @@ def _parse(line: str) -> tuple[int, str]:
     try:
         record = json.loads(line)
     except ValueError:
-        return logging.ERROR, line.rstrip()
+        record = None
 
-    if not isinstance(record, dict):
-        return logging.ERROR, line.rstrip()
-    return _LEVELS.get(record.get("lvl", ""), logging.INFO), str(
-        record.get("msg", "")
-    ).rstrip()
+    if isinstance(record, dict):
+        level = _LEVELS.get(record.get("lvl", ""), logging.INFO)
+        return level, str(record.get("msg", "")).rstrip()
+    return logging.ERROR, line.rstrip()
 
 
 def _mask(message: str, secrets: list[str]) -> str:
