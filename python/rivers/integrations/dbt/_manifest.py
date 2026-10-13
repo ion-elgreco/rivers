@@ -95,7 +95,8 @@ def build_outputs(
             elif source_asset_fn is not None:
                 deps.append(source_asset_fn(_node(resources[parent])))
 
-        output = _with_deps(defs[uid], deps)
+        output = defs[uid]
+        _add_deps(output, deps)
         if adapter == "duckdb":
             # The table DuckDBIOHandler loads when a downstream asset reads this one.
             output.metadata = {
@@ -138,8 +139,8 @@ def _node(props: dict[str, Any]) -> DbtNode:
     )
 
 
-def _with_deps(output: AssetDef, deps: list[str | None]) -> AssetDef:
-    """A copy of ``output`` with a lineage-only dep on each name in ``deps`` it lacks."""
+def _add_deps(output: AssetDef, deps: list[str | None]) -> None:
+    """Add a lineage-only dep to ``output`` on each name in ``deps`` that it lacks."""
     own = {dep.name for dep in output.deps}
     added = [
         AssetDef.dep(name)
@@ -147,10 +148,7 @@ def _with_deps(output: AssetDef, deps: list[str | None]) -> AssetDef:
         if name is not None and name not in own
     ]
 
-    # AssetDef has no setter for deps: rebuild it from the fields it pickles.
-    _, fields = output.__getnewargs_ex__()
-    fields["deps"] = [*output.deps, *added]
-    return AssetDef(**fields)
+    output.deps = [*output.deps, *added]
 
 
 def _upstream(resources: dict[str, Any], node: dict[str, Any]) -> Iterator[str]:

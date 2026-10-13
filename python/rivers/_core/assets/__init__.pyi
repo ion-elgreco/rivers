@@ -409,10 +409,6 @@ class AssetDef:
         """
         ...
 
-    def __getnewargs_ex__(self) -> tuple[tuple[()], dict[str, Any]]:
-        """For pickling: every field as a keyword argument of :meth:`__init__`."""
-        ...
-
     @property
     def deps(self) -> list["DepDef"]:
         """Per-output dependencies declared on this output.
