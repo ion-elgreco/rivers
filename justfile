@@ -25,9 +25,9 @@ _default:
 venv:
     uv sync --no-install-workspace --all-extras --all-packages
 
-# Free-threaded (3.14t) venv in .venv-ft, without deps that lack free-threaded wheels (gRPC client, delta/polars/datafusion)
+# Free-threaded (3.14t) venv in .venv-ft, without deps that lack free-threaded wheels (gRPC client, dbt, delta/polars/datafusion)
 venv-ft:
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' uv sync --no-install-workspace --all-packages --python 3.14t --no-group grpc --extra pyarrow --extra pandas --extra otel
+    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' uv sync --no-install-workspace --all-packages --python 3.14t --no-group grpc --no-group dbt --extra pyarrow --extra pandas --extra otel
 
 # Build the UI's hydration WASM (release).
 wasm:

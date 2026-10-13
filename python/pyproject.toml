@@ -29,6 +29,7 @@ delta-pyspark = ["rivers[pyspark]", "rivers[pyarrow]", "rivers[delta]", "delta-s
 otel = ["opentelemetry-api>=1.0"]
 slack = ["slack-sdk>=3.10.0"]
 duckdb = ["duckdb>=1.5.2"]
+dbt = ["dbt-core>=1.7.10,<2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
 
 [project.scripts]

@@ -1,0 +1,10 @@
+name: shop
+version: "1.0.0"
+config-version: 2
+profile: shop
+
+models:
+  shop:
+    +materialized: table
+    staging:
+      +tags: ["staging"]

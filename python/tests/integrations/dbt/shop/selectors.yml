@@ -1,0 +1,5 @@
+selectors:
+  - name: staging
+    definition:
+      method: tag
+      value: staging

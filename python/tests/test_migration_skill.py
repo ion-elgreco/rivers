@@ -200,6 +200,41 @@ def test_dagster_duckdb_maps_to_duckdb_integration(tmp_path):
     assert handler.table_name("users", None) == ("main", "users")
 
 
+def test_dagster_dbt_maps_to_dbt_integration():
+    pytest.importorskip("dbt.version")
+    import inspect
+
+    from rivers.integrations.dbt import (
+        DbtInvocation,
+        DbtProject,
+        DbtResource,
+        DbtTranslator,
+    )
+
+    assets = inspect.signature(DbtProject.assets).parameters
+    assert {"select", "exclude", "selector", "translator"} <= set(assets)
+    assert callable(DbtProject.prepare)
+    assert {"project_dir", "profiles_dir", "profile", "target"} <= set(
+        DbtResource.model_fields
+    )
+    assert list(inspect.signature(DbtResource.cli).parameters)[:3] == [
+        "self",
+        "args",
+        "context",
+    ]
+    assert callable(DbtInvocation.wait)
+
+    translator = DbtTranslator()
+    model = {"name": "orders", "resource_type": "model", "tags": ["daily"]}
+    source = {"name": "payments", "source_name": "raw", "resource_type": "source"}
+    assert translator.asset_name(model) == "orders"
+    assert translator.tags(model) == ["daily"]
+    assert translator.upstream_asset(model) == "orders"
+    assert translator.upstream_asset(source) is None
+    for hook in ("group", "metadata", "code_version"):
+        assert callable(getattr(translator, hook))
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()
