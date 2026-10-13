@@ -189,6 +189,8 @@ class SnowflakeIOHandler(BaseIOHandler):
             if not columns:
                 cur.execute(f"CREATE TABLE IF NOT EXISTS {target} ({definition})")
                 columns = table_columns(cur, schema, table)
+                # another write can create the table during the upload
+                _check_columns(schema, table, columns, reader.schema)
 
             delete = None
             if overwrite:

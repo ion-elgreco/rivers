@@ -427,6 +427,48 @@ def test_types_that_keep_the_values_load(warehouse):
     ]
 
 
+@pytest.mark.parametrize(
+    ("output", "match"),
+    [
+        pytest.param(
+            pa.table({"region": ["eu"], "v": [2], "extra": ["x"]}),
+            "table PUBLIC.T has no column extra",
+            id="missing-column",
+        ),
+        pytest.param(
+            pa.table({"region": ["eu"], "v": [2.5]}),
+            re.escape("table PUBLIC.T has column v NUMBER(38,0) (output FLOAT)"),
+            id="type-change",
+        ),
+    ],
+)
+def test_table_created_during_the_upload_is_checked(
+    warehouse, monkeypatch, output, match
+):
+    """Two first writes: the other one creates the table while this one uploads."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    others = [lambda: _write_region(handler, "us", [1])]
+    parquet_files = io_module._parquet_files
+
+    def racing(reader):
+        if others:
+            others.pop()()
+        yield from parquet_files(reader)
+
+    monkeypatch.setattr(io_module, "_parquet_files", racing)
+    with pytest.raises(ValueError, match=match):
+        handler.handle_output(
+            rs.OutputContext(
+                asset_name="t",
+                asset_metadata=_BY_REGION,
+                partition=_partition(_REGIONS, rs.PartitionKey.single("eu")),
+            ),
+            output,
+        )
+
+    assert _rows(warehouse, 'SELECT * FROM "PUBLIC"."T"') == [("us", 1)]
+
+
 def test_static_partition_overwrite(warehouse):
     handler = SnowflakeIOHandler(resource=warehouse)
     _write_region(handler, "us", [1, 2])
