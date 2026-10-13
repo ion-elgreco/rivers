@@ -42,6 +42,9 @@ pub struct SingleAsset {
     pub compute: Option<rivers_core::execution::compute::Compute>,
     /// Named actions this asset supports beyond materialize.
     pub actions: Vec<Py<super::action::PyAssetAction>>,
+    /// A multi-asset output's `AssetDef.type_hint`. A single asset's type is
+    /// its function's return hint.
+    pub type_hint: Option<Py<PyAny>>,
 }
 
 impl SingleAsset {
@@ -76,6 +79,7 @@ impl SingleAsset {
             retry: self.retry.clone(),
             compute: self.compute.clone(),
             actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+            type_hint: self.type_hint.as_ref().map(|h| h.clone_ref(py)),
         }
     }
 }

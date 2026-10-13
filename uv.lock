@@ -1710,6 +1710,10 @@ pyspark = [
 slack = [
     { name = "slack-sdk" },
 ]
+sling = [
+    { name = "pyyaml" },
+    { name = "sling" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1733,6 +1737,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11.9" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "pyspark", marker = "extra == 'pyspark'", specifier = ">=3.3.0" },
+    { name = "pyyaml", marker = "extra == 'sling'", specifier = ">=6.0.1" },
     { name = "rivers", extras = ["datafusion"], marker = "extra == 'delta-datafusion'" },
     { name = "rivers", extras = ["delta"], marker = "extra == 'delta-datafusion'" },
     { name = "rivers", extras = ["delta"], marker = "extra == 'delta-duckdb'" },
@@ -1747,9 +1752,10 @@ requires-dist = [
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyspark'" },
     { name = "rivers", extras = ["pyspark"], marker = "extra == 'delta-pyspark'" },
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.10.0" },
+    { name = "sling", marker = "extra == 'sling'", specifier = ">=1.4.3.post1" },
     { name = "typer", specifier = ">=0.27.0" },
 ]
-provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "delta-duckdb", "datadog", "pandera", "dataframely", "databricks"]
+provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "delta-duckdb", "datadog", "pandera", "dataframely", "sling", "databricks"]
 
 [[package]]
 name = "rivers-workspace"
@@ -1874,6 +1880,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/24/74/a4b30685bc76846b70baa9edaa45ba577ce5a28fc9e474b51524bb2aa932/slack_sdk-3.45.0.tar.gz", hash = "sha256:1ab794452f238b59db0d8a4d346263d65190288add53ec67a05751d8e7402486", size = 259739, upload-time = "2026-10-01T22:24:56.998Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/af/58/d54e4564946a9a3276f3de2905d18b66977977d4ba0fd7d11164df3c73cb/slack_sdk-3.45.0-py2.py3-none-any.whl", hash = "sha256:6356d4486d1a3ad156462c5544ab1b9c076ff426a250495c08f51b7ad71eb8fb", size = 322681, upload-time = "2026-10-01T22:24:55.133Z" },
+]
+
+[[package]]
+name = "sling"
+version = "1.6.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/83/228d582fbb0bb4f25a4a81de9b34ec6bae080b6e1fdd2518a6e0341d622e/sling-1.6.5.tar.gz", hash = "sha256:389d1eac6d15333c26d6de6a2839eefaedfb83c220f3ed90cde45575e49556f9", size = 103893, upload-time = "2026-10-08T21:34:56.987Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/f2/229445a4290d2741ed410db928a6bb31c209d7434aa957edf78f7947f95c/sling-1.6.5-py3-none-any.whl", hash = "sha256:f97ef335b60ac2d71260a6185490439505c326d328cf045f3d8c67ac66e08029", size = 52469, upload-time = "2026-10-08T21:34:55.804Z" },
 ]
 
 [[package]]

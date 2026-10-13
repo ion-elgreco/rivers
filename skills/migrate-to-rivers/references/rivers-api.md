@@ -78,7 +78,7 @@ def ingest():
     yield rs.Output([{"id": 9}], output_name="orders")
 ```
 
-`rs.AssetDef(name, tags=, kinds=, group=, code_version=, io_handler=, metadata=, partitions_def=, partition_mapping=, pool=, pool_slots=, deps=)`.
+`rs.AssetDef(name, tags=, kinds=, group=, code_version=, io_handler=, metadata=, partitions_def=, partition_mapping=, pool=, pool_slots=, deps=, type_hint=)`.
 
 `compute` and `retry` live on `from_multi` itself, not per output — a multi-asset is one step.
 
@@ -144,7 +144,7 @@ Declared via a `context` parameter. Generic over the config type: `rs.AssetExecu
 | `rs.Observation(metadata=, data_version=, output_name=)` | external-asset observe result |
 | `list[rs.DynamicOutput(key, value)]` | dynamic fan-out with explicit mapping keys |
 
-The return annotation is checked at run time on every executor: `isinstance` against the class (a generic by its origin, `list[int]` → `list`), a union by any member, `Annotated[T, ...]` by `T`. A mismatch fails the step with `rs.exceptions.AssetOutputValidationError`. A pandera or dataframely annotation (`pandera.typing.DataFrame[Model]`, `dy.DataFrame[Schema]`) validates the frame against the schema.
+The return annotation is checked at run time on every executor: `isinstance` against the class (a generic by its origin, `list[int]` → `list`), a union by any member, `Annotated[T, ...]` by `T`. A mismatch fails the step with `rs.exceptions.AssetOutputValidationError`. A pandera or dataframely annotation (`pandera.typing.DataFrame[Model]`, `dy.DataFrame[Schema]`) validates the frame against the schema. A multi-asset output gets the same check from `rs.AssetDef(name, type_hint=...)`.
 
 ## Tasks
 

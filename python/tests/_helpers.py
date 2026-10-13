@@ -6,6 +6,8 @@ mechanism adds `python/tests/` to `sys.path`.
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime
 from typing import Any
 
@@ -141,8 +143,6 @@ def observation_metadata(repo, run_id: str | None = None) -> dict:
     `run_id` to scope to a single run; a partitioned observable still collapses
     to one entry per asset, so scope by run when the per-partition value matters.
     """
-    import json
-
     latest: dict = {}
     if run_id is not None:
         run_ids = [run_id]
@@ -161,6 +161,26 @@ def observation_metadata(repo, run_id: str | None = None) -> dict:
                 parsed[key] = next(iter(tagged.values()))["value"]
             latest[ev.asset_key] = (ev.timestamp, parsed)
     return {key: parsed for key, (_, parsed) in latest.items()}
+
+
+def materialization_metadata(storage, asset_key: str) -> dict[str, Any]:
+    """Raw values of the latest materialization's metadata, without ``pid``."""
+    event = storage.get_latest_materialization(asset_key)
+    assert event is not None
+    meta = {
+        key: next(iter(json.loads(value).values()))["value"]
+        for key, value in event.metadata
+    }
+    meta.pop("pid", None)
+    return meta
+
+
+def written_in_worker(storage, asset_key: str) -> bool:
+    """Whether the handler wrote ``asset_key`` in a process other than this one."""
+    event = storage.get_latest_materialization(asset_key)
+    assert event is not None
+    (pid,) = [value for key, value in event.metadata if key == "pid"]
+    return json.loads(pid)["Int"]["value"] != os.getpid()
 
 
 class Login(BaseModel):

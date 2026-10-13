@@ -489,15 +489,7 @@ pub(super) fn build_worker_submit_args(
     let pickled_func = make_func_ref(py, &func).or_else(|_| func_by_value(py, &func))?;
 
     let io_spec = if is_multi {
-        build_multi_output_specs(
-            py,
-            multi_outputs,
-            &func,
-            return_hint.as_ref(),
-            node_map,
-            partition_key,
-            registry,
-        )?
+        build_multi_output_specs(py, multi_outputs, &func, node_map, partition_key, registry)?
     } else {
         build_single_output_spec(
             py,
@@ -644,11 +636,11 @@ fn build_graph_output_spec(
         .into_any())
 }
 
+/// The worker checks each output's value against the spec's `type_hint`.
 fn build_multi_output_specs(
     py: Python,
     outputs: &[String],
     func: &Py<PyAny>,
-    return_hint: Option<&Py<PyAny>>,
     node_map: &HashMap<String, ResolvedNode>,
     partition_key: &Option<PyPartitionKey>,
     registry: &IOHandlerRegistry,
@@ -668,7 +660,7 @@ fn build_multi_output_specs(
         kwargs.set_item("asset_metadata", out_node.metadata())?;
         let partition = ops::build_partition_context(out_node, partition_key)?;
         kwargs.set_item("partition", partition)?;
-        kwargs.set_item("type_hint", return_hint)?;
+        kwargs.set_item("type_hint", out_node.output_type_hint())?;
         let tuple = PyTuple::new(
             py,
             &[

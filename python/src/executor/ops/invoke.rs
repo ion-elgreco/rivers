@@ -332,10 +332,18 @@ pub(crate) fn execute_step(
                             step.name
                         ))
                     })?;
+                    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
+                        .outputs
+                        .iter()
+                        .map(|name| {
+                            let hint = node_map.get(name).and_then(|n| n.output_type_hint());
+                            (name.clone(), hint.map(|h| h.clone_ref(py)))
+                        })
+                        .collect();
                     let (outputs, error) = super::run_async_generator(
                         py,
                         &generator,
-                        &step.outputs,
+                        &selected_outputs,
                         built.ctx_ref.as_ref(),
                         locals,
                     );

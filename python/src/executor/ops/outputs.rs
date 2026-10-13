@@ -3,6 +3,8 @@
 //! Splits a step's `StepResult` into per-output items in one place,
 //! regardless of whether the asset returned a single value (`name == step.name`),
 //! a dict (`{output_name: value, ...}`), or a generator (`yield Output(...)`).
+//! A multi-asset output's value is checked here against its
+//! `AssetDef.type_hint`, so every executor checks it the same way.
 //!
 //! Consumers receive [`OutputItem`]s with all metadata and asset-declared
 //! `data_version` sources already merged with the right precedence:
@@ -12,6 +14,7 @@
 //!     > generator-context (gen-only)
 //!     > step-shared (step_result.output_metadata / data_version)
 //!     > legacy DataVersion-in-metadata fallback
+//!     > the validator of the output's type hint (metadata only)
 //! ```
 //!
 //! `OutputItem.metadata` is stripped of any `MetadataValue::DataVersion`
@@ -27,7 +30,7 @@
 //! partially-merged `OutputItem`; a `merge_metadata` call outside this
 //! module, other than that handler overlay, is skipping the contract.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use pyo3::exceptions::{PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
@@ -40,6 +43,7 @@ use crate::result_types::{self, ResultKind};
 use crate::runtime::rt;
 
 use super::StepResult;
+use super::annotations::validate_return_type;
 use super::extract_data_version;
 use super::merge_metadata;
 
@@ -137,10 +141,13 @@ fn item_for_kind(
 /// selected output. Handles single-output, dict multi-asset, and generator
 /// multi-asset (sync + async) shapes uniformly.
 ///
-/// `selected_outputs` is the multi-asset's output name list (`step.outputs`).
-/// Empty means single-output: one item is yielded with `name == step_name`.
-/// Non-empty means multi-asset: one item per selected output (subsetting),
-/// non-selected generator yields silently skipped.
+/// `selected_outputs` is the multi-asset's outputs (`step.outputs`), each
+/// with its `AssetDef.type_hint`. Empty means single-output: one item is
+/// yielded with `name == step_name`. Non-empty means multi-asset: one item
+/// per selected output (subsetting), non-selected generator yields silently
+/// skipped. An item carries its value as checked against the type hint, e.g.
+/// a frame that pandera coerced; a value that fails the check ends the
+/// iteration with `AssetOutputValidationError`.
 ///
 /// `step_name` equals `step.name` for non-mapped runs and the per-instance
 /// name for mapped fan-out (single-output only — multi-asset is never
@@ -151,7 +158,7 @@ fn item_for_kind(
 pub(crate) fn for_each_output<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     step_name: &str,
     mut on_item: F,
 ) -> PyResult<()>
@@ -169,10 +176,30 @@ where
     }
 }
 
+/// Checks an `Output` value against its output's type hint. Returns the value
+/// to store, and `metadata` over the entries of the hint's validator.
+fn check_output(
+    py: Python,
+    name: &str,
+    kind: ResultKind,
+    value: Option<Py<PyAny>>,
+    hint: Option<&Py<PyAny>>,
+    metadata: Vec<(String, MetadataValue)>,
+) -> PyResult<(Option<Py<PyAny>>, Vec<(String, MetadataValue)>)> {
+    let (ResultKind::Output, Some(hint)) = (kind, hint) else {
+        return Ok((value, metadata));
+    };
+    let value = value.unwrap_or_else(|| py.None());
+    let checked = validate_return_type(py, &value, Some(hint), name)?;
+    let mut merged = checked.metadata;
+    merge_metadata(&mut merged, &metadata);
+    Ok((Some(checked.value), merged))
+}
+
 fn for_each_output_generator<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     kind: &super::GeneratorType,
     on_item: &mut F,
 ) -> PyResult<()>
@@ -203,7 +230,7 @@ where
 pub(crate) fn run_async_generator(
     py: Python,
     generator: &Py<PyAny>,
-    selected_outputs: &[String],
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     context: Option<&Py<PyAny>>,
     locals: &TaskLocals,
 ) -> (Vec<OutputItem>, Option<PyErr>) {
@@ -228,7 +255,7 @@ pub(crate) fn run_async_generator(
 /// One item per selected output a generator yields, as `next` returns them.
 fn for_each_yield<F>(
     py: Python,
-    selected_outputs: &[String],
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     context: Option<&Py<PyAny>>,
     mut next: impl FnMut(Python) -> PyResult<Option<Py<PyAny>>>,
     on_item: &mut F,
@@ -236,7 +263,10 @@ fn for_each_yield<F>(
 where
     F: FnMut(Python, OutputItem) -> PyResult<()>,
 {
-    let selected: HashSet<&str> = selected_outputs.iter().map(|s| s.as_str()).collect();
+    let selected: HashMap<&str, Option<&Py<PyAny>>> = selected_outputs
+        .iter()
+        .map(|(name, hint)| (name.as_str(), hint.as_ref()))
+        .collect();
     let gen_ctx = context.and_then(|c| {
         c.bind(py)
             .cast::<PyAssetExecutionContext>()
@@ -255,9 +285,9 @@ where
             ExecutionError::new_err("yield in multi-asset must include output_name")
         })?;
 
-        if !selected.contains(output_name.as_str()) {
+        let Some(&hint) = selected.get(output_name.as_str()) else {
             continue;
-        }
+        };
 
         // Cumulative ctx-level metadata (peek, not drain) + per-yield ctx dv (drain).
         let ctx_metadata = gen_ctx
@@ -273,6 +303,8 @@ where
         // step_result.output_metadata as a shared layer — only ctx-set.
         let mut merged_metadata = ctx_metadata;
         merge_metadata(&mut merged_metadata, &ext.metadata);
+        let (value, merged_metadata) =
+            check_output(py, &output_name, ext.kind, ext.value, hint, merged_metadata)?;
         let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
 
         // dv precedence: per-yield > ctx > legacy-from-metadata.
@@ -282,7 +314,7 @@ where
             py,
             ext.kind,
             output_name,
-            ext.value,
+            value,
             stripped_metadata,
             resolved_dv,
         );
@@ -294,7 +326,7 @@ where
 fn for_each_output_dict<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     on_item: &mut F,
 ) -> PyResult<()>
 where
@@ -304,7 +336,7 @@ where
     let shared_metadata = &step_result.output_metadata;
     let shared_dv = step_result.data_version.as_deref();
 
-    for output_name in selected_outputs {
+    for (output_name, hint) in selected_outputs {
         let sliced = result.call_method1(py, "__getitem__", (output_name.as_str(),))?;
 
         let (value, per_metadata, per_dv, kind) =
@@ -315,6 +347,8 @@ where
 
         let mut merged_metadata = shared_metadata.clone();
         merge_metadata(&mut merged_metadata, &per_metadata);
+        let (value, merged_metadata) =
+            check_output(py, output_name, kind, value, hint.as_ref(), merged_metadata)?;
         let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
 
         // dv precedence: per-output > shared > legacy-from-metadata.

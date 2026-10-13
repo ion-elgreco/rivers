@@ -181,6 +181,15 @@ pub(crate) fn process_step_result(
         Vec::new()
     };
     let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
+    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
+        .outputs
+        .iter()
+        .map(|name| {
+            let node = ctx.repo.node_map.get(name);
+            let hint = node.and_then(|n| n.output_type_hint());
+            (name.clone(), hint.map(|h| h.clone_ref(py)))
+        })
+        .collect();
     let config_instance = step_result
         .config_instance
         .as_ref()
@@ -209,101 +218,112 @@ pub(crate) fn process_step_result(
         .generator
         .is_some()
         .then(|| StepCapture::start(py));
-    let result = ops::for_each_output(py, &step_result, &step.outputs, step_name, |py, item| {
-        if !gen_marks_stashed {
-            gen_marks_stashed = true;
-            stash_failed_partitions(
-                ctx,
-                step,
-                ops::drain_failed_partitions(py, gen_ctx.as_ref()),
-            );
-        }
-        match item {
-            ops::OutputItem::Materialization {
-                name,
-                value,
-                mut metadata,
-                data_version,
-            } => {
-                // Single-output (incl. mapped fan-out instances) shares the
-                // step's underlying node — `name` is the IO/event scope but
-                // node_map is keyed by step.name. Multi-asset outputs have
-                // their own per-output entries in node_map.
-                let node_lookup = if is_single { &step.name } else { &name };
-                let node = ctx.repo.node_map.get(node_lookup).ok_or_else(|| {
-                    ExecutionError::new_err(format!(
-                        "Output '{}' not found in node_map",
-                        node_lookup
-                    ))
-                })?;
-
-                // value.is_some() => Output(v): write via IO handler.
-                // value.is_none() => Materialization(...): user-managed.
-                let resolved_dv = if let Some(value) = &value {
-                    if in_step_pod() {
-                        let handler = ctx.repo.io_handler_registry.for_output(py, node);
-                        OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
-                    }
-                    let written = ops::handle_step_output(
-                        py,
-                        &name,
-                        node,
-                        value,
-                        ctx.scope.partition_key,
-                        return_hint.as_ref(),
-                        metadata.clone(),
-                        ctx.repo.io_handler_registry,
-                    )?;
-                    ops::merge_metadata(&mut metadata, &written.metadata);
-                    written.data_version.or(data_version)
-                } else {
-                    data_version
-                };
-                let final_dv = resolved_dv.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-                // Persist dynamic_keys to KV before emit_success so a
-                // racing downstream sees the new keys. Single-output Output
-                // path only — multi-asset can't carry DynamicOutputs.
-                if is_single
-                    && value.is_some()
-                    && let Some(keys) = dynamic_keys.as_deref()
-                    && !keys.is_empty()
-                {
-                    py.detach(|| {
-                        ops::persist_dynamic_keys(
-                            ctx.sink.storage,
-                            &name,
-                            ctx.scope.partition_key,
-                            &final_dv,
-                            keys,
-                        );
-                    });
-                }
-
-                emit_materialization_and_hooks(
+    let result = ops::for_each_output(
+        py,
+        &step_result,
+        &selected_outputs,
+        step_name,
+        |py, item| {
+            if !gen_marks_stashed {
+                gen_marks_stashed = true;
+                stash_failed_partitions(
                     ctx,
-                    node,
-                    &name,
-                    &metadata,
-                    final_dv,
-                    &input_versions,
-                    value.as_ref(),
-                    config_instance.as_ref(),
+                    step,
+                    ops::drain_failed_partitions(py, gen_ctx.as_ref()),
                 );
-                yielded_names.insert(name);
             }
-            ops::OutputItem::Observation {
-                name,
-                metadata,
-                data_version,
-            } => {
-                ctx.emit_observation(&name, &metadata, data_version, now_ts());
-                ctx.emit_success(&name);
-                yielded_names.insert(name);
+            match item {
+                ops::OutputItem::Materialization {
+                    name,
+                    value,
+                    mut metadata,
+                    data_version,
+                } => {
+                    // Single-output (incl. mapped fan-out instances) shares the
+                    // step's underlying node — `name` is the IO/event scope but
+                    // node_map is keyed by step.name. Multi-asset outputs have
+                    // their own per-output entries in node_map.
+                    let node_lookup = if is_single { &step.name } else { &name };
+                    let node = ctx.repo.node_map.get(node_lookup).ok_or_else(|| {
+                        ExecutionError::new_err(format!(
+                            "Output '{}' not found in node_map",
+                            node_lookup
+                        ))
+                    })?;
+
+                    // value.is_some() => Output(v): write via IO handler.
+                    // value.is_none() => Materialization(...): user-managed.
+                    let resolved_dv = if let Some(value) = &value {
+                        if in_step_pod() {
+                            let handler = ctx.repo.io_handler_registry.for_output(py, node);
+                            OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
+                        }
+                        let type_hint = if is_single {
+                            return_hint.as_ref()
+                        } else {
+                            node.output_type_hint()
+                        };
+                        let written = ops::handle_step_output(
+                            py,
+                            &name,
+                            node,
+                            value,
+                            ctx.scope.partition_key,
+                            type_hint,
+                            metadata.clone(),
+                            ctx.repo.io_handler_registry,
+                        )?;
+                        ops::merge_metadata(&mut metadata, &written.metadata);
+                        written.data_version.or(data_version)
+                    } else {
+                        data_version
+                    };
+                    let final_dv = resolved_dv.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                    // Persist dynamic_keys to KV before emit_success so a
+                    // racing downstream sees the new keys. Single-output Output
+                    // path only — multi-asset can't carry DynamicOutputs.
+                    if is_single
+                        && value.is_some()
+                        && let Some(keys) = dynamic_keys.as_deref()
+                        && !keys.is_empty()
+                    {
+                        py.detach(|| {
+                            ops::persist_dynamic_keys(
+                                ctx.sink.storage,
+                                &name,
+                                ctx.scope.partition_key,
+                                &final_dv,
+                                keys,
+                            );
+                        });
+                    }
+
+                    emit_materialization_and_hooks(
+                        ctx,
+                        node,
+                        &name,
+                        &metadata,
+                        final_dv,
+                        &input_versions,
+                        value.as_ref(),
+                        config_instance.as_ref(),
+                    );
+                    yielded_names.insert(name);
+                }
+                ops::OutputItem::Observation {
+                    name,
+                    metadata,
+                    data_version,
+                } => {
+                    ctx.emit_observation(&name, &metadata, data_version, now_ts());
+                    ctx.emit_success(&name);
+                    yielded_names.insert(name);
+                }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
     if let Some(capture) = body_capture {
         let logs = match (call_logs, capture.finish()) {
             (Some((out, err, logs)), Some(body)) => Some((

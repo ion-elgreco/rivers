@@ -231,13 +231,12 @@ def test_dagster_databricks_maps_to_databricks_resource():
 
 
 def test_dagster_pandera_maps_to_return_hints(storage):
-    """`dagster_type=pandera_schema_to_dagster_type(Model)` becomes `-> DataFrame[Model]`."""
+    """`dagster_type=pandera_schema_to_dagster_type(Model)` becomes `-> DataFrame[Model]`,
+    and `rs.AssetDef(type_hint=DataFrame[Model])` on a multi-asset output."""
     pytest.importorskip("pandera")
     pd = pytest.importorskip("pandas")
     import pandera.pandas as pa
     from pandera.typing import DataFrame, Series
-
-    from rivers.integrations.pandera import schema_metadata
 
     class Orders(pa.DataFrameModel):
         id: Series[int] = pa.Field(ge=0)
@@ -246,13 +245,20 @@ def test_dagster_pandera_maps_to_return_hints(storage):
     def orders() -> DataFrame[Orders]:
         return pd.DataFrame({"id": [-1]})
 
-    repo = rs.CodeRepository(assets=[orders], default_executor=rs.Executor.in_process())
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("refunds", type_hint=DataFrame[Orders])]
+    )
+    def load():
+        yield rs.Output(pd.DataFrame({"id": [-1]}), output_name="refunds")
+
+    repo = rs.CodeRepository(
+        assets=[orders, load], default_executor=rs.Executor.in_process()
+    )
     repo.resolve(storage=storage)
-    with pytest.raises(
-        rs.exceptions.AssetOutputValidationError, match="does not match"
-    ):
-        repo.materialize()
-    assert list(schema_metadata(Orders)) == ["pandera/schema"]
+    result = repo.materialize(raise_on_error=False)
+    failed = dict(result.failed_assets)
+    assert sorted(failed) == ["orders", "refunds"]
+    assert all("does not match" in error for error in failed.values())
 
 
 def test_dagster_airbyte_maps_to_airbyte_resource():
@@ -337,6 +343,36 @@ def test_dagster_datadog_maps_to_datadog_resource():
     assert isinstance(datadog.failure_hook(), rs.Hook)
     assert isinstance(datadog.success_hook(), rs.Hook)
     assert datadog.run_failure_sensor().monitored_status == rs.RunStatus.Failure
+
+
+def test_dagster_sling_maps_to_sling_integration():
+    pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
+    from rivers.integrations.sling import (
+        SlingConnection,
+        SlingReplication,
+        SlingResource,
+    )
+
+    replication = SlingReplication(
+        {"source": "PG", "target": "WAREHOUSE", "streams": {"public.users": None}},
+        asset_def_fn=lambda stream: stream.output_def(
+            deps=[rs.AssetDef.dep("pg_users")]
+        ),
+    )
+
+    @replication.assets(name="raw")
+    def raw(context: rs.AssetExecutionContext, sling: SlingResource):
+        yield from sling.replicate(context, replication)
+
+    @rs.Asset
+    def pg_users() -> None:
+        return None
+
+    assert [output.name for output in raw.output_defs] == ["public.users"]
+    sling = SlingResource(connections=[SlingConnection(name="PG", url="${PG_URL}")])
+    rs.CodeRepository(assets=[pg_users, raw], resources={"sling": sling}).validate()
+    with pytest.raises(rs.exceptions.GraphValidationError, match="'pg_users'"):
+        rs.CodeRepository(assets=[raw], resources={"sling": sling}).validate()
 
 
 def test_automation_condition_has_no_allow_or_ignore():
