@@ -310,7 +310,7 @@ class DatabricksResource(Resource):
             lines.extend(f"Task {key} is not in the run" for key in missing)
             raise DatabricksRunError("\n".join(lines))
         if _status(run.state) != "SUCCESS":
-            context.log.warning(_failure_message(client, run, _failed_tasks(run)))
+            context.log.warning(_failure_message(client, run))
 
     def _wait(
         self, client: WorkspaceClient, run_id: int, log: logging.Logger
@@ -416,7 +416,7 @@ def _status(state: jobs.RunState | None) -> str:
 
 def _succeeded(client: WorkspaceClient, run_id: int, run: jobs.Run) -> DatabricksRun:
     if _status(run.state) != "SUCCESS":
-        raise DatabricksRunError(_failure_message(client, run, _failed_tasks(run)))
+        raise DatabricksRunError(_failure_message(client, run))
 
     outputs = {}
     for task in run.tasks or []:
@@ -488,19 +488,20 @@ def _seconds(start_ms: int | None, end_ms: int | None) -> float | None:
     return (end_ms - start_ms) / 1000 if start_ms and end_ms else None
 
 
-def _failed_tasks(run: jobs.Run) -> list[jobs.RunTask]:
-    return [task for task in run.tasks or [] if _status(task.state) in _TASK_FAILURES]
-
-
 def _failure_message(
-    client: WorkspaceClient, run: jobs.Run, tasks: list[jobs.RunTask]
+    client: WorkspaceClient, run: jobs.Run, tasks: list[jobs.RunTask] | None = None
 ) -> str:
-    """The run's state and URL, and the state and error of each of ``tasks``."""
+    """The run's state and URL, and the state and error of each of ``tasks``.
+
+    ``tasks`` defaults to the run's tasks that have an error to show.
+    """
     head = f"Databricks run {run.run_id} ended with {_status(run.state)}"
     lines = [_with_message(head, run.state and run.state.state_message)]
     if run.run_page_url:
         lines.append(run.run_page_url)
 
+    if tasks is None:
+        tasks = [t for t in run.tasks or [] if _status(t.state) in _TASK_FAILURES]
     for task in tasks:
         status = _status(task.state)
         head = f"Task {task.task_key} {status}"
