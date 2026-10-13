@@ -371,61 +371,74 @@ pub fn worker_execute_step(
             // Multi-asset: drive the shared iterator over the selected outputs.
             // A `None` handler marks an output kept in memory.
             let mut spec_map: HashMap<String, (Option<Py<PyAny>>, Py<PyAny>)> = HashMap::new();
+            let mut output_hints: HashMap<String, Py<PyAny>> = HashMap::new();
             let mut selected_outputs: Vec<String> = Vec::new();
             for spec in specs.iter() {
                 let spec_tuple: &Bound<PyTuple> = spec.cast()?;
                 let name: String = spec_tuple.get_item(0)?.extract()?;
                 let handler: Option<Py<PyAny>> = spec_tuple.get_item(1)?.extract()?;
-                let kwargs = spec_tuple.get_item(2)?.unbind();
-                spec_map.insert(name.clone(), (handler, kwargs));
+                let kwargs = spec_tuple.get_item(2)?;
+                if let Some(hint) = kwargs.get_item("type_hint")?.extract()? {
+                    output_hints.insert(name.clone(), hint);
+                }
+                spec_map.insert(name.clone(), (handler, kwargs.unbind()));
                 selected_outputs.push(name);
             }
 
-            ops::for_each_output(py, &synth, &selected_outputs, "", None, |py, item| {
-                match item {
-                    ops::OutputItem::Materialization {
-                        name,
-                        value,
-                        mut metadata,
-                        data_version,
-                    } => {
-                        // value.is_some() => Output: write IO from the worker
-                        // and report tag=Output. value.is_none() => Materialization:
-                        // user-managed, report tag=Materialization.
-                        let (final_dv, kind) = if let Some(value) = value {
-                            let (handler, out_kwargs) = match spec_map.get(&name) {
-                                Some(s) => s,
-                                None => return Ok(()),
+            ops::for_each_output(
+                py,
+                &synth,
+                &selected_outputs,
+                &output_hints,
+                "",
+                None,
+                |py, item| {
+                    match item {
+                        ops::OutputItem::Materialization {
+                            name,
+                            value,
+                            mut metadata,
+                            data_version,
+                        } => {
+                            // value.is_some() => Output: write IO from the worker
+                            // and report tag=Output. value.is_none() => Materialization:
+                            // user-managed, report tag=Materialization.
+                            let (final_dv, kind) = if let Some(value) = value {
+                                let (handler, out_kwargs) = match spec_map.get(&name) {
+                                    Some(s) => s,
+                                    None => return Ok(()),
+                                };
+                                let Some(handler) = handler else {
+                                    return Err(OutOfProcess::Parallel.in_memory_error(&name));
+                                };
+                                let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
+                                let out_ctx =
+                                    Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
+                                let written = write_output(py, handler, &out_ctx, &value)?;
+                                ops::merge_metadata(&mut metadata, &written.metadata);
+                                (written.data_version.or(data_version), ResultKind::Output)
+                            } else {
+                                (data_version, ResultKind::Materialization)
                             };
-                            let Some(handler) = handler else {
-                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
-                            };
-                            let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
-                            let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                            let written = write_output(py, handler, &out_ctx, &value)?;
-                            ops::merge_metadata(&mut metadata, &written.metadata);
-                            (written.data_version.or(data_version), ResultKind::Output)
-                        } else {
-                            (data_version, ResultKind::Materialization)
-                        };
-                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
-                    }
-                    ops::OutputItem::Observation {
-                        name,
-                        metadata,
-                        data_version,
-                    } => {
-                        append_output_tuple(
-                            &outputs_list,
-                            &name,
-                            ResultKind::Observation,
+                            append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
+                        }
+                        ops::OutputItem::Observation {
+                            name,
                             metadata,
                             data_version,
-                        )?;
+                        } => {
+                            append_output_tuple(
+                                &outputs_list,
+                                &name,
+                                ResultKind::Observation,
+                                metadata,
+                                data_version,
+                            )?;
+                        }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         } else {
             // Single-output: drive the shared iterator with an empty
             // selected_outputs (single shape). Surface the dynamic keys to the
@@ -445,48 +458,58 @@ pub fn worker_execute_step(
                 String::new()
             };
 
-            ops::for_each_output(py, &synth, &[], &asset_name, None, |py, item| {
-                match item {
-                    ops::OutputItem::Materialization {
-                        name,
-                        value,
-                        mut metadata,
-                        data_version,
-                    } => {
-                        let (final_dv, kind) = if let Some(value) = value {
-                            let (Some(handler), Some(out_kwargs)) =
-                                (&io_handler, &output_context_kwargs)
-                            else {
-                                return Err(OutOfProcess::Parallel.in_memory_error(&name));
-                            };
-                            let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
-                            let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
-                            let written = write_output(py, handler, &out_ctx, &value)?;
-                            ops::merge_metadata(&mut metadata, &written.metadata);
-                            let final_dv = written.data_version.or(data_version);
-                            if let Some((graph_handler, graph_kwargs)) = &graph_output {
-                                let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;
-                                let graph_ctx =
-                                    Py::new(py, PyOutputContext::from_kwargs(py, graph_dict)?)?;
-                                match write_output(py, graph_handler, &graph_ctx, &value) {
-                                    Ok(_) => graph_written = true,
-                                    Err(e) => graph_error = Some(e.into_value(py).into_any()),
+            ops::for_each_output(
+                py,
+                &synth,
+                &[],
+                &HashMap::new(),
+                &asset_name,
+                None,
+                |py, item| {
+                    match item {
+                        ops::OutputItem::Materialization {
+                            name,
+                            value,
+                            mut metadata,
+                            data_version,
+                        } => {
+                            let (final_dv, kind) = if let Some(value) = value {
+                                let (Some(handler), Some(out_kwargs)) =
+                                    (&io_handler, &output_context_kwargs)
+                                else {
+                                    return Err(OutOfProcess::Parallel.in_memory_error(&name));
+                                };
+                                let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
+                                let out_ctx =
+                                    Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
+                                let written = write_output(py, handler, &out_ctx, &value)?;
+                                ops::merge_metadata(&mut metadata, &written.metadata);
+                                let final_dv = written.data_version.or(data_version);
+                                if let Some((graph_handler, graph_kwargs)) = &graph_output {
+                                    let graph_dict: &Bound<PyDict> =
+                                        graph_kwargs.bind(py).cast()?;
+                                    let graph_ctx =
+                                        Py::new(py, PyOutputContext::from_kwargs(py, graph_dict)?)?;
+                                    match write_output(py, graph_handler, &graph_ctx, &value) {
+                                        Ok(_) => graph_written = true,
+                                        Err(e) => graph_error = Some(e.into_value(py).into_any()),
+                                    }
                                 }
-                            }
-                            (final_dv, ResultKind::Output)
-                        } else {
-                            (data_version, ResultKind::Materialization)
-                        };
-                        append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
+                                (final_dv, ResultKind::Output)
+                            } else {
+                                (data_version, ResultKind::Materialization)
+                            };
+                            append_output_tuple(&outputs_list, &name, kind, metadata, final_dv)?;
+                        }
+                        ops::OutputItem::Observation { .. } => {
+                            // External-asset observations route through a separate
+                            // orchestrator path before the worker is called.
+                            unreachable!("single-output worker path does not produce Observation");
+                        }
                     }
-                    ops::OutputItem::Observation { .. } => {
-                        // External-asset observations route through a separate
-                        // orchestrator path before the worker is called.
-                        unreachable!("single-output worker path does not produce Observation");
-                    }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
 
         Ok(single_dynamic_keys)

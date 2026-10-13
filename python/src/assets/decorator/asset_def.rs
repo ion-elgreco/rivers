@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyString, PyTuple};
 
 use crate::assets::action::PyAssetAction;
 use crate::assets::dep_def::DepDef;
@@ -179,6 +179,26 @@ pub struct AssetDef {
     /// `actions=` at build time; a per-output action overrides a top-level
     /// one with the same name.
     pub actions: Vec<Py<PyAssetAction>>,
+    /// The type of the output's value, checked like a return hint.
+    pub type_hint: Option<Py<PyAny>>,
+}
+
+/// A string hint is rejected: rivers has no module globals to evaluate it in.
+fn checked_type_hint(hint: Option<Bound<'_, PyAny>>) -> PyResult<Option<Py<PyAny>>> {
+    match hint {
+        Some(hint) if hint.is_instance_of::<PyString>() => Err(AssetDefinitionError::new_err(
+            format!("type_hint must be a type, not the string {}", hint.repr()?),
+        )),
+        hint => Ok(hint.map(Bound::unbind)),
+    }
+}
+
+/// Type hints compare with Python `==`, e.g. `list[int] == list[int]`.
+fn type_hint_eq(py: Python, a: Option<&Py<PyAny>>, b: Option<&Py<PyAny>>) -> PyResult<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) => a.bind(py).eq(b),
+        (a, b) => Ok(a.is_none() && b.is_none()),
+    }
 }
 
 impl AssetDef {
@@ -209,6 +229,7 @@ impl AssetDef {
             pool: def.pool.clone(),
             deps: def.deps.iter().map(|d| d.clone_ref(py)).collect(),
             actions: def.actions.iter().map(|a| a.clone_ref(py)).collect(),
+            type_hint: def.type_hint.as_ref().map(|h| h.clone_ref(py)),
         })
     }
 
@@ -243,7 +264,8 @@ impl AssetDef {
             && a.metadata == b.metadata
             && a.pool == b.pool
             && PartitionsDefRef::opt_eq(&a.partitions_def, &b.partitions_def)
-            && io_handler_eq(slf.py(), a.io_handler.as_ref(), b.io_handler.as_ref()))
+            && io_handler_eq(slf.py(), a.io_handler.as_ref(), b.io_handler.as_ref())
+            && type_hint_eq(slf.py(), a.type_hint.as_ref(), b.type_hint.as_ref())?)
     }
 
     fn __hash__(&self) -> u64 {
@@ -272,6 +294,7 @@ impl AssetDef {
             pool,
             deps,
             actions,
+            type_hint,
         } = self;
         let kwargs = PyDict::new(py);
         kwargs.set_item("name", name)?;
@@ -293,6 +316,7 @@ impl AssetDef {
         )?;
         kwargs.set_item("deps", deps)?;
         kwargs.set_item("actions", actions)?;
+        kwargs.set_item("type_hint", type_hint)?;
         Ok((PyTuple::empty(py), kwargs))
     }
 
@@ -315,6 +339,7 @@ impl AssetDef {
         pool_slots = None,
         deps = vec![],
         actions = None,
+        type_hint = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -332,9 +357,11 @@ impl AssetDef {
         pool_slots: Option<&Bound<'py, PyAny>>,
         deps: Vec<Py<DepDef>>,
         actions: Option<Vec<Py<PyAssetAction>>>,
+        type_hint: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
         let actions = actions.unwrap_or_default();
         let pool = normalize_pool(pool, pool_slots)?;
+        let type_hint = checked_type_hint(type_hint)?;
         Ok(Self {
             name,
             tags,
@@ -348,6 +375,7 @@ impl AssetDef {
             pool,
             deps,
             actions,
+            type_hint,
         })
     }
 
@@ -373,6 +401,17 @@ impl AssetDef {
     #[setter]
     fn set_partitions_def(&mut self, val: Option<PartitionsDefRef>) {
         self.partitions_def = val;
+    }
+
+    #[getter]
+    fn type_hint(&self, py: Python) -> Option<Py<PyAny>> {
+        self.type_hint.as_ref().map(|h| h.clone_ref(py))
+    }
+
+    #[setter]
+    fn set_type_hint(&mut self, val: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        self.type_hint = checked_type_hint(val)?;
+        Ok(())
     }
 
     /// Create an input dependency definition for use with `deps=[...]`.

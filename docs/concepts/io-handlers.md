@@ -133,7 +133,7 @@ All IO handlers **must** inherit from `BaseIOHandler`. Duck-typing (objects that
 - `asset_name` — name of the asset being written
 - `asset_metadata` — static metadata from the asset definition
 - `partition` — `PartitionContext` if the asset is partitioned
-- `type_hint` — the return type annotation, if any
+- `type_hint` — the asset's return annotation, or a multi-asset output's `AssetDef(type_hint=...)`; `None` if there is none
 - `output_metadata` — `dict[str, MetadataValue]` accumulated via `add_output_metadata()`
 - `add_output_metadata(metadata)` — attach runtime metadata
 - `register_data_version(version)` — record a content-addressable data-version string for this output

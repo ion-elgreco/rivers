@@ -29,7 +29,7 @@ from polars.testing import assert_frame_equal as assert_polars_equal  # noqa: E4
 
 import rivers as rs  # noqa: E402
 from rivers.integrations import output_validator  # noqa: E402
-from rivers.integrations.pandera import schema_metadata, validate_output  # noqa: E402
+from rivers.integrations.pandera import validate_output  # noqa: E402
 
 
 class Orders(pa.DataFrameModel):
@@ -234,11 +234,18 @@ def test_coerced_frame_is_the_stored_frame(env, backend):
     def prices() -> hint:
         return FRAMES[backend]({"price": [1, 2]})
 
-    repo, result = env.materialize(prices)
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("sale_prices", io_handler=env.handler, type_hint=hint)]
+    )
+    def load():
+        return {"sale_prices": FRAMES[backend]({"price": [1, 2]})}
+
+    repo, result = env.materialize(prices, load)
 
     assert result.success
     expected = FRAMES[backend]({"price": [1.0, 2.0]})
     assert_frames_equal(repo.load_node("prices"), expected)
+    assert_frames_equal(repo.load_node("sale_prices"), expected)
 
 
 def test_lazy_frame_is_checked_against_the_schema_only(env):
@@ -312,45 +319,54 @@ def test_metadata_the_asset_sets_wins_over_the_schema_entry(env):
         context.add_output_metadata({"pandera/schema": "see the data contract"})
         return rs.Output(pd.DataFrame(GOOD_ROWS), metadata={"rows": 2})
 
-    _, result = env.materialize(orders)
-
-    assert result.success
-    materialization = env.storage.get_latest_materialization("orders")
-    metadata = {k: json.loads(v) for k, v in materialization.metadata}
-    assert metadata["pandera/schema"] == {"Text": {"value": "see the data contract"}}
-    assert metadata["rows"] == {"Int": {"value": 2}}
-
-
-def test_multi_asset_output_carries_schema_metadata(env):
     @rs.Asset.from_multi(
         output_defs=[
-            rs.AssetDef("orders", io_handler=env.handler),
-            rs.AssetDef("order_count", io_handler=env.handler),
+            rs.AssetDef("refunds", io_handler=env.handler, type_hint=DataFrame[Orders])
         ],
     )
-    def load():
-        orders = Orders.validate(pd.DataFrame(GOOD_ROWS), lazy=True)
-        yield rs.Output(orders, output_name="orders", metadata=schema_metadata(Orders))
-        yield rs.Output(len(orders), output_name="order_count")
+    def load(context: rs.AssetExecutionContext):
+        context.add_output_metadata({"pandera/schema": "see the data contract"})
+        return {"refunds": rs.Output(pd.DataFrame(GOOD_ROWS), metadata={"rows": 2})}
 
-    repo, result = env.materialize(load)
+    _, result = env.materialize(orders, load)
 
     assert result.success
-    assert repo.load_node("order_count") == 2
-    assert env.stored_json("orders", "pandera/schema") == expected_schema("pandas")
+    for name in ("orders", "refunds"):
+        materialization = env.storage.get_latest_materialization(name)
+        metadata = {k: json.loads(v) for k, v in materialization.metadata}
+        assert metadata["pandera/schema"] == {
+            "Text": {"value": "see the data contract"}
+        }
+        assert metadata["rows"] == {"Int": {"value": 2}}
 
 
 @pytest.mark.parametrize(("backend", "hint", "schema"), CASES)
-def test_schema_metadata_describes_model_and_schema(backend, hint, schema):
-    [(key, value)] = schema_metadata(schema).items()
+def test_multi_asset_output_is_validated_against_its_type_hint(
+    env, backend, hint, schema
+):
+    good, bad = FRAMES[backend](GOOD_ROWS), FRAMES[backend](BAD_ROWS)
 
-    assert key == "pandera/schema"
-    assert isinstance(value, rs.MetadataValue.Json)
-    assert json.loads(value.value) == expected_schema(backend)
+    @rs.Asset.from_multi(
+        output_defs=[
+            rs.AssetDef("orders", io_handler=env.handler, type_hint=hint),
+            rs.AssetDef("refunds", io_handler=env.handler, type_hint=hint),
+        ],
+    )
+    def load():
+        yield rs.Output(good, output_name="orders")
+        yield rs.Output(bad, output_name="refunds")
 
+    repo, result = env.materialize(load)
 
-def test_schema_metadata_takes_a_model_class():
-    assert schema_metadata(Orders) == schema_metadata(Orders.to_schema())
+    assert_frames_equal(repo.load_node("orders"), schema.validate(good))
+    assert env.stored_json("orders", "pandera/schema") == expected_schema(backend)
+    with pytest.raises(SchemaErrors) as report:
+        schema.validate(bad, lazy=True)
+    assert dict(result.failed_assets) == {
+        "refunds": "AssetOutputValidationError: Asset 'refunds' returned a value "
+        f"that does not match '{hint}': {report.value}"
+    }
+    assert env.storage.get_latest_materialization("refunds") is None
 
 
 def test_output_validator_finds_pandera_hints_only():
@@ -382,7 +398,24 @@ def test_validate_output_returns_the_validated_frame_and_metadata():
 
     assert isinstance(out, rs.Output)
     assert_pandas_equal(out.value, pd.DataFrame({"price": [1.0, 2.0]}))
-    assert out.metadata == schema_metadata(Prices)
+    [(key, value)] = out.metadata.items()
+    assert key == "pandera/schema"
+    assert isinstance(value, rs.MetadataValue.Json)
+    assert json.loads(value.value) == {
+        "name": "Prices",
+        "description": None,
+        "columns": [
+            {
+                "name": "price",
+                "type": "float64",
+                "nullable": False,
+                "unique": False,
+                "description": None,
+                "checks": [],
+            }
+        ],
+        "checks": [],
+    }
 
 
 def test_missing_pandera_names_the_extra(monkeypatch):

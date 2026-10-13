@@ -4,7 +4,7 @@
 
 ## Return hints
 
-rivers validates the return value when the return hint holds a dataframely schema. The integration needs no import for this.
+rivers validates the return value when the return hint holds a dataframely schema. The integration needs no import for this. For a multi-asset output, put the same hints in `AssetDef(type_hint=...)`, and rivers validates the output's value.
 
 | Return hint | Checked value | Validation |
 |-------------|---------------|------------|
@@ -42,35 +42,17 @@ The JSON object has these fields:
 
 A column check is shown by its rule name, with its bound when it has one, e.g. `"min=0"` or `"regex='^(open|closed)$'"`.
 
-## `schema_metadata(schema)`
-
-```python
-def schema_metadata(schema: type[dy.Schema]) -> dict[str, MetadataValue]
-```
-
-Returns `{"dataframely/schema": MetadataValue.json(...)}` for a schema class. Use it for outputs that have no dataframely return hint, such as multi-asset outputs:
-
-```python
-from rivers.integrations.dataframely import schema_metadata
-
-yield rs.Output(
-    Orders.validate(frame),
-    output_name="orders",
-    metadata=schema_metadata(Orders),
-)
-```
-
 ## `validate_output(value, hint)`
 
 ```python
 def validate_output(value: Any, hint: Any) -> Any
 ```
 
-The function that rivers calls for a dataframely return hint, and for each dataframely schema in an `Annotated` return hint.
+The function that rivers calls for a dataframely return hint or `AssetDef(type_hint=...)`, and for each dataframely schema in an `Annotated` hint.
 
 | Parameter | Description |
 |-----------|-------------|
-| `value` | The asset's return value. |
+| `value` | The asset's return value, or the value of a multi-asset output. |
 | `hint` | A `dy.DataFrame[Schema]` or `dy.LazyFrame[Schema]` hint, or a `dy.Schema` subclass. |
 
 **Returns:** an `Output` with the validated frame and the `dataframely/schema` metadata, or `NotImplemented` when `hint` holds no schema or `value` is not the hint's frame type.

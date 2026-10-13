@@ -274,6 +274,9 @@ rs.AssetDef(
 | `retry` | `RetryPolicy \| str \| None` | `None` |
 | `deps` | `list[DepDef]` | `[]` |
 | `actions` | `list[AssetAction] \| None` | `None` |
+| `type_hint` | `Any` | `None` |
+
+`type_hint` is the type of the output's value, for example `int` or a pandera `DataFrame[Model]`. rivers checks each value of the output against it, the same way as a [return annotation](../concepts/assets.md#return-type-checks), and passes it to the IO handler as `OutputContext.type_hint`. A string is not a type: `AssetDef(type_hint="int")` raises `AssetDefinitionError`.
 
 A multi-asset retries as one unit: every output that sets `retry` must set the same policy (checked at `resolve()`). Step compute is declared on `Asset.from_multi(compute=...)`, not per output.
 

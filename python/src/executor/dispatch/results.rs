@@ -8,7 +8,7 @@
 //! Called by `run_step_to_completion` (trait_def.rs) and AsyncBackend's
 //! result processing loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -182,6 +182,14 @@ pub(crate) fn process_step_result(
     };
     let bridge = ctx.repo.bridge;
     let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
+    let output_hints: HashMap<String, Py<PyAny>> = step
+        .outputs
+        .iter()
+        .filter_map(|name| {
+            let hint = ctx.repo.node_map.get(name)?.output_type_hint(py)?;
+            Some((name.clone(), hint))
+        })
+        .collect();
     let config_instance = step_result
         .config_instance
         .as_ref()
@@ -212,6 +220,7 @@ pub(crate) fn process_step_result(
         py,
         &step_result,
         &step.outputs,
+        &output_hints,
         step_name,
         bridge,
         |py, item| {
@@ -249,13 +258,18 @@ pub(crate) fn process_step_result(
                             let handler = ctx.repo.io_handler_registry.for_output(py, node);
                             OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
                         }
+                        let type_hint = if is_single {
+                            return_hint.as_ref()
+                        } else {
+                            output_hints.get(&name)
+                        };
                         let written = ops::handle_step_output(
                             py,
                             &name,
                             node,
                             value,
                             ctx.scope.partition_key,
-                            return_hint.as_ref(),
+                            type_hint,
                             metadata.clone(),
                             ctx.repo.io_handler_registry,
                         )?;

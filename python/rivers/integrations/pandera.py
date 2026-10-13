@@ -34,17 +34,18 @@ except ImportError as e:
         "rivers.integrations.pandera needs pandera: pip install rivers[pandera]"
     ) from e
 
-__all__ = ["schema_metadata", "validate_output"]
+__all__ = ["validate_output"]
 
 
 def validate_output(value: Any, hint: Any) -> Any:
-    """Validate an asset's return value against the pandera schema in ``hint``.
+    """Validate an asset's value against the pandera schema in ``hint``.
 
-    rivers calls this for a return hint from pandera, and for each pandera
-    schema in an ``Annotated`` return hint.
+    rivers calls this for a pandera type hint, which is a return hint or a
+    multi-asset output's ``AssetDef(type_hint=...)``, and for each pandera
+    schema in an ``Annotated`` hint.
 
     Args:
-        value: The asset's return value.
+        value: The asset's return value, or the value of a multi-asset output.
         hint: A pandera ``DataFrame[Model]`` or ``LazyFrame[Model]`` hint, a
             ``DataFrameModel`` subclass, or a ``DataFrameSchema``.
 
@@ -69,35 +70,14 @@ def validate_output(value: Any, hint: Any) -> Any:
     else:
         return NotImplemented
 
-    return Output(schema.validate(value, lazy=True), metadata=schema_metadata(schema))
+    return Output(schema.validate(value, lazy=True), metadata=_schema_metadata(schema))
 
 
-def schema_metadata(schema: DataFrameSchema | type[DataFrameModel]) -> dict[str, Any]:
-    """Describe a pandera schema as the ``pandera/schema`` metadata entry.
-
-    rivers adds this entry to every output it validates. Use it for outputs
-    that have no pandera return hint, e.g. the outputs of a multi-asset.
-
-    Args:
-        schema: A ``DataFrameSchema`` or a ``DataFrameModel`` subclass.
-
-    Returns:
-        ``{"pandera/schema": MetadataValue.json(...)}``: the schema's name,
-        description, and frame-wide checks, and each column's name, type,
-        nullability, uniqueness, description, and checks.
-
-    Example::
-
-        @rs.Asset.from_multi(output_defs=[rs.AssetDef("orders")])
-        def load():
-            orders = Orders.validate(read_orders(), lazy=True)
-            yield rs.Output(orders, output_name="orders", metadata=schema_metadata(Orders))
-    """
-    frame_schema = schema.to_schema() if isinstance(schema, type) else schema
-
+def _schema_metadata(schema: DataFrameSchema) -> dict[str, Any]:
+    """The ``pandera/schema`` metadata entry that describes ``schema``."""
     table = {
-        "name": frame_schema.name,
-        "description": frame_schema.description,
+        "name": schema.name,
+        "description": schema.description,
         "columns": [
             {
                 "name": column.name,
@@ -107,9 +87,9 @@ def schema_metadata(schema: DataFrameSchema | type[DataFrameModel]) -> dict[str,
                 "description": column.description,
                 "checks": [_check_text(check) for check in column.checks],
             }
-            for column in frame_schema.columns.values()
+            for column in schema.columns.values()
         ],
-        "checks": [_check_text(check) for check in frame_schema.checks or ()],
+        "checks": [_check_text(check) for check in schema.checks or ()],
     }
     return {"pandera/schema": MetadataValue.json(json.dumps(table, default=str))}
 

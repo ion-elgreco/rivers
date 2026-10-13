@@ -552,6 +552,7 @@ impl PyAsset {
             retry,
             compute: compute.map(|c| c.inner),
             actions,
+            type_hint: None,
         });
         Self::new_object(py, py_asset)
     }
@@ -676,6 +677,7 @@ impl PyAsset {
                 retry: None,
                 compute: None,
                 actions: output_actions,
+                type_hint: def.type_hint,
             });
         }
 

@@ -989,9 +989,11 @@ class TestDeclarationPickling:
                     name="optimize", outcome=rs.Outcome.Unchanged, description="compact"
                 )(_optimize)
             ],
+            type_hint=list[int],
         )
         restored = pickle.loads(pickle.dumps(ad))
         assert restored == ad
+        assert restored.type_hint == list[int]
         assert restored.kinds == ["delta", "table"]
         assert restored.pool == [("db", 3), ("api", 1)]
         assert restored.partitions_def == partitions_def
