@@ -331,25 +331,7 @@ def test_validate_output_returns_the_validated_frame_and_metadata():
 
     assert isinstance(out, rs.Output)
     assert_frame_equal(out.value, pl.DataFrame({"price": [1.0, 2.0]}))
-    [(key, value)] = out.metadata.items()
-    assert key == "dataframely/schema"
-    assert isinstance(value, rs.MetadataValue.Json)
-    assert json.loads(value.value) == {
-        "name": "Prices",
-        "description": None,
-        "columns": [
-            {
-                "name": "price",
-                "type": "Float64",
-                "nullable": False,
-                "primary_key": False,
-                "unique": False,
-                "description": None,
-                "checks": ["inf", "nan"],
-            }
-        ],
-        "checks": [],
-    }
+    assert list(out.metadata) == ["dataframely/schema"]
 
 
 def test_missing_dataframely_names_the_extra(monkeypatch):

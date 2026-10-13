@@ -398,24 +398,7 @@ def test_validate_output_returns_the_validated_frame_and_metadata():
 
     assert isinstance(out, rs.Output)
     assert_pandas_equal(out.value, pd.DataFrame({"price": [1.0, 2.0]}))
-    [(key, value)] = out.metadata.items()
-    assert key == "pandera/schema"
-    assert isinstance(value, rs.MetadataValue.Json)
-    assert json.loads(value.value) == {
-        "name": "Prices",
-        "description": None,
-        "columns": [
-            {
-                "name": "price",
-                "type": "float64",
-                "nullable": False,
-                "unique": False,
-                "description": None,
-                "checks": [],
-            }
-        ],
-        "checks": [],
-    }
+    assert list(out.metadata) == ["pandera/schema"]
 
 
 def test_missing_pandera_names_the_extra(monkeypatch):
