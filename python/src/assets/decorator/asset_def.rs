@@ -180,6 +180,7 @@ pub struct AssetDef {
     /// one with the same name.
     pub actions: Vec<Py<PyAssetAction>>,
     /// The type of the output's value, checked like a return hint.
+    #[pyo3(get)]
     pub type_hint: Option<Py<PyAny>>,
 }
 
@@ -401,11 +402,6 @@ impl AssetDef {
     #[setter]
     fn set_partitions_def(&mut self, val: Option<PartitionsDefRef>) {
         self.partitions_def = val;
-    }
-
-    #[getter]
-    fn type_hint(&self, py: Python) -> Option<Py<PyAny>> {
-        self.type_hint.as_ref().map(|h| h.clone_ref(py))
     }
 
     #[setter]
