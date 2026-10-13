@@ -142,9 +142,9 @@ The materialization of each output of an asset with `tasks` has this metadata:
 |-----|------|-------------|
 | `databricks/run_id` | `int` | The run id of the job. |
 | `databricks/job_id` | `int` | The job id. |
-| `databricks/task_key` | `str` | The task key. |
 | `databricks/run_url` | `MetadataValue.url` | The run page of the task. |
 | `databricks/duration` | `MetadataValue.duration` | Seconds from the start of the task to its end. |
+| `databricks/task_key` | `str` | The task key. |
 | `databricks/output` | `str` | The exit value of the task, when it is a notebook task. |
 
 A notebook task can send a value back with `dbutils.notebook.exit()`. Databricks returns the first 5 MB of each value. Keep values small: they are stored as metadata.

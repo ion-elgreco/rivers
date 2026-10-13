@@ -434,14 +434,7 @@ def _succeeded(client: WorkspaceClient, run_id: int, run: jobs.Run) -> Databrick
 
 
 def _run_metadata(run: DatabricksRun) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"databricks/run_id": run.run_id}
-    if run.job_id is not None:
-        metadata["databricks/job_id"] = run.job_id
-    if run.run_page_url:
-        metadata["databricks/run_url"] = MetadataValue.url(run.run_page_url)
-    if run.duration is not None:
-        metadata["databricks/duration"] = MetadataValue.duration(run.duration)
-
+    metadata = _metadata(run.run_id, run.job_id, run.run_page_url, run.duration)
     for task_key, output in run.outputs.items():
         metadata[f"databricks/output/{task_key}"] = output
 
@@ -451,20 +444,31 @@ def _run_metadata(run: DatabricksRun) -> dict[str, Any]:
 def _task_metadata(
     client: WorkspaceClient, run: jobs.Run, task: jobs.RunTask
 ) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"databricks/run_id": run.run_id}
-    if run.job_id is not None:
-        metadata["databricks/job_id"] = run.job_id
+    metadata = _metadata(
+        run.run_id,
+        run.job_id,
+        task.run_page_url or run.run_page_url,
+        _seconds(task.start_time, task.end_time),
+    )
     metadata["databricks/task_key"] = task.task_key
-    url = task.run_page_url or run.run_page_url
-    if url:
-        metadata["databricks/run_url"] = MetadataValue.url(url)
-    duration = _seconds(task.start_time, task.end_time)
-    if duration is not None:
-        metadata["databricks/duration"] = MetadataValue.duration(duration)
 
     output = _notebook_output(client, task)
     if output is not None:
         metadata["databricks/output"] = output
+
+    return metadata
+
+
+def _metadata(
+    run_id: int | None, job_id: int | None, url: str | None, duration: float | None
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"databricks/run_id": run_id}
+    if job_id is not None:
+        metadata["databricks/job_id"] = job_id
+    if url:
+        metadata["databricks/run_url"] = MetadataValue.url(url)
+    if duration is not None:
+        metadata["databricks/duration"] = MetadataValue.duration(duration)
 
     return metadata
 

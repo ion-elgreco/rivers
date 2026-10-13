@@ -69,9 +69,9 @@ materialization with this metadata:
 |-----|------|-------------|
 | `databricks/run_id` | `int` | The run id of the job. |
 | `databricks/job_id` | `int` | The job id. |
-| `databricks/task_key` | `str` | The task key. |
 | `databricks/run_url` | `MetadataValue.url` | The run page of the task. |
 | `databricks/duration` | `MetadataValue.duration` | Seconds from the start of the task to its end. |
+| `databricks/task_key` | `str` | The task key. |
 | `databricks/output` | `str` | The value the notebook task passed to `dbutils.notebook.exit()`. |
 
 The other selected outputs fail with `DatabricksRunError`. A failed task without an
