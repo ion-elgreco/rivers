@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -126,10 +127,37 @@ def grpc_stubs(tmp_path_factory):
 # before pytest-xdist starts the workers.
 _DUCKDB_EXTENSIONS = ("delta", "ducklake", "httpfs")
 
+# `import sling` downloads the sling binary (~120 MB) on first use. A run that
+# includes test_sling.py finds it once, before pytest-xdist starts the
+# workers, and passes it to them as SLING_BINARY.
+_SLING_TESTS = Path(__file__).parent / "integrations" / "test_sling.py"
+
+
+def _find_sling_binary(config) -> None:
+    if os.environ.get("SLING_BINARY") or importlib.util.find_spec("sling") is None:
+        return
+    paths = [Path(arg.split("::")[0]).resolve() for arg in config.args]
+    if not any(path == _SLING_TESTS or path in _SLING_TESTS.parents for path in paths):
+        return
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import sling; print(sling.SLING_BIN)"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return  # test_sling.py skips
+    # the download prints its progress before the path
+    os.environ["SLING_BINARY"] = result.stdout.splitlines()[-1]
+
 
 def pytest_configure(config):
     if hasattr(config, "workerinput"):
         return
+    _find_sling_binary(config)
     try:
         import duckdb
     except ImportError:

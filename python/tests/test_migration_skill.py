@@ -315,6 +315,36 @@ def test_dagster_datadog_maps_to_datadog_resource():
     assert datadog.run_failure_sensor().monitored_status == rs.RunStatus.Failure
 
 
+def test_dagster_sling_maps_to_sling_integration():
+    pytest.importorskip("rivers.integrations.sling", exc_type=ImportError)
+    from rivers.integrations.sling import (
+        SlingConnection,
+        SlingReplication,
+        SlingResource,
+    )
+
+    replication = SlingReplication(
+        {"source": "PG", "target": "WAREHOUSE", "streams": {"public.users": None}},
+        asset_def_fn=lambda stream: stream.output_def(
+            deps=[rs.AssetDef.dep("pg_users")]
+        ),
+    )
+
+    @replication.assets(name="raw")
+    def raw(context: rs.AssetExecutionContext, sling: SlingResource):
+        yield from sling.replicate(context, replication)
+
+    @rs.Asset
+    def pg_users() -> None:
+        return None
+
+    assert [output.name for output in raw.output_defs] == ["public.users"]
+    sling = SlingResource(connections=[SlingConnection(name="PG", url="${PG_URL}")])
+    rs.CodeRepository(assets=[pg_users, raw], resources={"sling": sling}).validate()
+    with pytest.raises(rs.exceptions.GraphValidationError, match="'pg_users'"):
+        rs.CodeRepository(assets=[raw], resources={"sling": sling}).validate()
+
+
 def test_automation_condition_has_no_allow_or_ignore():
     """Dagster's `.allow()`/`.ignore()`; rivers uses `.without()`/`.on_selected()`."""
     condition = rs.AutomationCondition.missing()

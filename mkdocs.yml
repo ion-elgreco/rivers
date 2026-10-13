@@ -79,6 +79,7 @@ nav:
       - DuckDB: guides/duckdb.md
       - pandera: guides/pandera.md
       - Slack: guides/slack.md
+      - Sling: guides/sling.md
       - Authentication: guides/authentication.md
   - API Reference:
       - CodeRepository: api-reference/repository.md
@@ -102,6 +103,7 @@ nav:
       - Delta Lake: api-reference/delta.md
       - DuckDB: api-reference/duckdb.md
       - pandera: api-reference/pandera.md
+      - Sling: api-reference/sling.md
       - MetadataValue: api-reference/metadata.md
       - Schema: api-reference/schema.md
       - Storage: api-reference/storage.md
