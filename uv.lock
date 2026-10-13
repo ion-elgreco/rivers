@@ -1785,6 +1785,7 @@ slack = [
     { name = "slack-sdk" },
 ]
 snowflake = [
+    { name = "pandas" },
     { name = "pyarrow" },
     { name = "snowflake-connector-python" },
 ]
@@ -1819,10 +1820,10 @@ requires-dist = [
     { name = "rivers", extras = ["delta"], marker = "extra == 'delta-pyspark'" },
     { name = "rivers", extras = ["duckdb"], marker = "extra == 'delta-duckdb'" },
     { name = "rivers", extras = ["pandas"], marker = "extra == 'delta-pandas'" },
+    { name = "rivers", extras = ["pandas"], marker = "extra == 'snowflake'" },
     { name = "rivers", extras = ["polars"], marker = "extra == 'delta-polars'" },
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyarrow'" },
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyspark'" },
-    { name = "rivers", extras = ["pyarrow"], marker = "extra == 'snowflake'" },
     { name = "rivers", extras = ["pyspark"], marker = "extra == 'delta-pyspark'" },
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.10.0" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3.7.0" },

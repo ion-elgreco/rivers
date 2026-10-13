@@ -12,7 +12,7 @@
 pip install rivers[snowflake]
 ```
 
-The extra installs [`snowflake-connector-python`](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector) and pyarrow. To read or write pandas or polars data frames, also install `rivers[pandas]` or `rivers[polars]`.
+The extra installs [`snowflake-connector-python`](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector), pyarrow, and pandas: the connector needs pandas to fetch rows as Arrow. To read or write polars data frames, also install `rivers[polars]`.
 
 ## Resource
 
