@@ -42,6 +42,8 @@ from rivers.integrations.sling import (  # noqa: E402
     SlingStream,
 )
 
+from _helpers import make_repo  # noqa: E402
+
 ORDERS = [(1, "apple", 10.5), (2, "pear", 20.0), (3, "plum", 30.25)]
 USERS = [(1, "a@x.io"), (2, "b@x.io")]
 
@@ -120,7 +122,7 @@ def _values(event) -> dict[str, object]:
 
 
 def _repo(
-    tmp_path, storage, executor_env, replication, resource, *assets
+    tmp_path, storage, replication, *assets, executor_env=None, resource=None
 ) -> rs.CodeRepository:
     """The replication as the multi-asset ``raw``, next to an independent asset.
 
@@ -128,7 +130,10 @@ def _repo(
     parallel executor refuses a step without a picklable IO handler, even one
     that only yields Materialization.
     """
-    executor, io_factory = executor_env
+    executor, io_factory = executor_env or (
+        rs.Executor.in_process(),
+        rs.InMemoryIOHandler,
+    )
 
     @replication.assets(name="raw", io_handler=io_factory())
     def raw(context: rs.AssetExecutionContext, sling: SlingResource):
@@ -139,13 +144,12 @@ def _repo(
     def bystander() -> int:
         return 1
 
-    repo = rs.CodeRepository(
-        assets=[raw, bystander, *assets],
-        resources={"sling": resource},
-        default_executor=executor,
+    return make_repo(
+        [raw, bystander, *assets],
+        storage,
+        executor=executor,
+        resources={"sling": resource or _resource(tmp_path)},
     )
-    repo.resolve(storage=storage)
-    return repo
 
 
 def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor_env):
@@ -156,9 +160,7 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
         [(total,)] = _rows(tmp_path, "SELECT sum(amount) FROM orders")
         return total
 
-    repo = _repo(
-        tmp_path, storage, executor_env, replication, _resource(tmp_path), order_total
-    )
+    repo = _repo(tmp_path, storage, replication, order_total, executor_env=executor_env)
 
     result = repo.materialize()
 
@@ -191,7 +193,7 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
 
 def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, executor_env):
     replication = SlingReplication(_replication(src, "orders", "users"))
-    repo = _repo(tmp_path, storage, executor_env, replication, _resource(tmp_path))
+    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
 
     result = repo.materialize(selection=["main.users"])
 
@@ -205,7 +207,7 @@ def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, execut
 
 def test_failed_stream_fails_the_step(tmp_path, src, storage, executor_env):
     replication = SlingReplication(_replication(src, "orders", "missing", "users"))
-    repo = _repo(tmp_path, storage, executor_env, replication, _resource(tmp_path))
+    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
 
     result = repo.materialize(raise_on_error=False)
 
@@ -237,7 +239,7 @@ def test_failed_stream_keeps_the_streams_that_succeeded(
     tmp_path, src, storage, executor_env
 ):
     replication = SlingReplication(_replication(src, "orders", "missing", "users"))
-    repo = _repo(tmp_path, storage, executor_env, replication, _resource(tmp_path))
+    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
 
     repo.materialize(raise_on_error=False)
 
@@ -271,14 +273,7 @@ def test_translator_names_outputs_and_links_deps(tmp_path, src, storage):
     assert [dep.name for dep in defs["shop_orders"].deps] == ["exports"]
     assert defs["shop_orders"].metadata == {"sling/stream": _uri(src / "orders.csv")}
 
-    repo = _repo(
-        tmp_path,
-        storage,
-        (rs.Executor.in_process(), rs.InMemoryIOHandler),
-        replication,
-        _resource(tmp_path),
-        exports,
-    )
+    repo = _repo(tmp_path, storage, replication, exports)
     result = repo.materialize(selection=["exports", "shop_orders"])
 
     assert result.success
@@ -297,13 +292,7 @@ def test_wildcard_stream_is_one_output(tmp_path, src, storage):
         },
         translator=lambda stream: stream.output_def(name="csv_files"),
     )
-    repo = _repo(
-        tmp_path,
-        storage,
-        (rs.Executor.in_process(), rs.InMemoryIOHandler),
-        replication,
-        _resource(tmp_path),
-    )
+    repo = _repo(tmp_path, storage, replication)
 
     assert repo.materialize().success
     # sling 1.4 keeps the extension in {stream_file_name}: orders_csv
@@ -342,13 +331,7 @@ streams:
     assert [d.name for d in replication.output_defs] == ["main.orders"]
     assert replication.config["env"] == {"RUN_DATE": date(2026, 10, 11)}
 
-    repo = _repo(
-        tmp_path,
-        storage,
-        (rs.Executor.in_process(), rs.InMemoryIOHandler),
-        replication,
-        _resource(tmp_path),
-    )
+    repo = _repo(tmp_path, storage, replication)
     assert repo.materialize().success
     assert _tables(tmp_path) == {"orders"}
 
@@ -391,13 +374,7 @@ def test_secrets_reach_sling_and_are_masked(
         ]
     )
     replication = SlingReplication(_replication(src, "orders", "missing"))
-    repo = _repo(
-        tmp_path,
-        storage,
-        (rs.Executor.in_process(), rs.InMemoryIOHandler),
-        replication,
-        resource,
-    )
+    repo = _repo(tmp_path, storage, replication, resource=resource)
 
     with caplog.at_level("INFO", logger="code-repo.assets.raw"):
         repo.materialize(raise_on_error=False)
