@@ -180,7 +180,6 @@ pub(crate) fn process_step_result(
     } else {
         Vec::new()
     };
-    let bridge = ctx.repo.bridge;
     let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
     let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
         .outputs
@@ -208,7 +207,9 @@ pub(crate) fn process_step_result(
     // first output is emitted rather than up-front like the return path.
     let gen_ctx: Option<Py<PyAny>> = match &step_result.generator {
         Some(ops::GeneratorType::Sync { context })
-        | Some(ops::GeneratorType::Async { context }) => context.as_ref().map(|c| c.clone_ref(py)),
+        | Some(ops::GeneratorType::Async { context, .. }) => {
+            context.as_ref().map(|c| c.clone_ref(py))
+        }
         None => None,
     };
     let mut gen_marks_stashed = false;
@@ -222,7 +223,6 @@ pub(crate) fn process_step_result(
         &step_result,
         &selected_outputs,
         step_name,
-        bridge,
         |py, item| {
             if !gen_marks_stashed {
                 gen_marks_stashed = true;

@@ -21,14 +21,19 @@ use crate::result_types::ResultKind;
 /// identity so per-CL methods can be reached without re-passing the id.
 pub(crate) type StorageHandle<'a> = &'a ScopedStorageHandle<SurrealStorage>;
 
-/// Generator multi-asset state attached to a `StepResult`. `Sync` uses
-/// `__next__`; `Async` uses `__anext__` driven through the async bridge.
-/// `context` is the `PyAssetExecutionContext` the generator was given (when
-/// requested) — used for per-yield `peek_output_metadata` and
-/// `drain_data_version`.
+/// Generator multi-asset state attached to a `StepResult`. `context` is the
+/// `PyAssetExecutionContext` the generator was given (when requested) — used
+/// for per-yield `peek_output_metadata` and `drain_data_version`.
 pub(crate) enum GeneratorType {
+    /// Run with `__next__` as the orchestrator handles its outputs.
     Sync { context: Option<Py<PyAny>> },
-    Async { context: Option<Py<PyAny>> },
+    /// Already run to its end by the step's worker, so that async steps run
+    /// at the same time: the outputs it yielded, then the error it raised.
+    Async {
+        context: Option<Py<PyAny>>,
+        outputs: Vec<OutputItem>,
+        error: Option<PyErr>,
+    },
 }
 
 pub(crate) struct StepResult {
@@ -110,4 +115,4 @@ pub(crate) use io::{
     is_in_memory, load_self_dependency, load_step_output, map_partition_key_for_upstream,
     write_output,
 };
-pub(crate) use outputs::{OutputItem, for_each_output};
+pub(crate) use outputs::{OutputItem, for_each_output, run_async_generator};
