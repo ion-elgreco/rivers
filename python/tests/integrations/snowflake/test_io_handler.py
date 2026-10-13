@@ -6,6 +6,8 @@ connector's requests, PUT uploads included, so loky workers reach it too.
 
 import json
 import os
+import re
+from contextlib import nullcontext
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
@@ -57,7 +59,9 @@ _REGIONS = rs.PartitionsDefinition.static_(["us", "eu"])
 _BY_REGION = {"snowflake/partition_expr": "region"}
 
 
-def _write_region(handler, region: str, values: list, definition=_REGIONS) -> None:
+def _write_region(
+    handler, region: str, values: list | pa.Array, definition=_REGIONS
+) -> None:
     handler.handle_output(
         rs.OutputContext(
             asset_name="t",
@@ -232,7 +236,7 @@ class RecordingCursor:
 @pytest.mark.parametrize(
     ("results", "exists", "creates"),
     [
-        ([[("ID",)]], True, []),
+        ([[("ID", "NUMBER", 38, 0)]], True, []),
         ([[], [(1,)]], False, []),
         ([[], [(0,)]], False, ['CREATE SCHEMA IF NOT EXISTS "RAW"']),
     ],
@@ -241,8 +245,49 @@ class RecordingCursor:
 def test_create_statements_only_run_for_missing_objects(results, exists, creates):
     """A role without the create privilege can still write to existing objects."""
     cur = RecordingCursor(*results)
-    assert io_module._prepare_table(cur, "RAW", "T", ["id"]) is exists
+    output = pa.schema([("id", pa.int64())])
+    assert io_module._prepare_table(cur, "RAW", "T", output) is exists
     assert [sql for sql in cur.sql if sql.startswith("CREATE")] == creates
+
+
+@pytest.mark.parametrize(
+    ("column", "arrow_type", "holds"),
+    [
+        (("NUMBER", 38, 0), pa.int8(), True),
+        (("NUMBER", 10, 2), pa.decimal128(12, 1), True),
+        (("NUMBER", 10, 2), pa.decimal128(10, 3), False),
+        (("NUMBER", 38, 0), pa.float64(), False),
+        (("NUMBER", 38, 0), pa.bool_(), False),
+        (("FLOAT", None, None), pa.int64(), False),
+        (("FLOAT", None, None), pa.null(), True),
+        (("TEXT", None, None), pa.large_string(), True),
+        (("TEXT", None, None), pa.float64(), False),
+        (("BINARY", None, None), pa.string(), False),
+        (("DATE", None, None), pa.timestamp("us"), False),
+        (("TIME", None, None), pa.time32("s"), True),
+        (("TIMESTAMP_NTZ", None, None), pa.timestamp("ns"), True),
+        (("TIMESTAMP_NTZ", None, None), pa.timestamp("us", tz="UTC"), False),
+        (("TIMESTAMP_LTZ", None, None), pa.timestamp("ms", tz="UTC"), True),
+        (("TIMESTAMP_LTZ", None, None), pa.timestamp("us"), False),
+        (("TIMESTAMP_TZ", None, None), pa.timestamp("us", tz="UTC"), True),
+        (("ARRAY", None, None), pa.list_(pa.int64()), True),
+        (("OBJECT", None, None), pa.list_(pa.int64()), False),
+        (("OBJECT", None, None), pa.map_(pa.string(), pa.int64()), True),
+        (("VARIANT", None, None), pa.float64(), True),
+    ],
+)
+def test_column_types_that_hold_the_output(column, arrow_type, holds):
+    """With the types that Snowflake reports: fakesnow reports TIMESTAMP_LTZ
+    columns as TIMESTAMP_TZ, and ARRAY and OBJECT columns as VARIANT."""
+    cur = RecordingCursor([("V", *column)])
+    output = pa.schema([("v", arrow_type)])
+    check = (
+        nullcontext()
+        if holds
+        else pytest.raises(ValueError, match="table RAW.T has column v ")
+    )
+    with check:
+        assert io_module._prepare_table(cur, "RAW", "T", output)
 
 
 def test_unsupported_column_type_fails_before_connecting():
@@ -299,13 +344,86 @@ def test_new_column_fails_and_keeps_the_rows(warehouse):
 
 
 def test_failed_load_rolls_back_the_delete(warehouse):
+    """A value too large for the column fails the COPY, after the delete."""
     handler = SnowflakeIOHandler(resource=warehouse)
-    _write_region(handler, "us", [1, 2])
-    with pytest.raises(ProgrammingError, match="not-a-number"):
-        _write_region(handler, "us", ["not-a-number"])
+    _write_region(handler, "us", pa.array([1, 2], pa.decimal128(3, 0)))
+    with pytest.raises(ProgrammingError, match="out of range"):
+        _write_region(handler, "us", pa.array([1234], pa.decimal128(4, 0)))
     assert _rows(warehouse, 'SELECT "REGION", "V" FROM "PUBLIC"."T" ORDER BY "V"') == [
         ("us", 1),
         ("us", 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first", "then", "types"),
+    [
+        pytest.param(
+            pa.array([10, 20]),
+            pa.array([10.5, 20.25]),
+            "NUMBER(38,0) (output FLOAT)",
+            id="floats-into-integers",
+        ),
+        pytest.param(
+            pa.array([None, None]),
+            pa.array([0.5, 0.25]),
+            "TEXT (output FLOAT)",
+            id="floats-after-nulls",
+        ),
+        pytest.param(
+            pa.array([Decimal("1.25")], pa.decimal128(10, 2)),
+            pa.array([Decimal("1.125")], pa.decimal128(10, 3)),
+            "NUMBER(10,2) (output NUMBER(10,3))",
+            id="larger-scale",
+        ),
+    ],
+)
+def test_type_that_changes_values_fails_and_keeps_the_rows(
+    warehouse, first, then, types
+):
+    """COPY would round the floats and decimals, or store the floats as text."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    ctx = rs.OutputContext(asset_name="t")
+    handler.handle_output(ctx, pa.table({"price": first}))
+
+    with pytest.raises(
+        ValueError, match=re.escape(f"table PUBLIC.T has column price {types}")
+    ):
+        handler.handle_output(ctx, pa.table({"price": then}))
+
+    assert _rows(warehouse, 'SELECT "PRICE" FROM "PUBLIC"."T" ORDER BY 1') == [
+        (value,) for value in first.to_pylist()
+    ]
+
+
+def test_types_that_keep_the_values_load(warehouse):
+    """Wider integers and decimals load, and so do nulls into a column of any type."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    ctx = rs.OutputContext(asset_name="t")
+    handler.handle_output(
+        ctx,
+        pa.table(
+            {
+                "n": pa.array([1], pa.int32()),
+                "price": pa.array([Decimal("1.25")], pa.decimal128(10, 2)),
+                "ratio": [0.5],
+            }
+        ),
+    )
+
+    handler.handle_output(
+        ctx,
+        pa.table(
+            {
+                "n": pa.array([2**40], pa.int64()),
+                "price": pa.array([Decimal("2.5")], pa.decimal128(10, 1)),
+                "ratio": [None],
+            }
+        ),
+    )
+
+    assert _rows(warehouse, 'SELECT "N", "PRICE", "RATIO" FROM "PUBLIC"."T"') == [
+        (2**40, Decimal("2.50"), None)
     ]
 
 

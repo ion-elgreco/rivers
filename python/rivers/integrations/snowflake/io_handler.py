@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager
 from enum import StrEnum
 from functools import cache
 from time import monotonic
-from typing import Any
+from typing import Any, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -55,7 +55,8 @@ class SnowflakeIOHandler(BaseIOHandler):
     creates the table from the output's Arrow types. Then ``COPY INTO`` loads
     the files; an overwrite deletes the old rows first, in the same
     transaction. The table keeps its columns, grants, and policies: an output
-    with a column that the table does not have fails.
+    fails if it has a column that the table does not have, or a column whose
+    values the table's column type would change.
 
     The handler's sessions use the UTC time zone: daily and hourly partition
     bounds and the timestamps that a read returns are in UTC.
@@ -126,7 +127,9 @@ class SnowflakeIOHandler(BaseIOHandler):
         Raises:
             TypeError: If ``obj`` is of another type, or has a column type
                 that Snowflake cannot store.
-            ValueError: If ``obj`` has a column that the table does not have.
+            ValueError: If ``obj`` has a column that the table does not have,
+                or a column whose values the table's column type would
+                change, such as floats for a ``NUMBER(38,0)`` column.
         """
         meta = context.asset_metadata or {}
         schema, table = self.table_name(context.asset_name, meta)
@@ -157,7 +160,7 @@ class SnowflakeIOHandler(BaseIOHandler):
         start = monotonic()
         with self.get_connection() as con:
             cur = con.cursor()
-            exists = _prepare_table(cur, schema, table, reader.schema.names)
+            exists = _prepare_table(cur, schema, table, reader.schema)
             cur.execute(f"CREATE TEMPORARY STAGE {stage}")
             for number, parquet in enumerate(_parquet_files(reader)):
                 with parquet:
@@ -225,33 +228,48 @@ def quote_table(schema: str, table: str) -> str:
     return f"{_quote(schema)}.{_quote(table)}"
 
 
-def table_columns(cur: SnowflakeCursor, schema: str, table: str) -> set[str]:
-    """The uppercased column names of ``schema.table``, empty if the table does not exist."""
+class Column(NamedTuple):
+    """A column's type, as ``information_schema.columns`` reports it.
+
+    ``type`` is Snowflake's name for it, such as ``NUMBER``, ``TEXT``, or
+    ``TIMESTAMP_LTZ``.
+    """
+
+    type: str
+    precision: int | None
+    scale: int | None
+
+    def __str__(self) -> str:
+        if self.type == "NUMBER":
+            return f"NUMBER({self.precision},{self.scale})"
+        return self.type
+
+
+def table_columns(cur: SnowflakeCursor, schema: str, table: str) -> dict[str, Column]:
+    """The columns of ``schema.table`` by uppercased name, empty if the table does not exist."""
     cur.execute(
-        "SELECT column_name FROM information_schema.columns "
+        "SELECT column_name, data_type, numeric_precision, numeric_scale "
+        "FROM information_schema.columns "
         "WHERE table_schema = %s AND table_name = %s",
         (schema, table),
     )
-    return {name.upper() for (name,) in cur.fetchall()}
+    return {name.upper(): Column(*column) for name, *column in cur.fetchall()}
 
 
 def _prepare_table(
-    cur: SnowflakeCursor, schema: str, table: str, names: list[str]
+    cur: SnowflakeCursor, schema: str, table: str, output: pa.Schema
 ) -> bool:
-    """Whether ``schema.table`` exists. Check that it has every column in ``names``, or create a missing schema.
+    """Whether ``schema.table`` exists. Check that it holds ``output``, or create a missing schema.
 
     The schema is looked up first: a ``CREATE`` statement can need the create
     privilege even when the object exists.
 
     Raises:
-        ValueError: If the table exists without a column in ``names``.
+        ValueError: If the table exists without a column of ``output``, or
+            with a column type that would change the column's values.
     """
-    if existing := table_columns(cur, schema, table):
-        if missing := [name for name in names if name.upper() not in existing]:
-            raise ValueError(
-                f"table {schema}.{table} has no column {', '.join(missing)}: add it "
-                "with ALTER TABLE, or drop the table to create it on the next write"
-            )
+    if columns := table_columns(cur, schema, table):
+        _check_columns(schema, table, columns, output)
         return True
 
     cur.execute(
@@ -263,6 +281,64 @@ def _prepare_table(
     if not schemas:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote(schema)}")
     return False
+
+
+def _check_columns(
+    schema: str, table: str, columns: dict[str, Column], output: pa.Schema
+) -> None:
+    """Check that the table's ``columns`` take each column of ``output`` without changing its values.
+
+    A ``null`` output column fits any column: it has no values to change.
+
+    Raises:
+        ValueError: If a column is missing, or its type would change the
+            output's values.
+    """
+    if missing := [name for name in output.names if name.upper() not in columns]:
+        raise ValueError(
+            f"table {schema}.{table} has no column {', '.join(missing)}: add it "
+            "with ALTER TABLE, or drop the table to create it on the next write"
+        )
+
+    changed = []
+    for field in output:
+        column = columns[field.name.upper()]
+        snowflake_type = _snowflake_type(field.type)
+        if not pa.types.is_null(field.type) and not _holds(column, snowflake_type):
+            changed.append(f"{field.name} {column} (output {snowflake_type})")
+
+    if changed:
+        raise ValueError(
+            f"table {schema}.{table} has column {', '.join(changed)}: the load would "
+            "change the values. Alter the column with ALTER TABLE, or drop the table "
+            "to create it on the next write"
+        )
+
+
+# The column types that hold an output type, where that is not only the type
+# itself: Snowflake reports VARCHAR columns as TEXT, and a TIMESTAMP_TZ column
+# keeps the instants of TIMESTAMP_LTZ values.
+_HOLDERS = {
+    "VARCHAR": ("TEXT",),
+    "TIMESTAMP_LTZ": ("TIMESTAMP_LTZ", "TIMESTAMP_TZ"),
+}
+
+
+def _holds(column: Column, snowflake_type: str) -> bool:
+    """Whether loading values of ``snowflake_type`` into ``column`` keeps them.
+
+    The column must have the output's type; its precision can differ. A
+    ``NUMBER`` column also needs at least the output's scale: a load rounds
+    values to the column's scale. A ``VARIANT`` column holds any type.
+    """
+    if column.type == "VARIANT":
+        return True
+
+    kind, _, size = snowflake_type.partition("(")
+    if kind == "NUMBER":
+        _, scale = size.removesuffix(")").split(",")
+        return column.type == "NUMBER" and int(scale) <= (column.scale or 0)
+    return column.type in _HOLDERS.get(kind, (kind,))
 
 
 def _write(cur: SnowflakeCursor, target: str, stage: str, delete: str | None) -> None:

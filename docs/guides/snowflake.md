@@ -101,7 +101,7 @@ A write:
 
 If reading the output fails, the write stops before step 3: the table and its rows do not change.
 
-The table keeps its columns, grants, and policies between writes. An output with a column that the table does not have fails. Add the column with `ALTER TABLE ... ADD COLUMN`, or drop the table to create it again on the next write. A column that the output does not have gets `NULL`.
+The table keeps its columns, grants, and policies between writes. An output with a column that the table does not have fails. An output column also fails if the table's column type would change its values, for example floats in a `NUMBER(38,0)` column or numbers in a `VARCHAR` column. A `NUMBER` column takes integers and decimals with the same or a smaller scale, a `VARIANT` column takes all types, and a `TIME` or timestamp column takes all precisions but stores its own. Add or alter the column with `ALTER TABLE`, or drop the table to create it again on the next write. A column that the output does not have gets `NULL`.
 
 The role needs `USAGE` on the database and the schema, `CREATE STAGE` on the schema, and `SELECT`, `INSERT`, and `DELETE` on the table. To create a missing table, it needs `CREATE TABLE` on the schema. To create a missing schema, it needs `CREATE SCHEMA` on the database.
 

@@ -58,7 +58,7 @@ These metadata keys override handler defaults per-asset:
 **Raises:**
 
 - `TypeError` from a write: an unsupported output type, or a column type with no Snowflake type (for example `duration`). Nothing is written.
-- `ValueError` from a write: an output column that the table does not have, a partitioned asset without `snowflake/partition_expr`, or an unknown `snowflake/mode`.
+- `ValueError` from a write: an output column that the table does not have, an output column whose values the table's column type would change (for example floats in a `NUMBER(38,0)` column), a partitioned asset without `snowflake/partition_expr`, or an unknown `snowflake/mode`. Nothing is written.
 - `TypeError` from a read: a missing or unsupported type hint.
 
 ### Methods for action bodies
