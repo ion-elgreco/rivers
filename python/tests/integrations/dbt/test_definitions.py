@@ -345,12 +345,25 @@ def test_a_directory_without_dbt_project_yml_raises(tmp_path):
         DbtProject(tmp_path)
 
 
-def test_the_body_must_be_a_generator(shop):
-    with pytest.raises(TypeError, match="must be a generator"):
+def _wait(dbt: DbtResource):
+    dbt.cli(["build"]).wait()
 
-        @DbtProject(shop, profiles_dir=shop).assets()
-        def shop_assets(dbt: DbtResource):
-            dbt.cli(["build"]).wait()
+
+async def _async_wait(dbt: DbtResource):
+    await dbt.cli(["build"]).async_wait()
+
+
+@pytest.mark.parametrize("body", [_wait, _async_wait], ids=["function", "coroutine"])
+def test_the_body_must_be_a_generator(shop, body):
+    define = DbtProject(shop, profiles_dir=shop).assets()
+
+    with pytest.raises(TypeError) as raised:
+        define(body)
+
+    assert str(raised.value) == (
+        f"'{body.__name__}' must be a generator: yield from dbt.cli([...], context), "
+        "or an async generator: async for ... in dbt.cli([...], context)"
+    )
 
 
 def test_prepare_writes_the_manifest(tmp_path):

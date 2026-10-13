@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from rivers._core.assets import Asset, AssetDef, MultiAsset
-from rivers.integrations.dbt._manifest import build_outputs, selection_args
+from rivers.integrations.dbt._manifest import DbtOutputs, build_outputs, selection_args
 from rivers.integrations.dbt.node import DbtNode
 from rivers.integrations.dbt.resource import DbtResource
 
@@ -122,7 +122,9 @@ class DbtProject(BaseModel):
 
         The body is a generator that runs dbt with the :class:`DbtResource` it
         receives; see :meth:`DbtResource.cli`. A body that makes its own
-        ``DbtResource`` instead raises ``TypeError``.
+        ``DbtResource`` instead raises ``TypeError``. An async generator body
+        runs dbt with ``async for``, so its step waits for dbt without holding
+        a worker of the executor.
 
         Args:
             select: dbt's ``--select``. Other than the default, the selection
@@ -152,6 +154,11 @@ class DbtProject(BaseModel):
             @project.assets(exclude="tag:hourly")
             def analytics(context: rs.AssetExecutionContext, dbt: DbtResource):
                 yield from dbt.cli(["build"], context)
+
+            @project.assets(select="tag:hourly")
+            async def hourly(context: rs.AssetExecutionContext, dbt: DbtResource):
+                async for materialization in dbt.cli(["build"], context):
+                    yield materialization
         """
         if selector and (exclude or select not in ("", "fqn:*")):
             raise ValueError("pass selector, or select and exclude, not both")
@@ -186,29 +193,28 @@ class DbtProject(BaseModel):
         parse_dir = self.manifest_path.parent
 
         def decorate(fn: Callable[..., Any]) -> MultiAsset:
-            if not inspect.isgeneratorfunction(fn):
+            is_async = inspect.isasyncgenfunction(fn)
+            if not is_async and not inspect.isgeneratorfunction(fn):
                 raise TypeError(
-                    f"'{fn.__name__}' must be a generator: yield from dbt.cli([...], context)"
+                    f"'{fn.__name__}' must be a generator: yield from dbt.cli([...], "
+                    "context), or an async generator: async for ... in "
+                    "dbt.cli([...], context)"
                 )
 
             @functools.wraps(fn)
             def body(*args: Any, **fn_kwargs: Any) -> Any:
-                if not any(isinstance(arg, DbtResource) for arg in args):
-                    raise TypeError(
-                        f"'{fn.__name__}' must take the DbtResource as a parameter, "
-                        "e.g. dbt: DbtResource; a DbtResource made in the body is "
-                        "not bound to its outputs"
-                    )
+                bound = _bound_args(fn, args, outputs, parse_dir)
+                yield from fn(*bound, **fn_kwargs)
 
-                args = tuple(
-                    arg._bind(outputs, parse_dir)
-                    if isinstance(arg, DbtResource)
-                    else arg
-                    for arg in args
-                )
-                yield from fn(*args, **fn_kwargs)
+            @functools.wraps(fn)
+            async def async_body(*args: Any, **fn_kwargs: Any) -> Any:
+                bound = _bound_args(fn, args, outputs, parse_dir)
+                async for item in fn(*bound, **fn_kwargs):
+                    yield item
 
-            return Asset.from_multi(body, output_defs=output_defs, **kwargs)
+            return Asset.from_multi(
+                async_body if is_async else body, output_defs=output_defs, **kwargs
+            )
 
         return decorate
 
@@ -234,3 +240,24 @@ class DbtProject(BaseModel):
         resource = DbtResource(project_dir=self)
         resource._parse_dir = self.manifest_path.parent
         return resource
+
+
+def _bound_args(
+    fn: Callable[..., Any], args: tuple[Any, ...], outputs: DbtOutputs, parse_dir: Path
+) -> tuple[Any, ...]:
+    """The body's arguments, with each ``DbtResource`` bound to the outputs.
+
+    Raises:
+        TypeError: When no argument is a ``DbtResource``.
+    """
+    if not any(isinstance(arg, DbtResource) for arg in args):
+        raise TypeError(
+            f"'{fn.__name__}' must take the DbtResource as a parameter, "
+            "e.g. dbt: DbtResource; a DbtResource made in the body is "
+            "not bound to its outputs"
+        )
+
+    return tuple(
+        arg._bind(outputs, parse_dir) if isinstance(arg, DbtResource) else arg
+        for arg in args
+    )

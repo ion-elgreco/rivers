@@ -1,5 +1,6 @@
 """Runs dbt commands and reports each built model as a materialization."""
 
+import asyncio
 import json
 import logging
 import os
@@ -9,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +40,9 @@ _TESTS = frozenset({"test", "unit_test"})
 _LOG_LEVELS = {"info": logging.INFO, "warn": logging.WARNING, "error": logging.ERROR}
 # How long dbt gets to cancel its queries before it is killed.
 _STOP_TIMEOUT_S = 25
+# dbt logs each event on one line, e.g. a model's SQL or every result of the
+# run, so the async reader takes lines of any length, as the sync one does.
+_LINE_LIMIT = sys.maxsize
 
 
 class DbtError(Exception):
@@ -111,9 +116,12 @@ class DbtResource(Resource):
     ) -> "DbtInvocation":
         """A dbt command, e.g. ``["build"]``. Iterate it, or call ``wait()``, to run it.
 
+        In async code, use ``async for`` or ``await async_wait()``: they run
+        dbt without blocking the event loop.
+
         With the context of a ``DbtProject.assets`` body, dbt runs the outputs
         the run selected, iteration yields a :class:`~rivers.Materialization` for
-        each output dbt builds, and dbt's log goes to the run log. In a ``build``,
+        each output dbt builds, and dbt's log goes to ``context.log``. In a ``build``,
         an output is reported once the tests on it pass; a failed test fails it.
         dbt's own ``--select``, ``--exclude``, or ``--selector`` in ``args``
         replace the selection.
@@ -225,7 +233,11 @@ class DbtResource(Resource):
 
 
 class DbtInvocation:
-    """One dbt command, made by :meth:`DbtResource.cli`. It runs once."""
+    """One dbt command, made by :meth:`DbtResource.cli`. It runs once.
+
+    In async code, ``async for`` and :meth:`async_wait` run it without
+    blocking the event loop.
+    """
 
     def __init__(
         self,
@@ -246,11 +258,15 @@ class DbtInvocation:
         self._command = command
         self._project_dir = project_dir
         self._env = env
-        self._outputs = outputs
-        self._selected = selected
+        self._results = _Results(
+            outputs, selected, holds_for_tests=_subcommand(args) == "build"
+        )
         self._log = log
         self._started = False
-        self._error: str | None = None
+        self._returncode: int | None = None
+        self._errors: list[str] = []
+        self._plain: deque[str] = deque(maxlen=20)
+        self._failures: list[str] = []
 
     def __iter__(self) -> Iterator[Materialization]:
         """Run dbt and yield a materialization for each output it builds.
@@ -259,15 +275,45 @@ class DbtInvocation:
             DbtError: When dbt fails, after the materializations of the outputs
                 it built.
         """
-        results = _Results(
-            self._outputs,
-            self._selected,
-            holds_for_tests=_subcommand(self._args) == "build",
-        )
         for event in self._events():
-            yield from results.add(event)
+            yield from self._results.add(event)
 
-        yield from results.release_all()
+        yield from self._results.release_all()
+        self._raise_on_error()
+
+    async def __aiter__(self) -> AsyncIterator[Materialization]:
+        """Run dbt and yield what ``__iter__`` yields, without blocking the event loop.
+
+        When the task is cancelled, or the iteration stops early, dbt gets an
+        interrupt, so that it cancels its queries. It is killed when it still
+        runs 25 seconds later.
+
+        Raises:
+            DbtError: When dbt fails, after the materializations of the outputs
+                it built.
+        """
+        with self._run_env() as env:
+            process = await asyncio.create_subprocess_exec(
+                *self._command,
+                cwd=self._project_dir,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                limit=_LINE_LIMIT,
+            )
+            try:
+                assert process.stdout is not None
+                async for line in process.stdout:
+                    event = self._read(line.decode("utf-8", errors="replace"))
+                    if event is not None:
+                        for materialization in self._results.add(event):
+                            yield materialization
+                self._returncode = await process.wait()
+            finally:
+                await _async_stop(process)
+
+        for materialization in self._results.release_all():
+            yield materialization
         self._raise_on_error()
 
     def wait(self) -> None:
@@ -279,25 +325,21 @@ class DbtInvocation:
         for _ in self:
             pass
 
+    async def async_wait(self) -> None:
+        """Run dbt to the end, without blocking the event loop.
+
+        Raises:
+            DbtError: When dbt fails.
+        """
+        async for _ in self:
+            pass
+
     def _events(self) -> Iterator[dict[str, Any]]:
         """dbt's structured log events, logged as they arrive.
 
         After the last event, :meth:`_raise_on_error` raises if dbt failed.
         """
-        if self._started:
-            raise RuntimeError("a DbtInvocation runs once; call DbtResource.cli again")
-        self._started = True
-
-        target = self._target_path or Path(tempfile.mkdtemp(prefix="rivers-dbt-"))
-        target.mkdir(parents=True, exist_ok=True)
-        _copy_partial_parse(self._parse_dir, target)
-        env = {**self._env, "DBT_TARGET_PATH": str(target), "DBT_LOG_PATH": str(target)}
-
-        errors: list[str] = []
-        plain: deque[str] = deque(maxlen=20)
-        failures: list[str] = []
-        process = None
-        try:
+        with self._run_env() as env:
             process = subprocess.Popen(
                 self._command,
                 cwd=self._project_dir,
@@ -308,43 +350,66 @@ class DbtInvocation:
                 encoding="utf-8",
                 errors="replace",
             )
-            assert process.stdout is not None
-            for line in process.stdout:
-                event = _parse(line)
-                if event is None:
-                    if line.strip():
-                        plain.append(line.rstrip())
-                        self._emit(logging.INFO, line.rstrip())
-                    continue
-
-                info = event["info"]
-                level = _LOG_LEVELS.get(info.get("level", ""))
-                if level is not None and info.get("msg"):
-                    self._emit(level, info["msg"])
-                    if level == logging.ERROR:
-                        errors.append(info["msg"])
-                if failure := _failure(event):
-                    failures.append(failure)
-
-                yield event
-
-            returncode = process.wait()
-        finally:
-            if process is not None:
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    event = self._read(line)
+                    if event is not None:
+                        yield event
+                self._returncode = process.wait()
+            finally:
                 _stop(process)
+
+    @contextmanager
+    def _run_env(self) -> Iterator[dict[str, str]]:
+        """The environment of the dbt process, with its own target directory.
+
+        The directory is removed at the end, unless it is ``target_path``.
+        """
+        if self._started:
+            raise RuntimeError("a DbtInvocation runs once; call DbtResource.cli again")
+        self._started = True
+
+        target = self._target_path or Path(tempfile.mkdtemp(prefix="rivers-dbt-"))
+        target.mkdir(parents=True, exist_ok=True)
+        _copy_partial_parse(self._parse_dir, target)
+
+        try:
+            yield {
+                **self._env,
+                "DBT_TARGET_PATH": str(target),
+                "DBT_LOG_PATH": str(target),
+            }
+        finally:
             if self._target_path is None:
                 shutil.rmtree(target, ignore_errors=True)
 
-        if returncode != 0:
-            lines = [
-                f"dbt {' '.join(self._args)} failed with exit code {returncode}",
-                *(failures or errors or plain),
-            ]
-            self._error = "\n".join(lines)
+    def _read(self, line: str) -> dict[str, Any] | None:
+        """Log a line of dbt's output, and return its structured event, if any."""
+        event = _parse(line)
+        if event is None:
+            if line.strip():
+                self._plain.append(line.rstrip())
+                self._emit(logging.INFO, line.rstrip())
+            return None
+
+        info = event["info"]
+        level = _LOG_LEVELS.get(info.get("level", ""))
+        if level is not None and info.get("msg"):
+            self._emit(level, info["msg"])
+            if level == logging.ERROR:
+                self._errors.append(info["msg"])
+        if failure := _failure(event):
+            self._failures.append(failure)
+        return event
 
     def _raise_on_error(self) -> None:
-        if self._error is not None:
-            raise DbtError(self._error)
+        if self._returncode:
+            lines = [
+                f"dbt {' '.join(self._args)} failed with exit code {self._returncode}",
+                *(self._failures or self._errors or self._plain),
+            ]
+            raise DbtError("\n".join(lines))
 
     def _emit(self, level: int, message: str) -> None:
         if self._log is not None:
@@ -473,12 +538,29 @@ def _stop(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
 
-    if os.name == "nt":
-        process.terminate()
-    else:
-        process.send_signal(signal.SIGINT)
+    _interrupt(process)
     try:
         process.wait(timeout=_STOP_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
+
+
+async def _async_stop(process: asyncio.subprocess.Process) -> None:
+    """:func:`_stop`, without blocking the event loop."""
+    if process.returncode is not None:
+        return
+
+    _interrupt(process)
+    try:
+        await asyncio.wait_for(process.wait(), _STOP_TIMEOUT_S)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+def _interrupt(process: subprocess.Popen[str] | asyncio.subprocess.Process) -> None:
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)

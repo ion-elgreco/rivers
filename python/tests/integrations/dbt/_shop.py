@@ -64,16 +64,30 @@ def payments_asset(project_dir: Path, amounts: list[str] = PAYMENTS) -> rs.Singl
     return payments
 
 
-def shop_assets(project_dir: Path, **kwargs: Any) -> rs.MultiAsset:
+def shop_assets(
+    project_dir: Path, *, is_async: bool = False, **kwargs: Any
+) -> rs.MultiAsset:
     """Every resource but ``daily_orders``, built with ``dbt build``.
 
-    Each output records the ``pid`` of the process that ran dbt.
+    The body is a generator, or with ``is_async`` an async generator. Each
+    output records the ``pid`` of the process that ran dbt.
     """
     project = DbtProject(
         project_dir, profiles_dir=project_dir, source_asset_fn=source_asset
     )
+    define = project.assets(exclude="daily_orders", **kwargs)
 
-    @project.assets(exclude="daily_orders", **kwargs)
+    if is_async:
+
+        @define
+        async def shop(context: rs.AssetExecutionContext, dbt: DbtResource):
+            context.add_output_metadata({"pid": os.getpid()})
+            async for materialization in dbt.cli(["build"], context):
+                yield materialization
+
+        return shop
+
+    @define
     def shop(context: rs.AssetExecutionContext, dbt: DbtResource):
         context.add_output_metadata({"pid": os.getpid()})
         yield from dbt.cli(["build"], context)

@@ -146,6 +146,36 @@ def export_orders(dbt: DbtResource) -> None:
 
 Pass `target_path` to keep `run_results.json` and the other artifacts. In a `project.assets()` body, your own `--select`, `--exclude`, or `--selector` replaces the selection of the run.
 
+### Async
+
+The body can be an async generator. `async for` yields the same materializations as `yield from`, and dbt's errors fail the outputs in the same way:
+
+```python
+@project.assets()
+async def analytics(context: rs.AssetExecutionContext, dbt: DbtResource):
+    async for materialization in dbt.cli(["build"], context):
+        yield materialization
+```
+
+dbt runs in its own process, so the step only waits for dbt. An async body waits on an event loop, so its step does not hold a worker of the executor:
+
+- With the parallel executor, a sync body holds a worker process until dbt ends. An async body leaves the workers to the other steps, and all the async steps of a level wait at the same time. `max_async_concurrent` limits them.
+- With the in-process executor, the sync steps of a level run one after the other. Up to four async steps of a level wait at the same time.
+
+A waiting step keeps its [pool](../concepts/concurrency.md#concurrency-pools) slots until dbt ends.
+
+In an `async def` asset, `await dbt.cli([...]).async_wait()` runs a command without blocking the event loop. It raises `DbtError` as `wait()` does:
+
+```python
+@rs.Asset(deps=[rs.AssetDef.dep("orders")])
+async def export_orders(dbt: DbtResource) -> None:
+    await dbt.cli(["run-operation", "export_orders"]).async_wait()
+```
+
+When rivers cancels an async step, e.g. on Ctrl-C, dbt stops as it does for a sync body. It gets an interrupt, so that it cancels its queries, and rivers kills it when it still runs 25 seconds later. On Windows, rivers ends dbt at once.
+
+rivers does not keep the log of an async step in the run log yet. dbt's log still goes to `context.log`, so it shows in the log of the process that runs the step.
+
 ## Select resources
 
 `select`, `exclude`, and `selector` take dbt's [node selection syntax](https://docs.getdbt.com/reference/node-selection/syntax). Use them to split a project into definitions, e.g. to partition the incremental models:

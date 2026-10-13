@@ -46,7 +46,7 @@ project.assets(
 ) -> Callable[[Callable], MultiAsset]
 ```
 
-A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The project's `asset_def_fn` builds each output. rivers adds a lineage-only dep on each model, seed, and snapshot that the output refs, by that resource's output name, and on the asset that `source_asset_fn` names for each source that it reads. The deps that `asset_def_fn` returns stay. The body must be a generator. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
+A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The project's `asset_def_fn` builds each output. rivers adds a lineage-only dep on each model, seed, and snapshot that the output refs, by that resource's output name, and on the asset that `source_asset_fn` names for each source that it reads. The deps that `asset_def_fn` returns stay. The body must be a generator, or an async generator (see [Async](../guides/dbt.md#async)); another function raises `TypeError`. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
 
 | Parameter | Description |
 |-----------|-------------|
@@ -143,7 +143,7 @@ dbt.cli(
 A dbt command, not started. With the context of a `DbtProject.assets()` body:
 
 - dbt runs the outputs that the run selected: the definition's selection for all of them, or `--select` with the fqn of each and the definition's `--exclude`. A `--select`, `--exclude`, or `--selector` in `args` replaces it.
-- Iteration yields a `Materialization` for each output that dbt builds (status `success`, `no-op`, or `reused`).
+- Iteration, sync or `async for`, yields a `Materialization` for each output that dbt builds (status `success`, `no-op`, or `reused`).
 - In a `build`, an output with tests is yielded when its tests finish, and not at all when one of them has status `fail` or `error`.
 
 dbt's log goes to `context.log`, or to the `rivers.integrations.dbt.resource` logger without a context. `target_path` keeps dbt's artifacts there; by default they go to a temporary directory that is removed.
@@ -168,6 +168,10 @@ One dbt command, made by `DbtResource.cli()`. It runs once.
 |--------|-------------|
 | `__iter__()` | Runs dbt and yields a `Materialization` per output. After the last one, raises `DbtError` when dbt failed. |
 | `wait()` | Runs dbt to the end. Raises `DbtError` when dbt failed. |
+| `__aiter__()` | `async for`: runs dbt without blocking the event loop, and yields what `__iter__()` yields. |
+| `async_wait()` | `await invocation.async_wait()`: runs dbt to the end without blocking the event loop. Raises `DbtError` when dbt failed. |
+
+When the iteration stops before dbt ends, e.g. on Ctrl-C, on a cancelled task, or on a `break`, dbt gets an interrupt, so that it cancels its queries. It is killed when it still runs 25 seconds later. On Windows, it is ended at once.
 
 ---
 

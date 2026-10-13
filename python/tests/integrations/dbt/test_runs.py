@@ -2,7 +2,8 @@
 
 Tests that take ``run_with`` run with both executors. The parallel executor runs
 a step in a worker only when its level has another step, so these runs add a
-sibling step beside the dbt step.
+sibling step beside the dbt step. Tests that take ``is_async`` also run an async
+body, which both executors run in this process.
 """
 
 import json
@@ -40,11 +41,11 @@ from ._shop import (  # noqa: E402
 
 
 def _shop_repo(
-    shop, storage, run_with, amounts=PAYMENTS, dbt=None
+    shop, storage, run_with, amounts=PAYMENTS, dbt=None, is_async=False
 ) -> rs.CodeRepository:
     assets = [
         payments_asset(shop, amounts),
-        shop_assets(shop, io_handler=run_with.io_handler()),
+        shop_assets(shop, is_async=is_async, io_handler=run_with.io_handler()),
         sibling_asset("payments", io_handler=run_with.io_handler()),
     ]
     return repository(shop, assets, storage, run_with.executor, dbt)
@@ -55,8 +56,9 @@ def _ran_in_worker(metadata: dict) -> bool:
     return pid != os.getpid()
 
 
-def test_build_materializes_every_output(shop, storage, run_with):
-    repo = _shop_repo(shop, storage, run_with)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_build_materializes_every_output(shop, storage, run_with, is_async):
+    repo = _shop_repo(shop, storage, run_with, is_async=is_async)
 
     result = repo.materialize()
 
@@ -72,7 +74,7 @@ def test_build_materializes_every_output(shop, storage, run_with):
 
     metadata = materializations(storage, result.run_id)
     assert set(metadata) == SHOP_OUTPUTS | {"payments", "sibling"}
-    assert _ran_in_worker(metadata) == run_with.in_worker
+    assert _ran_in_worker(metadata) == (run_with.in_worker and not is_async)
     assert metadata["raw_customers"]["dbt/rows_affected"] == 3
     assert metadata["raw_customers"]["dbt/message"] == "INSERT 3"
     assert metadata["customers"]["dbt/execution_time"] > 0
@@ -162,8 +164,10 @@ def test_build_records_typed_metadata(shop, storage):
     assert kinds["dbt/tests"] == "Json"
 
 
-def test_build_logs_dbt_output(shop, storage, caplog):
-    repo = repository(shop, [payments_asset(shop), shop_assets(shop)], storage)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_build_logs_dbt_output(shop, storage, caplog, is_async):
+    assets = [payments_asset(shop), shop_assets(shop, is_async=is_async)]
+    repo = repository(shop, assets, storage)
 
     with caplog.at_level("INFO"):
         assert repo.materialize().success
@@ -179,8 +183,9 @@ def test_build_logs_dbt_output(shop, storage, caplog):
     )
 
 
-def test_a_downstream_model_runs_alone(shop, storage, run_with):
-    repo = _shop_repo(shop, storage, run_with)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_downstream_model_runs_alone(shop, storage, run_with, is_async):
+    repo = _shop_repo(shop, storage, run_with, is_async=is_async)
     assert repo.materialize().success
 
     # Edit an upstream table by hand: rebuilding it would undo the edit.
@@ -191,7 +196,7 @@ def test_a_downstream_model_runs_alone(shop, storage, run_with):
     assert result.success
     metadata = materializations(storage, result.run_id)
     assert set(metadata) == {"customers", "sibling"}
-    assert _ran_in_worker(metadata) == run_with.in_worker
+    assert _ran_in_worker(metadata) == (run_with.in_worker and not is_async)
     assert rows(shop, "SELECT id, paid FROM customers ORDER BY id") == [
         (1, 107),
         (2, 3),
@@ -242,8 +247,11 @@ def test_a_failed_model_fails_with_what_it_skipped(shop, storage, run_with):
     assert "main.customers" not in tables(shop)
 
 
-def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
-    repo = _shop_repo(shop, storage, run_with, amounts=["5", "-4", "3"])
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with, is_async):
+    repo = _shop_repo(
+        shop, storage, run_with, amounts=["5", "-4", "3"], is_async=is_async
+    )
 
     result = repo.materialize(raise_on_error=False)
 
@@ -259,7 +267,7 @@ def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
         "payments",
         "sibling",
     }
-    assert _ran_in_worker(metadata) == run_with.in_worker
+    assert _ran_in_worker(metadata) == (run_with.in_worker and not is_async)
     # dbt built the table before its test failed.
     assert rows(shop, "SELECT amount FROM stg_payments ORDER BY order_id") == [
         (5,),
@@ -268,17 +276,26 @@ def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
     ]
 
 
-def test_the_body_must_take_the_resource_as_a_parameter(shop, storage, run_with):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_the_body_must_take_the_resource_as_a_parameter(
+    shop, storage, run_with, is_async
+):
     project = DbtProject(shop, profiles_dir=shop, source_asset_fn=source_asset)
+    define = project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
 
-    @project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
     def shop_def(context: rs.AssetExecutionContext):
         dbt = DbtResource(project_dir=project)
         yield from dbt.cli(["build"], context)
 
+    async def async_shop_def(context: rs.AssetExecutionContext):
+        dbt = DbtResource(project_dir=project)
+        async for materialization in dbt.cli(["build"], context):
+            yield materialization
+
+    body = async_shop_def if is_async else shop_def
     assets = [
         payments_asset(shop),
-        shop_def,
+        define(body),
         sibling_asset("payments", io_handler=run_with.io_handler()),
     ]
     repo = repository(shop, assets, storage, run_with.executor)
@@ -287,7 +304,7 @@ def test_the_body_must_take_the_resource_as_a_parameter(shop, storage, run_with)
 
     assert not result.success
     error = (
-        "TypeError: 'shop_def' must take the DbtResource as a parameter, e.g. "
+        f"TypeError: '{body.__name__}' must take the DbtResource as a parameter, e.g. "
         "dbt: DbtResource; a DbtResource made in the body is not bound to its outputs"
     )
     assert failures(storage, result.run_id) == dict.fromkeys(SHOP_OUTPUTS, error)
