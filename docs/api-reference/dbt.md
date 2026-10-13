@@ -54,7 +54,7 @@ A decorator that builds a multi-asset with one output per selected model, seed, 
 
 Raises `FileNotFoundError` when the manifest does not exist, `ValueError` when the selection has no model, seed, or snapshot, and `DbtError` when `dbt ls` fails.
 
-When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations. Its commands start from the `partial_parse.msgpack` in the project's `target_path`.
+When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations. Its commands start from the `partial_parse.msgpack` in the project's `target_path`. The body must take the resource as a parameter: a body that makes its own `DbtResource` instead raises `TypeError`.
 
 **Definition metadata:**
 

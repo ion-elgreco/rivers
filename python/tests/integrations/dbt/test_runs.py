@@ -269,6 +269,37 @@ def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
     ]
 
 
+def test_the_body_must_take_the_resource_as_a_parameter(shop, storage, run_with):
+    project = DbtProject(shop, profiles_dir=shop)
+
+    @project.assets(
+        exclude="daily_orders",
+        translator=SourceTranslator(),
+        io_handler=run_with.io_handler(),
+    )
+    def shop_def(context: rs.AssetExecutionContext):
+        dbt = DbtResource(project_dir=project)
+        yield from dbt.cli(["build"], context)
+
+    assets = [
+        payments_asset(shop),
+        shop_def,
+        sibling_asset("payments", io_handler=run_with.io_handler()),
+    ]
+    repo = repository(shop, assets, storage, run_with.executor)
+
+    result = repo.materialize(raise_on_error=False)
+
+    assert not result.success
+    error = (
+        "TypeError: 'shop_def' must take the DbtResource as a parameter, e.g. "
+        "dbt: DbtResource; a DbtResource made in the body is not bound to its outputs"
+    )
+    assert failures(storage, result.run_id) == dict.fromkeys(SHOP_OUTPUTS, error)
+    assert set(materializations(storage, result.run_id)) == {"payments", "sibling"}
+    assert tables(shop) == {"raw.payments"}
+
+
 def test_tests_the_definition_excludes_stay_excluded_in_a_subset(shop, storage):
     payments = payments_asset(shop, amounts=["5", "-4", "3"])
     project = DbtProject(shop, profiles_dir=shop)

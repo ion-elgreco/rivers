@@ -101,7 +101,8 @@ class DbtProject(BaseModel):
         outputs they test.
 
         The body is a generator that runs dbt with the :class:`DbtResource` it
-        receives; see :meth:`DbtResource.cli`.
+        receives; see :meth:`DbtResource.cli`. A body that makes its own
+        ``DbtResource`` instead raises ``TypeError``.
 
         Args:
             select: dbt's ``--select``. Other than the default, the selection
@@ -166,6 +167,13 @@ class DbtProject(BaseModel):
 
             @functools.wraps(fn)
             def body(*args: Any, **fn_kwargs: Any) -> Any:
+                if not any(isinstance(arg, DbtResource) for arg in args):
+                    raise TypeError(
+                        f"'{fn.__name__}' must take the DbtResource as a parameter, "
+                        "e.g. dbt: DbtResource; a DbtResource made in the body is "
+                        "not bound to its outputs"
+                    )
+
                 args = tuple(
                     arg._bind(outputs, self.manifest_path.parent)
                     if isinstance(arg, DbtResource)

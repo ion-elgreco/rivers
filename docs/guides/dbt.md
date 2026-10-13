@@ -83,6 +83,8 @@ The body runs dbt with `dbt.cli(args, context)`, and `yield from` reports each o
 - dbt's log goes to the run log.
 - When dbt fails, the outputs that it built keep their materializations. The other outputs fail with dbt's error, which names each failed or skipped resource.
 
+The body must take the resource as a parameter, as in the [example](#define-the-assets): a body that makes its own `DbtResource` instead raises `TypeError`.
+
 Each materialization records:
 
 | Key | Type | Description |
