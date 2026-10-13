@@ -236,7 +236,7 @@ class DatabricksResource(Resource):
         """
         client = self.get_client()
         run_id = _run_now(client, job_id, job_parameters, only)
-        return _succeeded(client, run_id, self._wait(client, run_id, log or _log))
+        return self._result(client, run_id, log)
 
     def submit_run(
         self,
@@ -275,7 +275,7 @@ class DatabricksResource(Resource):
             ],
             **submit_args,
         ).run_id
-        return _succeeded(client, run_id, self._wait(client, run_id, log or _log))
+        return self._result(client, run_id, log)
 
     def _run_tasks(
         self,
@@ -311,6 +311,28 @@ class DatabricksResource(Resource):
             raise DatabricksRunError("\n".join(lines))
         if _status(run.state) != "SUCCESS":
             context.log.warning(_failure_message(client, run))
+
+    def _result(
+        self, client: WorkspaceClient, run_id: int, log: logging.Logger | None
+    ) -> DatabricksRun:
+        """Wait until run ``run_id`` ends; raise unless it ended with ``SUCCESS``."""
+        run = self._wait(client, run_id, log or _log)
+        if _status(run.state) != "SUCCESS":
+            raise DatabricksRunError(_failure_message(client, run))
+
+        outputs = {}
+        for task in run.tasks or []:
+            output = _notebook_output(client, task)
+            if output is not None:
+                outputs[task.task_key] = output
+
+        return DatabricksRun(
+            run_id=run_id,
+            job_id=run.job_id,
+            run_page_url=run.run_page_url,
+            duration=_seconds(run.start_time, run.end_time),
+            outputs=outputs,
+        )
 
     def _wait(
         self, client: WorkspaceClient, run_id: int, log: logging.Logger
@@ -412,25 +434,6 @@ def _status(state: jobs.RunState | None) -> str:
     """The result state of an ended run or task, else its life cycle state."""
     status = state and (state.result_state or state.life_cycle_state)
     return status.value if status else "UNKNOWN"
-
-
-def _succeeded(client: WorkspaceClient, run_id: int, run: jobs.Run) -> DatabricksRun:
-    if _status(run.state) != "SUCCESS":
-        raise DatabricksRunError(_failure_message(client, run))
-
-    outputs = {}
-    for task in run.tasks or []:
-        output = _notebook_output(client, task)
-        if output is not None:
-            outputs[task.task_key] = output
-
-    return DatabricksRun(
-        run_id=run_id,
-        job_id=run.job_id,
-        run_page_url=run.run_page_url,
-        duration=_seconds(run.start_time, run.end_time),
-        outputs=outputs,
-    )
 
 
 def _run_metadata(run: DatabricksRun) -> dict[str, Any]:
