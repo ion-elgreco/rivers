@@ -15,7 +15,10 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
-from rivers.integrations.snowflake import SnowflakeResource  # noqa: E402
+from rivers.integrations.snowflake import (  # noqa: E402
+    SnowflakeIOHandler,
+    SnowflakeResource,
+)
 
 
 class FakeConnection:
@@ -176,6 +179,25 @@ def test_one_credential_at_a_time():
         SnowflakeResource(private_key="pem", private_key_path="rsa_key.p8")
 
 
+@pytest.mark.parametrize("in_handler", [False, True], ids=["resource", "handler"])
+@pytest.mark.parametrize("source", ["code", "env"])
+def test_two_credentials_fail_without_their_values(monkeypatch, source, in_handler):
+    """A handler validates a resource given as a dict, and its error shows
+    the handler's input."""
+    fields = {"account": "acct", "password": "s3cr3t-pw", "private_key": "s3cr3t-pem"}
+    if source == "env":
+        for name in ("password", "private_key"):
+            monkeypatch.setenv(f"SNOWFLAKE_{name.upper()}", fields.pop(name))
+
+    with pytest.raises(ValueError, match="got password and private_key") as error:
+        if in_handler:
+            SnowflakeIOHandler(resource=fields)
+        else:
+            SnowflakeResource(**fields)
+
+    assert "s3cr3t" not in str(error.value)
+
+
 def test_fields_from_env(monkeypatch, connect):
     monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "myorg-env")
     monkeypatch.setenv("SNOWFLAKE_USER", "ENV_USER")
@@ -197,6 +219,73 @@ def test_fields_from_env(monkeypatch, connect):
     ]
 
 
+@pytest.mark.parametrize("given", ["password", "private_key", "private_key_path"])
+def test_a_given_credential_hides_the_env_credentials(
+    monkeypatch, connect, rsa_key, tmp_path, given
+):
+    """The environment holds the two other kinds. A worker rebuilds the
+    resource from its fields with ``model_validate``, which reads the
+    environment again."""
+    pem = _pem(rsa_key, None)
+    path = tmp_path / "rsa_key.p8"
+    path.write_bytes(pem)
+    credentials = {
+        "password": "s3cr3t-pw",
+        "private_key": pem.decode(),
+        "private_key_path": str(path),
+    }
+    for name, value in credentials.items():
+        if name != given:
+            monkeypatch.setenv(f"SNOWFLAKE_{name.upper()}", value)
+
+    resource = SnowflakeResource(
+        account="acct", user="ETL", **{given: credentials[given]}
+    )
+    with resource.get_connection() as con:
+        pass
+
+    assert [n for n in credentials if getattr(resource, n) is not None] == [given]
+    expected = {"account": "acct", "user": "ETL"}
+    if given == "password":
+        expected["password"] = "s3cr3t-pw"
+    else:
+        assert _der(con.kwargs.pop("private_key")) == _der(rsa_key)
+    assert con.kwargs == expected
+
+    rebuilt = SnowflakeResource.model_validate(resource.model_dump(round_trip=True))
+    assert rebuilt == resource
+
+
+def test_none_is_not_a_credential(monkeypatch, connect, rsa_key):
+    monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY", _pem(rsa_key, None).decode())
+
+    resource = SnowflakeResource(account="acct", user="ETL", password=None)
+    with resource.get_connection() as con:
+        pass
+
+    assert _der(con.kwargs.pop("private_key")) == _der(rsa_key)
+    assert con.kwargs == {"account": "acct", "user": "ETL"}
+
+
+@pytest.mark.parametrize("key_source", ["code", "env"])
+def test_empty_env_vars_are_unset(monkeypatch, connect, rsa_key, key_source):
+    """A CI secret that is not defined becomes an empty variable."""
+    pem = _pem(rsa_key, None).decode()
+    for name in ("PASSWORD", "PRIVATE_KEY_PATH", "PRIVATE_KEY_PASSWORD", "ROLE"):
+        monkeypatch.setenv(f"SNOWFLAKE_{name}", "")
+    key = {"private_key": pem}
+    if key_source == "env":
+        monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY", pem)
+        key = {}
+
+    resource = SnowflakeResource(account="acct", user="ETL", **key)
+    with resource.get_connection() as con:
+        pass
+
+    assert _der(con.kwargs.pop("private_key")) == _der(rsa_key)
+    assert con.kwargs == {"account": "acct", "user": "ETL"}
+
+
 def test_secrets_stay_out_of_repr():
     resource = SnowflakeResource(
         user="ETL", private_key="pem-text", private_key_password="key-pass"
@@ -206,6 +295,21 @@ def test_secrets_stay_out_of_repr():
     assert "pem-text" not in repr(resource)
     assert "key-pass" not in repr(resource)
     assert "hunter2" not in repr(SnowflakeResource(password="hunter2"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("private_key_file_pwd", "s3cr3t-pass"),
+        ("connection_args", '{"token": "s3cr3t-token"}'),
+    ],
+    ids=["connector-passphrase-name", "connection-args-as-text"],
+)
+def test_validation_errors_hide_the_values(field, value):
+    with pytest.raises(ValueError, match=field) as error:
+        SnowflakeResource(account="acct", user="ETL", **{field: value})
+
+    assert "s3cr3t" not in str(error.value)
 
 
 def test_missing_connector_names_the_extra(monkeypatch):

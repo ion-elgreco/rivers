@@ -52,7 +52,7 @@ Fields that you do not give are read from `SNOWFLAKE_*` environment variables, f
 | `role` | `None` | Role of the session. |
 | `connection_args` | `{}` | Other keyword arguments for [`snowflake.connector.connect`](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-api#connect), e.g. `{"login_timeout": 30}`. |
 
-Give one of `password`, `private_key`, and `private_key_path`.
+Give one of `password`, `private_key`, and `private_key_path`. A credential that you pass to the resource wins over `SNOWFLAKE_*` variables of another kind, for example `SNOWFLAKE_PASSWORD` when you pass `private_key_path`. Empty variables count as unset.
 
 ### Key-pair authentication
 
@@ -69,7 +69,7 @@ In an environment variable, a PEM key keeps its newlines, or you can give its ba
 
 ### Secrets
 
-`password`, `private_key`, and `private_key_password` are pydantic `SecretStr` values: the resource's `repr` and the UI's launch form show them masked. Other connection secrets, such as an OAuth token in `connection_args`, have no such protection.
+`password`, `private_key`, and `private_key_password` are pydantic `SecretStr` values: the resource's `repr` and the UI's launch form show them masked. Other connection secrets, such as an OAuth token in `connection_args`, have no such protection. Validation errors of the resource and of `SnowflakeIOHandler` do not show field values, so they put no secret into tracebacks or logs.
 
 ## IO handler
 

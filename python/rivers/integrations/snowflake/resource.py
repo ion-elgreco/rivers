@@ -12,16 +12,26 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from pydantic import SecretStr, model_validator
-from pydantic_settings import SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    InitSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from rivers.resource import Resource
+
+_CREDENTIALS = ("password", "private_key", "private_key_path")
 
 
 class SnowflakeResource(Resource):
     """Opens Snowflake connections with ``snowflake.connector``.
 
     Fields are read from ``SNOWFLAKE_*`` environment variables when not given,
-    for example ``SNOWFLAKE_ACCOUNT`` and ``SNOWFLAKE_PRIVATE_KEY``.
+    for example ``SNOWFLAKE_ACCOUNT`` and ``SNOWFLAKE_PRIVATE_KEY``. Empty
+    variables count as unset. A credential that is given wins over
+    ``SNOWFLAKE_*`` credentials of another kind. Validation errors do not
+    show field values.
 
     Args:
         account: Account identifier, e.g. ``"myorg-myaccount"``.
@@ -42,7 +52,8 @@ class SnowflakeResource(Resource):
 
     Raises:
         ValueError: If more than one of ``password``, ``private_key``, and
-            ``private_key_path`` is given.
+            ``private_key_path`` is given, or is set in the environment when
+            none is given.
 
     Example::
 
@@ -56,7 +67,9 @@ class SnowflakeResource(Resource):
                 return cur.fetch_arrow_all(force_return_table=True)
     """
 
-    model_config = SettingsConfigDict(env_prefix="SNOWFLAKE_")
+    model_config = SettingsConfigDict(
+        env_prefix="SNOWFLAKE_", env_ignore_empty=True, hide_input_in_errors=True
+    )
 
     account: str | None = None
     user: str | None = None
@@ -71,13 +84,28 @@ class SnowflakeResource(Resource):
     role: str | None = None
     connection_args: dict[str, Any] = {}
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """A credential given to the constructor hides the variables of the
+        other credentials: init values, ``None`` too, come before them."""
+        given = init_settings()
+        if any(given.get(name) is not None for name in _CREDENTIALS):
+            init_settings = InitSettingsSource(
+                settings_cls, {**dict.fromkeys(_CREDENTIALS), **given}
+            )
+
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
+
     @model_validator(mode="after")
     def _one_credential(self) -> Self:
-        given = [
-            name
-            for name in ("password", "private_key", "private_key_path")
-            if getattr(self, name) is not None
-        ]
+        given = [name for name in _CREDENTIALS if getattr(self, name) is not None]
         if len(given) > 1:
             raise ValueError(
                 f"give one of password, private_key, and private_key_path, got {' and '.join(given)}"

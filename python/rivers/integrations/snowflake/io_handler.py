@@ -14,6 +14,7 @@ from typing import Any, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pydantic_settings import SettingsConfigDict
 from snowflake.connector import SnowflakeConnection
 from snowflake.connector.constants import FIELD_ID_TO_NAME
 from snowflake.connector.cursor import ResultMetadata, SnowflakeCursor
@@ -83,6 +84,9 @@ class SnowflakeIOHandler(BaseIOHandler):
             rows; ``APPEND`` adds rows. The strings ``"overwrite"`` and
             ``"append"`` work too.
     """
+
+    # a resource given as a dict is validated here, secrets too
+    model_config = SettingsConfigDict(hide_input_in_errors=True)
 
     resource: SnowflakeResource
     schema_name: str = "PUBLIC"

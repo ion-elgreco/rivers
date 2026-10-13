@@ -21,6 +21,8 @@ io = SnowflakeIOHandler(
 | `schema_name` | `str` | `"PUBLIC"` | Schema for the tables. |
 | `mode` | `SnowflakeWriteMode` | `OVERWRITE` | `OVERWRITE` or `APPEND`. The strings `"overwrite"` and `"append"` work too. |
 
+Validation errors of the handler do not show field values, the resource's secrets included.
+
 **Supported types:**
 
 | Type | Write | Read |
@@ -186,7 +188,7 @@ warehouse = SnowflakeResource(
 | `role` | `str \| None` | `None` | Role of the session. |
 | `connection_args` | `dict[str, Any]` | `{}` | Other keyword arguments for `snowflake.connector.connect`. |
 
-The `SecretStr` fields show masked in the resource's `repr` and in the UI's launch form. Giving more than one of `password`, `private_key`, and `private_key_path` raises `ValueError`. A private key is loaded once per process and passed to the connector as a key object, so the connector uses key-pair authentication.
+The `SecretStr` fields show masked in the resource's `repr` and in the UI's launch form. Giving more than one of `password`, `private_key`, and `private_key_path` raises `ValueError`. A credential that you give wins over `SNOWFLAKE_*` variables of another kind, empty variables count as unset, and validation errors do not show field values. A private key is loaded once per process and passed to the connector as a key object, so the connector uses key-pair authentication.
 
 ### Methods
 
