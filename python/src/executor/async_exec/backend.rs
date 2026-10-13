@@ -321,6 +321,7 @@ impl ExecutorBackend for AsyncBackend {
                 rt().handle(),
             );
         }
-        process_finished_steps(py, ctx, tasks, failures);
+        let bridge = ctx.repo.bridge;
+        process_finished_steps(py, ctx, tasks, bridge, failures);
     }
 }

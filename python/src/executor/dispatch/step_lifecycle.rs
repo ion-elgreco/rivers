@@ -33,6 +33,7 @@ use tokio::task::JoinSet;
 use crate::errors::ExecutionError;
 use crate::runtime::rt;
 
+use super::super::async_exec::AsyncBridge;
 use super::super::event_writer::{self, WriterMsg};
 use super::super::ops::{self, now_ts};
 use super::super::traceback;
@@ -224,13 +225,24 @@ pub(crate) struct FinishedStep {
 /// Route each step's outcome through `process_outcome` as its task finishes,
 /// then release the step's claim. Waiting for the whole set would keep a
 /// finished step's claim until its slowest sibling ends.
+///
+/// `bridge` is the event loop of async steps: a Ctrl-C during the wait
+/// cancels their tasks, as it interrupts a sync step.
 pub(crate) fn process_finished_steps(
     py: Python,
     ctx: &mut BatchContext,
     mut tasks: JoinSet<FinishedStep>,
+    bridge: Option<&AsyncBridge>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
-    while let Some(joined) = py.detach(|| rt().block_on(tasks.join_next())) {
+    loop {
+        let joined = match bridge {
+            Some(bridge) => bridge.block_on(py, tasks.join_next()),
+            None => py.detach(|| rt().block_on(tasks.join_next())),
+        };
+        let Some(joined) = joined else {
+            break;
+        };
         let finished = match joined {
             Ok(finished) => finished,
             Err(e) => {

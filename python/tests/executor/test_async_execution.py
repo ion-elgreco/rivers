@@ -2,6 +2,10 @@
 
 import asyncio
 import os
+import select
+import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -1343,3 +1347,120 @@ def test_async_failure_events_parallel(tmp_path, storage):
     events = storage.get_events_for_asset("par_fail_ev")
     event_types = [e.event_type for e in events]
     assert "StepFailure" in event_types
+
+
+# ── Ctrl-C ──
+
+_INTERRUPT_SCRIPT = """
+import asyncio
+import signal
+import sys
+
+import rivers as rs
+from rivers.testing import memory_storage
+
+# A child of an xdist worker can start with SIGINT ignored.
+signal.signal(signal.SIGINT, signal.default_int_handler)
+executor, kind = sys.argv[1:]
+
+
+async def wait() -> None:
+    print("started", flush=True)
+    try:
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        print("cancelled", flush=True)
+        raise
+
+
+if kind == "coroutine":
+
+    @rs.Asset(name="slow")
+    async def slow() -> rs.Materialization:
+        await wait()
+        return rs.Materialization()
+
+elif kind == "generator":
+
+    @rs.Asset.from_multi(output_defs=[rs.AssetDef("slow")])
+    async def slow():
+        await wait()
+        yield rs.Materialization(output_name="slow")
+
+else:
+
+    @rs.Asset(name="slow")
+    async def slow() -> rs.Materialization:
+        signal.raise_signal(signal.SIGINT)
+        return rs.Materialization()
+
+
+storage = memory_storage()
+repo = rs.CodeRepository(
+    assets=[slow],
+    default_executor=rs.Executor.in_process()
+    if executor == "in_process"
+    else rs.Executor.parallel(max_workers=2),
+)
+repo.resolve(storage=storage)
+try:
+    result = repo.materialize(raise_on_error=False)
+except KeyboardInterrupt:
+    print("interrupted", flush=True)
+    sys.exit()
+
+reasons = [
+    dict(event.metadata)["rivers/failure_reason"]
+    for event in storage.get_events_for_asset("slow")
+    if event.event_type == "StepFailure"
+]
+print("success", result.success, *reasons, flush=True)
+"""
+
+
+def _start_interrupt_script(executor_kind: str, kind: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _INTERRUPT_SCRIPT, executor_kind, kind],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _finish(proc: subprocess.Popen) -> list[str]:
+    """The lines the child prints until it exits; fails if it hangs."""
+    try:
+        out, err = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise AssertionError(f"the run hung; printed {out!r}\n{err}") from None
+    assert proc.returncode == 0, err
+    return out.splitlines()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGINT")
+@pytest.mark.parametrize("kind", ["coroutine", "generator"])
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_ctrl_c_cancels_a_running_async_step(executor_kind, kind):
+    """Ctrl-C cancels a running async step, as it interrupts a sync step:
+    the step ends with CancelledError, fails as cancelled, and the run ends."""
+    proc = _start_interrupt_script(executor_kind, kind)
+    ready, _, _ = select.select([proc.stdout], [], [], 20)
+    assert ready and proc.stdout.readline() == "started\n", proc.stderr.read()
+
+    proc.send_signal(signal.SIGINT)
+
+    assert _finish(proc) == ["cancelled", "success False cancelled"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGINT")
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_ctrl_c_as_an_async_step_ends_does_not_hang(executor_kind):
+    """A Ctrl-C that arrives as the last async step ends is still pending
+    when the run stops its event loop. It must not stop that shutdown: the
+    run ends, then the interrupt is raised. If the wait for the step sees
+    the Ctrl-C first, the step has already ended and the run succeeds."""
+    proc = _start_interrupt_script(executor_kind, "signal")
+
+    assert _finish(proc) in (["interrupted"], ["success True"])

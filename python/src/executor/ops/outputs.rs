@@ -233,14 +233,16 @@ fn next_yield(
 ) -> PyResult<Option<Py<PyAny>>> {
     if is_async_gen {
         let anext_coro = generator.call_method0(py, "__anext__")?;
-        let locals = bridge.map(|b| &b.task_locals).ok_or_else(|| {
+        let bridge = bridge.ok_or_else(|| {
             ExecutionError::new_err(
                 "Async generator requires TaskLocals — this is an internal error",
             )
         })?;
-        let future =
-            pyo3_async_runtimes::into_future_with_locals(locals, anext_coro.into_bound(py))?;
-        match py.detach(|| crate::runtime::rt().block_on(future)) {
+        let future = pyo3_async_runtimes::into_future_with_locals(
+            &bridge.task_locals,
+            anext_coro.into_bound(py),
+        )?;
+        match bridge.block_on(py, future) {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) => Ok(None),
             Err(e) => Err(e),
