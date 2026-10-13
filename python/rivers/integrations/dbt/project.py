@@ -12,10 +12,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from rivers._core.assets import Asset, MultiAsset
+from rivers._core.assets import Asset, AssetDef, MultiAsset
 from rivers.integrations.dbt._manifest import build_outputs, selection_args
+from rivers.integrations.dbt.node import DbtNode
 from rivers.integrations.dbt.resource import DbtResource
-from rivers.integrations.dbt.translator import DbtTranslator
 
 __all__ = ["DbtProject"]
 
@@ -26,6 +26,10 @@ class DbtProject(BaseModel):
     Write the manifest with ``dbt parse`` or :meth:`prepare` before the code
     location loads, e.g. when you build its image.
 
+    ``asset_def_fn`` builds the output of every model, seed, and snapshot in
+    the project, also of the ones that a definition does not select. So a dep
+    on a resource of another definition has that resource's output name.
+
     Args:
         project_dir: The directory with ``dbt_project.yml``.
         target_path: The directory with ``manifest.json``, relative to
@@ -35,19 +39,35 @@ class DbtProject(BaseModel):
             Default: dbt's search.
         profile: The profile to use instead of the project's.
         target: The target to use instead of the profile's default.
+        asset_def_fn: Builds the output of a model, seed, or snapshot.
+            Defaults to :meth:`DbtNode.output_def`. The deps that it returns
+            stay, and rivers adds a dep on each resource that the node refs.
+        source_asset_fn: Called with each dbt source that a selected output
+            reads, directly or through ephemeral models. Returns the name of
+            the rivers asset that loads the source, or ``None`` for no dep.
+            Default: a source adds no dep.
+
+    Raises:
+        ValueError: When ``project_dir`` has no ``dbt_project.yml``, or a
+            field is unknown.
 
     Example::
 
-        project = DbtProject(Path(__file__).parent / "analytics")
+        project = DbtProject(
+            Path(__file__).parent / "analytics",
+            source_asset_fn=lambda source: f"{source.props['source_name']}_{source.name}",
+        )
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     project_dir: Path
     target_path: Path = Path("target")
     profiles_dir: Path | None = None
     profile: str | None = None
     target: str | None = None
+    asset_def_fn: Callable[[DbtNode], AssetDef] | None = None
+    source_asset_fn: Callable[[DbtNode], str | None] | None = None
 
     def __init__(self, project_dir: str | Path, **kwargs: Any) -> None:
         super().__init__(project_dir=project_dir, **kwargs)
@@ -88,17 +108,17 @@ class DbtProject(BaseModel):
         select: str = "fqn:*",
         exclude: str = "",
         selector: str = "",
-        translator: DbtTranslator | None = None,
         **kwargs: Any,
     ) -> Callable[[Callable[..., Any]], MultiAsset]:
         """A decorator that builds a multi-asset of the project's models, seeds, and snapshots.
 
-        Each selected resource is an output, named by the translator. Its deps
-        are the resources it refs, so a run can build any subset of them. A
-        source, or a resource outside the selection, becomes a dep on the
-        asset :meth:`DbtTranslator.upstream_asset` names; by default sources
-        add no dep. Tests are not assets: in a ``dbt build`` they gate the
-        outputs they test.
+        Each selected resource is an output, built by the project's
+        ``asset_def_fn``. Its deps are the models, seeds, and snapshots it
+        refs, so a run can build any subset of them, and the asset that
+        ``source_asset_fn`` names for each source it reads. A dep on a
+        resource outside the selection has that resource's output name: define
+        every resource that the selection refs. Tests are not assets: in a
+        ``dbt build`` they gate the outputs they test.
 
         The body is a generator that runs dbt with the :class:`DbtResource` it
         receives; see :meth:`DbtResource.cli`. A body that makes its own
@@ -111,8 +131,6 @@ class DbtProject(BaseModel):
             exclude: dbt's ``--exclude``.
             selector: A selector from ``selectors.yml``, instead of ``select``
                 and ``exclude``.
-            translator: Maps resources to asset names, groups, tags, metadata,
-                code versions, and deps.
             **kwargs: Passed to :meth:`rivers.Asset.from_multi`, e.g. ``name``,
                 ``group``, ``partitions_def``, ``hooks``, or ``retry``. An
                 ``io_handler`` that reads tables, like ``DuckDBIOHandler``, loads
@@ -123,7 +141,9 @@ class DbtProject(BaseModel):
 
         Raises:
             FileNotFoundError: When the manifest does not exist.
-            ValueError: When the selection matches no model, seed, or snapshot.
+            ValueError: When the selection matches no model, seed, or snapshot,
+                an output has no name, or two resources in the project get the
+                same output name.
 
         Example::
 
@@ -150,7 +170,8 @@ class DbtProject(BaseModel):
         outputs, output_defs = build_outputs(
             json.loads(raw),
             selected,
-            translator or DbtTranslator(),
+            self.asset_def_fn or DbtNode.output_def,
+            self.source_asset_fn,
             selection,
             ("--exclude", exclude) if exclude else (),
         )
@@ -158,6 +179,9 @@ class DbtProject(BaseModel):
             raise ValueError(
                 f"dbt selection {' '.join(selection)} matches no model, seed, or snapshot"
             )
+
+        # The parallel executor pickles the body, so it must not hold the project.
+        parse_dir = self.manifest_path.parent
 
         def decorate(fn: Callable[..., Any]) -> MultiAsset:
             if not inspect.isgeneratorfunction(fn):
@@ -175,7 +199,7 @@ class DbtProject(BaseModel):
                     )
 
                 args = tuple(
-                    arg._bind(outputs, self.manifest_path.parent)
+                    arg._bind(outputs, parse_dir)
                     if isinstance(arg, DbtResource)
                     else arg
                     for arg in args

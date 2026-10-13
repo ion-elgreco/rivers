@@ -2,10 +2,12 @@
 
 import importlib
 import json
+import re
 import shutil
 import sys
 
 import pytest
+from pydantic import ValidationError
 
 pytest.importorskip("dbt.version")
 pytest.importorskip("duckdb")
@@ -15,9 +17,9 @@ import rivers as rs  # noqa: E402
 from rivers.exceptions import GraphValidationError  # noqa: E402
 from rivers.integrations.dbt import (  # noqa: E402
     DbtError,
+    DbtNode,
     DbtProject,
     DbtResource,
-    DbtTranslator,
 )
 
 from ._shop import (  # noqa: E402
@@ -42,6 +44,11 @@ def _define(project: DbtProject, **kwargs) -> rs.MultiAsset:
 
 def _outputs(asset: rs.MultiAsset) -> dict[str, rs.AssetDef]:
     return {output.name: output for output in asset.output_defs}
+
+
+def _validate(shop, *assets) -> None:
+    resources = {"dbt": DbtResource(project_dir=shop, profiles_dir=shop)}
+    rs.CodeRepository(assets=list(assets), resources=resources).validate()
 
 
 def test_outputs_are_the_models_seeds_and_snapshots(shop):
@@ -89,21 +96,123 @@ def test_definition_settings_fill_in_what_dbt_leaves_unset(shop):
     assert outputs["raw_orders"].tags == ["dbt"]
 
 
-def test_a_translator_renames_assets(shop):
-    class Prefixed(DbtTranslator):
-        def asset_name(self, node):
-            return f"shop/{node['name']}"
+def test_an_asset_def_fn_renames_the_outputs_and_sets_their_group(shop):
+    def asset_def(node: DbtNode) -> rs.AssetDef:
+        return node.output_def(
+            name=f"shop_{node.asset_name}", group=f"dbt_{node.resource_type}s"
+        )
 
-        def group(self, node):
-            return node["fqn"][1]
+    defaults = _outputs(_define(DbtProject(shop, profiles_dir=shop)))
+    project = DbtProject(shop, profiles_dir=shop, asset_def_fn=asset_def)
 
-    outputs = _outputs(
-        _define(DbtProject(shop, profiles_dir=shop), translator=Prefixed())
+    renamed = _define(project)
+
+    outputs = _outputs(renamed)
+    assert set(outputs) == {f"shop_{name}" for name in defaults}
+    assert outputs["shop_customers"].group == "dbt_models"
+    assert outputs["shop_raw_orders"].group == "dbt_seeds"
+    assert outputs["shop_customers_snapshot"].group == "dbt_snapshots"
+    # The deps have the new names: a dep on an old name would not resolve.
+    _validate(shop, renamed)
+    # The fields that the function does not give keep their defaults.
+    assert {
+        name: (output.tags, output.kinds, output.code_version, output.metadata)
+        for name, output in outputs.items()
+    } == {
+        f"shop_{name}": (
+            output.tags,
+            output.kinds,
+            output.code_version,
+            output.metadata,
+        )
+        for name, output in defaults.items()
+    }
+    assert outputs["shop_stg_orders"].tags == ["staging"]
+    assert outputs["shop_customers"].metadata["dbt/unique_id"] == (
+        "model.shop.customers"
     )
 
-    assert "shop/customers" in outputs
-    assert outputs["shop/customers"].group == "marts"
-    assert outputs["shop/stg_orders"].group == "staging"
+
+def test_deps_from_the_asset_def_fn_stay_beside_the_ref_deps(shop):
+    def asset_def(node: DbtNode) -> rs.AssetDef:
+        if node.name != "daily_orders":
+            return node.output_def()
+        return node.output_def(deps=[rs.AssetDef.dep("orders_export")])
+
+    @rs.Asset
+    def orders_export() -> rs.Materialization:
+        return rs.Materialization()
+
+    project = DbtProject(shop, profiles_dir=shop, asset_def_fn=asset_def)
+
+    daily = _define(project, select="daily_orders", name="daily")
+    rest = _define(project, exclude="daily_orders")
+
+    with pytest.raises(
+        GraphValidationError,
+        match="Asset 'daily_orders': unresolved input 'stg_orders'",
+    ):
+        _validate(shop, daily, orders_export)
+    with pytest.raises(
+        GraphValidationError,
+        match="Asset 'daily_orders': unresolved input 'orders_export'",
+    ):
+        _validate(shop, daily, rest)
+    _validate(shop, daily, rest, orders_export)
+
+
+def test_dbt_duckdb_adds_the_table_under_the_metadata_of_the_asset_def_fn(shop):
+    def asset_def(node: DbtNode) -> rs.AssetDef:
+        return node.output_def(metadata={"team": "shop", "duckdb/schema": "analytics"})
+
+    project = DbtProject(shop, profiles_dir=shop, asset_def_fn=asset_def)
+
+    outputs = _outputs(_define(project))
+
+    assert outputs["customers"].metadata == {
+        "team": "shop",
+        "duckdb/schema": "analytics",
+        "duckdb/table": "customers",
+    }
+
+
+def test_two_resources_with_one_output_name_raise_across_the_project(shop):
+    def asset_def(node: DbtNode) -> rs.AssetDef:
+        return node.output_def(name=node.name.removeprefix("stg_"))
+
+    project = DbtProject(shop, profiles_dir=shop, asset_def_fn=asset_def)
+
+    # The selection has neither customers nor stg_customers.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "dbt nodes 'model.shop.customers' and 'model.shop.stg_customers' both "
+            "map to the output 'customers'; pass an asset_def_fn that names them apart"
+        ),
+    ):
+        _define(project, select="daily_orders")
+
+
+@pytest.mark.parametrize("name", [None, ""])
+def test_an_output_without_a_name_raises(shop, name):
+    project = DbtProject(
+        shop,
+        profiles_dir=shop,
+        asset_def_fn=lambda node: node.output_def(name=name),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape("the output of dbt node 'model.shop.customers' has no name"),
+    ):
+        _define(project)
+
+
+def test_a_dagster_field_or_a_typo_raises(shop):
+    with pytest.raises(ValidationError, match="state_path\n  Extra inputs"):
+        DbtProject(shop, state_path=shop / "state")
+    with pytest.raises(ValidationError, match="profile_dir\n  Extra inputs"):
+        DbtProject(shop, profile_dir=shop)
 
 
 @pytest.mark.parametrize(
@@ -162,18 +271,41 @@ def test_selector_and_select_are_exclusive(shop):
         )
 
 
-def _validate(shop, *assets) -> None:
-    resources = {"dbt": DbtResource(project_dir=shop, profiles_dir=shop)}
-    rs.CodeRepository(assets=list(assets), resources=resources).validate()
-
-
 def test_sources_add_no_dep_unless_mapped(shop):
-    _validate(shop, shop_assets(shop, translator=DbtTranslator()))
+    _validate(shop, _define(DbtProject(shop, profiles_dir=shop)))
+    unmapped = DbtProject(shop, profiles_dir=shop, source_asset_fn=lambda source: None)
+    _validate(shop, _define(unmapped))
 
     mapped = shop_assets(shop)
-    with pytest.raises(GraphValidationError, match="unresolved input 'payments'"):
+    with pytest.raises(
+        GraphValidationError,
+        match="Asset 'stg_payments': unresolved input 'payments'",
+    ):
         _validate(shop, mapped)
     _validate(shop, payments_asset(shop), mapped)
+
+
+def test_source_asset_fn_gets_each_source_that_a_selected_output_reads(shop):
+    sources: list[DbtNode] = []
+
+    def source_asset(source: DbtNode) -> str | None:
+        sources.append(source)
+        return f"{source.props['source_name']}_{source.name}"
+
+    project = DbtProject(shop, profiles_dir=shop, source_asset_fn=source_asset)
+
+    _define(project, select="daily_orders")
+    assert sources == []
+
+    definition = _define(project)
+    assert [(s.unique_id, s.name, s.resource_type) for s in sources] == [
+        ("source.shop.raw.payments", "payments", "source")
+    ]
+    with pytest.raises(
+        GraphValidationError,
+        match="Asset 'stg_payments': unresolved input 'raw_payments'",
+    ):
+        _validate(shop, definition)
 
 
 def test_a_dep_outside_the_selection_needs_its_asset(shop):
@@ -183,6 +315,22 @@ def test_a_dep_outside_the_selection_needs_its_asset(shop):
         _validate(shop, daily)
 
     _validate(shop, payments_asset(shop), shop_assets(shop), daily)
+
+
+def test_a_dep_outside_the_selection_has_the_output_name_of_its_resource(shop):
+    project = DbtProject(
+        shop,
+        profiles_dir=shop,
+        asset_def_fn=lambda node: node.output_def(name=f"shop_{node.asset_name}"),
+    )
+    daily = _define(project, select="daily_orders", name="daily")
+
+    with pytest.raises(
+        GraphValidationError,
+        match="Asset 'shop_daily_orders': unresolved input 'shop_stg_orders'",
+    ):
+        _validate(shop, daily)
+    _validate(shop, daily, _define(project, exclude="daily_orders"))
 
 
 def test_a_missing_manifest_names_the_fix(tmp_path):

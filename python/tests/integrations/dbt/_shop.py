@@ -12,7 +12,7 @@ import duckdb
 import pyarrow as pa
 
 import rivers as rs
-from rivers.integrations.dbt import DbtProject, DbtResource, DbtTranslator
+from rivers.integrations.dbt import DbtNode, DbtProject, DbtResource
 from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource
 
 SHOP = Path(__file__).parent / "shop"
@@ -43,13 +43,9 @@ def write_profile(project_dir: Path) -> None:
     )
 
 
-class SourceTranslator(DbtTranslator):
-    """Maps a dbt source to the rivers asset named like its table."""
-
-    def upstream_asset(self, node: dict[str, Any]) -> str | None:
-        if node["resource_type"] == "source":
-            return node["name"]
-        return super().upstream_asset(node)
+def source_asset(source: DbtNode) -> str:
+    """The rivers asset that loads a dbt source: the one named like its table."""
+    return source.name
 
 
 def warehouse(project_dir: Path) -> DuckDBResource:
@@ -73,8 +69,9 @@ def shop_assets(project_dir: Path, **kwargs: Any) -> rs.MultiAsset:
 
     Each output records the ``pid`` of the process that ran dbt.
     """
-    project = DbtProject(project_dir, profiles_dir=project_dir)
-    kwargs.setdefault("translator", SourceTranslator())
+    project = DbtProject(
+        project_dir, profiles_dir=project_dir, source_asset_fn=source_asset
+    )
 
     @project.assets(exclude="daily_orders", **kwargs)
     def shop(context: rs.AssetExecutionContext, dbt: DbtResource):

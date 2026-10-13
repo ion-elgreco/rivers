@@ -8,6 +8,7 @@ sibling step beside the dbt step.
 import json
 import os
 import shutil
+import threading
 
 import pytest
 
@@ -16,14 +17,13 @@ pytest.importorskip("duckdb")
 pa = pytest.importorskip("pyarrow")
 
 import rivers as rs  # noqa: E402
-from rivers.integrations.dbt import DbtProject, DbtResource  # noqa: E402
+from rivers.integrations.dbt import DbtNode, DbtProject, DbtResource  # noqa: E402
 from rivers.integrations.duckdb import DuckDBIOHandler  # noqa: E402
 
 from ._shop import (  # noqa: E402
     DAYS,
     PAYMENTS,
     SHOP_OUTPUTS,
-    SourceTranslator,
     daily_assets,
     failures,
     materializations,
@@ -33,6 +33,7 @@ from ._shop import (  # noqa: E402
     rows,
     shop_assets,
     sibling_asset,
+    source_asset,
     tables,
     warehouse,
 )
@@ -118,14 +119,12 @@ def test_a_resource_from_the_project_builds_in_its_target(
 
 def test_a_run_reuses_the_parse_in_the_project_target_path(shop, storage, run_with):
     shutil.rmtree(shop / "target")
-    project = DbtProject(shop, target_path="build", profiles_dir=shop)
+    project = DbtProject(
+        shop, target_path="build", profiles_dir=shop, source_asset_fn=source_asset
+    )
     project.prepare()
 
-    @project.assets(
-        exclude="daily_orders",
-        translator=SourceTranslator(),
-        io_handler=run_with.io_handler(),
-    )
+    @project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
     def shop_def(context: rs.AssetExecutionContext, dbt: DbtResource):
         context.add_output_metadata({"pid": os.getpid()})
         yield from dbt.cli(["build"], context)
@@ -270,13 +269,9 @@ def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
 
 
 def test_the_body_must_take_the_resource_as_a_parameter(shop, storage, run_with):
-    project = DbtProject(shop, profiles_dir=shop)
+    project = DbtProject(shop, profiles_dir=shop, source_asset_fn=source_asset)
 
-    @project.assets(
-        exclude="daily_orders",
-        translator=SourceTranslator(),
-        io_handler=run_with.io_handler(),
-    )
+    @project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
     def shop_def(context: rs.AssetExecutionContext):
         dbt = DbtResource(project_dir=project)
         yield from dbt.cli(["build"], context)
@@ -302,11 +297,9 @@ def test_the_body_must_take_the_resource_as_a_parameter(shop, storage, run_with)
 
 def test_tests_the_definition_excludes_stay_excluded_in_a_subset(shop, storage):
     payments = payments_asset(shop, amounts=["5", "-4", "3"])
-    project = DbtProject(shop, profiles_dir=shop)
+    project = DbtProject(shop, profiles_dir=shop, source_asset_fn=source_asset)
 
-    @project.assets(
-        exclude="daily_orders assert_payments_positive", translator=SourceTranslator()
-    )
+    @project.assets(exclude="daily_orders assert_payments_positive")
     def shop_def(context: rs.AssetExecutionContext, dbt: DbtResource):
         yield from dbt.cli(["build"], context)
 
@@ -353,6 +346,99 @@ def test_partitions_pass_the_day_to_dbt(shop, storage, run_with):
         shop,
         "SELECT CAST(order_date AS VARCHAR), orders, amount FROM daily_orders ORDER BY 1",
     ) == [("2024-01-01", 1, 5), ("2024-01-02", 2, 10)]
+
+
+def test_a_dep_on_another_definition_has_the_name_of_its_output(
+    shop, storage, run_with
+):
+    project = DbtProject(
+        shop,
+        profiles_dir=shop,
+        asset_def_fn=lambda node: node.output_def(name=f"shop_{node.asset_name}"),
+        source_asset_fn=source_asset,
+    )
+
+    @project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
+    def shop_def(context: rs.AssetExecutionContext, dbt: DbtResource):
+        context.add_output_metadata({"pid": os.getpid()})
+        yield from dbt.cli(["build"], context)
+
+    @project.assets(select="daily_orders", io_handler=run_with.io_handler())
+    def daily_def(context: rs.AssetExecutionContext, dbt: DbtResource):
+        context.add_output_metadata({"pid": os.getpid()})
+        yield from dbt.cli(["build"], context)
+
+    assets = [
+        payments_asset(shop),
+        shop_def,
+        daily_def,
+        sibling_asset("payments", io_handler=run_with.io_handler()),
+        sibling_asset(
+            "shop_stg_orders", name="daily_sibling", io_handler=run_with.io_handler()
+        ),
+    ]
+    repo = repository(shop, assets, storage, run_with.executor)
+
+    result = repo.materialize()
+
+    assert result.success
+    metadata = materializations(storage, result.run_id)
+    assert set(metadata) == {f"shop_{name}" for name in SHOP_OUTPUTS} | {
+        "shop_daily_orders",
+        "payments",
+        "sibling",
+        "daily_sibling",
+    }
+    for name in ("shop_customers", "shop_daily_orders"):
+        assert (metadata[name]["pid"] != os.getpid()) == run_with.in_worker
+    built = [
+        event.asset_key
+        for event in storage.get_events_for_run(result.run_id)
+        if event.event_type == "Materialization"
+    ]
+    assert built.index("shop_stg_orders") < built.index("shop_daily_orders")
+    assert rows(
+        shop,
+        "SELECT CAST(order_date AS VARCHAR), orders, amount FROM daily_orders",
+    ) == [("2024-01-01", 1, 5)]
+
+
+def test_a_step_runs_when_the_project_functions_cannot_be_pickled(
+    shop, storage, run_with
+):
+    lock = threading.Lock()
+
+    def asset_def(node: DbtNode) -> rs.AssetDef:
+        with lock:
+            return node.output_def()
+
+    project = DbtProject(
+        shop, profiles_dir=shop, asset_def_fn=asset_def, source_asset_fn=source_asset
+    )
+
+    @project.assets(exclude="daily_orders", io_handler=run_with.io_handler())
+    def shop_def(context: rs.AssetExecutionContext, dbt: DbtResource):
+        context.add_output_metadata({"pid": os.getpid()})
+        yield from dbt.cli(["build"], context)
+
+    assets = [
+        payments_asset(shop),
+        shop_def,
+        sibling_asset("payments", io_handler=run_with.io_handler()),
+    ]
+    repo = repository(shop, assets, storage, run_with.executor)
+
+    result = repo.materialize(raise_on_error=False)
+
+    assert failures(storage, result.run_id) == {}
+    metadata = materializations(storage, result.run_id)
+    assert set(metadata) == SHOP_OUTPUTS | {"payments", "sibling"}
+    assert _ran_in_worker(metadata) == run_with.in_worker
+    assert rows(shop, "SELECT id, name, paid FROM customers ORDER BY id") == [
+        (1, "Ann", 12),
+        (2, "Bob", 3),
+        (3, "Cid", 0),
+    ]
 
 
 def test_downstream_assets_load_models_through_the_io_handler(shop, storage):

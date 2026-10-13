@@ -421,13 +421,15 @@ def test_dagster_dbt_maps_to_dbt_integration(tmp_path):
 
     from rivers.integrations.dbt import (
         DbtInvocation,
+        DbtNode,
         DbtProject,
         DbtResource,
-        DbtTranslator,
     )
 
     assets = inspect.signature(DbtProject.assets).parameters
-    assert {"select", "exclude", "selector", "translator"} <= set(assets)
+    assert {"select", "exclude", "selector"} <= set(assets)
+    # `dagster_dbt_translator=` becomes the project's `asset_def_fn` and `source_asset_fn`.
+    assert {"asset_def_fn", "source_asset_fn"} <= set(DbtProject.model_fields)
     assert callable(DbtProject.prepare)
     assert {"project_dir", "profiles_dir", "profile", "target"} <= set(
         DbtResource.model_fields
@@ -444,16 +446,57 @@ def test_dagster_dbt_maps_to_dbt_integration(tmp_path):
         "context",
     ]
     assert callable(DbtInvocation.wait)
+    # Dagster's `state_path`, `packaged_project_dir`, and `prepare_project_cli_args`
+    # have no counterpart.
+    for field in ("state_path", "packaged_project_dir", "prepare_project_cli_args"):
+        with pytest.raises(ValueError, match=field):
+            DbtProject(tmp_path, **{field: tmp_path})
 
-    translator = DbtTranslator()
-    model = {"name": "orders", "resource_type": "model", "tags": ["daily"]}
-    source = {"name": "payments", "source_name": "raw", "resource_type": "source"}
-    assert translator.asset_name(model) == "orders"
-    assert translator.tags(model) == ["daily"]
-    assert translator.upstream_asset(model) == "orders"
-    assert translator.upstream_asset(source) is None
-    for hook in ("group", "metadata", "code_version"):
-        assert callable(getattr(translator, hook))
+    # `get_asset_spec` and the per-attribute methods become `node.output_def(...)`.
+    model = DbtNode(
+        unique_id="model.shop.orders",
+        name="orders",
+        resource_type="model",
+        props={
+            "tags": ["daily"],
+            "group": "sales",
+            "description": "One row per order.",
+            "checksum": {"name": "sha256", "checksum": "abc"},
+        },
+    )
+    default = model.output_def()
+    assert (default.name, default.group, default.tags, default.code_version) == (
+        "orders",
+        "sales",
+        ["daily"],
+        "abc",
+    )
+    # No description field: `get_description` maps to the `dbt/description` metadata.
+    assert default.metadata["dbt/description"] == "One row per order."
+    assert default.deps == []
+    output = model.output_def(
+        name="sales_orders",
+        group="marts",
+        tags=["finance"],
+        metadata={"owner": "sales"},
+        code_version="v2",
+        partition_mapping={"stg_orders": rs.PartitionMapping.all_partitions()},
+    )
+    assert (output.name, output.group, output.tags, output.code_version) == (
+        "sales_orders",
+        "marts",
+        ["finance"],
+        "v2",
+    )
+    assert output.metadata == {"owner": "sales"}
+    assert set(output.partition_mapping) == {"stg_orders"}
+    # The default name is the model name, with `_v<version>` for a versioned model.
+    versioned = model.model_copy(update={"props": {"version": 2}})
+    assert versioned.asset_name == "orders_v2"
+    # A source's asset key becomes `source_asset_fn`; `get_owners` has no counterpart.
+    DbtProject(tmp_path, source_asset_fn=lambda source: f"raw_{source.name}")
+    assert not hasattr(rs.AssetDef, "owners")
+    assert not hasattr(rs.AssetDef, "automation_condition")
 
 
 def test_automation_condition_has_no_allow_or_ignore():

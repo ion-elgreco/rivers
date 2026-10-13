@@ -8,7 +8,12 @@ pytest.importorskip("dbt.version")
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("pyarrow")
 
-from rivers.integrations.dbt import DbtError, DbtProject, DbtResource  # noqa: E402
+from rivers.integrations.dbt import (  # noqa: E402
+    DbtError,
+    DbtNode,
+    DbtProject,
+    DbtResource,
+)
 
 from ._shop import rows  # noqa: E402
 
@@ -84,7 +89,14 @@ def test_settings_come_from_dbt_environment_variables(shop, monkeypatch):
 
 
 def test_a_project_gives_the_resource_its_settings(shop, tmp_path):
-    project = DbtProject(shop, profiles_dir=tmp_path, profile="shop", target="prod")
+    project = DbtProject(
+        shop,
+        profiles_dir=tmp_path,
+        profile="shop",
+        target="prod",
+        asset_def_fn=DbtNode.output_def,
+        source_asset_fn=lambda source: source.name,
+    )
 
     resource = DbtResource(project_dir=project)
 

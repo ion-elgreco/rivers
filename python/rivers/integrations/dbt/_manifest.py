@@ -1,11 +1,11 @@
 """Which resources in ``manifest.json`` become outputs, their deps, and the tests on them."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from rivers._core.assets import AssetDef
-from rivers.integrations.dbt.translator import DbtTranslator
+from rivers.integrations.dbt.node import DbtNode
 
 _ASSET_TYPES = ("model", "seed", "snapshot")
 
@@ -44,55 +44,67 @@ def selection_args(select: str, exclude: str, selector: str) -> tuple[str, ...]:
 def build_outputs(
     manifest: dict[str, Any],
     selected: set[str] | None,
-    translator: DbtTranslator,
+    asset_def_fn: Callable[[DbtNode], AssetDef],
+    source_asset_fn: Callable[[DbtNode], str | None] | None,
     selection: tuple[str, ...],
     exclude: tuple[str, ...],
 ) -> tuple[DbtOutputs, list[AssetDef]]:
     """The outputs of the models, seeds, and snapshots in ``selected`` (``None`` for all).
 
+    ``asset_def_fn`` builds the output of every model, seed, and snapshot in
+    the project, so a dep on one outside the selection has its output name.
     Ephemeral models build nothing, so the deps of an output skip through them
     to the resources they read. Only tests in ``selected`` check outputs.
+
+    Raises:
+        ValueError: When an output has no name, or two resources get the same
+            output name.
     """
     nodes = manifest["nodes"]
     resources = {**manifest.get("sources", {}), **nodes}
     adapter = manifest["metadata"].get("adapter_type")
 
+    defs: dict[str, AssetDef] = {}
+    owners: dict[str, str] = {}
+    for uid, node in sorted(nodes.items()):
+        if not _is_asset(node):
+            continue
+        output = asset_def_fn(_node(node))
+        if not output.name:
+            raise ValueError(f"the output of dbt node {uid!r} has no name")
+        if output.name in owners:
+            raise ValueError(
+                f"dbt nodes {owners[output.name]!r} and {uid!r} both map to the "
+                f"output {output.name!r}; pass an asset_def_fn that names them apart"
+            )
+        owners[output.name] = uid
+        defs[uid] = output
+
     names = {
-        uid: translator.asset_name(node)
-        for uid, node in sorted(nodes.items())
-        if _is_asset(node) and (selected is None or uid in selected)
+        uid: name for name, uid in owners.items() if selected is None or uid in selected
     }
 
     output_defs = []
     selectors = {}
     for uid, name in names.items():
         node = nodes[uid]
-        deps: list[str] = []
+        deps: list[str | None] = []
         for parent in _upstream(resources, node):
-            dep = names.get(parent) or translator.upstream_asset(resources[parent])
-            if dep is not None and dep not in deps:
-                deps.append(dep)
+            if parent in defs:
+                deps.append(defs[parent].name)
+            elif source_asset_fn is not None:
+                deps.append(source_asset_fn(_node(resources[parent])))
 
-        metadata = translator.metadata(node)
+        output = _with_deps(defs[uid], deps)
         if adapter == "duckdb":
             # The table DuckDBIOHandler loads when a downstream asset reads this one.
-            metadata = {
+            output.metadata = {
                 "duckdb/schema": node["schema"],
                 "duckdb/table": node["alias"],
-                **metadata,
+                **(output.metadata or {}),
             }
 
-        output_defs.append(
-            AssetDef(
-                name,
-                deps=[AssetDef.dep(dep) for dep in deps],
-                group=translator.group(node),
-                tags=translator.tags(node) or None,
-                kinds=["dbt"],
-                code_version=translator.code_version(node),
-                metadata=metadata,
-            )
-        )
+        output_defs.append(output)
         selectors[name] = "fqn:" + ".".join(node["fqn"])
 
     tests = {}
@@ -115,6 +127,30 @@ def _is_asset(node: dict[str, Any]) -> bool:
         node["resource_type"] in _ASSET_TYPES
         and node["config"].get("materialized") != "ephemeral"
     )
+
+
+def _node(props: dict[str, Any]) -> DbtNode:
+    return DbtNode(
+        unique_id=props["unique_id"],
+        name=props["name"],
+        resource_type=props["resource_type"],
+        props=props,
+    )
+
+
+def _with_deps(output: AssetDef, deps: list[str | None]) -> AssetDef:
+    """A copy of ``output`` with a lineage-only dep on each name in ``deps`` it lacks."""
+    own = {dep.name for dep in output.deps}
+    added = [
+        AssetDef.dep(name)
+        for name in dict.fromkeys(deps)
+        if name is not None and name not in own
+    ]
+
+    # AssetDef has no setter for deps: rebuild it from the fields it pickles.
+    _, fields = output.__getnewargs_ex__()
+    fields["deps"] = [*output.deps, *added]
+    return AssetDef(**fields)
 
 
 def _upstream(resources: dict[str, Any], node: dict[str, Any]) -> Iterator[str]:

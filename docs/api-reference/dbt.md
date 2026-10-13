@@ -21,6 +21,10 @@ project = DbtProject(Path(__file__).parent / "analytics")
 | `profiles_dir` | `Path \| None` | `None` | The directory with `profiles.yml`, for `prepare()`, selections, and a `DbtResource` made from the project. `None` uses dbt's search. |
 | `profile` | `str \| None` | `None` | The profile to use instead of the project's. |
 | `target` | `str \| None` | `None` | The target to use instead of the profile's default. |
+| `asset_def_fn` | `(DbtNode) -> AssetDef` | `DbtNode.output_def` | Builds the output of each model, seed, and snapshot of the project, also of the ones that a definition does not select. |
+| `source_asset_fn` | `(DbtNode) -> str \| None` | `None` | Called with each dbt source that a selected output reads, directly or through ephemeral models. Returns the name of the rivers asset that loads the source, or `None` for no dep. `None` adds no dep for sources. |
+
+An unknown field raises a pydantic `ValidationError`, e.g. Dagster's `state_path`.
 
 ### `manifest_path`
 
@@ -38,21 +42,19 @@ project.assets(
     select: str = "fqn:*",
     exclude: str = "",
     selector: str = "",
-    translator: DbtTranslator | None = None,
     **kwargs,
 ) -> Callable[[Callable], MultiAsset]
 ```
 
-A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The outputs have the kind `dbt`. The body must be a generator. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
+A decorator that builds a multi-asset with one output per selected model, seed, and snapshot. The project's `asset_def_fn` builds each output. rivers adds a lineage-only dep on each model, seed, and snapshot that the output refs, by that resource's output name, and on the asset that `source_asset_fn` names for each source that it reads. The deps that `asset_def_fn` returns stay. The body must be a generator. `kwargs` go to [`Asset.from_multi`](assets.md#assetfrom_multi).
 
 | Parameter | Description |
 |-----------|-------------|
 | `select` | dbt's `--select`. A selection other than the default runs `dbt ls` once per manifest; the result is cached in the target directory. |
 | `exclude` | dbt's `--exclude`. |
 | `selector` | A selector from `selectors.yml`. Raises `ValueError` with `select` or `exclude`. |
-| `translator` | A `DbtTranslator`. Default: `DbtTranslator()`. |
 
-Raises `FileNotFoundError` when the manifest does not exist, `ValueError` when the selection has no model, seed, or snapshot, and `DbtError` when `dbt ls` fails.
+Raises `FileNotFoundError` when the manifest does not exist, and `DbtError` when `dbt ls` fails. Raises `ValueError` when the selection has no model, seed, or snapshot, when an output has no name, or when two resources of the project get the same output name.
 
 When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations. Its commands start from the `partial_parse.msgpack` in the project's `target_path`. The body must take the resource as a parameter: a body that makes its own `DbtResource` instead raises `TypeError`.
 
@@ -64,7 +66,46 @@ When the body runs, each argument that is a `DbtResource` is bound to the output
 | `dbt/relation` | The relation, e.g. `"shop"."main"."customers"`. |
 | `dbt/materialized` | `table`, `view`, `incremental`, `seed`, `snapshot`, ... |
 | `dbt/description` | The resource's description, if it has one. |
-| `duckdb/schema`, `duckdb/table` | With dbt-duckdb: the table, for [`DuckDBIOHandler`](duckdb.md). |
+| `duckdb/schema`, `duckdb/table` | With dbt-duckdb: the table, for [`DuckDBIOHandler`](duckdb.md). rivers adds them to the metadata of the output; keys that `asset_def_fn` sets stay. |
+
+The `dbt/` keys are the defaults of `DbtNode.output_def`.
+
+---
+
+## `DbtNode`
+
+One model, seed, snapshot, or source of the manifest, as `asset_def_fn` and `source_asset_fn` get it. A frozen pydantic model.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `unique_id` | `str` | dbt's id, e.g. `model.shop.customers`. |
+| `name` | `str` | The resource name. |
+| `resource_type` | `str` | `"model"`, `"seed"`, `"snapshot"`, or `"source"`. |
+| `props` | `dict` | The resource's entry in `manifest.json`, e.g. `props["config"]`, `props["meta"]`, or `props["source_name"]`. |
+
+### `asset_name`
+
+The default asset name: `name`, with `_v<version>` for a versioned model, e.g. `orders_v2`.
+
+### `output_def(**fields)`
+
+Returns the default output with `fields` set or replaced. The keyword arguments go to [`AssetDef`](assets.md). It has no deps: `assets()` adds them.
+
+| Field | Default |
+|-------|---------|
+| `name` | `asset_name` |
+| `group` | The dbt group. `None` keeps the definition's group. |
+| `tags` | The dbt tags, or `None`. |
+| `kinds` | `["dbt"]` |
+| `code_version` | `props["checksum"]["checksum"]` |
+| `metadata` | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`, each when it has a value. |
+
+```python
+DbtProject(
+    Path(__file__).parent / "analytics",
+    asset_def_fn=lambda node: node.output_def(name=f"analytics_{node.asset_name}", pool="warehouse"),
+)
+```
 
 ---
 
@@ -127,21 +168,6 @@ One dbt command, made by `DbtResource.cli()`. It runs once.
 |--------|-------------|
 | `__iter__()` | Runs dbt and yields a `Materialization` per output. After the last one, raises `DbtError` when dbt failed. |
 | `wait()` | Runs dbt to the end. Raises `DbtError` when dbt failed. |
-
----
-
-## `DbtTranslator`
-
-Maps a dbt resource to the settings of its asset. Each method gets the resource's entry in `manifest.json`.
-
-| Method | Returns | Default |
-|--------|---------|---------|
-| `asset_name(node)` | `str` | `node["name"]`, with `_v<version>` for a versioned model. |
-| `group(node)` | `str \| None` | The dbt group. `None` keeps the definition's group. |
-| `tags(node)` | `list[str]` | The dbt tags. |
-| `metadata(node)` | `dict[str, str]` | The definition metadata above, without the `duckdb/` keys. |
-| `code_version(node)` | `str \| None` | `node["checksum"]["checksum"]`. |
-| `upstream_asset(node)` | `str \| None` | For a source or a resource outside the selection: the asset name of its dep, or `None` for no dep. Default: `None` for a source, `asset_name(node)` otherwise. |
 
 ---
 

@@ -29,14 +29,14 @@ except ImportError as e:
         "rivers.integrations.dbt needs dbt-core: pip install rivers[dbt]"
     ) from e
 
+from rivers.integrations.dbt.node import DbtNode
 from rivers.integrations.dbt.project import DbtProject
 from rivers.integrations.dbt.resource import DbtError, DbtInvocation, DbtResource
-from rivers.integrations.dbt.translator import DbtTranslator
 
 __all__ = [
     "DbtError",
     "DbtInvocation",
+    "DbtNode",
     "DbtProject",
     "DbtResource",
-    "DbtTranslator",
 ]

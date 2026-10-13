@@ -4,7 +4,7 @@
 
 - `DbtProject` reads the project's manifest and defines the assets.
 - `DbtResource` runs dbt commands and reports each output that dbt builds.
-- `DbtTranslator` sets the asset names, groups, metadata, and deps.
+- `DbtNode` is one model, seed, snapshot, or source of the manifest. The functions that change the outputs get it.
 
 ## Setup
 
@@ -34,17 +34,21 @@ repo = rs.CodeRepository(
 )
 ```
 
-`project.assets()` returns a decorator that builds one [multi-asset](../concepts/assets.md#multi-assets). Each model, seed, and snapshot is an output:
+`project.assets()` returns a decorator that builds one [multi-asset](../concepts/assets.md#multi-assets). Each model, seed, and snapshot is an output. By default, [`node.output_def()`](#change-the-outputs) builds it:
 
 | Setting | Value |
 |---------|-------|
 | Name | The resource name, e.g. `orders`. Version 2 of a versioned model is `orders_v2`. |
-| Deps | The resources it refs, as [lineage-only deps](../api-reference/assets.md#assetdefdep). An ephemeral model builds no table, so the deps go through it to the resources it reads. |
 | Code version | The checksum dbt records for the resource's file. When the file changes, the asset is stale. |
 | Group | The resource's dbt group. |
 | Tags | The resource's dbt tags. |
 | Kinds | `dbt`. |
-| Metadata | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. With dbt-duckdb, also `duckdb/schema` and `duckdb/table`. |
+| Metadata | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. |
+
+rivers then adds to each output:
+
+- Deps: the resources that it refs, as [lineage-only deps](../api-reference/assets.md#assetdefdep). An ephemeral model builds no table, so the deps go through it to the resources it reads.
+- With dbt-duckdb, the `duckdb/schema` and `duckdb/table` metadata.
 
 Tests, sources, and ephemeral models are not assets.
 
@@ -74,6 +78,8 @@ project.prepare()
 | `profiles_dir` | `None` | The directory with `profiles.yml`, for `prepare()`, selections, and a `DbtResource` made from the project. `None` uses dbt's search. |
 | `profile` | `None` | The profile to use instead of the project's. |
 | `target` | `None` | The target to use instead of the profile's default. |
+| `asset_def_fn` | `None` | Builds the output of each model, seed, and snapshot. `None` uses `DbtNode.output_def`. See [Change the outputs](#change-the-outputs). |
+| `source_asset_fn` | `None` | Names the rivers asset that loads a dbt source. `None` adds no dep for sources. See [Sources](#sources). |
 
 ## Run dbt
 
@@ -154,23 +160,17 @@ def analytics(context: rs.AssetExecutionContext, dbt: DbtResource): ...
 
 A selection other than the default runs `dbt ls` when the definitions load. The result is cached in the target directory, for that manifest.
 
-A dep on a resource outside the selection refers to that resource's asset by name. Define every resource that the selected resources ref, e.g. with a second definition as above, or drop the dep with [`upstream_asset`](#translator).
+A dep on a resource outside the selection refers to that resource's output by name. Names are project-wide: the project's `asset_def_fn` builds the output of every model, seed, and snapshot, also of the ones that a definition does not select. So a dep has the same name in every definition. Define every resource that the selected resources ref, e.g. with a second definition as above: a dep on an asset that no definition builds fails the repository's validation.
 
 ## Sources
 
-A dbt source adds no dep by default. To make the models that read a source run after the rivers asset that loads it, map the source to that asset:
+A dbt source adds no dep by default. To make the models that read a source run after the rivers asset that loads it, give the project a `source_asset_fn`. It gets each source that a selected output reads, also through ephemeral models, and returns the name of the asset that loads the source, or `None` for no dep:
 
 ```python
-from rivers.integrations.dbt import DbtTranslator
-
-class Translator(DbtTranslator):
-    def upstream_asset(self, node):
-        if node["resource_type"] == "source":
-            return f"{node['source_name']}_{node['name']}"  # e.g. raw_payments
-        return super().upstream_asset(node)
-
-@project.assets(translator=Translator())
-def analytics(context: rs.AssetExecutionContext, dbt: DbtResource): ...
+project = DbtProject(
+    Path(__file__).parent / "analytics",
+    source_asset_fn=lambda source: f"{source.props['source_name']}_{source.name}",  # e.g. raw_payments
+)
 ```
 
 The asset must be in the repository.
@@ -222,18 +222,35 @@ def customer_count(customers: pa.Table) -> int:
 
 The handler only reads: dbt writes the tables.
 
-## Translator
+## Change the outputs
 
-Subclass `DbtTranslator` and override a method to change one setting. Each method gets the resource's entry in `manifest.json`.
+The project's `asset_def_fn` builds the output of each model, seed, and snapshot. It takes a `DbtNode` and returns an [`AssetDef`](../api-reference/assets.md). `node.output_def(...)` returns the default output with the fields that you give:
 
-| Method | Default |
-|--------|---------|
-| `asset_name(node)` | `node["name"]`, with `_v<version>` for a versioned model. |
-| `group(node)` | The dbt group. `None` keeps the group of the definition. |
-| `tags(node)` | The dbt tags. |
-| `metadata(node)` | `dbt/unique_id`, `dbt/relation`, `dbt/materialized`, and `dbt/description`. |
-| `code_version(node)` | The checksum of the resource's file. |
-| `upstream_asset(node)` | For a source: `None`, no dep. For a resource outside the selection: `asset_name(node)`. |
+```python
+from rivers.integrations.dbt import DbtNode
+
+def asset_def(node: DbtNode) -> rs.AssetDef:
+    return node.output_def(
+        name=f"analytics_{node.asset_name}",
+        group="raw" if node.resource_type == "seed" else "analytics",
+    )
+
+project = DbtProject(Path(__file__).parent / "analytics", asset_def_fn=asset_def)
+```
+
+| `DbtNode` | Description |
+|-----------|-------------|
+| `unique_id` | dbt's id, e.g. `model.analytics.orders`. |
+| `name` | The resource name, e.g. `orders`. |
+| `resource_type` | `model`, `seed`, `snapshot`, or `source`. |
+| `props` | The resource's entry in `manifest.json`, e.g. `node.props["config"]`, `node.props["meta"]`, or `node.props["source_name"]`. |
+| `asset_name` | The default name: `name`, with `_v<version>` for a versioned model. |
+
+`metadata=` replaces the default metadata. To keep the `dbt/` keys, add to them: `node.output_def(metadata=node.output_def().metadata | {"team": "finance"})`.
+
+rivers adds the [deps and the `duckdb/` keys](#define-the-assets) to the output that the function returns. The deps and the `duckdb/` keys that the function returns stay, e.g. `deps=[rs.AssetDef.dep("crm_export")]`.
+
+The function runs for every model, seed, and snapshot of the project, so a dep on a resource of another definition gets the same name. An output without a name raises `ValueError`, and so do two resources with the same output name.
 
 ## Limits
 
