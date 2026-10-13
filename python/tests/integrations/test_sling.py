@@ -283,13 +283,9 @@ def test_translator_names_outputs_and_links_deps(tmp_path, src, storage):
 
 
 def test_wildcard_stream_is_one_output(tmp_path, src, storage):
+    streams = {_uri(src / "*.csv"): {"object": "main.{stream_file_name}"}}
     replication = SlingReplication(
-        {
-            "source": "FILES",
-            "target": "WAREHOUSE",
-            "defaults": {"mode": "full-refresh", "target_options": {"use_bulk": False}},
-            "streams": {_uri(src / "*.csv"): {"object": "main.{stream_file_name}"}},
-        },
+        _replication(src) | {"streams": streams},
         translator=lambda stream: stream.output_def(name="csv_files"),
     )
     repo = _repo(tmp_path, storage, replication)
