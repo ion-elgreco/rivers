@@ -119,27 +119,21 @@ def _values(event) -> dict[str, object]:
 
 
 def _repo(
-    tmp_path, storage, replication, *assets, executor_env=None, resource=None
+    tmp_path, storage, replication, *assets, executor=None, resource=None
 ) -> rs.CodeRepository:
     """The replication as the multi-asset ``raw``, next to an independent asset.
 
-    Two steps in one level send both to the parallel executor's workers. The
-    parallel executor refuses a step without a picklable IO handler, even one
-    that only yields Materialization.
+    Two steps in one level send both to the parallel executor's workers.
     """
-    executor, io_factory = executor_env or (
-        rs.Executor.in_process(),
-        rs.InMemoryIOHandler,
-    )
 
-    @replication.assets(name="raw", io_handler=io_factory())
+    @replication.assets(name="raw")
     def raw(context: rs.AssetExecutionContext, sling: SlingResource):
         (tmp_path / "raw.pid").write_text(str(os.getpid()))
         yield from sling.replicate(context, replication)
 
-    @rs.Asset(io_handler=io_factory())
-    def bystander() -> int:
-        return 1
+    @rs.Asset
+    def bystander() -> rs.Materialization:
+        return rs.Materialization()
 
     return make_repo(
         [raw, bystander, *assets],
@@ -157,7 +151,7 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
         [(total,)] = _rows(tmp_path, "SELECT sum(amount) FROM orders")
         return total
 
-    repo = _repo(tmp_path, storage, replication, order_total, executor_env=executor_env)
+    repo = _repo(tmp_path, storage, replication, order_total, executor=executor_env[0])
 
     result = repo.materialize()
 
@@ -184,7 +178,7 @@ def test_replicates_each_stream_into_its_output(tmp_path, src, storage, executor
 
 def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, executor_env):
     replication = SlingReplication(_replication(src, "orders", "users"))
-    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
+    repo = _repo(tmp_path, storage, replication, executor=executor_env[0])
 
     # two steps, so the parallel executor runs them in its workers
     result = repo.materialize(selection=["main.users", "bystander"])
@@ -199,7 +193,7 @@ def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, execut
 
 def test_failed_stream_fails_only_its_output(tmp_path, src, storage, executor_env):
     replication = SlingReplication(_replication(src, "orders", "missing", "users"))
-    repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
+    repo = _repo(tmp_path, storage, replication, executor=executor_env[0])
 
     result = repo.materialize(raise_on_error=False)
 
