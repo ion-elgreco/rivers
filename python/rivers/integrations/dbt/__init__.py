@@ -18,7 +18,7 @@ Example::
 
     repo = rs.CodeRepository(
         assets=[analytics],
-        resources={"dbt": DbtResource(project_dir=project.project_dir)},
+        resources={"dbt": DbtResource(project_dir=project)},
     )
 """
 

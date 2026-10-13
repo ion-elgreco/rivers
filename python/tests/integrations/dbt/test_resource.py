@@ -8,7 +8,7 @@ pytest.importorskip("dbt.version")
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("pyarrow")
 
-from rivers.integrations.dbt import DbtError, DbtResource  # noqa: E402
+from rivers.integrations.dbt import DbtError, DbtProject, DbtResource  # noqa: E402
 
 from ._shop import rows  # noqa: E402
 
@@ -81,3 +81,36 @@ def test_settings_come_from_dbt_environment_variables(shop, monkeypatch):
 
     assert resource.project_dir == shop
     assert resource.target == "prod"
+
+
+def test_a_project_gives_the_resource_its_settings(shop, tmp_path):
+    project = DbtProject(shop, profiles_dir=tmp_path, profile="shop", target="prod")
+
+    resource = DbtResource(project_dir=project)
+
+    assert json.loads(resource.model_dump_json()) == {
+        "project_dir": str(shop),
+        "profiles_dir": str(tmp_path),
+        "profile": "shop",
+        "target": "prod",
+        "executable": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("given", "in_project", "target"),
+    [
+        ({"target": "given"}, "project", "given"),
+        ({}, "project", "project"),
+        ({}, None, "env"),
+    ],
+    ids=["given", "project", "env"],
+)
+def test_target_comes_from_the_resource_then_the_project_then_the_environment(
+    shop, monkeypatch, given, in_project, target
+):
+    monkeypatch.setenv("DBT_TARGET", "env")
+
+    resource = DbtResource(project_dir=DbtProject(shop, target=in_project), **given)
+
+    assert resource.target == target

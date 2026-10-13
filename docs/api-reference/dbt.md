@@ -18,7 +18,7 @@ project = DbtProject(Path(__file__).parent / "analytics")
 |-----------|------|---------|-------------|
 | `project_dir` | `str \| Path` | required | The directory with `dbt_project.yml`. Made absolute. Raises `ValueError` without `dbt_project.yml`. |
 | `target_path` | `Path` | `Path("target")` | The directory with `manifest.json`, relative to `project_dir`. |
-| `profiles_dir` | `Path \| None` | `None` | The directory with `profiles.yml`, for `prepare()` and selections. `None` uses dbt's search. |
+| `profiles_dir` | `Path \| None` | `None` | The directory with `profiles.yml`, for `prepare()`, selections, and a `DbtResource` made from the project. `None` uses dbt's search. |
 | `profile` | `str \| None` | `None` | The profile to use instead of the project's. |
 | `target` | `str \| None` | `None` | The target to use instead of the profile's default. |
 
@@ -70,11 +70,19 @@ When the body runs, each argument that is a `DbtResource` is bound to the output
 
 ## `DbtResource`
 
-A [resource](../concepts/resources.md) that runs dbt commands. Fields that you do not give are read from `DBT_PROJECT_DIR`, `DBT_PROFILES_DIR`, `DBT_PROFILE`, `DBT_TARGET`, and `DBT_EXECUTABLE`.
+A [resource](../concepts/resources.md) that runs dbt commands.
+
+```python
+from rivers.integrations.dbt import DbtResource
+
+dbt = DbtResource(project_dir=project)
+```
+
+With a `DbtProject` as `project_dir`, each of `profiles_dir`, `profile`, and `target` that you do not give takes the project's value, when it is not `None`. Fields that still have no value are read from `DBT_PROJECT_DIR`, `DBT_PROFILES_DIR`, `DBT_PROFILE`, `DBT_TARGET`, and `DBT_EXECUTABLE`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `project_dir` | `Path` | required | The directory with `dbt_project.yml`. |
+| `project_dir` | `Path \| DbtProject` | required | The directory with `dbt_project.yml`, or a `DbtProject`. The field holds the directory. |
 | `profiles_dir` | `Path \| None` | `None` | The directory with `profiles.yml`. |
 | `profile` | `str \| None` | `None` | Passed as `--profile`. |
 | `target` | `str \| None` | `None` | Passed as `--target`. |

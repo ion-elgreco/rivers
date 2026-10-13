@@ -11,7 +11,7 @@ import tempfile
 from collections import deque
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import PrivateAttr
 from pydantic_settings import SettingsConfigDict
@@ -20,6 +20,9 @@ from rivers._core import Materialization, MetadataValue
 from rivers._core.assets import AssetExecutionContext
 from rivers.integrations.dbt._manifest import DbtOutputs
 from rivers.resource import Resource
+
+if TYPE_CHECKING:
+    from rivers.integrations.dbt.project import DbtProject
 
 __all__ = ["DbtError", "DbtInvocation", "DbtResource"]
 
@@ -49,18 +52,26 @@ class DbtResource(Resource):
     command ends, unless you pass ``target_path``. dbt's anonymous usage stats
     are off unless ``DBT_SEND_ANONYMOUS_USAGE_STATS`` is set.
 
-    Fields are read from the environment variables dbt reads
-    (``DBT_PROJECT_DIR``, ``DBT_PROFILES_DIR``, ``DBT_PROFILE``, ``DBT_TARGET``)
-    when not given.
+    With a :class:`DbtProject` as ``project_dir``, each of ``profiles_dir``,
+    ``profile``, and ``target`` that you do not give takes the project's value,
+    when it is not ``None``. Fields that still have no value are read from the
+    environment variables dbt reads (``DBT_PROJECT_DIR``, ``DBT_PROFILES_DIR``,
+    ``DBT_PROFILE``, ``DBT_TARGET``).
 
     Args:
-        project_dir: The directory with ``dbt_project.yml``.
+        project_dir: The directory with ``dbt_project.yml``, or a
+            :class:`DbtProject`.
         profiles_dir: The directory with ``profiles.yml``. Default: dbt's search
             (the project directory, then ``~/.dbt``).
         profile: The profile to use instead of the project's.
         target: The target to use instead of the profile's default.
         executable: The dbt executable, e.g. ``"dbt"`` or a path. Default: the
             dbt-core installed with rivers.
+
+    Example::
+
+        project = DbtProject(Path(__file__).parent / "analytics", target="prod")
+        dbt = DbtResource(project_dir=project)
     """
 
     model_config = SettingsConfigDict(env_prefix="DBT_")
@@ -72,6 +83,23 @@ class DbtResource(Resource):
     executable: str | None = None
 
     _outputs: DbtOutputs | None = PrivateAttr(default=None)
+
+    def __init__(
+        self, *, project_dir: "str | Path | DbtProject | None" = None, **kwargs: Any
+    ) -> None:
+        from rivers.integrations.dbt.project import DbtProject
+
+        # Before the environment is read: a validator sees its values as given ones.
+        if isinstance(project_dir, DbtProject):
+            settings = project_dir.model_dump(
+                include={"profiles_dir", "profile", "target"}, exclude_none=True
+            )
+            kwargs = {**settings, **kwargs}
+            project_dir = project_dir.project_dir
+        if project_dir is not None:
+            kwargs["project_dir"] = project_dir
+
+        super().__init__(**kwargs)
 
     def cli(
         self,

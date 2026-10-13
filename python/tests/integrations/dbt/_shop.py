@@ -108,12 +108,16 @@ def sibling_asset(dep: str, **kwargs: Any) -> rs.SingleAsset:
 
 
 def repository(
-    project_dir: Path, assets: list, storage, executor=None
+    project_dir: Path,
+    assets: list,
+    storage,
+    executor=None,
+    dbt: DbtResource | None = None,
 ) -> rs.CodeRepository:
     repo = rs.CodeRepository(
         assets=assets,
         resources={
-            "dbt": DbtResource(project_dir=project_dir, profiles_dir=project_dir)
+            "dbt": dbt or DbtResource(project_dir=project_dir, profiles_dir=project_dir)
         },
         default_executor=executor or rs.Executor.in_process(),
     )

@@ -30,7 +30,7 @@ def analytics(context: rs.AssetExecutionContext, dbt: DbtResource):
 
 repo = rs.CodeRepository(
     assets=[analytics],
-    resources={"dbt": DbtResource(project_dir=project.project_dir)},
+    resources={"dbt": DbtResource(project_dir=project)},
 )
 ```
 
@@ -71,7 +71,7 @@ project.prepare()
 |--------------------|---------|-------------|
 | `project_dir` | required | The directory with `dbt_project.yml`. |
 | `target_path` | `"target"` | The directory with `manifest.json`, relative to `project_dir`. |
-| `profiles_dir` | `None` | The directory with `profiles.yml`, for `prepare()` and selections. `None` uses dbt's search. |
+| `profiles_dir` | `None` | The directory with `profiles.yml`, for `prepare()`, selections, and a `DbtResource` made from the project. `None` uses dbt's search. |
 | `profile` | `None` | The profile to use instead of the project's. |
 | `target` | `None` | The target to use instead of the profile's default. |
 
@@ -109,13 +109,18 @@ rivers has no asset checks. In a `dbt build`, dbt tests each resource after it b
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `project_dir` | required | The directory with `dbt_project.yml`. |
+| `project_dir` | required | The directory with `dbt_project.yml`, or a `DbtProject`. |
 | `profiles_dir` | `None` | The directory with `profiles.yml`. `None` uses dbt's search: the project directory, then `~/.dbt`. |
 | `profile` | `None` | The profile to use instead of the project's. |
 | `target` | `None` | The target to use instead of the profile's default. |
 | `executable` | `None` | The dbt executable, e.g. `"dbt"` or a path. `None` runs the dbt-core installed with rivers. |
 
-Fields that you do not give are read from the environment variables that dbt reads: `DBT_PROJECT_DIR`, `DBT_PROFILES_DIR`, `DBT_PROFILE`, and `DBT_TARGET`.
+Give the resource the `DbtProject`, as in the [example](#define-the-assets). It then takes the project's `profiles_dir`, `profile`, and `target`, so dbt runs with the settings that `prepare()` and the selections use. Each field takes the first value that it finds:
+
+1. The value that you give the resource.
+2. The project's value, if it is not `None`.
+3. The environment variable that dbt reads: `DBT_PROJECT_DIR`, `DBT_PROFILES_DIR`, `DBT_PROFILE`, or `DBT_TARGET`.
+4. The default.
 
 Each command runs in a new process with its own target directory, so commands can run at the same time. The command starts from the project's `partial_parse.msgpack`, so dbt parses only the files that changed. The directory is removed when the command ends. rivers sets `DBT_SEND_ANONYMOUS_USAGE_STATS=false` unless you set it.
 

@@ -415,7 +415,7 @@ def test_dagster_dlt_maps_to_dlt_integration(tmp_path):
     rs.CodeRepository(assets=[github_assets]).validate()
 
 
-def test_dagster_dbt_maps_to_dbt_integration():
+def test_dagster_dbt_maps_to_dbt_integration(tmp_path):
     pytest.importorskip("dbt.version")
     import inspect
 
@@ -432,6 +432,12 @@ def test_dagster_dbt_maps_to_dbt_integration():
     assert {"project_dir", "profiles_dir", "profile", "target"} <= set(
         DbtResource.model_fields
     )
+    # Like DbtCliResource, the resource takes the project's settings it is not given.
+    (tmp_path / "dbt_project.yml").write_text("name: shop\n")
+    project = DbtProject(tmp_path, profiles_dir=tmp_path, profile="shop", target="prod")
+    resource = DbtResource(project_dir=project, target="dev")
+    assert (resource.project_dir, resource.profiles_dir) == (tmp_path, tmp_path)
+    assert (resource.profile, resource.target) == ("shop", "dev")
     assert list(inspect.signature(DbtResource.cli).parameters)[:3] == [
         "self",
         "args",

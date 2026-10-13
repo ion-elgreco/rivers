@@ -30,8 +30,9 @@ class DbtProject(BaseModel):
         project_dir: The directory with ``dbt_project.yml``.
         target_path: The directory with ``manifest.json``, relative to
             ``project_dir``.
-        profiles_dir: The directory with ``profiles.yml`` for :meth:`prepare`
-            and selections. Default: dbt's search.
+        profiles_dir: The directory with ``profiles.yml`` for :meth:`prepare`,
+            selections, and a :class:`DbtResource` made from the project.
+            Default: dbt's search.
         profile: The profile to use instead of the project's.
         target: The target to use instead of the profile's default.
 
@@ -194,12 +195,4 @@ class DbtProject(BaseModel):
         return selected
 
     def _resource(self) -> DbtResource:
-        settings = {
-            "profiles_dir": self.profiles_dir,
-            "profile": self.profile,
-            "target": self.target,
-        }
-        return DbtResource(
-            project_dir=self.project_dir,
-            **{key: value for key, value in settings.items() if value is not None},
-        )
+        return DbtResource(project_dir=self)

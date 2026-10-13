@@ -37,13 +37,15 @@ from ._shop import (  # noqa: E402
 )
 
 
-def _shop_repo(shop, storage, run_with, amounts=PAYMENTS) -> rs.CodeRepository:
+def _shop_repo(
+    shop, storage, run_with, amounts=PAYMENTS, dbt=None
+) -> rs.CodeRepository:
     assets = [
         payments_asset(shop, amounts),
         shop_assets(shop, io_handler=run_with.io_handler()),
         sibling_asset("payments", io_handler=run_with.io_handler()),
     ]
-    return repository(shop, assets, storage, run_with.executor)
+    return repository(shop, assets, storage, run_with.executor, dbt)
 
 
 def _ran_in_worker(metadata: dict) -> bool:
@@ -81,6 +83,36 @@ def test_build_materializes_every_output(shop, storage, run_with):
         "warn_large_orders": "warn"
     }
     assert "dbt/tests" not in metadata["raw_orders"]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [None, {"resources": {"dbt": {"profile": "shop"}}}],
+    ids=["defined", "overridden"],
+)
+def test_a_resource_from_the_project_builds_in_its_target(
+    shop, storage, run_with, config
+):
+    database = (shop.parent / "warehouse.duckdb").as_posix()
+    with (shop / "profiles.yml").open("a") as profile:
+        profile.write(
+            f"    prod:\n      type: duckdb\n      path: '{database}'\n"
+            "      schema: prod\n      threads: 4\n"
+        )
+    project = DbtProject(shop, profiles_dir=shop, target="prod")
+    repo = _shop_repo(shop, storage, run_with, dbt=DbtResource(project_dir=project))
+
+    result = repo.materialize(config=config)
+
+    assert result.success
+    metadata = materializations(storage, result.run_id)
+    assert _ran_in_worker(metadata) == run_with.in_worker
+    assert rows(shop, "SELECT id, name, paid FROM prod.customers ORDER BY id") == [
+        (1, "Ann", 12),
+        (2, "Bob", 3),
+        (3, "Cid", 0),
+    ]
+    assert "main.customers" not in tables(shop)
 
 
 def test_build_records_typed_metadata(shop, storage):
