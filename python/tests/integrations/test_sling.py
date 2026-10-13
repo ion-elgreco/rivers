@@ -192,7 +192,8 @@ def test_selection_runs_only_the_selected_streams(tmp_path, src, storage, execut
     replication = SlingReplication(_replication(src, "orders", "users"))
     repo = _repo(tmp_path, storage, replication, executor_env=executor_env)
 
-    result = repo.materialize(selection=["main.users"])
+    # two steps, so the parallel executor runs them in its workers
+    result = repo.materialize(selection=["main.users", "bystander"])
 
     assert result.success
     assert _tables(tmp_path) == {"users"}
