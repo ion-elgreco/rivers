@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _helpers import materialization_metadata, written_in_worker
 
 import rivers as rs
 
@@ -36,26 +37,6 @@ class JsonHandler(rs.BaseIOHandler):
 @pytest.fixture(params=[IN_PROCESS, PARALLEL], ids=["in_process", "parallel"])
 def executor(request):
     return request.param
-
-
-def materialization_metadata(storage, asset_key: str) -> dict[str, Any]:
-    """Raw values of the latest materialization's metadata, without ``pid``."""
-    event = storage.get_latest_materialization(asset_key)
-    assert event is not None
-    meta = {
-        key: next(iter(json.loads(value).values()))["value"]
-        for key, value in event.metadata
-    }
-    meta.pop("pid", None)
-    return meta
-
-
-def written_in_worker(storage, asset_key: str) -> bool:
-    """Whether the handler wrote ``asset_key`` in a process other than this one."""
-    event = storage.get_latest_materialization(asset_key)
-    assert event is not None
-    (pid,) = [value for key, value in event.metadata if key == "pid"]
-    return json.loads(pid)["Int"]["value"] != os.getpid()
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])

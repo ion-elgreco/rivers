@@ -4,11 +4,14 @@ Every case runs on both executors: the parallel executor checks a sync step in
 its loky worker.
 """
 
-import json
 import os
 
 import pytest
-from _helpers import materialize_beside_sibling
+from _helpers import (
+    materialization_metadata,
+    materialize_beside_sibling,
+    written_in_worker,
+)
 
 import rivers as rs
 from rivers.exceptions import AssetDefinitionError
@@ -128,8 +131,7 @@ def test_output_without_a_value_is_not_checked(storage, executor_env, shape):
 
     assert result.success
     assert repo.load_node("count") == 1
-    metadata = dict(storage.get_latest_materialization("title").metadata)
-    assert json.loads(metadata["rows"]) == {"Int": {"value": 2}}
+    assert materialization_metadata(storage, "title") == {"rows": 2}
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -142,21 +144,10 @@ def test_io_handler_gets_the_output_type_hint(storage, executor_env, shape):
     _, result = materialize_beside_sibling(storage, executor, handler, load)
 
     assert result.success
-    metadata = {
-        name: {
-            key: json.loads(value)
-            for key, value in storage.get_latest_materialization(name).metadata
-        }
-        for name in values
-    }
-    assert {name: entries["type_hint"] for name, entries in metadata.items()} == {
-        "count": {"Text": {"value": "<class 'int'>"}},
-        "rows": {"Text": {"value": "None"}},
-        "title": {"Text": {"value": "<class 'str'>"}},
-    }
-    in_worker = {
-        entries["pid"]["Int"]["value"] != os.getpid() for entries in metadata.values()
-    }
+    assert {
+        name: materialization_metadata(storage, name)["type_hint"] for name in values
+    } == {"count": "<class 'int'>", "rows": "None", "title": "<class 'str'>"}
+    in_worker = {written_in_worker(storage, name) for name in values}
     assert in_worker == {isinstance(executor, rs.Executor.Parallel)}
 
 
