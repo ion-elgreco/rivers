@@ -122,7 +122,7 @@ Give the resource the `DbtProject`, as in the [example](#define-the-assets). It 
 3. The environment variable that dbt reads: `DBT_PROJECT_DIR`, `DBT_PROFILES_DIR`, `DBT_PROFILE`, or `DBT_TARGET`.
 4. The default.
 
-Each command runs in a new process with its own target directory, so commands can run at the same time. The command starts from the project's `partial_parse.msgpack`, so dbt parses only the files that changed. The directory is removed when the command ends. rivers sets `DBT_SEND_ANONYMOUS_USAGE_STATS=false` unless you set it.
+Each command runs in a new process with its own target directory, so commands can run at the same time. The directory is removed when the command ends. The command starts from the project's `partial_parse.msgpack`, so dbt parses only the files that changed. For `prepare()`, selections, and the commands in a `project.assets()` body, the file is in the project's `target_path`. Elsewhere, it is in `target` in the project directory, or in `DBT_TARGET_PATH` when you set it. rivers sets `DBT_SEND_ANONYMOUS_USAGE_STATS=false` unless you set it.
 
 rivers reads dbt's JSON debug log. Do not pass `--log-format`, `--log-level`, or `--quiet`.
 

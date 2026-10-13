@@ -28,7 +28,7 @@ project = DbtProject(Path(__file__).parent / "analytics")
 
 ### `prepare()`
 
-Runs `dbt parse` and replaces the manifest in one step, so processes that read it meanwhile see the old file or the new one. Also replaces `partial_parse.msgpack`. Raises `DbtError` when dbt cannot parse the project.
+Runs `dbt parse` and replaces the manifest in one step, so processes that read it meanwhile see the old file or the new one. Also replaces `partial_parse.msgpack`. dbt starts from the old one, so it parses only the files that changed. Raises `DbtError` when dbt cannot parse the project.
 
 ### `assets()`
 
@@ -54,7 +54,7 @@ A decorator that builds a multi-asset with one output per selected model, seed, 
 
 Raises `FileNotFoundError` when the manifest does not exist, `ValueError` when the selection has no model, seed, or snapshot, and `DbtError` when `dbt ls` fails.
 
-When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations.
+When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations. Its commands start from the `partial_parse.msgpack` in the project's `target_path`.
 
 **Definition metadata:**
 

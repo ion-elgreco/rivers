@@ -222,6 +222,20 @@ def test_prepare_writes_the_manifest(tmp_path):
     ]
 
 
+def test_a_second_prepare_reuses_the_parse_in_the_target_path(shop, caplog):
+    shutil.rmtree(shop / "target")
+    project = DbtProject(shop, target_path="build", profiles_dir=shop)
+    project.prepare()
+    caplog.clear()
+
+    with caplog.at_level("INFO"):
+        project.prepare()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(m.startswith("Running with dbt=") for m in messages)
+    assert [m for m in messages if m.startswith("Unable to do partial parsing")] == []
+
+
 def test_missing_dbt_core_names_the_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "dbt.version", None)
     for name in [

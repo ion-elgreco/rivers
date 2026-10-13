@@ -167,7 +167,9 @@ class DbtProject(BaseModel):
             @functools.wraps(fn)
             def body(*args: Any, **fn_kwargs: Any) -> Any:
                 args = tuple(
-                    arg._bind(outputs) if isinstance(arg, DbtResource) else arg
+                    arg._bind(outputs, self.manifest_path.parent)
+                    if isinstance(arg, DbtResource)
+                    else arg
                     for arg in args
                 )
                 yield from fn(*args, **fn_kwargs)
@@ -195,4 +197,6 @@ class DbtProject(BaseModel):
         return selected
 
     def _resource(self) -> DbtResource:
-        return DbtResource(project_dir=self)
+        resource = DbtResource(project_dir=self)
+        resource._parse_dir = self.manifest_path.parent
+        return resource

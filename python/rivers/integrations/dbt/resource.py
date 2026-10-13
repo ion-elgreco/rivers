@@ -83,6 +83,7 @@ class DbtResource(Resource):
     executable: str | None = None
 
     _outputs: DbtOutputs | None = PrivateAttr(default=None)
+    _parse_dir: Path | None = PrivateAttr(default=None)
 
     def __init__(
         self, *, project_dir: "str | Path | DbtProject | None" = None, **kwargs: Any
@@ -176,21 +177,30 @@ class DbtResource(Resource):
         if self.target:
             command += ["--target", self.target]
 
+        parse_dir = self._parse_dir or self.project_dir / os.environ.get(
+            "DBT_TARGET_PATH", "target"
+        )
+
         return DbtInvocation(
             command=command,
             args=args,
             project_dir=self.project_dir,
             env=self._env(),
             target_path=Path(target_path) if target_path is not None else None,
+            parse_dir=parse_dir,
             outputs=outputs,
             selected=selected,
             log=log,
         )
 
-    def _bind(self, outputs: DbtOutputs) -> "DbtResource":
-        """A copy whose ``cli`` maps dbt's results to these outputs."""
+    def _bind(self, outputs: DbtOutputs, parse_dir: Path) -> "DbtResource":
+        """A copy whose ``cli`` maps dbt's results to these outputs.
+
+        Its commands start from the ``partial_parse.msgpack`` in ``parse_dir``.
+        """
         bound = self.model_copy()
         bound._outputs = outputs
+        bound._parse_dir = parse_dir
         return bound
 
     def _executable(self) -> list[str]:
@@ -225,12 +235,14 @@ class DbtInvocation:
         project_dir: Path,
         env: dict[str, str],
         target_path: Path | None,
+        parse_dir: Path,
         outputs: DbtOutputs | None,
         selected: set[str],
         log: logging.Logger | None,
     ) -> None:
         self._args = args
         self._target_path = target_path
+        self._parse_dir = parse_dir
         self._command = command
         self._project_dir = project_dir
         self._env = env
@@ -278,7 +290,7 @@ class DbtInvocation:
 
         target = self._target_path or Path(tempfile.mkdtemp(prefix="rivers-dbt-"))
         target.mkdir(parents=True, exist_ok=True)
-        _copy_partial_parse(self._project_dir, target)
+        _copy_partial_parse(self._parse_dir, target)
         env = {**self._env, "DBT_TARGET_PATH": str(target), "DBT_LOG_PATH": str(target)}
 
         errors: list[str] = []
@@ -449,13 +461,9 @@ def _failure(event: dict[str, Any]) -> str | None:
     return None
 
 
-def _copy_partial_parse(project_dir: Path, target: Path) -> None:
+def _copy_partial_parse(parse_dir: Path, target: Path) -> None:
     """Start from the project's parse, so dbt only parses the files that changed."""
-    saved = (
-        project_dir
-        / os.environ.get("DBT_TARGET_PATH", "target")
-        / "partial_parse.msgpack"
-    )
+    saved = parse_dir / "partial_parse.msgpack"
     if saved.is_file() and not (target / saved.name).exists():
         shutil.copy2(saved, target / saved.name)
 

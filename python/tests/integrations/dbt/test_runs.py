@@ -7,6 +7,7 @@ sibling step beside the dbt step.
 
 import json
 import os
+import shutil
 
 import pytest
 
@@ -113,6 +114,37 @@ def test_a_resource_from_the_project_builds_in_its_target(
         (3, "Cid", 0),
     ]
     assert "main.customers" not in tables(shop)
+
+
+def test_a_run_reuses_the_parse_in_the_project_target_path(shop, storage, run_with):
+    shutil.rmtree(shop / "target")
+    project = DbtProject(shop, target_path="build", profiles_dir=shop)
+    project.prepare()
+
+    @project.assets(
+        exclude="daily_orders",
+        translator=SourceTranslator(),
+        io_handler=run_with.io_handler(),
+    )
+    def shop_def(context: rs.AssetExecutionContext, dbt: DbtResource):
+        context.add_output_metadata({"pid": os.getpid()})
+        yield from dbt.cli(["build"], context)
+
+    assets = [
+        payments_asset(shop),
+        shop_def,
+        sibling_asset("payments", io_handler=run_with.io_handler()),
+    ]
+    repo = repository(shop, assets, storage, run_with.executor)
+
+    result = repo.materialize()
+
+    assert result.success
+    metadata = materializations(storage, result.run_id)
+    assert _ran_in_worker(metadata) == run_with.in_worker
+    log = "".join(row.logs or "" for row in storage.get_run_logs(result.run_id))
+    assert "Running with dbt=" in log
+    assert "Unable to do partial parsing" not in log
 
 
 def test_build_records_typed_metadata(shop, storage):
