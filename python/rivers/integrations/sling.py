@@ -385,13 +385,18 @@ def _sling_run(
     config: dict[str, Any], env: dict[str, str]
 ) -> Iterator[subprocess.Popen[str]]:
     """``sling run`` on ``config``, its stderr merged into stdout. Killed if the caller stops early."""
-    import sling
+    binary = os.environ.get("SLING_BINARY")
+    if not binary:
+        # `import sling` also imports pandas, pyarrow and polars when they are installed.
+        import sling
+
+        binary = sling.SLING_BIN
 
     with tempfile.TemporaryDirectory(prefix="rivers-sling-") as tmp:
         path = Path(tmp, "replication.json")
         path.write_text(json.dumps(config, default=str), encoding="utf-8")
         with subprocess.Popen(
-            [str(sling.SLING_BIN), "run", "-r", str(path)],
+            [str(binary), "run", "-r", str(path)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
