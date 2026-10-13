@@ -292,15 +292,27 @@ def _backfill_id(stdout):
 
 
 def _rivers(cwd, *args, env=None):
-    # A process of its own: the CLI decides the store's fate at exit.
-    return subprocess.run(
-        [sys.executable, "-c", "from rivers.cli import main; main()", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=None if env is None else {**os.environ, **env},
-    )
+    # A process of its own: the CLI decides the store's fate at exit. The
+    # timeout fails the test, with the CLI's log, before pytest's 60 s
+    # timeout ends the whole worker.
+    try:
+        return subprocess.run(
+            [sys.executable, "-c", "from rivers.cli import main; main()", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            env=None if env is None else {**os.environ, **env},
+        )
+    except subprocess.TimeoutExpired as e:
+        stderr = (
+            e.stderr.decode(errors="replace")
+            if isinstance(e.stderr, bytes)
+            else e.stderr
+        )
+        pytest.fail(
+            f"`rivers {' '.join(args)}` did not exit in 40 s. Its stderr:\n{stderr}"
+        )
 
 
 def _assert_events_p1_purged(storage):
