@@ -32,7 +32,7 @@ io = SnowflakeIOHandler(
 | `polars.LazyFrame` | yes | yes |
 | `pandas.DataFrame` | yes | yes |
 
-Reads fetch all rows as Arrow and lowercase the column names.
+Reads fetch all rows as Arrow and lowercase the column names. Each column gets the Arrow type of its Snowflake type, also when no rows match (see [column types](../guides/snowflake.md#column-types)).
 
 **Asset metadata overrides:**
 
@@ -60,6 +60,7 @@ These metadata keys override handler defaults per-asset:
 - `TypeError` from a write: an unsupported output type, or a column type with no Snowflake type (for example `duration`). Nothing is written.
 - `ValueError` from a write: an output column that the table does not have, an output column whose values the table's column type would change (for example floats in a `NUMBER(38,0)` column), a partitioned asset without `snowflake/partition_expr`, or an unknown `snowflake/mode`. Nothing is written.
 - `TypeError` from a read: a missing or unsupported type hint.
+- `ValueError` from a read: a column with a value that its Arrow type cannot hold, such as a `NUMBER` value outside the `int64` range. The message names the column.
 
 ### Methods for action bodies
 

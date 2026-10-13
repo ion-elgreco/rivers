@@ -15,7 +15,8 @@ from typing import Any, NamedTuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 from snowflake.connector import SnowflakeConnection
-from snowflake.connector.cursor import SnowflakeCursor
+from snowflake.connector.constants import FIELD_ID_TO_NAME
+from snowflake.connector.cursor import ResultMetadata, SnowflakeCursor
 
 from rivers._core import InputContext, MetadataValue, OutputContext
 from rivers._core.partitions import PartitionContext
@@ -216,11 +217,14 @@ class SnowflakeIOHandler(BaseIOHandler):
     def load_input(self, context: InputContext) -> Any:
         """Read the asset's table as ``context.type_hint``, with lowercased column names.
 
-        The rows are fetched as Arrow. A ``RecordBatchReader`` or ``LazyFrame``
-        wraps the fetched rows.
+        The rows are fetched as Arrow. Each column's Arrow type follows from
+        its Snowflake type, so a read without rows has the same types. A
+        ``RecordBatchReader`` or ``LazyFrame`` wraps the fetched rows.
 
         Raises:
             TypeError: If ``context.type_hint`` is missing or not supported.
+            ValueError: If a column has a value that its Arrow type cannot
+                hold, such as a ``NUMBER`` value outside the ``int64`` range.
         """
         read = _reader(context.type_hint)
 
@@ -239,9 +243,9 @@ class SnowflakeIOHandler(BaseIOHandler):
                 where = self.partition_predicate(meta, context.partition, columns)
                 sql += f" WHERE {where}"
             cur.execute(sql)
-            result = cur.fetch_arrow_all(force_return_table=True)
+            result = _fetch(cur, schema, table)
 
-        return read(_from_snowflake(result))
+        return read(result)
 
 
 def _quote(name: str) -> str:
@@ -428,20 +432,89 @@ def _write(cur: SnowflakeCursor, target: str, stage: str, delete: str | None) ->
         raise
 
 
-def _from_snowflake(table: pa.Table) -> pa.Table:
-    """``table`` with lowercased column names and integer columns as int64.
+def _fetch(cur: SnowflakeCursor, schema: str, table: str) -> pa.Table:
+    """The result of ``cur`` in the types of :func:`_arrow_type`, with lowercased column names.
 
-    Snowflake sends a NUMBER column in the smallest integer type that holds
-    its values.
+    The connector fetches the result in chunks, whose types can differ: each
+    chunk is cast before the chunks are joined.
+
+    Raises:
+        ValueError: If a column of ``schema.table`` has a value that its
+            Arrow type cannot hold.
     """
-    schema = pa.schema(
-        pa.field(
-            field.name.lower(),
-            pa.int64() if pa.types.is_integer(field.type) else field.type,
+    columns = cur.description
+
+    def typed(chunk: pa.Table) -> pa.Table:
+        types = pa.schema(
+            pa.field(column.name.lower(), _arrow_type(column) or field.type)
+            for column, field in zip(columns, chunk.schema)
         )
-        for field in table.schema
+        chunk = chunk.rename_columns(types.names)
+        try:
+            return chunk.cast(types)
+        except pa.ArrowInvalid as error:
+            for column, values, field in zip(columns, chunk.columns, types):
+                try:
+                    values.cast(field.type)
+                except pa.ArrowInvalid:
+                    raise ValueError(
+                        f"table {schema}.{table} has column {_misfit(column)}"
+                    ) from error
+            raise
+
+    tables = [typed(chunk) for chunk in cur.fetch_arrow_batches()]
+    if tables:
+        return pa.concat_tables(tables)
+    return typed(cur.fetch_arrow_all(force_return_table=True))
+
+
+def _misfit(column: ResultMetadata) -> str:
+    """``column``, which has a value outside its Arrow type, and the remedy.
+
+    Only two Arrow types can miss a value: ``int64`` for a ``NUMBER`` column
+    without a scale, and nanoseconds for a timestamp column.
+    """
+    kind = FIELD_ID_TO_NAME[column.type_code]
+    fix = "cast the column in the table or a view to"
+    if kind == "FIXED":
+        return (
+            f"{column.name} NUMBER({column.precision},0) with a value outside the "
+            f"int64 range: {fix} a type that holds it, such as NUMBER(38,1)"
+        )
+    return (
+        f"{column.name} {kind}({column.scale}) with a date outside the years 1677 "
+        f"to 2262, which nanoseconds cannot hold: {fix} {kind}(6)"
     )
-    return table.rename_columns(schema.names).cast(schema)
+
+
+# The Arrow time unit for the scale of a TIME or timestamp column
+_UNITS = ("s", "ms", "ms", "ms", "us", "us", "us", "ns", "ns", "ns")
+
+
+def _arrow_type(column: ResultMetadata) -> pa.DataType | None:
+    """The Arrow type of a result column, or ``None`` to keep the connector's type.
+
+    The types are the connector's types in the handler's session, but they
+    do not change with the rows. The connector's types do: Snowflake sends
+    each chunk of a ``NUMBER`` column in the smallest integer type that holds
+    its values, and a result without rows has the connector's own types.
+    Unlike the connector, a ``NUMBER(p,s)`` is ``decimal128(p,s)``, not
+    ``decimal128(38,s)``. The connector reads ``TIME`` at most in
+    microseconds.
+    """
+    kind = FIELD_ID_TO_NAME[column.type_code]
+    scale = column.scale or 0
+
+    if kind == "FIXED":
+        return pa.decimal128(column.precision, scale) if scale else pa.int64()
+    if kind == "DATE":
+        return pa.date32()
+    if kind == "TIME":
+        return pa.time32(_UNITS[scale]) if scale <= 3 else pa.time64("us")
+    if kind.startswith("TIMESTAMP_"):
+        zone = None if kind == "TIMESTAMP_NTZ" else _SESSION["timezone"]
+        return pa.timestamp(_UNITS[scale], zone)
+    return None
 
 
 def _to_reader(obj: Any) -> pa.RecordBatchReader:

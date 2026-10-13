@@ -10,12 +10,15 @@ import re
 from contextlib import nullcontext
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("snowflake.connector")
 pytest.importorskip("fakesnow")
 
+from snowflake.connector.constants import FIELD_NAME_TO_ID, FIELD_TYPES  # noqa: E402
+from snowflake.connector.cursor import ResultMetadata  # noqa: E402
 from snowflake.connector.errors import ProgrammingError  # noqa: E402
 
 import pandas as pd  # noqa: E402
@@ -164,7 +167,48 @@ def test_values_round_trip(warehouse):
             "raw": None,
         },
     ]
-    assert read.schema.field("instant").type.tz in ("UTC", "Etc/UTC")
+    assert read.schema.field("instant").type.tz == "UTC"
+
+
+def test_empty_read_has_the_types_of_a_read_with_rows(warehouse):
+    """For no rows, the connector types the columns by its own rules, not by the table."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    at = datetime(2024, 1, 1, 5, 30, tzinfo=timezone.utc)
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table(
+            {
+                "region": ["us"],
+                "n": [1],
+                "price": pa.array([Decimal("1.25")], pa.decimal128(10, 2)),
+                "ratio": [0.5],
+                "ok": [True],
+                "raw": [b"\x00"],
+                "day": pa.array([at.date()], pa.date32()),
+                "clock": pa.array([at.time()], pa.time64("us")),
+                "local": pa.array([at.replace(tzinfo=None)], pa.timestamp("us")),
+                "instant": pa.array([at], pa.timestamp("us", tz="UTC")),
+            }
+        ),
+    )
+
+    def read(region: str) -> pa.Table:
+        return _load(
+            handler,
+            "t",
+            pa.Table,
+            asset_metadata=_BY_REGION,
+            partition=_partition(_REGIONS, rs.PartitionKey.single(region)),
+        )
+
+    us, eu = read("us"), read("eu")
+    assert (us.num_rows, eu.num_rows) == (1, 0)
+    assert [(f.name, f.type) for f in eu.schema] == [
+        (f.name, f.type) for f in us.schema
+    ]
+    assert us.schema.field("price").type == pa.decimal128(10, 2)
+    assert us.schema.field("day").type == pa.date32()
+    assert us.schema.field("instant").type.tz == "UTC"
 
 
 @pytest.mark.parametrize(
@@ -198,27 +242,146 @@ def test_snowflake_column_types(arrow_type, snowflake_type):
     assert io_module._snowflake_type(arrow_type) == snowflake_type
 
 
-def test_reads_lowercase_names_and_widen_integers():
-    """Snowflake sends small NUMBER values as int8, with its own field metadata."""
-    sent = pa.table(
-        [pa.array([1, 2], pa.int8()), pa.array(["a", "b"]), pa.array([1.5, None])],
-        schema=pa.schema(
+class ResultCursor:
+    """A cursor whose result comes in ``chunks``, the tables that the connector makes
+    of Snowflake's result chunks.
+
+    ``columns`` describe the result as Snowflake does: ``(name, type, precision, scale)``.
+    """
+
+    def __init__(self, columns: list[tuple], *chunks: pa.Table):
+        self.description = [
+            ResultMetadata(
+                name, FIELD_NAME_TO_ID[kind], None, None, precision, scale, True
+            )
+            for name, kind, precision, scale in columns
+        ]
+        self.chunks = chunks
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetch_arrow_batches(self):
+        return iter(self.chunks)
+
+    def fetch_arrow_all(self, force_return_table=False):
+        """As the connector: the chunks joined without type promotion, or an empty
+        table in the connector's own types."""
+        if self.chunks:
+            return pa.concat_tables(self.chunks)
+        return pa.schema(
+            (column.name, FIELD_TYPES[column.type_code].pa_type(column))
+            for column in self.description
+        ).empty_table()
+
+
+def _read_from(monkeypatch, cursor: ResultCursor) -> pa.Table:
+    """Read a table whose SELECT runs on ``cursor``."""
+    connection = SimpleNamespace(cursor=lambda: cursor)
+    monkeypatch.setattr(
+        SnowflakeIOHandler, "get_connection", lambda self: nullcontext(connection)
+    )
+    resource = SnowflakeResource(account="unreachable", user="u", password="p")
+    return _load(SnowflakeIOHandler(resource=resource), "t", pa.Table)
+
+
+def test_chunks_of_a_number_column_read_as_one_int64_column(monkeypatch):
+    """fakesnow sends one chunk. Snowflake sends each chunk of a NUMBER column in the
+    smallest integer type that holds the chunk's values."""
+
+    def chunk(ids: list[int], int_type: pa.DataType, names: list) -> pa.Table:
+        schema = pa.schema(
             [
-                pa.field("ID", pa.int8(), metadata={"logicalType": "FIXED"}),
+                pa.field("ID", int_type, metadata={"logicalType": "FIXED"}),
                 pa.field("NAME", pa.string(), metadata={"logicalType": "TEXT"}),
-                pa.field("RATIO", pa.float64()),
             ]
-        ),
+        )
+        return pa.table([pa.array(ids, int_type), pa.array(names)], schema=schema)
+
+    cursor = ResultCursor(
+        [("ID", "FIXED", 38, 0), ("NAME", "TEXT", None, None)],
+        chunk([1, 2], pa.int8(), ["a", "b"]),
+        chunk([300, 400], pa.int16(), ["c", None]),
     )
-    read = io_module._from_snowflake(sent)
-    assert read.schema == pa.schema(
-        [("id", pa.int64()), ("name", pa.string()), ("ratio", pa.float64())]
-    )
+
+    read = _read_from(monkeypatch, cursor)
+
+    assert read.schema == pa.schema([("id", pa.int64()), ("name", pa.string())])
     assert read.schema.field("id").metadata is None
     assert read.to_pylist() == [
-        {"id": 1, "name": "a", "ratio": 1.5},
-        {"id": 2, "name": "b", "ratio": None},
+        {"id": 1, "name": "a"},
+        {"id": 2, "name": "b"},
+        {"id": 300, "name": "c"},
+        {"id": 400, "name": None},
     ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "precision", "scale", "fetched", "read"),
+    [
+        ("FIXED", 10, 0, pa.int16(), pa.int64()),
+        ("FIXED", 10, 2, pa.decimal128(38, 2), pa.decimal128(10, 2)),
+        ("DATE", None, None, pa.date32(), pa.date32()),
+        ("TIME", 0, 0, pa.time32("s"), pa.time32("s")),
+        ("TIME", 0, 3, pa.time32("ms"), pa.time32("ms")),
+        ("TIME", 0, 6, pa.time64("us"), pa.time64("us")),
+        ("TIME", 0, 9, pa.time64("us"), pa.time64("us")),
+        ("TIMESTAMP_NTZ", 0, 0, pa.timestamp("s"), pa.timestamp("s")),
+        ("TIMESTAMP_NTZ", 0, 3, pa.timestamp("ms"), pa.timestamp("ms")),
+        ("TIMESTAMP_NTZ", 0, 6, pa.timestamp("us"), pa.timestamp("us")),
+        ("TIMESTAMP_NTZ", 0, 9, pa.timestamp("ns"), pa.timestamp("ns")),
+        ("TIMESTAMP_LTZ", 0, 6, pa.timestamp("us", "UTC"), pa.timestamp("us", "UTC")),
+        ("TIMESTAMP_TZ", 0, 9, pa.timestamp("ns", "UTC"), pa.timestamp("ns", "UTC")),
+    ],
+    ids=str,
+)
+def test_read_types_follow_the_column_types(
+    monkeypatch, kind, precision, scale, fetched, read
+):
+    """With Snowflake's descriptions and the connector's chunk types. fakesnow describes
+    TIME and timestamp columns with scale 9, TIMESTAMP_LTZ as TIMESTAMP_TZ, and sends
+    NUMBER(p,s) as decimal128(p,s)."""
+    columns = [("C", kind, precision, scale)]
+    rows = _read_from(
+        monkeypatch, ResultCursor(columns, pa.table({"C": pa.nulls(1, fetched)}))
+    )
+    empty = _read_from(monkeypatch, ResultCursor(columns))
+
+    assert rows.schema == pa.schema([("c", read)])
+    assert empty.schema == pa.schema([("c", read)])
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "message"),
+    [
+        pytest.param(
+            ("BIG", "FIXED", 38, 0),
+            pa.array([2**64], pa.decimal128(38, 0)),
+            "column BIG NUMBER(38,0) with a value outside the int64 range: cast the "
+            "column in the table or a view to a type that holds it, such as NUMBER(38,1)",
+            id="number-outside-int64",
+        ),
+        pytest.param(
+            ("VALID_TO", "TIMESTAMP_NTZ", 0, 9),
+            pa.array([datetime(9999, 12, 31)], pa.timestamp("us")),
+            "column VALID_TO TIMESTAMP_NTZ(9) with a date outside the years 1677 to "
+            "2262, which nanoseconds cannot hold: cast the column in the table or a "
+            "view to TIMESTAMP_NTZ(6)",
+            id="date-outside-nanoseconds",
+        ),
+    ],
+)
+def test_values_outside_the_read_type_fail_the_read(
+    monkeypatch, column, values, message
+):
+    """Snowflake sends such NUMBER values as decimal128, which fakesnow cannot store,
+    and the connector reads such dates in microseconds."""
+    cursor = ResultCursor(
+        [("ID", "FIXED", 38, 0), column],
+        pa.table({"ID": pa.array([1], pa.int8()), column[0]: values}),
+    )
+    with pytest.raises(ValueError, match=re.escape(f"table PUBLIC.T has {message}")):
+        _read_from(monkeypatch, cursor)
 
 
 class RecordingCursor:

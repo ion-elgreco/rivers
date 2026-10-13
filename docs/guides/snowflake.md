@@ -144,11 +144,11 @@ The first write creates the columns from the Arrow types, as Snowflake's [ADBC d
 
 Other Arrow types, such as `duration`, fail before the write starts.
 
-A read returns `NUMBER` columns without a scale as `int64` (or `decimal128` when Snowflake cannot tell the largest value), `NUMBER(p,s)` as `decimal128(p,s)`, timestamps in the unit of the column's precision (`TIMESTAMP_NTZ(6)` in microseconds), and `ARRAY` and `OBJECT` as JSON text.
+A read gives each column the Arrow type of its Snowflake type, also when no rows match. `NUMBER` columns without a scale become `int64`, and `NUMBER(p,s)` columns become `decimal128(p,s)`. `DATE` becomes `date32`. Timestamps are in the smallest unit that holds the column's precision: `TIMESTAMP_NTZ(6)` in microseconds. `TIME` columns are too, but at most in microseconds. `ARRAY` and `OBJECT` become JSON text.
 
 ### Time zones
 
-The handler's sessions use the UTC time zone. A timestamp with a time zone is stored as an instant in a `TIMESTAMP_LTZ` column, and a read returns it in UTC. A timestamp without a time zone is stored as is in a `TIMESTAMP_NTZ` column.
+The handler's sessions use the UTC time zone. A timestamp with a time zone is stored as an instant in a `TIMESTAMP_LTZ` column. A read returns `TIMESTAMP_LTZ` and `TIMESTAMP_TZ` columns in UTC. A timestamp without a time zone is stored as is in a `TIMESTAMP_NTZ` column.
 
 ### Partitioned assets
 
@@ -205,4 +205,5 @@ There is no `optimize` or `vacuum`: Snowflake merges small micro-partitions itse
 - The handler writes with overwrite or append. It has no MERGE.
 - A read fetches all rows before the step gets them.
 - The handler has no PySpark type. Convert a Spark DataFrame to pandas or Arrow first.
-- A `TIMESTAMP_*(9)` column with dates outside the years 1677 to 2262 can fail to read: the connector reads such dates in microseconds, which can differ between result batches.
+- A `NUMBER` column without a scale fails to read if it holds a value outside the `int64` range. Cast it in the table or a view to a type that holds the values, such as `NUMBER(38,1)`.
+- A `TIMESTAMP_*(7)` to `TIMESTAMP_*(9)` column fails to read if it holds a date outside the years 1677 to 2262: such dates do not fit in nanoseconds. Cast it in the table or a view to `TIMESTAMP_*(6)`.
