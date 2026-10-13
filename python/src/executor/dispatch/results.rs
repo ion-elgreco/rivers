@@ -8,7 +8,7 @@
 //! Called by `run_step_to_completion` (trait_def.rs) and AsyncBackend's
 //! result processing loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -182,12 +182,13 @@ pub(crate) fn process_step_result(
     };
     let bridge = ctx.repo.bridge;
     let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
-    let output_hints: HashMap<String, Py<PyAny>> = step
+    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
         .outputs
         .iter()
-        .filter_map(|name| {
-            let hint = ctx.repo.node_map.get(name)?.output_type_hint()?;
-            Some((name.clone(), hint.clone_ref(py)))
+        .map(|name| {
+            let node = ctx.repo.node_map.get(name);
+            let hint = node.and_then(|n| n.output_type_hint());
+            (name.clone(), hint.map(|h| h.clone_ref(py)))
         })
         .collect();
     let config_instance = step_result
@@ -219,8 +220,7 @@ pub(crate) fn process_step_result(
     let result = ops::for_each_output(
         py,
         &step_result,
-        &step.outputs,
-        &output_hints,
+        &selected_outputs,
         step_name,
         bridge,
         |py, item| {

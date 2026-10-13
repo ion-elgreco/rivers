@@ -30,7 +30,7 @@
 //! partially-merged `OutputItem`; a `merge_metadata` call outside this
 //! module, other than that handler overlay, is skipping the contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
@@ -112,15 +112,13 @@ fn item_for_kind(
 /// selected output. Handles single-output, dict multi-asset, and generator
 /// multi-asset (sync + async) shapes uniformly.
 ///
-/// `selected_outputs` is the multi-asset's output name list (`step.outputs`).
-/// Empty means single-output: one item is yielded with `name == step_name`.
-/// Non-empty means multi-asset: one item per selected output (subsetting),
-/// non-selected generator yields silently skipped.
-///
-/// `output_hints` maps a multi-asset output to its `AssetDef.type_hint`. The
-/// item carries the checked value, e.g. a frame that pandera coerced, and a
-/// value that fails the check ends the iteration with
-/// `AssetOutputValidationError`.
+/// `selected_outputs` is the multi-asset's outputs (`step.outputs`), each
+/// with its `AssetDef.type_hint`. Empty means single-output: one item is
+/// yielded with `name == step_name`. Non-empty means multi-asset: one item
+/// per selected output (subsetting), non-selected generator yields silently
+/// skipped. An item carries its value as checked against the type hint, e.g.
+/// a frame that pandera coerced; a value that fails the check ends the
+/// iteration with `AssetOutputValidationError`.
 ///
 /// `step_name` equals `step.name` for non-mapped runs and the per-instance
 /// name for mapped fan-out (single-output only — multi-asset is never
@@ -133,8 +131,7 @@ fn item_for_kind(
 pub(crate) fn for_each_output<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
-    output_hints: &HashMap<String, Py<PyAny>>,
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     step_name: &str,
     bridge: Option<&AsyncBridge>,
     mut on_item: F,
@@ -147,18 +144,13 @@ where
             py,
             step_result,
             selected_outputs,
-            output_hints,
             kind,
             bridge,
             &mut on_item,
         ),
-        None if !selected_outputs.is_empty() => for_each_output_dict(
-            py,
-            step_result,
-            selected_outputs,
-            output_hints,
-            &mut on_item,
-        ),
+        None if !selected_outputs.is_empty() => {
+            for_each_output_dict(py, step_result, selected_outputs, &mut on_item)
+        }
         None => for_each_output_single(py, step_result, step_name, &mut on_item),
     }
 }
@@ -170,9 +162,9 @@ fn check_output(
     name: &str,
     kind: ResultKind,
     value: Option<Py<PyAny>>,
-    output_hints: &HashMap<String, Py<PyAny>>,
+    hint: Option<&Py<PyAny>>,
 ) -> PyResult<(Option<Py<PyAny>>, Vec<(String, MetadataValue)>)> {
-    let (ResultKind::Output, Some(hint)) = (kind, output_hints.get(name)) else {
+    let (ResultKind::Output, Some(hint)) = (kind, hint) else {
         return Ok((value, Vec::new()));
     };
     let value = value.unwrap_or_else(|| py.None());
@@ -183,8 +175,7 @@ fn check_output(
 fn for_each_output_generator<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
-    output_hints: &HashMap<String, Py<PyAny>>,
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     kind: &super::GeneratorType,
     bridge: Option<&AsyncBridge>,
     on_item: &mut F,
@@ -192,7 +183,10 @@ fn for_each_output_generator<F>(
 where
     F: FnMut(Python, OutputItem) -> PyResult<()>,
 {
-    let selected: HashSet<&str> = selected_outputs.iter().map(|s| s.as_str()).collect();
+    let selected: HashMap<&str, Option<&Py<PyAny>>> = selected_outputs
+        .iter()
+        .map(|(name, hint)| (name.as_str(), hint.as_ref()))
+        .collect();
     let generator = &step_result.result;
     let (is_async_gen, ctx_obj) = match kind {
         super::GeneratorType::Sync { context } => (false, context.as_ref()),
@@ -222,12 +216,12 @@ where
             ExecutionError::new_err("yield in multi-asset must include output_name")
         })?;
 
-        if !selected.contains(output_name.as_str()) {
+        let Some(&hint) = selected.get(output_name.as_str()) else {
             continue;
-        }
+        };
 
         let (value, mut merged_metadata) =
-            check_output(py, &output_name, ext.kind, ext.value, output_hints)?;
+            check_output(py, &output_name, ext.kind, ext.value, hint)?;
 
         // Cumulative ctx-level metadata (peek, not drain) + per-yield ctx dv (drain).
         let ctx_metadata = gen_ctx
@@ -293,8 +287,7 @@ fn next_yield(
 fn for_each_output_dict<F>(
     py: Python,
     step_result: &StepResult,
-    selected_outputs: &[String],
-    output_hints: &HashMap<String, Py<PyAny>>,
+    selected_outputs: &[(String, Option<Py<PyAny>>)],
     on_item: &mut F,
 ) -> PyResult<()>
 where
@@ -304,7 +297,7 @@ where
     let shared_metadata = &step_result.output_metadata;
     let shared_dv = step_result.data_version.as_deref();
 
-    for output_name in selected_outputs {
+    for (output_name, hint) in selected_outputs {
         let sliced = result.call_method1(py, "__getitem__", (output_name.as_str(),))?;
 
         let (value, per_metadata, per_dv, kind) =
@@ -313,7 +306,7 @@ where
                 None => (Some(sliced), Vec::new(), None, ResultKind::Output),
             };
         let (value, mut merged_metadata) =
-            check_output(py, output_name, kind, value, output_hints)?;
+            check_output(py, output_name, kind, value, hint.as_ref())?;
 
         // Merge precedence: per-output > shared > validator.
         merge_metadata(&mut merged_metadata, shared_metadata);
