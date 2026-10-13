@@ -9,7 +9,7 @@ A sling replication and the rivers output of each of its enabled streams.
 ```python
 from rivers.integrations.sling import SlingReplication
 
-replication = SlingReplication("replication.yaml", translator=None)
+replication = SlingReplication("replication.yaml", asset_def_fn=None)
 ```
 
 **Constructor:**
@@ -17,7 +17,7 @@ replication = SlingReplication("replication.yaml", translator=None)
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `config` | `str \| PathLike \| Mapping` | required | A [replication](https://docs.slingdata.io/concepts/replication) file (YAML or JSON), or the replication as a dict. |
-| `translator` | `(SlingStream) -> AssetDef` | `SlingStream.output_def` | Builds the output of each stream. When it sets no `code_version`, the output gets a hash of the stream's config and of the replication's other keys. |
+| `asset_def_fn` | `(SlingStream) -> AssetDef` | `SlingStream.output_def` | Builds the output of each stream. When it sets no `code_version`, the output gets a hash of the stream's config and of the replication's other keys. |
 
 Raises `ValueError` when the replication has no enabled streams, when an output has no name, or when two streams get the same output name.
 
@@ -43,7 +43,7 @@ def raw(context: rs.AssetExecutionContext, sling: SlingResource):
 
 ## `SlingStream`
 
-One stream, as a translator gets it.
+One stream, as `asset_def_fn` gets it.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -67,7 +67,7 @@ Returns the default output with `fields` set or replaced. The keyword arguments 
 ```python
 SlingReplication(
     "replication.yaml",
-    translator=lambda stream: stream.output_def(group="raw", deps=[rs.AssetDef.dep("source_users")]),
+    asset_def_fn=lambda stream: stream.output_def(group="raw", deps=[rs.AssetDef.dep("source_users")]),
 )
 ```
 

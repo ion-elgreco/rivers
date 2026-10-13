@@ -203,14 +203,14 @@ def test_failed_stream_fails_only_its_output(tmp_path, src, storage, executor_en
         assert not _events(storage, asset, "StepFailure")
 
 
-def test_translator_names_outputs_and_links_deps(tmp_path, src, storage):
+def test_asset_def_fn_names_outputs_and_links_deps(tmp_path, src, storage):
     names = {
         _uri(src / "orders.csv"): "shop_orders",
         _uri(src / "users.csv"): "shop_users",
     }
     replication = SlingReplication(
         _replication(src, "orders", "users"),
-        translator=lambda stream: stream.output_def(
+        asset_def_fn=lambda stream: stream.output_def(
             name=names[stream.name], group="shop", deps=[rs.AssetDef.dep("exports")]
         ),
     )
@@ -239,7 +239,7 @@ def test_wildcard_stream_is_one_output(tmp_path, src, storage):
     streams = {_uri(src / "*.csv"): {"object": "main.{stream_file_name}"}}
     replication = SlingReplication(
         _replication(src) | {"streams": streams},
-        translator=lambda stream: stream.output_def(name="csv_files"),
+        asset_def_fn=lambda stream: stream.output_def(name="csv_files"),
     )
     repo = _repo(tmp_path, storage, replication)
 
@@ -297,7 +297,7 @@ def test_code_version_follows_the_stream_config(src):
     assert before["main.orders"] == after["main.orders"]
     assert before["main.users"] != after["main.users"]
     assert (
-        SlingReplication(config, translator=lambda s: s.output_def(code_version="v1"))
+        SlingReplication(config, asset_def_fn=lambda s: s.output_def(code_version="v1"))
         .output_defs[0]
         .code_version
         == "v1"

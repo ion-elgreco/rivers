@@ -125,7 +125,7 @@ class SlingConnection(BaseModel):
 
 
 class SlingStream(BaseModel):
-    """One stream of a replication, as passed to a translator.
+    """One stream of a replication, as passed to ``asset_def_fn``.
 
     Args:
         name: The stream's key under ``streams``.
@@ -174,7 +174,7 @@ class SlingStream(BaseModel):
 class SlingReplication:
     """A sling replication and the rivers output of each of its streams.
 
-    Each enabled stream becomes one output. The translator builds the output;
+    Each enabled stream becomes one output. ``asset_def_fn`` builds the output;
     when it sets no ``code_version``, the output gets a hash of the stream's
     config and the replication's other keys, so a config change marks the
     asset as changed.
@@ -182,7 +182,7 @@ class SlingReplication:
     Args:
         config: A replication file (YAML or JSON), or its contents as a dict.
             See https://docs.slingdata.io/concepts/replication.
-        translator: Builds a stream's output definition. Defaults to
+        asset_def_fn: Builds a stream's output definition. Defaults to
             :meth:`SlingStream.output_def`, which declares no deps: return
             ``stream.output_def(deps=[...])`` to link a stream to the asset
             that holds its source data.
@@ -200,7 +200,7 @@ class SlingReplication:
     def __init__(
         self,
         config: str | os.PathLike[str] | Mapping[str, Any],
-        translator: Callable[[SlingStream], AssetDef] | None = None,
+        asset_def_fn: Callable[[SlingStream], AssetDef] | None = None,
     ) -> None:
         if isinstance(config, Mapping):
             self.config: dict[str, Any] = dict(config)
@@ -209,7 +209,7 @@ class SlingReplication:
 
             self.config = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
 
-        translate = translator or SlingStream.output_def
+        make_def = asset_def_fn or SlingStream.output_def
         shared = {key: value for key, value in self.config.items() if key != "streams"}
         self.streams: dict[str, SlingStream] = {}
         self.output_defs: list[AssetDef] = []
@@ -218,13 +218,14 @@ class SlingReplication:
             if stream.config.get("disabled"):
                 continue
 
-            output = translate(stream)
+            output = make_def(stream)
             if not output.name:
                 raise ValueError(f"the output of sling stream {name!r} has no name")
             if output.name in self.streams:
                 raise ValueError(
                     f"sling streams {self.streams[output.name].name!r} and {name!r} "
-                    f"both map to the output {output.name!r}; set a translator"
+                    f"both map to the output {output.name!r}; "
+                    "pass an asset_def_fn that names them apart"
                 )
             if output.code_version is None:
                 output.code_version = _digest([shared, stream.config])

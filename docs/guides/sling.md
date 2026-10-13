@@ -70,7 +70,7 @@ An output is named after the stream's `object` when the stream sets one without 
 | `"Public"."Users"` | none | `public.users` |
 | `file://data/orders.csv` | none | `file_data_orders.csv` |
 
-Two streams with the same name raise `ValueError`. Use a [translator](#translator) to choose other names.
+Two streams with the same name raise `ValueError`. Use an [`asset_def_fn`](#change-the-outputs) to choose other names.
 
 ## Run part of a replication
 
@@ -115,14 +115,14 @@ SlingConnection(name="LAKE", type="s3", bucket="lake", secret_access_key=SecretS
 
 When `connections` is not given, it is read from the `SLING_CONNECTIONS` environment variable, as a JSON list.
 
-## Translator
+## Change the outputs
 
-A translator builds the output of each stream. It takes a `SlingStream`, with the stream's `name` and its own `config`, and returns an [`AssetDef`](../api-reference/assets.md). `stream.output_def(...)` returns the default output with the fields that you give:
+`asset_def_fn` builds the output of each stream. It takes a `SlingStream`, with the stream's `name` and its own `config`, and returns an [`AssetDef`](../api-reference/assets.md). `stream.output_def(...)` returns the default output with the fields that you give:
 
 ```python
 from rivers.integrations.sling import SlingStream
 
-def translate(stream: SlingStream) -> rs.AssetDef:
+def asset_def(stream: SlingStream) -> rs.AssetDef:
     table = stream.name.split(".")[-1]
     return stream.output_def(
         name=f"raw_{table}",
@@ -130,12 +130,12 @@ def translate(stream: SlingStream) -> rs.AssetDef:
         deps=[rs.AssetDef.dep(f"postgres_{table}")],
     )
 
-replication = SlingReplication("replication.yaml", translator=translate)
+replication = SlingReplication("replication.yaml", asset_def_fn=asset_def)
 ```
 
 The default output has no deps, so a replication works without other assets. To link a stream to the rivers asset that holds its source data, return `deps=[rs.AssetDef.dep(...)]`. That asset must be in the repository.
 
-When the translator sets no `code_version`, the output gets a hash of the stream's config and of the replication's other keys. So `code_version_changed()` sees a change to the config.
+When `asset_def_fn` sets no `code_version`, the output gets a hash of the stream's config and of the replication's other keys. So `code_version_changed()` sees a change to the config.
 
 ## Downstream assets
 

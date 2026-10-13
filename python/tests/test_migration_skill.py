@@ -319,7 +319,9 @@ def test_dagster_sling_maps_to_sling_integration():
 
     replication = SlingReplication(
         {"source": "PG", "target": "WAREHOUSE", "streams": {"public.users": None}},
-        translator=lambda stream: stream.output_def(deps=[rs.AssetDef.dep("pg_users")]),
+        asset_def_fn=lambda stream: stream.output_def(
+            deps=[rs.AssetDef.dep("pg_users")]
+        ),
     )
 
     @replication.assets(name="raw")
