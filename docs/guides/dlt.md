@@ -105,7 +105,7 @@ A resource that raises, or a failed normalize step, fails every selected output:
 
 A load job that fails fails every selected output, with dlt's default `load.raise_on_failed_jobs = true`. With `false`, dlt finishes the package. rivers then records the resources whose tables loaded, and the step fails for the others with `DestinationHasFailedJobs`.
 
-Before each run, the pipeline drops the load packages that a failed run left, so that a retry loads new data. With `restore_from_destination` on (dlt's default), the pipeline also drops its local state and restores it from the destination. With it off, the pipeline only drops the packages, and keeps its incremental state.
+Before each run, the pipeline aborts the load packages that a failed run left (`pipeline.abort_packages()`). dlt rewinds the pipeline state, such as incremental cursors, to before those packages, so the run extracts their data again.
 
 To try a failed load again, give the assets a [retry policy](../concepts/retries.md):
 

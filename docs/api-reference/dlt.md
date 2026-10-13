@@ -52,7 +52,7 @@ Loads the resources of `context.output_selection` with one `pipeline.run`, and y
 
 A run:
 
-1. Drops the pipeline's pending load packages. With `restore_from_destination` on, it drops all local state, which dlt restores from the destination.
+1. Aborts the pipeline's pending load packages with `pipeline.abort_packages()`, which rewinds the pipeline state to before them.
 2. Runs `pipeline.run(source.with_resources(...))` with the resources of the selected outputs.
 3. Yields a `Materialization` per resource whose tables have no failed load job, then raises dlt's `DestinationHasFailedJobs` when a job failed.
 

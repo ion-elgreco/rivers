@@ -1,4 +1,4 @@
-"""dlt integration: dlt sources as multi-assets, loaded into DuckDB files under ``tmp_path``.
+"""dlt integration: dlt sources as multi-assets, loaded into DuckDB or a sink under ``tmp_path``.
 
 The ``DltSourceAssets`` and the asset functions that load them are module-level:
 a dlt source does not pickle, so parallel workers import them from this module.
@@ -68,20 +68,45 @@ def stale():
     return leftovers
 
 
+@dlt.source(name="feed")
+def feed(title: str = "new"):
+    @dlt.resource(primary_key="id")
+    def posts(cursor=dlt.sources.incremental("id", initial_value=0)):
+        yield [{"id": i, "title": title} for i in (1, 2, 3)]
+
+    return posts
+
+
+@dlt.destination(name="sink")
+def jsonl_sink(items, table, path: str = dlt.config.value) -> None:
+    with open(path, "a", encoding="utf-8") as file:
+        file.writelines(json.dumps(item) + "\n" for item in items)
+
+
 class Warehouse(rs.Resource):
-    """The DuckDB file that the shop pipeline loads, and the pipeline's directory."""
+    """The destination that the pipelines load, and their directory.
+
+    The destination is the DuckDB file ``warehouse.duckdb``, or with ``sink``,
+    a custom destination that appends the rows to ``sink.jsonl``.
+    """
 
     directory: str
     pipeline_name: str = "shop"
     restore: bool = True
+    sink: bool = False
 
     def pipeline(self) -> dlt.Pipeline:
+        destination = (
+            jsonl_sink(path=os.path.join(self.directory, "sink.jsonl"))
+            if self.sink
+            else dlt.destinations.duckdb(
+                os.path.join(self.directory, "warehouse.duckdb")
+            )
+        )
         pipeline = dlt.pipeline(
             pipeline_name=self.pipeline_name,
             pipelines_dir=os.path.join(self.directory, "pipelines"),
-            destination=dlt.destinations.duckdb(
-                os.path.join(self.directory, "warehouse.duckdb")
-            ),
+            destination=destination,
             dataset_name="shop_data",
         )
         pipeline.config.restore_from_destination = self.restore
@@ -101,6 +126,8 @@ SHOP_TABLES = DltSourceAssets(
         metadata={"duckdb/schema": "shop_data", "duckdb/table": resource.table_name},
     ),
 )
+
+FEED = DltSourceAssets(feed())
 
 
 def load_shop(context: rs.AssetExecutionContext, warehouse: Warehouse):
@@ -125,6 +152,10 @@ def load_regional_shop(context: rs.AssetExecutionContext, warehouse: Warehouse):
 
 def load_shop_tables(context: rs.AssetExecutionContext, warehouse: Warehouse):
     yield from SHOP_TABLES.load(context, warehouse.pipeline())
+
+
+def load_feed(context: rs.AssetExecutionContext, warehouse: Warehouse):
+    yield from FEED.load(context, warehouse.pipeline())
 
 
 def _repo(
@@ -432,24 +463,50 @@ def test_failed_load_job_keeps_the_loaded_resources(tmp_path, storage, executor_
 
 
 @pytest.mark.parametrize("restore", [True, False], ids=["restore", "no-restore"])
-def test_pending_packages_are_dropped_before_a_run(tmp_path, storage, restore):
+def test_pending_packages_are_aborted_before_a_run(tmp_path, storage, restore):
     pending = Warehouse(directory=str(tmp_path), restore=restore).pipeline()
-    pending.extract(stale())
+    pending.extract(feed(title="old"))
     pending.normalize()
     assert pending.list_normalized_load_packages()
 
     repo = _repo(
-        tmp_path, storage, SHOP.assets(name="shop")(load_shop), restore=restore
+        tmp_path, storage, FEED.assets(name="feed")(load_feed), restore=restore
     )
 
     assert repo.materialize().success
-    assert "leftovers" not in _tables(tmp_path)
-    assert _rows(tmp_path, "SELECT id, name FROM shop_data.customers ORDER BY id") == [
-        (1, "ann"),
-        (2, "bob"),
+    # The abort rewinds the incremental cursor, so the run extracts the rows again.
+    assert _rows(tmp_path, "SELECT id, title FROM shop_data.posts ORDER BY id") == [
+        (1, "new"),
+        (2, "new"),
+        (3, "new"),
     ]
     after = Warehouse(directory=str(tmp_path), restore=restore).pipeline()
     assert not after.list_normalized_load_packages()
+
+
+def test_sink_keeps_the_incremental_state(tmp_path, storage, executor_env):
+    repo = _repo(
+        tmp_path,
+        storage,
+        FEED.assets(name="feed")(load_feed),
+        executor=executor_env[0],
+        sink=True,
+    )
+
+    rows_loaded = []
+    for _ in range(2):
+        result = repo.materialize()
+        assert result.success
+        posts = _materializations(storage, result.run_id)["feed_posts"]
+        rows_loaded.append(_values(posts)["dlt/rows_loaded"])
+
+    assert rows_loaded == [3, 0]
+    with open(tmp_path / "sink.jsonl", encoding="utf-8") as file:
+        assert [json.loads(line) for line in file] == [
+            {"id": 1, "title": "new"},
+            {"id": 2, "title": "new"},
+            {"id": 3, "title": "new"},
+        ]
 
 
 def test_partition_builds_the_source(tmp_path, storage):

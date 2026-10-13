@@ -147,10 +147,9 @@ class DltSourceAssets:
     ) -> Iterator[Materialization]:
         """Load the resources of ``context.output_selection`` with one ``pipeline.run``.
 
-        Before the run, the pipeline drops the load packages that a failed run
-        left. With ``restore_from_destination`` on (dlt's default), it drops
-        all local state, which dlt restores from the destination. dlt's load
-        summary goes to ``context.log``.
+        Before the run, the pipeline aborts the load packages that a failed run
+        left, and dlt rewinds the pipeline state to before them, so the run
+        extracts their data again. dlt's load summary goes to ``context.log``.
 
         Args:
             context: The multi-asset's context.
@@ -189,11 +188,7 @@ class DltSourceAssets:
                 f"the dlt source {source.name!r} has no resources {sorted(missing)}"
             )
 
-        if pipeline.config.restore_from_destination:
-            pipeline.drop()
-        else:
-            _abort_packages(pipeline)
-
+        pipeline.abort_packages()
         load_info = pipeline.run(source.with_resources(*selected.values()))
         context.log.info("%s", load_info)
 
@@ -222,12 +217,6 @@ class DltSourceAssets:
                 )
 
         load_info.raise_on_failed_jobs()
-
-
-def _abort_packages(pipeline: dlt.Pipeline) -> None:
-    # dlt 1.30 renamed drop_pending_packages to abort_packages, which also restores the state
-    abort = getattr(pipeline, "abort_packages", None) or pipeline.drop_pending_packages
-    abort()
 
 
 def _tables_metadata(
