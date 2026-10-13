@@ -329,6 +329,26 @@ def test_static_partition_overwrite(warehouse):
     assert eu.to_pylist() == [{"region": "eu", "v": 3}]
 
 
+@pytest.mark.parametrize("process_wide", [False, True], ids=["resource", "process"])
+def test_writes_with_qmark_paramstyle(warehouse, monkeypatch, process_wide):
+    """The handler binds its own lookups, whatever paramstyle the resource or process sets."""
+    if process_wide:
+        monkeypatch.setattr("snowflake.connector.paramstyle", "qmark")
+    else:
+        args = {**warehouse.connection_args, "paramstyle": "qmark"}
+        warehouse = SnowflakeResource(database=warehouse.database, connection_args=args)
+    handler = SnowflakeIOHandler(resource=warehouse)
+
+    _write_region(handler, "us", [1, 2])
+    _write_region(handler, "eu", [3])
+    _write_region(handler, "us", [4])
+
+    assert _load(handler, "t", pa.Table).sort_by("v").to_pylist() == [
+        {"region": "eu", "v": 3},
+        {"region": "us", "v": 4},
+    ]
+
+
 def test_daily_partition_overwrite_on_a_date_column(warehouse):
     handler = SnowflakeIOHandler(resource=warehouse)
     definition = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))

@@ -166,6 +166,30 @@ def test_delete_runs_in_the_handler_session(warehouse, monkeypatch):
     assert _rows(warehouse, 'SELECT COUNT(*) FROM "PUBLIC"."EVENTS"') == [(0,)]
 
 
+@pytest.mark.parametrize("process_wide", [False, True], ids=["resource", "process"])
+def test_delete_with_qmark_paramstyle(warehouse, monkeypatch, process_wide):
+    """The delete binds its table lookup, whatever paramstyle the resource or process sets."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    handler.handle_output(
+        rs.OutputContext(asset_name="events"), pa.table({"region": ["us", "eu"]})
+    )
+
+    if process_wide:
+        monkeypatch.setattr(snowflake_connector, "paramstyle", "qmark")
+    else:
+        args = {**warehouse.connection_args, "paramstyle": "qmark"}
+        resource = SnowflakeResource(database=warehouse.database, connection_args=args)
+        handler = SnowflakeIOHandler(resource=resource)
+
+    partition = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("us")], definition=_REGIONS
+    )
+    meta = {"snowflake/partition_expr": "region"}
+    SnowflakeAsset.delete(_action_context(handler, partition, meta))
+
+    assert _rows(warehouse, 'SELECT "REGION" FROM "PUBLIC"."EVENTS"') == [("eu",)]
+
+
 def test_keyed_delete_without_partition_expr_names_the_key():
     resource = SnowflakeResource(account="unreachable", user="u", password="p")
     partition = rs.PartitionContext(

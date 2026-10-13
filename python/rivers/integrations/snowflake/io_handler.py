@@ -25,8 +25,13 @@ from rivers.io_handlers.base import BaseIOHandler
 _FILE_FORMAT = "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE BINARY_AS_TEXT = FALSE"
 _PRECISION = {"s": 0, "ms": 3, "us": 6, "ns": 9}
 # UTC: partition bounds are UTC times without a zone. Without the decimal
-# setting, a NUMBER column with a scale is read as float64.
-_SESSION = {"timezone": "UTC", "arrow_number_to_decimal": True}
+# setting, a NUMBER column with a scale is read as float64. pyformat: the
+# handler binds %s, whatever paramstyle the resource or the process sets.
+_SESSION = {
+    "timezone": "UTC",
+    "arrow_number_to_decimal": True,
+    "paramstyle": "pyformat",
+}
 # Arrow bytes per staged file. Snowflake loads the files of a stage in
 # parallel and recommends 100 to 250 MB per file.
 _FILE_SIZE = 100 * 2**20
@@ -103,8 +108,9 @@ class SnowflakeIOHandler(BaseIOHandler):
     def get_connection(self) -> AbstractContextManager[SnowflakeConnection]:
         """A connection in the handler's session, closed when the block exits.
 
-        The session uses UTC, the time zone of partition bounds, and fetches
-        ``NUMBER`` columns with a scale as decimals.
+        The session uses UTC, the time zone of partition bounds, fetches
+        ``NUMBER`` columns with a scale as decimals, and binds parameters as
+        ``%s`` (pyformat).
         """
         return self.resource.get_connection(**_SESSION)
 

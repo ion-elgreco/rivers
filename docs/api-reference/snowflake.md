@@ -67,7 +67,7 @@ An [action](../concepts/actions.md) receives the asset's resolved handler as `ct
 
 #### `get_connection()`
 
-Context manager: a connection in the handler's session, closed when the block exits. The session uses UTC, the time zone of daily and hourly partition bounds, and fetches `NUMBER` columns with a scale as decimals, as reads do.
+Context manager: a connection in the handler's session, closed when the block exits. The session uses UTC, the time zone of daily and hourly partition bounds, and fetches `NUMBER` columns with a scale as decimals, as reads do. It binds parameters as `%s` (pyformat), also when `connection_args` sets another `paramstyle`.
 
 #### `table_name(asset_name, asset_metadata)`
 
