@@ -46,14 +46,6 @@ def _shop_repo(shop, storage, run_with, amounts=PAYMENTS) -> rs.CodeRepository:
     return repository(shop, assets, storage, run_with.executor)
 
 
-# A parallel worker drops the outputs that a generator yielded before it raised
-# (core, executor/parallel/worker.rs); in process, they keep their materializations.
-_WORKERS_DROP_YIELDED_OUTPUTS = pytest.mark.xfail(
-    reason="a parallel worker drops the outputs a generator yielded before it raised",
-    raises=AssertionError,
-)
-
-
 def _ran_in_worker(metadata: dict) -> bool:
     [pid] = {metadata[name]["pid"] for name in metadata if name in SHOP_OUTPUTS}
     return pid != os.getpid()
@@ -162,9 +154,7 @@ def test_include_upstream_follows_refs_through_ephemeral_models(shop, storage):
     }
 
 
-def test_a_failed_model_fails_with_what_it_skipped(shop, storage, run_with, request):
-    if run_with.in_worker:
-        request.applymarker(_WORKERS_DROP_YIELDED_OUTPUTS)
+def test_a_failed_model_fails_with_what_it_skipped(shop, storage, run_with):
     repo = _shop_repo(shop, storage, run_with, amounts=["5", "oops", "3"])
 
     result = repo.materialize(raise_on_error=False)
@@ -189,9 +179,7 @@ def test_a_failed_model_fails_with_what_it_skipped(shop, storage, run_with, requ
     assert "main.customers" not in tables(shop)
 
 
-def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with, request):
-    if run_with.in_worker:
-        request.applymarker(_WORKERS_DROP_YIELDED_OUTPUTS)
+def test_a_failed_test_fails_the_output_it_tests(shop, storage, run_with):
     repo = _shop_repo(shop, storage, run_with, amounts=["5", "-4", "3"])
 
     result = repo.materialize(raise_on_error=False)
