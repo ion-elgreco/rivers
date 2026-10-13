@@ -57,12 +57,12 @@ _REGIONS = rs.PartitionsDefinition.static_(["us", "eu"])
 _BY_REGION = {"snowflake/partition_expr": "region"}
 
 
-def _write_region(handler, region: str, values: list) -> None:
+def _write_region(handler, region: str, values: list, definition=_REGIONS) -> None:
     handler.handle_output(
         rs.OutputContext(
             asset_name="t",
             asset_metadata=_BY_REGION,
-            partition=_partition(_REGIONS, rs.PartitionKey.single(region)),
+            partition=_partition(definition, rs.PartitionKey.single(region)),
         ),
         pa.table({"region": [region] * len(values), "v": values}),
     )
@@ -327,6 +327,38 @@ def test_static_partition_overwrite(warehouse):
         partition=_partition(_REGIONS, rs.PartitionKey.single("eu")),
     )
     assert eu.to_pylist() == [{"region": "eu", "v": 3}]
+
+
+_ODD_KEYS = ["us", "a\\b", "us\\", "x\\' OR 1=1 --"]
+
+
+@pytest.mark.parametrize(
+    "key", _ODD_KEYS[1:], ids=["backslash", "trailing-backslash", "injection"]
+)
+def test_keys_with_backslashes_select_only_their_rows(warehouse, key):
+    """Snowflake reads backslash escapes in string literals."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    definition = rs.PartitionsDefinition.static_(_ODD_KEYS)
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table({"region": _ODD_KEYS, "v": list(range(len(_ODD_KEYS)))}),
+    )
+
+    _write_region(handler, key, [9], definition)
+
+    expected = {region: v for v, region in enumerate(_ODD_KEYS)} | {key: 9}
+    assert sorted(_rows(warehouse, 'SELECT "REGION", "V" FROM "PUBLIC"."T"')) == sorted(
+        expected.items()
+    )
+    for region, v in expected.items():
+        read = _load(
+            handler,
+            "t",
+            pa.Table,
+            asset_metadata=_BY_REGION,
+            partition=_partition(definition, rs.PartitionKey.single(region)),
+        )
+        assert read.to_pylist() == [{"region": region, "v": v}]
 
 
 @pytest.mark.parametrize("process_wide", [False, True], ids=["resource", "process"])

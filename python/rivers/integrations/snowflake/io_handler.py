@@ -103,7 +103,7 @@ class SnowflakeIOHandler(BaseIOHandler):
                 "metadata key to map the partition to the table's columns"
             )
 
-        return _build_predicate(partition, expr)
+        return _build_predicate(partition, expr, quote=_literal)
 
     def get_connection(self) -> AbstractContextManager[SnowflakeConnection]:
         """A connection in the handler's session, closed when the block exits.
@@ -214,6 +214,11 @@ class SnowflakeIOHandler(BaseIOHandler):
 def _quote(name: str) -> str:
     """Quote ``name``, uppercased, as a Snowflake identifier."""
     return '"' + name.upper().replace('"', '""') + '"'
+
+
+def _literal(value: str) -> str:
+    """``value`` as a Snowflake string literal, in which a backslash starts an escape."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 def quote_table(schema: str, table: str) -> str:

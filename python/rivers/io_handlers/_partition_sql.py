@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel
@@ -78,12 +79,12 @@ def _dim_filters(
     return _col_filters(col, vals)
 
 
-def _render(filters: list[Filter]) -> str:
+def _render(filters: list[Filter], quote: Callable[[str], str]) -> str:
     """The SQL predicate for a conjunction of filters."""
     return " AND ".join(
-        f"{col} IN ({', '.join(_sql_quote(v) for v in value)})"
+        f"{col} IN ({', '.join(quote(v) for v in value)})"
         if op == "in"
-        else f"{col} {op} {_sql_quote(value)}"
+        else f"{col} {op} {quote(value)}"
         for col, op, value in filters
     )
 
@@ -129,9 +130,10 @@ def _build_predicate_for_key(
     key: PartitionKey,
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
+    quote: Callable[[str], str],
 ) -> str:
     """Build a SQL predicate for a single partition key."""
-    return _render(_filters_for_key(key, definition, partition_expr))
+    return _render(_filters_for_key(key, definition, partition_expr), quote)
 
 
 def _build_partition_filters(
@@ -153,13 +155,16 @@ def _build_partition_filters(
 
 
 def _build_predicate(
-    partition: PartitionContext, partition_expr: PartitionExpr | None
+    partition: PartitionContext,
+    partition_expr: PartitionExpr | None,
+    quote: Callable[[str], str] = _sql_quote,
 ) -> str:
     """Build a SQL predicate covering all partition keys in the context.
 
     For normal materialization (1 key), produces a simple predicate.
     For backfill with multiple keys, produces an OR of per-key predicates
-    or an IN clause when possible.
+    or an IN clause when possible. ``quote`` renders each value as a
+    string literal; the default doubles single quotes.
     """
     if partition_expr is None:
         raise ValueError(
@@ -168,7 +173,9 @@ def _build_predicate(
 
     keys = partition.keys
     if len(keys) == 1:
-        return _build_predicate_for_key(keys[0], partition.definition, partition_expr)
+        return _build_predicate_for_key(
+            keys[0], partition.definition, partition_expr, quote
+        )
 
     # Multiple keys (backfill): try to build an efficient combined predicate
     # For Single keys with static partitions, merge into one IN clause
@@ -179,7 +186,7 @@ def _build_predicate(
         # Check if time-windowed — need OR of range predicates
         if isinstance(partition.definition, PartitionsDefinition.TimeWindow):
             predicates = [
-                _build_predicate_for_key(k, partition.definition, partition_expr)
+                _build_predicate_for_key(k, partition.definition, partition_expr, quote)
                 for k in keys
             ]
             return " OR ".join(f"({p})" for p in predicates)
@@ -188,7 +195,7 @@ def _build_predicate(
         for k in keys:
             assert isinstance(k, PartitionKey.Single)
             all_vals.extend(k.key)
-        return _render(_col_filters(col, all_vals))
+        return _render(_col_filters(col, all_vals), quote)
 
     # Multi-dimension keys: factor out shared dimension values into AND + IN
     # e.g. keys [(region=us, tier=free), (region=us, tier=pro)]
@@ -198,12 +205,13 @@ def _build_predicate(
         partition_expr.expr, dict
     ):
         return _build_factored_multi_predicate(
-            keys, partition.definition, partition_expr
+            keys, partition.definition, partition_expr, quote
         )
 
     # Fallback: OR of individual predicates
     predicates = [
-        _build_predicate_for_key(k, partition.definition, partition_expr) for k in keys
+        _build_predicate_for_key(k, partition.definition, partition_expr, quote)
+        for k in keys
     ]
     if len(predicates) == 1:
         return predicates[0]
@@ -214,6 +222,7 @@ def _build_factored_multi_predicate(
     keys: list[PartitionKey],
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
+    quote: Callable[[str], str],
 ) -> str:
     """Build an optimized predicate for multiple multi-dimension partition keys.
 
@@ -255,7 +264,7 @@ def _build_factored_multi_predicate(
     if expected_count != len(keys):
         # Not a full cartesian product — fall back to OR of individual predicates
         predicates = [
-            _build_predicate_for_key(k, definition, partition_expr) for k in keys
+            _build_predicate_for_key(k, definition, partition_expr, quote) for k in keys
         ]
         return " OR ".join(f"({p})" for p in predicates)
 
@@ -266,5 +275,6 @@ def _build_factored_multi_predicate(
             for f in _dim_filters(
                 partition_expr.expr[dim], dim_values[dim], dim_defs.get(dim)
             )
-        ]
+        ],
+        quote,
     )

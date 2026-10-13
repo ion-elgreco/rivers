@@ -1,4 +1,4 @@
-"""Partition-key SQL predicates shared by the Delta and DuckDB handlers."""
+"""Partition-key SQL predicates shared by the Delta, DuckDB and Snowflake handlers."""
 
 from datetime import datetime
 
@@ -149,4 +149,53 @@ def test_backfill_predicate_multi_three_dims_partial_cartesian():
     assert (
         pred
         == "env IN ('staging', 'prod') AND region = 'us' AND tier IN ('free', 'pro')"
+    )
+
+
+def test_default_quote_keeps_backslashes():
+    """DuckDB and DataFusion read a backslash as itself: only quotes are doubled."""
+    ctx = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("C:\\it's")],
+        definition=rs.PartitionsDefinition.static_(["C:\\it's"]),
+    )
+    assert _build_predicate(ctx, PartitionExpr(expr="col")) == "col = 'C:\\it''s'"
+
+
+def test_quote_renders_every_value():
+    """Keys, IN lists, time bounds, and factored dimensions all go through ``quote``."""
+
+    def angle(value: str) -> str:
+        return f"<{value}>"
+
+    def predicate(definition, expr, *keys):
+        ctx = rs.PartitionContext(keys=list(keys), definition=definition)
+        return _build_predicate(ctx, PartitionExpr(expr=expr), quote=angle)
+
+    single = rs.PartitionKey.single
+    static = rs.PartitionsDefinition.static_(["a", "b"])
+    assert predicate(static, "col", single("a")) == "col = <a>"
+    assert predicate(static, "col", single("a"), single("b")) == "col IN (<a>, <b>)"
+
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+    assert predicate(daily, "day", single("2024-01-15"), single("2024-01-16")) == (
+        "(day >= <2024-01-15> AND day < <2024-01-16>) OR "
+        "(day >= <2024-01-16> AND day < <2024-01-17>)"
+    )
+
+    multi = rs.PartitionsDefinition.multi(
+        {
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+            "tier": rs.PartitionsDefinition.static_(["free", "pro"]),
+        }
+    )
+    dims = {"region": "region", "tier": "tier"}
+    us_free, us_pro, eu_pro = (
+        rs.PartitionKey.multi({"region": region, "tier": tier})
+        for region, tier in (("us", "free"), ("us", "pro"), ("eu", "pro"))
+    )
+    assert predicate(multi, dims, us_free, us_pro) == (
+        "region = <us> AND tier IN (<free>, <pro>)"
+    )
+    assert predicate(multi, dims, us_free, eu_pro) == (
+        "(region = <us> AND tier = <free>) OR (region = <eu> AND tier = <pro>)"
     )

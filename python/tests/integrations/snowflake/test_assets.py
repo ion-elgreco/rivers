@@ -190,6 +190,27 @@ def test_delete_with_qmark_paramstyle(warehouse, monkeypatch, process_wide):
     assert _rows(warehouse, 'SELECT "REGION" FROM "PUBLIC"."EVENTS"') == [("eu",)]
 
 
+def test_keyed_delete_with_a_backslash_in_the_key(warehouse):
+    """Snowflake reads backslash escapes in string literals."""
+    keys = ["us", "a\\b", "us\\", "x\\' OR 1=1 --"]
+    handler = SnowflakeIOHandler(resource=warehouse)
+    handler.handle_output(
+        rs.OutputContext(asset_name="events"),
+        pa.table({"region": keys, "v": list(range(len(keys)))}),
+    )
+
+    partition = rs.PartitionContext(
+        keys=[rs.PartitionKey.single("x\\' OR 1=1 --")],
+        definition=rs.PartitionsDefinition.static_(keys),
+    )
+    meta = {"snowflake/partition_expr": "region"}
+    SnowflakeAsset.delete(_action_context(handler, partition, meta))
+
+    assert _rows(
+        warehouse, 'SELECT "REGION", "V" FROM "PUBLIC"."EVENTS" ORDER BY "V"'
+    ) == [("us", 0), ("a\\b", 1), ("us\\", 2)]
+
+
 def test_keyed_delete_without_partition_expr_names_the_key():
     resource = SnowflakeResource(account="unreachable", user="u", password="p")
     partition = rs.PartitionContext(
