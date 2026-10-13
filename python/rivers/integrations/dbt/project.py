@@ -127,7 +127,8 @@ class DbtProject(BaseModel):
         Args:
             select: dbt's ``--select``. Other than the default, the selection
                 runs ``dbt ls`` once per manifest; the result is cached in the
-                target path.
+                target path. ``dbt ls`` needs the profile, like ``dbt parse``,
+                but does not connect to the warehouse.
             exclude: dbt's ``--exclude``.
             selector: A selector from ``selectors.yml``, instead of ``select``
                 and ``exclude``.
@@ -141,6 +142,7 @@ class DbtProject(BaseModel):
 
         Raises:
             FileNotFoundError: When the manifest does not exist.
+            DbtError: When ``dbt ls`` fails, e.g. without the profile.
             ValueError: When the selection matches no model, seed, or snapshot,
                 an output has no name, or two resources in the project get the
                 same output name.

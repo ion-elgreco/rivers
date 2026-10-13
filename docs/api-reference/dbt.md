@@ -50,11 +50,11 @@ A decorator that builds a multi-asset with one output per selected model, seed, 
 
 | Parameter | Description |
 |-----------|-------------|
-| `select` | dbt's `--select`. A selection other than the default runs `dbt ls` once per manifest; the result is cached in the target directory. |
+| `select` | dbt's `--select`. A selection other than the default runs `dbt ls` once per manifest; the result is cached in the target directory. `dbt ls` needs the profile, like `dbt parse`, but does not connect to the warehouse. See [Select resources](../guides/dbt.md#select-resources). |
 | `exclude` | dbt's `--exclude`. |
 | `selector` | A selector from `selectors.yml`. Raises `ValueError` with `select` or `exclude`. |
 
-Raises `FileNotFoundError` when the manifest does not exist, and `DbtError` when `dbt ls` fails. Raises `ValueError` when the selection has no model, seed, or snapshot, when an output has no name, or when two resources of the project get the same output name.
+Raises `FileNotFoundError` when the manifest does not exist, and `DbtError` when `dbt ls` fails, e.g. without the profile. Raises `ValueError` when the selection has no model, seed, or snapshot, when an output has no name, or when two resources of the project get the same output name.
 
 When the body runs, each argument that is a `DbtResource` is bound to the outputs, so its `cli(args, context)` selects them and yields their materializations. Its commands start from the `partial_parse.msgpack` in the project's `target_path`. The body must take the resource as a parameter: a body that makes its own `DbtResource` instead raises `TypeError`.
 

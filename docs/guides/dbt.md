@@ -59,7 +59,7 @@ Other keyword arguments go to `rs.Asset.from_multi`, e.g. `name`, `group` (for r
 `DbtProject` reads `manifest.json` from the target directory. Write it before the code location loads, e.g. when you build its image:
 
 ```bash
-dbt parse --project-dir analytics
+dbt parse --project-dir analytics --profiles-dir analytics
 ```
 
 `project.prepare()` does the same: it runs `dbt parse` and replaces the manifest in one step. During development, call it in the module, so that a reload picks up your dbt changes:
@@ -69,7 +69,7 @@ project = DbtProject(Path(__file__).parent / "analytics")
 project.prepare()
 ```
 
-`prepare()` uses the profile, like other dbt commands. When the project uses packages, run `dbt deps` first.
+`prepare()` uses the profile, like other dbt commands. A [selection](#select-resources) also uses it when the definitions load. When the project uses packages, run `dbt deps` first. Parse with the target that the runs use: the manifest records the database and schema of each table, which go into `dbt/relation`, so use a placeholder only for a secret.
 
 | `DbtProject` field | Default | Description |
 |--------------------|---------|-------------|
@@ -158,7 +158,16 @@ def incremental(context: rs.AssetExecutionContext, dbt: DbtResource): ...
 def analytics(context: rs.AssetExecutionContext, dbt: DbtResource): ...
 ```
 
-A selection other than the default runs `dbt ls` when the definitions load. The result is cached in the target directory, for that manifest.
+A selection other than the default runs `dbt ls` when the definitions load. `dbt ls` needs what `dbt parse` needs, e.g. `profiles.yml` and each env var that the profile or the project reads. dbt does not connect to the warehouse, so a placeholder for a secret, such as a password, is enough.
+
+rivers caches the result in the target directory. The load runs `dbt ls` again for a new selection or a new manifest: each `dbt parse` or `prepare()` writes a new manifest, also when no file changed. To put the cache in the image, load the definitions once when you build it, after `dbt parse`:
+
+```bash
+dbt parse --project-dir analytics --profiles-dir analytics
+python -c "import my_module"   # the code location's module
+```
+
+The code location then loads without `dbt ls`, so the load does not need the profile.
 
 A dep on a resource outside the selection refers to that resource's output by name. Names are project-wide: the project's `asset_def_fn` builds the output of every model, seed, and snapshot, also of the ones that a definition does not select. So a dep has the same name in every definition. Define every resource that the selected resources ref, e.g. with a second definition as above: a dep on an asset that no definition builds fails the repository's validation.
 
