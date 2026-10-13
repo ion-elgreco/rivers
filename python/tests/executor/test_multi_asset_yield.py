@@ -1193,10 +1193,7 @@ def test_generator_body_output_is_captured(
 
     stdout, logs = _captured(storage, result.run_id, "ga")
     assert stdout == "first\nsecond\n"
-    # An async body, plain or generator, logs on the event loop's thread,
-    # where no capture runs.
-    if not is_async:
-        assert "log from the body" in logs
+    assert "log from the body" in logs
     assert result.success is not fails
 
 

@@ -45,7 +45,8 @@ pub(crate) struct StepInstance {
 pub(crate) type CapturedLogs = Option<(String, String, String)>;
 
 /// What a step body writes while it runs in this process: stdout and stderr
-/// through `rivers._capture`, and this thread's Rust logs.
+/// through `rivers._capture`, and the Rust logs of this thread and of the
+/// step's context.
 pub(crate) struct StepCapture<'py>(Option<Bound<'py, PyAny>>);
 
 impl<'py> StepCapture<'py> {
@@ -56,8 +57,7 @@ impl<'py> StepCapture<'py> {
             .and_then(|cls| cls.call0())
             .ok()
             .inspect(|c| {
-                let _ = c.call_method0("start");
-                crate::log_capture::start();
+                let _ = c.call_method1("start", (crate::log_capture::start(),));
             });
         Self(capture)
     }

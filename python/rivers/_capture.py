@@ -70,9 +70,15 @@ class StepCapture:
 
     __slots__ = ("_bufs", "_token", "_done")
 
-    def start(self):
-        """Begin capturing stdout/stderr for the current step."""
-        self._bufs = [[], []]
+    def start(self, logs=None):
+        """Begin capturing stdout/stderr for the current step.
+
+        Args:
+            logs: The step's Rust log buffer. A Python log record logged in the
+                step's context, on a thread that does not capture (the event
+                loop's thread of async steps), goes to it.
+        """
+        self._bufs = [[], [], logs]
         self._token = _capture.set(self._bufs)  # type: ignore
         self._done = False
 

@@ -106,6 +106,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     pyo3_pylogger::setup_logging(m.py(), "rivers")?;
+    log_capture::route_python_records(m.py())?;
 
     // Set root logger level to DEBUG so Python doesn't filter before the HostHandler;
     // actual filtering is done by the Rust EnvFilter above.

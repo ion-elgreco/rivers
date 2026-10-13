@@ -170,8 +170,9 @@ def test_build_logs_dbt_output(shop, storage, caplog, is_async):
     repo = repository(shop, assets, storage)
 
     with caplog.at_level("INFO"):
-        assert repo.materialize().success
+        result = repo.materialize()
 
+    assert result.success
     messages = [(record.levelname, record.getMessage()) for record in caplog.records]
     assert any(
         level == "INFO" and "OK created sql table model main.customers" in message
@@ -181,6 +182,8 @@ def test_build_logs_dbt_output(shop, storage, caplog, is_async):
         level == "WARNING" and "warn_large_orders" in message
         for level, message in messages
     )
+    log = "".join(row.logs or "" for row in storage.get_run_logs(result.run_id))
+    assert "OK created sql table model main.customers" in log
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])

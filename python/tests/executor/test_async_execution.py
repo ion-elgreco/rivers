@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import select
 import signal
 import subprocess
@@ -539,6 +540,72 @@ def test_async_multi_asset_dict_return(executor_kind):
     repo.materialize()
     assert repo.load_node("p") == 100
     assert repo.load_node("q") == 200
+
+
+# ── Run log ──
+
+
+def _logged(storage, run_id: str, step_key: str) -> list[str]:
+    """The ``<name> says <i>`` messages in the step's run log, in order."""
+    logs = "".join(
+        row.logs or ""
+        for row in storage.get_run_logs(run_id)
+        if row.step_key == step_key
+    )
+    return re.findall(r"\w+ says \d", logs)
+
+
+@pytest.mark.parametrize("kind", ["sync", "async", "async_generator"])
+@pytest.mark.parametrize("executor_kind", ["in_process", "parallel"])
+def test_each_step_run_log_has_its_own_log_lines(executor_kind, kind, storage):
+    """Two steps of one level log with ``context.log``: each run log has the
+    step's own lines, and none of the other's. The async steps share one event
+    loop and wait for each other after each line, so their lines interleave."""
+    barrier = asyncio.Barrier(2)
+
+    async def log_in_turns(context: rs.AssetExecutionContext, name: str):
+        for i in range(3):
+            context.log.info("%s says %d", name, i)
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+
+    def logging_step(name: str):
+        if kind == "sync":
+
+            @rs.Asset(name=name)
+            def step(context: rs.AssetExecutionContext) -> rs.Materialization:
+                for i in range(3):
+                    context.log.info("%s says %d", name, i)
+                return rs.Materialization()
+
+        elif kind == "async":
+
+            @rs.Asset(name=name)
+            async def step(context: rs.AssetExecutionContext) -> rs.Materialization:
+                await log_in_turns(context, name)
+                return rs.Materialization()
+
+        else:
+
+            @rs.Asset.from_multi(output_defs=[rs.AssetDef(name)], name=f"multi_{name}")
+            async def step(context: rs.AssetExecutionContext):
+                await log_in_turns(context, name)
+                yield rs.Materialization(output_name=name)
+
+        return step
+
+    repo = rs.CodeRepository(
+        assets=[logging_step("a"), logging_step("b")],
+        default_executor=rs.Executor.in_process()
+        if executor_kind == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+
+    result = repo.materialize(raise_on_error=False)
+
+    assert result.success
+    assert _logged(storage, result.run_id, "a") == ["a says 0", "a says 1", "a says 2"]
+    assert _logged(storage, result.run_id, "b") == ["b says 0", "b says 1", "b says 2"]
 
 
 # ── Event loop lifecycle ──

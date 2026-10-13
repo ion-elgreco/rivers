@@ -174,8 +174,6 @@ async def export_orders(dbt: DbtResource) -> None:
 
 When rivers cancels an async step, e.g. on Ctrl-C, dbt stops as it does for a sync body. It gets an interrupt, so that it cancels its queries, and rivers kills it when it still runs 25 seconds later. On Windows, rivers ends dbt at once.
 
-rivers does not keep the log of an async step in the run log yet. dbt's log still goes to `context.log`, so it shows in the log of the process that runs the step.
-
 ## Select resources
 
 `select`, `exclude`, and `selector` take dbt's [node selection syntax](https://docs.getdbt.com/reference/node-selection/syntax). Use them to split a project into definitions, e.g. to partition the incremental models:

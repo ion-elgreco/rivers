@@ -151,7 +151,7 @@ def print_after_finish():
             for i in range(LATE_LINES):
                 print(f"late {i}")
                 sys.stderr.writelines([f"late {i}\n"])
-            held.extend(len(buf) for buf in cap._get())
+            held.extend(len(buf) for buf in cap._get()[:2])
         except BaseException as e:
             errors.append(f"{type(e).__name__}: {e}")
 
