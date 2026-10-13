@@ -1,5 +1,6 @@
 """SnowflakeAsset's delete action against a fakesnow server."""
 
+import json
 from datetime import date, datetime
 
 import pytest
@@ -111,6 +112,71 @@ def test_backfill_delete_removes_each_day(storage, warehouse):
         (date(2024, 1, 2),)
     ]
     assert storage.get_materialized_partitions("daily") == [keys[1]]
+
+
+def test_backfill_over_days_of_a_timestamp_column(storage, warehouse):
+    """One run over several days selects each day's range of a timestamp column:
+    a rerun replaces the rows, and a read and the delete find them."""
+    days = ["2024-01-01", "2024-01-02", "2024-01-03"]
+
+    class Events(SnowflakeAsset):
+        name = "events"
+        io_handler = SnowflakeIOHandler(resource=warehouse)
+        partitions_def = rs.PartitionsDefinition.multi(
+            {
+                "region": _REGIONS,
+                "date": rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)),
+            }
+        )
+        metadata = {
+            "snowflake/partition_expr": json.dumps({"region": "region", "date": "ts"})
+        }
+
+        @classmethod
+        def materialize(cls, context: rs.AssetExecutionContext) -> pa.Table:
+            keys = [key.keys for key in context.partition.keys]
+            return pa.table(
+                {
+                    "region": [key["region"][0] for key in keys],
+                    "ts": [
+                        datetime.fromisoformat(key["date"][0]).replace(hour=10)
+                        for key in keys
+                    ],
+                }
+            )
+
+    repo = make_repo([Events], storage)
+    count = 'SELECT "REGION", COUNT(*) FROM "PUBLIC"."EVENTS" GROUP BY 1 ORDER BY 1'
+
+    def keys(region: str) -> list[rs.PartitionKey]:
+        return [rs.PartitionKey.multi({"region": region, "date": day}) for day in days]
+
+    def backfill(region: str, action: str | None = None) -> None:
+        result = repo.backfill(
+            selection=["events"],
+            partition_keys=keys(region),
+            strategy=rs.BackfillStrategy.single_run(),
+            action=action,
+        )
+        assert (result.status, result.num_runs) == ("CompletedSuccess", 1)
+
+    backfill("eu")
+    backfill("us")
+    backfill("us")
+    assert _rows(warehouse, count) == [("eu", 3), ("us", 3)]
+
+    us = repo.load_node(
+        "events",
+        partition_key=rs.PartitionKey.multi({"region": "us", "date": days}),
+        type_hint=pa.Table,
+    )
+    assert us.sort_by("ts").to_pylist() == [
+        {"region": "us", "ts": datetime(2024, 1, day, 10)} for day in (1, 2, 3)
+    ]
+
+    backfill("us", action="delete")
+    assert _rows(warehouse, count) == [("eu", 3)]
+    assert set(storage.get_materialized_partitions("events")) == set(keys("eu"))
 
 
 def test_keyless_delete_removes_every_row_and_keeps_the_table(storage, warehouse):

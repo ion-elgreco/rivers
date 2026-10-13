@@ -442,6 +442,44 @@ def test_hourly_partition_overwrite_on_a_timestamp_column(warehouse, tz):
     ]
 
 
+def test_a_key_with_several_days_reads_each_day(warehouse):
+    """Mapped reads (specific_partitions, multi_to_single) pass one key with several days."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    at_ten = [datetime(2024, 1, day, 10) for day in (1, 2, 3)]
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table({"region": ["us", "eu", "us"], "ts": at_ten}),
+    )
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+    days = ["2024-01-01", "2024-01-02"]
+
+    by_day = _load(
+        handler,
+        "t",
+        pa.Table,
+        asset_metadata={"snowflake/partition_expr": "ts"},
+        partition=_partition(daily, rs.PartitionKey.single(days)),
+    )
+    us = _load(
+        handler,
+        "t",
+        pa.Table,
+        asset_metadata={
+            "snowflake/partition_expr": json.dumps({"region": "region", "date": "ts"})
+        },
+        partition=_partition(
+            rs.PartitionsDefinition.multi({"region": _REGIONS, "date": daily}),
+            rs.PartitionKey.multi({"region": "us", "date": days}),
+        ),
+    )
+
+    assert by_day.sort_by("ts").to_pylist() == [
+        {"region": "us", "ts": at_ten[0]},
+        {"region": "eu", "ts": at_ten[1]},
+    ]
+    assert us.to_pylist() == [{"region": "us", "ts": at_ten[0]}]
+
+
 def test_multi_partition_overwrite(warehouse):
     handler = SnowflakeIOHandler(resource=warehouse)
     definition = rs.PartitionsDefinition.multi(

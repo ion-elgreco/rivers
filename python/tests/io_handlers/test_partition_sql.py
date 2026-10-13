@@ -199,3 +199,54 @@ def test_quote_renders_every_value():
     assert predicate(multi, dims, us_free, eu_pro) == (
         "(region = <us> AND tier = <free>) OR (region = <eu> AND tier = <pro>)"
     )
+
+
+def test_factored_days_become_an_or_of_ranges():
+    """Several days in a batch select each day's range, so the column can be a timestamp."""
+    definition = rs.PartitionsDefinition.multi(
+        {
+            "region": rs.PartitionsDefinition.static_(["us", "eu"]),
+            "date": rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)),
+        }
+    )
+    ctx = rs.PartitionContext(
+        keys=[
+            rs.PartitionKey.multi({"region": region, "date": day})
+            for region in ("us", "eu")
+            for day in ("2024-01-15", "2024-01-16")
+        ],
+        definition=definition,
+    )
+
+    pred = _build_predicate(
+        ctx,
+        PartitionExpr(expr={"region": "region", "date": "ts"}),
+        quote=lambda value: f"<{value}>",
+    )
+
+    assert pred == (
+        "((ts >= <2024-01-15> AND ts < <2024-01-16>) OR "
+        "(ts >= <2024-01-16> AND ts < <2024-01-17>)) AND region IN (<us>, <eu>)"
+    )
+
+
+def test_a_key_with_several_days_selects_each_range():
+    """Mapped reads (specific_partitions, multi_to_single) pass one key with several days."""
+    daily = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+    multi = rs.PartitionsDefinition.multi(
+        {"region": rs.PartitionsDefinition.static_(["us", "eu"]), "date": daily}
+    )
+    days = ["2024-01-15", "2024-01-16"]
+    ranges = (
+        "((ts >= '2024-01-15' AND ts < '2024-01-16') OR "
+        "(ts >= '2024-01-16' AND ts < '2024-01-17'))"
+    )
+
+    single = rs.PartitionContext(keys=[rs.PartitionKey.single(days)], definition=daily)
+    assert _build_predicate(single, PartitionExpr(expr="ts")) == ranges
+
+    us = rs.PartitionContext(
+        keys=[rs.PartitionKey.multi({"region": "us", "date": days})], definition=multi
+    )
+    expr = PartitionExpr(expr={"region": "region", "date": "ts"})
+    assert _build_predicate(us, expr) == f"{ranges} AND region = 'us'"
