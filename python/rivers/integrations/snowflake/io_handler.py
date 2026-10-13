@@ -145,6 +145,7 @@ class SnowflakeIOHandler(BaseIOHandler):
         Accepts a pyarrow ``Table`` or ``RecordBatchReader``, a polars
         ``DataFrame`` or ``LazyFrame``, a pandas ``DataFrame``, or another
         object that exports an Arrow stream (``__arrow_c_stream__``). A
+        polars frame is converted to Arrow one slice at a time. A
         ``LazyFrame`` runs in batches (``collect_batches``), so its whole
         result is never in memory.
 
@@ -525,23 +526,36 @@ def _arrow_type(column: ResultMetadata) -> pa.DataType | None:
 
 
 def _to_reader(obj: Any) -> pa.RecordBatchReader:
-    """``obj`` as an Arrow stream, without importing polars or pandas."""
+    """``obj`` as an Arrow stream in types that the Parquet writer can write."""
+    reader = _arrow_stream(obj)
+    schema = pa.schema(
+        [field.with_type(_writable(field.type)) for field in reader.schema],
+        metadata=reader.schema.metadata,
+    )
+    return reader if schema == reader.schema else reader.cast(schema)
+
+
+def _arrow_stream(obj: Any) -> pa.RecordBatchReader:
+    """``obj`` as an Arrow stream, without importing polars or pandas.
+
+    A polars frame is converted one slice at a time.
+    """
     if isinstance(obj, pa.Table):
         return obj.to_reader()
     if isinstance(obj, pa.RecordBatchReader):
         return obj
 
     pl = sys.modules.get("polars")
-    if pl is not None and isinstance(obj, pl.DataFrame):
-        return obj.to_arrow().to_reader()
-    if pl is not None and isinstance(obj, pl.LazyFrame):
-        # to_arrow, not the frames' Arrow streams: the Parquet writer cannot
-        # write the dictionary<string_view> columns that a stream exports
+    if pl is not None and isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
         schema = pl.DataFrame(schema=obj.collect_schema()).to_arrow().schema
+        # collect_batches gives a frame in memory whole, as one batch
         batches = (
             batch
-            for frame in obj.collect_batches()
-            for batch in frame.to_arrow().to_batches()
+            for frame in obj.lazy().collect_batches()
+            for part in frame.iter_slices(
+                _rows_per_file(frame.height, frame.estimated_size())
+            )
+            for batch in part.to_arrow().to_batches()
         )
         return pa.RecordBatchReader.from_batches(schema, batches)
 
@@ -559,6 +573,41 @@ def _to_reader(obj: Any) -> pa.RecordBatchReader:
     )
 
 
+# The Parquet writer cannot write a dictionary of views, the type of polars'
+# Categorical and Enum columns in an Arrow stream
+_VIEWS = {pa.string_view(): pa.large_string(), pa.binary_view(): pa.large_binary()}
+
+
+def _writable(t: pa.DataType) -> pa.DataType:
+    """``t`` with ``large_string`` and ``large_binary`` for the view values of its
+    dictionaries, also of dictionaries in lists, structs, and maps."""
+    if pa.types.is_dictionary(t):
+        values = _VIEWS.get(t.value_type, t.value_type)
+        return pa.dictionary(t.index_type, values, t.ordered)
+
+    if pa.types.is_struct(t):
+        return pa.struct([field.with_type(_writable(field.type)) for field in t])
+    if pa.types.is_map(t):
+        return pa.map_(
+            t.key_field.with_type(_writable(t.key_type)),
+            t.item_field.with_type(_writable(t.item_type)),
+            t.keys_sorted,
+        )
+    if pa.types.is_list(t):
+        return pa.list_(t.value_field.with_type(_writable(t.value_type)))
+    if pa.types.is_large_list(t):
+        return pa.large_list(t.value_field.with_type(_writable(t.value_type)))
+    if pa.types.is_fixed_size_list(t):
+        item = t.value_field.with_type(_writable(t.value_type))
+        return pa.list_(item, t.list_size)
+    return t
+
+
+def _rows_per_file(rows: int, nbytes: int) -> int:
+    """How many of ``rows`` rows in ``nbytes`` bytes make about ``_FILE_SIZE`` bytes, at least one."""
+    return max(1, rows * _FILE_SIZE // max(nbytes, 1))
+
+
 def _parquet_files(reader: pa.RecordBatchReader) -> Iterator[io.BytesIO]:
     """The rows as Parquet files, each from about ``_FILE_SIZE`` bytes of Arrow data.
 
@@ -568,7 +617,7 @@ def _parquet_files(reader: pa.RecordBatchReader) -> Iterator[io.BytesIO]:
     batches: list[pa.RecordBatch] = []
     size = 0
     for batch in reader:
-        rows = max(1, batch.num_rows * _FILE_SIZE // max(batch.nbytes, 1))
+        rows = _rows_per_file(batch.num_rows, batch.nbytes)
         for offset in range(0, batch.num_rows, rows):
             batches.append(batch.slice(offset, rows))
             size += batches[-1].nbytes

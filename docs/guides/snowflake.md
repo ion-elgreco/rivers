@@ -114,7 +114,7 @@ The role needs `USAGE` on the database and the schema, `CREATE STAGE` on the sch
 | `polars.LazyFrame` | yes | yes |
 | `pandas.DataFrame` | yes | yes |
 
-A `LazyFrame` output runs in batches with `collect_batches`, so its whole result is never in memory. A read needs a type hint on the downstream parameter. It fetches the rows as Arrow. A `RecordBatchReader` or `LazyFrame` input holds rows that are already fetched. A pandas index is not written.
+polars `DataFrame` and `LazyFrame` outputs are converted to Arrow one slice at a time, so only one file's rows are in memory in addition to the frame. A `LazyFrame` runs in batches with `collect_batches`, so its whole result is never in memory. A pandas `DataFrame` is converted whole, and its index is not written. A read needs a type hint on the downstream parameter. It fetches the rows as Arrow. A `RecordBatchReader` or `LazyFrame` input holds rows that are already fetched.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

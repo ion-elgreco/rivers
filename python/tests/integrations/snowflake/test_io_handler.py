@@ -198,6 +198,89 @@ def test_nested_values_round_trip(warehouse):
     }
 
 
+_CATEGORIES = pl.DataFrame(
+    {
+        "id": [1, 2, 3],
+        "cat": pl.Series(["x", None, "y"], dtype=pl.Categorical),
+        "enm": pl.Series(["lo", "hi", None], dtype=pl.Enum(["lo", "hi"])),
+        "cats": pl.Series([["a", None], None, ["b"]], dtype=pl.List(pl.Categorical)),
+        "pair": pl.Series(
+            [["a", "b"], None, ["c", None]], dtype=pl.Array(pl.Categorical, 2)
+        ),
+        "rec": pl.Series(
+            [{"c": "a"}, {"c": None}, None], dtype=pl.Struct({"c": pl.Categorical})
+        ),
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(
+            lambda: pa.RecordBatchReader.from_stream(_CATEGORIES), id="pyarrow-reader"
+        ),
+        pytest.param(lambda: pa.table(_CATEGORIES), id="pyarrow-table"),
+        pytest.param(lambda: Arro3Reader.from_stream(_CATEGORIES), id="arro3-reader"),
+        pytest.param(lambda: _CATEGORIES, id="polars"),
+        pytest.param(lambda: _CATEGORIES.lazy(), id="polars-lazy"),
+    ],
+)
+def test_categorical_columns_load_from_each_arrow_export(warehouse, make):
+    """polars' Arrow streams hold Categorical and Enum values as dictionaries of
+    string views, also inside lists and structs."""
+    handler = SnowflakeIOHandler(resource=warehouse)
+    handler.handle_output(rs.OutputContext(asset_name="t"), make())
+
+    read = _load(handler, "t", pa.Table).sort_by("id")
+
+    assert read.select(["cat", "enm"]).to_pylist() == [
+        {"cat": "x", "enm": "lo"},
+        {"cat": None, "enm": "hi"},
+        {"cat": "y", "enm": None},
+    ]
+    nested = read.select(["cats", "pair", "rec"]).to_pylist()
+    assert [
+        {name: json.loads(value or "null") for name, value in row.items()}
+        for row in nested
+    ] == [
+        {"cats": ["a", None], "pair": ["a", "b"], "rec": {"c": "a"}},
+        {"cats": None, "pair": None, "rec": {"c": None}},
+        {"cats": ["b"], "pair": ["c", None], "rec": None},
+    ]
+
+
+def test_binary_view_dictionaries_and_nested_view_dictionaries_load(warehouse):
+    handler = SnowflakeIOHandler(resource=warehouse)
+    names = pa.array(["x", "y"], pa.string_view()).dictionary_encode()
+    offsets = pa.array([0, 1, 2], pa.int32())
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"),
+        pa.table(
+            {
+                "id": [1, 2],
+                "raw": pa.array(
+                    [b"\x00", b"\xff"], pa.binary_view()
+                ).dictionary_encode(),
+                "l": pa.ListArray.from_arrays(offsets, names),
+                "m": pa.MapArray.from_arrays(offsets, pa.array(["k", "k"]), names),
+            }
+        ),
+    )
+
+    read = _load(handler, "t", pa.Table).sort_by("id")
+
+    assert read.column("raw").to_pylist() == [b"\x00", b"\xff"]
+    assert [json.loads(value) for value in read.column("l").to_pylist()] == [
+        ["x"],
+        ["y"],
+    ]
+    assert [json.loads(value) for value in read.column("m").to_pylist()] == [
+        {"k": "x"},
+        {"k": "y"},
+    ]
+
+
 def test_empty_read_has_the_types_of_a_read_with_rows(warehouse):
     """For no rows, the connector types the columns by its own rules, not by the table."""
     handler = SnowflakeIOHandler(resource=warehouse)
@@ -1176,6 +1259,56 @@ def test_write_in_several_files(warehouse, monkeypatch, make):
         (2, "b"),
         (3, "c"),
     ]
+
+
+@pytest.mark.parametrize("lazy", [False, True], ids=["polars", "polars-lazy"])
+def test_polars_frame_is_converted_one_slice_at_a_time(warehouse, monkeypatch, lazy):
+    """A lazy frame over a frame in memory gives the whole frame as one batch."""
+    frame = pl.concat(
+        [
+            pl.DataFrame({"id": range(start, start + 100)}).with_columns(
+                name=pl.format("name-{}", "id")
+            )
+            for start in (0, 100, 200)
+        ],
+        rechunk=False,
+    )
+    monkeypatch.setattr(io_module, "_FILE_SIZE", frame.estimated_size() // 5)
+    heights = []
+    to_arrow = pl.DataFrame.to_arrow
+
+    def recording(self, *args, **kwargs):
+        heights.append(self.height)
+        return to_arrow(self, *args, **kwargs)
+
+    monkeypatch.setattr(pl.DataFrame, "to_arrow", recording)
+    handler = SnowflakeIOHandler(resource=warehouse)
+
+    handler.handle_output(
+        rs.OutputContext(asset_name="t"), frame.lazy() if lazy else frame
+    )
+
+    converted = [height for height in heights if height]  # not the empty schema frame
+    assert sum(converted) == frame.height
+    assert max(converted) < frame.height
+    assert (
+        _rows(warehouse, 'SELECT "ID", "NAME" FROM "PUBLIC"."T" ORDER BY "ID"')
+        == frame.rows()
+    )
+
+
+def test_struct_column_with_nulls_loads_across_slices(warehouse, monkeypatch):
+    """polars before 1.43.2 exports a slice of such a column as an invalid struct array."""
+    values = [{"a": i, "b": f"b{i}"} if i % 3 else None for i in range(30)]
+    values[4] = {"a": None, "b": None}
+    frame = pl.DataFrame({"id": range(30), "s": values})
+    monkeypatch.setattr(io_module, "_FILE_SIZE", frame.estimated_size() // 4)
+    handler = SnowflakeIOHandler(resource=warehouse)
+
+    handler.handle_output(rs.OutputContext(asset_name="t"), frame)
+
+    read = _load(handler, "t", pa.Table).sort_by("id")
+    assert [json.loads(s or "null") for s in read.column("s").to_pylist()] == values
 
 
 def test_lazy_frame_is_not_collected(warehouse, monkeypatch):
