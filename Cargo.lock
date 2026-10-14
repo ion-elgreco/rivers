@@ -9413,9 +9413,9 @@ dependencies = [
 
 [[package]]
 name = "test-temp-dir"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b5c3522ef0cc9068ac46bea8b9247f8a7bf8d5584d491925efe17c0a79dddfc"
+checksum = "a8ba54b5647c063fc401398b2230f389fe46c429dc9dcd6a2a0c1c81d262dc06"
 dependencies = [
  "anyhow",
  "derive_more",
