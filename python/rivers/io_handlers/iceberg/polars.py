@@ -37,7 +37,7 @@ class PolarsTypeHandler(ArrowIcebergTypeHandler[PolarsTypes]):
         ``pl.DataFrame`` is collected with the streaming engine. Polars reads
         the files with the table's storage properties, as pyiceberg does.
         """
-        table = request.load_table()
+        table = request.table
         lf = pl.scan_iceberg(
             table,
             snapshot_id=request.snapshot_id,

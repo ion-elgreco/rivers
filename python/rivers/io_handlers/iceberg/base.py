@@ -6,6 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, Generic, Literal, TypeVar
 
 import pyarrow as pa
@@ -69,15 +70,16 @@ class IcebergReadRequest:
             self.partition, require_partition_expr(self.partition_expr)
         )
 
-    def load_table(self) -> Table:
-        """The table to read."""
+    @cached_property
+    def table(self) -> Table:
+        """The table to read, loaded on first use."""
         return self.catalog.load_table(self.identifier)
 
-    def scan(self, table: Table) -> DataScan:
-        """A scan of ``table`` with the partition filter, the columns, and the snapshot."""
-        return table.scan(
+    def scan(self) -> DataScan:
+        """A pyiceberg scan with the partition filter, the columns, and the snapshot."""
+        return self.table.scan(
             row_filter=partition_filter(
-                self.partition, self.partition_expr, table.schema()
+                self.partition, self.partition_expr, self.table.schema()
             ),
             selected_fields=tuple(self.columns) if self.columns else ("*",),
             snapshot_id=self.snapshot_id,

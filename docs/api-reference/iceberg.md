@@ -171,7 +171,7 @@ class MyTypeHandler(IcebergTypeHandler[MyType]):
 | `load_input(request, target_type)` | Read the table. |
 | `handle_output(context, obj, request)` | Write the table and record output metadata. |
 
-`IcebergReadRequest` has the `catalog`, the table `identifier`, the `partition` and `partition_expr`, the `columns`, and the `snapshot_id`. Its helpers are `load_table()`, `scan(table)` (a pyiceberg scan with the partition filter, the columns, and the snapshot), and `predicate` (the partition as a SQL `WHERE` clause). `IcebergWriteRequest` has the resolved write settings.
+`IcebergReadRequest` has the `catalog`, the table `identifier`, the `partition` and `partition_expr`, the `columns`, and the `snapshot_id`. Its helpers are `table` (the pyiceberg table, loaded on first use), `scan()` (a pyiceberg scan with the partition filter, the columns, and the snapshot), and `predicate` (the partition as a SQL `WHERE` clause). `IcebergWriteRequest` has the resolved write settings.
 
 ## `ArrowIcebergTypeHandler`
 
@@ -189,7 +189,7 @@ class MyTypeHandler(ArrowIcebergTypeHandler[MyType]):
         ...
 
     def load_input(self, request: IcebergReadRequest, target_type: type[MyType]) -> MyType:
-        return convert(request.scan(request.load_table()).to_arrow())
+        return convert(request.scan().to_arrow())
 ```
 
 **Built-in handlers** (registered when their library is installed):

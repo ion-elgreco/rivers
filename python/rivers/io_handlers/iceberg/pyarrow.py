@@ -32,7 +32,7 @@ class PyArrowTypeHandler(ArrowIcebergTypeHandler[ArrowTypes]):
         A ``pa.RecordBatchReader`` streams the scan; a ``pa.Table`` reads it
         into memory.
         """
-        scan = request.scan(request.load_table())
+        scan = request.scan()
         if target_type is pa.RecordBatchReader:
             return scan.to_arrow_batch_reader()
         return scan.to_arrow()

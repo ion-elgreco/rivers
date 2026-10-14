@@ -44,7 +44,7 @@ class DuckDBTypeHandler(ArrowIcebergTypeHandler[DuckDBPyRelation]):
         its bucket or container. Relations read in one thread share
         :meth:`DuckDBResource.shared_connection`, so they can be joined.
         """
-        table = request.load_table()
+        table = request.table
         con = self._resource.shared_connection()
         if secret := iceberg_secret(table.metadata_location, table.io.properties):
             con.execute(secret)

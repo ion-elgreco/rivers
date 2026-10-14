@@ -29,4 +29,4 @@ class PandasTypeHandler(ArrowIcebergTypeHandler[pd.DataFrame]):
         self, request: IcebergReadRequest, target_type: type[pd.DataFrame]
     ) -> pd.DataFrame:
         """Scan the table with pyiceberg into a ``pd.DataFrame``."""
-        return request.scan(request.load_table()).to_pandas()
+        return request.scan().to_pandas()
