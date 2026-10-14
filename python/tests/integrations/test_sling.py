@@ -51,13 +51,13 @@ def _uri(path: Path) -> str:
     return f"file://{path.as_posix()}"
 
 
-def _replication(src: Path, *names: str) -> dict:
+def _replication(src: Path, *names: str, schema: str = "main") -> dict:
     return {
         "source": "FILES",
         "target": "WAREHOUSE",
         "defaults": {"mode": "full-refresh", "target_options": {"use_bulk": False}},
         "streams": {
-            _uri(src / f"{name}.csv"): {"object": f"main.{name}"} for name in names
+            _uri(src / f"{name}.csv"): {"object": f"{schema}.{name}"} for name in names
         },
     }
 
@@ -109,14 +109,20 @@ def _values(event) -> dict[str, object]:
 
 
 def _repo(
-    tmp_path, storage, replication, *assets, executor=None, resource=None
+    tmp_path,
+    storage,
+    replication,
+    *assets,
+    executor=None,
+    resource=None,
+    io_handler=None,
 ) -> rs.CodeRepository:
     """The replication as the multi-asset ``raw``, next to an independent asset.
 
     Two steps in one level send both to the parallel executor's workers.
     """
 
-    @replication.assets(name="raw")
+    @replication.assets(name="raw", io_handler=io_handler)
     def raw(context: rs.AssetExecutionContext, sling: SlingResource):
         (tmp_path / "raw.pid").write_text(str(os.getpid()))
         yield from sling.replicate(context, replication)
@@ -233,6 +239,71 @@ def test_asset_def_fn_names_outputs_and_links_deps(tmp_path, src, storage):
     assert _tables(tmp_path) == {"orders"}
     [orders] = _events(storage, "shop_orders", "Materialization")
     assert _values(orders)["sling/object"] == "main.orders"
+
+
+def _duckdb_table_def(stream: SlingStream) -> rs.AssetDef:
+    """The Sling guide's ``asset_def`` for ``DuckDBIOHandler``."""
+    metadata = stream.output_def().metadata
+    schema, table = stream.config["object"].split(".")
+    return stream.output_def(
+        name=f"{schema}_{table}",
+        metadata=metadata | {"duckdb/schema": schema, "duckdb/table": table},
+    )
+
+
+def test_downstream_reads_the_table_with_an_io_handler(
+    tmp_path, src, storage, executor_env
+):
+    duckdb = pytest.importorskip("duckdb")
+    pa = pytest.importorskip("pyarrow")
+    from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource
+
+    replication = SlingReplication(
+        _replication(src, "orders", "users", schema="raw"),
+        asset_def_fn=_duckdb_table_def,
+    )
+
+    @rs.Asset(io_handler=executor_env[1]())
+    def loaded(raw_orders: pa.Table, raw_users: pa.Table) -> dict:
+        return {
+            name: [tuple(row.values()) for row in table.sort_by("id").to_pylist()]
+            for name, table in (("orders", raw_orders), ("users", raw_users))
+        }
+
+    assert {d.name: d.metadata for d in replication.output_defs} == {
+        "raw_orders": {
+            "sling/stream": _uri(src / "orders.csv"),
+            "duckdb/schema": "raw",
+            "duckdb/table": "orders",
+        },
+        "raw_users": {
+            "sling/stream": _uri(src / "users.csv"),
+            "duckdb/schema": "raw",
+            "duckdb/table": "users",
+        },
+    }
+
+    # the tables that sling writes for the replication
+    warehouse = str(tmp_path / "warehouse.duckdb")
+    with duckdb.connect(warehouse) as con:
+        con.execute("CREATE SCHEMA raw")
+        con.execute("CREATE TABLE raw.orders (id INT, item TEXT, amount DOUBLE)")
+        con.execute("CREATE TABLE raw.users (id INT, email TEXT)")
+        con.executemany("INSERT INTO raw.orders VALUES (?, ?, ?)", ORDERS)
+        con.executemany("INSERT INTO raw.users VALUES (?, ?)", USERS)
+
+    repo = _repo(
+        tmp_path,
+        storage,
+        replication,
+        loaded,
+        executor=executor_env[0],
+        io_handler=DuckDBIOHandler(resource=DuckDBResource(database=warehouse)),
+    )
+
+    # sling does not run; two steps, so the parallel executor runs them in its workers
+    assert repo.materialize(selection=["loaded", "bystander"]).success
+    assert repo.load_node("loaded") == {"orders": ORDERS, "users": USERS}
 
 
 def test_wildcard_stream_is_one_output(tmp_path, src, storage):
