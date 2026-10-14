@@ -48,6 +48,7 @@ print(repo.load_node("summary"))  # "100 users, 5000 events"
 - **Multiple asset types** — single, multi-output, graph (composing `Task`s into sub-DAGs), and external assets.
 - **Partitioning** — static, time-window (daily/hourly/custom cron), multi-dimensional, and runtime-extensible dynamic partitions.
 - **Pluggable IO** — built-in handlers for in-memory, pickle (any object store), Delta Lake with merge support, and Apache Iceberg with upserts.
+- **[Integrations](integrations/index.md)** — Airbyte, dlt, Sling, dbt, Databricks, DuckDB, Delta Lake, Iceberg, dataframely, pandera, Datadog, and Slack.
 - **Parallel & distributed execution** — `Executor.parallel()` for concurrent subprocess workers, `Executor.kubernetes()` for one-pod-per-step on K8s.
 - **Schedules, sensors, and automation conditions** — declarative triggers (cron, event-driven, dep-aware) executed by the rivers daemon.
 - **Backfills** — partition-range execution with multi-run, single-run, and per-dimension strategies.
