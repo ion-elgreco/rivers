@@ -28,4 +28,4 @@ siphasher = "1"
 tracing.workspace = true
 
 [dev-dependencies]
-test-temp-dir = "0.8"
+test-temp-dir = "0.9"
