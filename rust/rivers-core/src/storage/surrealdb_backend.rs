@@ -355,17 +355,10 @@ impl SurrealStorage {
         })
     }
 
-    /// [`SurrealStorage`] on a dedicated runtime owned for its lifetime — test fixtures only.
-    pub fn new_embedded_blocking(path: &str) -> Result<Self> {
-        let runtime = build_storage_runtime();
-        let mut storage = runtime.block_on(Self::new_embedded(path))?;
-        storage.runtime = Some(runtime);
-        Ok(storage)
-    }
-
-    /// See [`Self::new_embedded_blocking`]. For a store that is removed when
-    /// the process exits: no commit is synced to disk, so a new store's
-    /// migration does not wait on slow disks (Windows).
+    /// Embedded [`SurrealStorage`] on a dedicated runtime owned for its
+    /// lifetime, for test fixtures and the CLI's scratch store. No commit is
+    /// synced to disk, so a new store's migration does not wait on slow disks
+    /// (Windows).
     pub fn new_scratch_blocking(path: &str) -> Result<Self> {
         let runtime = build_storage_runtime();
         let mut storage = runtime.block_on(Self::open_embedded(
@@ -378,7 +371,7 @@ impl SurrealStorage {
         Ok(storage)
     }
 
-    /// See [`Self::new_embedded_blocking`]. In-memory variant.
+    /// See [`Self::new_scratch_blocking`]. In-memory variant.
     pub fn new_memory_blocking() -> Result<Self> {
         let runtime = build_storage_runtime();
         let mut storage = runtime.block_on(Self::new_memory())?;

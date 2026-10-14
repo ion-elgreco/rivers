@@ -32,6 +32,8 @@ dev = [
     "rumdl>=0.2.37",
     # Memory sampling for the comparison benchmark in bench/.
     "psutil>=7.0",
+    # SQLite catalog for the Iceberg tests.
+    "sqlalchemy>=2.0.18",
 ]
 # gRPC client for the API tests. No free-threaded (3.14t) wheels yet, so
 # `just venv-ft` leaves this group out.

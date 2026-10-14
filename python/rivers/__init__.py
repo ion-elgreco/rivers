@@ -196,23 +196,42 @@ __all__ = [
     "EvalMode",
 ]
 
+# Exported names whose optional extra failed to import: (what to install, the error).
+_missing_extras: dict[str, tuple[str, ImportError]] = {}
+
 try:
     from rivers.io_handlers.delta import DeltaAsset, DeltaIOHandler
 
     __all__ = [*__all__, "DeltaAsset", "DeltaIOHandler"]
 except ImportError as e:
-    _delta_import_error = e
+    _missing_extras.update(
+        dict.fromkeys(
+            ("DeltaAsset", "DeltaIOHandler"),
+            ("the Delta extras — install 'rivers[delta-pyarrow]'", e),
+        )
+    )
 
-    def __getattr__(name: str):
-        """Point at the missing extra instead of a bare "cannot import name".
+try:
+    from rivers.io_handlers.iceberg import IcebergAsset, IcebergIOHandler
 
-        Raises:
-            ImportError: For the Delta names, naming the extra to install.
-            AttributeError: For everything else, as usual.
-        """
-        if name in ("DeltaAsset", "DeltaIOHandler"):
-            raise ImportError(
-                f"{name} requires the Delta extras — install "
-                f"'rivers[delta-pyarrow]' ({_delta_import_error})"
-            ) from _delta_import_error
-        raise AttributeError(f"module 'rivers' has no attribute '{name}'")
+    __all__ = [*__all__, "IcebergAsset", "IcebergIOHandler"]
+except ImportError as e:
+    _missing_extras.update(
+        dict.fromkeys(
+            ("IcebergAsset", "IcebergIOHandler"),
+            ("the Iceberg extra — install 'rivers[iceberg]'", e),
+        )
+    )
+
+
+def __getattr__(name: str):
+    """Point at the missing extra instead of a bare "cannot import name".
+
+    Raises:
+        ImportError: For the Delta and Iceberg names, naming the extra to install.
+        AttributeError: For everything else, as usual.
+    """
+    if name in _missing_extras:
+        extra, error = _missing_extras[name]
+        raise ImportError(f"{name} requires {extra} ({error})") from error
+    raise AttributeError(f"module 'rivers' has no attribute '{name}'")

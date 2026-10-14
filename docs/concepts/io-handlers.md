@@ -94,6 +94,22 @@ See the [Delta Lake guide](../guides/delta-lake.md) for full details.
 
 Stores each asset as a table in a DuckDB database or a DuckLake catalog. Requires `pip install rivers[duckdb]`. See the [DuckDB guide](../guides/duckdb.md).
 
+### IcebergIOHandler
+
+Stores each asset as an Apache Iceberg table through a pyiceberg catalog. Requires `pip install rivers[iceberg]`:
+
+```python
+from rivers.io_handlers.iceberg import IcebergIOHandler
+
+io = IcebergIOHandler(
+    catalog_name="lake",
+    catalog_properties={"type": "rest", "uri": "https://catalog.example.com"},
+    namespace="analytics",
+)
+```
+
+See the [Iceberg guide](../guides/iceberg.md) for full details.
+
 ## Writing a custom handler
 
 Subclass `BaseIOHandler` (which extends `pydantic_settings.BaseSettings`). Configuration fields can be resolved from environment variables, `.env` files, or explicit kwargs:

@@ -12,6 +12,7 @@ Optional extras:
 pip install rivers[delta]     # Delta Lake IO handler
 pip install rivers[pyarrow]   # PyArrow Tables / RecordBatchReaders for Delta
 pip install rivers[polars]    # Polars DataFrames / LazyFrames for Delta
+pip install rivers[iceberg]   # Apache Iceberg IO handler (pyiceberg)
 pip install rivers[otel]      # OpenTelemetry instrumentation
 pip install rivers[slack]     # Slack alerts (hooks and a run-failure sensor)
 pip install rivers[duckdb]    # DuckDB and DuckLake resource and IO handler

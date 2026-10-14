@@ -135,4 +135,4 @@ def embedded(tmp_path):
 | Function | Returns |
 |----------|---------|
 | `memory_storage()` | `Storage` — in-memory with sync-shutdown on drop. |
-| `embedded_storage(path)` | `Storage` — embedded RocksDB at `path` with sync-shutdown on drop. |
+| `embedded_storage(path)` | `Storage` — embedded RocksDB at `path` with sync-shutdown on drop. Commits are not synced to disk. |
