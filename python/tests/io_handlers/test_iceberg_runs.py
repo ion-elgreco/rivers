@@ -1,5 +1,6 @@
 """IcebergIOHandler in repository runs: executors, async and multi-asset steps, backfills."""
 
+import json
 from datetime import date, datetime
 
 import pytest
@@ -13,14 +14,12 @@ import pyarrow as pa  # noqa: E402
 
 import rivers as rs  # noqa: E402
 
-from .helpers import iceberg_handler  # noqa: E402
+from _helpers import make_repo  # noqa: E402
+
+from .helpers import iceberg_handler, iceberg_table  # noqa: E402
 
 _USERS = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
 _SCORES = pl.DataFrame({"id": [1, 3], "score": [10, 30]})
-
-
-def _table(handler, name: str) -> pa.Table:
-    return handler.load_table(name).scan().to_arrow()
 
 
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
@@ -93,17 +92,14 @@ def test_executors(storage, executor_env, tmp_path, is_async, shape):
             {"total": [int(scores["score"].sum())], "users": [named.height]}
         )
 
-    repo = rs.CodeRepository(
-        assets=[*sources, ranked, total], default_executor=executor
-    )
-    repo.resolve(storage=storage)
+    repo = make_repo([*sources, ranked, total], storage, executor=executor)
     repo.materialize()
 
-    assert sorted(_table(handler, "ranked").to_pylist(), key=lambda r: r["name"]) == [
+    assert iceberg_table(handler, "ranked").sort_by("name").to_pylist() == [
         {"name": "a", "score": 10},
         {"name": "c", "score": 30},
     ]
-    assert _table(handler, "total").to_pylist() == [{"total": 40, "users": 2}]
+    assert iceberg_table(handler, "total").to_pylist() == [{"total": 40, "users": 2}]
 
 
 def test_materialization_records_the_snapshot_as_data_version(storage, tmp_path):
@@ -113,18 +109,14 @@ def test_materialization_records_the_snapshot_as_data_version(storage, tmp_path)
     def users() -> pa.Table:
         return _USERS
 
-    repo = rs.CodeRepository(assets=[users], default_executor=rs.Executor.in_process())
-    repo.resolve(storage=storage)
+    repo = make_repo([users], storage)
     repo.materialize()
 
-    [event] = [
-        e
-        for e in storage.get_events_for_asset("users")
-        if e.event_type == "Materialization"
-    ]
     snapshot_id = handler.load_table("users").current_snapshot().snapshot_id
+    event = storage.get_latest_materialization("users")
     assert event.data_version == str(snapshot_id)
-    assert "ns.users" in dict(event.metadata)["iceberg/table"]
+    table = json.loads(dict(event.metadata)["iceberg/table"])
+    assert table == {"Text": {"value": "ns.users"}}
 
 
 def test_backfill_writes_every_key_in_one_run(storage, tmp_path):
@@ -140,9 +132,11 @@ def test_backfill_writes_every_key_in_one_run(storage, tmp_path):
         days = [date.fromisoformat(k.key[0]) for k in context.partition.keys]
         return pa.table({"day": days, "n": list(range(len(days)))})
 
-    repo = rs.CodeRepository(assets=[events], default_executor=rs.Executor.in_process())
-    repo.resolve(storage=storage)
+    repo = make_repo([events], storage)
     keys = [rs.PartitionKey.single(f"2024-01-0{i}") for i in (1, 2, 3)]
+
+    def n_by_day() -> list:
+        return iceberg_table(handler, "events").sort_by("day").column("n").to_pylist()
 
     result = repo.backfill(
         selection=["events"],
@@ -150,11 +144,11 @@ def test_backfill_writes_every_key_in_one_run(storage, tmp_path):
         strategy=rs.BackfillStrategy.single_run(),
     )
     assert result.num_runs == 1
-    assert _table(handler, "events").sort_by("day").column("n").to_pylist() == [0, 1, 2]
+    assert n_by_day() == [0, 1, 2]
 
     result = repo.backfill(selection=["events"], partition_keys=keys[1:])
     assert result.completed == 2
-    assert _table(handler, "events").sort_by("day").column("n").to_pylist() == [0, 0, 0]
+    assert n_by_day() == [0, 0, 0]
 
 
 def test_partitioned_downstream_reads_its_partition(storage, tmp_path):
@@ -179,14 +173,11 @@ def test_partitioned_downstream_reads_its_partition(storage, tmp_path):
         day = date.fromisoformat(context.partition_key)
         return pa.table({"day": [day], "events": [events.height]})
 
-    repo = rs.CodeRepository(
-        assets=[events, daily], default_executor=rs.Executor.in_process()
-    )
-    repo.resolve(storage=storage)
+    repo = make_repo([events, daily], storage)
     for day in ("2024-01-01", "2024-01-02"):
         repo.materialize(partition_key=rs.PartitionKey.single(day))
 
-    assert _table(handler, "daily").sort_by("day").to_pylist() == [
+    assert iceberg_table(handler, "daily").sort_by("day").to_pylist() == [
         {"day": date(2024, 1, 1), "events": 3},
         {"day": date(2024, 1, 2), "events": 3},
     ]
@@ -200,8 +191,7 @@ def test_input_metadata_selects_columns_and_snapshot(storage, tmp_path):
     def users() -> pa.Table:
         return users_v1
 
-    repo = rs.CodeRepository(assets=[users], default_executor=rs.Executor.in_process())
-    repo.resolve(storage=storage)
+    repo = make_repo([users], storage)
     repo.materialize()
     first = handler.load_table("users").current_snapshot().snapshot_id
     users_v1 = pa.table({"id": [2], "name": ["b"], "email": ["b@x"]})
@@ -222,10 +212,7 @@ def test_input_metadata_selects_columns_and_snapshot(storage, tmp_path):
     def names(users: pa.Table) -> list:
         return users.to_pylist()
 
-    repo = rs.CodeRepository(
-        assets=[users, names], default_executor=rs.Executor.in_process()
-    )
-    repo.resolve(storage=storage)
+    repo = make_repo([users, names], storage)
     repo.materialize(selection=["names"])
 
     assert repo.load_node("names") == [{"id": 1, "name": "a"}]

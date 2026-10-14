@@ -16,24 +16,10 @@ from pyiceberg.table import Transaction  # noqa: E402
 import rivers as rs  # noqa: E402
 from rivers.io_handlers.iceberg import UpsertConfig  # noqa: E402
 
-from .helpers import iceberg_handler  # noqa: E402
+from .helpers import iceberg_handler, read_input, write_output  # noqa: E402
 
 _TABLE = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
 _ROWS = _TABLE.to_pylist()
-
-
-def _write(handler, obj, name="t", **kwargs) -> rs.OutputContext:
-    ctx = rs.OutputContext(asset_name=name, **kwargs)
-    handler.handle_output(ctx, obj)
-    return ctx
-
-
-def _read(handler, type_hint=pa.Table, name="t", **kwargs):
-    return handler.load_input(
-        rs.InputContext(
-            asset_name=name, downstream_asset="d", type_hint=type_hint, **kwargs
-        )
-    )
 
 
 def _rows(value) -> list[dict]:
@@ -72,8 +58,8 @@ def _rows(value) -> list[dict]:
 )
 def test_write_each_type(tmp_path, make):
     handler = iceberg_handler(tmp_path)
-    _write(handler, make())
-    assert _rows(_read(handler)) == _ROWS
+    write_output(handler, make())
+    assert _rows(read_input(handler)) == _ROWS
 
 
 @pytest.mark.parametrize(
@@ -82,8 +68,8 @@ def test_write_each_type(tmp_path, make):
 )
 def test_read_each_type(tmp_path, type_hint):
     handler = iceberg_handler(tmp_path)
-    _write(handler, _TABLE)
-    value = _read(handler, type_hint)
+    write_output(handler, _TABLE)
+    value = read_input(handler, type_hint)
     assert isinstance(value, type_hint)
     assert _rows(value) == _ROWS
 
@@ -91,8 +77,8 @@ def test_read_each_type(tmp_path, type_hint):
 def test_pandas_index_is_not_written(tmp_path):
     handler = iceberg_handler(tmp_path)
     df = pd.DataFrame({"v": [10, 20]}, index=pd.Index(["r1", "r2"], name="label"))
-    _write(handler, df)
-    assert _read(handler).column_names == ["v"]
+    write_output(handler, df)
+    assert read_input(handler).column_names == ["v"]
 
 
 def test_reader_streams_into_an_unpartitioned_table(tmp_path, monkeypatch):
@@ -106,15 +92,15 @@ def test_reader_streams_into_an_unpartitioned_table(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Transaction, "append", spy)
     batches = (batch for batch in _TABLE.to_batches(max_chunksize=1))
-    _write(handler, pa.RecordBatchReader.from_batches(_TABLE.schema, batches))
+    write_output(handler, pa.RecordBatchReader.from_batches(_TABLE.schema, batches))
 
     assert written == [pa.RecordBatchReader]
-    assert _rows(_read(handler)) == _ROWS
+    assert _rows(read_input(handler)) == _ROWS
 
 
 def test_output_metadata_and_data_version(tmp_path):
     handler = iceberg_handler(tmp_path)
-    ctx = _write(handler, _TABLE)
+    ctx = write_output(handler, _TABLE)
     table = handler.load_table("t")
     snapshot = table.current_snapshot()
     meta = ctx.output_metadata
@@ -130,7 +116,7 @@ def test_output_metadata_and_data_version(tmp_path):
     assert isinstance(meta["rivers/schema"], rs.MetadataValue.Schema)
     assert ctx.drain_data_version() == str(snapshot.snapshot_id)
 
-    appended = _write(
+    appended = write_output(
         handler, _TABLE.slice(0, 1), asset_metadata={"iceberg/mode": "append"}
     )
     assert appended.output_metadata["iceberg/num_rows"].raw_value() == 4
@@ -140,12 +126,12 @@ def test_output_metadata_and_data_version(tmp_path):
 def test_namespace_and_table_overrides(tmp_path):
     handler = iceberg_handler(tmp_path)
     meta = {"iceberg/namespace": "lake", "iceberg/table": "events_v2"}
-    _write(handler, _TABLE, name="events", asset_metadata=meta)
+    write_output(handler, _TABLE, name="events", asset_metadata=meta)
 
     catalog = handler.catalog()
     assert catalog.table_exists(("lake", "events_v2"))
     assert not catalog.table_exists(("ns", "events"))
-    assert _rows(_read(handler, name="events", asset_metadata=meta)) == _ROWS
+    assert _rows(read_input(handler, name="events", asset_metadata=meta)) == _ROWS
 
 
 def test_dots_in_the_namespace_nest_it(tmp_path):
@@ -172,26 +158,26 @@ def test_dots_in_the_namespace_nest_it(tmp_path):
 )
 def test_asset_names_are_kept_as_table_names(tmp_path, name):
     handler = iceberg_handler(tmp_path)
-    _write(handler, _TABLE, name=name)
+    write_output(handler, _TABLE, name=name)
     assert handler.load_table(name).name() == ("ns", name)
-    assert _rows(_read(handler, name=name)) == _ROWS
+    assert _rows(read_input(handler, name=name)) == _ROWS
 
 
 def test_overwrite_replaces_the_table(tmp_path):
     handler = iceberg_handler(tmp_path)
-    _write(handler, _TABLE)
-    _write(handler, pa.table({"id": [9], "name": ["z"]}))
-    assert _rows(_read(handler)) == [{"id": 9, "name": "z"}]
+    write_output(handler, _TABLE)
+    write_output(handler, pa.table({"id": [9], "name": ["z"]}))
+    assert _rows(read_input(handler)) == [{"id": 9, "name": "z"}]
 
 
 def test_append_mode_and_per_asset_override(tmp_path):
     handler = iceberg_handler(tmp_path, mode="append")
-    _write(handler, _TABLE)
-    _write(handler, _TABLE)
-    assert _read(handler).num_rows == 6
+    write_output(handler, _TABLE)
+    write_output(handler, _TABLE)
+    assert read_input(handler).num_rows == 6
 
-    _write(handler, _TABLE, asset_metadata={"iceberg/mode": "overwrite"})
-    assert _rows(_read(handler)) == _ROWS
+    write_output(handler, _TABLE, asset_metadata={"iceberg/mode": "overwrite"})
+    assert _rows(read_input(handler)) == _ROWS
 
 
 @pytest.mark.parametrize(
@@ -201,17 +187,17 @@ def test_append_mode_and_per_asset_override(tmp_path):
 def test_unknown_modes_are_rejected(tmp_path, key, value):
     handler = iceberg_handler(tmp_path)
     with pytest.raises(ValueError, match=f"{key} must be one of"):
-        _write(handler, _TABLE, asset_metadata={key: value})
+        write_output(handler, _TABLE, asset_metadata={key: value})
 
 
 def test_upsert_updates_and_inserts(tmp_path):
     handler = iceberg_handler(
         tmp_path, mode="upsert", upsert_config=UpsertConfig(join_cols=["id"])
     )
-    _write(handler, _TABLE)
-    ctx = _write(handler, pa.table({"id": [2, 4], "name": ["B", "d"]}))
+    write_output(handler, _TABLE)
+    ctx = write_output(handler, pa.table({"id": [2, 4], "name": ["B", "d"]}))
 
-    assert _rows(_read(handler)) == [
+    assert _rows(read_input(handler)) == [
         {"id": 1, "name": "a"},
         {"id": 2, "name": "B"},
         {"id": 3, "name": "c"},
@@ -230,19 +216,21 @@ def test_upsert_join_cols_from_metadata_and_insert_only(tmp_path):
         upsert_config=UpsertConfig(when_matched_update_all=False),
     )
     meta = {"iceberg/join_cols": '["id"]'}
-    _write(handler, _TABLE, asset_metadata=meta)
-    _write(handler, pa.table({"id": [2, 4], "name": ["B", "d"]}), asset_metadata=meta)
+    write_output(handler, _TABLE, asset_metadata=meta)
+    write_output(
+        handler, pa.table({"id": [2, 4], "name": ["B", "d"]}), asset_metadata=meta
+    )
 
-    assert _rows(_read(handler)) == [*_ROWS, {"id": 4, "name": "d"}]
+    assert _rows(read_input(handler)) == [*_ROWS, {"id": 4, "name": "d"}]
 
 
 def test_upsert_without_changes_keeps_the_data_version(tmp_path):
     handler = iceberg_handler(
         tmp_path, mode="upsert", upsert_config=UpsertConfig(join_cols=["id"])
     )
-    version = _write(handler, _TABLE).drain_data_version()
+    version = write_output(handler, _TABLE).drain_data_version()
 
-    again = _write(handler, _TABLE)
+    again = write_output(handler, _TABLE)
     assert again.drain_data_version() == version
     assert again.output_metadata["iceberg/rows_updated"].raw_value() == 0
     assert again.output_metadata["iceberg/rows_inserted"].raw_value() == 0
@@ -251,39 +239,39 @@ def test_upsert_without_changes_keeps_the_data_version(tmp_path):
 def test_upsert_needs_join_columns(tmp_path):
     handler = iceberg_handler(tmp_path, mode="upsert")
     with pytest.raises(ValueError, match="Join columns could not be found"):
-        _write(handler, _TABLE)
+        write_output(handler, _TABLE)
 
 
 def test_schema_mode_merge_adds_columns(tmp_path):
     handler = iceberg_handler(tmp_path, mode="append", schema_mode="merge")
-    _write(handler, _TABLE)
-    _write(handler, pa.table({"id": [4], "name": ["d"], "score": [1.5]}))
+    write_output(handler, _TABLE)
+    write_output(handler, pa.table({"id": [4], "name": ["d"], "score": [1.5]}))
 
-    rows = _rows(_read(handler))
+    rows = _rows(read_input(handler))
     assert rows[0] == {"id": 1, "name": "a", "score": None}
     assert rows[-1] == {"id": 4, "name": "d", "score": 1.5}
 
 
 def test_schema_mode_overwrite_drops_missing_columns(tmp_path):
     handler = iceberg_handler(tmp_path, schema_mode="overwrite")
-    _write(handler, _TABLE)
-    _write(handler, pa.table({"id": [7], "score": [0.5]}))
+    write_output(handler, _TABLE)
+    write_output(handler, pa.table({"id": [7], "score": [0.5]}))
 
     assert handler.load_table("t").schema().column_names == ["id", "score"]
-    assert _rows(_read(handler)) == [{"id": 7, "score": 0.5}]
+    assert _rows(read_input(handler)) == [{"id": 7, "score": 0.5}]
 
 
 def test_a_new_column_without_schema_mode_fails(tmp_path):
     handler = iceberg_handler(tmp_path)
-    _write(handler, _TABLE)
+    write_output(handler, _TABLE)
     with pytest.raises(ValueError, match="more columns"):
-        _write(handler, pa.table({"id": [4], "name": ["d"], "score": [1.5]}))
+        write_output(handler, pa.table({"id": [4], "name": ["d"], "score": [1.5]}))
 
 
 def test_schema_mode_overwrite_rejects_append(tmp_path):
     handler = iceberg_handler(tmp_path, mode="append", schema_mode="overwrite")
     with pytest.raises(ValueError, match="needs mode 'overwrite'"):
-        _write(handler, _TABLE)
+        write_output(handler, _TABLE)
 
 
 def test_nanosecond_and_zoned_timestamps_become_utc_microseconds(tmp_path):
@@ -296,9 +284,9 @@ def test_nanosecond_and_zoned_timestamps_become_utc_microseconds(tmp_path):
             "naive": [pd.Timestamp("2024-01-01 12:00:00.123456789")],
         }
     )
-    _write(handler, df)
+    write_output(handler, df)
 
-    table = _read(handler)
+    table = read_input(handler)
     assert table.schema.field("zoned").type == pa.timestamp("us", tz="UTC")
     assert table.schema.field("naive").type == pa.timestamp("us")
     assert table.to_pylist() == [
@@ -312,9 +300,11 @@ def test_nanosecond_and_zoned_timestamps_become_utc_microseconds(tmp_path):
 def test_reader_with_nanosecond_timestamps(tmp_path):
     handler = iceberg_handler(tmp_path)
     data = pa.table({"ts": pa.array([1_000, 2_000], pa.timestamp("ns"))})
-    _write(handler, pa.RecordBatchReader.from_batches(data.schema, data.to_batches()))
+    write_output(
+        handler, pa.RecordBatchReader.from_batches(data.schema, data.to_batches())
+    )
 
-    ts = _read(handler).column("ts")
+    ts = read_input(handler).column("ts")
     assert ts.type == pa.timestamp("us")
     assert ts.to_pylist() == [
         datetime(1970, 1, 1, 0, 0, 0, 1),
@@ -329,7 +319,7 @@ def test_polars_reads_with_the_storage_properties(tmp_path, monkeypatch, type_hi
     handler = handler.model_copy(
         update={"catalog_properties": {**handler.catalog_properties, **storage}}
     )
-    _write(handler, _TABLE)
+    write_output(handler, _TABLE)
     seen: dict[str, str] = {}
     scan_iceberg = pl.scan_iceberg
 
@@ -339,7 +329,7 @@ def test_polars_reads_with_the_storage_properties(tmp_path, monkeypatch, type_hi
 
     monkeypatch.setattr(pl, "scan_iceberg", spy)
 
-    assert _rows(_read(handler, type_hint)) == _ROWS
+    assert _rows(read_input(handler, type_hint)) == _ROWS
     assert seen == storage
 
 
@@ -348,8 +338,10 @@ def test_polars_reads_with_the_storage_properties(tmp_path, monkeypatch, type_hi
 )
 def test_column_projection(tmp_path, type_hint):
     handler = iceberg_handler(tmp_path)
-    _write(handler, _TABLE)
-    value = _read(handler, type_hint, asset_metadata={"iceberg/columns": '["name"]'})
+    write_output(handler, _TABLE)
+    value = read_input(
+        handler, type_hint, asset_metadata={"iceberg/columns": '["name"]'}
+    )
     if isinstance(value, pl.LazyFrame):
         value = value.collect()
     names = value.column_names if isinstance(value, pa.Table) else list(value.columns)
@@ -359,19 +351,23 @@ def test_column_projection(tmp_path, type_hint):
 @pytest.mark.parametrize("type_hint", [pa.Table, pl.DataFrame, pd.DataFrame])
 def test_snapshot_id_reads_an_older_snapshot(tmp_path, type_hint):
     handler = iceberg_handler(tmp_path)
-    first = _write(handler, _TABLE).output_metadata["iceberg/snapshot_id"].raw_value()
-    _write(handler, pa.table({"id": [9], "name": ["z"]}))
+    first = (
+        write_output(handler, _TABLE).output_metadata["iceberg/snapshot_id"].raw_value()
+    )
+    write_output(handler, pa.table({"id": [9], "name": ["z"]}))
 
-    old = _read(handler, type_hint, asset_metadata={"iceberg/snapshot_id": str(first)})
+    old = read_input(
+        handler, type_hint, asset_metadata={"iceberg/snapshot_id": str(first)}
+    )
     assert _rows(old) == _ROWS
-    assert _rows(_read(handler, type_hint)) == [{"id": 9, "name": "z"}]
+    assert _rows(read_input(handler, type_hint)) == [{"id": 9, "name": "z"}]
 
 
 def test_table_properties_on_create_and_on_change(tmp_path):
     handler = iceberg_handler(
         tmp_path, table_properties={"write.parquet.compression-codec": "zstd"}
     )
-    _write(
+    write_output(
         handler,
         _TABLE,
         asset_metadata={"iceberg/table_properties": '{"owner": "data"}'},
@@ -380,7 +376,7 @@ def test_table_properties_on_create_and_on_change(tmp_path):
     assert properties["write.parquet.compression-codec"] == "zstd"
     assert properties["owner"] == "data"
 
-    _write(
+    write_output(
         handler, _TABLE, asset_metadata={"iceberg/table_properties": '{"owner": "ml"}'}
     )
     assert handler.load_table("t").properties["owner"] == "ml"
@@ -388,7 +384,7 @@ def test_table_properties_on_create_and_on_change(tmp_path):
 
 def test_snapshot_properties_are_in_the_summary(tmp_path):
     handler = iceberg_handler(tmp_path, snapshot_properties={"producer": "rivers"})
-    _write(
+    write_output(
         handler,
         _TABLE,
         asset_metadata={"iceberg/snapshot_properties": '{"batch": "b1"}'},
@@ -407,10 +403,10 @@ def test_load_input_needs_a_type_hint(tmp_path):
 def test_unsupported_types_are_rejected(tmp_path):
     handler = iceberg_handler(tmp_path)
     with pytest.raises(TypeError, match="No type handler found"):
-        _write(handler, {"id": [1]})
+        write_output(handler, {"id": [1]})
 
 
 def test_reading_a_missing_table_raises(tmp_path):
     handler = iceberg_handler(tmp_path)
     with pytest.raises(NoSuchTableError):
-        _read(handler)
+        read_input(handler)

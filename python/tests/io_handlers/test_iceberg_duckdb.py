@@ -12,25 +12,20 @@ duckdb = pytest.importorskip("duckdb")
 import pyarrow as pa  # noqa: E402
 from duckdb import DuckDBPyRelation  # noqa: E402
 
-import rivers as rs  # noqa: E402
 from rivers.integrations.duckdb import DuckDBResource  # noqa: E402
 from rivers.io_handlers.iceberg.duckdb import iceberg_secret  # noqa: E402
 
-from .helpers import iceberg_handler, make_daily_partition, make_partition  # noqa: E402
+from .helpers import (  # noqa: E402
+    iceberg_handler,
+    make_daily_partition,
+    make_partition,
+    read_input,
+    write_output,
+)
 
 
-def _write(handler, obj, name="t", **kwargs) -> rs.OutputContext:
-    ctx = rs.OutputContext(asset_name=name, **kwargs)
-    handler.handle_output(ctx, obj)
-    return ctx
-
-
-def _read(handler, name="t", **kwargs) -> DuckDBPyRelation:
-    return handler.load_input(
-        rs.InputContext(
-            asset_name=name, downstream_asset="x", type_hint=DuckDBPyRelation, **kwargs
-        )
-    )
+def _read(handler, name="t", **context) -> DuckDBPyRelation:
+    return read_input(handler, DuckDBPyRelation, name, **context)
 
 
 def _files_read(rel: DuckDBPyRelation) -> int:
@@ -40,7 +35,9 @@ def _files_read(rel: DuckDBPyRelation) -> int:
 
 def test_round_trip_relation(tmp_path):
     handler = iceberg_handler(tmp_path)
-    _write(handler, duckdb.sql("SELECT * FROM (VALUES (1, 'x'), (2, 'y')) v(a, b)"))
+    write_output(
+        handler, duckdb.sql("SELECT * FROM (VALUES (1, 'x'), (2, 'y')) v(a, b)")
+    )
 
     result = _read(handler)
     assert isinstance(result, DuckDBPyRelation)
@@ -50,7 +47,9 @@ def test_round_trip_relation(tmp_path):
 
 def test_streaming_write_of_many_batches(tmp_path):
     handler = iceberg_handler(tmp_path)
-    _write(handler, duckdb.sql("SELECT range AS i, range % 7 AS k FROM range(250000)"))
+    write_output(
+        handler, duckdb.sql("SELECT range AS i, range % 7 AS k FROM range(250000)")
+    )
 
     assert (
         handler.load_table("t").current_snapshot().summary["total-records"] == "250000"
@@ -63,7 +62,7 @@ def test_relation_into_a_partitioned_table(tmp_path):
     handler = iceberg_handler(tmp_path)
     meta = {"iceberg/partition_expr": "region"}
     for region in ("us", "eu"):
-        _write(
+        write_output(
             handler,
             duckdb.sql(f"SELECT '{region}' AS region, range AS v FROM range(3)"),
             partition=make_partition(region),
@@ -78,7 +77,7 @@ def test_static_partition_read_prunes_files(tmp_path):
     handler = iceberg_handler(tmp_path)
     meta = {"iceberg/partition_expr": "region"}
     for region, v in [("us", 1), ("eu", 2), ("apac", 3)]:
-        _write(
+        write_output(
             handler,
             pa.table({"v": [v], "region": [region]}),
             partition=make_partition(region),
@@ -94,7 +93,7 @@ def test_daily_partition_read_on_a_timestamp_column(tmp_path):
     handler = iceberg_handler(tmp_path)
     meta = {"iceberg/partition_expr": "ts"}
     for day, v in [("2024-01-01", 10), ("2024-01-02", 20)]:
-        _write(
+        write_output(
             handler,
             pa.table({"ts": [datetime.fromisoformat(day).replace(hour=12)], "v": [v]}),
             partition=make_daily_partition(day),
@@ -109,8 +108,8 @@ def test_daily_partition_read_on_a_timestamp_column(tmp_path):
 
 def test_columns_and_snapshot(tmp_path):
     handler = iceberg_handler(tmp_path)
-    first = _write(handler, pa.table({"a": [1], "b": ["old"], "c": [True]}))
-    _write(handler, pa.table({"a": [2], "b": ["new"], "c": [False]}))
+    first = write_output(handler, pa.table({"a": [1], "b": ["old"], "c": [True]}))
+    write_output(handler, pa.table({"a": [2], "b": ["new"], "c": [False]}))
 
     current = _read(handler, asset_metadata={"iceberg/columns": json.dumps(["b", "a"])})
     assert current.columns == ["b", "a"]
@@ -123,8 +122,8 @@ def test_columns_and_snapshot(tmp_path):
 
 def test_relations_from_two_tables_join(tmp_path):
     handler = iceberg_handler(tmp_path)
-    _write(handler, pa.table({"id": [1, 2], "name": ["a", "b"]}), name="users")
-    _write(handler, pa.table({"user": [2, 2, 1], "n": [1, 2, 3]}), name="orders")
+    write_output(handler, pa.table({"id": [1, 2], "name": ["a", "b"]}), name="users")
+    write_output(handler, pa.table({"user": [2, 2, 1], "n": [1, 2, 3]}), name="orders")
 
     users = _read(handler, "users").set_alias("u")
     orders = _read(handler, "orders").set_alias("o")
@@ -137,7 +136,7 @@ def test_handler_config_resource_is_used(tmp_path):
         tmp_path,
         handler_config={"duckdb": DuckDBResource(connection_config={"threads": 3})},
     )
-    _write(handler, pa.table({"a": [1]}))
+    write_output(handler, pa.table({"a": [1]}))
 
     rel = _read(handler)
     assert rel.query("t", "SELECT current_setting('threads') FROM t").fetchall() == [
@@ -148,12 +147,12 @@ def test_handler_config_resource_is_used(tmp_path):
 def test_relation_upsert(tmp_path):
     handler = iceberg_handler(tmp_path, mode="upsert")
     meta = {"iceberg/join_cols": '["day"]'}
-    _write(
+    write_output(
         handler,
         duckdb.sql("SELECT DATE '2024-01-01' AS day, 1 AS n"),
         asset_metadata=meta,
     )
-    _write(
+    write_output(
         handler,
         duckdb.sql(
             "SELECT * FROM (VALUES (DATE '2024-01-01', 2), (DATE '2024-01-02', 3)) v(day, n)"

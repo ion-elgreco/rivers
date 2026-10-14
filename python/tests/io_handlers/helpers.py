@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import Any
 
+import pyarrow as pa
+
 import rivers as rs
 
 
@@ -26,6 +28,29 @@ def iceberg_handler(tmp_path, **kwargs: Any):
     )
     handler.catalog().close()
     return handler
+
+
+def iceberg_table(handler, name: str):
+    """The whole Iceberg table of asset ``name``, as a ``pa.Table``."""
+    return handler.load_table(name).scan().to_arrow()
+
+
+def write_output(handler, obj, name: str = "t", **context: Any) -> rs.OutputContext:
+    """Write ``obj`` as asset ``name`` with ``handler``, and return the context."""
+    ctx = rs.OutputContext(asset_name=name, **context)
+    handler.handle_output(ctx, obj)
+    return ctx
+
+
+def read_input(
+    handler, type_hint: Any = pa.Table, name: str = "t", **context: Any
+) -> Any:
+    """Read asset ``name`` with ``handler`` as ``type_hint``."""
+    return handler.load_input(
+        rs.InputContext(
+            asset_name=name, downstream_asset="d", type_hint=type_hint, **context
+        )
+    )
 
 
 def make_partition(key_val: str | list[str]) -> rs.PartitionContext:

@@ -1,7 +1,6 @@
 """IcebergIOHandler partitions: row filters, partition specs, partition overwrites."""
 
 import json
-import threading
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -42,7 +41,9 @@ from rivers.io_handlers.iceberg._partitions import (  # noqa: E402
     partition_filter,
 )
 
-from .helpers import iceberg_handler  # noqa: E402
+from _threads import run_threads  # noqa: E402
+
+from .helpers import iceberg_handler, read_input, write_output  # noqa: E402
 
 _DAILY = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
 _REGIONS = rs.PartitionsDefinition.static_(["us", "eu", "apac"])
@@ -58,22 +59,12 @@ def _ctx(definition, *keys) -> rs.PartitionContext:
     )
 
 
-def _write(handler, obj, partition, meta, name="t") -> rs.OutputContext:
-    ctx = rs.OutputContext(asset_name=name, partition=partition, asset_metadata=meta)
-    handler.handle_output(ctx, obj)
-    return ctx
+def _write(handler, obj, partition, meta) -> rs.OutputContext:
+    return write_output(handler, obj, partition=partition, asset_metadata=meta)
 
 
-def _read(handler, partition=None, meta=None, type_hint=pa.Table, name="t"):
-    value = handler.load_input(
-        rs.InputContext(
-            asset_name=name,
-            downstream_asset="d",
-            partition=partition,
-            asset_metadata=meta,
-            type_hint=type_hint,
-        )
-    )
+def _read(handler, partition=None, meta=None, type_hint=pa.Table):
+    value = read_input(handler, type_hint, partition=partition, asset_metadata=meta)
     return value.to_arrow() if isinstance(value, pl.DataFrame) else value
 
 
@@ -434,10 +425,7 @@ def test_partitioned_append_without_partition_expr(tmp_path):
 
 def test_an_existing_table_keeps_its_spec(tmp_path):
     handler = iceberg_handler(tmp_path)
-    handler.handle_output(
-        rs.OutputContext(asset_name="t"),
-        pa.table({"region": ["us", "eu"], "v": [0, 0]}),
-    )
+    write_output(handler, pa.table({"region": ["us", "eu"], "v": [0, 0]}))
     meta = {"iceberg/partition_expr": "region"}
     _write(handler, pa.table({"region": ["us"], "v": [1]}), _ctx(_REGIONS, "us"), meta)
 
@@ -466,22 +454,12 @@ def test_concurrent_writers_create_one_table_and_keep_every_partition(tmp_path):
     )
     definition = rs.PartitionsDefinition.static_([f"p{i}" for i in range(6)])
     meta = {"iceberg/partition_expr": "p"}
-    barrier = threading.Barrier(6)
-    errors: list[BaseException] = []
 
     def write(i: int) -> None:
-        barrier.wait()
-        try:
-            data = pa.table({"p": [f"p{i}"] * 100, "v": list(range(100))})
-            _write(handler, data, _ctx(definition, f"p{i}"), meta)
-        except BaseException as e:
-            errors.append(e)
+        data = pa.table({"p": [f"p{i}"] * 100, "v": list(range(100))})
+        _write(handler, data, _ctx(definition, f"p{i}"), meta)
 
-    threads = [threading.Thread(target=write, args=(i,)) for i in range(6)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    _, errors = run_threads(write, n=6)
 
     assert errors == []
     counts = _read(handler).group_by("p").aggregate([("v", "count")]).to_pylist()

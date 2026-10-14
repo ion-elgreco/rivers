@@ -1,5 +1,7 @@
 """IcebergAsset actions: delete and expire_snapshots."""
 
+import json
+
 import pytest
 
 pytest.importorskip("pyiceberg")
@@ -10,17 +12,11 @@ import rivers as rs  # noqa: E402
 from rivers.exceptions import ExecutionError  # noqa: E402
 from rivers.io_handlers.iceberg import IcebergAsset  # noqa: E402
 
-from .helpers import iceberg_handler  # noqa: E402
+from _helpers import make_repo  # noqa: E402
+
+from .helpers import iceberg_handler, iceberg_table  # noqa: E402
 
 _DAYS = rs.PartitionsDefinition.static_(["a", "b"])
-
-
-def _repo(storage, *assets) -> rs.CodeRepository:
-    repo = rs.CodeRepository(
-        assets=list(assets), default_executor=rs.Executor.in_process()
-    )
-    repo.resolve(storage=storage)
-    return repo
 
 
 def _events(handler, meta=None):
@@ -39,29 +35,27 @@ def _events(handler, meta=None):
 
 def _materialized_events(tmp_path, storage, meta=None, **handler_kwargs):
     handler = iceberg_handler(tmp_path, **handler_kwargs)
-    repo = _repo(storage, _events(handler, meta))
+    repo = make_repo([_events(handler, meta)], storage)
     for day in ("a", "b"):
         repo.materialize(partition_key=rs.PartitionKey.single(day))
     return handler, repo
 
 
 def _days(handler) -> list[str]:
-    return sorted(
-        handler.load_table("events").scan().to_arrow().column("day").to_pylist()
-    )
+    return sorted(iceberg_table(handler, "events").column("day").to_pylist())
 
 
 def _deletions(storage, name="events") -> int:
     return sum(e.event_type == "Deletion" for e in storage.get_events_for_asset(name))
 
 
-def _action_metadata(storage, result) -> dict[str, str]:
-    event = next(
+def _snapshots_expired(storage, result) -> int:
+    [event] = [
         e
         for e in storage.get_events_for_run(result.run_id)
-        if str(e.event_type) == "ActionCompleted"
-    )
-    return dict(event.metadata)
+        if e.event_type == "ActionCompleted"
+    ]
+    return json.loads(dict(event.metadata)["snapshots_expired"])["Int"]["value"]
 
 
 def test_kinds():
@@ -103,7 +97,7 @@ def test_delete_of_a_missing_table_clears_state(tmp_path, storage):
 
 def test_keyed_delete_needs_partition_expr(tmp_path, storage):
     handler = iceberg_handler(tmp_path, mode="append")
-    repo = _repo(storage, _events(handler, meta={}))
+    repo = make_repo([_events(handler, meta={})], storage)
     repo.materialize(partition_key=rs.PartitionKey.single("a"))
 
     result = repo.run_action(
@@ -131,7 +125,7 @@ def test_expire_snapshots_keeps_the_newest(tmp_path, storage):
     assert result.success
     table = handler.load_table("events")
     assert [s.snapshot_id for s in table.snapshots()] == [current]
-    assert str(before - 1) in _action_metadata(storage, result)["snapshots_expired"]
+    assert _snapshots_expired(storage, result) == before - 1
     assert _days(handler) == ["a", "a", "b", "b"]
 
 
@@ -165,7 +159,7 @@ def test_expire_snapshots_defaults_keep_recent_snapshots(tmp_path, storage):
 
     assert result.success
     assert len(handler.load_table("events").snapshots()) == before
-    assert "0" in _action_metadata(storage, result)["snapshots_expired"]
+    assert _snapshots_expired(storage, result) == 0
 
 
 def test_expire_snapshots_reads_the_table_property(tmp_path, storage):
@@ -181,12 +175,12 @@ def test_expire_snapshots_reads_the_table_property(tmp_path, storage):
 
 def test_expire_snapshots_of_a_missing_table_is_unchanged(tmp_path, storage):
     handler = iceberg_handler(tmp_path)
-    repo = _repo(storage, _events(handler))
+    repo = make_repo([_events(handler)], storage)
 
     result = repo.run_action("expire_snapshots")
 
     assert result.success
-    assert "0" in _action_metadata(storage, result)["snapshots_expired"]
+    assert _snapshots_expired(storage, result) == 0
 
 
 def test_expire_snapshots_rejects_a_partition_key(tmp_path, storage):
@@ -215,7 +209,7 @@ def test_verbs_need_an_iceberg_handler(storage):
         def materialize(cls) -> dict:
             return {"v": 1}
 
-    repo = _repo(storage, NotIceberg)
+    repo = make_repo([NotIceberg], storage)
     repo.materialize()
 
     result = repo.run_action("expire_snapshots", raise_on_error=False)
@@ -240,7 +234,7 @@ def test_subclass_override_wins(tmp_path, storage):
         def expire_snapshots(cls, ctx: rs.ActionContext) -> None:
             calls.append(ctx.asset_name)
 
-    repo = _repo(storage, Events)
+    repo = make_repo([Events], storage)
     repo.materialize()
 
     assert repo.run_action("expire_snapshots").success
