@@ -48,7 +48,10 @@ import rivers as rs
 
 daily_sales = databricks.job_asset(123, name="daily_sales")
 
-repo = rs.CodeRepository(assets=[daily_sales])
+repo = rs.CodeRepository(
+    assets=[daily_sales],
+    resources={"databricks": databricks},
+)
 ```
 
 `job_asset` does not call Databricks when the code location loads, so you give the asset its `name`. The asset has the kind `databricks`. A run starts the job with `run_now`, waits until the run ends, and records one materialization. A wrong job id fails when the asset runs.
@@ -94,6 +97,30 @@ A run of all the outputs runs the whole job. A run of some outputs runs only the
 When the run ends, each selected task that ended with `SUCCESS` records a materialization. The other selected outputs fail with `DatabricksRunError`. When a task that you did not list fails, the outputs do not fail, and the run log has a warning.
 
 rivers does not [retry](../concepts/retries.md#multi-assets) an asset with `tasks`, because its outputs are recorded one at a time. To retry a task, set `max_retries` on the task in Databricks.
+
+## The registered resource
+
+A run uses the resource registered under the key `databricks`, not the instance that made the asset. So a run can [override the resource's fields](../concepts/resources.md#per-run-overrides), from Python or from the launch dialog in the UI:
+
+```python
+repo.materialize(config={"resources": {"databricks": {"poll_timeout": 7200}}})
+```
+
+Without the resource, the code location fails to load with `unresolved input 'databricks'`.
+
+To register a resource under another key, for example for a second workspace, give the key as `resource_key`:
+
+```python
+staging = DatabricksResource(host="https://dbc-9f8e7d6c-5b4a.cloud.databricks.com", token="...")
+
+repo = rs.CodeRepository(
+    assets=[
+        databricks.job_asset(123, name="daily_sales"),
+        staging.job_asset(123, name="staging_daily_sales", resource_key="databricks_staging"),
+    ],
+    resources={"databricks": databricks, "databricks_staging": staging},
+)
+```
 
 ## Waiting and failures
 
@@ -165,7 +192,11 @@ The function of a job asset is async, so its step waits without holding a worker
 ```python
 daily_sales = databricks.job_asset(123, name="daily_sales", partitions_def=daily, pool="databricks")
 
-repo = rs.CodeRepository(assets=[daily_sales], pool_limits={"databricks": 4})
+repo = rs.CodeRepository(
+    assets=[daily_sales],
+    resources={"databricks": databricks},
+    pool_limits={"databricks": 4},
+)
 ```
 
 An asset with `tasks` takes the pool on each output: `rs.AssetDef(pool="databricks")`.
@@ -186,13 +217,13 @@ Databricks can also retry a task itself: set `max_retries` in the task.
 
 ## Run a job in your own asset
 
-`run_job` runs a job of the workspace, and `submit_run` submits a one-time run of tasks that you give in Python. Both wait as `job_asset` does, return a `DatabricksRun`, and raise `DatabricksRunError` when the run does not succeed:
+`run_job` runs a job of the workspace, and `submit_run` submits a one-time run of tasks that you give in Python. Both wait as `job_asset` does, return a `DatabricksRun`, and raise `DatabricksRunError` when the run does not succeed. Take the registered resource as a parameter, so that a run's config reaches it too:
 
 ```python
 import json
 
 @rs.Asset(kinds="databricks")
-def customers(context: rs.AssetExecutionContext) -> rs.Materialization:
+def customers(context: rs.AssetExecutionContext, databricks: DatabricksResource) -> rs.Materialization:
     run = databricks.submit_run(
         [
             {
@@ -216,7 +247,7 @@ A task is a dict in the form of the [Jobs API](https://docs.databricks.com/api/w
 
 ```python
 @rs.Asset
-def warehouses() -> list[str]:
+def warehouses(databricks: DatabricksResource) -> list[str]:
     return [w.name for w in databricks.get_client().warehouses.list()]
 ```
 

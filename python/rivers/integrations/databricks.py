@@ -13,8 +13,12 @@ Example::
         assets=[
             databricks.job_asset(123, name="daily_sales"),
             databricks.job_asset(456, name="sales", tasks=["orders", "refunds"]),
-        ]
+        ],
+        resources={"databricks": databricks},
     )
+
+A run uses the resource registered under ``"databricks"``, so the run's
+config can override its fields.
 """
 
 import asyncio
@@ -36,6 +40,7 @@ from rivers._core.assets import (
     MultiAsset,
     SingleAsset,
 )
+from rivers.integrations._resource_key import with_resource_key
 from rivers.resource import Resource
 
 try:
@@ -113,7 +118,11 @@ class DatabricksResource(Resource):
     Example::
 
         databricks = DatabricksResource(poll_timeout=3600)
-        daily_sales = databricks.job_asset(123, name="daily_sales")
+
+        repo = rs.CodeRepository(
+            assets=[databricks.job_asset(123, name="daily_sales")],
+            resources={"databricks": databricks},
+        )
     """
 
     model_config = SettingsConfigDict(env_prefix="DATABRICKS_")
@@ -148,6 +157,7 @@ class DatabricksResource(Resource):
         name: str,
         tasks: Sequence[str] | Mapping[str, AssetDef] | None = None,
         job_parameters: _JobParameters | None = None,
+        resource_key: str = "databricks",
         **asset_options: Any,
     ) -> SingleAsset | MultiAsset:
         """An asset that runs a job of the workspace.
@@ -158,6 +168,12 @@ class DatabricksResource(Resource):
         outputs runs only their tasks. Each task that succeeds records a
         materialization; the other selected outputs fail with
         :class:`DatabricksRunError`.
+
+        A run uses the ``DatabricksResource`` registered under
+        ``resource_key``, not the instance that this method is called on, so
+        the run's config can override the resource's fields. Without that
+        resource, the code location fails to load with ``unresolved input``
+        and the key, e.g. ``unresolved input 'databricks'``.
 
         The asset's function is async, so the step waits for the run without
         holding a worker of the executor. The job is not read when the asset
@@ -173,6 +189,8 @@ class DatabricksResource(Resource):
             job_parameters: Values for the job's parameters, or a function
                 that returns them from the asset's context, e.g.
                 ``lambda context: {"date": context.partition_key}``.
+            resource_key: The key of the resource in
+                ``CodeRepository(resources={...})``.
             **asset_options: Passed to ``Asset`` or, with ``tasks``, to
                 ``Asset.from_multi``, e.g. ``group``, ``partitions_def``, or
                 ``retry``. ``kinds`` defaults to ``["databricks"]``.
@@ -188,28 +206,35 @@ class DatabricksResource(Resource):
         asset_options.setdefault("kinds", ["databricks"])
         if tasks is None:
 
-            async def run_job(context: AssetExecutionContext) -> Materialization:
-                run = await self.async_run_job(
+            async def run_job(
+                context: AssetExecutionContext, databricks: DatabricksResource
+            ) -> Materialization:
+                run = await databricks.async_run_job(
                     job_id,
                     job_parameters=_parameters(job_parameters, context),
                     log=context.log,
                 )
                 return Materialization(metadata=_run_metadata(run))
 
-            return Asset(name=name, **asset_options)(run_job)
+            return Asset(name=name, **asset_options)(
+                with_resource_key(run_job, resource_key)
+            )
 
         task_keys, output_defs = _task_outputs(name, tasks)
 
         async def run_tasks(
-            context: AssetExecutionContext,
+            context: AssetExecutionContext, databricks: DatabricksResource
         ) -> AsyncIterator[Materialization]:
-            async for materialization in self._run_tasks(
+            async for materialization in databricks._run_tasks(
                 job_id, task_keys, _parameters(job_parameters, context), context
             ):
                 yield materialization
 
         return Asset.from_multi(
-            run_tasks, output_defs=output_defs, name=name, **asset_options
+            with_resource_key(run_tasks, resource_key),
+            output_defs=output_defs,
+            name=name,
+            **asset_options,
         )
 
     def run_job(

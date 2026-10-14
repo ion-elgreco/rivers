@@ -35,7 +35,6 @@ change other fields, return :meth:`AirbyteConnection.output_def` from
 
 import asyncio
 import base64
-import inspect
 import json
 import logging
 import re
@@ -62,6 +61,7 @@ from pydantic_settings import SettingsConfigDict
 
 from rivers._core import Materialization, MetadataValue
 from rivers._core.assets import Asset, AssetDef, AssetExecutionContext, MultiAsset
+from rivers.integrations._resource_key import with_resource_key
 from rivers.resource import Resource
 
 __all__ = [
@@ -377,16 +377,9 @@ class AirbyteResource(Resource):
             ):
                 yield materialization
 
-        # rivers injects a resource into the parameter named after its key.
-        signature = inspect.signature(sync_streams)
-        context_param, resource_param = signature.parameters.values()
-        sync_streams.__signature__ = signature.replace(  # type: ignore[attr-defined]
-            parameters=[context_param, resource_param.replace(name=resource_key)]
-        )
-
         asset_options.setdefault("kinds", ["airbyte"])
         return Asset.from_multi(
-            sync_streams,
+            with_resource_key(sync_streams, resource_key),
             output_defs=output_defs,
             name=name or _asset_name(connection.name),
             **asset_options,

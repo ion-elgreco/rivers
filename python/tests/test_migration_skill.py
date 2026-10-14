@@ -225,6 +225,21 @@ def test_dagster_databricks_maps_to_databricks_resource():
 
     assert daily_sales.is_single and daily_sales.kinds == ["databricks"]
     assert [d.name for d in sales.output_defs] == ["orders", "refunds"]
+
+    # Like Dagster's run-now op, the asset takes the resource registered under
+    # "databricks"; the op's `databricks_resource_key` becomes `resource_key`.
+    rs.CodeRepository(
+        assets=[daily_sales, sales], resources={"databricks": databricks}
+    ).validate()
+    with pytest.raises(
+        rs.exceptions.GraphValidationError, match="unresolved input 'databricks'"
+    ):
+        rs.CodeRepository(assets=[daily_sales]).validate()
+    workspace = databricks.job_asset(789, name="nightly", resource_key="workspace")
+    rs.CodeRepository(
+        assets=[workspace], resources={"workspace": databricks}
+    ).validate()
+
     assert databricks.poll_timeout is None
     assert callable(databricks.run_job) and callable(databricks.submit_run)
     assert issubclass(DatabricksRunError, Exception)
