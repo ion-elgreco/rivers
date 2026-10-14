@@ -9,12 +9,7 @@ from arro3.core import RecordBatchReader
 from duckdb import ConstantExpression, DuckDBPyRelation
 
 from rivers.integrations.duckdb import DuckDBResource
-from rivers.integrations.duckdb._secrets import (
-    azure_params,
-    normalize,
-    s3_params,
-    scoped_secret,
-)
+from rivers.integrations.duckdb._secrets import azure_params, s3_params, scoped_secret
 from rivers.integrations.duckdb._sql import select_sql
 from rivers.io_handlers.delta.base import ArrowDeltaTypeHandler
 
@@ -80,10 +75,10 @@ def delta_secret(table_uri: str, storage_options: dict[str, str] | None) -> str 
     url = urlparse(table_uri)
     scheme = url.scheme.lower()
     if scheme in ("s3", "s3a"):
-        params = s3_params(normalize(storage_options, "aws_"))
+        params = s3_params(_normalize(storage_options, "aws_"))
     elif scheme in ("az", "azure", "abfs", "abfss"):
         params = azure_params(
-            normalize(storage_options, "azure_", "storage_"),
+            _normalize(storage_options, "azure_", "storage_"),
             url,
             "azure_storage_account_name",
         )
@@ -98,3 +93,14 @@ def delta_secret(table_uri: str, storage_options: dict[str, str] | None) -> str 
         return None
 
     return scoped_secret("delta", url, params)
+
+
+def _normalize(options: dict[str, str] | None, *prefixes: str) -> dict[str, str]:
+    normalized = {}
+    for key, value in (options or {}).items():
+        key = key.lower()
+        for prefix in prefixes:
+            key = key.removeprefix(prefix)
+        normalized[key] = value
+
+    return normalized

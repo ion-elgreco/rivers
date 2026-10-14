@@ -8,18 +8,6 @@ from urllib.parse import ParseResult
 from rivers.integrations.duckdb._sql import render_secret
 
 
-def normalize(options: dict[str, str] | None, *prefixes: str) -> dict[str, str]:
-    """``options`` with lower-case keys and the ``prefixes`` removed."""
-    normalized = {}
-    for key, value in (options or {}).items():
-        key = key.lower()
-        for prefix in prefixes:
-            key = key.removeprefix(prefix)
-        normalized[key] = value
-
-    return normalized
-
-
 def _truthy(value: str | None) -> bool:
     return str(value).lower() in ("true", "1")
 
