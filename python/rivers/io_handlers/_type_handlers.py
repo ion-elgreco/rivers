@@ -42,13 +42,7 @@ def resolve(
             install extra from ``extras`` (keyed by top-level module) when the
             type comes from a known library.
     """
-    # Spark 4.0+ introduced a split between the public DataFrame API
-    # (``pyspark.sql.dataframe.DataFrame``) and the underlying classic
-    # implementation (``pyspark.sql.classic.dataframe.DataFrame``).
-    # So a direct type lookup can therefore fail because ``type(df)`` may
-    # resolve to the classic implementation while handlers are registered
-    # against the public API class. Using ``issubclass()`` is therefore a
-    # more robust check instead of exact class comparison.
+    # Spark 4 DataFrames are pyspark.sql.classic subclasses of the registered class
     for supported, handler in handlers.items():
         if issubclass(target_type, supported):
             return handler
