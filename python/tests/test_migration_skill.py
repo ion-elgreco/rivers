@@ -291,6 +291,16 @@ def test_dagster_airbyte_maps_to_airbyte_resource():
         ("pg_orders", "raw"),
     ]
 
+    # Like the body's `airbyte` parameter, the asset takes the resource
+    # registered under "airbyte"; another parameter name becomes `resource_key`.
+    rs.CodeRepository(assets=[assets], resources={"airbyte": airbyte}).validate()
+    with pytest.raises(
+        rs.exceptions.GraphValidationError, match="unresolved input 'airbyte'"
+    ):
+        rs.CodeRepository(assets=[assets]).validate()
+    workspace = airbyte.connection_asset(connection, resource_key="workspace")
+    rs.CodeRepository(assets=[workspace], resources={"workspace": airbyte}).validate()
+
     # `get_asset_spec` becomes `connection.output_def(stream, ...)`, which keeps
     # the default name.
     custom = airbyte.connection_asset(

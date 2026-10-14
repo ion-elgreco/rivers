@@ -37,18 +37,30 @@ With client credentials, the resource gets an access token from `POST {api_url}/
 
 Returns the [`AirbyteConnection`](#airbyteconnection) with its enabled streams, from `GET {api_url}/connections/{connection_id}`. Raises `AirbyteError` when the request fails.
 
-#### `connection_asset(connection, *, name=None, asset_def_fn=None, **asset_options)`
+#### `connection_asset(connection, *, name=None, asset_def_fn=None, resource_key="airbyte", **asset_options)`
 
 Returns a `MultiAsset` that syncs `connection`, with one output per enabled stream. The asset's function is async, so its step waits for the job without holding a worker of the executor.
+
+```python
+postgres = airbyte.get_connection("9924bcd0-99be-453d-ba47-c2c9766f7da5")
+
+repo = rs.CodeRepository(
+    assets=[airbyte.connection_asset(postgres)],
+    resources={"airbyte": airbyte},
+)
+```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `connection` | `AirbyteConnection` | required | From `get_connection()`, or built by hand. |
 | `name` | `str \| None` | `None` | Asset name. The default is `airbyte_` and the connection name in snake case. |
 | `asset_def_fn` | `(AirbyteConnection, AirbyteStream) -> AssetDef` | `AirbyteConnection.output_def` | Makes the output of a stream. The default names it like the destination table: the connection's `prefix` and the stream name. |
+| `resource_key` | `str` | `"airbyte"` | The key of the `AirbyteResource` in `CodeRepository(resources={...})`. |
 | `**asset_options` | | | Passed to [`Asset.from_multi()`](assets.md#assetfrom_multi), for example `group`, `hooks`, `automation_condition`, or `retry`. `kinds` defaults to `["airbyte"]`. |
 
 Raises `ValueError` when the connection has no enabled streams, or when two streams get the same output name.
+
+A run uses the resource registered under `resource_key`, not the instance that `connection_asset` is called on, so the run's config can [override the resource's fields](../concepts/resources.md#per-run-overrides). Without that resource, the code location fails to load with `unresolved input` and the key, for example `unresolved input 'airbyte'`.
 
 A run:
 
@@ -83,11 +95,15 @@ Raises `AirbyteError` when a request fails, when the job ends with a status othe
 
 `sync` for async code. It takes the same arguments, returns and raises the same, and waits without blocking the event loop. A cancellation of the task, for example on Ctrl-C, stops the wait, so the job is cancelled as above.
 
+The asset takes the resource registered under `airbyte`:
+
 ```python
 @rs.Asset(kinds="airbyte")
-async def postgres_sync(context: rs.AssetExecutionContext) -> rs.Materialization:
+async def postgres_sync(context: rs.AssetExecutionContext, airbyte: AirbyteResource) -> rs.Materialization:
     job = await airbyte.async_sync("9924bcd0-99be-453d-ba47-c2c9766f7da5", log=context.log)
     return rs.Materialization(metadata={"airbyte/job_id": job.job_id})
+
+repo = rs.CodeRepository(assets=[postgres_sync], resources={"airbyte": AirbyteResource()})
 ```
 
 ---

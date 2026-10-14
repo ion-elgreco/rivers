@@ -13,7 +13,13 @@ Example::
     # One API call when the code location loads.
     postgres = airbyte.get_connection("9924bcd0-99be-453d-ba47-c2c9766f7da5")
 
-    repo = rs.CodeRepository(assets=[airbyte.connection_asset(postgres)])
+    repo = rs.CodeRepository(
+        assets=[airbyte.connection_asset(postgres)],
+        resources={"airbyte": airbyte},
+    )
+
+A run uses the resource registered under ``"airbyte"``, so the run's config
+can override its fields.
 
 Each output has the name of its destination table, e.g. ``pg_users``. To
 change other fields, return :meth:`AirbyteConnection.output_def` from
@@ -29,6 +35,7 @@ change other fields, return :meth:`AirbyteConnection.output_def` from
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import re
@@ -301,6 +308,7 @@ class AirbyteResource(Resource):
         name: str | None = None,
         asset_def_fn: Callable[[AirbyteConnection, AirbyteStream], AssetDef]
         | None = None,
+        resource_key: str = "airbyte",
         **asset_options: Any,
     ) -> MultiAsset:
         """A multi-asset that syncs a connection, with one output per enabled stream.
@@ -310,6 +318,12 @@ class AirbyteResource(Resource):
         materialization with the job id and the stream's committed records
         and bytes. A selected output whose stream the connection no longer
         syncs fails with :class:`AirbyteError`.
+
+        A run uses the ``AirbyteResource`` registered under ``resource_key``,
+        not the instance that this method is called on, so the run's config
+        can override the resource's fields. Without that resource, the code
+        location fails to load with ``unresolved input`` and the key, e.g.
+        ``unresolved input 'airbyte'``.
 
         The asset's function is async, so the step waits for the job without
         holding a worker of the executor.
@@ -323,6 +337,8 @@ class AirbyteResource(Resource):
                 destination table: the connection's prefix and the stream
                 name. Return ``connection.output_def(stream, ...)`` to keep
                 that name and set other fields.
+            resource_key: The key of the resource in
+                ``CodeRepository(resources={...})``.
             **asset_options: Passed to ``Asset.from_multi``, e.g. ``group``,
                 ``hooks``, ``automation_condition``, or ``retry``. ``kinds``
                 defaults to ``["airbyte"]``.
@@ -354,12 +370,19 @@ class AirbyteResource(Resource):
             )
 
         async def sync_streams(
-            context: AssetExecutionContext,
+            context: AssetExecutionContext, airbyte: AirbyteResource
         ) -> AsyncIterator[Materialization]:
-            async for materialization in self._materialize(
+            async for materialization in airbyte._materialize(
                 connection.connection_id, streams, context
             ):
                 yield materialization
+
+        # rivers injects a resource into the parameter named after its key.
+        signature = inspect.signature(sync_streams)
+        context_param, resource_param = signature.parameters.values()
+        sync_streams.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[context_param, resource_param.replace(name=resource_key)]
+        )
 
         asset_options.setdefault("kinds", ["airbyte"])
         return Asset.from_multi(

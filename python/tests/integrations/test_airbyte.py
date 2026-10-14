@@ -20,6 +20,7 @@ from obstore.store import LocalStore
 from pydantic import SecretStr, ValidationError
 
 import rivers as rs
+from rivers.exceptions import GraphValidationError
 from rivers.integrations.airbyte import (
     AirbyteConnection,
     AirbyteError,
@@ -231,6 +232,14 @@ def fake():
     server.close()
 
 
+@pytest.fixture
+def other_fake():
+    """A second Airbyte API."""
+    server = FakeAirbyte()
+    yield server
+    server.close()
+
+
 @pytest.fixture(params=["in_process", "parallel"])
 def executor(request) -> str:
     return request.param
@@ -264,7 +273,13 @@ def pickle_handler(tmp_path) -> PickleIOHandler:
     return PickleIOHandler(store=LocalStore(str(tmp_path), mkdir=True))
 
 
-def make_repo(storage, executor: str, tmp_path, *assets: rs.Asset) -> rs.CodeRepository:
+def make_repo(
+    storage,
+    executor: str,
+    tmp_path,
+    *assets: rs.Asset,
+    resources: dict[str, AirbyteResource] | None = None,
+) -> rs.CodeRepository:
     """A repository with a second step, so the parallel executor uses its workers."""
 
     @rs.Asset(io_handler=pickle_handler(tmp_path))
@@ -273,6 +288,7 @@ def make_repo(storage, executor: str, tmp_path, *assets: rs.Asset) -> rs.CodeRep
 
     repo = rs.CodeRepository(
         assets=[*assets, pid],
+        resources=resources,
         default_executor=rs.Executor.in_process()
         if executor == "in_process"
         else rs.Executor.parallel(max_workers=2),
@@ -321,13 +337,9 @@ def run_log(storage, run_id: str) -> str:
     return "".join(row.logs or "" for row in storage.get_run_logs(run_id))
 
 
-def connection_asset(
-    fake: FakeAirbyte, io_handler: PickleIOHandler | None = None, **fields: Any
-) -> rs.MultiAsset:
-    airbyte = make_resource(fake, **fields)
-    return airbyte.connection_asset(
-        airbyte.get_connection(CONNECTION_ID), io_handler=io_handler
-    )
+def connection_asset(airbyte: AirbyteResource, **options: Any) -> rs.MultiAsset:
+    """The asset of the test connection, read with ``airbyte``."""
+    return airbyte.connection_asset(airbyte.get_connection(CONNECTION_ID), **options)
 
 
 # ── Resource ─────────────────────────────────────────────────────────
@@ -667,14 +679,16 @@ def test_failed_cancel_keeps_the_original_error(fake, sync):
 
 
 def test_sync_in_your_own_asset(fake, storage, executor, tmp_path):
-    """A sync asset that calls ``sync``. The parallel executor runs it in a worker."""
-    airbyte = make_resource(fake)
+    """A sync asset that calls ``sync`` on the registered resource. The parallel
+    executor runs it in a worker."""
 
     @rs.Asset(io_handler=pickle_handler(tmp_path))
-    def synced(context: rs.AssetExecutionContext) -> int:
+    def synced(context: rs.AssetExecutionContext, airbyte: AirbyteResource) -> int:
         return airbyte.sync(CONNECTION_ID, log=context.log).rows_synced
 
-    repo = make_repo(storage, executor, tmp_path, synced)
+    repo = make_repo(
+        storage, executor, tmp_path, synced, resources={"airbyte": make_resource(fake)}
+    )
 
     assert repo.materialize().success
     assert (repo.load_node("pid") != os.getpid()) == (executor == "parallel")
@@ -804,8 +818,9 @@ def test_connection_without_streams_raises():
 
 def test_run_materializes_every_stream(fake, storage, executor, tmp_path):
     """The asset's function is async, so both executors run it in this process."""
-    asset = connection_asset(fake, io_handler=pickle_handler(tmp_path))
-    repo = make_repo(storage, executor, tmp_path, asset)
+    airbyte = make_resource(fake)
+    asset = connection_asset(airbyte, io_handler=pickle_handler(tmp_path))
+    repo = make_repo(storage, executor, tmp_path, asset, resources={"airbyte": airbyte})
 
     result = repo.materialize()
 
@@ -838,10 +853,102 @@ def test_run_materializes_every_stream(fake, storage, executor, tmp_path):
     assert f"Airbyte job {JOB_ID} committed 10 records, 3072 bytes" in log
 
 
+def test_run_uses_the_registered_resource(
+    fake, other_fake, storage, executor, tmp_path
+):
+    """A run calls the API with the resource registered under ``airbyte``. The
+    instance that made the asset only reads the connection at load."""
+    loader = make_resource(other_fake)
+    asset = connection_asset(loader, io_handler=pickle_handler(tmp_path))
+    repo = make_repo(
+        storage, executor, tmp_path, asset, resources={"airbyte": make_resource(fake)}
+    )
+
+    assert repo.materialize().success
+    assert [call.path for call in other_fake.calls] == [TOKEN_PATH, CONNECTION_PATH]
+    assert [call.path for call in fake.calls] == [
+        TOKEN_PATH,
+        CONNECTION_PATH,
+        f"{API}/jobs",
+        JOB_PATH,
+        JOB_PATH,
+        STATS_PATH,
+    ]
+    assert materializations(storage, "pg_users") == [
+        stream_metadata("public.users", 7, 2048)
+    ]
+
+
+def test_run_config_overrides_the_resource(
+    fake, other_fake, storage, executor, tmp_path
+):
+    """A run's config rebuilds the registered resource for that run: here it
+    syncs with another Airbyte, with the same credentials."""
+    airbyte = make_resource(fake)
+    asset = connection_asset(airbyte, io_handler=pickle_handler(tmp_path))
+    repo = make_repo(storage, executor, tmp_path, asset, resources={"airbyte": airbyte})
+    urls = {
+        "api_url": other_fake.url + API,
+        "configuration_api_url": other_fake.url + CONFIG_API,
+    }
+
+    result = repo.materialize(config={"resources": {"airbyte": urls}})
+
+    assert result.success
+    assert [call.path for call in fake.calls] == [TOKEN_PATH, CONNECTION_PATH]
+    assert other_fake.calls == [
+        ("POST", TOKEN_PATH, None, TOKEN_BODY),
+        ("GET", CONNECTION_PATH, "Bearer token-1", None),
+        (
+            "POST",
+            f"{API}/jobs",
+            "Bearer token-1",
+            {"connectionId": CONNECTION_ID, "jobType": "sync"},
+        ),
+        ("GET", JOB_PATH, "Bearer token-1", None),
+        ("GET", JOB_PATH, "Bearer token-1", None),
+        ("POST", STATS_PATH, "Bearer token-1", {"id": JOB_ID}),
+    ]
+    assert materializations(storage, "pg_users") == [
+        stream_metadata("public.users", 7, 2048)
+    ]
+
+
+def test_resource_key_picks_the_resource(fake, other_fake, storage, executor, tmp_path):
+    """A run uses the resource registered under ``resource_key``, not the one
+    under ``airbyte``."""
+    asset = connection_asset(
+        make_resource(fake), io_handler=pickle_handler(tmp_path), resource_key="cloud"
+    )
+    repo = make_repo(
+        storage,
+        executor,
+        tmp_path,
+        asset,
+        resources={"airbyte": make_resource(other_fake), "cloud": make_resource(fake)},
+    )
+
+    assert repo.materialize().success
+    assert other_fake.calls == []
+    assert materializations(storage, "pg_users") == [
+        stream_metadata("public.users", 7, 2048)
+    ]
+
+
+def test_asset_without_its_resource_fails_to_load(fake):
+    repo = rs.CodeRepository(assets=[connection_asset(make_resource(fake))])
+
+    with pytest.raises(
+        GraphValidationError, match="^Asset 'pg_events': unresolved input 'airbyte'$"
+    ):
+        repo.validate()
+
+
 def test_failed_job_fails_every_output(fake, storage, executor, tmp_path):
     fake.statuses = ["running", "failed"]
-    asset = connection_asset(fake, io_handler=pickle_handler(tmp_path))
-    repo = make_repo(storage, executor, tmp_path, asset)
+    airbyte = make_resource(fake)
+    asset = connection_asset(airbyte, io_handler=pickle_handler(tmp_path))
+    repo = make_repo(storage, executor, tmp_path, asset, resources={"airbyte": airbyte})
 
     result = repo.materialize(raise_on_error=False)
 
@@ -858,10 +965,9 @@ def test_failed_job_fails_every_output(fake, storage, executor, tmp_path):
 
 def test_poll_timeout_cancels_the_job(fake, storage, executor, tmp_path):
     fake.statuses = ["running"]
-    asset = connection_asset(
-        fake, io_handler=pickle_handler(tmp_path), poll_timeout=0.05
-    )
-    repo = make_repo(storage, executor, tmp_path, asset)
+    airbyte = make_resource(fake, poll_timeout=0.05)
+    asset = connection_asset(airbyte, io_handler=pickle_handler(tmp_path))
+    repo = make_repo(storage, executor, tmp_path, asset, resources={"airbyte": airbyte})
 
     result = repo.materialize(raise_on_error=False)
 
@@ -873,7 +979,14 @@ def test_poll_timeout_cancels_the_job(fake, storage, executor, tmp_path):
 
 
 def test_subset_run_syncs_the_connection_once(fake, storage, tmp_path):
-    repo = make_repo(storage, "in_process", tmp_path, connection_asset(fake))
+    airbyte = make_resource(fake)
+    repo = make_repo(
+        storage,
+        "in_process",
+        tmp_path,
+        connection_asset(airbyte),
+        resources={"airbyte": airbyte},
+    )
 
     repo.materialize(selection=["pg_users"])
 
@@ -887,7 +1000,14 @@ def test_subset_run_syncs_the_connection_once(fake, storage, tmp_path):
 
 def test_missing_counts_still_record_materializations(fake, storage, tmp_path, caplog):
     fake.overrides[("POST", STATS_PATH)] = [(403, {"message": "forbidden"})]
-    repo = make_repo(storage, "in_process", tmp_path, connection_asset(fake))
+    airbyte = make_resource(fake)
+    repo = make_repo(
+        storage,
+        "in_process",
+        tmp_path,
+        connection_asset(airbyte),
+        resources={"airbyte": airbyte},
+    )
 
     repo.materialize()
 
@@ -900,9 +1020,12 @@ def test_missing_counts_still_record_materializations(fake, storage, tmp_path, c
 
 
 def test_stream_removed_after_load_fails_its_output(fake, storage, tmp_path):
-    asset = connection_asset(fake)
+    airbyte = make_resource(fake)
+    asset = connection_asset(airbyte)
     fake.connection = connection_json(STREAMS[:2])
-    repo = make_repo(storage, "in_process", tmp_path, asset)
+    repo = make_repo(
+        storage, "in_process", tmp_path, asset, resources={"airbyte": airbyte}
+    )
 
     result = repo.materialize(raise_on_error=False)
 
@@ -920,11 +1043,14 @@ def test_stream_removed_after_load_fails_its_output(fake, storage, tmp_path):
 
 
 def test_stream_added_after_load_is_logged(fake, storage, tmp_path, caplog):
-    asset = connection_asset(fake)
+    airbyte = make_resource(fake)
+    asset = connection_asset(airbyte)
     fake.connection = connection_json(
         [*STREAMS, {"name": "refunds", "namespace": "public"}]
     )
-    repo = make_repo(storage, "in_process", tmp_path, asset)
+    repo = make_repo(
+        storage, "in_process", tmp_path, asset, resources={"airbyte": airbyte}
+    )
 
     result = repo.materialize()
 
@@ -942,8 +1068,14 @@ def test_downstream_asset_depends_on_an_airbyte_output(fake, storage, tmp_path):
     def active_users() -> int:
         return 1
 
+    airbyte = make_resource(fake)
     repo = make_repo(
-        storage, "in_process", tmp_path, connection_asset(fake), active_users
+        storage,
+        "in_process",
+        tmp_path,
+        connection_asset(airbyte),
+        active_users,
+        resources={"airbyte": airbyte},
     )
 
     repo.materialize()

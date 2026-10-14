@@ -47,7 +47,10 @@ import rivers as rs
 
 postgres = airbyte.get_connection("9924bcd0-99be-453d-ba47-c2c9766f7da5")
 
-repo = rs.CodeRepository(assets=[airbyte.connection_asset(postgres)])
+repo = rs.CodeRepository(
+    assets=[airbyte.connection_asset(postgres)],
+    resources={"airbyte": airbyte},
+)
 ```
 
 `get_connection` reads the connection and its enabled streams from the Airbyte API. `connection_asset` makes a multi-asset named `airbyte_` and the connection name in snake case, for example `airbyte_postgres_to_snowflake`. Each output has the name of its destination table: the connection's table prefix and the stream name, for example `pg_users`. The outputs have the kind `airbyte`.
@@ -64,6 +67,34 @@ postgres = AirbyteConnection.model_validate_json(Path("airbyte/postgres.json").r
 ```
 
 When the connection's streams change in Airbyte, load the code location again to update the outputs.
+
+## The registered resource
+
+A run uses the resource registered under the key `airbyte`, not the instance that made the asset. So a run can [override the resource's fields](../concepts/resources.md#per-run-overrides), from Python or from the launch dialog in the UI:
+
+```python
+repo.materialize(config={"resources": {"airbyte": {"poll_timeout": 7200}}})
+```
+
+Without the resource, the code location fails to load with `unresolved input 'airbyte'`.
+
+To register a resource under another key, for example for a second Airbyte, give the key as `resource_key`:
+
+```python
+local = AirbyteResource(
+    api_url="http://localhost:8000/api/public/v1",
+    configuration_api_url="http://localhost:8000/api/v1",
+)
+mysql = local.get_connection("0c31738c-0b2d-4887-b506-e2cd1c39cc35")
+
+repo = rs.CodeRepository(
+    assets=[
+        airbyte.connection_asset(postgres),
+        local.connection_asset(mysql, resource_key="airbyte_local"),
+    ],
+    resources={"airbyte": airbyte, "airbyte_local": local},
+)
+```
 
 ## What a run does
 
@@ -142,11 +173,13 @@ def active_users() -> None:
 
 ## Start a sync in your own code
 
-`sync` starts a sync job, waits for it, and returns the `AirbyteJob`. It raises `AirbyteError` when the job does not succeed:
+`sync` starts a sync job, waits for it, and returns the `AirbyteJob`. It raises `AirbyteError` when the job does not succeed. Take the registered resource as a parameter, so that a run's config reaches it too:
 
 ```python
-job = airbyte.sync("9924bcd0-99be-453d-ba47-c2c9766f7da5", log=context.log)
-job.rows_synced  # records of all streams
+@rs.Asset
+def postgres_rows(context: rs.AssetExecutionContext, airbyte: AirbyteResource) -> int:
+    job = airbyte.sync("9924bcd0-99be-453d-ba47-c2c9766f7da5", log=context.log)
+    return job.rows_synced  # records of all streams
 ```
 
 In an `async def` asset, use `async_sync`. It takes the same arguments and waits without blocking the event loop.
