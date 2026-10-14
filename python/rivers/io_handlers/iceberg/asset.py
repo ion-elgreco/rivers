@@ -9,13 +9,13 @@ subclass to replace it.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import time
 from itertools import islice
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 from pyiceberg.exceptions import NoSuchTableError
-from pyiceberg.table import Table
+from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.snapshots import ancestors_of
 
 from rivers._core.assets import (
@@ -33,10 +33,6 @@ if TYPE_CHECKING:
     from rivers.io_handlers.iceberg import IcebergIOHandler
 
 __all__ = ["ExpireSnapshotsConfig", "IcebergAsset"]
-
-# Iceberg's table properties for snapshot expiry, with their defaults
-_MAX_SNAPSHOT_AGE_MS = ("history.expire.max-snapshot-age-ms", 432_000_000)
-_MIN_SNAPSHOTS_TO_KEEP = ("history.expire.min-snapshots-to-keep", 1)
 
 
 class ExpireSnapshotsConfig(BaseModel):
@@ -116,15 +112,26 @@ class IcebergAsset(Asset):
             ctx.log.info("[expire_snapshots] no table for %s yet", ctx.asset_name)
             return ActionResult.unchanged(metadata={"snapshots_expired": 0})
 
+        properties = table.properties
         if cfg.retention_hours is None:
-            max_age_ms = int(table.properties.get(*_MAX_SNAPSHOT_AGE_MS))
+            max_age_ms = int(
+                properties.get(
+                    TableProperties.MAX_SNAPSHOT_AGE_MS,
+                    TableProperties.MAX_SNAPSHOT_AGE_MS_DEFAULT,
+                )
+            )
         else:
-            max_age_ms = int(cfg.retention_hours * 3_600_000)
+            max_age_ms = cfg.retention_hours * 3_600_000
         retain_last = cfg.retain_last
         if retain_last is None:
-            retain_last = int(table.properties.get(*_MIN_SNAPSHOTS_TO_KEEP))
+            retain_last = int(
+                properties.get(
+                    TableProperties.MIN_SNAPSHOTS_TO_KEEP,
+                    TableProperties.MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+                )
+            )
 
-        cutoff = datetime.now(timezone.utc) - timedelta(milliseconds=max_age_ms)
+        cutoff_ms = time.time() * 1000 - max_age_ms
         keep = {ref.snapshot_id for ref in table.metadata.refs.values()}
         keep.update(
             snapshot.snapshot_id
@@ -135,8 +142,7 @@ class IcebergAsset(Asset):
         expired = [
             snapshot.snapshot_id
             for snapshot in table.snapshots()
-            if snapshot.timestamp_ms < cutoff.timestamp() * 1000
-            and snapshot.snapshot_id not in keep
+            if snapshot.timestamp_ms < cutoff_ms and snapshot.snapshot_id not in keep
         ]
         if expired:
             table.maintenance.expire_snapshots().by_ids(expired).commit()
