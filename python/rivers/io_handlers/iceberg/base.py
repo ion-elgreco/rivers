@@ -17,6 +17,7 @@ from pyiceberg.exceptions import (
     TableAlreadyExistsError,
 )
 from pyiceberg.table import DataScan, Table, Transaction, UpsertResult
+from pyiceberg.table.snapshots import Snapshot
 
 from rivers._core import MetadataValue, OutputContext
 from rivers._core.partitions import PartitionContext
@@ -151,10 +152,11 @@ class ArrowIcebergTypeHandler(IcebergTypeHandler[T], ABC):
         upserted = _write(table, data, request)
         duration = time.monotonic() - start
 
+        snapshot = table.current_snapshot()
         context.add_output_metadata(
-            _output_metadata(table, request, duration, upserted)
+            _output_metadata(table, snapshot, request, duration, upserted)
         )
-        if (snapshot := table.current_snapshot()) is not None:
+        if snapshot is not None:
             context.register_data_version(str(snapshot.snapshot_id))
 
 
@@ -274,17 +276,17 @@ def _evolve_schema(
 
 def _output_metadata(
     table: Table,
+    snapshot: Snapshot | None,
     request: IcebergWriteRequest,
     duration: float,
     upserted: UpsertResult | None,
 ) -> dict[str, Any]:
-    snapshot = table.current_snapshot()
-    summary = snapshot.summary if snapshot is not None else None
+    summary = (snapshot.summary if snapshot is not None else None) or {}
     meta: dict[str, Any] = {
         "iceberg/table": ".".join(request.identifier),
         "iceberg/mode": request.mode,
-        "iceberg/num_rows": int(summary.get("total-records", 0)) if summary else 0,
-        "iceberg/size_bytes": int(summary.get("total-files-size", 0)) if summary else 0,
+        "iceberg/num_rows": int(summary.get("total-records", 0)),
+        "iceberg/size_bytes": int(summary.get("total-files-size", 0)),
         "iceberg/write_duration_s": round(duration, 6),
         "iceberg/metadata_location": table.metadata_location,
         "rivers/schema": MetadataValue.schema(table.schema().as_arrow()),
