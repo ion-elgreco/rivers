@@ -135,7 +135,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "(python_full_version < '3.14' and implementation_name != 'PyPy') or (implementation_name != 'PyPy' and platform_python_implementation != 'PyPy') or (implementation_name != 'PyPy' and sys_platform == 'emscripten')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -486,19 +486,25 @@ wheels = [
 
 [[package]]
 name = "datafusion"
-version = "53.0.0"
+version = "54.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "cloudpickle" },
     { name = "pyarrow" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/58/2b/0f96f12b70839c93930c4e17d767fc32b6c77d548c78784128049e944701/datafusion-53.0.0.tar.gz", hash = "sha256:ba9a5ec06b5453fbd8710d6aeeb515a8bcac4b6c140e254409bb53a5f322ef22", size = 224267, upload-time = "2026-04-13T00:45:02.686Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/3d/d564d983812e78614a62cd977e347827fec3c353b528e58ed0ffd0396d8b/datafusion-54.1.0.tar.gz", hash = "sha256:0045864afee13a137b92c40406fe59f0dba46deb8f4f0c933bf7c74591946c58", size = 276477, upload-time = "2026-10-05T12:21:58.37Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/4c/60e052813d81f1ffe3123ead013dbdd2cf961daa576cb9056cbb80228e6b/datafusion-53.0.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:a0bd1a98d736571321416dc4ed361a9d1225da1ec9f6c5fad818d75f547697a7", size = 35774913, upload-time = "2026-04-13T00:44:46.235Z" },
-    { url = "https://files.pythonhosted.org/packages/6e/59/beabe5301df3338d8206446cd624079e43bdad46e20377a6336017fb6ccf/datafusion-53.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:ce186a8d2405afd67e11e2fb75715019f16b00d070b8d0da89d8aa61cc74c8b5", size = 32667118, upload-time = "2026-04-13T00:44:50.269Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/94/636ab61ade98395daea6e733e225e9c7beef111c7c5b575ac851513e203c/datafusion-53.0.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:288a00a7ef03e2807a4667683f7560efd80d60ed1d41696ac15ca9ded14c8251", size = 35585824, upload-time = "2026-04-13T00:44:53.683Z" },
-    { url = "https://files.pythonhosted.org/packages/34/80/b9f4889209af02f8d14bccb0e6f0519c329b072bc4d2595025a1303f144c/datafusion-53.0.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:8fef0004f0161fcfc556c025a7201f9cc3169aa3adb97a86419ebb34182d9efb", size = 38083690, upload-time = "2026-04-13T00:44:57.188Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/1a/ea4831fc6aeefedbcf186c9f6a273d507b1787c03cbb905bded7e1149a6a/datafusion-53.0.0-cp310-abi3-win_amd64.whl", hash = "sha256:4c8410f5f659b926677be6c7d443bbc05d825c078c970b7d8cf977ebcf948314", size = 38120687, upload-time = "2026-04-13T00:45:00.633Z" },
+    { url = "https://files.pythonhosted.org/packages/37/07/fba9fc887b72c6e069b2daf06e34be2e2beabd3e41a3df4669d0a33b80fc/datafusion-54.1.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:77c6575baaa7526911bf442f679971955985ad7a6095d009f61ea676129fdbbc", size = 39140971, upload-time = "2026-10-05T12:21:06.308Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/bd/5c211a56113144fc928b2f2ce079e53c41f9ddcb8d5ea2d6726a05f39ae0/datafusion-54.1.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:b8019bd12ee41d043fc4875867a5d1a13c5757e1adee239056efef2fd7191ea7", size = 36584427, upload-time = "2026-10-05T12:21:11.404Z" },
+    { url = "https://files.pythonhosted.org/packages/54/00/2d905992da4ec20a5ab438fedc006f852207f4d5ca32902ac74844a34587/datafusion-54.1.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:0b4270eb031f841de729d883625d7d554ad993900bf8fcc43864710e379e6b21", size = 38149873, upload-time = "2026-10-05T12:21:17.337Z" },
+    { url = "https://files.pythonhosted.org/packages/54/28/33fe20840071394fbd236aadee6bcfd3275be55bf302244ab85fc1d55910/datafusion-54.1.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:e4bba2ab6afba3c5939d334430f56a2c25285b69d7c23489afb6c51988e29123", size = 40311653, upload-time = "2026-10-05T12:21:22.469Z" },
+    { url = "https://files.pythonhosted.org/packages/37/57/f244efebc049663fdeec1f778f9e81b5cf1cb8c2c20230fd3efdd221d2aa/datafusion-54.1.0-cp310-abi3-win_amd64.whl", hash = "sha256:6a007203478e09a6e204eb968013c60a86752b830cdbb15e20ed4095857eb304", size = 42858869, upload-time = "2026-10-05T12:21:28.8Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/7b/04e7fdd5741b45d2b2b510291fc54c1567f837cd07fb747b46619f206dfc/datafusion-54.1.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:ca790f6aaa93065a44047f931248cd2ab98bed52c81acd84aaf8f0b120d2f696", size = 39100935, upload-time = "2026-10-05T12:21:34.265Z" },
+    { url = "https://files.pythonhosted.org/packages/56/5c/4e4706e8193795127d97e0974dd14d2daae3390254e47a80abee51622152/datafusion-54.1.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:12a5fb5c1b18ac90a4aa5813ea0d3c89ced3c394b242ebe07ab73ca80ebac5ac", size = 36575605, upload-time = "2026-10-05T12:21:39.245Z" },
+    { url = "https://files.pythonhosted.org/packages/15/e7/23fad288be09bcc0acc497dfd5eea4ed440ac62f2ccd5d080975145fe87f/datafusion-54.1.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:5448d7e0cca95e205b75566c115db60270e4d40895a9a013afcf3f0c8584bc3c", size = 38167545, upload-time = "2026-10-05T12:21:44.748Z" },
+    { url = "https://files.pythonhosted.org/packages/43/77/b530f938fd82ff9d1e10b2779d6024e09c997360a709afde275140b8c779/datafusion-54.1.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:3890c605e13127732b12e8301e124dfda4e05d36293135a52260f07094455df9", size = 40317700, upload-time = "2026-10-05T12:21:50.649Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/82/2fbc21f676b427ccdc94b5f994cd3b187518ae4be622043171936d27f152/datafusion-54.1.0-cp314-cp314t-win_amd64.whl", hash = "sha256:abf3c7f84d3936015320fc8fc842c7fff4d5d8b24fb344a0ee9b8c1fa41e69d5", size = 42862503, upload-time = "2026-10-05T12:21:56.345Z" },
 ]
 
 [[package]]
@@ -575,7 +581,7 @@ dependencies = [
     { name = "tomlkit" },
     { name = "typing-extensions" },
     { name = "tzdata" },
-    { name = "win-precise-time", marker = "python_full_version < '3.13' and os_name == 'nt'" },
+    { name = "win-precise-time", marker = "(python_full_version < '3.13' and os_name == 'nt') or (python_full_version >= '3.15' and os_name == 'nt')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8d/e8/85f94c7ff5163433aded06c361f5fbe75e91353eb25a3ad95c5e0a778922/dlt-1.31.0.tar.gz", hash = "sha256:3919c1223170175cc9365514223c68048cb8c42a38ea32bb291fb99bdd7d62bd", size = 1246394, upload-time = "2026-10-07T13:20:47.465Z" }
 wheels = [
@@ -623,7 +629,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -2052,7 +2058,7 @@ requires-dist = [
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.10.0" },
     { name = "datadog", marker = "extra == 'datadog'", specifier = ">=0.47.0" },
     { name = "dataframely", marker = "extra == 'dataframely'", specifier = ">=3.0.0" },
-    { name = "datafusion", marker = "extra == 'datafusion'", specifier = ">=53" },
+    { name = "datafusion", marker = "extra == 'datafusion'", specifier = ">=54.1.0" },
     { name = "delta-spark", marker = "extra == 'delta-pyspark'", specifier = ">=3.0.0" },
     { name = "deltalake", marker = "extra == 'delta'", specifier = ">=0.25.0" },
     { name = "deltalake", marker = "extra == 'delta-datafusion'", specifier = ">=1.6.0" },
