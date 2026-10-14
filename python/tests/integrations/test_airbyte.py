@@ -4,12 +4,14 @@ A fake Airbyte API runs on a local port with the endpoints the resource calls,
 so nothing reaches Airbyte.
 """
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import socket
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
 
@@ -234,6 +236,18 @@ def executor(request) -> str:
     return request.param
 
 
+@pytest.fixture(params=["sync", "async"])
+def sync(request) -> Callable[..., AirbyteJob]:
+    """Calls ``sync``, or ``async_sync`` in an event loop."""
+
+    def sync(airbyte: AirbyteResource, connection_id: str, **kwargs: Any) -> AirbyteJob:
+        if request.param == "sync":
+            return airbyte.sync(connection_id, **kwargs)
+        return asyncio.run(airbyte.async_sync(connection_id, **kwargs))
+
+    return sync
+
+
 def make_resource(fake: FakeAirbyte, **fields: Any) -> AirbyteResource:
     defaults = {
         "api_url": fake.url + API,
@@ -303,9 +317,8 @@ def stream_metadata(stream: str, records: int | None = None, size: int = 0) -> d
     return metadata
 
 
-def values(metadata: dict) -> dict:
-    """Stored metadata without the value types."""
-    return {key: next(iter(value.values()))["value"] for key, value in metadata.items()}
+def run_log(storage, run_id: str) -> str:
+    return "".join(row.logs or "" for row in storage.get_run_logs(run_id))
 
 
 def connection_asset(
@@ -524,14 +537,14 @@ def test_a_response_with_the_wrong_shape_names_the_url(fake):
     )
 
 
-# ── sync() ───────────────────────────────────────────────────────────
+# ── sync() and async_sync() ──────────────────────────────────────────
 
 
-def test_sync_polls_until_the_job_succeeds(fake, caplog):
+def test_sync_polls_until_the_job_succeeds(fake, caplog, sync):
     fake.statuses = ["pending", "running", "succeeded"]
 
     with caplog.at_level(logging.INFO, logger="rivers.integrations.airbyte"):
-        job = make_resource(fake).sync(CONNECTION_ID)
+        job = sync(make_resource(fake), CONNECTION_ID)
 
     assert job == AirbyteJob(
         job_id=JOB_ID, status="succeeded", rows_synced=10, bytes_synced=3072
@@ -557,19 +570,35 @@ def test_sync_polls_until_the_job_succeeds(fake, caplog):
 
 
 @pytest.mark.parametrize("status", ["failed", "cancelled"])
-def test_sync_raises_when_the_job_does_not_succeed(fake, status):
+def test_sync_raises_when_the_job_does_not_succeed(fake, status, sync):
     fake.statuses = ["running", status]
 
     with pytest.raises(
         AirbyteError,
         match=f"Airbyte job {JOB_ID} of connection {CONNECTION_ID} ended with status '{status}'",
     ):
-        make_resource(fake).sync(CONNECTION_ID)
+        sync(make_resource(fake), CONNECTION_ID)
 
     assert [call.method for call in fake.calls].count("DELETE") == 0
 
 
-def test_running_sync_conflict_is_not_retried(fake):
+@pytest.mark.parametrize("cancel", [True, False])
+def test_poll_timeout_raises(fake, cancel, sync):
+    fake.statuses = ["running"]
+    airbyte = make_resource(
+        fake, poll_interval=0.01, poll_timeout=0.05, cancel_on_interrupt=cancel
+    )
+
+    with pytest.raises(
+        AirbyteError, match=rf"^Airbyte job {JOB_ID} did not finish within 0\.05 s$"
+    ):
+        sync(airbyte, CONNECTION_ID)
+
+    cancels = [call for call in fake.calls if call.method == "DELETE"]
+    assert cancels == ([("DELETE", JOB_PATH, "Bearer token-1", None)] if cancel else [])
+
+
+def test_running_sync_conflict_is_not_retried(fake, sync):
     fake.overrides[("POST", f"{API}/jobs")] = [
         (
             409,
@@ -582,7 +611,7 @@ def test_running_sync_conflict_is_not_retried(fake):
     ]
 
     with pytest.raises(AirbyteError, match="HTTP 409 .*A sync is already running"):
-        make_resource(fake).sync(CONNECTION_ID)
+        sync(make_resource(fake), CONNECTION_ID)
 
     assert [call.path for call in fake.calls] == [
         TOKEN_PATH,
@@ -597,25 +626,59 @@ class _InterruptWhenRunning(logging.Logger):
 
 
 @pytest.mark.parametrize("cancel", [True, False])
-def test_interrupt_cancels_the_job(fake, cancel):
+def test_interrupt_cancels_the_job(fake, cancel, sync):
     fake.statuses = ["running"]
     airbyte = make_resource(fake, cancel_on_interrupt=cancel)
 
     with pytest.raises(KeyboardInterrupt):
-        airbyte.sync(CONNECTION_ID, log=_InterruptWhenRunning("airbyte"))
+        sync(airbyte, CONNECTION_ID, log=_InterruptWhenRunning("airbyte"))
 
     cancels = [call for call in fake.calls if call.method == "DELETE"]
     assert cancels == ([("DELETE", JOB_PATH, "Bearer token-1", None)] if cancel else [])
 
 
-def test_failed_cancel_keeps_the_original_error(fake):
+@pytest.mark.parametrize("cancel", [True, False])
+def test_cancelling_async_sync_cancels_the_job(fake, cancel):
+    fake.statuses = ["running"]
+    airbyte = make_resource(fake, cancel_on_interrupt=cancel)
+
+    async def cancel_while_running() -> None:
+        task = asyncio.create_task(airbyte.async_sync(CONNECTION_ID))
+        while ("GET", JOB_PATH) not in [(c.method, c.path) for c in fake.calls]:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_while_running())
+
+    cancels = [call for call in fake.calls if call.method == "DELETE"]
+    assert cancels == ([("DELETE", JOB_PATH, "Bearer token-1", None)] if cancel else [])
+
+
+def test_failed_cancel_keeps_the_original_error(fake, sync):
     fake.statuses = ["running"]
     fake.overrides[("DELETE", JOB_PATH)] = [(409, {"detail": "Job is not running"})]
 
     with pytest.raises(AirbyteError, match="did not finish within 0.01 s"):
-        make_resource(fake, poll_timeout=0.01).sync(CONNECTION_ID)
+        sync(make_resource(fake, poll_timeout=0.01), CONNECTION_ID)
 
     assert fake.calls[-1] == ("DELETE", JOB_PATH, "Bearer token-1", None)
+
+
+def test_sync_in_your_own_asset(fake, storage, executor, tmp_path):
+    """A sync asset that calls ``sync``. The parallel executor runs it in a worker."""
+    airbyte = make_resource(fake)
+
+    @rs.Asset(io_handler=pickle_handler(tmp_path))
+    def synced(context: rs.AssetExecutionContext) -> int:
+        return airbyte.sync(CONNECTION_ID, log=context.log).rows_synced
+
+    repo = make_repo(storage, executor, tmp_path, synced)
+
+    assert repo.materialize().success
+    assert (repo.load_node("pid") != os.getpid()) == (executor == "parallel")
+    assert repo.load_node("synced") == 10
 
 
 # ── connection_asset() ───────────────────────────────────────────────
@@ -740,26 +803,22 @@ def test_connection_without_streams_raises():
 
 
 def test_run_materializes_every_stream(fake, storage, executor, tmp_path):
+    """The asset's function is async, so both executors run it in this process."""
     asset = connection_asset(fake, io_handler=pickle_handler(tmp_path))
     repo = make_repo(storage, executor, tmp_path, asset)
 
     result = repo.materialize()
 
     assert result.success
-    assert (repo.load_node("pid") != os.getpid()) == (executor == "parallel")
-    expected = {
-        "pg_users": stream_metadata("public.users", 7, 2048),
-        "pg_orders": stream_metadata("public.orders", 3, 1024),
-        "pg_events": stream_metadata("events"),
-    }
-    for name, metadata in expected.items():
-        [stored] = materializations(storage, name)
-        if executor == "in_process":
-            assert stored == metadata
-        else:
-            # Worker steps store metadata without its value types for now.
-            assert values(stored) == values(metadata)
-    calls = [
+    assert asset.is_async
+    assert materializations(storage, "pg_users") == [
+        stream_metadata("public.users", 7, 2048)
+    ]
+    assert materializations(storage, "pg_orders") == [
+        stream_metadata("public.orders", 3, 1024)
+    ]
+    assert materializations(storage, "pg_events") == [stream_metadata("events")]
+    assert fake.calls == [
         ("POST", TOKEN_PATH, None, TOKEN_BODY),
         ("GET", CONNECTION_PATH, "Bearer token-1", None),
         ("GET", CONNECTION_PATH, "Bearer token-1", None),
@@ -773,11 +832,10 @@ def test_run_materializes_every_stream(fake, storage, executor, tmp_path):
         ("GET", JOB_PATH, "Bearer token-1", None),
         ("POST", STATS_PATH, "Bearer token-1", {"id": JOB_ID}),
     ]
-    if executor == "in_process":
-        assert fake.calls == calls
-    else:
-        # A worker's copy of the resource may hold masked secrets.
-        assert without_auth(fake.calls) == without_auth(calls)
+    log = run_log(storage, result.run_id)
+    assert f"Airbyte job {JOB_ID} started for connection {CONNECTION_ID}" in log
+    assert f"Airbyte job {JOB_ID}: succeeded" in log
+    assert f"Airbyte job {JOB_ID} committed 10 records, 3072 bytes" in log
 
 
 def test_failed_job_fails_every_output(fake, storage, executor, tmp_path):
@@ -868,12 +926,14 @@ def test_stream_added_after_load_is_logged(fake, storage, tmp_path, caplog):
     )
     repo = make_repo(storage, "in_process", tmp_path, asset)
 
-    repo.materialize()
+    result = repo.materialize()
 
-    assert (
+    warning = (
         f"Airbyte connection {CONNECTION_ID} also syncs public.refunds, which have "
         "no outputs. Reload the code location to add them."
-    ) in caplog.messages
+    )
+    assert warning in caplog.messages
+    assert warning in run_log(storage, result.run_id)
     assert [len(materializations(storage, name)) for name in OUTPUTS] == [1, 1, 1]
 
 

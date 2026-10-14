@@ -72,6 +72,8 @@ When the connection's streams change in Airbyte, load the code location again to
 3. Checks the job every `poll_interval` seconds until it finishes.
 4. Records a materialization for each selected output.
 
+The asset's function is async, so its step waits for the job without holding a worker of the executor, and the Airbyte assets of one level wait at the same time: all of them with the parallel executor (`max_async_concurrent` limits them), and up to four with the in-process executor. A waiting step keeps its [pool](../concepts/concurrency.md#concurrency-pools) slots until the job finishes.
+
 Airbyte syncs all the streams of a connection. A run that selects some outputs syncs all the streams too, and records materializations only for the selected outputs.
 
 When the job fails or is cancelled in Airbyte, all the outputs fail with `AirbyteError`. When a selected output's stream is no longer enabled, that output fails and the others succeed. A stream that was enabled after the code location loaded is synced, and the run log names it.
@@ -146,5 +148,7 @@ def active_users() -> None:
 job = airbyte.sync("9924bcd0-99be-453d-ba47-c2c9766f7da5", log=context.log)
 job.rows_synced  # records of all streams
 ```
+
+In an `async def` asset, use `async_sync`. It takes the same arguments and waits without blocking the event loop.
 
 See the [API reference](../api-reference/airbyte.md) for all the classes.

@@ -39,7 +39,7 @@ Returns the [`AirbyteConnection`](#airbyteconnection) with its enabled streams, 
 
 #### `connection_asset(connection, *, name=None, asset_def_fn=None, **asset_options)`
 
-Returns a `MultiAsset` that syncs `connection`, with one output per enabled stream.
+Returns a `MultiAsset` that syncs `connection`, with one output per enabled stream. The asset's function is async, so its step waits for the job without holding a worker of the executor.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -53,7 +53,7 @@ Raises `ValueError` when the connection has no enabled streams, or when two stre
 A run:
 
 1. Reads the connection again with `get_connection()`.
-2. Calls `sync()`.
+2. Calls `async_sync()`.
 3. Gets the per-stream counts from `POST {configuration_api_url}/jobs/get_without_logs`. When this request fails, the run log has a warning and the materializations have no counts.
 4. Records a materialization for each selected output, with the metadata below.
 
@@ -78,6 +78,17 @@ Starts a sync job with `POST {api_url}/jobs`, checks it with `GET {api_url}/jobs
 When the wait stops before the job finishes and `cancel_on_interrupt` is set, the job is cancelled with `DELETE {api_url}/jobs/{job_id}`. A failed cancel is logged and does not replace the original error.
 
 Raises `AirbyteError` when a request fails, when the job ends with a status other than `succeeded`, or when `poll_timeout` passes.
+
+#### `async_sync(connection_id, *, log=None)`
+
+`sync` for async code. It takes the same arguments, returns and raises the same, and waits without blocking the event loop. A cancellation of the task, for example on Ctrl-C, stops the wait, so the job is cancelled as above.
+
+```python
+@rs.Asset(kinds="airbyte")
+async def postgres_sync(context: rs.AssetExecutionContext) -> rs.Materialization:
+    job = await airbyte.async_sync("9924bcd0-99be-453d-ba47-c2c9766f7da5", log=context.log)
+    return rs.Materialization(metadata={"airbyte/job_id": job.job_id})
+```
 
 ---
 
