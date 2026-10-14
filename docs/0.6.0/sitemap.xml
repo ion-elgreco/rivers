@@ -222,4 +222,7 @@
       <url>
         <loc>https://orchestrator.rs/docs/0.6.0/installation/overview/</loc>
       </url>
+      <url>
+        <loc>https://orchestrator.rs/docs/0.6.0/integrations/</loc>
+      </url>
 </urlset>
