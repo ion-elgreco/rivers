@@ -27,7 +27,7 @@ If your code imports an extension module that does not support free-threading, P
 
 These extras work on 3.14t: `pyarrow`, `pandas`, `datafusion`, and `otel`.
 
-The `delta`, `delta-*`, `polars`, `duckdb`, and `dlt` extras do not install yet: `deltalake`, `polars`, `duckdb`, and the `pendulum` and `orjson` packages that dlt needs have no free-threaded wheels.
+The `delta`, `delta-*`, `iceberg`, `iceberg-*`, `polars`, `duckdb`, and `dlt` extras do not install yet: `deltalake`, `pyiceberg-core`, `polars`, `duckdb`, and the `pendulum` and `orjson` packages that dlt needs have no free-threaded wheels.
 
 On 3.15t, only `otel` installs for now: `pyarrow` and `datafusion` have no 3.15t wheels yet.
 

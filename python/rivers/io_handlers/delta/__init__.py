@@ -23,6 +23,7 @@ from rivers.io_handlers._partition_sql import (
     _build_predicate,
     _resolve_partition_expr,
 )
+from rivers.io_handlers._type_handlers import Candidate, discover, resolve
 from rivers.io_handlers.base import BaseIOHandler
 from rivers.io_handlers.delta.asset import DeltaAsset, OptimizeConfig, VacuumConfig
 from rivers.io_handlers.delta.base import (
@@ -75,39 +76,14 @@ _MODULE_TO_EXTRA: dict[str, str] = {
 }
 
 
-def _build_type_handler_map(
-    handler_config: dict[str, Any] | None,
-) -> dict[type, DeltaTypeHandler]:
-    """Best-effort discovery of installed type handlers (pyarrow, polars, pandas, duckdb, pyspark).
-
-    Returns a mapping from supported Python type to its handler. Missing optional
-    dependencies are silently skipped — the handler is only registered when its
-    backing library can be imported.
-    """
-    handlers: dict[type, DeltaTypeHandler] = {}
-    for mod_path, cls_name, cls_params in [
-        ("rivers.io_handlers.delta.pyarrow", "PyArrowTypeHandler", []),
-        ("rivers.io_handlers.delta.polars", "PolarsTypeHandler", []),
-        ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler", []),
-        ("rivers.io_handlers.delta.pandas", "PandasTypeHandler", []),
-        ("rivers.io_handlers.delta.duckdb", "DuckDBTypeHandler", ["duckdb"]),
-        (
-            "rivers.io_handlers.delta.pyspark",
-            "PySparkDeltaTypeHandler",
-            ["spark_session"],
-        ),
-    ]:
-        try:
-            mod = __import__(mod_path, fromlist=[cls_name])
-            kwargs = {}
-            if handler_config:
-                kwargs = {param: handler_config.get(param) for param in cls_params}
-            h = getattr(mod, cls_name)(**kwargs)
-            for t in h.supported_types:
-                handlers[t] = h
-        except ImportError:
-            pass
-    return handlers
+_TYPE_HANDLERS: list[Candidate] = [
+    ("rivers.io_handlers.delta.pyarrow", "PyArrowTypeHandler", []),
+    ("rivers.io_handlers.delta.polars", "PolarsTypeHandler", []),
+    ("rivers.io_handlers.delta.datafusion", "DataFusionTypeHandler", []),
+    ("rivers.io_handlers.delta.pandas", "PandasTypeHandler", []),
+    ("rivers.io_handlers.delta.duckdb", "DuckDBTypeHandler", ["duckdb"]),
+    ("rivers.io_handlers.delta.pyspark", "PySparkDeltaTypeHandler", ["spark_session"]),
+]
 
 
 class DeltaIOHandler(BaseIOHandler):
@@ -139,7 +115,7 @@ class DeltaIOHandler(BaseIOHandler):
         handler_config: dict[str, Any] | None = None,
     ) -> dict[type, DeltaTypeHandler]:
         """Return the currently registered ``{type: DeltaTypeHandler}`` map."""
-        return _build_type_handler_map(handler_config)
+        return discover(_TYPE_HANDLERS, handler_config)
 
     def _resolve_handler(self, target_type: type) -> DeltaTypeHandler:
         """Look up the type handler for ``target_type`` or raise ``TypeError``.
@@ -147,32 +123,8 @@ class DeltaIOHandler(BaseIOHandler):
         Suggests the right install extra (e.g. ``rivers[polars]``) when a known
         type is requested but its handler library is not installed.
         """
-
-        type_handlers = self.type_handlers(self.handler_config)
-        handler = None
-        # Spark 4.0+ introduced a split between the public DataFrame API
-        # (``pyspark.sql.dataframe.DataFrame``) and the underlying classic
-        # implementation (``pyspark.sql.classic.dataframe.DataFrame``).
-        # So a direct type lookup can therefore fail because ``type(df)`` may
-        # resolve to the classic implementation while handlers are registered
-        # against the public API class. Using ``issubclass()`` is therefore a
-        # more robust check instead of exact class comparison.
-        for type, type_handler in type_handlers.items():
-            if issubclass(target_type, type):
-                handler = type_handler
-                break
-
-        if handler is not None:
-            return handler
-        extra = _MODULE_TO_EXTRA.get(target_type.__module__.split(".", 1)[0])
-        if extra:
-            raise TypeError(
-                f"No handler for {target_type.__name__}. "
-                f"Install the required extra: pip install rivers[{extra}]"
-            )
-        raise TypeError(
-            f"No type handler found for {target_type!r}. "
-            f"Supported types: {list(type_handlers)}"
+        return resolve(
+            self.type_handlers(self.handler_config), target_type, _MODULE_TO_EXTRA
         )
 
     def _asset_uri(self, asset_name: str) -> str:

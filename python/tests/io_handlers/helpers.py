@@ -1,6 +1,31 @@
 from datetime import datetime
+from typing import Any
 
 import rivers as rs
+
+
+def iceberg_handler(tmp_path, **kwargs: Any):
+    """An ``IcebergIOHandler`` on a SQLite catalog with its warehouse in ``tmp_path``.
+
+    The catalog tables are created here, before steps in other processes
+    connect to the database.
+    """
+    from rivers.io_handlers.iceberg import IcebergIOHandler
+
+    handler = IcebergIOHandler(
+        **{
+            "namespace": "ns",
+            "catalog_name": "rivers_test",
+            "catalog_properties": {
+                "type": "sql",
+                "uri": f"sqlite:///{(tmp_path / 'catalog.db').as_posix()}",
+                "warehouse": str(tmp_path / "warehouse"),
+            },
+            **kwargs,
+        }
+    )
+    handler.catalog().close()
+    return handler
 
 
 def make_partition(key_val: str | list[str]) -> rs.PartitionContext:

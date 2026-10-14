@@ -14,6 +14,7 @@ Optional extras for IO handlers:
 
 ```bash
 pip install rivers[delta]     # Delta Lake support
+pip install rivers[iceberg]   # Apache Iceberg support
 pip install rivers[pyarrow]   # PyArrow table support
 pip install rivers[polars]    # Polars DataFrame support
 ```
@@ -46,7 +47,7 @@ print(repo.load_node("summary"))  # "100 users, 5000 events"
 - **Rust core** — graph resolution, execution planning, partition logic, and the scheduler all run in compiled Rust.
 - **Multiple asset types** — single, multi-output, graph (composing `Task`s into sub-DAGs), and external assets.
 - **Partitioning** — static, time-window (daily/hourly/custom cron), multi-dimensional, and runtime-extensible dynamic partitions.
-- **Pluggable IO** — built-in handlers for in-memory, pickle (any object store), and Delta Lake with merge support.
+- **Pluggable IO** — built-in handlers for in-memory, pickle (any object store), Delta Lake with merge support, and Apache Iceberg with upserts.
 - **Parallel & distributed execution** — `Executor.parallel()` for concurrent subprocess workers, `Executor.kubernetes()` for one-pod-per-step on K8s.
 - **Schedules, sensors, and automation conditions** — declarative triggers (cron, event-driven, dep-aware) executed by the rivers daemon.
 - **Backfills** — partition-range execution with multi-run, single-run, and per-dimension strategies.

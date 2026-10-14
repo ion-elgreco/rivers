@@ -125,7 +125,7 @@ def grpc_stubs(tmp_path_factory):
 # The DuckDB extensions tests install. On Windows a worker cannot replace an
 # extension file another worker has loaded, so they are installed once,
 # before pytest-xdist starts the workers.
-_DUCKDB_EXTENSIONS = ("delta", "ducklake", "httpfs")
+_DUCKDB_EXTENSIONS = ("avro", "delta", "ducklake", "httpfs", "iceberg")
 
 # `import sling` downloads the sling binary (~120 MB) on first use. A run that
 # includes test_sling.py finds it once, before pytest-xdist starts the
