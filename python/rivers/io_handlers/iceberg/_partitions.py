@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 from collections.abc import Callable, Iterable
 from datetime import datetime
 
@@ -28,6 +30,8 @@ from pyiceberg.types import DateType, TimestampType, TimestamptzType
 
 from rivers._core.partitions import PartitionContext, PartitionsDefinition
 from rivers.io_handlers._partition_sql import PartitionExpr, _key_dimensions, _window
+
+_Dimension = tuple[str, list[str], PartitionsDefinition | None]
 
 # Coarsest first. Each truncates a datetime to the start of its unit.
 _TIME_TRANSFORMS: list[tuple[Transform, Callable[[datetime], datetime]]] = [
@@ -61,9 +65,12 @@ def partition_filter(
 ) -> BooleanExpression:
     """The rows of the partition's keys as a pyiceberg expression; all rows without a partition.
 
-    Time-window bounds on date and timestamp columns are ``datetime`` values:
-    pyiceberg cannot convert a key such as ``2024-01-01`` to a timestamp.
-    Other values stay strings, which pyiceberg converts to the column type.
+    pyiceberg checks the expression against every data file, so the keys of a
+    backfill are merged: one ``In`` per dimension, and adjacent time windows
+    in one range. Time-window bounds on date and timestamp columns are
+    ``datetime`` values: pyiceberg cannot convert a key such as
+    ``2024-01-01`` to a timestamp. Other values stay strings, which pyiceberg
+    converts to the column type.
 
     Raises:
         ValueError: If ``partition_expr`` is ``None`` or does not fit the
@@ -73,14 +80,15 @@ def partition_filter(
         return AlwaysTrue()
 
     partition_expr = require_partition_expr(partition_expr)
-    return _any(
-        _all(
-            _dimension_filter(column, values, definition, schema)
-            for column, values, definition in _key_dimensions(
-                key, partition.definition, partition_expr
-            )
-        )
+    keys = [
+        _key_dimensions(key, partition.definition, partition_expr)
         for key in partition.keys
+    ]
+    if (dimensions := _product(keys)) is not None:
+        return _all(_dimension_filter(*dimension, schema) for dimension in dimensions)
+    return _any(
+        _all(_dimension_filter(*dimension, schema) for dimension in dimensions)
+        for dimensions in keys
     )
 
 
@@ -113,29 +121,69 @@ def partition_fields(
     return fields
 
 
+def _product(keys: list[list[_Dimension]]) -> list[_Dimension] | None:
+    """The dimensions with all their values, if the keys are every combination of them."""
+    combinations = {
+        combination
+        for dimensions in keys
+        for combination in itertools.product(*(values for _, values, _ in dimensions))
+    }
+    merged = [
+        (
+            column,
+            sorted({v for dimensions in keys for v in dimensions[i][1]}),
+            definition,
+        )
+        for i, (column, _, definition) in enumerate(keys[0])
+    ]
+    if math.prod(len(values) for _, values, _ in merged) != len(combinations):
+        return None
+    return merged
+
+
 def _dimension_filter(
     column: str,
     values: list[str],
     definition: PartitionsDefinition | None,
     schema: Schema,
 ) -> BooleanExpression:
-    """The rows of one dimension: a time range for a single time-window value."""
-    if len(values) == 1 and isinstance(definition, PartitionsDefinition.TimeWindow):
-        window = _window(values[0], definition)
-        if window is not None:
-            start, end = window
-            temporal = DateType | TimestampType | TimestamptzType
-            if not isinstance(schema.find_type(column), temporal):
-                start, end = (
-                    start.strftime(definition.fmt),
-                    end.strftime(definition.fmt),
-                )
-            return And(
-                GreaterThanOrEqual(column, start),  # pyright: ignore[reportCallIssue]
-                LessThan(column, end),  # pyright: ignore[reportCallIssue]
-            )
+    """The rows of one dimension's values: time ranges for time-window values."""
+    if not isinstance(definition, PartitionsDefinition.TimeWindow):
+        return In(column, values)  # pyright: ignore[reportCallIssue]
 
-    return In(column, values)  # pyright: ignore[reportCallIssue]
+    windows = [_window(value, definition) for value in values]
+    if None in windows:
+        return In(column, values)  # pyright: ignore[reportCallIssue]
+
+    ranges = _merge([window for window in windows if window is not None])
+    temporal = DateType | TimestampType | TimestamptzType
+    bounds = (
+        ranges
+        if isinstance(schema.find_type(column), temporal)
+        else [
+            (s.strftime(definition.fmt), e.strftime(definition.fmt)) for s, e in ranges
+        ]
+    )
+    return _any(_range(column, start, end) for start, end in bounds)
+
+
+def _merge(windows: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    """The windows as ranges, with adjacent and overlapping windows joined."""
+    ranges: list[tuple[datetime, datetime]] = []
+    for start, end in sorted(windows):
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+    return ranges
+
+
+def _range(column: str, start: object, end: object) -> BooleanExpression:
+    """``start <= column < end``."""
+    return And(
+        GreaterThanOrEqual(column, start),  # pyright: ignore[reportCallIssue]
+        LessThan(column, end),  # pyright: ignore[reportCallIssue]
+    )
 
 
 def _all(expressions: Iterable[BooleanExpression]) -> BooleanExpression:

@@ -11,12 +11,15 @@ pytest.importorskip("pyiceberg")
 import polars as pl  # noqa: E402
 import pyarrow as pa  # noqa: E402
 from pyiceberg.expressions import (  # noqa: E402
+    AlwaysTrue,
     And,
     EqualTo,
     GreaterThanOrEqual,
+    In,
     LessThan,
     Or,
 )
+from pyiceberg.expressions.visitors import bind  # noqa: E402
 from pyiceberg.schema import Schema  # noqa: E402
 from pyiceberg.transforms import (  # noqa: E402
     DayTransform,
@@ -96,43 +99,86 @@ _SCHEMA = Schema(
 )
 
 
+def _range(column, start, end):
+    return And(GreaterThanOrEqual(column, start), LessThan(column, end))
+
+
+def test_filter_without_a_partition_is_every_row():
+    assert partition_filter(None, None, _SCHEMA) == AlwaysTrue()
+
+
 def test_filter_static_keys():
     expr = PartitionExpr(expr="region")
     assert partition_filter(_ctx(_REGIONS, "us"), expr, _SCHEMA) == EqualTo(
         "region", "us"
     )
-    assert partition_filter(_ctx(_REGIONS, "us", "eu"), expr, _SCHEMA) == Or(
-        EqualTo("region", "us"), EqualTo("region", "eu")
+    assert partition_filter(_ctx(_REGIONS, "us", "eu"), expr, _SCHEMA) == In(
+        "region", ["us", "eu"]
     )
 
 
 def test_filter_time_window_on_a_string_column_compares_strings():
     expr = PartitionExpr(expr="day")
-    assert partition_filter(_ctx(_DAILY, "2024-01-05"), expr, _SCHEMA) == And(
-        GreaterThanOrEqual("day", "2024-01-05"), LessThan("day", "2024-01-06")
+    assert partition_filter(_ctx(_DAILY, "2024-01-05"), expr, _SCHEMA) == _range(
+        "day", "2024-01-05", "2024-01-06"
     )
 
 
 @pytest.mark.parametrize("column", ["d", "ts"])
 def test_filter_time_window_on_a_temporal_column_uses_datetimes(column):
     expr = PartitionExpr(expr=column)
-    assert partition_filter(_ctx(_DAILY, "2024-01-05"), expr, _SCHEMA) == And(
-        GreaterThanOrEqual(column, datetime(2024, 1, 5)),
-        LessThan(column, datetime(2024, 1, 6)),
+    assert partition_filter(_ctx(_DAILY, "2024-01-05"), expr, _SCHEMA) == _range(
+        column, datetime(2024, 1, 5), datetime(2024, 1, 6)
     )
 
 
-def test_filter_multi_dimension_key():
+def test_filter_merges_adjacent_time_windows():
+    days = _ctx(_DAILY, "2024-01-03", "2024-01-01", "2024-01-02", "2024-01-06")
+    assert partition_filter(days, PartitionExpr(expr="ts"), _SCHEMA) == Or(
+        _range("ts", datetime(2024, 1, 1), datetime(2024, 1, 4)),
+        _range("ts", datetime(2024, 1, 6), datetime(2024, 1, 7)),
+    )
+
+
+def test_filter_multi_dimension_keys():
     definition = rs.PartitionsDefinition.multi({"region": _REGIONS, "day": _DAILY})
-    key = rs.PartitionKey.multi({"region": "eu", "day": "2024-01-05"})
     expr = PartitionExpr(expr={"region": "region", "day": "ts"})
-    assert partition_filter(_ctx(definition, key), expr, _SCHEMA) == And(
-        And(
-            GreaterThanOrEqual("ts", datetime(2024, 1, 5)),
-            LessThan("ts", datetime(2024, 1, 6)),
-        ),
-        EqualTo("region", "eu"),
+
+    def key(region, day):
+        return rs.PartitionKey.multi({"region": region, "day": day})
+
+    every_combination = _ctx(
+        definition,
+        *(key(r, d) for r in ("us", "eu") for d in ("2024-01-01", "2024-01-02")),
     )
+    assert partition_filter(every_combination, expr, _SCHEMA) == And(
+        _range("ts", datetime(2024, 1, 1), datetime(2024, 1, 3)),
+        In("region", ["us", "eu"]),
+    )
+
+    some = _ctx(definition, key("us", "2024-01-01"), key("eu", "2024-01-02"))
+    assert partition_filter(some, expr, _SCHEMA) == Or(
+        And(
+            _range("ts", datetime(2024, 1, 1), datetime(2024, 1, 2)),
+            EqualTo("region", "us"),
+        ),
+        And(
+            _range("ts", datetime(2024, 1, 2), datetime(2024, 1, 3)),
+            EqualTo("region", "eu"),
+        ),
+    )
+
+
+def test_filter_of_many_separate_windows_binds():
+    hourly = rs.PartitionsDefinition.hourly(start=datetime(2024, 1, 1))
+    every_other_hour = [
+        (datetime(2024, 1, 1) + timedelta(hours=2 * i)).strftime("%Y-%m-%dT%H:00")
+        for i in range(1200)
+    ]
+    expr = partition_filter(
+        _ctx(hourly, *every_other_hour), PartitionExpr(expr="ts"), _SCHEMA
+    )
+    bind(_SCHEMA, expr, case_sensitive=True)
 
 
 def test_filter_errors():
