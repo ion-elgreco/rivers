@@ -15,7 +15,7 @@ from rivers.io_handlers.iceberg.base import ArrowIcebergTypeHandler, IcebergRead
 
 
 class DuckDBTypeHandler(ArrowIcebergTypeHandler[DuckDBPyRelation]):
-    """Reads Iceberg tables with DuckDB's ``iceberg_scan``; writes stream through pyiceberg.
+    """Reads Iceberg tables with DuckDB's ``iceberg_scan``; writes go through pyiceberg.
 
     Args:
         duckdb: The resource that opens the read connection. The default is an
@@ -31,7 +31,7 @@ class DuckDBTypeHandler(ArrowIcebergTypeHandler[DuckDBPyRelation]):
         return [DuckDBPyRelation]
 
     def to_arrow(self, obj: DuckDBPyRelation) -> pa.RecordBatchReader:
-        """Stream the relation's result into pyiceberg."""
+        """The relation's result as a ``pa.RecordBatchReader``."""
         return obj.to_arrow_reader()
 
     def load_input(

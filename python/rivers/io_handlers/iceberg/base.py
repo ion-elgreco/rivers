@@ -128,7 +128,7 @@ class ArrowIcebergTypeHandler(IcebergTypeHandler[T], ABC):
 
     @abstractmethod
     def to_arrow(self, obj: T) -> pa.Table | pa.RecordBatchReader:
-        """``obj`` as Arrow data. A reader streams into unpartitioned tables."""
+        """``obj`` as Arrow data."""
         ...
 
     def handle_output(

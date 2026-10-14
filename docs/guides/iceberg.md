@@ -42,7 +42,7 @@ The first write creates the namespace and the table `analytics.users`.
 
 ### Catalogs
 
-The handler loads the catalog with `pyiceberg.catalog.load_catalog(catalog_name, **catalog_properties)`. pyiceberg adds the properties of the same catalog name from `.pyiceberg.yaml` and from `PYICEBERG_CATALOG__<NAME>__<KEY>` environment variables, so credentials can stay out of your code (see [Storage](#storage)):
+The handler loads the catalog with `pyiceberg.catalog.load_catalog(catalog_name, **catalog_properties)`. pyiceberg also reads the properties of the catalog from `.pyiceberg.yaml` and from environment variables (see [Storage](#storage)), so the handler can use a catalog that you configure outside your code:
 
 ```python
 io = IcebergIOHandler(catalog_name="lake", namespace="analytics")
@@ -128,7 +128,7 @@ All readers and writers use the same properties:
 | Type | Extra | Read with |
 |------|-------|-----------|
 | `pyarrow.Table` | `rivers[iceberg]` | a pyiceberg scan, into memory |
-| `pyarrow.RecordBatchReader` | `rivers[iceberg]` | a pyiceberg scan, streamed |
+| `pyarrow.RecordBatchReader` | `rivers[iceberg]` | a pyiceberg scan, in batches |
 | `polars.DataFrame` | `rivers[iceberg-polars]` | `pl.scan_iceberg`, collected |
 | `polars.LazyFrame` | `rivers[iceberg-polars]` | `pl.scan_iceberg`, lazy |
 | `pandas.DataFrame` | `rivers[iceberg-pandas]` | a pyiceberg scan, into memory |
@@ -138,7 +138,7 @@ The type of the returned value selects the writer. The type annotation of the do
 
 About writes:
 
-- A `RecordBatchReader` and a DuckDB relation stream into an unpartitioned table. pyiceberg cannot stream into a partitioned table, so partitioned writes and upserts read the data into memory first.
+- A write needs memory for all of its data. pyiceberg 0.12 also reads a `RecordBatchReader` or a DuckDB relation into memory.
 - Iceberg v2 stores timestamps in microseconds, and pyiceberg accepts only UTC time zones. The handler writes nanosecond timestamps as microseconds, and zoned timestamps as UTC.
 - The pandas index is not written.
 

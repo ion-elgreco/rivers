@@ -21,7 +21,7 @@ class PyArrowTypeHandler(ArrowIcebergTypeHandler[ArrowTypes]):
         return [pa.Table, pa.RecordBatchReader]
 
     def to_arrow(self, obj: ArrowTypes) -> pa.Table | pa.RecordBatchReader:
-        """``obj`` as is; a reader streams into unpartitioned tables."""
+        """``obj`` as is."""
         return obj
 
     def load_input(
@@ -29,8 +29,8 @@ class PyArrowTypeHandler(ArrowIcebergTypeHandler[ArrowTypes]):
     ) -> ArrowTypes:
         """Scan the table with pyiceberg.
 
-        A ``pa.RecordBatchReader`` streams the scan; a ``pa.Table`` reads it
-        into memory.
+        A ``pa.RecordBatchReader`` returns the scan in batches; a ``pa.Table``
+        reads it into memory.
         """
         scan = request.scan()
         if target_type is pa.RecordBatchReader:
