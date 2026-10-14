@@ -417,6 +417,33 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 .card p { margin: 0 0 17px; color: var(--muted); font-size: 15px; }
 .card a { font-size: 14px; font-weight: 600; }
 
+/* ---- Integrations ---- */
+.integrations { padding: 78px 0; }
+.int-groups {
+  max-width: 760px; margin: 0 auto 26px; padding: 8px 28px;
+  background: var(--glass); border: 1px solid var(--border); border-radius: var(--radius);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+.int-groups > div {
+  display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: center;
+  padding: 16px 0; border-bottom: 1px solid var(--border);
+}
+.int-groups > div:last-child { border-bottom: 0; }
+.int-groups dt { color: var(--muted); font-size: 14.5px; font-weight: 550; }
+.int-groups dd { display: flex; flex-wrap: wrap; gap: 10px; margin: 0; }
+/* Logos stay at 30px with 7px around them: Slack's minimum size and clear space. */
+.int {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 46px; padding: 0 18px;
+  border-radius: 999px; background: var(--glass); border: 1px solid var(--border);
+  transition: border-color 0.22s;
+}
+.int:hover { border-color: var(--border-strong); }
+.int:has(.int-logo) { padding-left: 4px; }
+.int-logo { display: flex; padding: 7px; }
+.int-logo img { width: 30px; height: 30px; object-fit: contain; }
+.int a:not(.int-logo) { color: var(--text); font-size: 14.5px; font-weight: 550; }
+.integrations p.center a { font-size: 14px; font-weight: 600; }
+
 /* ---- Split sections ---- */
 .split { padding: 84px 0; }
 .split.alt::before {
@@ -464,6 +491,7 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 .footer-links a { color: var(--muted); font-size: 14.5px; transition: color 0.15s; }
 .footer-links a:hover { color: var(--text); }
 .license { color: var(--muted); font-size: 14px; margin: 0; }
+.trademarks { flex-basis: 100%; color: var(--muted); font-size: 12px; margin: 0; max-width: 72em; }
 
 /* ---- Scroll reveal (armed by JS only) ---- */
 .reveal-armed { opacity: 0; transform: translateY(26px); }
@@ -563,6 +591,8 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   .stat { padding: 9px 14px; }
 
   .grid, .snips { grid-template-columns: 1fr; }
+  .int-groups { padding: 4px 18px; }
+  .int-groups > div { grid-template-columns: 1fr; gap: 10px; }
   .table-scroll { overflow-x: auto; }
   .cmp { min-width: 620px; }
   .nav-links { gap: 14px; }

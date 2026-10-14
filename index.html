@@ -35,6 +35,7 @@
     <nav class="nav-links" aria-label="Main">
       <a href="/docs/latest/">Docs</a>
       <a href="/docs/latest/concepts/assets/">Concepts</a>
+      <a href="/docs/latest/integrations/">Integrations</a>
       <a href="/docs/latest/comparisons/">Comparisons</a>
       <a href="/docs/latest/installation/kubernetes/">Kubernetes</a>
       <a class="ghost" href="https://github.com/ion-elgreco/rivers">GitHub</a>
@@ -350,6 +351,42 @@ repo.materialize()</code></pre>
     </div>
   </section>
 
+  <!-- Integrations -->
+  <section class="integrations reveal">
+    <div class="wrap">
+      <h2 class="center">Works with your stack</h2>
+      <p class="center sub">Ingest, transform, store, check, and alert with the tools you already run.</p>
+      <!-- Each logo links to its project site, as the Delta Lake and Apache Iceberg
+           trademark policies require; the name links to our guide. Logos are the
+           owners' files, unaltered. -->
+      <dl class="int-groups">
+        <div><dt>Ingestion</dt><dd>
+          <span class="int"><a class="int-logo" href="https://airbyte.com/" aria-label="Airbyte website"><img src="/assets/integrations/airbyte.svg" alt="" width="30" height="30"></a><a href="/docs/latest/guides/airbyte/">Airbyte</a></span>
+          <span class="int"><a class="int-logo" href="https://dlthub.com/" aria-label="dlt website"><img src="/assets/integrations/dlt.svg" alt="" width="30" height="30"></a><a href="/docs/latest/guides/dlt/">dlt</a></span>
+          <span class="int"><a class="int-logo" href="https://slingdata.io/" aria-label="Sling website"><img src="/assets/integrations/sling.svg" alt="" width="30" height="30"></a><a href="/docs/latest/guides/sling/">Sling</a></span>
+        </dd></div>
+        <div><dt>Transform &amp; compute</dt><dd>
+          <span class="int"><a href="/docs/latest/guides/dbt/">dbt</a></span>
+          <span class="int"><a href="/docs/latest/guides/databricks/">Databricks</a></span>
+          <span class="int"><a href="/docs/latest/guides/duckdb/">DuckDB</a></span>
+        </dd></div>
+        <div><dt>Table formats</dt><dd>
+          <span class="int"><a class="int-logo" href="https://delta.io/" aria-label="Delta Lake website"><img src="/assets/integrations/delta-lake.svg" alt="" width="30" height="30"></a><a href="/docs/latest/guides/delta-lake/">Delta Lake</a></span>
+          <span class="int"><a class="int-logo" href="https://iceberg.apache.org/" aria-label="Apache Iceberg website"><img src="/assets/integrations/iceberg.png" alt="" width="30" height="30"></a><a href="/docs/latest/guides/iceberg/">Apache Iceberg</a></span>
+        </dd></div>
+        <div><dt>Validation</dt><dd>
+          <span class="int"><a href="/docs/latest/guides/dataframely/">dataframely</a></span>
+          <span class="int"><a class="int-logo" href="https://pandera.readthedocs.io/" aria-label="pandera website"><img src="/assets/integrations/pandera.png" alt="" width="30" height="30"></a><a href="/docs/latest/guides/pandera/">pandera</a></span>
+        </dd></div>
+        <div><dt>Alerts</dt><dd>
+          <span class="int"><a href="/docs/latest/guides/datadog/">Datadog</a></span>
+          <span class="int"><a class="int-logo" href="https://slack.com/" aria-label="Slack website"><img src="/assets/integrations/slack.svg" alt="" width="30" height="30"></a><a href="/docs/latest/guides/slack/">Slack</a></span>
+        </dd></div>
+      </dl>
+      <p class="center"><a href="/docs/latest/integrations/">All integrations<span aria-hidden="true"> →</span></a></p>
+    </div>
+  </section>
+
   <!-- Code showcase -->
   <section class="showcase reveal">
     <div class="wrap">
@@ -573,6 +610,7 @@ repo.run_action(<span class="s">"optimize"</span>)</code></pre>
       <a href="https://github.com/ion-elgreco/rivers/discussions">Discussions</a>
     </nav>
     <p class="license">Apache 2.0 licensed.</p>
+    <p class="trademarks">Apache®, Apache Iceberg, Iceberg®, and the Apache Iceberg logo are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Delta Lake™ is a trademark of LF Projects, LLC. Slack is a registered trademark and service mark of Slack Technologies, Inc. All other trademarks belong to their owners. Their use on this page does not imply endorsement.</p>
   </div>
 </footer>
 
