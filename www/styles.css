@@ -417,6 +417,29 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
 .card p { margin: 0 0 17px; color: var(--muted); font-size: 15px; }
 .card a { font-size: 14px; font-weight: 600; }
 
+/* ---- Integrations ---- */
+.integrations { padding: 78px 0; }
+.int-groups {
+  max-width: 760px; margin: 0 auto 26px; padding: 8px 28px;
+  background: var(--glass); border: 1px solid var(--border); border-radius: var(--radius);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+.int-groups > div {
+  display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: center;
+  padding: 16px 0; border-bottom: 1px solid var(--border);
+}
+.int-groups > div:last-child { border-bottom: 0; }
+.int-groups dt { color: var(--muted); font-size: 14.5px; font-weight: 550; }
+.int-groups dd { display: flex; flex-wrap: wrap; gap: 10px; margin: 0; }
+.int-groups dd a {
+  padding: 7px 16px; border-radius: 999px;
+  background: var(--glass); border: 1px solid var(--border);
+  color: var(--text); font-size: 14.5px; font-weight: 550;
+  transition: border-color 0.22s;
+}
+.int-groups dd a:hover { border-color: var(--border-strong); }
+.integrations p.center a { font-size: 14px; font-weight: 600; }
+
 /* ---- Split sections ---- */
 .split { padding: 84px 0; }
 .split.alt::before {
@@ -563,6 +586,8 @@ h2 { font-size: clamp(28px, 3.4vw, 42px); letter-spacing: -0.028em; margin: 0 0 
   .stat { padding: 9px 14px; }
 
   .grid, .snips { grid-template-columns: 1fr; }
+  .int-groups { padding: 4px 18px; }
+  .int-groups > div { grid-template-columns: 1fr; gap: 10px; }
   .table-scroll { overflow-x: auto; }
   .cmp { min-width: 620px; }
   .nav-links { gap: 14px; }
