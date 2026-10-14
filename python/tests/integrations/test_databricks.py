@@ -26,6 +26,7 @@ from databricks.sdk import WorkspaceClient  # noqa: E402
 from databricks.sdk.service import jobs  # noqa: E402
 
 import rivers as rs  # noqa: E402
+from rivers.exceptions import GraphValidationError  # noqa: E402
 from rivers.integrations import databricks as databricks_module  # noqa: E402
 from rivers.integrations.databricks import (  # noqa: E402
     DatabricksResource,
@@ -210,6 +211,14 @@ def fake():
     server.close()
 
 
+@pytest.fixture
+def other_fake():
+    """A second workspace."""
+    server = FakeDatabricks()
+    yield server
+    server.close()
+
+
 @pytest.fixture(params=["in_process", "parallel"])
 def executor(request) -> str:
     return request.param
@@ -233,9 +242,15 @@ def call(request) -> Callable[..., DatabricksRun]:
     return call
 
 
-def make_repo(storage, executor: str, *assets: rs.Asset) -> rs.CodeRepository:
+def make_repo(
+    storage,
+    executor: str,
+    *assets: rs.Asset,
+    resources: dict[str, DatabricksResource] | None = None,
+) -> rs.CodeRepository:
     repo = rs.CodeRepository(
         assets=list(assets),
+        resources=resources,
         default_executor=rs.Executor.in_process()
         if executor == "in_process"
         else rs.Executor.parallel(max_workers=2),
@@ -702,10 +717,11 @@ def test_job_asset_runs_the_job(fake, storage, executor):
             outputs={71: {"notebook_output": {"result": '{"rows": 3}'}}},
         ),
     )
-    asset = make_resource(fake).job_asset(
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(
         7, name="daily_sales", job_parameters={"day": "2024-01-01"}
     )
-    repo = make_repo(storage, executor, asset)
+    repo = make_repo(storage, executor, asset, resources={"databricks": databricks})
 
     assert repo.materialize().success
 
@@ -737,7 +753,7 @@ def test_job_parameters_from_the_partition(fake, storage, executor):
         )
         for job_id in (7, 8)
     ]
-    repo = make_repo(storage, executor, *assets)
+    repo = make_repo(storage, executor, *assets, resources={"databricks": databricks})
 
     assert repo.materialize(partition_key=rs.PartitionKey.single("2024-01-02")).success
 
@@ -765,6 +781,7 @@ def test_failed_job_fails_the_asset(fake, storage, executor):
         executor,
         databricks.job_asset(7, name="orders"),
         databricks.job_asset(8, name="customers"),
+        resources={"databricks": databricks},
     )
 
     assert not repo.materialize(raise_on_error=False).success
@@ -782,7 +799,12 @@ def test_failed_job_fails_the_asset(fake, storage, executor):
 def test_poll_timeout_fails_the_asset_with_reason_timeout(fake, storage):
     fake.add(7, Run(70, job_id=7, states=[RUNNING]))
     databricks = make_resource(fake, poll_interval=0.01, poll_timeout=0.05)
-    repo = make_repo(storage, "in_process", databricks.job_asset(7, name="orders"))
+    repo = make_repo(
+        storage,
+        "in_process",
+        databricks.job_asset(7, name="orders"),
+        resources={"databricks": databricks},
+    )
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -804,12 +826,13 @@ def test_job_asset_retries(fake, storage, executor):
         Run(70, job_id=7, states=[FAILED]),
         Run(71, job_id=7, states=[SUCCESS]),
     )
-    asset = make_resource(fake).job_asset(
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(
         7,
         name="orders",
         retry=rs.RetryPolicy(max_retries=1, retry_on=[DatabricksRunError]),
     )
-    repo = make_repo(storage, executor, asset)
+    repo = make_repo(storage, executor, asset, resources={"databricks": databricks})
 
     assert repo.materialize().success
 
@@ -845,6 +868,7 @@ def test_job_assets_wait_at_the_same_time(fake, storage, executor, with_tasks):
             )
             for job_id in (7, 8)
         ),
+        resources={"databricks": databricks},
     )
 
     assert repo.materialize().success
@@ -905,13 +929,14 @@ def test_each_task_records_its_output(fake, storage, executor):
             outputs={91: {"notebook_output": {"result": "1200"}}},
         ),
     )
-    asset = make_resource(fake).job_asset(
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(
         9,
         name="sales",
         tasks=["orders", "refunds"],
         job_parameters={"day": "2024-01-01"},
     )
-    repo = make_repo(storage, executor, asset)
+    repo = make_repo(storage, executor, asset, resources={"databricks": databricks})
 
     assert repo.materialize().success
 
@@ -935,8 +960,9 @@ def test_subset_runs_only_the_selected_tasks(fake, storage):
             tasks=[task("orders", 91, excluded, **NOTEBOOK), SALES_TASKS[1]],
         ),
     )
-    asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", asset)
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(9, name="sales", tasks=["orders", "refunds"])
+    repo = make_repo(storage, "in_process", asset, resources={"databricks": databricks})
 
     assert repo.materialize(selection=["refunds"]).success
 
@@ -959,8 +985,9 @@ def test_failed_task_fails_only_its_output(fake, storage, executor):
             },
         ),
     )
-    asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, executor, asset)
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(9, name="sales", tasks=["orders", "refunds"])
+    repo = make_repo(storage, executor, asset, resources={"databricks": databricks})
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -984,8 +1011,9 @@ def test_task_missing_from_the_run_fails_its_output(fake, storage):
             outputs={91: {"notebook_output": {}}},
         ),
     )
-    asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", asset)
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(9, name="sales", tasks=["orders", "refunds"])
+    repo = make_repo(storage, "in_process", asset, resources={"databricks": databricks})
 
     assert not repo.materialize(raise_on_error=False).success
 
@@ -1011,8 +1039,9 @@ def test_failed_task_without_an_output_is_logged(fake, storage, caplog):
             },
         ),
     )
-    asset = make_resource(fake).job_asset(9, name="sales", tasks=["orders", "refunds"])
-    repo = make_repo(storage, "in_process", asset)
+    databricks = make_resource(fake)
+    asset = databricks.job_asset(9, name="sales", tasks=["orders", "refunds"])
+    repo = make_repo(storage, "in_process", asset, resources={"databricks": databricks})
 
     assert repo.materialize().success
 
@@ -1022,3 +1051,128 @@ def test_failed_task_without_an_output_is_logged(fake, storage, caplog):
         "Task cleanup FAILED: OSError: disk full"
     ) in caplog.messages
     assert materializations(storage, "refunds") == [task_metadata(fake, "refunds", 92)]
+
+
+# ── The registered resource ──────────────────────────────────────────
+
+
+def add_sales_runs(fake: FakeDatabricks) -> None:
+    """A run of job 7, for the asset without tasks, and of job 9, for the
+    asset with tasks."""
+    fake.add(7, Run(70, job_id=7, states=[SUCCESS]))
+    fake.add(
+        9,
+        Run(
+            90,
+            job_id=9,
+            states=[SUCCESS],
+            tasks=SALES_TASKS,
+            outputs={91: {"notebook_output": {}}},
+        ),
+    )
+
+
+def sales_assets(databricks: DatabricksResource, **options: Any) -> list[rs.Asset]:
+    """A job asset of each shape: ``daily_sales`` runs job 7, and ``sales``
+    has an output for each task of job 9."""
+    return [
+        databricks.job_asset(7, name="daily_sales", **options),
+        databricks.job_asset(9, name="sales", tasks=["orders", "refunds"], **options),
+    ]
+
+
+def sales_materializations(storage) -> dict[str, list[dict]]:
+    return {
+        name: materializations(storage, name)
+        for name in ("daily_sales", "orders", "refunds")
+    }
+
+
+def sales_metadata(fake: FakeDatabricks) -> dict[str, list[dict]]:
+    """The stored metadata of ``sales_assets`` after a run on ``fake``."""
+    return {
+        "daily_sales": [run_metadata(fake, 70, 7)],
+        "orders": [task_metadata(fake, "orders", 91)],
+        "refunds": [task_metadata(fake, "refunds", 92)],
+    }
+
+
+def test_run_uses_the_registered_resource(fake, other_fake, storage, executor):
+    """A run calls the workspace of the resource registered under
+    ``databricks``, not the workspace of the instance that made the assets."""
+    add_sales_runs(fake)
+    add_sales_runs(other_fake)
+    assets = sales_assets(make_resource(other_fake))
+    repo = make_repo(
+        storage, executor, *assets, resources={"databricks": make_resource(fake)}
+    )
+
+    assert repo.materialize().success
+
+    assert other_fake.requests == []
+    assert sorted(fake.bodies("run-now"), key=lambda body: body["job_id"]) == [
+        {"job_id": 7},
+        {"job_id": 9},
+    ]
+    assert sales_materializations(storage) == sales_metadata(fake)
+
+
+def test_run_config_overrides_the_resource(fake, other_fake, storage, executor):
+    """A run's config rebuilds the registered resource for that run: here the
+    run goes to another workspace, with the same token."""
+    add_sales_runs(fake)
+    add_sales_runs(other_fake)
+    databricks = make_resource(fake)
+    repo = make_repo(
+        storage,
+        executor,
+        *sales_assets(databricks),
+        resources={"databricks": databricks},
+    )
+
+    result = repo.materialize(
+        config={"resources": {"databricks": {"host": other_fake.host}}}
+    )
+
+    assert result.success
+    assert fake.requests == []
+    assert {r.authorization for r in other_fake.requests} == {f"Bearer {TOKEN}"}
+    assert sales_materializations(storage) == sales_metadata(other_fake)
+
+
+def test_resource_key_picks_the_resource(fake, other_fake, storage, executor):
+    """A run uses the resource registered under ``resource_key``, not the one
+    under ``databricks``."""
+    add_sales_runs(fake)
+    add_sales_runs(other_fake)
+    assets = sales_assets(make_resource(fake), resource_key="other")
+    repo = make_repo(
+        storage,
+        executor,
+        *assets,
+        resources={
+            "databricks": make_resource(other_fake),
+            "other": make_resource(fake),
+        },
+    )
+
+    assert repo.materialize().success
+
+    assert other_fake.requests == []
+    assert sales_materializations(storage) == sales_metadata(fake)
+
+
+@pytest.mark.parametrize(
+    ("tasks", "output"),
+    [(None, "sales"), (["orders", "refunds"], "orders")],
+    ids=["job", "tasks"],
+)
+def test_asset_without_its_resource_fails_to_load(tasks, output):
+    asset = DatabricksResource().job_asset(9, name="sales", tasks=tasks)
+    repo = rs.CodeRepository(assets=[asset])
+
+    with pytest.raises(
+        GraphValidationError,
+        match=f"^Asset '{output}': unresolved input 'databricks'$",
+    ):
+        repo.validate()

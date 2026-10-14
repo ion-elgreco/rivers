@@ -16,11 +16,14 @@
 //! The async flavor returns the [`WorkOutcome`] with the guard still held:
 //! `process_outcome` requires `&mut BatchContext`, which isn't available
 //! inside spawned tasks. [`process_finished_steps`] runs phases 5 and 6 for
-//! each task as it finishes.
+//! each task as it finishes. For the same reason, an async generator step's
+//! worker sends each output that the body yields to the orchestrator thread,
+//! which records it during phase 4, while the body waits.
 //!
 //! K8s does not use the lifecycle helper: its step pods write events directly
 //! and the orchestrator-side path is just "build Job, poll, mark failed."
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -40,8 +43,8 @@ use super::super::traceback;
 use super::context::BatchContext;
 use super::failure::{self, classify_pyerr};
 use super::pool_claim::{ClaimCancelled, PoolGuard};
-use super::results::{emit_captured_logs, process_outcome};
-use super::types::WorkOutcome;
+use super::results::{emit_captured_logs, process_outcome, record_yielded_output};
+use super::types::{WorkOutcome, YieldedOutput};
 
 /// Phase-4 work supplied by an in-process backend. Runs synchronously with
 /// the GIL held; the lifecycle hands `&BatchContext` so the worker can read
@@ -206,7 +209,16 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         attempt += 1;
     };
 
-    process_outcome(py, ctx, step, step_name, event_names, outcome, failures);
+    process_outcome(
+        py,
+        ctx,
+        step,
+        step_name,
+        event_names,
+        outcome,
+        None,
+        failures,
+    );
 
     if let Some(g) = guard {
         g.release_blocking(py);
@@ -227,28 +239,51 @@ pub(crate) struct FinishedStep {
 /// finished step's claim until its slowest sibling ends.
 ///
 /// `bridge` is the event loop of async steps: a Ctrl-C during the wait
-/// cancels their tasks, as it interrupts a sync step.
+/// cancels their tasks, as it interrupts a sync step. `outputs` carries the
+/// outputs that async generator steps yield, which are recorded as they come.
 pub(crate) fn process_finished_steps(
     py: Python,
     ctx: &mut BatchContext,
     mut tasks: JoinSet<FinishedStep>,
     bridge: Option<&AsyncBridge>,
+    mut outputs: Option<mpsc::UnboundedReceiver<YieldedOutput>>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
+    #[allow(clippy::large_enum_variant)]
+    enum Next {
+        Yielded(YieldedOutput),
+        Joined(Option<Result<FinishedStep, tokio::task::JoinError>>),
+    }
+
+    let mut recorders = HashMap::new();
     loop {
-        let joined = match bridge {
-            Some(bridge) => bridge.block_on(py, tasks.join_next()),
-            None => py.detach(|| rt().block_on(tasks.join_next())),
+        let next = async {
+            let yielded = async {
+                match outputs.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => None,
+                }
+            };
+            tokio::select! {
+                Some(output) = yielded => Next::Yielded(output),
+                joined = tasks.join_next() => Next::Joined(joined),
+            }
         };
-        let Some(joined) = joined else {
-            break;
+        let next = match bridge {
+            Some(bridge) => bridge.block_on(py, next),
+            None => py.detach(|| rt().block_on(next)),
         };
-        let finished = match joined {
-            Ok(finished) => finished,
-            Err(e) => {
+        let finished = match next {
+            Next::Yielded(output) => {
+                record_yielded_output(py, ctx, &mut recorders, output);
+                continue;
+            }
+            Next::Joined(None) => break,
+            Next::Joined(Some(Err(e))) => {
                 tracing::error!("step task panicked: {e}");
                 continue;
             }
+            Next::Joined(Some(Ok(finished))) => finished,
         };
         let step = &ctx.scope.plan.steps[finished.idx];
         process_outcome(
@@ -258,6 +293,7 @@ pub(crate) fn process_finished_steps(
             &finished.instance_name,
             &finished.event_names,
             finished.outcome,
+            recorders.remove(&finished.idx),
             failures,
         );
         if let Some(g) = finished.guard {

@@ -380,10 +380,15 @@ impl AssetDef {
         })
     }
 
-    /// Read-only access to the per-output dependency list (the `deps=` argument).
+    /// Per-output dependencies (the `deps=` argument).
     #[getter]
     fn deps(&self, py: Python) -> Vec<Py<DepDef>> {
         self.deps.iter().map(|d| d.clone_ref(py)).collect()
+    }
+
+    #[setter]
+    fn set_deps(&mut self, val: Vec<Py<DepDef>>) {
+        self.deps = val;
     }
 
     /// Per-output actions (the `actions=` argument) — the introspection route

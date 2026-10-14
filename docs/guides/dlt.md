@@ -200,20 +200,26 @@ dlt writes the tables to its destination, not to an IO handler. A downstream ass
 def issue_report() -> None: ...
 ```
 
-Or it takes the output as an input, through an IO handler that reads the destination. For a DuckDB destination, give the assets a [`DuckDBIOHandler`](duckdb.md#io-handler), and point it at the tables with the `duckdb/schema` and `duckdb/table` metadata keys:
+Or it takes the output as an input, through an IO handler that reads the destination. For a DuckDB destination, give the assets a [`DuckDBIOHandler`](duckdb.md#io-handler). The handler reads the table that the `duckdb/schema` and `duckdb/table` metadata keys name. Without them, it looks for `main.<asset name>`, e.g. `main.github_issues`. So set the keys in the `asset_def_fn`:
 
 ```python
 import pyarrow as pa
 import pyarrow.compute as pc
 from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource
 
-github = DltSourceAssets(
-    github_source(),
-    asset_def_fn=lambda resource: output_def(
+source = github_source()
+
+
+def asset_def(resource) -> rs.AssetDef:
+    metadata = output_def(resource).metadata
+    table = source.schema.naming.normalize_table_identifier(metadata["dlt/table"])
+    return output_def(
         resource,
-        metadata={"duckdb/schema": "github", "duckdb/table": resource.table_name},
-    ),
-)
+        metadata=metadata | {"duckdb/schema": "github", "duckdb/table": table},
+    )
+
+
+github = DltSourceAssets(source, asset_def_fn=asset_def)
 
 
 @github.assets(
@@ -230,6 +236,10 @@ def github_assets(context: rs.AssetExecutionContext):
 def open_issues(github_issues: pa.Table) -> pa.Table:
     return github_issues.filter(pc.field("state") == "open")
 ```
+
+`metadata=` replaces the default metadata, so `asset_def` adds the two keys to the `dlt/` keys. `duckdb/schema` is the pipeline's `dataset_name`, and `duckdb/table` is the resource's table name. dlt normalizes both names when it loads them: `pullRequests` becomes `pull_requests`. `normalize_table_identifier` does the same for the table name. For the dataset, use a name that does not change, such as `github`.
+
+The handler loads the resource's root table, e.g. `github.issues`. dlt loads lists into nested tables, such as `issues__labels`, and the handler does not read them. When a resource sets its table name in the run, `dlt/table` is the resource name: set `duckdb/table` to the table to read.
 
 The IO handler only reads: dlt writes the tables.
 

@@ -271,6 +271,91 @@ def test_job_allow_incomplete_deps_without_io_handler_raises():
         repo.resolve()
 
 
+def _lineage_assets(shape: str, io_handler=None) -> list:
+    """``b`` depends on ``a`` for lineage only, as two assets or two outputs of one."""
+    if shape == "single":
+
+        @rs.Asset(io_handler=io_handler)
+        def a() -> rs.Materialization:
+            return rs.Materialization()
+
+        @rs.Asset(io_handler=io_handler, deps=[rs.AssetDef.dep("a")])
+        def b() -> rs.Materialization:
+            return rs.Materialization(metadata={"selection": "b"})
+
+        return [a, b]
+
+    @rs.Asset.from_multi(
+        output_defs=[rs.AssetDef("a"), rs.AssetDef("b", deps=[rs.AssetDef.dep("a")])],
+        io_handler=io_handler,
+    )
+    def ab(context: rs.AssetExecutionContext):
+        for name in context.output_selection:
+            yield rs.Materialization(
+                output_name=name,
+                metadata={"selection": ",".join(context.output_selection)},
+            )
+
+    return [ab]
+
+
+@pytest.mark.parametrize("shape", ["single", "multi"])
+def test_materialize_skips_lineage_only_dep_outside_the_selection(
+    storage, executor_env, shape
+):
+    """A lineage-only dep loads nothing, so it needs no io_handler to stay out of the run."""
+    executor, io_factory = executor_env
+
+    # A second step, so the parallel executor runs the steps in workers.
+    @rs.Asset(io_handler=io_factory())
+    def other() -> rs.Materialization:
+        return rs.Materialization()
+
+    repo = rs.CodeRepository(
+        assets=[*_lineage_assets(shape, io_factory()), other],
+        default_executor=executor,
+    )
+    repo.resolve(storage=storage)
+    result = repo.materialize(["b", "other"])
+
+    assert result.success
+    assert storage.get_events_for_asset("a") == []
+    [materialization] = [
+        e
+        for e in storage.get_events_for_asset("b")
+        if e.event_type == "Materialization"
+    ]
+    assert materialization.metadata == [("selection", '{"Text":{"value":"b"}}')]
+
+
+def test_job_lineage_only_dep_outside_a_strict_job_raises():
+    """Without allow_incomplete_deps, a job must still hold its lineage-only deps."""
+    a, b = _lineage_assets("single")
+
+    repo = rs.CodeRepository(
+        assets=[a, b],
+        jobs=[rs.Job(name="strict", assets=[b], executor=rs.Executor.in_process())],
+    )
+    with pytest.raises(GraphValidationError, match="set allow_incomplete_deps=True"):
+        repo.resolve()
+
+
+def test_job_dep_that_is_also_an_input_still_needs_an_io_handler():
+    """Declaring an input with AssetDef.dep too does not make it lineage-only."""
+
+    @rs.Asset
+    def a() -> int:
+        return 1
+
+    @rs.Asset(deps=[rs.AssetDef.dep("a")])
+    def b(a: int) -> int:
+        return a + 1
+
+    repo = rs.CodeRepository(assets=[a, b])
+    with pytest.raises(GraphValidationError, match="has no io_handler"):
+        repo.materialize(["b"])
+
+
 def test_job_execute_before_validation_raises():
     """Executing a job not added to a CodeRepository raises ValueError."""
 

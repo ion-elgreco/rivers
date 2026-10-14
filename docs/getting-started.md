@@ -21,6 +21,7 @@ pip install rivers[dataframely]  # Validate polars asset outputs against datafra
 pip install rivers[sling]     # Sling replications as assets
 pip install rivers[databricks] # Databricks jobs as assets
 pip install rivers[dlt]       # dlt sources as assets, one per dlt resource
+pip install rivers[dbt]       # dbt models, seeds, and snapshots as assets (add your dbt adapter)
 ```
 
 The [Airbyte integration](guides/airbyte.md) needs no extra.

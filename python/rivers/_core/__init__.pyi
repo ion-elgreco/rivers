@@ -452,7 +452,9 @@ class Job:
                 Schedule machinery. Every targeted asset must define it.
             executor: Override the repository default executor for this job.
             allow_incomplete_deps: Tolerate missing upstream deps (debug / partial
-                graphs); production jobs should leave this ``False``.
+                graphs): a missing input dep needs an ``io_handler``, a
+                lineage-only dep (:meth:`AssetDef.dep`) needs none. Production
+                jobs should leave this ``False``.
             retry: Job-level retry default — a :class:`RetryPolicy` or the name of
                 a policy registered in ``CodeRepository(retries=...)``. Assets with
                 their own policy keep it.

@@ -76,6 +76,7 @@ nav:
       - Databricks: guides/databricks.md
       - Datadog: guides/datadog.md
       - dataframely: guides/dataframely.md
+      - dbt: guides/dbt.md
       - Delta Lake: guides/delta-lake.md
       - dlt: guides/dlt.md
       - DuckDB: guides/duckdb.md
@@ -103,6 +104,7 @@ nav:
       - Databricks: api-reference/databricks.md
       - Datadog: api-reference/datadog.md
       - dataframely: api-reference/dataframely.md
+      - dbt: api-reference/dbt.md
       - Delta Lake: api-reference/delta.md
       - dlt: api-reference/dlt.md
       - DuckDB: api-reference/duckdb.md

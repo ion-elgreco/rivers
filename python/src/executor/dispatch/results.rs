@@ -3,12 +3,14 @@
 //! for materializations, then Materialization / Observation event + dv
 //! recording + StepSuccess + success hooks). All three result shapes
 //! (single-output, dict multi-asset, generator multi-asset) flow through
-//! the same closure body.
+//! the same [`OutputRecorder`]. An async generator's worker sends each output
+//! that it yields to the orchestrator thread, which records it the same way
+//! ([`record_yielded_output`]).
 //!
 //! Called by `run_step_to_completion` (trait_def.rs) and AsyncBackend's
 //! result processing loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -23,7 +25,7 @@ use super::super::ops::{self, OutOfProcess, now_ts};
 use super::super::parallel::worker::unwrap_worker_error;
 use super::super::traceback;
 use super::context::BatchContext;
-use super::types::{CapturedLogs, StepCapture, WorkOutcome};
+use super::types::{CapturedLogs, StepCapture, WorkOutcome, YieldedOutput};
 
 /// Emit a Materialization event + run success hooks for one output. Shared
 /// by the `Output` (with IO write) and `Materialization` (no IO) paths so
@@ -73,12 +75,6 @@ fn emit_materialization_and_hooks(
     }
 }
 
-/// Process a step result: drive iteration, write IO + emit events per item,
-/// reconcile any unyielded outputs (generator multi only).
-///
-/// `step_name` is the IO + event scope: `step.name` for non-mapped (single
-/// or multi-asset), `instance_name` for a mapped fan-out instance. Multi-
-/// asset paths are never mapped, so `step_name == step.name` for them.
 /// Stash per-partition failure marks (`mark_partition_failed`) so
 /// `emit_materialization` emits a StepFailure for them instead of a
 /// Materialization. Keyed by every name the step emits under — a multi-asset
@@ -102,6 +98,233 @@ fn stash_failed_partitions(
     }
 }
 
+/// Records a step's outputs one at a time: the IO write of an `Output` value,
+/// then the output's events and hooks.
+pub(crate) struct OutputRecorder {
+    is_single: bool,
+    return_hint: Option<Py<PyAny>>,
+    config_instance: Option<Py<PyAny>>,
+    /// dynamic_keys writes the `__keys` index alongside the step's value.
+    /// Only meaningful on the single-output path (multi-assets write per-output).
+    dynamic_keys: Option<Vec<String>>,
+    input_versions: Vec<(String, String)>,
+    /// A generator's context, until its first output: the partitions that the
+    /// body marked failed by then are stashed before that output is emitted.
+    context: Option<Py<PyAny>>,
+    recorded: HashSet<String>,
+    /// What the orchestrator thread wrote as it recorded an async generator's
+    /// outputs, apart from the body's own output.
+    logs: CapturedLogs,
+}
+
+impl OutputRecorder {
+    fn new(
+        ctx: &BatchContext,
+        step: &ExecutionStep,
+        step_name: &str,
+        config_instance: Option<Py<PyAny>>,
+        context: Option<Py<PyAny>>,
+    ) -> Self {
+        // Provenance is per-step, not per-instance: empty for mapped fan-out.
+        let input_versions = if step_name == step.name {
+            ops::collect_input_data_versions(ctx.state.data_versions, &step.graph_dependencies)
+        } else {
+            Vec::new()
+        };
+        Self {
+            is_single: step.outputs.is_empty(),
+            return_hint: None,
+            config_instance,
+            dynamic_keys: None,
+            input_versions,
+            context,
+            recorded: HashSet::new(),
+            logs: None,
+        }
+    }
+
+    /// For the outputs of `step_result`.
+    fn of(
+        py: Python,
+        ctx: &BatchContext,
+        step: &ExecutionStep,
+        step_name: &str,
+        step_result: &ops::StepResult,
+    ) -> Self {
+        let context = match &step_result.generator {
+            Some(
+                ops::GeneratorType::Sync { context } | ops::GeneratorType::Async { context, .. },
+            ) => context.as_ref().map(|c| c.clone_ref(py)),
+            None => None,
+        };
+        let config_instance = step_result
+            .config_instance
+            .as_ref()
+            .map(|c| c.clone_ref(py));
+        let recorder = Self::new(ctx, step, step_name, config_instance, context);
+        if !recorder.is_single {
+            return recorder;
+        }
+        Self {
+            return_hint: step_result.return_hint.as_ref().map(|h| h.clone_ref(py)),
+            dynamic_keys: step_result.dynamic_keys.clone(),
+            ..recorder
+        }
+    }
+
+    fn record(
+        &mut self,
+        py: Python,
+        ctx: &mut BatchContext,
+        step: &ExecutionStep,
+        item: ops::OutputItem,
+    ) -> PyResult<()> {
+        if let Some(context) = self.context.take() {
+            stash_failed_partitions(ctx, step, ops::drain_failed_partitions(py, Some(&context)));
+        }
+        match item {
+            ops::OutputItem::Materialization {
+                name,
+                value,
+                mut metadata,
+                data_version,
+            } => {
+                // Single-output (incl. mapped fan-out instances) shares the
+                // step's underlying node — `name` is the IO/event scope but
+                // node_map is keyed by step.name. Multi-asset outputs have
+                // their own per-output entries in node_map.
+                let node_lookup = if self.is_single { &step.name } else { &name };
+                let node = ctx.repo.node_map.get(node_lookup).ok_or_else(|| {
+                    ExecutionError::new_err(format!(
+                        "Output '{}' not found in node_map",
+                        node_lookup
+                    ))
+                })?;
+
+                // value.is_some() => Output(v): write via IO handler.
+                // value.is_none() => Materialization(...): user-managed.
+                let resolved_dv = if let Some(value) = &value {
+                    if in_step_pod() {
+                        let handler = ctx.repo.io_handler_registry.for_output(py, node);
+                        OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
+                    }
+                    let type_hint = if self.is_single {
+                        self.return_hint.as_ref()
+                    } else {
+                        node.output_type_hint()
+                    };
+                    let written = ops::handle_step_output(
+                        py,
+                        &name,
+                        node,
+                        value,
+                        ctx.scope.partition_key,
+                        type_hint,
+                        metadata.clone(),
+                        ctx.repo.io_handler_registry,
+                    )?;
+                    ops::merge_metadata(&mut metadata, &written.metadata);
+                    written.data_version.or(data_version)
+                } else {
+                    data_version
+                };
+                let final_dv = resolved_dv.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                // Persist dynamic_keys to KV before emit_success so a
+                // racing downstream sees the new keys. Single-output Output
+                // path only — multi-asset can't carry DynamicOutputs.
+                if self.is_single
+                    && value.is_some()
+                    && let Some(keys) = self.dynamic_keys.as_deref()
+                    && !keys.is_empty()
+                {
+                    py.detach(|| {
+                        ops::persist_dynamic_keys(
+                            ctx.sink.storage,
+                            &name,
+                            ctx.scope.partition_key,
+                            &final_dv,
+                            keys,
+                        );
+                    });
+                }
+
+                emit_materialization_and_hooks(
+                    ctx,
+                    node,
+                    &name,
+                    &metadata,
+                    final_dv,
+                    &self.input_versions,
+                    value.as_ref(),
+                    self.config_instance.as_ref(),
+                );
+                self.recorded.insert(name);
+            }
+            ops::OutputItem::Observation {
+                name,
+                metadata,
+                data_version,
+            } => {
+                ctx.emit_observation(&name, &metadata, data_version, now_ts());
+                ctx.emit_success(&name);
+                self.recorded.insert(name);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Record an output that an async generator step's worker sent, and send it
+/// the result. The step's first output makes its recorder, which
+/// `process_step_result` takes over when the step ends.
+pub(crate) fn record_yielded_output(
+    py: Python,
+    ctx: &mut BatchContext,
+    recorders: &mut HashMap<usize, OutputRecorder>,
+    output: YieldedOutput,
+) {
+    let YieldedOutput {
+        idx,
+        item,
+        context,
+        config,
+        recorded,
+    } = output;
+    let plan = ctx.scope.plan;
+    let step = &plan.steps[idx];
+    let recorder = recorders
+        .entry(idx)
+        .or_insert_with(|| OutputRecorder::new(ctx, step, &step.name, config, context));
+
+    let capture = StepCapture::start(py);
+    let result = recorder.record(py, ctx, step, item);
+    recorder.logs = join_logs(recorder.logs.take(), capture.finish());
+
+    let _ = recorded.send(result);
+}
+
+/// `first`'s streams, each followed by the same stream of `then`.
+fn join_logs(first: CapturedLogs, then: CapturedLogs) -> CapturedLogs {
+    match (first, then) {
+        (Some((out, err, logs)), Some(then)) => Some((
+            out + then.0.as_str(),
+            err + then.1.as_str(),
+            logs + then.2.as_str(),
+        )),
+        (first, then) => first.or(then),
+    }
+}
+
+/// Process a step result: drive iteration, write IO + emit events per item,
+/// reconcile any unyielded outputs (generator multi only).
+///
+/// `step_name` is the IO + event scope: `step.name` for non-mapped (single
+/// or multi-asset), `instance_name` for a mapped fan-out instance. Multi-
+/// asset paths are never mapped, so `step_name == step.name` for them.
+/// `recorder` is the recorder of an async generator step, which recorded
+/// each output as the body yielded it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_step_result(
     py: Python,
     ctx: &mut BatchContext,
@@ -109,6 +332,7 @@ pub(crate) fn process_step_result(
     step_name: &str,
     step_result: ops::StepResult,
     captured_logs: CapturedLogs,
+    recorder: Option<OutputRecorder>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
     // A generator's body runs only as its outputs are drained below, after
@@ -173,14 +397,6 @@ pub(crate) fn process_step_result(
         }
     }
 
-    let mut yielded_names: HashSet<String> = HashSet::new();
-    // Provenance is per-step, not per-instance: empty for mapped fan-out.
-    let input_versions = if is_non_mapped {
-        ops::collect_input_data_versions(ctx.state.data_versions, &step.graph_dependencies)
-    } else {
-        Vec::new()
-    };
-    let return_hint = step_result.return_hint.as_ref().map(|h| h.clone_ref(py));
     let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
         .outputs
         .iter()
@@ -190,29 +406,8 @@ pub(crate) fn process_step_result(
             (name.clone(), hint.map(|h| h.clone_ref(py)))
         })
         .collect();
-    let config_instance = step_result
-        .config_instance
-        .as_ref()
-        .map(|c| c.clone_ref(py));
-    // dynamic_keys writes the `__keys` index alongside the step's value.
-    // Only meaningful on the single-output path (multi-assets write per-output).
-    let dynamic_keys = if is_single {
-        step_result.dynamic_keys.clone()
-    } else {
-        None
-    };
-
-    // A generator's marks are set only as its body runs (lazily, while
-    // for_each_output drives it), so drain the generator context before the
-    // first output is emitted rather than up-front like the return path.
-    let gen_ctx: Option<Py<PyAny>> = match &step_result.generator {
-        Some(ops::GeneratorType::Sync { context })
-        | Some(ops::GeneratorType::Async { context, .. }) => {
-            context.as_ref().map(|c| c.clone_ref(py))
-        }
-        None => None,
-    };
-    let mut gen_marks_stashed = false;
+    let mut recorder =
+        recorder.unwrap_or_else(|| OutputRecorder::of(py, ctx, step, step_name, &step_result));
 
     let body_capture = step_result
         .generator
@@ -223,117 +418,11 @@ pub(crate) fn process_step_result(
         &step_result,
         &selected_outputs,
         step_name,
-        |py, item| {
-            if !gen_marks_stashed {
-                gen_marks_stashed = true;
-                stash_failed_partitions(
-                    ctx,
-                    step,
-                    ops::drain_failed_partitions(py, gen_ctx.as_ref()),
-                );
-            }
-            match item {
-                ops::OutputItem::Materialization {
-                    name,
-                    value,
-                    mut metadata,
-                    data_version,
-                } => {
-                    // Single-output (incl. mapped fan-out instances) shares the
-                    // step's underlying node — `name` is the IO/event scope but
-                    // node_map is keyed by step.name. Multi-asset outputs have
-                    // their own per-output entries in node_map.
-                    let node_lookup = if is_single { &step.name } else { &name };
-                    let node = ctx.repo.node_map.get(node_lookup).ok_or_else(|| {
-                        ExecutionError::new_err(format!(
-                            "Output '{}' not found in node_map",
-                            node_lookup
-                        ))
-                    })?;
-
-                    // value.is_some() => Output(v): write via IO handler.
-                    // value.is_none() => Materialization(...): user-managed.
-                    let resolved_dv = if let Some(value) = &value {
-                        if in_step_pod() {
-                            let handler = ctx.repo.io_handler_registry.for_output(py, node);
-                            OutOfProcess::Kubernetes.check_handler(py, &name, &handler)?;
-                        }
-                        let type_hint = if is_single {
-                            return_hint.as_ref()
-                        } else {
-                            node.output_type_hint()
-                        };
-                        let written = ops::handle_step_output(
-                            py,
-                            &name,
-                            node,
-                            value,
-                            ctx.scope.partition_key,
-                            type_hint,
-                            metadata.clone(),
-                            ctx.repo.io_handler_registry,
-                        )?;
-                        ops::merge_metadata(&mut metadata, &written.metadata);
-                        written.data_version.or(data_version)
-                    } else {
-                        data_version
-                    };
-                    let final_dv = resolved_dv.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-                    // Persist dynamic_keys to KV before emit_success so a
-                    // racing downstream sees the new keys. Single-output Output
-                    // path only — multi-asset can't carry DynamicOutputs.
-                    if is_single
-                        && value.is_some()
-                        && let Some(keys) = dynamic_keys.as_deref()
-                        && !keys.is_empty()
-                    {
-                        py.detach(|| {
-                            ops::persist_dynamic_keys(
-                                ctx.sink.storage,
-                                &name,
-                                ctx.scope.partition_key,
-                                &final_dv,
-                                keys,
-                            );
-                        });
-                    }
-
-                    emit_materialization_and_hooks(
-                        ctx,
-                        node,
-                        &name,
-                        &metadata,
-                        final_dv,
-                        &input_versions,
-                        value.as_ref(),
-                        config_instance.as_ref(),
-                    );
-                    yielded_names.insert(name);
-                }
-                ops::OutputItem::Observation {
-                    name,
-                    metadata,
-                    data_version,
-                } => {
-                    ctx.emit_observation(&name, &metadata, data_version, now_ts());
-                    ctx.emit_success(&name);
-                    yielded_names.insert(name);
-                }
-            }
-            Ok(())
-        },
+        |py, item| recorder.record(py, ctx, step, item),
     );
     if let Some(capture) = body_capture {
-        let logs = match (call_logs, capture.finish()) {
-            (Some((out, err, logs)), Some(body)) => Some((
-                out + body.0.as_str(),
-                err + body.1.as_str(),
-                logs + body.2.as_str(),
-            )),
-            (call, body) => call.or(body),
-        };
-        emit_captured_logs(ctx, step_name, logs);
+        let logs = join_logs(call_logs, recorder.logs.take());
+        emit_captured_logs(ctx, step_name, join_logs(logs, capture.finish()));
     }
 
     if let Err(e) = result {
@@ -345,7 +434,7 @@ pub(crate) fn process_step_result(
         } else if is_single {
             step.event_names().to_vec()
         } else {
-            unyielded_outputs(step, &yielded_names)
+            unyielded_outputs(step, &recorder.recorded)
         };
         handle_failure(
             py,
@@ -358,7 +447,7 @@ pub(crate) fn process_step_result(
             failures,
         );
     } else if !is_single {
-        py.detach(|| fail_unyielded_outputs(ctx, step, &yielded_names, failures));
+        py.detach(|| fail_unyielded_outputs(ctx, step, &recorder.recorded, failures));
     }
 
     // The graph's Materialization takes this time: after this task's own
@@ -543,6 +632,8 @@ fn handle_observation_result(
 ///   failures-map key on the Error path.
 /// - `event_names` — names to emit `StepFailure` for on the Error path. Pass
 ///   `step.event_names()` for non-mapped, `&[instance_name]` for mapped.
+/// - `recorder` — see [`process_step_result`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_outcome(
     py: Python,
     ctx: &mut BatchContext,
@@ -550,6 +641,7 @@ pub(crate) fn process_outcome(
     step_name: &str,
     event_names: &[String],
     outcome: WorkOutcome,
+    recorder: Option<OutputRecorder>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
     match outcome {
@@ -564,6 +656,7 @@ pub(crate) fn process_outcome(
                 step_name,
                 step_result,
                 captured_logs,
+                recorder,
                 failures,
             );
         }

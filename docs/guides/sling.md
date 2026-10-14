@@ -91,7 +91,7 @@ Sling's log goes to the step log. Each stream is materialized as soon as sling r
 | `sling/stream` | `str` | The stream. |
 | `sling/object` | `str` | The table or file that sling wrote, e.g. `raw.app_users`. |
 | `sling/rows_written` | `int` | Rows that sling wrote for the stream in this run. |
-| `sling/duration_s` | `float` | Seconds the stream took. |
+| `sling/duration` | `MetadataValue.duration` | Seconds the stream took. |
 
 `sling/object` and `sling/rows_written` are there when sling's log shows them. A stream that sling's log does not name, such as a wildcard stream that becomes many tables, is materialized when the whole replication succeeds, with `sling/stream` only.
 
@@ -139,7 +139,7 @@ When `asset_def_fn` sets no `code_version`, the output gets a hash of the stream
 
 ## Downstream assets
 
-Sling writes the data to its target, not to an IO handler. A downstream asset reads the target and takes the stream's output as a lineage dep:
+Sling writes the data to its target, not to an IO handler. A downstream asset can read the target, and take the stream's output as a lineage dep:
 
 ```python
 from rivers.integrations.duckdb import DuckDBResource
@@ -149,5 +149,54 @@ def active_users(warehouse: DuckDBResource) -> int:
     with warehouse.get_connection() as con:
         return con.sql("SELECT count(*) FROM raw.app_users WHERE active").fetchone()[0]
 ```
+
+Or it takes the output as an input, through an IO handler that reads the target. For a DuckDB target, give the assets a [`DuckDBIOHandler`](duckdb.md#io-handler). The handler reads the table that the `duckdb/schema` and `duckdb/table` metadata keys name. Without them, it looks for `main.<asset name>`. So set the keys in the `asset_def_fn`, from each stream's `object`:
+
+```yaml
+# replication.yaml
+source: PG
+target: WAREHOUSE
+
+defaults:
+  mode: full-refresh
+
+streams:
+  public.orders:
+    object: raw.orders
+  public.users:
+    object: raw.app_users
+```
+
+```python
+import pyarrow as pa
+import pyarrow.compute as pc
+from rivers.integrations.duckdb import DuckDBIOHandler, DuckDBResource
+from rivers.integrations.sling import SlingStream
+
+def asset_def(stream: SlingStream) -> rs.AssetDef:
+    metadata = stream.output_def().metadata
+    schema, table = stream.config["object"].split(".")
+    return stream.output_def(
+        name=f"{schema}_{table}",
+        metadata=metadata | {"duckdb/schema": schema, "duckdb/table": table},
+    )
+
+replication = SlingReplication("replication.yaml", asset_def_fn=asset_def)
+warehouse = DuckDBResource(database="warehouse.duckdb")  # the instance of WAREHOUSE
+
+@replication.assets(name="raw", io_handler=DuckDBIOHandler(resource=warehouse))
+def raw(context: rs.AssetExecutionContext, sling: SlingResource):
+    yield from sling.replicate(context, replication)
+
+@rs.Asset
+def active_users(raw_app_users: pa.Table) -> pa.Table:
+    return raw_app_users.filter(pc.field("active"))
+```
+
+`metadata=` replaces the default metadata, so `asset_def` adds the two keys to `sling/stream`. It also names each output `<schema>_<table>`, e.g. `raw_app_users`, because a parameter name cannot have a dot.
+
+`stream.config` has only the stream's own keys, so each stream sets its `object`, not `defaults`. The `object` must be a plain `schema.table`, without quotes or runtime variables such as `{stream_table}`: a variable gets its value when sling runs, after rivers builds the outputs.
+
+The IO handler only reads: sling writes the tables.
 
 See the [API reference](../api-reference/sling.md) for every parameter.

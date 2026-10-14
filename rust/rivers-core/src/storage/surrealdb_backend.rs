@@ -163,17 +163,29 @@ impl SurrealStorage {
         retry_config: super::retry::StorageRetryConfig,
         cap: Capability,
     ) -> Result<Self> {
+        Self::open_embedded(path, "every", retry_config, cap).await
+    }
+
+    /// `sync` is RocksDB's sync mode: `"every"` syncs the log to disk at each
+    /// commit; `"never"` leaves it to the OS.
+    async fn open_embedded(
+        path: &str,
+        sync: &str,
+        retry_config: super::retry::StorageRetryConfig,
+        cap: Capability,
+    ) -> Result<Self> {
         let started = std::time::Instant::now();
         tracing::info!(
             backend = "embedded",
             path = %path,
+            sync,
             max_retries = retry_config.max_retries,
             max_backoff_ms = retry_config.max_backoff.as_millis() as u64,
             "opening surreal storage"
         );
         let db = super::retry::with_retry(&retry_config, || async {
             tracing::debug!(path = %path, "connecting rocksdb engine");
-            let db = any::connect(format!("rocksdb://{path}"))
+            let db = any::connect(format!("rocksdb://{path}?sync={sync}"))
                 .await
                 .context("failed to open RocksDB")?;
             tracing::debug!(
@@ -347,6 +359,21 @@ impl SurrealStorage {
     pub fn new_embedded_blocking(path: &str) -> Result<Self> {
         let runtime = build_storage_runtime();
         let mut storage = runtime.block_on(Self::new_embedded(path))?;
+        storage.runtime = Some(runtime);
+        Ok(storage)
+    }
+
+    /// See [`Self::new_embedded_blocking`]. For a store that is removed when
+    /// the process exits: no commit is synced to disk, so a new store's
+    /// migration does not wait on slow disks (Windows).
+    pub fn new_scratch_blocking(path: &str) -> Result<Self> {
+        let runtime = build_storage_runtime();
+        let mut storage = runtime.block_on(Self::open_embedded(
+            path,
+            "never",
+            super::retry::StorageRetryConfig::default(),
+            Capability::ReadWrite,
+        ))?;
         storage.runtime = Some(runtime);
         Ok(storage)
     }

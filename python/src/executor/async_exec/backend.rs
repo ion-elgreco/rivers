@@ -19,8 +19,8 @@ use crate::runtime::rt;
 
 use super::super::dispatch::pool_claim::PoolGuard;
 use super::super::dispatch::{
-    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, StepCapture, StepInstance,
-    WorkOutcome, process_finished_steps, run_step_async_lifecycle,
+    AsyncWorker, BatchContext, ExecutorBackend, FinishedStep, OutputSender, StepCapture,
+    StepInstance, WorkOutcome, process_finished_steps, run_step_async_lifecycle,
 };
 use super::super::event_writer::WriterMsg;
 use super::super::ops::{self};
@@ -74,11 +74,11 @@ impl SharedStepContext {
     }
 }
 
-/// Capture stdout/stderr (Python) + Rust logs around `execute_step`. The
-/// resolved Pydantic config is dropped eagerly under the GIL on success
-/// (it's already on `StepResult.config_instance`) and only carried out via
-/// `failure_config` on the Err branch where the orchestrator needs it for
-/// `run_failure_hooks`.
+/// Capture stdout/stderr (Python) + Rust logs around `execute_step`, and the
+/// body of an async generator step. The resolved Pydantic config is dropped
+/// eagerly under the GIL on success (it's already on
+/// `StepResult.config_instance`) and only carried out via `failure_config` on
+/// the Err branch where the orchestrator needs it for `run_failure_hooks`.
 fn execute_with_capture(
     py: Python,
     step: &ExecutionStep,
@@ -86,6 +86,7 @@ fn execute_with_capture(
     action_key: &Option<PyPartitionKey>,
     input_overrides: &HashMap<String, Py<PyAny>>,
     locals: Option<&pyo3_async_runtimes::TaskLocals>,
+    outputs: &OutputSender,
 ) -> WorkOutcome {
     let capture = StepCapture::start(py);
 
@@ -117,6 +118,10 @@ fn execute_with_capture(
             locals,
             &mut resolved_config,
         )
+        .map(|mut step_result| {
+            run_async_generator_body(py, step, shared, locals, outputs, &mut step_result);
+            step_result
+        })
     };
 
     let captured_logs = capture.finish();
@@ -134,6 +139,49 @@ fn execute_with_capture(
     }
 }
 
+/// Run the body of an async generator step to its end on this thread. The
+/// orchestrator thread records each output that the body yields before the
+/// body goes on, as it records the outputs of a sync generator.
+fn run_async_generator_body(
+    py: Python,
+    step: &ExecutionStep,
+    shared: &SharedStepContext,
+    locals: Option<&pyo3_async_runtimes::TaskLocals>,
+    outputs: &OutputSender,
+    step_result: &mut ops::StepResult,
+) {
+    let Some(ops::GeneratorType::Async { context, error }) = &mut step_result.generator else {
+        return;
+    };
+    let Some(locals) = locals else {
+        *error = Some(ExecutionError::new_err(format!(
+            "Async node '{}' requires TaskLocals — this is an internal error",
+            step.name
+        )));
+        return;
+    };
+
+    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
+        .outputs
+        .iter()
+        .map(|name| {
+            let hint = shared.node_map.get(name).and_then(|n| n.output_type_hint());
+            (name.clone(), hint.map(|h| h.clone_ref(py)))
+        })
+        .collect();
+    let config = step_result.config_instance.as_ref();
+
+    *error = ops::run_async_generator(
+        py,
+        &step_result.result,
+        &selected_outputs,
+        context.as_ref(),
+        locals,
+        &mut |py, item| outputs.record(py, item, context.as_ref(), config),
+    )
+    .err();
+}
+
 struct StepDispatch {
     shared: Arc<SharedStepContext>,
     step: ExecutionStep,
@@ -146,6 +194,7 @@ struct StepDispatch {
     semaphore: Option<Arc<Semaphore>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
     events_tx: mpsc::UnboundedSender<WriterMsg>,
+    outputs: OutputSender,
     /// Step name reported on the `StepSlotWaiting` events emitted by the pool
     /// guard. Single-step name for `schedule_batch`; instance name for
     /// mapped fan-out.
@@ -167,6 +216,7 @@ struct AsyncStepWorker {
     action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
+    outputs: OutputSender,
 }
 
 impl AsyncWorker for AsyncStepWorker {
@@ -179,6 +229,7 @@ impl AsyncWorker for AsyncStepWorker {
                 &self.action_key,
                 &self.input_overrides,
                 self.locals.as_ref(),
+                &self.outputs,
             )
         })
         .unwrap_or_else(python_not_attached_outcome)
@@ -200,6 +251,7 @@ async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
         semaphore,
         locals,
         events_tx,
+        outputs,
         pool_step_name,
         start_event_names,
         retry,
@@ -228,6 +280,7 @@ async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
             action_key,
             input_overrides,
             locals,
+            outputs,
         },
     )
     .await
@@ -264,6 +317,7 @@ impl ExecutorBackend for AsyncBackend {
         let shared = Arc::new(SharedStepContext::clone_from(py, ctx));
         let bridge_locals = ctx.repo.bridge.map(|b| b.task_locals.clone());
         let events_tx = ctx.event_sender();
+        let (outputs_tx, outputs_rx) = mpsc::unbounded_channel();
 
         let dispatches: Vec<(usize, String, Vec<String>, StepDispatch)> = instances
             .into_iter()
@@ -295,6 +349,10 @@ impl ExecutorBackend for AsyncBackend {
                         semaphore: semaphore.clone(),
                         locals: bridge_locals.clone(),
                         events_tx: events_tx.clone(),
+                        outputs: OutputSender {
+                            idx: inst.idx,
+                            tx: outputs_tx.clone(),
+                        },
                         pool_step_name,
                         start_event_names,
                         retry,
@@ -322,6 +380,6 @@ impl ExecutorBackend for AsyncBackend {
             );
         }
         let bridge = ctx.repo.bridge;
-        process_finished_steps(py, ctx, tasks, bridge, failures);
+        process_finished_steps(py, ctx, tasks, bridge, Some(outputs_rx), failures);
     }
 }

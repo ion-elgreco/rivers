@@ -326,31 +326,9 @@ pub(crate) fn execute_step(
             if is_gen || is_async_gen {
                 let generator = func.call1(py, args_tuple)?;
                 let kind = if is_async_gen {
-                    let locals = task_locals.ok_or_else(|| {
-                        ExecutionError::new_err(format!(
-                            "Async node '{}' requires TaskLocals — this is an internal error",
-                            step.name
-                        ))
-                    })?;
-                    let selected_outputs: Vec<(String, Option<Py<PyAny>>)> = step
-                        .outputs
-                        .iter()
-                        .map(|name| {
-                            let hint = node_map.get(name).and_then(|n| n.output_type_hint());
-                            (name.clone(), hint.map(|h| h.clone_ref(py)))
-                        })
-                        .collect();
-                    let (outputs, error) = super::run_async_generator(
-                        py,
-                        &generator,
-                        &selected_outputs,
-                        built.ctx_ref.as_ref(),
-                        locals,
-                    );
                     super::GeneratorType::Async {
                         context: built.ctx_ref,
-                        outputs,
-                        error,
+                        error: None,
                     }
                 } else {
                     super::GeneratorType::Sync {

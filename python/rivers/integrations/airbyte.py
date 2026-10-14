@@ -13,9 +13,27 @@ Example::
     # One API call when the code location loads.
     postgres = airbyte.get_connection("9924bcd0-99be-453d-ba47-c2c9766f7da5")
 
-    repo = rs.CodeRepository(assets=[airbyte.connection_asset(postgres)])
+    repo = rs.CodeRepository(
+        assets=[airbyte.connection_asset(postgres)],
+        resources={"airbyte": airbyte},
+    )
+
+A run uses the resource registered under ``"airbyte"``, so the run's config
+can override its fields.
+
+Each output has the name of its destination table, e.g. ``pg_users``. To
+change other fields, return :meth:`AirbyteConnection.output_def` from
+``asset_def_fn``::
+
+    airbyte.connection_asset(
+        postgres,
+        asset_def_fn=lambda connection, stream: connection.output_def(
+            stream, kinds=["airbyte", "snowflake"]
+        ),
+    )
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -23,7 +41,8 @@ import re
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable
+from dataclasses import dataclass, field
 from http.client import HTTPException
 from typing import Any, Self, TypeVar
 
@@ -42,6 +61,7 @@ from pydantic_settings import SettingsConfigDict
 
 from rivers._core import Materialization, MetadataValue
 from rivers._core.assets import Asset, AssetDef, AssetExecutionContext, MultiAsset
+from rivers.integrations._resource_key import with_resource_key
 from rivers.resource import Resource
 
 __all__ = [
@@ -104,6 +124,25 @@ class AirbyteConnection(_ApiModel):
     streams: list[AirbyteStream] = Field(
         default=[], validation_alias=AliasPath("configurations", "streams")
     )
+
+    def output_def(self, stream: AirbyteStream, **fields: Any) -> AssetDef:
+        """The default output of ``stream``, with ``fields`` set or replaced.
+
+        Defaults: ``name`` is :attr:`prefix` and the stream name, the name of
+        the destination table, e.g. ``"pg_users"``. The output sets no
+        ``kinds``, so it gets the kinds of
+        :meth:`AirbyteResource.connection_asset`, ``["airbyte"]`` by default.
+        Other keyword arguments go to :class:`~rivers.AssetDef`, e.g.
+        ``group="raw"`` or ``kinds=["airbyte", "snowflake"]``.
+
+        Args:
+            stream: One of the connection's streams.
+
+        Returns:
+            The output definition.
+        """
+        defaults: dict[str, Any] = {"name": f"{self.prefix or ''}{stream.name}"}
+        return AssetDef(**(defaults | fields))
 
 
 class AirbyteJob(_ApiModel):
@@ -246,44 +285,21 @@ class AirbyteResource(Resource):
                 ``poll_timeout`` passed.
         """
         log = log or _log
-        job = self._job(
-            "POST", "jobs", {"connectionId": connection_id, "jobType": "sync"}
-        )
-        log.info("Airbyte job %d started for connection %s", job.job_id, connection_id)
+        job = self._start(connection_id, log)
+        return _result(connection_id, self._wait(job, log), log)
 
-        started = time.monotonic()
-        try:
-            while job.status in _RUNNING:
-                if (
-                    self.poll_timeout is not None
-                    and time.monotonic() - started > self.poll_timeout
-                ):
-                    raise AirbyteError(
-                        f"Airbyte job {job.job_id} did not finish "
-                        f"within {self.poll_timeout} s"
-                    )
-                time.sleep(self.poll_interval)
-                previous = job.status
-                job = self._job("GET", f"jobs/{job.job_id}")
-                if job.status != previous:
-                    log.info("Airbyte job %d: %s", job.job_id, job.status)
-        except BaseException:
-            if self.cancel_on_interrupt and job.status in _RUNNING:
-                self._cancel(job.job_id, log)
-            raise
+    async def async_sync(
+        self, connection_id: str, *, log: logging.Logger | None = None
+    ) -> AirbyteJob:
+        """Start a sync job of a connection and wait until it finishes, without
+        blocking the event loop.
 
-        if job.status != "succeeded":
-            raise AirbyteError(
-                f"Airbyte job {job.job_id} of connection {connection_id} "
-                f"ended with status {job.status!r}"
-            )
-        log.info(
-            "Airbyte job %d committed %s records, %s bytes",
-            job.job_id,
-            job.rows_synced,
-            job.bytes_synced,
-        )
-        return job
+        Takes the arguments of :meth:`sync`, and returns and raises as it
+        does. A cancellation of the task, e.g. on Ctrl-C, stops the wait.
+        """
+        log = log or _log
+        job = await asyncio.to_thread(self._start, connection_id, log)
+        return _result(connection_id, await self._async_wait(job, log), log)
 
     def connection_asset(
         self,
@@ -292,23 +308,37 @@ class AirbyteResource(Resource):
         name: str | None = None,
         asset_def_fn: Callable[[AirbyteConnection, AirbyteStream], AssetDef]
         | None = None,
+        resource_key: str = "airbyte",
         **asset_options: Any,
     ) -> MultiAsset:
         """A multi-asset that syncs a connection, with one output per enabled stream.
 
         A run starts one sync job for the whole connection and waits for it
-        (see :meth:`sync`). Then each selected output records a
+        (see :meth:`async_sync`). Then each selected output records a
         materialization with the job id and the stream's committed records
         and bytes. A selected output whose stream the connection no longer
         syncs fails with :class:`AirbyteError`.
+
+        A run uses the ``AirbyteResource`` registered under ``resource_key``,
+        not the instance that this method is called on, so the run's config
+        can override the resource's fields. Without that resource, the code
+        location fails to load with ``unresolved input`` and the key, e.g.
+        ``unresolved input 'airbyte'``.
+
+        The asset's function is async, so the step waits for the job without
+        holding a worker of the executor.
 
         Args:
             connection: From :meth:`get_connection`, or built by hand.
             name: Asset name. Defaults to ``"airbyte_"`` and the connection
                 name in snake case.
-            asset_def_fn: Builds the output of a stream. The default names it
-                like the destination table: the connection's prefix and the
-                stream name.
+            asset_def_fn: Builds the output of a stream. Defaults to
+                :meth:`AirbyteConnection.output_def`, which names it like the
+                destination table: the connection's prefix and the stream
+                name. Return ``connection.output_def(stream, ...)`` to keep
+                that name and set other fields.
+            resource_key: The key of the resource in
+                ``CodeRepository(resources={...})``.
             **asset_options: Passed to ``Asset.from_multi``, e.g. ``group``,
                 ``hooks``, ``automation_condition``, or ``retry``. ``kinds``
                 defaults to ``["airbyte"]``.
@@ -320,7 +350,7 @@ class AirbyteResource(Resource):
             ValueError: The connection has no enabled streams, or two streams
                 have the same output name.
         """
-        make_def = asset_def_fn or _table_asset_def
+        make_def = asset_def_fn or AirbyteConnection.output_def
         streams: dict[str | None, AirbyteStream] = {}
         output_defs = []
         for stream in connection.streams:
@@ -339,27 +369,34 @@ class AirbyteResource(Resource):
                 f"Airbyte connection {connection.name!r} has no enabled streams"
             )
 
-        def sync_streams(context: AssetExecutionContext) -> Iterator[Materialization]:
-            yield from self._materialize(connection.connection_id, streams, context)
+        async def sync_streams(
+            context: AssetExecutionContext, airbyte: AirbyteResource
+        ) -> AsyncIterator[Materialization]:
+            async for materialization in airbyte._materialize(
+                connection.connection_id, streams, context
+            ):
+                yield materialization
 
         asset_options.setdefault("kinds", ["airbyte"])
         return Asset.from_multi(
-            sync_streams,
+            with_resource_key(sync_streams, resource_key),
             output_defs=output_defs,
             name=name or _asset_name(connection.name),
             **asset_options,
         )
 
-    def _materialize(
+    async def _materialize(
         self,
         connection_id: str,
         streams: dict[str | None, AirbyteStream],
         context: AssetExecutionContext,
-    ) -> Iterator[Materialization]:
-        enabled = self._enabled_streams(connection_id, streams.values(), context.log)
+    ) -> AsyncIterator[Materialization]:
+        enabled = await asyncio.to_thread(
+            self._enabled_streams, connection_id, streams.values(), context.log
+        )
 
-        job = self.sync(connection_id, log=context.log)
-        stats = self._stream_stats(job.job_id, context.log)
+        job = await self.async_sync(connection_id, log=context.log)
+        stats = await asyncio.to_thread(self._stream_stats, job.job_id, context.log)
 
         gone = []
         for output_name in context.output_selection:
@@ -426,6 +463,40 @@ class AirbyteResource(Resource):
             (s.stream_namespace, s.stream_name): s
             for s in stats.stream_aggregated_stats
         }
+
+    def _start(self, connection_id: str, log: logging.Logger) -> AirbyteJob:
+        job = self._job(
+            "POST", "jobs", {"connectionId": connection_id, "jobType": "sync"}
+        )
+        log.info("Airbyte job %d started for connection %s", job.job_id, connection_id)
+        return job
+
+    def _wait(self, job: AirbyteJob, log: logging.Logger) -> AirbyteJob:
+        """Poll ``job`` until it finishes."""
+        progress = _Progress(job.status, self.poll_timeout, log)
+        try:
+            while progress.running(job):
+                time.sleep(self.poll_interval)
+                job = self._job("GET", f"jobs/{job.job_id}")
+            return job
+        except BaseException:
+            if self.cancel_on_interrupt and job.status in _RUNNING:
+                self._cancel(job.job_id, log)
+            raise
+
+    async def _async_wait(self, job: AirbyteJob, log: logging.Logger) -> AirbyteJob:
+        """Poll ``job`` until it finishes, without blocking the event loop."""
+        progress = _Progress(job.status, self.poll_timeout, log)
+        try:
+            while progress.running(job):
+                await asyncio.sleep(self.poll_interval)
+                job = await asyncio.to_thread(self._job, "GET", f"jobs/{job.job_id}")
+            return job
+        except BaseException:
+            if self.cancel_on_interrupt and job.status in _RUNNING:
+                # Not awaited, so a second cancellation cannot stop it.
+                self._cancel(job.job_id, log)
+            raise
 
     def _job(
         self, method: str, path: str, body: dict[str, Any] | None = None
@@ -523,6 +594,51 @@ class AirbyteResource(Resource):
         return {}
 
 
+@dataclass
+class _Progress:
+    """Logs each new status of a job, and ends the wait for it after
+    ``timeout`` seconds.
+
+    ``last`` is the job's last status: at first, its status when the wait
+    starts.
+    """
+
+    last: str
+    timeout: float | None
+    log: logging.Logger
+    started: float = field(default_factory=time.monotonic)
+
+    def running(self, job: AirbyteJob) -> bool:
+        if job.status != self.last:
+            self.log.info("Airbyte job %d: %s", job.job_id, job.status)
+            self.last = job.status
+
+        if job.status not in _RUNNING:
+            return False
+        if self.timeout is not None and time.monotonic() - self.started > self.timeout:
+            raise AirbyteError(
+                f"Airbyte job {job.job_id} did not finish within {self.timeout} s"
+            )
+        return True
+
+
+def _result(connection_id: str, job: AirbyteJob, log: logging.Logger) -> AirbyteJob:
+    """The finished ``job``; raises unless it succeeded."""
+    if job.status != "succeeded":
+        raise AirbyteError(
+            f"Airbyte job {job.job_id} of connection {connection_id} "
+            f"ended with status {job.status!r}"
+        )
+
+    log.info(
+        "Airbyte job %d committed %s records, %s bytes",
+        job.job_id,
+        job.rows_synced,
+        job.bytes_synced,
+    )
+    return job
+
+
 def _join(base: str, path: str) -> str:
     return f"{base.rstrip('/')}/{path}"
 
@@ -544,10 +660,6 @@ def _key(stream: AirbyteStream) -> tuple[str | None, str]:
 
 def _label(stream: AirbyteStream) -> str:
     return f"{stream.namespace}.{stream.name}" if stream.namespace else stream.name
-
-
-def _table_asset_def(connection: AirbyteConnection, stream: AirbyteStream) -> AssetDef:
-    return AssetDef(f"{connection.prefix or ''}{stream.name}")
 
 
 def _asset_name(connection_name: str) -> str:

@@ -225,6 +225,21 @@ def test_dagster_databricks_maps_to_databricks_resource():
 
     assert daily_sales.is_single and daily_sales.kinds == ["databricks"]
     assert [d.name for d in sales.output_defs] == ["orders", "refunds"]
+
+    # Like Dagster's run-now op, the asset takes the resource registered under
+    # "databricks"; the op's `databricks_resource_key` becomes `resource_key`.
+    rs.CodeRepository(
+        assets=[daily_sales, sales], resources={"databricks": databricks}
+    ).validate()
+    with pytest.raises(
+        rs.exceptions.GraphValidationError, match="unresolved input 'databricks'"
+    ):
+        rs.CodeRepository(assets=[daily_sales]).validate()
+    workspace = databricks.job_asset(789, name="nightly", resource_key="workspace")
+    rs.CodeRepository(
+        assets=[workspace], resources={"workspace": databricks}
+    ).validate()
+
     assert databricks.poll_timeout is None
     assert callable(databricks.run_job) and callable(databricks.submit_run)
     assert issubclass(DatabricksRunError, Exception)
@@ -291,11 +306,28 @@ def test_dagster_airbyte_maps_to_airbyte_resource():
         ("pg_orders", "raw"),
     ]
 
-    renamed = airbyte.connection_asset(
+    # Like the body's `airbyte` parameter, the asset takes the resource
+    # registered under "airbyte"; another parameter name becomes `resource_key`.
+    rs.CodeRepository(assets=[assets], resources={"airbyte": airbyte}).validate()
+    with pytest.raises(
+        rs.exceptions.GraphValidationError, match="unresolved input 'airbyte'"
+    ):
+        rs.CodeRepository(assets=[assets]).validate()
+    workspace = airbyte.connection_asset(connection, resource_key="workspace")
+    rs.CodeRepository(assets=[workspace], resources={"workspace": airbyte}).validate()
+
+    # `get_asset_spec` becomes `connection.output_def(stream, ...)`, which keeps
+    # the default name.
+    custom = airbyte.connection_asset(
         connection,
-        asset_def_fn=lambda connection, stream: rs.AssetDef(f"raw_{stream.name}"),
+        asset_def_fn=lambda connection, stream: connection.output_def(
+            stream, kinds=["airbyte", "snowflake"]
+        ),
     )
-    assert [d.name for d in renamed.output_defs] == ["raw_users", "raw_orders"]
+    assert [(d.name, d.kinds) for d in custom.output_defs] == [
+        ("pg_users", ["airbyte", "snowflake"]),
+        ("pg_orders", ["airbyte", "snowflake"]),
+    ]
     assert callable(airbyte.sync) and callable(airbyte.get_connection)
 
     with pytest.raises(ValidationError):
@@ -413,6 +445,90 @@ def test_dagster_dlt_maps_to_dlt_integration(tmp_path):
     assert output.pool == [("github", 1)]
     # No default upstream deps: Dagster's `github_issues` source key would not resolve.
     rs.CodeRepository(assets=[github_assets]).validate()
+
+
+def test_dagster_dbt_maps_to_dbt_integration(tmp_path):
+    pytest.importorskip("dbt.version")
+    import inspect
+
+    from rivers.integrations.dbt import (
+        DbtInvocation,
+        DbtNode,
+        DbtProject,
+        DbtResource,
+    )
+
+    assets = inspect.signature(DbtProject.assets).parameters
+    assert {"select", "exclude", "selector"} <= set(assets)
+    # `dagster_dbt_translator=` becomes the project's `asset_def_fn` and `source_asset_fn`.
+    assert {"asset_def_fn", "source_asset_fn"} <= set(DbtProject.model_fields)
+    assert callable(DbtProject.prepare)
+    assert {"project_dir", "profiles_dir", "profile", "target"} <= set(
+        DbtResource.model_fields
+    )
+    # Like DbtCliResource, the resource takes the project's settings it is not given.
+    (tmp_path / "dbt_project.yml").write_text("name: shop\n")
+    project = DbtProject(tmp_path, profiles_dir=tmp_path, profile="shop", target="prod")
+    resource = DbtResource(project_dir=project, target="dev")
+    assert (resource.project_dir, resource.profiles_dir) == (tmp_path, tmp_path)
+    assert (resource.profile, resource.target) == ("shop", "dev")
+    assert list(inspect.signature(DbtResource.cli).parameters)[:3] == [
+        "self",
+        "args",
+        "context",
+    ]
+    assert callable(DbtInvocation.wait)
+    # Dagster's `state_path`, `packaged_project_dir`, and `prepare_project_cli_args`
+    # have no counterpart.
+    for field in ("state_path", "packaged_project_dir", "prepare_project_cli_args"):
+        with pytest.raises(ValueError, match=field):
+            DbtProject(tmp_path, **{field: tmp_path})
+
+    # `get_asset_spec` and the per-attribute methods become `node.output_def(...)`.
+    model = DbtNode(
+        unique_id="model.shop.orders",
+        name="orders",
+        resource_type="model",
+        props={
+            "tags": ["daily"],
+            "group": "sales",
+            "description": "One row per order.",
+            "checksum": {"name": "sha256", "checksum": "abc"},
+        },
+    )
+    default = model.output_def()
+    assert (default.name, default.group, default.tags, default.code_version) == (
+        "orders",
+        "sales",
+        ["daily"],
+        "abc",
+    )
+    # No description field: `get_description` maps to the `dbt/description` metadata.
+    assert default.metadata["dbt/description"] == "One row per order."
+    assert default.deps == []
+    output = model.output_def(
+        name="sales_orders",
+        group="marts",
+        tags=["finance"],
+        metadata={"owner": "sales"},
+        code_version="v2",
+        partition_mapping={"stg_orders": rs.PartitionMapping.all_partitions()},
+    )
+    assert (output.name, output.group, output.tags, output.code_version) == (
+        "sales_orders",
+        "marts",
+        ["finance"],
+        "v2",
+    )
+    assert output.metadata == {"owner": "sales"}
+    assert set(output.partition_mapping) == {"stg_orders"}
+    # The default name is the model name, with `_v<version>` for a versioned model.
+    versioned = model.model_copy(update={"props": {"version": 2}})
+    assert versioned.asset_name == "orders_v2"
+    # A source's asset key becomes `source_asset_fn`; `get_owners` has no counterpart.
+    DbtProject(tmp_path, source_asset_fn=lambda source: f"raw_{source.name}")
+    assert not hasattr(rs.AssetDef, "owners")
+    assert not hasattr(rs.AssetDef, "automation_condition")
 
 
 def test_automation_condition_has_no_allow_or_ignore():

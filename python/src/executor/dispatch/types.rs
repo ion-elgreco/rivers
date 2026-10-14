@@ -2,6 +2,9 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
+use tokio::sync::mpsc;
+
+use crate::errors::ExecutionError;
 
 use super::super::ops;
 
@@ -45,7 +48,8 @@ pub(crate) struct StepInstance {
 pub(crate) type CapturedLogs = Option<(String, String, String)>;
 
 /// What a step body writes while it runs in this process: stdout and stderr
-/// through `rivers._capture`, and this thread's Rust logs.
+/// through `rivers._capture`, and the Rust logs of this thread and of the
+/// step's context.
 pub(crate) struct StepCapture<'py>(Option<Bound<'py, PyAny>>);
 
 impl<'py> StepCapture<'py> {
@@ -56,8 +60,7 @@ impl<'py> StepCapture<'py> {
             .and_then(|cls| cls.call0())
             .ok()
             .inspect(|c| {
-                let _ = c.call_method0("start");
-                crate::log_capture::start();
+                let _ = c.call_method1("start", (crate::log_capture::start(),));
             });
         Self(capture)
     }
@@ -102,4 +105,48 @@ pub(crate) enum WorkOutcome {
     /// The run was cancelled before the step started. Nothing ran, so nothing
     /// is recorded.
     Cancelled,
+}
+
+/// An output that an async generator step yielded, sent by the step's worker
+/// to the orchestrator thread, which records it and sends back the result.
+pub(crate) struct YieldedOutput {
+    /// The step's index in the plan.
+    pub idx: usize,
+    pub item: ops::OutputItem,
+    /// The step's context and config, which its outputs are recorded with.
+    pub context: Option<Py<PyAny>>,
+    pub config: Option<Py<PyAny>>,
+    pub recorded: std::sync::mpsc::Sender<PyResult<()>>,
+}
+
+/// The worker's end of the channel that an async generator step sends its
+/// outputs on.
+pub(crate) struct OutputSender {
+    pub idx: usize,
+    pub tx: mpsc::UnboundedSender<YieldedOutput>,
+}
+
+impl OutputSender {
+    /// Have the orchestrator thread record `item`, and wait until it has: the
+    /// step's body goes on after its output is recorded, as a sync body does.
+    pub(crate) fn record(
+        &self,
+        py: Python,
+        item: ops::OutputItem,
+        context: Option<&Py<PyAny>>,
+        config: Option<&Py<PyAny>>,
+    ) -> PyResult<()> {
+        let stopped = || ExecutionError::new_err("the run stopped before it recorded the output");
+        let (recorded, result) = std::sync::mpsc::channel();
+        let output = YieldedOutput {
+            idx: self.idx,
+            item,
+            context: context.map(|c| c.clone_ref(py)),
+            config: config.map(|c| c.clone_ref(py)),
+            recorded,
+        };
+        self.tx.send(output).map_err(|_| stopped())?;
+        py.detach(move || result.recv())
+            .unwrap_or_else(|_| Err(stopped()))
+    }
 }

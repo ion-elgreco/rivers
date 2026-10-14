@@ -42,7 +42,7 @@ def shop(region: str = "eu", broken: str = ""):
             {"id": 2, "name": "bob", "pid": pid, "tags": ["new"]},
         ]
 
-    @dlt.resource(table_name="order_rows")
+    @dlt.resource(table_name="orderRows")
     def orders():
         if broken == "orders":
             raise ValueError("orders API is down")
@@ -119,13 +119,22 @@ class ShopApi(rs.Resource):
 
 SHOP = DltSourceAssets(shop())
 
-SHOP_TABLES = DltSourceAssets(
-    shop(),
-    asset_def_fn=lambda resource: output_def(
+SHOP_TABLES_SOURCE = shop()
+
+
+def shop_tables_def(resource) -> rs.AssetDef:
+    """The dlt guide's ``asset_def`` for ``DuckDBIOHandler``, with this module's dataset."""
+    metadata = output_def(resource).metadata
+    table = SHOP_TABLES_SOURCE.schema.naming.normalize_table_identifier(
+        metadata["dlt/table"]
+    )
+    return output_def(
         resource,
-        metadata={"duckdb/schema": "shop_data", "duckdb/table": resource.table_name},
-    ),
-)
+        metadata=metadata | {"duckdb/schema": "shop_data", "duckdb/table": table},
+    )
+
+
+SHOP_TABLES = DltSourceAssets(SHOP_TABLES_SOURCE, asset_def_fn=shop_tables_def)
 
 FEED = DltSourceAssets(feed())
 
@@ -239,7 +248,7 @@ def test_one_output_per_selected_resource():
             ["dlt"],
             {"dlt/resource": "customers", "dlt/table": "customers"},
         ),
-        ("shop_orders", ["dlt"], {"dlt/resource": "orders", "dlt/table": "order_rows"}),
+        ("shop_orders", ["dlt"], {"dlt/resource": "orders", "dlt/table": "orderRows"}),
         ("shop_notes", ["dlt"], {"dlt/resource": "notes", "dlt/table": "notes"}),
     ]
     assert {output: r.name for output, r in SHOP.resources.items()} == {
@@ -581,13 +590,48 @@ def test_downstream_reads_the_table_with_an_io_handler(tmp_path, storage, execut
     )(load_shop_tables)
 
     @rs.Asset(io_handler=executor_env[1]())
-    def big_orders(shop_orders: pa.Table) -> list[int]:
-        return [row["id"] for row in shop_orders.to_pylist() if row["amount"] > 6]
+    def loaded(shop_customers: pa.Table, shop_orders: pa.Table) -> dict:
+        customers = shop_customers.select(["id", "name"]).sort_by("id")
+        orders = shop_orders.select(["id", "customer_id", "amount"]).sort_by("id")
+        return {
+            "customer_columns": shop_customers.column_names,
+            "customers": customers.to_pylist(),
+            "orders": orders.to_pylist(),
+        }
 
-    repo = _repo(tmp_path, storage, assets, big_orders, executor=executor_env[0])
+    assert {output.name: output.metadata for output in SHOP_TABLES.output_defs} == {
+        "shop_customers": {
+            "dlt/resource": "customers",
+            "dlt/table": "customers",
+            "duckdb/schema": "shop_data",
+            "duckdb/table": "customers",
+        },
+        "shop_orders": {
+            "dlt/resource": "orders",
+            "dlt/table": "orderRows",
+            "duckdb/schema": "shop_data",
+            "duckdb/table": "order_rows",
+        },
+        "shop_notes": {
+            "dlt/resource": "notes",
+            "dlt/table": "notes",
+            "duckdb/schema": "shop_data",
+            "duckdb/table": "notes",
+        },
+    }
+
+    repo = _repo(tmp_path, storage, assets, loaded, executor=executor_env[0])
 
     assert repo.materialize().success
-    assert repo.load_node("big_orders") == [11]
+    # the root table: dlt loads the `tags` lists into shop_data.customers__tags
+    assert repo.load_node("loaded") == {
+        "customer_columns": ["id", "name", "pid", "_dlt_load_id", "_dlt_id"],
+        "customers": [{"id": 1, "name": "ann"}, {"id": 2, "name": "bob"}],
+        "orders": [
+            {"id": 10, "customer_id": 1, "amount": 5.5},
+            {"id": 11, "customer_id": 2, "amount": 7.25},
+        ],
+    }
 
 
 def test_source_assets_errors():

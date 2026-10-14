@@ -78,33 +78,6 @@ pub(crate) enum OutputItem {
     },
 }
 
-impl OutputItem {
-    fn clone_ref(&self, py: Python) -> Self {
-        match self {
-            Self::Materialization {
-                name,
-                value,
-                metadata,
-                data_version,
-            } => Self::Materialization {
-                name: name.clone(),
-                value: value.as_ref().map(|v| v.clone_ref(py)),
-                metadata: metadata.clone(),
-                data_version: data_version.clone(),
-            },
-            Self::Observation {
-                name,
-                metadata,
-                data_version,
-            } => Self::Observation {
-                name: name.clone(),
-                metadata: metadata.clone(),
-                data_version: data_version.clone(),
-            },
-        }
-    }
-}
-
 /// Build an `OutputItem` from the discriminator. The mapping is the same in
 /// every iterator (`for_each_output_*`); centralising it keeps the three
 /// sites in lock-step when a new variant is added.
@@ -216,24 +189,27 @@ where
             };
             for_each_yield(py, selected_outputs, context.as_ref(), next, on_item)
         }
-        super::GeneratorType::Async { outputs, error, .. } => {
-            for item in outputs {
-                on_item(py, item.clone_ref(py))?;
-            }
+        // Recorded as its worker ran the body.
+        super::GeneratorType::Async { error, .. } => {
             error.as_ref().map_or(Ok(()), |e| Err(e.clone_ref(py)))
         }
     }
 }
 
-/// Run an async generator to its end on this thread, the step's worker: the
-/// outputs it yielded, then the error it raised.
-pub(crate) fn run_async_generator(
+/// Run an async generator to its end on this thread, the step's worker,
+/// calling `on_item` for each output as the body yields it. The body goes on
+/// only when `on_item` returns `Ok`.
+pub(crate) fn run_async_generator<F>(
     py: Python,
     generator: &Py<PyAny>,
     selected_outputs: &[(String, Option<Py<PyAny>>)],
     context: Option<&Py<PyAny>>,
     locals: &TaskLocals,
-) -> (Vec<OutputItem>, Option<PyErr>) {
+    on_item: &mut F,
+) -> PyResult<()>
+where
+    F: FnMut(Python, OutputItem) -> PyResult<()>,
+{
     let next = |py: Python| {
         let anext = generator.call_method0(py, "__anext__")?;
         let future = pyo3_async_runtimes::into_future_with_locals(locals, anext.into_bound(py))?;
@@ -243,13 +219,7 @@ pub(crate) fn run_async_generator(
             Err(e) => Err(e),
         }
     };
-    let mut outputs = Vec::new();
-    let error = for_each_yield(py, selected_outputs, context, next, &mut |_, item| {
-        outputs.push(item);
-        Ok(())
-    })
-    .err();
-    (outputs, error)
+    for_each_yield(py, selected_outputs, context, next, on_item)
 }
 
 /// One item per selected output a generator yields, as `next` returns them.

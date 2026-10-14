@@ -27,11 +27,11 @@ pub(crate) type StorageHandle<'a> = &'a ScopedStorageHandle<SurrealStorage>;
 pub(crate) enum GeneratorType {
     /// Run with `__next__` as the orchestrator handles its outputs.
     Sync { context: Option<Py<PyAny>> },
-    /// Already run to its end by the step's worker, so that async steps run
-    /// at the same time: the outputs it yielded, then the error it raised.
+    /// Run by the step's worker, so that async steps run at the same time.
+    /// The orchestrator records each output as the body yields it; `error`
+    /// is the error the body raised.
     Async {
         context: Option<Py<PyAny>>,
-        outputs: Vec<OutputItem>,
         error: Option<PyErr>,
     },
 }

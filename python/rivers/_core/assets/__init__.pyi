@@ -420,6 +420,8 @@ class AssetDef:
         """
         ...
 
+    @deps.setter
+    def deps(self, value: list["DepDef"]) -> None: ...
     @staticmethod
     def input(
         name: str,

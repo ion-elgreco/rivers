@@ -4,7 +4,10 @@ version = "0.0.0"
 requires-python = ">=3.11"
 
 [tool.uv]
-default-groups = ["dev", "grpc"]
+default-groups = ["dev", "grpc", "dbt"]
+# grpcio-tools 1.82+ needs protobuf 7, and dbt-adapters caps it below 7. dbt
+# runs on protobuf 7, so the workspace lifts dbt's cap.
+override-dependencies = ["protobuf>=7.35.1,<8"]
 
 [tool.uv.workspace]
 members = [
@@ -35,4 +38,9 @@ dev = [
 grpc = [
     "grpcio>=1.82.1",
     "grpcio-tools>=1.82.1",
+]
+# dbt adapter for the dbt integration tests. Its dependencies have no
+# free-threaded (3.14t) wheels, so `just venv-ft` leaves this group out.
+dbt = [
+    "dbt-duckdb>=1.11.0",
 ]

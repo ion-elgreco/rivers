@@ -18,6 +18,10 @@ from typer.testing import CliRunner
 from rivers.cli import app
 from rivers.cli.backfill import _format_backfill_status
 
+# A test runs `_rivers` up to three times.
+_CLI_TIMEOUT_S = 120
+pytestmark = pytest.mark.timeout(3 * _CLI_TIMEOUT_S)
+
 runner = CliRunner()
 
 ACTION_MODULE = """
@@ -292,16 +296,17 @@ def _backfill_id(stdout):
 
 
 def _rivers(cwd, *args, env=None):
-    # A process of its own: the CLI decides the store's fate at exit. The
-    # timeout fails the test, with the CLI's log, before pytest's 60 s
-    # timeout ends the whole worker.
+    # A process of its own: the CLI decides the store's fate at exit. A new
+    # `--storage-path` store syncs each migration commit to disk, which took
+    # 38 s on a busy Windows runner. The timeout fails the test, with the
+    # CLI's log, before the module's pytest timeout ends the whole worker.
     try:
         return subprocess.run(
             [sys.executable, "-c", "from rivers.cli import main; main()", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=40,
+            timeout=_CLI_TIMEOUT_S,
             env=None if env is None else {**os.environ, **env},
         )
     except subprocess.TimeoutExpired as e:
@@ -311,7 +316,8 @@ def _rivers(cwd, *args, env=None):
             else e.stderr
         )
         pytest.fail(
-            f"`rivers {' '.join(args)}` did not exit in 40 s. Its stderr:\n{stderr}"
+            f"`rivers {' '.join(args)}` did not exit in {_CLI_TIMEOUT_S} s. "
+            f"Its stderr:\n{stderr}"
         )
 
 

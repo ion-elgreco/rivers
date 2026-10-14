@@ -34,12 +34,19 @@ hidden from `repr()` and from the UI's launch dialog.
 
 ### Methods
 
-#### `job_asset(job_id, *, name, tasks=None, job_parameters=None, **asset_options)`
+#### `job_asset(job_id, *, name, tasks=None, job_parameters=None, resource_key="databricks", **asset_options)`
 
 Returns an asset that runs job `job_id` of the workspace. The asset's function is
 async, so its step waits for the run without holding a worker of the executor. The job
 is not read when the asset is made: a wrong job id or task key fails when the asset
 runs.
+
+```python
+repo = rs.CodeRepository(
+    assets=[databricks.job_asset(123, name="daily_sales")],
+    resources={"databricks": databricks},
+)
+```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -47,9 +54,16 @@ runs.
 | `name` | `str` | required | Asset name. |
 | `tasks` | `list[str] \| dict[str, AssetDef] \| None` | `None` | Keys of the tasks that get an output, named like the task. Map a task key to an `AssetDef` to give its output another name or settings; an `AssetDef` without a name gets the task key. |
 | `job_parameters` | `dict[str, str] \| (AssetExecutionContext) -> dict[str, str] \| None` | `None` | Values for the job's parameters, or a function that returns them from the asset's context. |
+| `resource_key` | `str` | `"databricks"` | The key of the `DatabricksResource` in `CodeRepository(resources={...})`. |
 | `**asset_options` | | | Passed to [`Asset`](assets.md) or, with `tasks`, to [`Asset.from_multi()`](assets.md#assetfrom_multi), for example `group`, `partitions_def`, or `retry`. `kinds` defaults to `["databricks"]`. |
 
 Raises `ValueError` when `tasks` is empty, or when two tasks get the same output name.
+
+A run uses the resource registered under `resource_key`, not the instance that
+`job_asset` is called on, so the run's config can
+[override the resource's fields](../concepts/resources.md#per-run-overrides). Without
+that resource, the code location fails to load with `unresolved input` and the key, for
+example `unresolved input 'databricks'`.
 
 Without `tasks`, the asset is a `SingleAsset`. A run calls `async_run_job()` and records a
 [`Materialization`](assets.md#materialization) with this metadata:
@@ -121,13 +135,16 @@ waits without blocking the event loop.
 
 #### `async_submit_run(tasks, *, log=None, **submit_args)`
 
-`submit_run` for async code, in the same way:
+`submit_run` for async code, in the same way. The asset takes the resource registered
+under `databricks`:
 
 ```python
 @rs.Asset(kinds="databricks")
-async def customers(context: rs.AssetExecutionContext) -> rs.Materialization:
+async def customers(context: rs.AssetExecutionContext, databricks: DatabricksResource) -> rs.Materialization:
     run = await databricks.async_submit_run(tasks, run_name="customers", log=context.log)
     return rs.Materialization(metadata={"databricks/run_id": run.run_id})
+
+repo = rs.CodeRepository(assets=[customers], resources={"databricks": DatabricksResource()})
 ```
 
 These methods and the job assets get the state of the run every `poll_interval`

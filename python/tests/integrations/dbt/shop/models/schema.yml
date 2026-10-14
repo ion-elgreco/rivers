@@ -1,0 +1,20 @@
+version: 2
+
+groups:
+  - name: marts
+    owner:
+      name: Data team
+
+models:
+  - name: stg_customers
+    description: One row per customer.
+    columns:
+      - name: id
+        tests: [unique, not_null]
+  - name: customers
+    description: Customers and what they paid.
+    config:
+      group: marts
+    columns:
+      - name: id
+        tests: [unique]

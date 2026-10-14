@@ -14,6 +14,7 @@ Per-output deps interact with the multi-asset's top-level ``deps=`` as follows:
 import pytest
 import rivers as rs
 from _helpers import CapturingHandler, DictIOHandler
+from rivers.exceptions import GraphValidationError
 
 
 class TestAssetDefAPI:
@@ -28,6 +29,35 @@ class TestAssetDefAPI:
     def test_deps_defaults_to_empty(self):
         ad = rs.AssetDef("out")
         assert ad.deps == []
+
+    def test_set_deps_adds_edge(self, storage):
+        """Deps set after construction work like ``deps=``. Assets without
+        an edge run in name order, so ``out`` would run before ``upstream``."""
+        handler = DictIOHandler()
+        out = rs.AssetDef("out", io_handler=handler)
+        out.deps = [rs.AssetDef.dep("upstream")]
+
+        @rs.Asset(io_handler=handler)
+        def upstream() -> int:
+            return 1
+
+        @rs.Asset.from_multi(output_defs=[out])
+        def m():
+            yield rs.Output(value=2, output_name="out")
+
+        with pytest.raises(
+            GraphValidationError, match="Asset 'out': unresolved input 'upstream'"
+        ):
+            rs.CodeRepository(assets=[m]).resolve(storage=storage)
+
+        repo = rs.CodeRepository(
+            assets=[upstream, m], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        result = repo.materialize()
+
+        assert result.success
+        assert result.materialized_assets == ["upstream", "out"]
 
 
 class TestLineageDeps:

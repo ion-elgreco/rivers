@@ -166,6 +166,7 @@ impl ExecutorBackend for ParallelBackend {
                     &submitted.instance_name,
                     &submitted.event_names,
                     outcome,
+                    None,
                     failures,
                 );
             }
@@ -538,6 +539,7 @@ impl ParallelBackend {
                     &inst.instance_name,
                     &inst.event_names,
                     outcome,
+                    None,
                     failures,
                 );
 
@@ -661,7 +663,7 @@ impl ParallelBackend {
                 rt().handle(),
             );
         }
-        process_finished_steps(py, ctx, tasks, None, failures);
+        process_finished_steps(py, ctx, tasks, None, None, failures);
     }
 }
 

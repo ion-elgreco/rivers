@@ -258,8 +258,7 @@ pub fn worker_execute_step(
         .and_then(|cls| cls.call0())
         .ok();
     if let Some(ref c) = step_capture {
-        let _ = c.call_method0("start");
-        crate::log_capture::start();
+        let _ = c.call_method1("start", (crate::log_capture::start(),));
     }
 
     let resolved_args: Vec<Py<PyAny>> = args
