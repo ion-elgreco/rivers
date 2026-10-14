@@ -27,10 +27,7 @@ from rivers._core.partitions import PartitionContext
 from rivers.io_handlers._partition_sql import PartitionExpr, _resolve_partition_expr
 from rivers.io_handlers._type_handlers import Candidate, discover, resolve
 from rivers.io_handlers.base import BaseIOHandler
-from rivers.io_handlers.iceberg._partitions import (
-    partition_filter,
-    require_partition_expr,
-)
+from rivers.io_handlers.iceberg import _partitions
 from rivers.io_handlers.iceberg.asset import ExpireSnapshotsConfig, IcebergAsset
 from rivers.io_handlers.iceberg.base import (
     ArrowIcebergTypeHandler,
@@ -193,7 +190,7 @@ class IcebergIOHandler(BaseIOHandler):
         partition_expr = _resolve_partition_expr(
             asset_metadata or {}, "iceberg/partition_expr"
         )
-        return partition_filter(partition, partition_expr, schema)
+        return _partitions.partition_filter(partition, partition_expr, schema)
 
     def resolved_snapshot_properties(
         self, asset_metadata: dict[str, str] | None
@@ -235,7 +232,7 @@ class IcebergIOHandler(BaseIOHandler):
 
         partition_expr = _resolve_partition_expr(meta, "iceberg/partition_expr")
         if context.partition is not None and mode == "overwrite":
-            require_partition_expr(partition_expr)
+            _partitions.require_partition_expr(partition_expr)
 
         upsert_config = self.upsert_config or UpsertConfig()
         if "iceberg/join_cols" in meta:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -64,15 +65,21 @@ def _col_filters(col: str, values: list[str]) -> list[Filter]:
     return [(col, "in", list(values))]
 
 
+def _window(
+    value: str, definition: PartitionsDefinition.TimeWindow
+) -> tuple[datetime, datetime] | None:
+    """The half-open time window of one time-window partition value."""
+    return PartitionContext(
+        keys=[PartitionKey.single(value)], definition=definition
+    ).time_window()
+
+
 def _dim_filters(
     col: str, vals: list[str], dim_def: PartitionsDefinition | None
 ) -> list[Filter]:
     """Filters for one dimension: a range for a single time-window value."""
     if len(vals) == 1 and isinstance(dim_def, PartitionsDefinition.TimeWindow):
-        dim_ctx = PartitionContext(
-            keys=[PartitionKey.single(vals[0])], definition=dim_def
-        )
-        tw = dim_ctx.time_window()
+        tw = _window(vals[0], dim_def)
         if tw is not None:
             return _time_window_filters(col, tw, dim_def.fmt)
     return _col_filters(col, vals)
@@ -88,25 +95,19 @@ def _render(filters: list[Filter]) -> str:
     )
 
 
-def _filters_for_key(
+def _key_dimensions(
     key: PartitionKey,
     definition: PartitionsDefinition,
     partition_expr: PartitionExpr,
-) -> list[Filter]:
-    """The conjunction of filters that selects a single partition key."""
+) -> list[tuple[str, list[str], PartitionsDefinition | None]]:
+    """``(column, values, definition)`` for each dimension of a partition key."""
     if isinstance(key, PartitionKey.Single):
         if not isinstance(partition_expr.expr, str):
             raise ValueError(
                 "partition_expr with a string column name is required "
                 "for single-key partitioned assets"
             )
-        col = partition_expr.expr
-        if isinstance(definition, PartitionsDefinition.TimeWindow):
-            ctx = PartitionContext(keys=[key], definition=definition)
-            tw = ctx.time_window()
-            if tw is not None:
-                return _time_window_filters(col, tw, definition.fmt)
-        return _col_filters(col, key.key)
+        return [(partition_expr.expr, key.key, definition)]
     elif isinstance(key, PartitionKey.Multi):
         if not isinstance(partition_expr.expr, dict):
             raise ValueError(
@@ -117,12 +118,24 @@ def _filters_for_key(
         if isinstance(definition, PartitionsDefinition.Multi):
             dim_defs = {name: defn for name, defn in definition.dimensions}
         return [
-            f
+            (partition_expr.expr[dim], vals, dim_defs.get(dim))
             for dim, vals in sorted(key.keys.items())
-            for f in _dim_filters(partition_expr.expr[dim], vals, dim_defs.get(dim))
         ]
     else:
         raise NotImplementedError(type(key))
+
+
+def _filters_for_key(
+    key: PartitionKey,
+    definition: PartitionsDefinition,
+    partition_expr: PartitionExpr,
+) -> list[Filter]:
+    """The conjunction of filters that selects a single partition key."""
+    return [
+        f
+        for col, vals, dim_def in _key_dimensions(key, definition, partition_expr)
+        for f in _dim_filters(col, vals, dim_def)
+    ]
 
 
 def _build_predicate_for_key(

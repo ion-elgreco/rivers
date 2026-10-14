@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
-from functools import reduce
 
 import pyarrow as pa
 from pyiceberg.expressions import (
+    AlwaysTrue,
     And,
     BooleanExpression,
-    EqualTo,
     GreaterThanOrEqual,
     In,
     LessThan,
@@ -27,14 +26,8 @@ from pyiceberg.transforms import (
 )
 from pyiceberg.types import DateType, TimestampType, TimestamptzType
 
-from rivers._core.partitions import PartitionContext, PartitionKey, PartitionsDefinition
-from rivers.io_handlers._partition_sql import (
-    Filter,
-    PartitionExpr,
-    _build_partition_filters,
-)
-
-_COMPARISONS = {"=": EqualTo, ">=": GreaterThanOrEqual, "<": LessThan}
+from rivers._core.partitions import PartitionContext, PartitionsDefinition
+from rivers.io_handlers._partition_sql import PartitionExpr, _key_dimensions, _window
 
 # Coarsest first. Each truncates a datetime to the start of its unit.
 _TIME_TRANSFORMS: list[tuple[Transform, Callable[[datetime], datetime]]] = [
@@ -62,9 +55,11 @@ def require_partition_expr(partition_expr: PartitionExpr | None) -> PartitionExp
 
 
 def partition_filter(
-    partition: PartitionContext, partition_expr: PartitionExpr | None, schema: Schema
+    partition: PartitionContext | None,
+    partition_expr: PartitionExpr | None,
+    schema: Schema,
 ) -> BooleanExpression:
-    """The rows of the partition's keys, as a pyiceberg expression.
+    """The rows of the partition's keys as a pyiceberg expression; all rows without a partition.
 
     Time-window bounds on date and timestamp columns are ``datetime`` values:
     pyiceberg cannot convert a key such as ``2024-01-01`` to a timestamp.
@@ -74,22 +69,18 @@ def partition_filter(
         ValueError: If ``partition_expr`` is ``None`` or does not fit the
             partition definition, or a partition column is not in ``schema``.
     """
-    partition_expr = require_partition_expr(partition_expr)
-    formats = {
-        column: definition.fmt
-        for column, definition, _ in _dimensions(partition, partition_expr)
-        if isinstance(definition, PartitionsDefinition.TimeWindow)
-        and isinstance(
-            schema.find_type(column), DateType | TimestampType | TimestamptzType
-        )
-    }
+    if partition is None:
+        return AlwaysTrue()
 
-    return reduce(
-        Or,
-        (
-            reduce(And, (_expression(f, formats) for f in conjunction))
-            for conjunction in _build_partition_filters(partition, partition_expr)
-        ),
+    partition_expr = require_partition_expr(partition_expr)
+    return _any(
+        _all(
+            _dimension_filter(column, values, definition, schema)
+            for column, values, definition in _key_dimensions(
+                key, partition.definition, partition_expr
+            )
+        )
+        for key in partition.keys
     )
 
 
@@ -108,61 +99,53 @@ def partition_fields(
             definition, or a partition column is not in ``schema``.
     """
     fields = []
-    for column, definition, value in _dimensions(partition, partition_expr):
+    for column, values, definition in _key_dimensions(
+        partition.keys[0], partition.definition, partition_expr
+    ):
         if column not in schema.names:
             raise ValueError(
                 f"partition column {column!r} is not in the data: {schema.names}"
             )
         fields.append(
-            (column, _transform(definition, value, schema.field(column).type))
+            (column, _transform(definition, values[0], schema.field(column).type))
         )
 
     return fields
 
 
-def _dimensions(
-    partition: PartitionContext, partition_expr: PartitionExpr
-) -> list[tuple[str, PartitionsDefinition | None, str]]:
-    """``(column, definition, first key value)`` for each partition dimension."""
-    key, definition = partition.keys[0], partition.definition
-    if isinstance(key, PartitionKey.Single):
-        if not isinstance(partition_expr.expr, str):
-            raise ValueError(
-                "partition_expr with a string column name is required "
-                "for single-key partitioned assets"
+def _dimension_filter(
+    column: str,
+    values: list[str],
+    definition: PartitionsDefinition | None,
+    schema: Schema,
+) -> BooleanExpression:
+    """The rows of one dimension: a time range for a single time-window value."""
+    if len(values) == 1 and isinstance(definition, PartitionsDefinition.TimeWindow):
+        window = _window(values[0], definition)
+        if window is not None:
+            start, end = window
+            temporal = DateType | TimestampType | TimestamptzType
+            if not isinstance(schema.find_type(column), temporal):
+                start, end = (
+                    start.strftime(definition.fmt),
+                    end.strftime(definition.fmt),
+                )
+            return And(
+                GreaterThanOrEqual(column, start),  # pyright: ignore[reportCallIssue]
+                LessThan(column, end),  # pyright: ignore[reportCallIssue]
             )
-        return [(partition_expr.expr, definition, key.key[0])]
 
-    if isinstance(key, PartitionKey.Multi):
-        if not isinstance(partition_expr.expr, dict):
-            raise ValueError(
-                "partition_expr with a dict mapping is required "
-                "for multi-key partitioned assets"
-            )
-        if missing := sorted(key.keys.keys() - partition_expr.expr.keys()):
-            raise ValueError(f"partition_expr has no column for dimensions {missing}")
-        definitions: dict[str, PartitionsDefinition] = {}
-        if isinstance(definition, PartitionsDefinition.Multi):
-            definitions = dict(definition.dimensions)
-        return [
-            (partition_expr.expr[dim], definitions.get(dim), values[0])
-            for dim, values in sorted(key.keys.items())
-        ]
-
-    raise NotImplementedError(type(key))
+    return In(column, values)  # pyright: ignore[reportCallIssue]
 
 
-def _expression(f: Filter, formats: dict[str, str]) -> BooleanExpression:
-    column, op, value = f
-    if (fmt := formats.get(column)) is not None:
-        if op == "in":
-            value = [datetime.strptime(v, fmt) for v in value]
-        else:
-            value = datetime.strptime(value, fmt)
+def _all(expressions: Iterable[BooleanExpression]) -> BooleanExpression:
+    expressions = list(expressions)
+    return expressions[0] if len(expressions) == 1 else And(*expressions)
 
-    if op == "in":
-        return In(column, value)  # pyright: ignore[reportCallIssue]
-    return _COMPARISONS[op](column, value)
+
+def _any(expressions: Iterable[BooleanExpression]) -> BooleanExpression:
+    expressions = list(expressions)
+    return expressions[0] if len(expressions) == 1 else Or(*expressions)
 
 
 def _transform(
@@ -175,9 +158,7 @@ def _transform(
         return IdentityTransform()
 
     candidates = _TIME_TRANSFORMS if timestamp else _TIME_TRANSFORMS[:-1]
-    window = PartitionContext(
-        keys=[PartitionKey.single(value)], definition=definition
-    ).time_window()
+    window = _window(value, definition)
     for transform, truncate in candidates:
         if window is not None and all(truncate(bound) == bound for bound in window):
             return transform

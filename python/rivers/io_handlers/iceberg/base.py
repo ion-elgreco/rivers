@@ -15,7 +15,6 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
     TableAlreadyExistsError,
 )
-from pyiceberg.expressions import AlwaysTrue, BooleanExpression
 from pyiceberg.table import DataScan, Table, Transaction, UpsertResult
 
 from rivers._core import MetadataValue, OutputContext
@@ -76,13 +75,10 @@ class IcebergReadRequest:
 
     def scan(self, table: Table) -> DataScan:
         """A scan of ``table`` with the partition filter, the columns, and the snapshot."""
-        row_filter: BooleanExpression = AlwaysTrue()
-        if self.partition is not None:
-            row_filter = partition_filter(
-                self.partition, self.partition_expr, table.schema()
-            )
         return table.scan(
-            row_filter=row_filter,
+            row_filter=partition_filter(
+                self.partition, self.partition_expr, table.schema()
+            ),
             selected_fields=tuple(self.columns) if self.columns else ("*",),
             snapshot_id=self.snapshot_id,
         )
@@ -251,13 +247,9 @@ def _write(
         elif request.mode == "append" or table.current_snapshot() is None:
             txn.append(data, snapshot_properties=snapshot_properties)
         else:
-            row_filter: BooleanExpression = AlwaysTrue()
-            if request.partition is not None:
-                row_filter = partition_filter(
-                    request.partition,
-                    request.partition_expr,
-                    txn.table_metadata.schema(),
-                )
+            row_filter = partition_filter(
+                request.partition, request.partition_expr, txn.table_metadata.schema()
+            )
             txn.overwrite(
                 data,
                 overwrite_filter=row_filter,
