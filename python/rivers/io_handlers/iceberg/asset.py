@@ -184,12 +184,6 @@ class IcebergAsset(Asset):
             ctx.log.info("[delete] %s: deleted all rows", ctx.asset_name)
             return None
 
-        if "iceberg/partition_expr" not in (ctx.asset_metadata or {}):
-            raise ValueError(
-                f"keyed delete on '{ctx.asset_name}' needs the "
-                f"'iceberg/partition_expr' metadata key to map the partition "
-                f"to the table's columns"
-            )
         row_filter = handler.partition_filter(
             ctx.asset_metadata, ctx.partition, table.schema()
         )
