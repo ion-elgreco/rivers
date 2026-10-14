@@ -256,12 +256,13 @@ impl PyStorage {
     /// with fire-and-forget shutdown tasks faster than they drain and
     /// later opens hang. Production code should keep using
     /// [`embedded`](Self::embedded), which routes through `io_rt()`.
+    /// Like the CLI scratch store, its commits are not synced to disk.
     #[staticmethod]
     fn _test_embedded(py: Python<'_>, path: &str) -> PyResult<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
         let storage =
-            py.detach(|| SurrealStorage::new_embedded_blocking(path).map_err(to_py_err))?;
+            py.detach(|| SurrealStorage::new_scratch_blocking(path).map_err(to_py_err))?;
         tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (own runtime)");
         Ok(Self::from_storage(storage, PyStorageType::Embedded))
     }

@@ -50,5 +50,9 @@ def memory_storage() -> Storage:
 
 
 def embedded_storage(path: str) -> Storage:
-    """Embedded RocksDB :class:`Storage` with synchronous-shutdown semantics on drop."""
+    """Embedded RocksDB :class:`Storage` with synchronous-shutdown semantics on drop.
+
+    Commits are not synced to disk, so a new store opens fast on slow disks.
+    A process crash loses no data; an operating system crash can.
+    """
     return Storage._test_embedded(path)  # type: ignore[attr-defined]

@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 import rivers as rs
 from rivers.cli import app
 from rivers.cli._common import _cleanup_storage, _create_storage
+from rivers.testing import embedded_storage
 
 runner = CliRunner()
 
@@ -383,6 +384,20 @@ def test_scratch_store_closes_when_the_repository_releases_it(tmp_path, monkeypa
     repo._release_storage()
 
     assert rs.Storage.embedded(scratch).kv_get("kept") == b"value"
+
+
+@pytest.mark.parametrize(
+    "open_store", [embedded_storage, rs.Storage._scratch], ids=["test", "scratch"]
+)
+def test_temporary_stores_do_not_sync_each_commit(tmp_path: Path, open_store):
+    """A new store's migration makes about 25 commits; with an fsync each, two
+    test stores took more than 55 s to open on a busy Windows runner. RocksDB's
+    OPTIONS file has `manual_wal_flush=true` when commits wait for an fsync."""
+    path = tmp_path / "db"
+    open_store(str(path))
+
+    options = max(path.glob("OPTIONS-*")).read_text()
+    assert "manual_wal_flush=false" in options
 
 
 # --- CLI integration tests ---
