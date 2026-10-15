@@ -229,8 +229,9 @@ fails with reason `InvalidUrl`, and the operator does not fetch from it.
 out to run the chart's default runtime image,
 `ghcr.io/ion-elgreco/rivers-runtime:<chart version>-py3.12`
 (`codeLocation.runtime.*` in the chart). Each release publishes this
-image for Python 3.11, 3.12 and 3.13 (tags `<version>-py3.11`,
-`-py3.12`, `-py3.13`), for `linux/amd64` and `linux/arm64`.
+image for Python 3.11 to 3.15 and free-threaded 3.14t and 3.15t (tags
+`<version>-py3.11` to `-py3.15`, `-py3.14t`, `-py3.15t`), for
+`linux/amd64` and `linux/arm64`.
 
 | To | Set |
 | --- | --- |
