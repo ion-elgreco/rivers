@@ -479,7 +479,8 @@ jobs:
       matrix:
         # Keep in sync with runtime-manifest, the Dockerfile.runtime header,
         # and the chart's codeLocation.runtime.pythonVersion default.
-        python: ["3.11", "3.12", "3.13"]
+        # No 3.15t until obstore publishes a 3.15t wheel.
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15", "3.14t"]
         platform:
           - arch: amd64
             runner: ubuntu-latest
@@ -520,10 +521,15 @@ jobs:
           owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
           version="${REF_NAME#v}"
           repo="${REGISTRY}/${owner_lc}/${IMAGE_NAME}"
+          case "${PYTHON}" in
+            *t) python_build=freethreaded ;;
+            *) python_build=gil ;;
+          esac
           {
             echo "repo=${repo}"
             echo "version=${version}"
             echo "arch_tag=${repo}:${version}-py${PYTHON}-${ARCH}"
+            echo "python_build=${python_build}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -547,6 +553,7 @@ jobs:
           tags: ${{ steps.ref.outputs.arch_tag }}
           build-args: |
             PYTHON_VERSION=${{ matrix.python }}
+            PYTHON_BUILD=${{ steps.ref.outputs.python_build }}
             RIVERS_VERSION=${{ steps.ref.outputs.version }}
             RIVERS_REVISION=${{ github.sha }}
           provenance: mode=max
@@ -569,7 +576,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15", "3.14t"]
 
     env:
       REGISTRY: ghcr.io

@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[3]
 CHART = ROOT / "deploy" / "helm" / "rivers"
 DOCKERFILE = "deploy/docker/Dockerfile.runtime"
 RUNTIME_REPO = "ghcr.io/ion-elgreco/rivers-runtime"
-PUBLISHED_PYTHONS = ("3.11", "3.12", "3.13")
+PUBLISHED_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15", "3.14t")
 GLIBC_WHEEL_TARGETS = {
     "amd64": "x86_64-unknown-linux-gnu",
     "arm64": "aarch64-unknown-linux-gnu",
@@ -402,3 +402,12 @@ def test_runtime_images_carry_the_static_rivers_runtime_of_their_arch(release):
             f"{name}: {release.artifacts.get(name)}"
         )
         assert release.uploads[name].endswith(f"{target}/release/rivers-runtime")
+
+
+def test_runtime_images_pick_the_base_of_their_python_build(release):
+    for python in _expected_pythons():
+        builds = [
+            b for b in release.builds if b.build_args.get("PYTHON_VERSION") == python
+        ]
+        want = "freethreaded" if python.endswith("t") else "gil"
+        assert {b.build_args.get("PYTHON_BUILD") for b in builds} == {want}, python
