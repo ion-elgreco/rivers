@@ -20,18 +20,7 @@ name: release-python
 on:
   push:
     tags: ["v*.*.*"]
-  # Set both inputs to rebuild only the runtime images of a past release,
-  # from its run's wheel and rivers-runtime artifacts.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag of the runtime images, e.g. v0.6.0"
-        required: false
-        type: string
-      artifacts_run_id:
-        description: "Run ID of that tag's release-python run"
-        required: false
-        type: string
 
 concurrency:
   group: release-python-${{ github.ref }}
@@ -45,7 +34,6 @@ jobs:
   # on `rust/rivers-ui/pkg/` would fail without it.
   build-wasm:
     name: Build hydration WASM bundle
-    if: ${{ !inputs.artifacts_run_id }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -73,7 +61,6 @@ jobs:
 
   build-linux:
     name: Build wheel (linux ${{ matrix.libc }} ${{ matrix.arch }})
-    if: ${{ !inputs.artifacts_run_id }}
     needs: build-wasm
     # aarch64 builds run on native arm runners — cross-compiling aws-lc-sys
     # (pulled in by rustls via surrealdb + kube) through manylinux's
@@ -198,7 +185,6 @@ jobs:
 
   build-macos:
     name: Build wheel (macos ${{ matrix.arch }})
-    if: ${{ !inputs.artifacts_run_id }}
     needs: build-wasm
 
     runs-on: ${{ matrix.runner }}
@@ -297,7 +283,6 @@ jobs:
 
   build-windows:
     name: Build wheel (windows ${{ matrix.arch }})
-    if: ${{ !inputs.artifacts_run_id }}
     needs: build-wasm
     runs-on: windows-latest
     permissions:
@@ -393,7 +378,6 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    if: ${{ !inputs.artifacts_run_id }}
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
@@ -425,7 +409,6 @@ jobs:
   # each Python version into one multi-arch tag.
   build-runtime:
     name: Build rivers-runtime (${{ matrix.arch }})
-    if: ${{ !inputs.artifacts_run_id }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read       # checkout sources
@@ -484,11 +467,9 @@ jobs:
   build-runtime-images:
     name: Build & push rivers-runtime py${{ matrix.python }} (${{ matrix.platform.arch }})
     needs: [build-linux, build-runtime]
-    if: ${{ !cancelled() && !failure() }}
     runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read       # checkout Dockerfile.runtime
-      actions: read        # download artifacts of another run
       packages: write      # push images to ghcr.io
       id-token: write      # OIDC for Sigstore signing via attest-build-provenance
       attestations: write  # publish SLSA provenance to repo attestation log
@@ -517,20 +498,28 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Download the glibc wheel for this arch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.platform.wheel }}
+          path: staging/wheels/
+
+      - name: Download rivers-runtime for this arch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rivers-runtime-${{ matrix.platform.arch }}
+          path: staging/
+
       - name: Resolve image ref
         id: ref
         env:
           OWNER: ${{ github.repository_owner }}
           REF_NAME: ${{ github.ref_name }}
-          TAG: ${{ inputs.tag }}
-          RUN_ID: ${{ github.run_id }}
-          ARTIFACTS_RUN_ID: ${{ inputs.artifacts_run_id }}
           PYTHON: ${{ matrix.python }}
           ARCH: ${{ matrix.platform.arch }}
         run: |
           owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          tag="${TAG:-${REF_NAME}}"
-          version="${tag#v}"
+          version="${REF_NAME#v}"
           repo="${REGISTRY}/${owner_lc}/${IMAGE_NAME}"
           case "${PYTHON}" in
             *t) python_build=freethreaded ;;
@@ -541,24 +530,7 @@ jobs:
             echo "version=${version}"
             echo "arch_tag=${repo}:${version}-py${PYTHON}-${ARCH}"
             echo "python_build=${python_build}"
-            echo "artifacts_run_id=${ARTIFACTS_RUN_ID:-${RUN_ID}}"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Download the glibc wheel for this arch
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ matrix.platform.wheel }}
-          path: staging/wheels/
-          run-id: ${{ steps.ref.outputs.artifacts_run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download rivers-runtime for this arch
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rivers-runtime-${{ matrix.platform.arch }}
-          path: staging/
-          run-id: ${{ steps.ref.outputs.artifacts_run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -597,7 +569,6 @@ jobs:
   runtime-manifest:
     name: Multi-arch manifest (rivers-runtime py${{ matrix.python }})
     needs: build-runtime-images
-    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
       packages: write  # push the multi-arch index manifest to ghcr.io
@@ -617,13 +588,11 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
           REF_NAME: ${{ github.ref_name }}
-          TAG: ${{ inputs.tag }}
           PYTHON: ${{ matrix.python }}
         run: |
           owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          tag="${TAG:-${REF_NAME}}"
           echo "repo=${REGISTRY}/${owner_lc}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag#v}-py${PYTHON}" >> "$GITHUB_OUTPUT"
+          echo "tag=${REF_NAME#v}-py${PYTHON}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
