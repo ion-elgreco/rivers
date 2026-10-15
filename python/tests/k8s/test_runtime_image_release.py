@@ -49,6 +49,7 @@ GITHUB = {
     "repository_owner": "ion-elgreco",
     "actor": "ion-elgreco",
     "sha": "0" * 40,
+    "run_id": "1",
 }
 SECRETS = {"GITHUB_TOKEN": "fake-token"}
 _EXPRESSION = re.compile(r"\$\{\{\s*([\w.-]+)\s*\}\}")
@@ -183,6 +184,7 @@ def _run_job(
     ctx: dict = {
         "github": GITHUB,
         "secrets": SECRETS,
+        "inputs": {"tag": "", "artifacts_run_id": ""},
         "matrix": matrix,
         "steps": {},
         "env": {},
