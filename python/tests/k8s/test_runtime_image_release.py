@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[3]
 CHART = ROOT / "deploy" / "helm" / "rivers"
 DOCKERFILE = "deploy/docker/Dockerfile.runtime"
 RUNTIME_REPO = "ghcr.io/ion-elgreco/rivers-runtime"
-PUBLISHED_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15", "3.14t", "3.15t")
+PUBLISHED_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15", "3.14t")
 GLIBC_WHEEL_TARGETS = {
     "amd64": "x86_64-unknown-linux-gnu",
     "arm64": "aarch64-unknown-linux-gnu",

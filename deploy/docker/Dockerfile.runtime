@@ -3,7 +3,7 @@
 # Carries python, uv, git, CA certs, the rivers CLI and `rivers-runtime`,
 # whose `workspace-sync` command builds the trees. Published per Python
 # version for linux/amd64 and linux/arm64 by the release-python workflow:
-#   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13|3.14|3.15|3.14t|3.15t
+#   ghcr.io/ion-elgreco/rivers-runtime:<version>-py3.11|3.12|3.13|3.14|3.15|3.14t
 #
 # Build context must contain the rivers wheel under wheels/ and the static
 # rivers-runtime binary of the image's arch (the release stages both;
@@ -16,7 +16,7 @@
 # CVEs.
 #
 # PYTHON_BUILD picks the base: `gil` uses uv's image of the official Python
-# image; `freethreaded` (PYTHON_VERSION 3.14t, 3.15t) installs a uv-managed
+# image; `freethreaded` (PYTHON_VERSION 3.14t) installs a uv-managed
 # interpreter, as no official free-threaded image exists. uv marks its
 # interpreters externally managed; the marker goes so `--system` works.
 ARG PYTHON_VERSION=3.12
