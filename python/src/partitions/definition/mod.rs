@@ -4,6 +4,7 @@ mod time_window;
 pub(crate) use time_window::*;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use jiff::{SignedDuration, civil};
 use ordermap::OrderSet;
@@ -16,14 +17,15 @@ use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
 
-/// Insertion-ordered set of static partition keys.
-#[derive(Clone, PartialEq)]
-pub struct OrderedKeySet(OrderSet<String>);
+/// Insertion-ordered set of static partition keys. Shared, so cloning a
+/// definition stays O(1) however many keys it holds.
+#[derive(Clone)]
+pub struct OrderedKeySet(Arc<OrderSet<String>>);
 
 impl OrderedKeySet {
     /// Build from a key list; duplicate keys collapse (set semantics).
     pub fn new(keys: Vec<String>) -> Self {
-        Self(keys.into_iter().collect())
+        Self(Arc::new(keys.into_iter().collect()))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &String> {
@@ -54,6 +56,12 @@ impl OrderedKeySet {
     }
 }
 
+impl PartialEq for OrderedKeySet {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
 impl std::fmt::Debug for OrderedKeySet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.0.iter()).finish()
@@ -66,7 +74,7 @@ impl<'py> IntoPyObject<'py> for &OrderedKeySet {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        PyList::new(py, &self.0)
+        PyList::new(py, self.0.iter())
     }
 }
 
@@ -76,7 +84,7 @@ impl<'py> IntoPyObject<'py> for OrderedKeySet {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        PyList::new(py, &self.0)
+        PyList::new(py, self.0.iter())
     }
 }
 
