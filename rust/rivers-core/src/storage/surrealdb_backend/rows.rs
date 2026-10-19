@@ -363,3 +363,66 @@ impl DbStoredEvent {
         }
     }
 }
+
+/// One `backfill_runs` row: a run linked to its backfill.
+#[derive(Debug, Clone, SurrealValue)]
+pub(super) struct BackfillRunRow {
+    backfill_id: String,
+    run_id: String,
+    linked_at: i64,
+}
+
+impl BackfillRunRow {
+    /// Rows for `run_ids` in order, linked now.
+    pub(super) fn linked_now(backfill_id: &str, run_ids: &[String]) -> Vec<Self> {
+        let now = super::now_nanos();
+        run_ids
+            .iter()
+            .enumerate()
+            .map(|(i, run_id)| Self {
+                backfill_id: backfill_id.to_string(),
+                run_id: run_id.clone(),
+                linked_at: now + i as i64,
+            })
+            .collect()
+    }
+}
+
+/// One `backfill_outcomes` row: a settled key of a backfill.
+#[derive(Debug, Clone, SurrealValue)]
+pub(super) struct BackfillOutcomeRow {
+    backfill_id: String,
+    partition_key: PartitionKey,
+    outcome: String,
+}
+
+impl BackfillOutcomeRow {
+    /// Rows for the keys of each outcome. A key in more than one list keeps
+    /// the last: Failed over Canceled over Completed.
+    pub(super) fn settled(
+        backfill_id: &str,
+        completed: &[PartitionKey],
+        failed: &[PartitionKey],
+        canceled: &[PartitionKey],
+    ) -> Vec<Self> {
+        let mut by_key: std::collections::HashMap<&PartitionKey, &'static str> =
+            std::collections::HashMap::new();
+        for (keys, outcome) in [
+            (completed, "Completed"),
+            (canceled, "Canceled"),
+            (failed, "Failed"),
+        ] {
+            for key in keys {
+                by_key.insert(key, outcome);
+            }
+        }
+        by_key
+            .into_iter()
+            .map(|(key, outcome)| Self {
+                backfill_id: backfill_id.to_string(),
+                partition_key: key.clone(),
+                outcome: outcome.to_string(),
+            })
+            .collect()
+    }
+}

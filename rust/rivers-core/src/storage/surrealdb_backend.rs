@@ -7,7 +7,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::types::{RecordId, SurrealValue};
 
-use super::{EventRecord, PartitionKey, StorageBackend};
+use super::{BackfillRecord, EventRecord, PartitionKey, StorageBackend};
 
 mod migration;
 pub use migration::{Capability, SchemaMigrationNeeded};
@@ -637,6 +637,72 @@ impl SurrealStorage {
         let bytes = serde_json::to_vec(value)?;
         self.kv_set(key, &bytes).await
     }
+}
+
+/// Fill in the requested keys, linked runs and settled keys of `backfills`,
+/// read from their own tables.
+async fn load_backfill_progress(
+    db: &Surreal<Any>,
+    mut backfills: Vec<BackfillRecord>,
+) -> Result<Vec<BackfillRecord>> {
+    #[derive(SurrealValue)]
+    struct KeysRow {
+        backfill_id: String,
+        partition_keys: Vec<PartitionKey>,
+    }
+    #[derive(SurrealValue)]
+    struct RunRow {
+        backfill_id: String,
+        run_id: String,
+    }
+    #[derive(SurrealValue)]
+    struct OutcomeRow {
+        backfill_id: String,
+        partition_key: PartitionKey,
+        outcome: String,
+    }
+
+    if backfills.is_empty() {
+        return Ok(backfills);
+    }
+    let ids: Vec<String> = backfills.iter().map(|b| b.backfill_id.clone()).collect();
+    let mut result = db
+        .query(LOAD_BACKFILL_PROGRESS)
+        .bind(("ids", ids))
+        .await?
+        .check()?;
+    let keys: Vec<KeysRow> = result.take(0)?;
+    let runs: Vec<RunRow> = result.take(1)?;
+    let outcomes: Vec<OutcomeRow> = result.take(2)?;
+
+    let index: HashMap<String, usize> = backfills
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.backfill_id.clone(), i))
+        .collect();
+    for row in keys {
+        if let Some(&i) = index.get(&row.backfill_id) {
+            backfills[i].partition_keys = row.partition_keys;
+        }
+    }
+    for row in runs {
+        if let Some(&i) = index.get(&row.backfill_id) {
+            backfills[i].run_ids.push(row.run_id);
+        }
+    }
+    for row in outcomes {
+        let Some(&i) = index.get(&row.backfill_id) else {
+            continue;
+        };
+        let backfill = &mut backfills[i];
+        match row.outcome.as_str() {
+            "Completed" => backfill.completed_partitions.push(row.partition_key),
+            "Failed" => backfill.failed_partitions.push(row.partition_key),
+            "Canceled" => backfill.canceled_partitions.push(row.partition_key),
+            other => anyhow::bail!("unknown backfill outcome '{other}'"),
+        }
+    }
+    Ok(backfills)
 }
 
 /// Convert a unique-index violation on a client-supplied-ID `CREATE` into `Ok(())`, logging a warning.

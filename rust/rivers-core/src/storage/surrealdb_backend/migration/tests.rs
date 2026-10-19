@@ -10,6 +10,30 @@ async fn count_rows(db: &Surreal<Any>, table: &str) -> u64 {
     n.unwrap_or(0)
 }
 
+/// The floors migration `version` recorded, whatever was applied after it.
+async fn stamps_at(db: &Surreal<Any>, version: u32) -> SchemaStamps {
+    #[derive(SurrealValue)]
+    struct Row {
+        min_reader: i64,
+        min_writer: i64,
+    }
+    let rows: Vec<Row> = db
+        .query(format!(
+            "SELECT min_reader, min_writer FROM {MIGRATION_META_TABLE} WHERE version = $v"
+        ))
+        .bind(("v", version))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let row = rows.into_iter().next().expect("migration_meta row");
+    SchemaStamps {
+        version,
+        min_reader: row.min_reader as u32,
+        min_writer: row.min_writer as u32,
+    }
+}
+
 /// Plant a `migration_meta` row so the open guard reads the given stamps. The
 /// fold takes the max, so values dominating any existing row set the result.
 async fn plant_stamps(db: &Surreal<Any>, version: u32, min_reader: u32, min_writer: u32) {
@@ -178,10 +202,10 @@ async fn test_v2_moves_logoutput_events_to_run_logs() {
         1,
         "only the structured event remains"
     );
-    let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+    let stamps = stamps_at(&db, 11).await;
     assert_eq!(
         (stamps.version, stamps.min_reader, stamps.min_writer),
-        (SCHEMA_VERSION, 2, 10),
+        (11, 2, 10),
         "v2 raised the read floor to 2; v7 raised the write floor to 7 (v10 to 10), because a \
              pre-v7 writer records provenance without the time a v7 writer compares"
     );
@@ -397,10 +421,10 @@ async fn test_v7_backfills_provenance_timestamp() {
     ];
     assert_eq!(provenance_times().await, expected);
 
-    let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+    let stamps = stamps_at(&db, 7).await;
     assert_eq!(
         (stamps.version, stamps.min_reader, stamps.min_writer),
-        (SCHEMA_VERSION, 2, 10),
+        (7, 2, 7),
         "a pre-v7 writer records a code version without its time, which a \
              v7 writer then lets an older materialization overwrite"
     );
@@ -633,16 +657,127 @@ async fn test_v10_rewrites_run_config_into_the_launch_document() {
         backfill.as_deref(),
         Some(r#"{"assets":{"a":{"config":{"y":true}}}}"#)
     );
-    let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+    let stamps = stamps_at(&db, 10).await;
     assert_eq!(
         (stamps.version, stamps.min_reader, stamps.min_writer),
-        (SCHEMA_VERSION, 2, 10)
+        (10, 2, 10)
     );
     assert!(check_compatibility(stamps, Capability::Read, 9).is_ok());
     assert!(check_compatibility(stamps, Capability::ReadWrite, 9).is_err());
     // Nothing to rewrite the second time.
     assert_eq!(launch_document_from_v9(r#"{"assets":{"a":{}}}"#), None);
     assert_eq!(launch_document_from_v9("[1]"), None);
+}
+
+/// V12 moves a backfill's keys, run links and settled keys out of its row.
+/// Rows from before it read back the same, and neither a V11 reader nor a
+/// V11 writer may open the store.
+#[tokio::test]
+async fn test_v12_moves_backfill_progress_out_of_the_row() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let mut backend = SurrealMigrate { db: db.clone() };
+    let migrations: Vec<Migration> = embedded_migrations().into_iter().take(11).collect();
+    backend
+        .migrate(
+            &migrations,
+            true,
+            false,
+            false,
+            Target::Latest,
+            REFINERY_HISTORY_TABLE,
+        )
+        .await
+        .expect("apply migrations");
+    db.query(
+        "INSERT INTO backfills [\
+            { backfill_id: 'b1', code_location_id: 'default', status: 'InProgress', \
+              strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: ['a'], \
+              partition_keys: [{ variant: 'Single', keys: ['p1'] }, { variant: 'Single', keys: ['p2'] }, \
+                  { variant: 'Single', keys: ['p3'] }, { variant: 'Single', keys: ['p4'] }], \
+              run_ids: ['r2', 'r1', 'r3'], \
+              completed_partitions: [{ variant: 'Single', keys: ['p1'] }, { variant: 'Single', keys: ['p3'] }], \
+              failed_partitions: [{ variant: 'Single', keys: ['p2'] }, { variant: 'Single', keys: ['p3'] }], \
+              canceled_partitions: [{ variant: 'Single', keys: ['p4'] }], \
+              max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }, \
+            { backfill_id: 'b2', code_location_id: 'default', status: 'Requested', \
+              strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: ['a'], \
+              partition_keys: [], run_ids: [], completed_partitions: [], failed_partitions: [], \
+              canceled_partitions: [], max_concurrency: 1, tags: [], create_time: 2, \
+              end_time: NONE, error: NONE } \
+         ] RETURN NONE",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db).await.unwrap();
+
+    let read = async |id: &str| -> crate::storage::BackfillRecord {
+        let rows: Vec<crate::storage::BackfillRecord> = db
+            .query("SELECT * FROM backfills WHERE backfill_id = $id")
+            .bind(("id", id.to_string()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        load_backfill_progress(&db, rows)
+            .await
+            .unwrap()
+            .pop()
+            .expect("backfill row")
+    };
+    let single = |k: &str| PartitionKey::Single {
+        keys: vec![k.to_string()],
+    };
+    let b1 = read("b1").await;
+    assert_eq!(
+        b1.partition_keys,
+        vec![single("p1"), single("p2"), single("p3"), single("p4")]
+    );
+    assert_eq!(b1.run_ids, vec!["r2", "r1", "r3"]);
+    assert_eq!(b1.completed_partitions, vec![single("p1")]);
+    let mut failed = b1.failed_partitions.clone();
+    failed.sort_by_key(|k| k.to_display());
+    assert_eq!(failed, vec![single("p2"), single("p3")]);
+    assert_eq!(b1.canceled_partitions, vec![single("p4")]);
+    let b2 = read("b2").await;
+    assert!(b2.partition_keys.is_empty() && b2.run_ids.is_empty());
+    assert!(b2.completed_partitions.is_empty() && b2.failed_partitions.is_empty());
+
+    let left_on_row: Vec<serde_json::Value> = db
+        .query(
+            "SELECT VALUE [partition_keys, run_ids, completed_partitions, failed_partitions, \
+             canceled_partitions] FROM backfills",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert!(
+        left_on_row
+            .iter()
+            .flat_map(|v| v.as_array().unwrap())
+            .all(serde_json::Value::is_null),
+        "no progress is left on the backfill rows: {left_on_row:?}"
+    );
+    db.query("UPDATE backfills SET status = 'Canceled' WHERE backfill_id = 'b1'")
+        .await
+        .unwrap()
+        .check()
+        .expect("a migrated backfill row stays writable");
+
+    let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (SCHEMA_VERSION, 12, 12)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 11).is_err());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 11).is_err());
 }
 
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

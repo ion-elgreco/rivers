@@ -441,7 +441,7 @@ impl SurrealStorage {
             let rows: Vec<BackfillRecord> = result.take(0)?;
             let total: Option<u64> = result.take((1, "total"))?;
             Ok(BackfillsPage {
-                rows,
+                rows: load_backfill_progress(&self.db, rows).await?,
                 total: total.unwrap_or(0),
             })
         })

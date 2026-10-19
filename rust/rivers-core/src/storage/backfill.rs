@@ -178,10 +178,22 @@ pub struct BackfillRecord {
     /// Set when the backfill targets a named `Job`.
     #[serde(default)]
     pub job_name: Option<String>,
+    /// This and the four fields after it are kept in their own tables, not
+    /// on the `backfills` row; storage fills them in on read.
+    #[serde(default)]
+    #[surreal(default)]
     pub partition_keys: Vec<PartitionKey>,
+    #[serde(default)]
+    #[surreal(default)]
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    #[surreal(default)]
     pub completed_partitions: Vec<PartitionKey>,
+    #[serde(default)]
+    #[surreal(default)]
     pub failed_partitions: Vec<PartitionKey>,
+    #[serde(default)]
+    #[surreal(default)]
     pub canceled_partitions: Vec<PartitionKey>,
     pub max_concurrency: i64,
     pub tags: Vec<(String, String)>,
