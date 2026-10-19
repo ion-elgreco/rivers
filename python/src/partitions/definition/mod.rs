@@ -440,22 +440,25 @@ impl PartitionsDefinition {
         }
     }
 
-    /// `(page, match_count)` for single-dim keys containing `query`, in one pass.
+    /// `(page, match_count)` for single-dim keys containing `query`, in one pass;
+    /// each page entry carries the key's index in definition order.
     pub fn get_partition_keys_filtered(
         &self,
         query: &str,
         offset: usize,
         limit: usize,
-    ) -> PyResult<(Vec<String>, usize)> {
+    ) -> PyResult<(Vec<(usize, String)>, usize)> {
         let mut total = 0usize;
-        let mut page: Vec<String> = Vec::new();
+        let mut position = 0usize;
+        let mut page: Vec<(usize, String)> = Vec::new();
         let mut consume = |k: String| {
             if k.contains(query) {
                 if total >= offset && page.len() < limit {
-                    page.push(k);
+                    page.push((position, k));
                 }
                 total += 1;
             }
+            position += 1;
         };
         match self {
             Self::Static { keys } => {

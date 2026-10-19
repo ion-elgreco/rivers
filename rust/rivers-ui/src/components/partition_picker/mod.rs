@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use leptos::prelude::*;
 
 use crate::helpers::{JobPartitionPicker, cartesian_partition_keys};
-use crate::types::SubmitPartitionKey;
+use crate::types::{SpanSource, SubmitPartitionKey};
 
+mod spans;
 mod virtual_list;
 
-use virtual_list::VirtualPartitionList;
+use spans::SpanSet;
+use virtual_list::{PagedSelection, VirtualPartitionList};
 
 /// Where a [`VirtualPartitionList`] pages its keys: an asset definition (gRPC)
 /// or a storage-managed Dynamic namespace.
@@ -43,10 +45,18 @@ pub fn PartitionPicker(
     let single_anchor = RwSignal::new(None::<usize>);
     let multi_selected = RwSignal::new(HashMap::<String, Vec<String>>::new());
     let multi_anchors = RwSignal::new(HashMap::<String, Option<usize>>::new());
+    let paged_spans = RwSignal::new(SpanSet::default());
+    let paged_labels = RwSignal::new(HashMap::<u64, String>::new());
+    let paged = PagedSelection::Spans {
+        spans: paged_spans,
+        labels: paged_labels,
+    };
 
     Effect::new(move |_| {
         if reset.get() {
             single_selected.set(Vec::new());
+            paged_spans.set(SpanSet::default());
+            paged_labels.set(HashMap::new());
             single_anchor.set(None);
             multi_selected.set(HashMap::new());
             multi_anchors.set(HashMap::new());
@@ -58,7 +68,13 @@ pub fn PartitionPicker(
         let p = picker.get();
         let s_single = single_selected.get();
         let s_multi = multi_selected.get();
-        selected.set(collect_submit_keys(&p, &s_single, &s_multi));
+        let keys = match span_source(&p) {
+            Some(source) => {
+                paged_labels.with(|l| collect_span_keys(&source, &paged_spans.get(), l))
+            }
+            None => collect_submit_keys(&p, &s_single, &s_multi),
+        };
+        selected.set(keys);
     });
 
     let toggle_single = move |idx: usize, shift: bool| {
@@ -138,13 +154,13 @@ pub fn PartitionPicker(
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         {format!(
-                            "{total} partitions — scroll to browse, search to filter, or jump to a key.",
+                            "{total} partitions — scroll to browse, search to filter, or jump to a key. Shift-click selects a range.",
                         )}
                     </div>
                     <VirtualPartitionList
                         source=KeySource::Asset { asset_key, dimension: String::new() }
                         total=total as usize
-                        selected=single_selected
+                        selection=paged
                         reset=reset
                     />
                 </div>
@@ -155,14 +171,14 @@ pub fn PartitionPicker(
                     <label>"Partitions"</label>
                     <div class="exec-dialog-partition-hint">
                         {format!(
-                            "{} — scroll to browse, search to filter, or jump to a key.",
+                            "{} — scroll to browse, search to filter, or jump to a key. Shift-click selects a range.",
                             crate::helpers::plural(total, "dynamic partition", "dynamic partitions"),
                         )}
                     </div>
                     <VirtualPartitionList
                         source=KeySource::Dynamic { dynamic_name }
                         total=total as usize
-                        selected=single_selected
+                        selection=paged
                         reset=reset
                     />
                 </div>
@@ -209,7 +225,7 @@ pub fn PartitionPicker(
                                     <VirtualPartitionList
                                         source=KeySource::Asset { asset_key: ak, dimension: dim_name }
                                         total=dim_total
-                                        selected=dim_sel
+                                        selection=PagedSelection::Keys(dim_sel)
                                         reset=reset
                                     />
                                 </div>
@@ -280,6 +296,40 @@ pub fn WholeAssetChoice(
             "Whole asset (every partition)"
         </label>
     }
+}
+
+/// The source a paged single-dim picker selects index spans from.
+fn span_source(picker: &JobPartitionPicker) -> Option<SpanSource> {
+    match picker {
+        JobPartitionPicker::SingleDimPaged { asset_key, .. } => {
+            Some(SpanSource::Asset(asset_key.clone()))
+        }
+        JobPartitionPicker::Dynamic { dynamic_name, .. } => {
+            Some(SpanSource::Dynamic(dynamic_name.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// A lone index whose key is known submits as that key; anything else as a
+/// span the server expands.
+fn collect_span_keys(
+    source: &SpanSource,
+    spans: &SpanSet,
+    labels: &HashMap<u64, String>,
+) -> Vec<SubmitPartitionKey> {
+    spans
+        .spans()
+        .iter()
+        .map(|&(start, end)| match labels.get(&start) {
+            Some(key) if start == end => SubmitPartitionKey::Single(key.clone()),
+            _ => SubmitPartitionKey::Span {
+                source: source.clone(),
+                start,
+                end,
+            },
+        })
+        .collect()
 }
 
 /// Compute the structured partition keys to submit for a given picker

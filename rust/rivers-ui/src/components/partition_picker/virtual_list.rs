@@ -8,7 +8,40 @@ use crate::server_fns::overview::{
     get_partition_keys_page,
 };
 
+use super::spans::SpanSet;
 use super::{KeySource, partition_row_body};
+
+/// What a [`VirtualPartitionList`] click writes.
+#[derive(Clone, Copy)]
+pub(super) enum PagedSelection {
+    /// Key strings — a Multi dimension, combined into a cartesian product.
+    Keys(RwSignal<Vec<String>>),
+    /// Index spans, with shift-click ranges; `labels` keeps the keys seen at
+    /// clicked indices so a lone key submits as itself.
+    Spans {
+        spans: RwSignal<SpanSet>,
+        labels: RwSignal<HashMap<u64, String>>,
+    },
+}
+
+impl PagedSelection {
+    fn count(&self) -> u64 {
+        match self {
+            Self::Keys(keys) => keys.with(|k| k.len() as u64),
+            Self::Spans { spans, .. } => spans.with(SpanSet::count),
+        }
+    }
+
+    fn clear(&self) {
+        match self {
+            Self::Keys(keys) => keys.set(Vec::new()),
+            Self::Spans { spans, labels } => {
+                spans.set(SpanSet::default());
+                labels.set(HashMap::new());
+            }
+        }
+    }
+}
 
 // ── Virtual partition list geometry ──
 //
@@ -75,14 +108,14 @@ fn scroll_for_row(row: usize, total: usize) -> f64 {
 /// only visible rows, paging on scroll. Three ways to reach any key past the
 /// element-height cap — **scroll** (rolling window, scaled past the cap),
 /// **search** (substring filter, position-independent), **jump** (resolve index,
-/// seek there) — plus a **Selected (N)** toggle. Selection is by key string, so
-/// it survives all of them.
+/// seek there) — plus a **Selected (N)** toggle. Selection is by key string or by
+/// index in the full set, so it survives all of them.
 #[component]
 pub(super) fn VirtualPartitionList(
     /// Key source — see [`KeySource`].
     source: KeySource,
     total: usize,
-    selected: RwSignal<Vec<String>>,
+    selection: PagedSelection,
     /// Dialog-open signal — clears the list's state + selection on reopen.
     #[prop(into)]
     reset: Signal<bool>,
@@ -104,11 +137,13 @@ pub(super) fn VirtualPartitionList(
     // scrollbar (full count, or match count when filtering), corrected as pages
     // arrive; `count_known` is false until a filter's first page lands, so the
     // header shows "searching…" rather than the full count.
-    let pages = RwSignal::new(HashMap::<usize, Vec<String>>::new());
+    let pages = RwSignal::new(HashMap::<usize, Vec<(u64, String)>>::new());
     let requested = RwSignal::new(HashSet::<usize>::new());
     let view_total = RwSignal::new(total);
     let count_known = RwSignal::new(true);
     let scroll_top = RwSignal::new(0.0_f64);
+    // Index of the last plain click: a shift-click selects from here.
+    let anchor = RwSignal::new(None::<u64>);
 
     // Drop the page cache + in-flight set — every key-space change (reset, new
     // search, jump out of a filter) must do this together, so keep it in one spot.
@@ -128,7 +163,8 @@ pub(super) fn VirtualPartitionList(
             view_total.set(total);
             count_known.set(true);
             scroll_top.set(0.0);
-            selected.set(Vec::new());
+            anchor.set(None);
+            selection.clear();
             if let Some(el) = list_ref.get_untracked() {
                 el.set_scroll_top(0);
             }
@@ -323,7 +359,7 @@ pub(super) fn VirtualPartitionList(
         <div class="exec-dialog-partition-head">
             <span class="exec-dialog-partition-count">
                 {move || {
-                    let sel = selected.get().len();
+                    let sel = selection.count();
                     if show_selected.get() {
                         format!("{sel} selected")
                     } else if !count_known.get() {
@@ -352,12 +388,18 @@ pub(super) fn VirtualPartitionList(
                         if show_selected.get() {
                             "Show all".to_string()
                         } else {
-                            format!("Show selected ({})", selected.get().len())
+                            format!("Show selected ({})", selection.count())
                         }
                     }}
                 </button>
                 <span class="bulk-sep">"·"</span>
-                <button class="link-btn" on:click=move |_| selected.set(Vec::new())>
+                <button
+                    class="link-btn"
+                    on:click=move |_| {
+                        anchor.set(None);
+                        selection.clear();
+                    }
+                >
                     "Clear"
                 </button>
             </span>
@@ -374,7 +416,12 @@ pub(super) fn VirtualPartitionList(
         }}
         {move || {
             if show_selected.get() {
-                selected_review_view(selected).into_any()
+                match selection {
+                    PagedSelection::Keys(keys) => selected_review_view(keys).into_any(),
+                    PagedSelection::Spans { spans, labels } => {
+                        selected_spans_view(spans, labels).into_any()
+                    }
+                }
             } else {
                 view! {
                     <div
@@ -395,69 +442,67 @@ pub(super) fn VirtualPartitionList(
                                 let base = scroll_top.get();
                                 // Borrow the cache/selection (no per-tick clone);
                                 // membership via a set built once per render.
-                                selected.with(|sel| {
-                                    let sel_set: HashSet<&str> =
-                                        sel.iter().map(String::as_str).collect();
-                                    pages.with(|pgs| {
-                                        (rstart..rend)
-                                            .map(|idx| {
-                                                let top = if scaled {
-                                                    base + (idx as f64 - logical as f64) * ROW_H
-                                                } else {
-                                                    idx as f64 * ROW_H
-                                                };
-                                                let style =
-                                                    format!("top:{top}px;height:{ROW_H}px");
-                                                match pgs
-                                                    .get(&(idx / PAGE))
-                                                    .and_then(|v| v.get(idx % PAGE))
-                                                {
-                                                    Some(key) => {
-                                                        let is_sel =
-                                                            sel_set.contains(key.as_str());
-                                                        let key = key.clone();
-                                                        let k = key.clone();
-                                                        let cls = if is_sel {
-                                                            "exec-dialog-partition-row exec-dialog-partition-vrow exec-dialog-partition-row--selected"
-                                                        } else {
-                                                            "exec-dialog-partition-row exec-dialog-partition-vrow"
-                                                        };
-                                                        view! {
-                                                            <div
-                                                                class=cls
-                                                                style=style
-                                                                on:click=move |_| {
-                                                                    let k = k.clone();
-                                                                    selected
-                                                                        .update(|s| {
-                                                                            if let Some(p) = s.iter().position(|x| x == &k) {
-                                                                                s.remove(p);
-                                                                            } else {
-                                                                                s.push(k);
-                                                                            }
-                                                                        });
-                                                                }
-                                                            >
-                                                                {partition_row_body(key, is_sel)}
-                                                            </div>
-                                                        }
-                                                            .into_any()
+                                let sel_keys: HashSet<String> = match selection {
+                                    PagedSelection::Keys(keys) => keys.get().into_iter().collect(),
+                                    PagedSelection::Spans { .. } => HashSet::new(),
+                                };
+                                let sel_spans = match selection {
+                                    PagedSelection::Spans { spans, .. } => Some(spans.get()),
+                                    PagedSelection::Keys(_) => None,
+                                };
+                                pages.with(|pgs| {
+                                    (rstart..rend)
+                                        .map(|idx| {
+                                            let top = if scaled {
+                                                base + (idx as f64 - logical as f64) * ROW_H
+                                            } else {
+                                                idx as f64 * ROW_H
+                                            };
+                                            let style = format!("top:{top}px;height:{ROW_H}px");
+                                            match pgs
+                                                .get(&(idx / PAGE))
+                                                .and_then(|v| v.get(idx % PAGE))
+                                            {
+                                                Some((at, key)) => {
+                                                    let at = *at;
+                                                    let is_sel = match &sel_spans {
+                                                        Some(spans) => spans.contains(at),
+                                                        None => sel_keys.contains(key),
+                                                    };
+                                                    let key = key.clone();
+                                                    let k = key.clone();
+                                                    let cls = if is_sel {
+                                                        "exec-dialog-partition-row exec-dialog-partition-vrow exec-dialog-partition-row--selected"
+                                                    } else {
+                                                        "exec-dialog-partition-row exec-dialog-partition-vrow"
+                                                    };
+                                                    view! {
+                                                        <div
+                                                            class=cls
+                                                            style=style
+                                                            on:click=move |ev| {
+                                                                click_row(selection, anchor, at, k.clone(), ev.shift_key())
+                                                            }
+                                                        >
+                                                            {partition_row_body(key, is_sel)}
+                                                        </div>
                                                     }
-                                                    None => {
-                                                        view! {
-                                                            <div
-                                                                class="exec-dialog-partition-row exec-dialog-partition-vrow exec-dialog-partition-vrow--loading"
-                                                                style=style
-                                                            >
-                                                                "…"
-                                                            </div>
-                                                        }
-                                                            .into_any()
-                                                    }
+                                                        .into_any()
                                                 }
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
+                                                None => {
+                                                    view! {
+                                                        <div
+                                                            class="exec-dialog-partition-row exec-dialog-partition-vrow exec-dialog-partition-vrow--loading"
+                                                            style=style
+                                                        >
+                                                            "…"
+                                                        </div>
+                                                    }
+                                                        .into_any()
+                                                }
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
                                 })
                             }}
                         </div>
@@ -466,6 +511,90 @@ pub(super) fn VirtualPartitionList(
                     .into_any()
             }
         }}
+    }
+}
+
+/// Apply a row click: toggle the key, or with shift extend from the anchor.
+fn click_row(
+    selection: PagedSelection,
+    anchor: RwSignal<Option<u64>>,
+    at: u64,
+    key: String,
+    shift: bool,
+) {
+    match selection {
+        PagedSelection::Keys(keys) => keys.update(|s| {
+            if let Some(p) = s.iter().position(|x| x == &key) {
+                s.remove(p);
+            } else {
+                s.push(key);
+            }
+        }),
+        PagedSelection::Spans { spans, labels } => {
+            labels.update(|l| {
+                l.insert(at, key);
+            });
+            match anchor.get_untracked() {
+                Some(from) if shift => spans.update(|s| s.insert(from, at)),
+                _ => {
+                    spans.update(|s| s.toggle(at));
+                    anchor.set(Some(at));
+                }
+            }
+        }
+    }
+}
+
+/// The selected spans for review, one row each. Click removes the span.
+fn selected_spans_view(
+    spans: RwSignal<SpanSet>,
+    labels: RwSignal<HashMap<u64, String>>,
+) -> impl IntoView {
+    let label = move |at: u64| {
+        labels.with(|l| {
+            l.get(&at)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", at + 1))
+        })
+    };
+    view! {
+        <div class="exec-dialog-partition-list" style=format!("max-height:{VIEWPORT_H}px")>
+            {move || {
+                let all = spans.get();
+                if all.spans().is_empty() {
+                    return view! {
+                        <div class="exec-dialog-partition-row exec-dialog-partition-vrow--loading">
+                            "Nothing selected yet."
+                        </div>
+                    }
+                        .into_any();
+                }
+                all.spans()
+                    .iter()
+                    .map(|&(start, end)| {
+                        let text = if start == end {
+                            label(start)
+                        } else {
+                            format!(
+                                "{} → {} ({})",
+                                label(start),
+                                label(end),
+                                end - start + 1,
+                            )
+                        };
+                        view! {
+                            <div
+                                class="exec-dialog-partition-row exec-dialog-partition-row--selected"
+                                on:click=move |_| spans.update(|s| s.remove(start, end))
+                            >
+                                {partition_row_body(text, true)}
+                            </div>
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_any()
+            }}
+        </div>
     }
 }
 

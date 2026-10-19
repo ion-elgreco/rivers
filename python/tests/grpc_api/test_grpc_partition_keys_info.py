@@ -224,6 +224,30 @@ def test_get_partition_keys_search_filters_static(partition_kinds_grpc_channel):
     assert resp.total == 2
 
 
+@pytest.mark.parametrize(
+    ("offset", "query", "keys", "indices"),
+    [
+        (0, "", ["red", "green", "blue"], [0, 1, 2]),
+        (2, "", ["blue"], [2]),
+        (0, "ue", ["blue"], [2]),
+        (1, "re", ["green"], [1]),
+    ],
+)
+def test_get_partition_keys_reports_definition_indices(
+    partition_kinds_grpc_channel, offset, query, keys, indices
+):
+    """Each key carries its index in definition order, also under a filter."""
+    channel, pb2, pb2_grpc = partition_kinds_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+    resp = stub.GetPartitionKeys(
+        pb2.GetPartitionKeysRequest(
+            asset_key="static_asset", offset=offset, limit=50, query=query
+        )
+    )
+    assert list(resp.keys) == keys
+    assert list(resp.indices) == indices
+
+
 def test_get_partition_keys_search_filters_timewindow(partition_kinds_grpc_channel):
     channel, pb2, pb2_grpc = partition_kinds_grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)

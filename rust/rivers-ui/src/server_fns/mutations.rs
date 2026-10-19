@@ -80,18 +80,20 @@ fn tags_to_proto(tags: Option<Vec<(String, String)>>) -> Vec<rivers_api::rivers:
 /// `ProtoPartitionKey`. SSR-only because `rivers_api` isn't compiled on
 /// WASM.
 #[cfg(feature = "ssr")]
-fn submit_to_proto(pk: SubmitPartitionKey) -> rivers_api::rivers::ProtoPartitionKey {
+fn submit_to_proto(
+    pk: SubmitPartitionKey,
+) -> Result<rivers_api::rivers::ProtoPartitionKey, ServerFnError> {
     use rivers_api::rivers::{
         MultiPartitionDimension, MultiPartitionKey, ProtoPartitionKey, SinglePartitionKey,
         proto_partition_key,
     };
     match pk {
-        SubmitPartitionKey::Single(key) => ProtoPartitionKey {
+        SubmitPartitionKey::Single(key) => Ok(ProtoPartitionKey {
             kind: Some(proto_partition_key::Kind::Single(SinglePartitionKey {
                 keys: vec![key],
             })),
-        },
-        SubmitPartitionKey::Multi(dims) => ProtoPartitionKey {
+        }),
+        SubmitPartitionKey::Multi(dims) => Ok(ProtoPartitionKey {
             kind: Some(proto_partition_key::Kind::Multi(MultiPartitionKey {
                 dimensions: dims
                     .into_iter()
@@ -101,8 +103,80 @@ fn submit_to_proto(pk: SubmitPartitionKey) -> rivers_api::rivers::ProtoPartition
                     })
                     .collect(),
             })),
-        },
+        }),
+        SubmitPartitionKey::Span { .. } => Err(ServerFnError::new(
+            "a span of partition keys can only be submitted as a backfill",
+        )),
     }
+}
+
+/// Replace each `Span` with the `Single` keys it covers, dropping keys already
+/// submitted.
+#[cfg(feature = "ssr")]
+async fn expand_spans(
+    loc_ns: &str,
+    loc_name: &str,
+    client: &mut rivers_api::rivers::code_location_service_client::CodeLocationServiceClient<
+        tonic::transport::Channel,
+    >,
+    keys: Vec<SubmitPartitionKey>,
+) -> Result<Vec<SubmitPartitionKey>, ServerFnError> {
+    use crate::types::SpanSource;
+    use rivers_api::rivers::GetPartitionKeysRequest;
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let SubmitPartitionKey::Span { source, start, end } = key else {
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+            continue;
+        };
+
+        let wanted = end
+            .checked_sub(start)
+            .ok_or_else(|| ServerFnError::new("partition span ends before it starts"))?
+            + 1;
+        let covered: Vec<String> = match source {
+            SpanSource::Asset(asset_key) => {
+                client
+                    .get_partition_keys(GetPartitionKeysRequest {
+                        asset_key,
+                        offset: start,
+                        limit: wanted,
+                        query: String::new(),
+                        dimension: String::new(),
+                    })
+                    .await
+                    .map_err(super::grpc_err)?
+                    .into_inner()
+                    .keys
+            }
+            SpanSource::Dynamic(name) => {
+                super::overview::load_dynamic_partition_keys(loc_ns, loc_name, &name)
+                    .await?
+                    .into_iter()
+                    .skip(start as usize)
+                    .take(wanted as usize)
+                    .collect()
+            }
+        };
+        if covered.len() as u64 != wanted {
+            return Err(ServerFnError::new(
+                "the partition keys changed since they were selected; select them again",
+            ));
+        }
+
+        for k in covered {
+            let key = SubmitPartitionKey::Single(k);
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Result of a `trigger_materialize` call. Always fire-and-forget — the
@@ -140,7 +214,7 @@ pub async fn trigger_materialize(
     let resp = client
         .materialize(MaterializeRequest {
             selection: selection.unwrap_or_default(),
-            partition_key: partition_key.map(submit_to_proto),
+            partition_key: partition_key.map(submit_to_proto).transpose()?,
             tags: tags_to_proto(tags),
             user: current_user_ref().await,
             config,
@@ -191,7 +265,7 @@ pub async fn trigger_action(
         .run_action(RunActionRequest {
             action,
             selection,
-            partition_key: partition_key.map(submit_to_proto),
+            partition_key: partition_key.map(submit_to_proto).transpose()?,
             tags: tags_to_proto(tags),
             user: current_user_ref().await,
             all_assets: false,
@@ -368,12 +442,17 @@ pub async fn launch_backfill(
         .connect_to(&loc_ns, &loc_name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let partition_keys = expand_spans(&loc_ns, &loc_name, &mut client, partition_keys)
+        .await?
+        .into_iter()
+        .map(submit_to_proto)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let resp = client
         .launch_backfill(LaunchBackfillRequest {
             action,
             selection: selection.unwrap_or_default(),
-            partition_keys: partition_keys.into_iter().map(submit_to_proto).collect(),
+            partition_keys,
             partition_range: None,
             strategy: None,
             failure_policy: String::new(),
@@ -419,7 +498,7 @@ pub async fn execute_job(
     let resp = client
         .execute_job(ExecuteJobRequest {
             job_name,
-            partition_key: partition_key.map(submit_to_proto),
+            partition_key: partition_key.map(submit_to_proto).transpose()?,
             user: current_user_ref().await,
             whole_asset,
             action,
