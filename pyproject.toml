@@ -23,13 +23,13 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "pyright>=1.1.411",
-    "ruff>=0.15.22",
-    "typos>=1.48.0",
-    "cryptography>=50.0.1",
+    "pyright>=1.1.414",
+    "ruff>=0.17.0",
+    "typos>=1.51.1",
+    "cryptography>=50.0.2",
     "kr8s>=0.20",
     "pyyaml>=6.0",
-    "rumdl>=0.2.37",
+    "rumdl>=0.2.79",
     # Memory sampling for the comparison benchmark in bench/.
     "psutil>=7.0",
     # SQLite catalog for the Iceberg tests.
@@ -38,8 +38,8 @@ dev = [
 # gRPC client for the API tests. No free-threaded (3.14t) wheels yet, so
 # `just venv-ft` leaves this group out.
 grpc = [
-    "grpcio>=1.82.1",
-    "grpcio-tools>=1.82.1",
+    "grpcio>=1.84.0",
+    "grpcio-tools>=1.84.0",
 ]
 # dbt adapter for the dbt integration tests. Its dependencies have no
 # free-threaded (3.14t) wheels, so `just venv-ft` leaves this group out.
