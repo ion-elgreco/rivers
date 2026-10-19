@@ -15,11 +15,8 @@ use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{launch_backfill, trigger_action, trigger_materialize};
 use crate::types::{
     AssetActionInfo, AssetDefinitionInfo, AssetRecord, ResourceInfo, StaleStatus,
-    SubmitPartitionKey,
+    SubmitPartitionKey, launches_backfill, submit_partition_count,
 };
-
-/// Above this many selected partitions, submit one backfill instead of a run each.
-const BACKFILL_THRESHOLD: usize = 2;
 
 /// What a submit produced, so the success Effect navigates to the right page.
 #[derive(Clone)]
@@ -32,7 +29,8 @@ enum DialogOutcome {
 /// branching in `materialize_action` — if that changes, this must too.
 fn launch_summary(
     n_assets: usize,
-    n_partitions: usize,
+    n_partitions: u64,
+    backfill: bool,
     partitioned: bool,
     whole_asset: bool,
 ) -> String {
@@ -58,7 +56,7 @@ fn launch_summary(
     } else {
         format!("{n_partitions} partitions")
     };
-    if n_partitions > BACKFILL_THRESHOLD {
+    if backfill {
         format!("{assets} · {parts} · 1 backfill")
     } else if n_partitions > 1 {
         format!("{assets} · {parts} · {n_partitions} runs")
@@ -173,7 +171,7 @@ pub fn MaterializeDialog(
         let cfg = config_check.get_untracked().payload;
         async move {
             let tags_opt = if t.is_empty() { None } else { Some(t) };
-            if pks.len() > BACKFILL_THRESHOLD {
+            if launches_backfill(&pks) {
                 let r =
                     launch_backfill(ns, name, Some(sel), pks, tags_opt, None, verb, cfg).await?;
                 return Ok::<_, ServerFnError>(DialogOutcome::Backfill(r.backfill_id));
@@ -259,7 +257,8 @@ pub fn MaterializeDialog(
     let summary = Signal::derive(move || {
         launch_summary(
             selected.get().len(),
-            partition_keys.get().len(),
+            partition_keys.with(|k| submit_partition_count(k)),
+            partition_keys.with(|k| launches_backfill(k)),
             is_partitioned.get(),
             whole_asset_chosen.get(),
         )
@@ -267,11 +266,11 @@ pub fn MaterializeDialog(
     let submit_label = Signal::derive(move || {
         if pending.get() {
             "Submitting…".to_string()
-        } else if is_partitioned.get() && partition_keys.get().len() > BACKFILL_THRESHOLD {
+        } else if is_partitioned.get() && partition_keys.with(|k| launches_backfill(k)) {
             format!(
                 "Backfill {}",
                 crate::helpers::plural(
-                    partition_keys.get().len() as u64,
+                    partition_keys.with(|k| submit_partition_count(k)),
                     "partition",
                     "partitions"
                 ),
@@ -542,20 +541,26 @@ mod tests {
 
     #[test]
     fn empty_selection_reads_as_nothing() {
-        assert_eq!(launch_summary(0, 0, false, false), "Nothing selected");
-        assert_eq!(launch_summary(0, 5, true, false), "Nothing selected");
+        assert_eq!(
+            launch_summary(0, 0, false, false, false),
+            "Nothing selected"
+        );
+        assert_eq!(launch_summary(0, 5, true, true, false), "Nothing selected");
     }
 
     #[test]
     fn unpartitioned_is_always_one_run() {
-        assert_eq!(launch_summary(1, 0, false, false), "1 asset · 1 run");
-        assert_eq!(launch_summary(3, 0, false, false), "3 assets · 1 run");
+        assert_eq!(launch_summary(1, 0, false, false, false), "1 asset · 1 run");
+        assert_eq!(
+            launch_summary(3, 0, false, false, false),
+            "3 assets · 1 run"
+        );
     }
 
     #[test]
     fn partitioned_without_keys_asks_for_one() {
         assert_eq!(
-            launch_summary(2, 0, true, false),
+            launch_summary(2, 0, false, true, false),
             "2 assets · select a partition"
         );
     }
@@ -563,12 +568,12 @@ mod tests {
     #[test]
     fn whole_asset_choice_covers_every_partition() {
         assert_eq!(
-            launch_summary(2, 0, true, true),
+            launch_summary(2, 0, false, true, true),
             "2 assets · whole asset · 1 run"
         );
         // An empty pick alone never reads as the whole asset.
         assert_eq!(
-            launch_summary(2, 0, true, false),
+            launch_summary(2, 0, false, true, false),
             "2 assets · select a partition"
         );
     }
@@ -576,11 +581,11 @@ mod tests {
     #[test]
     fn one_run_per_partition_up_to_the_threshold() {
         assert_eq!(
-            launch_summary(1, 1, true, false),
+            launch_summary(1, 1, false, true, false),
             "1 asset · 1 partition · 1 run"
         );
         assert_eq!(
-            launch_summary(3, 2, true, false),
+            launch_summary(3, 2, false, true, false),
             "3 assets · 2 partitions · 2 runs"
         );
     }
@@ -588,11 +593,11 @@ mod tests {
     #[test]
     fn past_the_threshold_it_is_a_backfill() {
         assert_eq!(
-            launch_summary(3, 3, true, false),
+            launch_summary(3, 3, true, true, false),
             "3 assets · 3 partitions · 1 backfill"
         );
         assert_eq!(
-            launch_summary(1, 400, true, false),
+            launch_summary(1, 400, true, true, false),
             "1 asset · 400 partitions · 1 backfill"
         );
     }

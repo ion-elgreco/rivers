@@ -45,7 +45,7 @@ pub struct PartitionDimensionInfo {
 /// Structured partition key for UI → gRPC submissions. Mirrors the
 /// shape of `rivers_api::ProtoPartitionKey` so the wire format carries
 /// `Single` vs `Multi` explicitly instead of relying on string parsing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SubmitPartitionKey {
     Single(String),
     /// `(dim_name, value)` pairs, one per dimension. The cartesian-
@@ -53,6 +53,43 @@ pub enum SubmitPartitionKey {
     /// `SubmitPartitionKey::Multi` already represents one concrete
     /// partition.
     Multi(Vec<(String, String)>),
+    /// Every single-dim key at index `start..=end` of `source`'s order. Expanded
+    /// into `Single` keys on the server, so a range never ships its keys to the
+    /// browser.
+    Span {
+        source: SpanSource,
+        start: u64,
+        end: u64,
+    },
+}
+
+/// Where a [`SubmitPartitionKey::Span`]'s keys come from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SpanSource {
+    Asset(String),
+    Dynamic(String),
+}
+
+/// Above this many partitions, a submit launches one backfill instead of a run each.
+pub const BACKFILL_THRESHOLD: u64 = 2;
+
+/// Whether `keys` submit as one backfill: past [`BACKFILL_THRESHOLD`], or
+/// holding a span, which only the backfill path expands.
+pub fn launches_backfill(keys: &[SubmitPartitionKey]) -> bool {
+    submit_partition_count(keys) > BACKFILL_THRESHOLD
+        || keys
+            .iter()
+            .any(|k| matches!(k, SubmitPartitionKey::Span { .. }))
+}
+
+/// How many partitions `keys` submit.
+pub fn submit_partition_count(keys: &[SubmitPartitionKey]) -> u64 {
+    keys.iter()
+        .map(|k| match k {
+            SubmitPartitionKey::Span { start, end, .. } => end - start + 1,
+            _ => 1,
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

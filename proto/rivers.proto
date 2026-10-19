@@ -141,6 +141,8 @@ message GetPartitionKeysResponse {
   // Size of the set the window is drawn from: the full partition count when
   // `query` is empty, otherwise the number of matching keys.
   uint64 total = 2;
+  // Each key's index in definition order, parallel to `keys`.
+  repeated uint64 indices = 3;
 }
 
 // Index of a single-dim key in definition order, for the picker's jump.

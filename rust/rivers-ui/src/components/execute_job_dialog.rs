@@ -14,11 +14,10 @@ use crate::components::partition_picker::{PartitionPicker, WholeAssetChoice};
 use crate::helpers::{JobPartitionPicker, close_on_navigation};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::mutations::{execute_job, launch_backfill};
-use crate::types::{AssetActionInfo, AssetDefinitionInfo, ResourceInfo, SubmitPartitionKey};
-
-/// Above this many selected partitions, submit one job-aware backfill instead of
-/// a run each (mirrors `MaterializeDialog`).
-const BACKFILL_THRESHOLD: usize = 2;
+use crate::types::{
+    AssetActionInfo, AssetDefinitionInfo, ResourceInfo, SubmitPartitionKey, launches_backfill,
+    submit_partition_count,
+};
 
 /// What a submit produced, so the success Effect navigates to the right page.
 #[derive(Clone)]
@@ -79,7 +78,7 @@ pub fn ExecuteJobDialog(
             let shown = verb.get_untracked().map(|v| v.name);
             let (ns, name) = loc.get_untracked();
             async move {
-                if keys.len() > BACKFILL_THRESHOLD {
+                if launches_backfill(&keys) {
                     // >2 partitions → one job-aware backfill. `None` selection: the
                     // server resolves the job's assets.
                     let r = launch_backfill(ns, name, None, keys, None, Some(job), shown, config)
@@ -128,8 +127,11 @@ pub fn ExecuteJobDialog(
         if matches!(picker.get(), JobPartitionPicker::None) {
             1
         } else {
-            selected.get().len()
+            selected.with(|k| submit_partition_count(k))
         }
+    });
+    let backfill = Memo::new(move |_| {
+        !matches!(picker.get(), JobPartitionPicker::None) && selected.with(|k| launches_backfill(k))
     });
 
     Effect::new(move |_| {
@@ -236,7 +238,7 @@ pub fn ExecuteJobDialog(
                                     "Submitting…".to_string()
                                 } else {
                                     let n = run_count.get();
-                                    if n > BACKFILL_THRESHOLD {
+                                    if backfill.get() {
                                         format!("Backfill {n} partitions")
                                     } else if n > 1 {
                                         format!("Execute {n} runs")

@@ -293,7 +293,8 @@ pub async fn get_partition_status(
     })
 }
 
-/// A window `[offset, offset+limit)` of an asset's keys plus the `total`, fetched on demand.
+/// A window `[offset, offset+limit)` of an asset's keys, each with its index in
+/// definition order, plus the `total`, fetched on demand.
 #[server]
 pub async fn get_partition_keys_page(
     loc_ns: String,
@@ -303,7 +304,7 @@ pub async fn get_partition_keys_page(
     query: String,
     offset: u64,
     limit: u64,
-) -> Result<(Vec<String>, u64), ServerFnError> {
+) -> Result<(Vec<(u64, String)>, u64), ServerFnError> {
     use rivers_api::rivers::GetPartitionKeysRequest;
 
     let state = expect_context::<crate::state::AppState>();
@@ -322,7 +323,10 @@ pub async fn get_partition_keys_page(
         .await
         .map_err(super::grpc_err)?
         .into_inner();
-    Ok((resp.keys, resp.total))
+    Ok((
+        resp.indices.into_iter().zip(resp.keys).collect(),
+        resp.total,
+    ))
 }
 
 /// Index of a key in definition order for the picker's jump; `-1` if absent.
@@ -355,7 +359,7 @@ pub async fn get_partition_key_index(
 
 /// Load a Dynamic partition set's full key list from storage.
 #[cfg(feature = "ssr")]
-async fn load_dynamic_partition_keys(
+pub(super) async fn load_dynamic_partition_keys(
     loc_ns: &str,
     loc_name: &str,
     dynamic_name: &str,
@@ -372,7 +376,8 @@ async fn load_dynamic_partition_keys(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// `[offset, offset+limit)` window of a Dynamic set's keys + total; `query` filters by substring.
+/// `[offset, offset+limit)` window of a Dynamic set's keys, each with its index in
+/// stored order, + total; `query` filters by substring.
 #[server]
 pub async fn get_dynamic_partition_keys_page(
     loc_ns: String,
@@ -381,15 +386,16 @@ pub async fn get_dynamic_partition_keys_page(
     query: String,
     offset: u64,
     limit: u64,
-) -> Result<(Vec<String>, u64), ServerFnError> {
+) -> Result<(Vec<(u64, String)>, u64), ServerFnError> {
     let all = load_dynamic_partition_keys(&loc_ns, &loc_name, &dynamic_name).await?;
-    let filtered: Vec<String> = if query.is_empty() {
-        all
-    } else {
-        all.into_iter().filter(|k| k.contains(&query)).collect()
-    };
+    let filtered: Vec<(u64, String)> = all
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| (i as u64, k))
+        .filter(|(_, k)| k.contains(&query))
+        .collect();
     let total = filtered.len() as u64;
-    let window: Vec<String> = filtered
+    let window: Vec<(u64, String)> = filtered
         .into_iter()
         .skip(offset as usize)
         .take(limit as usize)
