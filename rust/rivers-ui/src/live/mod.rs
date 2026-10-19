@@ -60,7 +60,7 @@ pub const LIVE_CHANNELS: &[LiveChannel] = &[
     LiveChannel {
         name: "backfills",
         event_name: "backfills-changed",
-        tables: &["backfills"],
+        tables: &["backfills", "backfill_runs", "backfill_outcomes"],
     },
     LiveChannel {
         name: "automation",

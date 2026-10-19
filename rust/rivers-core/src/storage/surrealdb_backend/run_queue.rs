@@ -117,22 +117,22 @@ impl SurrealStorage {
             .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
             .collect();
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
+        let links = BackfillRunRow::linked_now(backfill_id, &run_ids);
         let result = retry::with_retry(&self.retry_config, || async {
             self.db
-                .query(
+                .query(format!(
                     "BEGIN TRANSACTION;\n\
                      INSERT INTO runs $runs;\n\
                      INSERT INTO events $events;\n\
-                     UPDATE backfills SET run_ids = array::union(run_ids, $run_ids) \
-                         WHERE backfill_id = $backfill_id;\n\
-                     COMMIT TRANSACTION;",
-                )
+                     {LINK_BACKFILL_RUNS};\n\
+                     COMMIT TRANSACTION;"
+                ))
                 .bind(("runs", records.to_vec()))
                 .bind(("events", events.clone()))
-                .bind(("run_ids", run_ids.clone()))
-                .bind(("backfill_id", backfill_id.to_string()))
+                .bind(("links", links.clone()))
                 .await
-                .context("failed to enqueue backfill runs batch")?;
+                .context("failed to enqueue backfill runs batch")?
+                .check()?;
             Ok(())
         })
         .await;
@@ -162,21 +162,29 @@ impl SurrealStorage {
     /// create the run. Linked before the run exists, so a cancel cascade can
     /// always reach every child that will ever exist.
     pub async fn link_backfill_run(&self, backfill_id: &str, run_id: &str) -> Result<bool> {
+        let links = BackfillRunRow::linked_now(backfill_id, &[run_id.to_string()]);
         retry::with_retry(&self.retry_config, || async {
+            // The status is read again after the commit: a cancel writes the
+            // status before it reads the links, so one of the two sees the other.
             let mut result = self
                 .db
-                .query(
-                    "UPDATE backfills SET run_ids = array::union(run_ids, [$run_id]) \
-                         WHERE backfill_id = $id AND status = 'InProgress'; \
-                     SELECT count() AS total FROM backfills \
-                         WHERE backfill_id = $id AND status = 'InProgress' \
-                         AND $run_id IN run_ids GROUP ALL",
-                )
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     IF (SELECT VALUE status FROM backfills WHERE backfill_id = $id)[0] = 'InProgress' {{\n\
+                         {LINK_BACKFILL_RUNS};\n\
+                     }};\n\
+                     COMMIT TRANSACTION;\n\
+                     RETURN (SELECT VALUE status FROM backfills WHERE backfill_id = $id)[0] = 'InProgress' \
+                         AND (SELECT VALUE run_id FROM backfill_runs \
+                             WHERE backfill_id = $id AND run_id = $run_id) != [];"
+                ))
                 .bind(("id", backfill_id.to_string()))
                 .bind(("run_id", run_id.to_string()))
-                .await?;
-            let count: Option<u32> = result.take((1, "total"))?;
-            Ok(count.unwrap_or(0) > 0)
+                .bind(("links", links.clone()))
+                .await?
+                .check()?;
+            let linked: Option<bool> = result.take(3)?;
+            Ok(linked.unwrap_or(false))
         })
         .await
     }
@@ -196,7 +204,8 @@ impl SurrealStorage {
                 .query(
                     "UPDATE backfills SET status = 'Requested' \
                          WHERE backfill_id = $id AND status = 'InProgress' \
-                         AND array::len(run_ids) = 0 \
+                         AND (SELECT VALUE run_id FROM backfill_runs \
+                             WHERE backfill_id = $id LIMIT 1) = [] \
                          RETURN backfill_id",
                 )
                 .bind(("id", backfill_id.to_string()))

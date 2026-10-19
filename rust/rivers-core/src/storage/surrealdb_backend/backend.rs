@@ -779,13 +779,31 @@ impl StorageBackend for SurrealStorage {
     // ── Backfills ──
 
     async fn create_backfill(&self, backfill: &BackfillRecord) -> Result<()> {
+        let links = BackfillRunRow::linked_now(&backfill.backfill_id, &backfill.run_ids);
+        let outcomes = BackfillOutcomeRow::settled(
+            &backfill.backfill_id,
+            &backfill.completed_partitions,
+            &backfill.failed_partitions,
+            &backfill.canceled_partitions,
+        );
         let result = retry::with_retry(&self.retry_config, || async {
-            let _: Option<BackfillRecord> = self
-                .db
-                .create("backfills")
-                .content(backfill.clone())
+            self.db
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     CREATE backfills CONTENT object::remove($backfill, {BACKFILL_PROGRESS_COLUMNS});\n\
+                     CREATE backfill_keys CONTENT {{ backfill_id: $id, partition_keys: $keys }};\n\
+                     {LINK_BACKFILL_RUNS};\n\
+                     {RECORD_BACKFILL_OUTCOMES};\n\
+                     COMMIT TRANSACTION;"
+                ))
+                .bind(("backfill", backfill.clone()))
+                .bind(("id", backfill.backfill_id.clone()))
+                .bind(("keys", backfill.partition_keys.clone()))
+                .bind(("links", links.clone()))
+                .bind(("outcomes", outcomes.clone()))
                 .await
-                .context("failed to create backfill")?;
+                .context("failed to create backfill")?
+                .check()?;
             Ok(())
         })
         .await;
@@ -827,22 +845,20 @@ impl StorageBackend for SurrealStorage {
         failed: &[PartitionKey],
         canceled: &[PartitionKey],
     ) -> Result<()> {
+        let links = BackfillRunRow::linked_now(backfill_id, run_ids);
+        let outcomes = BackfillOutcomeRow::settled(backfill_id, completed, failed, canceled);
         retry::with_retry(&self.retry_config, || async {
             self.db
-                .query(
-                    "UPDATE backfills SET \
-                     run_ids = array::union(run_ids, $run_ids), \
-                     completed_partitions = array::union(completed_partitions, $completed), \
-                     failed_partitions = array::union(failed_partitions, $failed), \
-                     canceled_partitions = array::union(canceled_partitions, $canceled) \
-                     WHERE backfill_id = $id",
-                )
-                .bind(("id", backfill_id.to_string()))
-                .bind(("run_ids", run_ids.to_vec()))
-                .bind(("completed", completed.to_vec()))
-                .bind(("failed", failed.to_vec()))
-                .bind(("canceled", canceled.to_vec()))
-                .await?;
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     {LINK_BACKFILL_RUNS};\n\
+                     {RECORD_BACKFILL_OUTCOMES};\n\
+                     COMMIT TRANSACTION;"
+                ))
+                .bind(("links", links.clone()))
+                .bind(("outcomes", outcomes.clone()))
+                .await?
+                .check()?;
             Ok(())
         })
         .await
@@ -856,7 +872,7 @@ impl StorageBackend for SurrealStorage {
                 .bind(("id", backfill_id.to_string()))
                 .await?;
             let rows: Vec<BackfillRecord> = result.take(0)?;
-            Ok(rows.into_iter().next())
+            Ok(load_backfill_progress(&self.db, rows).await?.pop())
         })
         .await
     }
@@ -974,24 +990,6 @@ impl StorageBackend for SurrealStorage {
             any_canceled = true;
         }
 
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "UPDATE backfills SET \
-                     completed_partitions = $completed, \
-                     failed_partitions = $failed, \
-                     canceled_partitions = $canceled \
-                     WHERE backfill_id = $id",
-                )
-                .bind(("id", backfill_id.to_string()))
-                .bind(("completed", completed_pks.clone()))
-                .bind(("failed", failed_pks.clone()))
-                .bind(("canceled", canceled_pks.clone()))
-                .await?;
-            Ok(())
-        })
-        .await?;
-
         let new_status = if any_failed {
             BackfillStatus::CompletedFailed
         } else if any_canceled {
@@ -1000,9 +998,28 @@ impl StorageBackend for SurrealStorage {
             BackfillStatus::CompletedSuccess
         };
 
+        let outcomes =
+            BackfillOutcomeRow::settled(backfill_id, &completed_pks, &failed_pks, &canceled_pks);
         let now = now_nanos();
-        self.update_backfill_status(backfill_id, new_status.clone(), Some(now))
-            .await?;
+        retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     DELETE backfill_outcomes WHERE backfill_id = $id;\n\
+                     {RECORD_BACKFILL_OUTCOMES};\n\
+                     UPDATE backfills SET status = $status, end_time = $end_time \
+                         WHERE backfill_id = $id;\n\
+                     COMMIT TRANSACTION;"
+                ))
+                .bind(("id", backfill_id.to_string()))
+                .bind(("outcomes", outcomes.clone()))
+                .bind(("status", format!("{new_status:?}")))
+                .bind(("end_time", now))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await?;
         Ok(Some(new_status))
     }
 

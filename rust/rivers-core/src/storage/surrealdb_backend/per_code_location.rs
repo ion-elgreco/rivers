@@ -980,7 +980,7 @@ impl PerCodeLocationStorage for SurrealStorage {
         }
         let mut result = q.await?;
         let rows: Vec<BackfillRecord> = result.take(0)?;
-        Ok(rows)
+        load_backfill_progress(&self.db, rows).await
     }
 
     async fn set_pool_limit(

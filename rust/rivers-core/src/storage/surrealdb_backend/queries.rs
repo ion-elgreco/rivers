@@ -106,3 +106,23 @@ pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
              AND last_timestamp <= $deletion.timestamp; \
          }; \
      }";
+
+/// The requested keys, linked runs and settled keys of the backfills `$ids`.
+/// `IN` on the leading index column is one index scan per id.
+pub(super) const LOAD_BACKFILL_PROGRESS: &str = "\
+     SELECT backfill_id, partition_keys FROM backfill_keys WHERE backfill_id IN $ids; \
+     SELECT backfill_id, run_id, linked_at FROM backfill_runs \
+         WHERE backfill_id IN $ids ORDER BY linked_at; \
+     SELECT backfill_id, partition_key, outcome FROM backfill_outcomes WHERE backfill_id IN $ids;";
+
+/// The `backfills` columns kept in their own tables (see [`LOAD_BACKFILL_PROGRESS`]).
+pub(super) const BACKFILL_PROGRESS_COLUMNS: &str = "['partition_keys', 'run_ids', \
+     'completed_partitions', 'failed_partitions', 'canceled_partitions']";
+
+/// Link `$links` (`BackfillRunRow`s) to their backfill; a link that exists keeps its place.
+pub(super) const LINK_BACKFILL_RUNS: &str =
+    "INSERT INTO backfill_runs $links ON DUPLICATE KEY UPDATE linked_at = linked_at";
+
+/// Record `$outcomes` (`BackfillOutcomeRow`s); a key settled again takes the new outcome.
+pub(super) const RECORD_BACKFILL_OUTCOMES: &str =
+    "INSERT INTO backfill_outcomes $outcomes ON DUPLICATE KEY UPDATE outcome = $input.outcome";

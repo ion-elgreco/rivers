@@ -63,6 +63,8 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 | 8 | Run logs keep each failed attempt's traceback | 2, 7 |
 | 9 | Runs keep the config they were launched with | 2, 7 |
 | 10 | The run config is the launch document; stored rows are rewritten to it | 2, 10 |
+| 11 | Runs are indexed by code location, status and end time | 2, 10 |
+| 12 | A backfill's requested keys, runs and settled keys move into tables of their own | 12, 12 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
