@@ -1171,30 +1171,6 @@ code[title],
     font-size: var(--fs-xs);
     color: var(--text-muted);
 }
-/* Pushes the toggle button to the right edge of the banner */
-.attention-banner-spacer { flex: 1; }
-.attention-banner-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: transparent;
-    border: 0;
-    padding: 0;
-    font-family: var(--font-mono);
-    font-size: var(--fs-xs);
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: color 120ms ease;
-}
-.attention-banner-toggle:hover { color: var(--text); }
-.attention-banner-toggle-chevron {
-    display: inline-block;
-    font-size: var(--fs-md);
-    line-height: 1;
-    transform: rotate(90deg);
-    transition: transform 160ms ease;
-}
-.attention-banner-toggle-chevron--open { transform: rotate(270deg); }
 
 /* ── Rivers: FeaturedDonut — large 24h runs indicator ── */
 .featured-donut {

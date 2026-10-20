@@ -39,7 +39,6 @@ pub fn AssetsListPage() -> impl IntoView {
     let show_dialog = RwSignal::new(false);
     let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
-    let (attention_collapsed, set_attention_collapsed) = signal(true);
 
     let loc = use_current_location();
     // Single unfiltered fetch — all filtering happens client-side.
@@ -601,17 +600,10 @@ pub fn AssetsListPage() -> impl IntoView {
                     }
                 }
 
-                let collapsed_sig = Signal::derive(move || attention_collapsed.get());
-                let toggle_attention = Callback::new(move |_: ()| {
-                    set_attention_collapsed.update(|v| *v = !*v);
-                });
-                let is_collapsed = attention_collapsed.get();
                 view! {
                     <AttentionBanner
                         count=n_attention
                         breakdown=format!("{n_stale} stale · {n_missing} missing · {} up-to-date", healthy.len())
-                        collapsed=collapsed_sig
-                        on_toggle=toggle_attention
                     />
 
                     <div class="grid-table">
@@ -625,11 +617,11 @@ pub fn AssetsListPage() -> impl IntoView {
                             <span>"LAST MATERIALIZED"</span>
                             <span>"STATUS"</span>
                         </div>
-                        {(!is_collapsed).then(|| {
+                        {{
                             let (lns, lnm) = loc.get();
                             attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
-                        })}
-                        {(!is_collapsed && n_attention > 0 && !healthy.is_empty()).then(|| view! {
+                        }}
+                        {(n_attention > 0 && !healthy.is_empty()).then(|| view! {
                             <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:var(--fs-2xs); font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
                                 <span>{format!("HEALTHY · {}", healthy.len())}</span>
                                 <span style="flex:1; height:1px; background:var(--bg-highest)"></span>
