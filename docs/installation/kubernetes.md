@@ -120,6 +120,27 @@ spec:
     (required for HTTP-only registries unless `operator.allowInsecureRegistry`
     is enabled). `spec.tag` is ignored when `digest` is set.
 
+### Image rollouts
+
+Runs get the last *fully rolled-out* image. When the tag moves to a new
+digest, or you change `spec.tag` or `spec.digest`, the operator rolls the
+code-location pods to the new image. `status.resolvedImage` and the
+`SOURCE` column move only when every pod runs the new image and is
+ready; the `ImageResolved` condition names the digest being rolled out.
+A pod is ready once its module has loaded and its gRPC server answers
+the readiness probe. Until then runs and the UI keep the previous
+digest, and the CodeLocation stays `Ready` on it.
+
+While the rollout runs, `DeploymentAvailable` has reason `RollingOut`
+(`ProgressDeadlineExceeded` once it is stuck) and its message names the
+digest being rolled out and the one runs still use. If the new image's
+module does not load, `rivers serve` exits, and `status.message` and the
+end of the `DeploymentAvailable` message show
+`code location <image>@sha256:... failed to load (Error, exit code 1):`
+and the end of its log. Runs keep the previous digest until an image
+that loads rolls out. A first deployment stays `Deploying` until its
+first rollout completes.
+
 !!! warning "Identity is immutable"
     `spec.identity` is a UUID the mutating webhook stamps on creation
     and the validating webhook rejects changes to. It's the storage

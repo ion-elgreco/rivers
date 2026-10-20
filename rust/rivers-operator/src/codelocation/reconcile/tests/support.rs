@@ -874,3 +874,45 @@ pub(crate) async fn registry_outage(responses: Vec<ResponseTemplate>) -> Registr
         requests,
     }
 }
+
+/// Digest `c` of [`PIPELINE`].
+pub(crate) fn pipeline(c: char) -> String {
+    format!("{PIPELINE}@{}", digest(c))
+}
+
+/// Code location x in image mode on digest `target` of [`PIPELINE`],
+/// whose every pod ran digest `serving`.
+pub(crate) fn image_cl_at(target: char, serving: char) -> CodeLocation {
+    let mut cl = make_cl(json!({ "image": PIPELINE, "digest": digest(target) }));
+    cl.status = Some(
+        serde_json::from_value(json!({
+            "phase": "Ready",
+            "observedGeneration": 1,
+            "resolvedImage": pipeline(serving),
+            "source": pipeline(serving),
+            "readyReplicas": 1,
+        }))
+        .unwrap(),
+    );
+    cl
+}
+
+/// A pod of image-mode code location x that runs `image`.
+pub(crate) fn image_pod(name: &str, image: &str) -> Pod {
+    serde_json::from_value(json!({
+        "metadata": {
+            "name": name,
+            "namespace": "y",
+            "labels": crate::codelocation::resources::labels("x"),
+        },
+        "spec": { "containers": [{ "name": MAIN_CONTAINER, "image": image }] },
+        "status": {},
+    }))
+    .unwrap()
+}
+
+/// `state`'s Deployment once every pod runs its template and is ready.
+pub(crate) fn finish_rollout(state: &ApiState) {
+    let mut s = state.lock().unwrap();
+    s.deployments.get_mut("x").unwrap().status = rolled_out().status;
+}

@@ -11,7 +11,7 @@ use rivers_k8s::crd::code_location::{
 };
 
 use super::config::parse_refresh_interval;
-use super::{Context, FOLLOWER_WAIT, TERMINAL_RETRY};
+use super::{Context, TERMINAL_RETRY};
 use crate::codelocation::image_auth::resolve_auth;
 use crate::codelocation::registry::{
     ImageRef, RegistryAuth, RegistryError, Resolution, ResolveRequest,
@@ -24,7 +24,7 @@ pub(super) enum ImageOutcome {
         refresh_after: Duration,
         immutable: bool,
     },
-    /// Follower waiting for the leader to seed `status.resolvedImage`.
+    /// A follower: only the leader asks the registry.
     AwaitingLeader,
     Error(ImageError),
 }
@@ -132,17 +132,7 @@ async fn resolve_image_ref(
         .and_then(|a| a.get(IMMUTABLE_TAG_ANNOTATION))
         .is_some_and(|v| v == "true");
 
-    // Followers can serve status as long as the leader has already resolved
-    // the digest (we reuse whatever is currently in status.resolvedImage).
     if !ctx.leader.is_leader() {
-        if let Some(prev) = cl.status.as_ref().and_then(|s| s.resolved_image.clone()) {
-            return ImageOutcome::Resolved {
-                resolved_image: prev,
-                reason: REASON_DIGEST_RESOLVED,
-                refresh_after: FOLLOWER_WAIT,
-                immutable: false,
-            };
-        }
         return ImageOutcome::AwaitingLeader;
     }
 

@@ -19,12 +19,12 @@ use rivers_k8s::crd::run::RunSource;
 
 use super::image::ImageError;
 use super::rollout::{
-    GitRollout, build_failure_message, load_failure_message, observe_git_deployment,
+    GitRollout, Rollout, Template, build_failure_message, load_failure_message, observe_deployment,
     rollout_message,
 };
 use super::{Context, FIELD_MANAGER, TERMINAL_RETRY};
 use crate::codelocation::git;
-use crate::codelocation::resources::grpc_endpoint;
+use crate::codelocation::resources::{deployment_name, grpc_endpoint};
 
 /// A status of the git source, not yet replaced by the leader's first image
 /// pass after a switch to image mode.
@@ -126,8 +126,12 @@ pub(super) async fn patch_git_status(
 ) -> Result<bool, kube_client::Error> {
     let name = cl.name_any();
     let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
+    let deployment = deployments_api
+        .get_status(&deployment_name(&name))
+        .await
+        .ok();
     let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
-    let rollout = observe_git_deployment(&name, &deployments_api, &pods_api).await;
+    let rollout = observe_deployment(&name, deployment.as_ref(), &pods_api).await;
     let complete = rollout.complete;
     let update = GitStatusUpdate {
         resolution,
@@ -141,30 +145,39 @@ pub(super) async fn patch_git_status(
     Ok(complete && status.phase == Some(CodeLocationPhase::Ready))
 }
 
-/// Git-mode status. Runs get the serving tree: the pod template's once every
-/// pod runs it and is ready, until then the prior status's — a commit that
-/// is still building, or fails to build or load, never reaches a run. A
-/// rollout in progress or stuck shows on `DeploymentAvailable`, not in the
-/// phase, with the error of a failed build or load of its tree, which
-/// `status.message` also shows unless a resolution error is there. An object the API server
-/// refused shows the same way: the cluster still runs what it ran before,
-/// so the serving tree serves on; with no serving tree the phase is Failed.
-pub(super) fn git_status(
+/// What a pass publishes of a rollout, in either mode. Runs get the serving
+/// template: the pod template's once every pod runs it and is ready, until
+/// then `prior_serving` — a template that is still building, or fails to
+/// build or load, never reaches a run. A rollout in progress or stuck shows
+/// on `DeploymentAvailable`, not in the phase, with the error of a failed
+/// build or load of its template. An object the API server refused shows
+/// the same way: the cluster still runs what it ran before, so the serving
+/// template serves on; with no serving template the phase is Failed.
+struct RolloutStatus<T> {
+    serving: Option<T>,
+    ready: bool,
+    failed: bool,
+    phase: CodeLocationPhase,
+    reason: &'static str,
+    message: Option<String>,
+    /// A failed build or load of the template rolling out.
+    pod_failure: Option<String>,
+}
+
+fn rollout_status<T: Template>(
     cl: &CodeLocation,
-    update: GitStatusUpdate,
-    at: jiff::Timestamp,
-) -> CodeLocationStatus {
-    let now = &at.to_string();
-    let prior = cl.status.as_ref();
-    let rollout = &update.rollout;
+    rollout: &Rollout<T>,
+    prior_serving: Option<T>,
+    apply_failure: Option<&str>,
+) -> RolloutStatus<T> {
     let serving = match &rollout.template {
         Some(template) if rollout.complete => Some(template.clone()),
-        _ => prior.and_then(|s| s.run_source.clone()),
+        _ => prior_serving,
     };
     let desired = cl.spec.replicas;
     let ready =
         serving.is_some() && desired > 0 && rollout.ready_replicas.is_some_and(|r| r >= desired);
-    let failed = update.apply_failure.is_some() && serving.is_none();
+    let failed = apply_failure.is_some() && serving.is_none();
     let pod_failure = rollout.template.as_ref().and_then(|target| {
         let build = rollout
             .build_failure
@@ -177,10 +190,10 @@ pub(super) fn git_status(
                 .map(|f| load_failure_message(target, f))
         })
     });
-    let (deployment_reason, deployment_message) = if let Some(failure) = &update.apply_failure {
+    let (reason, message) = if let Some(failure) = apply_failure {
         let message = match &serving {
-            Some(serving) => format!("{failure}; runs use {}", source_display(serving)),
-            None => failure.clone(),
+            Some(serving) => format!("{failure}; runs use {}", serving.describe(None)),
+            None => failure.to_string(),
         };
         (REASON_APPLY_FAILED, Some(message))
     } else if rollout.ready_replicas.is_none() {
@@ -213,15 +226,42 @@ pub(super) fn git_status(
     } else {
         CodeLocationPhase::Deploying
     };
+    RolloutStatus {
+        serving,
+        ready,
+        failed,
+        phase,
+        reason,
+        message,
+        pod_failure,
+    }
+}
+
+/// Git-mode status: the serving tree of [`rollout_status`], and
+/// `status.message` shows a resolution error before the Deployment's.
+pub(super) fn git_status(
+    cl: &CodeLocation,
+    update: GitStatusUpdate,
+    at: jiff::Timestamp,
+) -> CodeLocationStatus {
+    let now = &at.to_string();
+    let prior = cl.status.as_ref();
+    let rollout = rollout_status(
+        cl,
+        &update.rollout,
+        prior.and_then(|s| s.run_source.clone()),
+        update.apply_failure.as_deref(),
+    );
+    let serving = rollout.serving;
     let mut status = CodeLocationStatus {
         resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
-        grpc_endpoint: (!failed).then_some(update.endpoint),
-        ready_replicas: rollout.ready_replicas.filter(|_| !failed),
+        grpc_endpoint: (!rollout.failed).then_some(update.endpoint),
+        ready_replicas: update.rollout.ready_replicas.filter(|_| !rollout.failed),
         source: serving.as_ref().map(source_display),
         resolved_commit: serving.as_ref().map(|t| t.git.commit.clone()),
         resolved_ref: serving.as_ref().and_then(|t| t.git.r#ref.clone()),
         run_source: serving,
-        ..next_status(cl, phase, now)
+        ..next_status(cl, rollout.phase, now)
     };
     match update.resolution {
         Some(GitResolution::ImageResolved {
@@ -285,9 +325,9 @@ pub(super) fn git_status(
         &mut status,
         prior,
         CONDITION_DEPLOYMENT_AVAILABLE,
-        if ready { "True" } else { "False" },
-        deployment_reason,
-        deployment_message,
+        if rollout.ready { "True" } else { "False" },
+        rollout.reason,
+        rollout.message,
         now,
     );
     // A resolution error first: until it clears, no commit that fixes the
@@ -302,7 +342,120 @@ pub(super) fn git_status(
         })
         .and_then(|c| c.message.clone())
         .or(update.apply_failure)
-        .or(pod_failure);
+        .or(rollout.pod_failure);
+    status
+}
+
+/// The leader's pass over an image-mode CL.
+pub(super) struct ImagePass {
+    /// The digest reference the Deployment now rolls out.
+    pub(super) image: String,
+    pub(super) image_reason: &'static str,
+    /// Why the git workspace of an earlier git source stays, while it does.
+    pub(super) workspace_kept: Option<(&'static str, String)>,
+}
+
+pub(super) struct ImageStatusUpdate {
+    /// `None` on followers: resolution and the git workspace are the leader's.
+    pub(super) leader: Option<ImagePass>,
+    pub(super) rollout: Rollout<String>,
+    pub(super) endpoint: String,
+}
+
+/// Publish image-mode CL `cl`'s status for what `deployment` shows now and
+/// for the leader's pass, if this is one. Returns whether `cl` is Ready with
+/// every pod on the current template.
+pub(super) async fn patch_image_status(
+    cl: &CodeLocation,
+    ctx: &Context,
+    namespace: &str,
+    deployment: Option<&Deployment>,
+    leader: Option<ImagePass>,
+) -> Result<bool, kube_client::Error> {
+    let name = cl.name_any();
+    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let rollout = observe_deployment(&name, deployment, &pods_api).await;
+    let complete = rollout.complete;
+    let update = ImageStatusUpdate {
+        leader,
+        rollout,
+        endpoint: grpc_endpoint(&name, namespace, cl.spec.grpc_port),
+    };
+    let status = image_status(cl, update, jiff::Timestamp::now());
+    let code_locations_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), namespace);
+    patch_status(&code_locations_api, cl, &status).await?;
+    Ok(complete && status.phase == Some(CodeLocationPhase::Ready))
+}
+
+/// Image-mode status: `resolvedImage` is the serving image of
+/// [`rollout_status`], the one runs get; `ImageResolved` names the one
+/// rolling out. A git status names the runtime image, which serves no run
+/// of the image, so after a switch from git nothing serves until the image
+/// has rolled out.
+pub(super) fn image_status(
+    cl: &CodeLocation,
+    update: ImageStatusUpdate,
+    at: jiff::Timestamp,
+) -> CodeLocationStatus {
+    let now = &at.to_string();
+    let prior = cl.status.as_ref();
+    let prior_serving = prior
+        .filter(|s| !is_git_status(s))
+        .and_then(|s| s.resolved_image.clone());
+    let rollout = rollout_status(cl, &update.rollout, prior_serving, None);
+    let mut status = CodeLocationStatus {
+        phase: Some(rollout.phase),
+        observed_generation: cl.metadata.generation,
+        grpc_endpoint: Some(update.endpoint),
+        last_reconciled: Some(now.clone()),
+        ready_replicas: update.rollout.ready_replicas,
+        message: rollout.pod_failure,
+        // The pinned digest ref doubles as the Source column.
+        source: rollout.serving.clone(),
+        resolved_image: rollout.serving,
+        ..Default::default()
+    };
+    match &update.leader {
+        Some(pass) => push_condition(
+            &mut status,
+            prior,
+            CONDITION_IMAGE_RESOLVED,
+            "True",
+            pass.image_reason,
+            Some(pass.image.clone()),
+            now,
+        ),
+        None => status
+            .conditions
+            .extend(kept_conditions(prior, &[CONDITION_IMAGE_RESOLVED])),
+    }
+    push_condition(
+        &mut status,
+        prior,
+        CONDITION_DEPLOYMENT_AVAILABLE,
+        if rollout.ready { "True" } else { "False" },
+        rollout.reason,
+        rollout.message,
+        now,
+    );
+    match update.leader {
+        Some(ImagePass {
+            workspace_kept: Some((reason, message)),
+            ..
+        }) => push_condition(
+            &mut status,
+            prior,
+            CONDITION_WORKSPACE_KEPT,
+            "True",
+            reason,
+            Some(message),
+            now,
+        ),
+        Some(_) => {}
+        None => status
+            .conditions
+            .extend(kept_conditions(prior, &[CONDITION_WORKSPACE_KEPT])),
+    }
     status
 }
 

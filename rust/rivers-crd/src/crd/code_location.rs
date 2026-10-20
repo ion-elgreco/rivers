@@ -346,10 +346,12 @@ pub struct CodeLocationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
 
-    /// Fully-qualified digest reference (`repo@sha256:...`) that the
-    /// reconciler has pinned. For multi-arch images this is the index digest,
-    /// so each node can still descend into per-platform manifests at pull time.
-    /// In git mode, `runSource.runtimeImage`.
+    /// Fully-qualified digest reference (`repo@sha256:...`) of the image
+    /// every code-location pod ran and was ready on: runs get it. A new digest
+    /// takes over only when its rollout finishes; condition `ImageResolved`
+    /// names the one rolling out. For multi-arch images this is the index
+    /// digest, so each node can still descend into per-platform manifests at
+    /// pull time. In git mode, `runSource.runtimeImage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_image: Option<String>,
 

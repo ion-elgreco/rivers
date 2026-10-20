@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use kube_runtime::controller::Action;
 use rivers_k8s::crd::code_location::*;
+use rivers_k8s::crd::run::RunSource;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -13,7 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::support::*;
 use crate::codelocation::git;
 use crate::codelocation::reconcile::TERMINAL_RETRY;
-use crate::codelocation::reconcile::rollout::template_source;
+use crate::codelocation::reconcile::rollout::template_of;
 use crate::leader::LeaderGate;
 
 #[tokio::test]
@@ -72,7 +73,7 @@ async fn a_git_resolution_error_keeps_status_message_over_a_failed_build() {
         let rollout = deployment.status.as_mut().unwrap();
         rollout.ready_replicas = Some(0);
         rollout.available_replicas = Some(0);
-        let main = template_source(deployment).unwrap();
+        let main = template_of::<RunSource>(deployment).unwrap();
         let pod = code_location_pod(
             "x-1",
             &main,
@@ -473,7 +474,7 @@ async fn https_code_location_fetches_with_a_password_file_that_ends_in_a_newline
     );
     let deployment = state.lock().unwrap().deployments["x"].clone();
     assert_eq!(
-        template_source(&deployment).map(|source| source.git.commit),
+        template_of::<RunSource>(&deployment).map(|source| source.git.commit),
         Some(commit('a'))
     );
 }

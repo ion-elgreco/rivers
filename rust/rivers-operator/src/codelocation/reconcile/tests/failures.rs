@@ -329,3 +329,50 @@ async fn a_complete_rollout_reads_no_pods() {
         .collect();
     assert!(pod_reads.is_empty(), "{pod_reads:?}");
 }
+
+#[tokio::test]
+async fn an_image_that_fails_to_load_shows_in_status_while_runs_keep_the_serving_digest() {
+    let state = api_with(image_cl_at('b', 'a'), mid_rollout());
+    // The new image does not import its module: its pod never gets
+    // ready, so the old pod serves digest a.
+    let traceback =
+        "Traceback (most recent call last):\n  ...\nModuleNotFoundError: No module named 'x'\n";
+    add_pods(
+        &state,
+        [
+            image_pod("x-a", &pipeline('a')),
+            failed_load(
+                image_pod("x-b", &pipeline('b')),
+                traceback,
+                "2026-10-03T00:00:00Z",
+            ),
+        ],
+    );
+
+    let status = pass(&state, LeaderGate::leading())
+        .await
+        .expect("status patch");
+
+    let failure = format!(
+        "code location {} failed to load (Error, exit code 1): {}",
+        pipeline('b'),
+        traceback.trim()
+    );
+    assert_eq!(status["message"], failure, "{status}");
+    let available = format!(
+        "rolling out {}; runs use {}; {failure}",
+        pipeline('b'),
+        pipeline('a')
+    );
+    assert_eq!(
+        says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+        ("True", REASON_ROLLING_OUT, available.as_str())
+    );
+    assert_eq!(status["phase"], "Ready");
+    assert_eq!(status["resolvedImage"], pipeline('a'));
+    assert_eq!(status["source"], pipeline('a'));
+    // The same failure in the next passes: nothing new to write, from
+    // either replica.
+    assert_eq!(pass(&state, LeaderGate::leading()).await, None);
+    assert_eq!(pass(&state, LeaderGate::new()).await, None);
+}
