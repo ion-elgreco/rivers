@@ -11,7 +11,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use common::{
-    Reply, fresh_mount_target, install_routing_fetch_mock, nav_to, query_all, wait_until,
+    Reply, click, fresh_mount_target, install_routing_fetch_mock, nav_to, query_all, query_one,
+    wait_until,
 };
 use leptos::mount::mount_to;
 use leptos::prelude::*;
@@ -89,6 +90,13 @@ fn row_count(host: &web_sys::HtmlElement) -> usize {
     query_all(host, ".grid-table a.grid-row").len()
 }
 
+fn header_text(host: &web_sys::HtmlElement) -> String {
+    query_all(host, ".topbar-subtitle")
+        .first()
+        .and_then(|e| e.text_content())
+        .unwrap_or_default()
+}
+
 /// With no asset materialized yet, every asset needs attention; the table
 /// must list them without a click.
 #[wasm_bindgen_test]
@@ -112,5 +120,84 @@ async fn assets_needing_attention_are_listed() {
     assert!(
         query_all(&host, ".attention-banner button").is_empty(),
         "the banner must not offer to hide the rows"
+    );
+}
+
+/// A code location reload adds an asset; after the next fetch the header
+/// must count the same assets as the table lists.
+#[wasm_bindgen_test]
+async fn header_counts_follow_the_listed_assets() {
+    let assets = Rc::new(RefCell::new(records(&[
+        ("orders", "Missing"),
+        ("revenue", "Missing"),
+    ])));
+    let (host, _mock) = mount_assets_page(assets.clone());
+
+    assert!(
+        wait_until(|| row_count(&host) == 2).await,
+        "first fetch never listed 2 rows"
+    );
+    assert!(
+        wait_until(|| header_text(&host).starts_with("2 assets")).await,
+        "header: {:?}",
+        header_text(&host)
+    );
+
+    *assets.borrow_mut() = records(&[
+        ("orders", "Missing"),
+        ("revenue", "Missing"),
+        ("weekly_revenue", "Missing"),
+    ]);
+    click(&query_one(&host, ".live-chip-refresh"), false);
+
+    assert!(
+        wait_until(|| row_count(&host) == 3).await,
+        "refetch never listed 3 rows"
+    );
+    assert!(
+        wait_until(|| header_text(&host).starts_with("3 assets")).await,
+        "header after reload: {:?}",
+        header_text(&host)
+    );
+    assert!(
+        header_text(&host).contains("3 missing"),
+        "header after reload: {:?}",
+        header_text(&host)
+    );
+}
+
+/// The code location defines `weekly_revenue` before storage has its record,
+/// and storage still holds `old_report`, which it no longer defines. The page
+/// lists what the code location defines, and the header counts that list.
+#[wasm_bindgen_test]
+async fn assets_follow_the_code_location_definitions() {
+    let mut store = records(&[("orders", "Missing"), ("old_report", "Missing")]);
+    store.definitions = format!(
+        "[{},{}]",
+        definition("orders"),
+        definition("weekly_revenue")
+    );
+    let (host, _mock) = mount_assets_page(Rc::new(RefCell::new(store)));
+
+    let keys = || -> Vec<String> {
+        query_all(&host, ".grid-table a.grid-row .grid-cell-mono")
+            .iter()
+            .filter_map(|e| e.text_content())
+            .collect()
+    };
+    assert!(
+        wait_until(|| keys() == ["orders", "weekly_revenue"]).await,
+        "rows: {:?}",
+        keys()
+    );
+    assert!(
+        header_text(&host).starts_with("2 assets"),
+        "header: {:?}",
+        header_text(&host)
+    );
+    assert!(
+        header_text(&host).contains("2 missing"),
+        "header: {:?}",
+        header_text(&host)
     );
 }

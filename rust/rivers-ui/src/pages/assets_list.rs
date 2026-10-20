@@ -57,8 +57,11 @@ pub fn AssetsListPage() -> impl IntoView {
         |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
 
-    let all_records =
-        move || -> Vec<AssetRecord> { all_assets.get().and_then(|r| r.ok()).unwrap_or_default() };
+    let all_records = move || -> Vec<AssetRecord> {
+        let records = all_assets.get().and_then(|r| r.ok()).unwrap_or_default();
+        let definitions = assets_info.get().and_then(|r| r.ok());
+        crate::helpers::defined_assets(records, definitions.as_deref())
+    };
 
     let unique_tags = move || {
         let mut tags: Vec<String> = all_records().iter().flat_map(|r| r.tags.clone()).collect();
