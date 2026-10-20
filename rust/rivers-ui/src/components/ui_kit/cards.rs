@@ -216,10 +216,6 @@ pub fn BottleneckCard(
 }
 
 /// "N assets need attention" warning banner with optional sub-breakdown.
-///
-/// When both `collapsed` and `on_toggle` are supplied, the banner shows a
-/// Collapse/Expand button with chevron on the right — mirrors the Rivers
-/// `setAttentionOpen` pattern on the AssetsScreen.
 #[component]
 pub fn AttentionBanner(
     #[prop(into)] count: usize,
@@ -227,10 +223,6 @@ pub fn AttentionBanner(
     #[prop(optional, into)]
     breakdown: Option<String>,
     #[prop(optional, into, default = "asset".to_string())] noun: String,
-    /// Current collapsed state. When present (with `on_toggle`), shows the toggle button.
-    #[prop(optional, into)]
-    collapsed: Option<Signal<bool>>,
-    #[prop(optional, into)] on_toggle: Option<Callback<()>>,
 ) -> impl IntoView {
     if count == 0 {
         return view! { <></> }.into_any();
@@ -240,22 +232,6 @@ pub fn AttentionBanner(
     } else {
         format!("{noun}s")
     };
-    let toggle_view = match (collapsed, on_toggle) {
-        (Some(c), Some(cb)) => Some(view! {
-            <button
-                class="attention-banner-toggle"
-                aria-expanded=move || (!c.get()).to_string()
-                on:click=move |_| cb.run(())
-            >
-                <span class="attention-banner-toggle-label">{move || if c.get() { "Expand" } else { "Collapse" }}</span>
-                <span
-                    class="attention-banner-toggle-chevron"
-                    class:attention-banner-toggle-chevron--open=move || !c.get()
-                >"›"</span>
-            </button>
-        }),
-        _ => None,
-    };
     view! {
         <div class="attention-banner">
             <span class="attention-banner-dot"></span>
@@ -263,7 +239,6 @@ pub fn AttentionBanner(
                 <strong>{count}</strong> " " {plural} {if count == 1 { " needs" } else { " need" }} " attention"
             </span>
             {breakdown.map(|b| view! { <span class="attention-banner-sub">{b}</span> })}
-            {toggle_view.map(|t| view! { <span class="attention-banner-spacer"></span> {t} })}
         </div>
     }
     .into_any()
