@@ -224,10 +224,10 @@ minute for a server error (HTTP 5xx), a conflict or throttling.
 
 | Field | Meaning |
 | --- | --- |
-| `status.source` | The `SOURCE` column of `kubectl get rcl`: `main@9f3c1ab` in git mode, `repo@sha256:abc1234` in image mode. |
+| `status.source` | The `SOURCE` column of `kubectl get rcl`: `main@9f3c1ab` in git mode, `repo@sha256:abc1234` in image mode. Moves only when a rollout finishes. |
 | `status.resolvedCommit` | The full commit of `runSource`. |
 | `status.resolvedRef` | The ref that commit came from, such as `refs/heads/main`. Absent for a pinned commit. |
 | `status.lastFetchedAt` | The last fetch of `spec.git.ref` from the git host. Absent for a pinned commit. |
 | `status.runSource` | The source runs get: url, commit, path, Secret, dependencies and the runtime image that built the tree. Moves only when a rollout finishes. |
-| `status.resolvedImage` | The digest of the runtime image; `runSource.runtimeImage` in git mode. |
+| `status.resolvedImage` | The digest of the image every pod runs and is ready on, which runs get; `runSource.runtimeImage` in git mode. Moves only when a rollout finishes. |
 | `status.message` | The current error, if any. |

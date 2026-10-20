@@ -1,34 +1,75 @@
-//! What the git Deployment and its pods show: the tree the template runs,
-//! how far it has rolled out, and a failed build or load of it.
+//! What the Deployment and its pods show: what the pod template runs, how
+//! far it has rolled out, and a failed build or load of it.
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
 use k8s_openapi::api::core::v1::{
-    ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
+    Container, ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
 };
 use kube_client::api::{Api, ListParams};
-use rivers_k8s::crd::code_location::{
-    CodeLocation, CodeLocationPhase, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
-    REASON_PROGRESS_DEADLINE, REASON_ROLLING_OUT,
-};
 use rivers_k8s::crd::run::RunSource;
 use rivers_k8s::workspace;
 
 use super::status::source_display;
-use crate::codelocation::resources::{MAIN_CONTAINER, deployment_name, labels};
+use crate::codelocation::resources::{MAIN_CONTAINER, labels};
 
-/// Read the git Deployment and, until its rollout is complete, its pods,
-/// without mutating anything — shared by the leader (post-apply) and
-/// follower (status refresh) paths, so both publish the same status.
-pub(super) async fn observe_git_deployment(
+/// What a code-location pod runs, by which a rollout tells the pods of the
+/// current template from the old ones: the git tree, or in image mode the
+/// image.
+pub(super) trait Template: Clone + PartialEq + Default {
+    fn of_pod(spec: &PodSpec) -> Option<Self>;
+
+    /// How status messages name it, beside `other` in the same message.
+    fn describe(&self, other: Option<&Self>) -> String;
+}
+
+/// The tree of a git code-location pod: its main container's
+/// `RIVERS_RUN_SOURCE`.
+impl Template for RunSource {
+    fn of_pod(spec: &PodSpec) -> Option<Self> {
+        let source = main_container(spec)?
+            .env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)?
+            .value
+            .as_deref()?;
+        serde_json::from_str(source).ok()
+    }
+
+    fn describe(&self, other: Option<&Self>) -> String {
+        let source = source_display(self);
+        if other.is_some_and(|other| other.runtime_image != self.runtime_image) {
+            format!("{source} on {}", self.runtime_image)
+        } else {
+            source
+        }
+    }
+}
+
+/// The image of an image-mode code-location pod's main container.
+impl Template for String {
+    fn of_pod(spec: &PodSpec) -> Option<Self> {
+        main_container(spec)?.image.clone()
+    }
+
+    fn describe(&self, _other: Option<&Self>) -> String {
+        self.clone()
+    }
+}
+
+fn main_container(spec: &PodSpec) -> Option<&Container> {
+    spec.containers.iter().find(|c| c.name == MAIN_CONTAINER)
+}
+
+/// Read code location `name`'s pods while `deployment`'s rollout is not
+/// complete, without mutating anything — shared by the leader (post-apply)
+/// and follower (status refresh) paths, so both publish the same status.
+pub(super) async fn observe_deployment<T: Template>(
     name: &str,
-    deployments_api: &Api<Deployment>,
+    deployment: Option<&Deployment>,
     pods_api: &Api<Pod>,
-) -> GitRollout {
-    let deployment = deployments_api
-        .get_status(&deployment_name(name))
-        .await
-        .ok();
-    let mut rollout = git_rollout(deployment.as_ref());
+) -> Rollout<T> {
+    let mut rollout = deployment_rollout(deployment);
     let Some(template) = rollout.template.as_ref().filter(|_| !rollout.complete) else {
         return rollout;
     };
@@ -48,39 +89,23 @@ pub(super) async fn observe_git_deployment(
         Err(error) => tracing::warn!(
             code_location = name,
             %error,
-            "could not list the code-location pods; their build errors are not shown"
+            "could not list the code-location pods; their failures are not shown"
         ),
     }
     rollout
 }
 
-/// The tree `deployment`'s pod template runs.
-pub(super) fn template_source(deployment: &Deployment) -> Option<RunSource> {
-    pod_source(deployment.spec.as_ref()?.template.spec.as_ref()?)
-}
-
-/// The tree a code-location pod runs: its main container's
-/// `RIVERS_RUN_SOURCE`.
-fn pod_source(spec: &PodSpec) -> Option<RunSource> {
-    let source = spec
-        .containers
-        .iter()
-        .find(|c| c.name == MAIN_CONTAINER)?
-        .env
-        .as_ref()?
-        .iter()
-        .find(|e| e.name == rivers_k8s::env::ENV_RUN_SOURCE)?
-        .value
-        .as_deref()?;
-    serde_json::from_str(source).ok()
+/// What `deployment`'s pod template runs.
+pub(super) fn template_of<T: Template>(deployment: &Deployment) -> Option<T> {
+    T::of_pod(deployment.spec.as_ref()?.template.spec.as_ref()?)
 }
 
 /// The newest failed run of the `workspace` init container among the pods
 /// that run `template`. A container whose last run succeeded has none, even
 /// if a run before it failed.
-pub(super) fn newest_build_failure(
+pub(super) fn newest_build_failure<T: Template>(
     pods: &[Pod],
-    template: &RunSource,
+    template: &T,
 ) -> Option<ContainerStateTerminated> {
     newest_failure(pods, template, |status| {
         status
@@ -93,9 +118,9 @@ pub(super) fn newest_build_failure(
 
 /// The newest failed run of the main container among the pods that run
 /// `template`: `rivers serve` exits when the module does not load.
-pub(super) fn newest_load_failure(
+pub(super) fn newest_load_failure<T: Template>(
     pods: &[Pod],
-    template: &RunSource,
+    template: &T,
 ) -> Option<ContainerStateTerminated> {
     newest_failure(pods, template, |status| {
         status
@@ -106,13 +131,13 @@ pub(super) fn newest_load_failure(
     })
 }
 
-fn newest_failure(
+fn newest_failure<T: Template>(
     pods: &[Pod],
-    template: &RunSource,
+    template: &T,
     container: impl Fn(&PodStatus) -> Option<&ContainerStatus>,
 ) -> Option<ContainerStateTerminated> {
     pods.iter()
-        .filter(|pod| pod.spec.as_ref().and_then(pod_source).as_ref() == Some(template))
+        .filter(|pod| pod.spec.as_ref().and_then(T::of_pod).as_ref() == Some(template))
         .filter_map(|pod| {
             let container = container(pod.status.as_ref()?)?;
             let last_run = match container.state.as_ref().and_then(|s| s.terminated.as_ref()) {
@@ -125,11 +150,11 @@ fn newest_failure(
         .map(|(last_run, _)| last_run.clone())
 }
 
-/// What the git Deployment shows: the tree its pod template runs, and how
-/// far that template has rolled out.
+/// What the Deployment shows: what its pod template runs, and how far that
+/// template has rolled out.
 #[derive(Debug, Default)]
-pub(super) struct GitRollout {
-    pub(super) template: Option<RunSource>,
+pub(super) struct Rollout<T> {
+    pub(super) template: Option<T>,
     /// Every pod runs the current template and is ready.
     pub(super) complete: bool,
     /// `None` when the Deployment or its status could not be read.
@@ -139,16 +164,18 @@ pub(super) struct GitRollout {
     /// template's tree in its pods.
     pub(super) build_failure: Option<ContainerStateTerminated>,
     /// While the rollout is not complete: the newest exit of a pod of the
-    /// template's tree that built it but could not load it.
+    /// template that could not load its code location.
     pub(super) load_failure: Option<ContainerStateTerminated>,
 }
 
-pub(super) fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
+pub(super) type GitRollout = Rollout<RunSource>;
+
+pub(super) fn deployment_rollout<T: Template>(deployment: Option<&Deployment>) -> Rollout<T> {
     let Some((deployment, status)) = deployment.and_then(|d| Some((d, d.status.as_ref()?))) else {
-        return GitRollout::default();
+        return Rollout::default();
     };
-    GitRollout {
-        template: template_source(deployment),
+    Rollout {
+        template: template_of(deployment),
         complete: rollout_complete(deployment),
         ready_replicas: Some(status.ready_replicas.unwrap_or(0)),
         deadline_exceeded: generation_observed(deployment)
@@ -195,33 +222,24 @@ fn generation_observed(deployment: &Deployment) -> bool {
     )
 }
 
-/// Names the tree being rolled out and the tree runs keep meanwhile; `None`
-/// when the rollout does not change the tree.
-pub(super) fn rollout_message(
-    target: Option<&RunSource>,
-    serving: Option<&RunSource>,
+/// Names what is being rolled out and what runs keep meanwhile; `None`
+/// when the rollout does not change what runs get.
+pub(super) fn rollout_message<T: Template>(
+    target: Option<&T>,
+    serving: Option<&T>,
     stuck: bool,
 ) -> Option<String> {
     let target = target.filter(|t| Some(*t) != serving)?;
-    let with_image = serving.is_some_and(|s| s.runtime_image != target.runtime_image);
-    let describe = |tree: &RunSource| {
-        let source = source_display(tree);
-        if with_image {
-            format!("{source} on {}", tree.runtime_image)
-        } else {
-            source
-        }
-    };
     let rollout = if stuck {
         format!(
             "rollout of {} exceeded its progress deadline",
-            describe(target)
+            target.describe(serving)
         )
     } else {
-        format!("rolling out {}", describe(target))
+        format!("rolling out {}", target.describe(serving))
     };
     Some(match serving {
-        Some(serving) => format!("{rollout}; runs use {}", describe(serving)),
+        Some(serving) => format!("{rollout}; runs use {}", serving.describe(Some(target))),
         None => rollout,
     })
 }
@@ -229,24 +247,24 @@ pub(super) fn rollout_message(
 /// `workspace build of main@9f3c1ab failed (Error, exit code 1): <its
 /// termination message>`. No times or restart counts: every pass over the
 /// same failure says the same, so it writes the status once.
-pub(super) fn build_failure_message(
-    target: &RunSource,
+pub(super) fn build_failure_message<T: Template>(
+    target: &T,
     failed: &ContainerStateTerminated,
 ) -> String {
     failure_message(
-        format!("workspace build of {} failed", source_display(target)),
+        format!("workspace build of {} failed", target.describe(None)),
         failed,
     )
 }
 
 /// `code location main@9f3c1ab failed to load (Error, exit code 1): <the
 /// end of its log>`, worded once per failure like [`build_failure_message`].
-pub(super) fn load_failure_message(
-    target: &RunSource,
+pub(super) fn load_failure_message<T: Template>(
+    target: &T,
     failed: &ContainerStateTerminated,
 ) -> String {
     failure_message(
-        format!("code location {} failed to load", source_display(target)),
+        format!("code location {} failed to load", target.describe(None)),
         failed,
     )
 }
@@ -263,37 +281,6 @@ fn failure_message(what_failed: String, failed: &ContainerStateTerminated) -> St
     }
 }
 
-pub(super) fn evaluate_deployment_phase(
-    cl: &CodeLocation,
-    status: Option<&Deployment>,
-) -> (CodeLocationPhase, Option<i32>, &'static str, bool) {
-    let desired = cl.spec.replicas;
-    let Some(d) = status.and_then(|d| d.status.clone()) else {
-        return (
-            CodeLocationPhase::Deploying,
-            None,
-            REASON_NO_DEPLOYMENT_STATUS,
-            false,
-        );
-    };
-    let ready = d.ready_replicas.unwrap_or(0);
-    if ready >= desired && desired > 0 {
-        (
-            CodeLocationPhase::Ready,
-            Some(ready),
-            REASON_MIN_REPLICAS,
-            true,
-        )
-    } else {
-        let reason = if has_progress_deadline_exceeded(&d) {
-            REASON_PROGRESS_DEADLINE
-        } else {
-            REASON_ROLLING_OUT
-        };
-        (CodeLocationPhase::Deploying, Some(ready), reason, false)
-    }
-}
-
 fn has_progress_deadline_exceeded(d: &DeploymentStatus) -> bool {
     d.conditions
         .as_ref()
@@ -305,45 +292,4 @@ fn has_progress_deadline_exceeded(d: &DeploymentStatus) -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codelocation::reconcile::tests::support::make_cl;
-
-    #[test]
-    fn evaluate_deployment_ready() {
-        use k8s_openapi::api::apps::v1::DeploymentStatus;
-        let cl = make_cl(serde_json::json!({"image": "img", "tag": "v1", "replicas": 2}));
-        let d = Deployment {
-            status: Some(DeploymentStatus {
-                ready_replicas: Some(2),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let (phase, ready, reason, ok) = evaluate_deployment_phase(&cl, Some(&d));
-        assert_eq!(phase, CodeLocationPhase::Ready);
-        assert_eq!(ready, Some(2));
-        assert_eq!(reason, REASON_MIN_REPLICAS);
-        assert!(ok);
-    }
-
-    #[test]
-    fn evaluate_deployment_rolling() {
-        use k8s_openapi::api::apps::v1::DeploymentStatus;
-        let cl = make_cl(serde_json::json!({"image": "img", "tag": "v1", "replicas": 2}));
-        let d = Deployment {
-            status: Some(DeploymentStatus {
-                ready_replicas: Some(1),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let (phase, ready, _reason, ok) = evaluate_deployment_phase(&cl, Some(&d));
-        assert_eq!(phase, CodeLocationPhase::Deploying);
-        assert_eq!(ready, Some(1));
-        assert!(!ok);
-    }
 }

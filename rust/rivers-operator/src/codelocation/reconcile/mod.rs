@@ -1,18 +1,18 @@
 //! CodeLocation reconciler.
 //!
 //! Responsibilities:
-//!   1. Resolve `spec.image:spec.tag` → `status.resolvedImage` (a digest
-//!      reference), unless `spec.digest` is set (which short-circuits the
+//!   1. Resolve `spec.image:spec.tag` to a digest reference, unless `spec.digest` is set (which short-circuits the
 //!      registry call).
 //!   2. Maintain the owned `Deployment` + `Service`, keyed by the CR name.
-//!   3. Keep `status` in sync: phase, conditions, `resolvedImage`,
-//!      `grpcEndpoint`, `observedGeneration`, `readyReplicas`.
+//!   3. Keep `status` in sync: phase, conditions, `resolvedImage` (once
+//!      rolled out), `grpcEndpoint`, `observedGeneration`, `readyReplicas`.
 //!
-//! Registry polling is gated on the leader lease (see [`crate::leader`]): only
-//! the leader issues registry HEADs. In image mode, followers still reconcile
-//! owned resources against whatever digest is already in
-//! `status.resolvedImage`, so the backing Deployment doesn't drift while a
-//! leader election is in flight.
+//! Registry polling and applies are gated on the leader lease (see
+//! [`crate::leader`]): only the leader issues registry HEADs and applies the
+//! owned resources. Followers only refresh status from what the Deployment
+//! shows. In both modes `status.resolvedImage` names what every pod ran and
+//! was ready on, which runs get: a new image takes over only once its
+//! rollout completes.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,14 +25,13 @@ use kube_runtime::controller::Action;
 use kube_runtime::reflector::Store;
 use rivers_k8s::crd::code_location::{
     CONDITION_DEPLOYMENT_AVAILABLE, CONDITION_IMAGE_RESOLVED, CONDITION_SOURCE_RESOLVED,
-    CONDITION_WORKSPACE_KEPT, CodeLocation, CodeLocationPhase, CodeLocationStatus, GitRef,
-    REASON_APPLY_FAILED,
+    CodeLocation, CodeLocationPhase, GitRef, REASON_APPLY_FAILED,
 };
 use rivers_k8s::crd::run::Run;
 
 use super::git::GitResolveRequest;
 use super::registry::{ImageRef, RegistryClient};
-use super::resources::{build_deployment, build_service, deployment_name, grpc_endpoint};
+use super::resources::{build_deployment, build_service, deployment_name};
 use crate::leader::LeaderGate;
 use crate::metrics;
 
@@ -51,10 +50,9 @@ pub(crate) use image::wanted_image;
 use config::parse_refresh_interval;
 use credentials::git_credentials;
 use image::{ImageOutcome, resolve_image};
-use rollout::evaluate_deployment_phase;
 use status::{
-    GitResolution, Unresolved, git_error_reason_retry, is_git_status, kept_conditions,
-    patch_git_status, patch_status, patch_unresolved, push_condition,
+    GitResolution, ImagePass, Unresolved, git_error_reason_retry, is_git_status, patch_git_status,
+    patch_image_status, patch_unresolved,
 };
 use workspace::{Applied, apply_git_workspace, remove_git_workspace};
 
@@ -112,7 +110,6 @@ pub enum Error {
 pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = cl.name_any();
     let namespace = cl.namespace().unwrap_or(ctx.namespace.clone());
-    let generation = cl.metadata.generation;
 
     let code_locations_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), &namespace);
     let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &namespace);
@@ -132,11 +129,8 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         .await;
     }
 
-    let leader = ctx.leader.is_leader();
-    if !leader && cl.status.as_ref().is_some_and(is_git_status) {
-        // Its resolvedImage is the git runtime image, and the leader's
-        // first image pass decides about the git workspace.
-        return Ok(Action::requeue(FOLLOWER_WAIT));
+    if !ctx.leader.is_leader() {
+        return follow_image(&cl, &ctx, &namespace, &code_locations_api, &deployments_api).await;
     }
 
     let timer = Instant::now();
@@ -176,74 +170,22 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         apply(&services_api, &service),
     )?;
 
-    let dep_status = deployments_api
+    let observed = deployments_api
         .get_status(&deployment_name(&name))
         .await
         .ok();
-    let (phase, ready_replicas, deployment_reason, deployment_ok) =
-        evaluate_deployment_phase(&cl, dep_status.as_ref());
-    let workspace_kept = if leader {
-        remove_git_workspace(&cl, &ctx, &namespace, dep_status.as_ref()).await?
-    } else {
-        None
-    };
-
-    let endpoint = grpc_endpoint(&name, &namespace, cl.spec.grpc_port);
-    let now_rfc3339 = jiff::Timestamp::now().to_string();
-
-    let prior_status = cl.status.as_ref();
-    // No git fields: the pods run the image.
-    let mut status = CodeLocationStatus {
-        phase: Some(phase.clone()),
-        observed_generation: generation,
-        resolved_image: Some(resolved_image.clone()),
-        grpc_endpoint: Some(endpoint),
-        last_reconciled: Some(now_rfc3339.clone()),
-        ready_replicas,
-        // Image mode: the pinned digest ref doubles as the Source column.
-        source: Some(resolved_image.clone()),
-        ..Default::default()
-    };
-    push_condition(
-        &mut status,
-        prior_status,
-        CONDITION_IMAGE_RESOLVED,
-        "True",
+    let workspace_kept = remove_git_workspace(&cl, &ctx, &namespace, observed.as_ref()).await?;
+    let keeps_workspace = workspace_kept.is_some();
+    let pass = ImagePass {
+        image: resolved_image,
         image_reason,
-        Some(resolved_image.clone()),
-        &now_rfc3339,
-    );
-    push_condition(
-        &mut status,
-        prior_status,
-        CONDITION_DEPLOYMENT_AVAILABLE,
-        if deployment_ok { "True" } else { "False" },
-        deployment_reason,
-        None,
-        &now_rfc3339,
-    );
-    if leader {
-        if let Some((reason, message)) = &workspace_kept {
-            push_condition(
-                &mut status,
-                prior_status,
-                CONDITION_WORKSPACE_KEPT,
-                "True",
-                reason,
-                Some(message.clone()),
-                &now_rfc3339,
-            );
-        }
-    } else {
-        status
-            .conditions
-            .extend(kept_conditions(prior_status, &[CONDITION_WORKSPACE_KEPT]));
-    }
-    patch_status(&code_locations_api, &cl, &status).await?;
+        workspace_kept,
+    };
+    let settled = patch_image_status(&cl, &ctx, &namespace, observed.as_ref(), Some(pass)).await?;
 
-    let requeue = if !matches!(phase, CodeLocationPhase::Ready) {
+    let requeue = if !settled {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)
-    } else if workspace_kept.is_some() {
+    } else if keeps_workspace {
         Action::requeue(WORKSPACE_RECHECK)
     } else if immutable {
         // Immutable + Ready → rely on CR/Deployment change events.
@@ -252,6 +194,41 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         Action::requeue(jitter(refresh_after))
     };
     Ok(requeue)
+}
+
+/// Image-mode follower: like a git follower, it neither resolves nor
+/// applies — the Deployment rolls out the leader's image, which status only
+/// names once it serves. It refreshes what the Deployment shows and keeps
+/// the leader's conditions, so both replicas publish the same status.
+async fn follow_image(
+    cl: &CodeLocation,
+    ctx: &Context,
+    namespace: &str,
+    code_locations_api: &Api<CodeLocation>,
+    deployments_api: &Api<Deployment>,
+) -> Result<Action, Error> {
+    let prior = cl.status.as_ref();
+    // A git status's resolvedImage is the git runtime image, and the
+    // leader's first image pass decides about the git workspace.
+    if prior.is_some_and(is_git_status) {
+        return Ok(Action::requeue(FOLLOWER_WAIT));
+    }
+    let resolved = prior.is_some_and(|s| {
+        s.conditions
+            .iter()
+            .any(|c| c.r#type == CONDITION_IMAGE_RESOLVED && c.status == "True")
+    });
+    if resolved {
+        let observed = deployments_api
+            .get_status(&deployment_name(&cl.name_any()))
+            .await
+            .ok();
+        patch_image_status(cl, ctx, namespace, observed.as_ref(), None).await?;
+    } else if !prior.is_some_and(|s| s.phase == Some(CodeLocationPhase::Failed)) {
+        // A Failed status is the leader's to clear.
+        patch_unresolved(code_locations_api, cl, Unresolved::AwaitingLeader).await?;
+    }
+    Ok(Action::requeue(FOLLOWER_WAIT))
 }
 
 /// Git-mode reconcile: pin the runtime image digest and the ref's commit,

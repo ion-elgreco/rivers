@@ -12,7 +12,7 @@ use serde_json::json;
 use super::support::*;
 use crate::codelocation::reconcile::WorkspaceConfig;
 use crate::codelocation::reconcile::rollout::{
-    GitRollout, git_rollout, rollout_complete, template_source,
+    GitRollout, deployment_rollout, rollout_complete, template_of,
 };
 use crate::codelocation::reconcile::workspace::workspace_keep_csv;
 use crate::codelocation::resources::{MAIN_CONTAINER, build_deployment, keep_config_map_name};
@@ -204,14 +204,14 @@ fn rollout_reads_the_tree_from_the_pod_template() {
         ..Default::default()
     });
 
-    let rollout = git_rollout(Some(&d));
+    let rollout = deployment_rollout::<RunSource>(Some(&d));
     assert_eq!(rollout.template, Some(tree('b')));
     assert!(rollout.deadline_exceeded);
 
     // Until the controller sees this template, the deadline is the
     // previous rollout's.
     d.status.as_mut().unwrap().observed_generation = Some(1);
-    assert!(!git_rollout(Some(&d)).deadline_exceeded);
+    assert!(!deployment_rollout::<RunSource>(Some(&d)).deadline_exceeded);
 }
 
 #[tokio::test]
@@ -296,7 +296,7 @@ async fn new_dependencies_at_the_same_commit_get_and_keep_their_own_tree() {
     .await;
 
     let s = state.lock().unwrap();
-    let target = template_source(&s.deployments["x"]).unwrap();
+    let target = template_of::<RunSource>(&s.deployments["x"]).unwrap();
     assert_eq!(target.dependencies.groups, ["test"]);
     let pod = s.deployments["x"]
         .spec
@@ -383,7 +383,7 @@ async fn keep_set_in_force_stays_until_the_run_store_has_synced() {
     assert_eq!(keep_in(&state), in_force);
     // The rest of the pass goes on: b rolls out, runs stay on a.
     assert_eq!(
-        template_source(&state.lock().unwrap().deployments["x"]),
+        template_of::<RunSource>(&state.lock().unwrap().deployments["x"]),
         Some(tree('b'))
     );
     assert_eq!(
@@ -606,4 +606,66 @@ async fn run_pods_size_their_workspace_like_the_code_location_pods() {
             "workspaceSize {workspace_size:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn image_mode_keeps_the_serving_digest_until_the_new_one_rolls_out() {
+    let state = api_with(image_cl_at('b', 'a'), mid_rollout());
+
+    let status = pass(&state, LeaderGate::leading())
+        .await
+        .expect("status patch");
+
+    assert_eq!(status["phase"], "Ready", "{status}");
+    assert_eq!(status["resolvedImage"], pipeline('a'));
+    assert_eq!(status["source"], pipeline('a'));
+    assert_eq!(status.get("runSource"), None, "{status}");
+    let target = pipeline('b');
+    assert_eq!(
+        says(&status, CONDITION_IMAGE_RESOLVED),
+        ("True", REASON_DIGEST_PINNED, target.as_str())
+    );
+    let rolling_out = format!("rolling out {target}; runs use {}", pipeline('a'));
+    assert_eq!(
+        says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+        ("True", REASON_ROLLING_OUT, rolling_out.as_str())
+    );
+
+    // A follower does not move the Deployment back to the serving digest.
+    let (_, requests) = reconcile_with(&state, LeaderGate::new(), &resolver()).await;
+    assert_eq!(main_image(&state), Some(target.clone()));
+    assert_eq!(patched_status(&requests), None);
+
+    finish_rollout(&state);
+    let status = pass(&state, LeaderGate::leading())
+        .await
+        .expect("status patch");
+
+    assert_eq!(status["phase"], "Ready", "{status}");
+    assert_eq!(status["resolvedImage"], target);
+    assert_eq!(status["source"], target);
+    assert_eq!(
+        says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+        ("True", REASON_MIN_REPLICAS, "")
+    );
+    assert_eq!(pass(&state, LeaderGate::new()).await, None);
+}
+
+#[tokio::test]
+async fn a_first_image_rollout_stays_deploying_until_it_completes() {
+    let mut cl = image_cl_at('b', 'a');
+    cl.status = None;
+    let state = api_with(cl, mid_rollout());
+
+    let status = pass(&state, LeaderGate::leading())
+        .await
+        .expect("status patch");
+
+    assert_eq!(status["phase"], "Deploying", "{status}");
+    assert_eq!(status.get("resolvedImage"), None, "{status}");
+    let rolling_out = format!("rolling out {}", pipeline('b'));
+    assert_eq!(
+        says(&status, CONDITION_DEPLOYMENT_AVAILABLE),
+        ("False", REASON_ROLLING_OUT, rolling_out.as_str())
+    );
 }

@@ -2,9 +2,10 @@
 #
 # Apply with: kubectl apply -n <your-namespace> -f codelocation-sample.yaml
 #
-# The rivers operator reconciles this into a Deployment + Service and writes
-# the pinned digest back to `.status.resolvedImage`. Tag changes upstream
-# trigger a rolling update without editing this file.
+# The rivers operator reconciles this into a Deployment + Service and, once
+# every pod runs the pinned digest and is ready, writes it back to
+# `.status.resolvedImage`. Tag changes upstream trigger a rolling update
+# without editing this file.
 apiVersion: rivers.io/v1alpha1
 kind: CodeLocation
 metadata:

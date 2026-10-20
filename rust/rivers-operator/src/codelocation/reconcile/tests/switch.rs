@@ -12,26 +12,6 @@ use crate::codelocation::resources::{keep_config_map_name, workspace_pvc_name};
 use crate::leader::LeaderGate;
 
 #[tokio::test]
-async fn image_mode_publishes_the_new_digest_mid_rollout_as_before() {
-    let image = |c: char| format!("ghcr.io/acme/pipeline@{}", digest(c));
-    let mut cl = make_cl(json!({ "image": "ghcr.io/acme/pipeline", "digest": digest('b') }));
-    cl.status = Some(
-        serde_json::from_value(json!({ "phase": "Ready", "resolvedImage": image('a') })).unwrap(),
-    );
-
-    let status = leader_pass(cl, mid_rollout()).await;
-
-    assert_eq!(status["phase"], "Ready");
-    assert_eq!(status["resolvedImage"], image('b'));
-    assert_eq!(status["source"], image('b'));
-    assert_eq!(status.get("runSource"), None, "{status}");
-    assert_eq!(
-        condition(&status, CONDITION_DEPLOYMENT_AVAILABLE)["reason"],
-        REASON_MIN_REPLICAS
-    );
-}
-
-#[tokio::test]
 async fn image_mode_publishes_no_git_fields_after_a_switch_from_git() {
     let state = api_with(image_cl(git_era_status()), rolled_out());
 
@@ -75,16 +55,12 @@ async fn a_follower_leaves_the_switch_from_git_to_the_leader() {
         .expect("status patch");
     assert_eq!(leader["resolvedImage"], image);
 
-    // Then the follower refreshes as usual: it applies the leader's
-    // image and has nothing new to publish.
+    // Then the follower refreshes as usual: it leaves the Deployment to
+    // the leader and has nothing new to publish.
     let (_, requests) = reconcile_with(&state, LeaderGate::new(), &resolver()).await;
 
-    assert!(
-        writes(&requests).contains(&("PATCH", "/apis/apps/v1/namespaces/y/deployments/x")),
-        "{requests:?}"
-    );
+    assert_eq!(writes(&requests), []);
     assert_eq!(main_image(&state), Some(image));
-    assert_eq!(patched_status(&requests), None);
 }
 
 #[tokio::test]
@@ -317,7 +293,13 @@ async fn the_workspace_stays_while_a_pod_may_mount_it_and_the_status_says_why() 
             Some(("True", reason, message.as_str())),
             "{case}"
         );
-        assert_eq!(requeue, Action::requeue(WORKSPACE_RECHECK), "{case}");
+        // A rollout in progress is looked at sooner.
+        let recheck = if reason == REASON_ROLLING_OUT {
+            DEPLOYMENT_ROLLOUT_POLL
+        } else {
+            WORKSPACE_RECHECK
+        };
+        assert_eq!(requeue, Action::requeue(recheck), "{case}");
         // The follower shows what the leader found.
         assert_eq!(pass(&state, LeaderGate::new()).await, None, "{case}");
     }
