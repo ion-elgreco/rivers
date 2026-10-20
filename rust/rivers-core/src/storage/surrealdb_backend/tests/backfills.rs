@@ -289,3 +289,102 @@ async fn test_backfill_lists_read_each_backfills_own_progress() {
         .unwrap();
     check(&page.rows);
 }
+
+// ── backfill completion needs every partition accounted for ──
+
+/// A backfill over `keys` with one linked run per `(run_id, keys, status)`.
+async fn backfill_with_runs(
+    storage: &SurrealStorage,
+    keys: &[&str],
+    runs: &[(&str, &[&str], RunStatus)],
+) {
+    let mut bf = make_backfill("bf", BackfillStatus::InProgress, 1);
+    bf.partition_keys = keys.iter().map(|k| key(k)).collect();
+    storage.create_backfill(&bf).await.unwrap();
+    for (run_id, run_keys, status) in runs {
+        assert!(storage.link_backfill_run("bf", run_id).await.unwrap());
+        let mut run = minimal_run(run_id, status.clone());
+        let group: Vec<PartitionKey> = run_keys.iter().map(|k| key(k)).collect();
+        run.partition_key = Some(crate::execution::backfill::bundle_keys(&group));
+        storage.create_run(&run).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_try_complete_backfill_waits_for_unlaunched_partitions() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    backfill_with_runs(
+        &storage,
+        &["a", "b", "c", "d"],
+        &[
+            ("ra", &["a"], RunStatus::Success),
+            ("rb", &["b"], RunStatus::Failure),
+        ],
+    )
+    .await;
+    // Linked but not created yet: its partition is not accounted for either.
+    assert!(storage.link_backfill_run("bf", "rc").await.unwrap());
+
+    assert_eq!(
+        storage.try_complete_backfill("bf", &[]).await.unwrap(),
+        None
+    );
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.status, BackfillStatus::InProgress);
+    assert_eq!(read.end_time, None);
+}
+
+#[tokio::test]
+async fn test_try_complete_backfill_completes_once_every_partition_ran() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    backfill_with_runs(
+        &storage,
+        &["a", "b", "c"],
+        &[
+            ("ra", &["a"], RunStatus::Success),
+            ("rbc", &["b", "c"], RunStatus::Success),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        storage.try_complete_backfill("bf", &[]).await.unwrap(),
+        Some(BackfillStatus::CompletedSuccess)
+    );
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.completed_partitions.len(), 3);
+}
+
+#[tokio::test]
+async fn test_try_complete_backfill_counts_unlaunched_keys_passed_as_canceled() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    backfill_with_runs(
+        &storage,
+        &["a", "b", "c", "d"],
+        &[("ra", &["a"], RunStatus::Failure)],
+    )
+    .await;
+    // A group whose link failed is recorded failed without a run.
+    storage
+        .update_backfill_progress("bf", &[], &[], &[key("b")], &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .try_complete_backfill("bf", &[key("c"), key("d")])
+            .await
+            .unwrap(),
+        Some(BackfillStatus::CompletedFailed)
+    );
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    let mut failed = read.failed_partitions.clone();
+    failed.sort_by_key(|k| k.to_display());
+    assert_eq!(failed, vec![key("a"), key("b")]);
+    let mut canceled = read.canceled_partitions.clone();
+    canceled.sort_by_key(|k| k.to_display());
+    assert_eq!(canceled, vec![key("c"), key("d")]);
+}

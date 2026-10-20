@@ -910,6 +910,41 @@ impl StorageBackend for SurrealStorage {
             return Ok(None);
         }
 
+        // Every requested partition must be accounted for: run by a linked run
+        // that exists, passed in as canceled, or settled without a run (a group
+        // whose link failed). Otherwise groups are still to be launched.
+        let ran: HashSet<PartitionKey> = runs
+            .iter()
+            .filter_map(|r| r.partition_key.as_ref())
+            .flat_map(PartitionKey::members)
+            .collect();
+        let extra: HashSet<PartitionKey> = extra_canceled
+            .iter()
+            .flat_map(PartitionKey::members)
+            .collect();
+        let settled_without_run = |keys: &[PartitionKey]| -> Vec<PartitionKey> {
+            keys.iter()
+                .flat_map(PartitionKey::members)
+                .filter(|k| !ran.contains(k) && !extra.contains(k))
+                .collect()
+        };
+        let failed_without_run = settled_without_run(&backfill.failed_partitions);
+        let canceled_without_run = settled_without_run(&backfill.canceled_partitions);
+        let accounted = |k: &PartitionKey| {
+            ran.contains(k)
+                || extra.contains(k)
+                || failed_without_run.contains(k)
+                || canceled_without_run.contains(k)
+        };
+        if !backfill
+            .partition_keys
+            .iter()
+            .flat_map(PartitionKey::members)
+            .all(|k| accounted(&k))
+        {
+            return Ok(None);
+        }
+
         let mut completed_pks: Vec<PartitionKey> = Vec::new();
         let mut failed_pks: Vec<PartitionKey> = Vec::new();
         let mut canceled_pks: Vec<PartitionKey> = Vec::new();
@@ -989,6 +1024,10 @@ impl StorageBackend for SurrealStorage {
             canceled_pks.extend(extra_canceled.iter().cloned());
             any_canceled = true;
         }
+        any_failed |= !failed_without_run.is_empty();
+        any_canceled |= !canceled_without_run.is_empty();
+        failed_pks.extend(failed_without_run);
+        canceled_pks.extend(canceled_without_run);
 
         let new_status = if any_failed {
             BackfillStatus::CompletedFailed
