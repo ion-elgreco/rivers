@@ -18,7 +18,10 @@ use rivers_k8s::crd::code_location::{
 use rivers_k8s::crd::run::RunSource;
 
 use super::image::ImageError;
-use super::rollout::{GitRollout, build_failure_message, observe_git_deployment, rollout_message};
+use super::rollout::{
+    GitRollout, build_failure_message, load_failure_message, observe_git_deployment,
+    rollout_message,
+};
 use super::{Context, FIELD_MANAGER, TERMINAL_RETRY};
 use crate::codelocation::git;
 use crate::codelocation::resources::grpc_endpoint;
@@ -140,10 +143,10 @@ pub(super) async fn patch_git_status(
 
 /// Git-mode status. Runs get the serving tree: the pod template's once every
 /// pod runs it and is ready, until then the prior status's — a commit that
-/// is still building, or fails to build, never reaches a run. A rollout in
-/// progress or stuck shows on `DeploymentAvailable`, not in the phase, with
-/// the error of a failed build of its tree, which `status.message` also
-/// shows unless a resolution error is there. An object the API server
+/// is still building, or fails to build or load, never reaches a run. A
+/// rollout in progress or stuck shows on `DeploymentAvailable`, not in the
+/// phase, with the error of a failed build or load of its tree, which
+/// `status.message` also shows unless a resolution error is there. An object the API server
 /// refused shows the same way: the cluster still runs what it ran before,
 /// so the serving tree serves on; with no serving tree the phase is Failed.
 pub(super) fn git_status(
@@ -162,11 +165,18 @@ pub(super) fn git_status(
     let ready =
         serving.is_some() && desired > 0 && rollout.ready_replicas.is_some_and(|r| r >= desired);
     let failed = update.apply_failure.is_some() && serving.is_none();
-    let build_failure = rollout
-        .template
-        .as_ref()
-        .zip(rollout.build_failure.as_ref())
-        .map(|(target, failed)| build_failure_message(target, failed));
+    let pod_failure = rollout.template.as_ref().and_then(|target| {
+        let build = rollout
+            .build_failure
+            .as_ref()
+            .map(|f| build_failure_message(target, f));
+        build.or_else(|| {
+            rollout
+                .load_failure
+                .as_ref()
+                .map(|f| load_failure_message(target, f))
+        })
+    });
     let (deployment_reason, deployment_message) = if let Some(failure) = &update.apply_failure {
         let message = match &serving {
             Some(serving) => format!("{failure}; runs use {}", source_display(serving)),
@@ -189,7 +199,7 @@ pub(super) fn git_status(
                 serving.as_ref(),
                 rollout.deadline_exceeded,
             ),
-            build_failure.clone(),
+            pod_failure.clone(),
         ) {
             (Some(rollout), Some(failure)) => Some(format!("{rollout}; {failure}")),
             (rollout, failure) => rollout.or(failure),
@@ -292,7 +302,7 @@ pub(super) fn git_status(
         })
         .and_then(|c| c.message.clone())
         .or(update.apply_failure)
-        .or(build_failure);
+        .or(pod_failure);
     status
 }
 

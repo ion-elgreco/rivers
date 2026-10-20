@@ -310,8 +310,10 @@ rolls the code-location pods to the new commit. `status.resolvedCommit`
 moves only when every pod runs it and is ready, and `status.runSource`,
 the full source of that tree (url, commit, path, Secret, dependencies
 and the runtime image that built it, also `status.resolvedImage`), moves
-with it. Until then runs keep the previous commit, and if the new commit
-fails to build they keep it until a later commit rolls out.
+with it. A pod is ready once its module has loaded and its gRPC server
+answers the readiness probe (the standard `grpc.health.v1` check). Until
+then runs keep the previous commit, and if the new commit fails to build
+or its module fails to load, they keep it until a later commit rolls out.
 
 The CodeLocation stays `Ready` throughout: the Deployment never takes
 the old pod down before its replacement is ready (a rollout needs room
@@ -370,7 +372,7 @@ limit) and in image mode (the working directory is the image's
 | `ImageResolved` | `TagNotFound`, `AuthenticationFailed` | The registry does not have the runtime image's tag, or the login failed. |
 | | `RegistryError`, `RateLimited` | The registry does not answer, or rate-limits the operator. The CodeLocation stays `Ready`; see [outages](git-workspace-reference.md#outages). |
 | `DeploymentAvailable` | `RollingOut` | A new commit or image rolls out. The message names the commit being rolled out and the one runs still use. |
-| | `ProgressDeadlineExceeded` | The rollout is stuck, for example because the new commit does not build. The message ends with the build error. |
+| | `ProgressDeadlineExceeded` | The rollout is stuck, for example because the new commit does not build or its module does not load. The message ends with the build or load error. |
 | | `ApplyFailed` | The API server refused the Deployment, Service, PVC or ConfigMap; see [apply failures](git-workspace-reference.md#apply-failures). |
 | `WorkspaceKept` | `RunsUseWorkspace` | After a switch back to image mode, pods of finished runs still mount the workspace PVC; see [back to image mode](git-workspace-reference.md#back-to-image-mode). |
 
@@ -392,6 +394,11 @@ end of the `DeploymentAvailable` message show the error of the pod's
 | The init container's own message | A `path` that is not in the repository, a key of the git Secret that the pod cannot read, or a build that did not finish within `dependencies.timeoutSeconds`. |
 | `git fetch of commit <sha> failed:` and the last lines of git's error | `Permission denied (publickey)`, `Could not resolve host`, or `not our ref` when the repository does not have the commit. For a branch or tag, the init container then fetches the ref and checks that it points to the commit; if that fails too, the message gives its error. |
 | The last lines of the init container's log | Any other error, such as a failed install, with the error of `uv`. |
+
+When the commit builds but its module does not load, for example on an
+import error, `rivers serve` exits and the message is
+`code location main@9f3c1ab failed to load (Error, exit code 1):` and
+the last lines of its log, with the traceback.
 
 Kubernetes keeps at most 80 lines or 2048 bytes of the log for this
 message. For all of it:

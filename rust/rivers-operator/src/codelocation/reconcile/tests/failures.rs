@@ -8,7 +8,9 @@ use rivers_k8s::crd::code_location::*;
 use serde_json::json;
 
 use super::support::*;
-use crate::codelocation::reconcile::rollout::{build_failure_message, newest_build_failure};
+use crate::codelocation::reconcile::rollout::{
+    build_failure_message, load_failure_message, newest_build_failure, newest_load_failure,
+};
 use crate::codelocation::reconcile::{TERMINAL_RETRY, WorkspaceConfig};
 use crate::leader::LeaderGate;
 
@@ -51,6 +53,49 @@ async fn a_failed_build_of_the_tree_rolling_out_shows_in_status() {
     // either replica.
     assert_eq!(pass(&state, LeaderGate::leading()).await, None);
     assert_eq!(pass(&state, LeaderGate::new()).await, None);
+}
+
+#[tokio::test]
+async fn a_tree_that_fails_to_load_shows_in_status_while_runs_keep_the_serving_tree() {
+    let state = api_with(git_cl_at('b', serving_status('a')), mid_rollout());
+    // b builds, but its module does not import: the new pod never gets
+    // ready, so the old pod serves a.
+    let traceback =
+        "Traceback (most recent call last):\n  ...\nNameError: name 'x' is not defined\n";
+    add_pods(
+        &state,
+        [
+            code_location_pod("x-a", &tree('a'), completed_sync()),
+            failed_load(
+                code_location_pod("x-b", &tree('b'), completed_sync()),
+                traceback,
+                "2026-10-03T00:00:00Z",
+            ),
+        ],
+    );
+
+    let status = pass(&state, LeaderGate::leading())
+        .await
+        .expect("status patch");
+
+    let failure = format!(
+        "code location bbbbbbb (pinned) failed to load (Error, exit code 1): {}",
+        traceback.trim()
+    );
+    assert_eq!(status["message"], failure, "{status}");
+    let available = condition(&status, CONDITION_DEPLOYMENT_AVAILABLE);
+    assert_eq!(available["reason"], REASON_ROLLING_OUT, "{available}");
+    assert_eq!(
+        available["message"],
+        format!(
+            "rolling out bbbbbbb (pinned) on {}; runs use aaaaaaa (pinned) on {}; {failure}",
+            runtime('b'),
+            runtime('a')
+        )
+    );
+    assert_eq!(status["phase"], "Ready");
+    assert_eq!(status["resolvedCommit"], commit('a'));
+    assert_eq!(status["runSource"], run_source_json('a'));
 }
 
 #[tokio::test]
@@ -248,6 +293,28 @@ fn build_failure_message_shapes() {
     ] {
         assert_eq!(build_failure_message(&tree('b'), &failed), expected);
     }
+}
+
+#[test]
+fn load_failure_is_the_newest_crash_of_a_pod_that_runs_the_template() {
+    let pod = |name, tree| code_location_pod(name, tree, completed_sync());
+    let pods = [
+        failed_load(pod("x-a", &tree('a')), "other tree", "2026-10-03T00:10:00Z"),
+        failed_load(pod("x-b-1", &tree('b')), "first", "2026-10-03T00:01:00Z"),
+        failed_load(pod("x-b-2", &tree('b')), "second", "2026-10-03T00:02:00Z"),
+        pod("x-b-3", &tree('b')),
+    ];
+
+    let newest = newest_load_failure(&pods, &tree('b')).expect("a failed load");
+    assert_eq!(newest.message.as_deref(), Some("second"));
+    assert_eq!(newest_load_failure(&pods[..1], &tree('b')), None);
+    assert_eq!(newest_load_failure(&pods[3..], &tree('b')), None);
+    // A crash of the main container is no failed build.
+    assert_eq!(newest_build_failure(&pods, &tree('b')), None);
+    assert_eq!(
+        load_failure_message(&tree('b'), &newest),
+        "code location bbbbbbb (pinned) failed to load (Error, exit code 1): second"
+    );
 }
 
 #[tokio::test]
