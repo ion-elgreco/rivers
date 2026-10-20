@@ -1,8 +1,10 @@
 //! What the git Deployment and its pods show: the tree the template runs,
-//! how far it has rolled out, and a failed build of it.
+//! how far it has rolled out, and a failed build or load of it.
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
-use k8s_openapi::api::core::v1::{ContainerStateTerminated, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{
+    ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
+};
 use kube_client::api::{Api, ListParams};
 use rivers_k8s::crd::code_location::{
     CodeLocation, CodeLocationPhase, REASON_MIN_REPLICAS, REASON_NO_DEPLOYMENT_STATUS,
@@ -39,7 +41,10 @@ pub(super) async fn observe_git_deployment(
         .list(&ListParams::default().labels(&selector))
         .await
     {
-        Ok(pods) => rollout.build_failure = newest_build_failure(&pods.items, template),
+        Ok(pods) => {
+            rollout.build_failure = newest_build_failure(&pods.items, template);
+            rollout.load_failure = newest_load_failure(&pods.items, template);
+        }
         Err(error) => tracing::warn!(
             code_location = name,
             %error,
@@ -77,19 +82,42 @@ pub(super) fn newest_build_failure(
     pods: &[Pod],
     template: &RunSource,
 ) -> Option<ContainerStateTerminated> {
+    newest_failure(pods, template, |status| {
+        status
+            .init_container_statuses
+            .as_deref()?
+            .iter()
+            .find(|c| c.name == workspace::SYNC_CONTAINER)
+    })
+}
+
+/// The newest failed run of the main container among the pods that run
+/// `template`: `rivers serve` exits when the module does not load.
+pub(super) fn newest_load_failure(
+    pods: &[Pod],
+    template: &RunSource,
+) -> Option<ContainerStateTerminated> {
+    newest_failure(pods, template, |status| {
+        status
+            .container_statuses
+            .as_deref()?
+            .iter()
+            .find(|c| c.name == MAIN_CONTAINER)
+    })
+}
+
+fn newest_failure(
+    pods: &[Pod],
+    template: &RunSource,
+    container: impl Fn(&PodStatus) -> Option<&ContainerStatus>,
+) -> Option<ContainerStateTerminated> {
     pods.iter()
         .filter(|pod| pod.spec.as_ref().and_then(pod_source).as_ref() == Some(template))
         .filter_map(|pod| {
-            let sync = pod
-                .status
-                .as_ref()?
-                .init_container_statuses
-                .as_ref()?
-                .iter()
-                .find(|c| c.name == workspace::SYNC_CONTAINER)?;
-            let last_run = match sync.state.as_ref().and_then(|s| s.terminated.as_ref()) {
+            let container = container(pod.status.as_ref()?)?;
+            let last_run = match container.state.as_ref().and_then(|s| s.terminated.as_ref()) {
                 Some(ended) => ended,
-                None => sync.last_state.as_ref()?.terminated.as_ref()?,
+                None => container.last_state.as_ref()?.terminated.as_ref()?,
             };
             (last_run.exit_code != 0).then_some((last_run, pod.metadata.name.as_deref()))
         })
@@ -110,6 +138,9 @@ pub(super) struct GitRollout {
     /// While the rollout is not complete: the newest failed build of the
     /// template's tree in its pods.
     pub(super) build_failure: Option<ContainerStateTerminated>,
+    /// While the rollout is not complete: the newest exit of a pod of the
+    /// template's tree that built it but could not load it.
+    pub(super) load_failure: Option<ContainerStateTerminated>,
 }
 
 pub(super) fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
@@ -123,6 +154,7 @@ pub(super) fn git_rollout(deployment: Option<&Deployment>) -> GitRollout {
         deadline_exceeded: generation_observed(deployment)
             && has_progress_deadline_exceeded(status),
         build_failure: None,
+        load_failure: None,
     }
 }
 
@@ -201,14 +233,30 @@ pub(super) fn build_failure_message(
     target: &RunSource,
     failed: &ContainerStateTerminated,
 ) -> String {
+    failure_message(
+        format!("workspace build of {} failed", source_display(target)),
+        failed,
+    )
+}
+
+/// `code location main@9f3c1ab failed to load (Error, exit code 1): <the
+/// end of its log>`, worded once per failure like [`build_failure_message`].
+pub(super) fn load_failure_message(
+    target: &RunSource,
+    failed: &ContainerStateTerminated,
+) -> String {
+    failure_message(
+        format!("code location {} failed to load", source_display(target)),
+        failed,
+    )
+}
+
+fn failure_message(what_failed: String, failed: &ContainerStateTerminated) -> String {
     let cause = match &failed.reason {
         Some(reason) => format!("{reason}, exit code {}", failed.exit_code),
         None => format!("exit code {}", failed.exit_code),
     };
-    let summary = format!(
-        "workspace build of {} failed ({cause})",
-        source_display(target)
-    );
+    let summary = format!("{what_failed} ({cause})");
     match failed.message.as_deref().map(str::trim) {
         Some(said) if !said.is_empty() => format!("{summary}: {said}"),
         _ => summary,

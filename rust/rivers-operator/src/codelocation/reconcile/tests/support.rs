@@ -336,6 +336,7 @@ pub(crate) fn rollout(template: char, complete: bool, ready: i32) -> GitRollout 
         ready_replicas: Some(ready),
         deadline_exceeded: false,
         build_failure: None,
+        load_failure: None,
     }
 }
 
@@ -468,6 +469,17 @@ pub(crate) fn failed_sync(message: &str, finished_at: &str) -> serde_json::Value
         } },
         "restartCount": 3,
     })
+}
+
+/// `pod` after its main container exited with `message` at
+/// `finished_at`, for example on an import error; kubelet waits before it
+/// starts it again.
+pub(crate) fn failed_load(mut pod: Pod, message: &str, finished_at: &str) -> Pod {
+    let mut crashed = failed_sync(message, finished_at);
+    crashed["name"] = json!(MAIN_CONTAINER);
+    pod.status.as_mut().unwrap().container_statuses =
+        Some(vec![serde_json::from_value(crashed).unwrap()]);
+    pod
 }
 
 pub(crate) fn completed_sync() -> serde_json::Value {

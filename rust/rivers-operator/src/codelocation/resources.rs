@@ -9,7 +9,8 @@ use k8s_openapi::api::apps::v1::{
     Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
 };
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, GRPCAction, PodSpec, PodTemplateSpec, Probe, Service,
+    ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -168,6 +169,24 @@ pub fn build_deployment(
                             protocol: Some("TCP".to_string()),
                             ..Default::default()
                         }]),
+                        // `rivers serve` binds the port only once the
+                        // module has loaded, and its health service says
+                        // NOT_SERVING while the pod drains. Without a
+                        // liveness probe, a slow import needs no startup
+                        // probe: the pod just stays unready.
+                        readiness_probe: Some(Probe {
+                            grpc: Some(GRPCAction {
+                                port: spec.grpc_port,
+                                service: Some(
+                                    rivers_api::code_location_service_server::SERVICE_NAME
+                                        .to_string(),
+                                ),
+                            }),
+                            ..Default::default()
+                        }),
+                        // A module that fails to import exits with the
+                        // traceback as the last lines of its log.
+                        termination_message_policy: Some("FallbackToLogsOnError".to_string()),
                         resources: Some(spec.resources.clone()),
                         env: Some(env),
                         volume_mounts: workspace.map(|p| p.main_mounts.clone()),
@@ -421,6 +440,10 @@ mod tests {
                                 "containerPort": 3001,
                                 "protocol": "TCP",
                             }],
+                            "readinessProbe": {
+                                "grpc": { "port": 3001, "service": "rivers.v1.CodeLocationService" },
+                            },
+                            "terminationMessagePolicy": "FallbackToLogsOnError",
                             "resources": {},
                             "env": [
                                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
@@ -574,6 +597,10 @@ mod tests {
                                 "containerPort": 50051,
                                 "protocol": "TCP",
                             }],
+                            "readinessProbe": {
+                                "grpc": { "port": 50051, "service": "rivers.v1.CodeLocationService" },
+                            },
+                            "terminationMessagePolicy": "FallbackToLogsOnError",
                             "resources": {
                                 "requests": { "cpu": "250m", "memory": "512Mi" },
                                 "limits":   { "cpu": "1",    "memory": "1Gi" },
@@ -792,6 +819,10 @@ mod tests {
             "args": ["serve", "analytics.pipeline", "--grpc-port", "50051"],
             "workingDir": "/workspace/src/analytics",
             "ports": [{ "name": "grpc", "containerPort": 50051, "protocol": "TCP" }],
+            "readinessProbe": {
+                "grpc": { "port": 50051, "service": "rivers.v1.CodeLocationService" },
+            },
+            "terminationMessagePolicy": "FallbackToLogsOnError",
             "resources": {
                 "requests": { "cpu": "250m", "memory": "512Mi" },
                 "limits": { "memory": "1Gi" },
@@ -895,6 +926,10 @@ mod tests {
             "args": ["serve", "analytics.pipeline", "--grpc-port", "3001"],
             "workingDir": "/workspace/src/analytics",
             "ports": [{ "name": "grpc", "containerPort": 3001, "protocol": "TCP" }],
+            "readinessProbe": {
+                "grpc": { "port": 3001, "service": "rivers.v1.CodeLocationService" },
+            },
+            "terminationMessagePolicy": "FallbackToLogsOnError",
             "resources": {},
             "env": [
                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
@@ -1084,6 +1119,39 @@ mod tests {
             serde_json::to_value(&d.spec.unwrap().strategy).unwrap(),
             json!({ "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } })
         );
+    }
+
+    #[test]
+    fn pod_is_ready_only_once_its_code_location_service_answers() {
+        let image_cl = make_cl(
+            json!({ "image": "ghcr.io/acme/pipeline", "tag": "v1.0.0", "grpcPort": 4000 }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let git_cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
+        let pieces = git_pieces(&git_cl, shared_volume());
+        for (cl, workspace, port) in [(&image_cl, None, 4000), (&git_cl, Some(&pieces), 50051)] {
+            let d = build_deployment(
+                cl,
+                "ghcr.io/rt@sha256:1a2b3c4dff",
+                "rivers-code-location",
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                workspace,
+            );
+            let main = serde_json::to_value(&d).unwrap()["spec"]["template"]["spec"]["containers"]
+                [0]
+            .clone();
+
+            assert_eq!(
+                main["readinessProbe"],
+                json!({ "grpc": { "port": port, "service": "rivers.v1.CodeLocationService" } }),
+                "git: {}",
+                workspace.is_some()
+            );
+            assert_eq!(main["terminationMessagePolicy"], "FallbackToLogsOnError");
+        }
     }
 
     #[test]
