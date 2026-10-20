@@ -636,3 +636,74 @@ class TestMarkedFailedPartitionNotRematerialized:
             }
         finally:
             daemon.stop()
+
+
+class TestQueuedBackfillProgress:
+    """A queued backfill shows each partition as its run finishes."""
+
+    def test_progress_counts_runs_as_they_finish(self, storage, executor_env, tmp_path):
+        """While one run waits on a gate file, the backfill already counts the
+        runs that finished: completed and failed, not "0 of 4" until the end."""
+        executor, io_handler = executor_env
+        gate = str(tmp_path / "release")
+
+        @rs.Asset(
+            name="gated",
+            io_handler=io_handler(),
+            partitions_def=rs.PartitionsDefinition.static_(["a", "b", "c", "d"]),
+        )
+        def gated(context: rs.AssetExecutionContext) -> int:
+            import os
+            import time
+
+            if context.partition_key == "b":
+                raise ValueError("b fails")
+            if context.partition_key == "c":
+                deadline = time.monotonic() + 60
+                while not os.path.exists(gate) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[gated],
+            default_executor=executor,
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=10, dequeue_interval="100ms"
+            ),
+        )
+        repo.resolve(storage=storage)
+        launched = repo.backfill(
+            selection=["gated"],
+            partition_keys=[rs.PartitionKey.single(k) for k in "abcd"],
+            block=False,
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo, storage=storage, condition_eval_interval="1s"
+        )
+        daemon.start()
+        try:
+            deadline = time.monotonic() + 30
+            bf = None
+            while time.monotonic() < deadline:
+                bf = repo.get_backfill(launched.backfill_id)
+                if bf.completed_partitions == 2 and bf.failed_partitions == 1:
+                    break
+                time.sleep(0.2)
+            assert bf.status == "InProgress", bf.status
+            assert (bf.completed_partitions, bf.failed_partitions) == (2, 1), (
+                f"completed={bf.completed_partitions} failed={bf.failed_partitions}"
+            )
+
+            open(gate, "w").close()
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                bf = repo.get_backfill(launched.backfill_id)
+                if bf.status not in ("Requested", "InProgress"):
+                    break
+                time.sleep(0.2)
+            assert bf.status == "CompletedFailed"
+            assert (bf.completed_partitions, bf.failed_partitions) == (3, 1)
+        finally:
+            open(gate, "w").close()
+            daemon.stop()
