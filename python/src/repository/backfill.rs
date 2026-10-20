@@ -446,10 +446,6 @@ impl PyCodeRepository {
                 ));
             }
 
-            let mut group_run_ids = Vec::new();
-            let mut group_completed = Vec::new();
-            let mut group_failed = Vec::new();
-
             let batch_pk =
                 PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
             let run_config = record.config.clone();
@@ -500,33 +496,25 @@ impl PyCodeRepository {
                 },
             };
 
-            match result {
-                Ok(run_result) => {
-                    group_run_ids.push(run_result.run_id);
-                    if run_result.success {
-                        group_completed.extend(group.iter().cloned());
-                    } else {
-                        group_failed.extend(group.iter().cloned());
-                    }
-                }
+            // A run that finished recorded its own outcome; one that failed to
+            // launch has none.
+            let succeeded = match result {
+                Ok(run_result) => run_result.success,
                 Err(_) => {
-                    group_failed.extend(group.iter().cloned());
+                    let _ = io_rt().block_on(state.storage.update_backfill_progress(
+                        backfill_id,
+                        &[],
+                        &[],
+                        group,
+                        &[],
+                    ));
+                    false
                 }
-            }
+            };
 
-            if !group_failed.is_empty()
-                && matches!(record.failure_policy, BackfillFailurePolicy::StopOnFailure)
-            {
+            if !succeeded && matches!(record.failure_policy, BackfillFailurePolicy::StopOnFailure) {
                 stop = true;
             }
-
-            let _ = io_rt().block_on(state.storage.update_backfill_progress(
-                backfill_id,
-                &group_run_ids,
-                &group_completed,
-                &group_failed,
-                &[],
-            ));
         }
 
         // Single finalizer: reconciles per-partition credit and records the

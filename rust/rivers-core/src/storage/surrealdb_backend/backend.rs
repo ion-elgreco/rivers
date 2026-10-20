@@ -10,6 +10,7 @@ use crate::storage::{
     StorageBackend, StoredEvent, StoredLog, TickRecord,
 };
 
+use super::run_queue::SettledRunKeys;
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -452,27 +453,33 @@ impl StorageBackend for SurrealStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> Result<()> {
-        retry::with_retry(&self.retry_config, || async {
+        let runs: Vec<RunRecord> = retry::with_retry(&self.retry_config, || async {
             let status_str = format!("{:?}", status);
-            if let Some(end) = end_time {
+            let mut response = if let Some(end) = end_time {
                 self.db
                     .query(
-                        "UPDATE runs SET status = $status, end_time = $end_time WHERE run_id = $run_id",
+                        "UPDATE runs SET status = $status, end_time = $end_time \
+                         WHERE run_id = $run_id RETURN AFTER",
                     )
                     .bind(("run_id", run_id.to_string()))
                     .bind(("status", status_str))
                     .bind(("end_time", end))
-                    .await?;
+                    .await?
             } else {
                 self.db
-                    .query("UPDATE runs SET status = $status WHERE run_id = $run_id")
+                    .query("UPDATE runs SET status = $status WHERE run_id = $run_id RETURN AFTER")
                     .bind(("run_id", run_id.to_string()))
                     .bind(("status", status_str))
-                    .await?;
-            }
-            Ok(())
+                    .await?
+            };
+            Ok(response.take(0)?)
         })
-        .await
+        .await?;
+
+        for run in &runs {
+            self.record_backfill_run_outcome(run).await;
+        }
+        Ok(())
     }
 
     async fn update_run_block_reason(&self, run_id: &str, reason: Option<&str>) -> Result<()> {
@@ -951,73 +958,28 @@ impl StorageBackend for SurrealStorage {
         let mut any_failed = false;
         let mut any_canceled = false;
 
-        #[derive(SurrealValue)]
-        struct FailRow {
-            run_id: String,
-            partition_key: PartitionKey,
-        }
         let success_run_ids: Vec<String> = runs
             .iter()
             .filter(|r| matches!(r.status, RunStatus::Success))
             .map(|r| r.run_id.clone())
             .collect();
-        let mut failed_by_run: std::collections::HashMap<
-            String,
-            std::collections::HashSet<PartitionKey>,
-        > = std::collections::HashMap::new();
-        if !success_run_ids.is_empty() {
-            let rows: Vec<FailRow> = retry::with_retry(&self.retry_config, || async {
-                let mut res = self
-                    .db
-                    .query(
-                        "SELECT run_id, partition_key FROM events \
-                         WHERE run_id IN $rids AND event_type = 'StepFailure' \
-                         AND partition_key IS NOT NONE GROUP BY run_id, partition_key",
-                    )
-                    .bind(("rids", success_run_ids.clone()))
-                    .await?;
-                Ok(res.take(0)?)
-            })
-            .await?;
-            for row in rows {
-                failed_by_run
-                    .entry(row.run_id)
-                    .or_default()
-                    .insert(row.partition_key);
-            }
-        }
+        let failed_by_run = self.step_failed_members(success_run_ids).await?;
 
         for run in &runs {
-            let Some(ref pk) = run.partition_key else {
+            if run.partition_key.is_none() {
                 match run.status {
                     RunStatus::Failure => any_failed = true,
                     RunStatus::Canceled => any_canceled = true,
                     _ => {}
                 }
                 continue;
-            };
-            match run.status {
-                RunStatus::Success => {
-                    let failed_members = failed_by_run.get(&run.run_id);
-                    for member in pk.members() {
-                        if failed_members.is_some_and(|f| f.contains(&member)) {
-                            failed_pks.push(member);
-                            any_failed = true;
-                        } else {
-                            completed_pks.push(member);
-                        }
-                    }
-                }
-                RunStatus::Failure => {
-                    failed_pks.extend(pk.members());
-                    any_failed = true;
-                }
-                RunStatus::Canceled => {
-                    canceled_pks.extend(pk.members());
-                    any_canceled = true;
-                }
-                _ => {}
             }
+            let settled = SettledRunKeys::of(run, failed_by_run.get(&run.run_id));
+            any_failed |= !settled.failed.is_empty();
+            any_canceled |= !settled.canceled.is_empty();
+            completed_pks.extend(settled.completed);
+            failed_pks.extend(settled.failed);
+            canceled_pks.extend(settled.canceled);
         }
 
         if !extra_canceled.is_empty() {
@@ -1171,7 +1133,7 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn cancel_queued_run(&self, run_id: &str) -> Result<bool> {
-        retry::with_retry(&self.retry_config, || async {
+        let canceled = retry::with_retry(&self.retry_config, || async {
             let now_ns = now_nanos();
             let mut result = self
                 .db
@@ -1189,7 +1151,12 @@ impl StorageBackend for SurrealStorage {
             let count: Option<u32> = result.take((2, "total"))?;
             Ok(count.unwrap_or(0) > 0)
         })
-        .await
+        .await?;
+
+        if canceled && let Some(run) = self.get_run(run_id).await? {
+            self.record_backfill_run_outcome(&run).await;
+        }
+        Ok(canceled)
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<bool> {

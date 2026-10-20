@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use surrealdb::types::SurrealValue;
 
 use crate::storage::retry;
-use crate::storage::{BackfillStatus, EventRecord, EventType, RunRecord};
+use std::collections::{HashMap, HashSet};
+
+use crate::storage::{
+    BackfillStatus, EventRecord, EventType, LaunchedBy, PartitionKey, RunRecord, RunStatus,
+};
 
 use super::*;
 
@@ -23,13 +27,50 @@ fn run_queued_event(record: &RunRecord) -> EventRecord {
     }
 }
 
+/// The partition members a finished run settles, by outcome.
+pub(super) struct SettledRunKeys {
+    pub(super) completed: Vec<PartitionKey>,
+    pub(super) failed: Vec<PartitionKey>,
+    pub(super) canceled: Vec<PartitionKey>,
+}
+
+impl SettledRunKeys {
+    /// A successful run completes each member of its key, except the members
+    /// in `step_failed`; a failed or canceled run settles every member so.
+    pub(super) fn of(run: &RunRecord, step_failed: Option<&HashSet<PartitionKey>>) -> Self {
+        let mut settled = Self {
+            completed: Vec::new(),
+            failed: Vec::new(),
+            canceled: Vec::new(),
+        };
+        let Some(pk) = &run.partition_key else {
+            return settled;
+        };
+        match run.status {
+            RunStatus::Success => {
+                for member in pk.members() {
+                    if step_failed.is_some_and(|f| f.contains(&member)) {
+                        settled.failed.push(member);
+                    } else {
+                        settled.completed.push(member);
+                    }
+                }
+            }
+            RunStatus::Failure => settled.failed = pk.members(),
+            RunStatus::Canceled => settled.canceled = pk.members(),
+            _ => {}
+        }
+        settled
+    }
+}
+
 impl SurrealStorage {
     /// Conditional `update_run_status`: mark `Failure` only while the run is
     /// still non-terminal. Returns whether a row matched — `false` means the
     /// run already reached a terminal status and was left alone (a late
     /// launch-error must not stomp a concurrent Canceled/Success write).
     pub async fn fail_run_if_active(&self, run_id: &str, end_time: i64) -> Result<bool> {
-        retry::with_retry(&self.retry_config, || async {
+        let rows: Vec<RunRecord> = retry::with_retry(&self.retry_config, || async {
             let mut response = self
                 .db
                 .query(
@@ -44,9 +85,14 @@ impl SurrealStorage {
                 .context("failed to fail-out run")?
                 .check()?;
             let rows: Vec<RunRecord> = response.take(0)?;
-            Ok(!rows.is_empty())
+            Ok(rows)
         })
-        .await
+        .await?;
+
+        for run in &rows {
+            self.record_backfill_run_outcome(run).await;
+        }
+        Ok(!rows.is_empty())
     }
 
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
@@ -187,6 +233,103 @@ impl SurrealStorage {
             Ok(linked.unwrap_or(false))
         })
         .await
+    }
+
+    /// Record the keys of a finished backfill run as settled, so the backfill
+    /// shows its progress run by run. A key settled again takes the new
+    /// outcome. Errors are only logged: the run's status is already written,
+    /// and the backfill's final settle derives every key from its runs again.
+    pub(super) async fn record_backfill_run_outcome(&self, run: &RunRecord) {
+        let LaunchedBy::Backfill { backfill_id } = &run.launched_by else {
+            return;
+        };
+        if run.partition_key.is_none()
+            || !matches!(
+                run.status,
+                RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+            )
+        {
+            return;
+        }
+
+        let result = async {
+            let failed_by_run = if run.status == RunStatus::Success {
+                self.step_failed_members(vec![run.run_id.clone()]).await?
+            } else {
+                HashMap::new()
+            };
+            let settled = SettledRunKeys::of(run, failed_by_run.get(&run.run_id));
+            let outcomes = BackfillOutcomeRow::settled(
+                backfill_id,
+                &settled.completed,
+                &settled.failed,
+                &settled.canceled,
+            );
+
+            // A deleted backfill gets no rows back.
+            retry::with_retry(&self.retry_config, || async {
+                self.db
+                    .query(format!(
+                        "BEGIN TRANSACTION;\n\
+                         IF (SELECT VALUE backfill_id FROM backfills WHERE backfill_id = $id) != [] {{\n\
+                             {RECORD_BACKFILL_OUTCOMES};\n\
+                         }};\n\
+                         COMMIT TRANSACTION;"
+                    ))
+                    .bind(("id", backfill_id.clone()))
+                    .bind(("outcomes", outcomes.clone()))
+                    .await?
+                    .check()?;
+                Ok(())
+            })
+            .await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "rivers::storage",
+                run_id = %run.run_id,
+                backfill_id = %backfill_id,
+                error = %e,
+                "failed to record the backfill run's outcome"
+            );
+        }
+    }
+
+    /// The partition members each of `run_ids` recorded a `StepFailure` for.
+    pub(super) async fn step_failed_members(
+        &self,
+        run_ids: Vec<String>,
+    ) -> Result<HashMap<String, HashSet<PartitionKey>>> {
+        #[derive(SurrealValue)]
+        struct FailRow {
+            run_id: String,
+            partition_key: PartitionKey,
+        }
+        let mut failed_by_run: HashMap<String, HashSet<PartitionKey>> = HashMap::new();
+        if run_ids.is_empty() {
+            return Ok(failed_by_run);
+        }
+        let rows: Vec<FailRow> = retry::with_retry(&self.retry_config, || async {
+            let mut res = self
+                .db
+                .query(
+                    "SELECT run_id, partition_key FROM events \
+                     WHERE run_id IN $rids AND event_type = 'StepFailure' \
+                     AND partition_key IS NOT NONE GROUP BY run_id, partition_key",
+                )
+                .bind(("rids", run_ids.clone()))
+                .await?;
+            Ok(res.take(0)?)
+        })
+        .await?;
+        for row in rows {
+            failed_by_run
+                .entry(row.run_id)
+                .or_default()
+                .insert(row.partition_key);
+        }
+        Ok(failed_by_run)
     }
 
     /// Flip a zero-run `InProgress` backfill back to `Requested` so the

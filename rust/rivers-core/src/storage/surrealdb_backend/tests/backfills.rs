@@ -388,3 +388,118 @@ async fn test_try_complete_backfill_counts_unlaunched_keys_passed_as_canceled() 
     canceled.sort_by_key(|k| k.to_display());
     assert_eq!(canceled, vec![key("c"), key("d")]);
 }
+
+// ── a backfill run records its own outcome as it finishes ──
+
+/// Link and create a run of backfill `bf` over `keys`.
+async fn backfill_child(storage: &SurrealStorage, run_id: &str, keys: &[&str], status: RunStatus) {
+    assert!(storage.link_backfill_run("bf", run_id).await.unwrap());
+    let mut run = minimal_run(run_id, status);
+    let group: Vec<PartitionKey> = keys.iter().map(|k| key(k)).collect();
+    run.partition_key = Some(crate::execution::backfill::bundle_keys(&group));
+    run.launched_by = LaunchedBy::Backfill {
+        backfill_id: "bf".into(),
+    };
+    storage.create_run(&run).await.unwrap();
+}
+
+async fn in_progress_backfill(storage: &SurrealStorage, keys: &[&str]) {
+    let mut bf = make_backfill("bf", BackfillStatus::InProgress, 1);
+    bf.partition_keys = keys.iter().map(|k| key(k)).collect();
+    storage.create_backfill(&bf).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_finished_backfill_run_records_its_outcome() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    in_progress_backfill(&storage, &["a", "b", "c", "d"]).await;
+    backfill_child(&storage, "ra", &["a"], RunStatus::Started).await;
+    backfill_child(&storage, "rb", &["b"], RunStatus::Started).await;
+    backfill_child(&storage, "rcd", &["c", "d"], RunStatus::Queued).await;
+
+    storage
+        .update_run_status("ra", RunStatus::Success, Some(2))
+        .await
+        .unwrap();
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.completed_partitions, vec![key("a")]);
+    assert!(read.failed_partitions.is_empty());
+    assert_eq!(read.status, BackfillStatus::InProgress);
+
+    storage
+        .update_run_status("rb", RunStatus::Failure, Some(3))
+        .await
+        .unwrap();
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.completed_partitions, vec![key("a")]);
+    assert_eq!(read.failed_partitions, vec![key("b")]);
+
+    assert!(storage.cancel_queued_run("rcd").await.unwrap());
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    let mut canceled = read.canceled_partitions.clone();
+    canceled.sort_by_key(|k| k.to_display());
+    assert_eq!(canceled, vec![key("c"), key("d")]);
+
+    // The final settle agrees with what the runs already wrote.
+    assert_eq!(
+        storage.try_complete_backfill("bf", &[]).await.unwrap(),
+        Some(BackfillStatus::CompletedFailed)
+    );
+    let settled = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(settled.completed_partitions, vec![key("a")]);
+    assert_eq!(settled.failed_partitions, vec![key("b")]);
+    let mut canceled = settled.canceled_partitions.clone();
+    canceled.sort_by_key(|k| k.to_display());
+    assert_eq!(canceled, vec![key("c"), key("d")]);
+}
+
+#[tokio::test]
+async fn test_finished_backfill_run_keeps_its_latest_outcome() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    in_progress_backfill(&storage, &["a"]).await;
+    backfill_child(&storage, "ra", &["a"], RunStatus::Started).await;
+
+    assert!(storage.fail_run_if_active("ra", 2).await.unwrap());
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.failed_partitions, vec![key("a")]);
+
+    storage
+        .update_run_status("ra", RunStatus::Success, Some(3))
+        .await
+        .unwrap();
+    let read = storage.get_backfill("bf").await.unwrap().unwrap();
+    assert_eq!(read.completed_partitions, vec![key("a")]);
+    assert!(read.failed_partitions.is_empty());
+}
+
+#[tokio::test]
+async fn test_finished_run_writes_no_outcome_outside_a_backfill() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = embedded_storage(&temp_dir).await;
+    let mut orphan = minimal_run("orphan", RunStatus::Started);
+    orphan.partition_key = Some(key("a"));
+    orphan.launched_by = LaunchedBy::Backfill {
+        backfill_id: "gone".into(),
+    };
+    storage.create_run(&orphan).await.unwrap();
+    let mut manual = minimal_run("manual", RunStatus::Started);
+    manual.partition_key = Some(key("a"));
+    storage.create_run(&manual).await.unwrap();
+
+    for run_id in ["orphan", "manual"] {
+        storage
+            .update_run_status(run_id, RunStatus::Success, Some(2))
+            .await
+            .unwrap();
+    }
+    let rows: Vec<serde_json::Value> = storage
+        .db
+        .query("SELECT VALUE outcome FROM backfill_outcomes")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert!(rows.is_empty());
+}

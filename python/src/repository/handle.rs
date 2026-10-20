@@ -960,15 +960,8 @@ pub(super) async fn submit_runs(
                 .enqueue_backfill_runs(&records, backfill_id)
                 .await
                 .map_err(|e| ExecutionError::new_err(format!("Failed to enqueue runs: {e}")))?;
+            // The swept runs recorded their keys as canceled.
             if !live {
-                let canceled: Vec<rivers_core::storage::PartitionKey> = records
-                    .iter()
-                    .filter_map(|r| r.partition_key.as_ref())
-                    .flat_map(|pk| pk.members())
-                    .collect();
-                let _ = storage
-                    .update_backfill_progress(backfill_id, &[], &[], &[], &canceled)
-                    .await;
                 tracing::info!(
                     target: "rivers::repo",
                     backfill_id = %backfill_id,
