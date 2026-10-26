@@ -74,4 +74,4 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 [build-dependencies]
-pyo3-build-config = "0.29.3"
+pyo3-build-config = "0.30.1"
