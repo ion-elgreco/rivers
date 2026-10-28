@@ -32,15 +32,19 @@ from rivers.io_handlers.iceberg.config import UpsertConfig
 T = TypeVar("T")
 
 IcebergWriteMode = Literal["overwrite", "append", "upsert"]
-
 IcebergSchemaMode = Literal["merge", "overwrite"]
 
 
 @dataclass(frozen=True)
 class IcebergWriteRequest:
-    """Fully-resolved write parameters."""
+    """Fully-resolved write parameters.
 
-    catalog: Catalog
+    ``catalog`` is ``None`` for Spark-backed operations, which use the Spark
+    catalog configured on the Spark handler. PyIceberg-backed handlers require
+    a catalog.
+    """
+
+    catalog: Catalog | None
     identifier: tuple[str, ...]
     mode: IcebergWriteMode
     schema_mode: IcebergSchemaMode | None
@@ -53,9 +57,14 @@ class IcebergWriteRequest:
 
 @dataclass(frozen=True)
 class IcebergReadRequest:
-    """Fully-resolved read parameters."""
+    """Fully-resolved read parameters.
 
-    catalog: Catalog
+    ``catalog`` is ``None`` for Spark-backed operations, which use the Spark
+    catalog configured on the Spark handler. PyIceberg-backed handlers require
+    a catalog.
+    """
+
+    catalog: Catalog | None
     identifier: tuple[str, ...]
     partition: PartitionContext | None
     partition_expr: PartitionExpr | None
@@ -74,6 +83,11 @@ class IcebergReadRequest:
     @cached_property
     def table(self) -> Table:
         """The table to read, loaded on first use."""
+        if self.catalog is None:
+            raise RuntimeError(
+                "This Iceberg read request has no PyIceberg catalog. "
+                "Spark-backed reads must use the configured Spark catalog."
+            )
         return self.catalog.load_table(self.identifier)
 
     def scan(self) -> DataScan:
@@ -141,9 +155,16 @@ class ArrowIcebergTypeHandler(IcebergTypeHandler[T], ABC):
         the partition spec of the asset's partitions; an existing table keeps
         its spec. The snapshot id is registered as the data version.
         """
+        if request.catalog is None:
+            raise RuntimeError(
+                "ArrowIcebergTypeHandler requires a PyIceberg catalog. "
+                "Only the PySpark Iceberg handler can write with catalog=None."
+            )
+
         start = time.monotonic()
         data = _iceberg_types(self.to_arrow(obj))
         table = _load_or_create(request, data.schema)
+
         if isinstance(data, pa.RecordBatchReader) and (
             request.mode == "upsert" or not table.spec().is_unpartitioned()
         ):
@@ -186,7 +207,13 @@ def _iceberg_type(data_type: pa.DataType) -> pa.DataType:
 
 
 def _load_or_create(request: IcebergWriteRequest, schema: pa.Schema) -> Table:
-    catalog, identifier = request.catalog, request.identifier
+    catalog = request.catalog
+    if catalog is None:
+        raise RuntimeError(
+            "Cannot create a PyIceberg table without a PyIceberg catalog."
+        )
+
+    identifier = request.identifier
     try:
         return catalog.load_table(identifier)
     except NoSuchTableError:

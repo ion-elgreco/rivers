@@ -143,7 +143,7 @@ Actions receive a single `ActionContext` — no upstream inputs:
 
 It also carries `mark_partition_failed(key, error)`, which reports one key of a
 batched run as failed while the rest still complete — see
-[the context reference](../api-reference/context.md#mark_partition_failedpartition_key-error-1).
+[the context reference](../api-reference/context.md#mark_partition_failedpartition_key-error).
 
 Parameters after the context are **resources, injected by name** — the same rule
 materialize functions use; a parameter matching no resource is a resolution error:

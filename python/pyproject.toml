@@ -32,6 +32,7 @@ duckdb = ["duckdb>=1.5.2"]
 dbt = ["dbt-core>=1.7.10,<2"]
 delta-duckdb = ["rivers[duckdb]", "rivers[delta]"]
 iceberg = ["pyiceberg[pyarrow,pyiceberg-core]>=0.12.0"]
+iceberg-pyspark = ["rivers[iceberg]", "rivers[pyspark]"]
 iceberg-polars = ["rivers[polars]", "rivers[iceberg]"]
 iceberg-pandas = ["rivers[pandas]", "rivers[iceberg]"]
 iceberg-duckdb = ["rivers[duckdb]", "rivers[iceberg]"]
@@ -61,7 +62,9 @@ timeout_method = "thread"
 # thread's stack to the real stderr, which reaches the CI log, before it.
 faulthandler_timeout = 55
 markers = [
-    "spark_test: marks tests that Spark instance (deselect with '-m \"not spark_test\"')",
+    "spark_test: marks tests that need a Spark instance (deselect with '-m \"not spark_test\"')",
+    "delta_spark: marks delta lake tests that use a Spark instance (deselect with '-m \"not delta_spark\"')",
+    "iceberg_spark: marks iceberg tests that use a Spark instance (deselect with '-m \"not iceberg_spark\"')",
     "serial: timing-sensitive; the `just test` recipes run it alone, after the parallel run",
 ]
 

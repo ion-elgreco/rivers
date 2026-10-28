@@ -54,6 +54,7 @@ Optional extras for IO handlers:
 ```bash
 pip install rivers[delta]     # Delta Lake support
 pip install rivers[iceberg]   # Apache Iceberg support
+pip install rivers[iceberg-pyspark]  # Apache Iceberg through PySpark
 pip install rivers[pyarrow]   # PyArrow table support
 pip install rivers[polars]    # Polars DataFrame support
 ```

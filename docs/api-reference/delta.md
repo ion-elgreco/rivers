@@ -248,7 +248,7 @@ and writes with `handle_output`, both are implemented with Spark.
 ```python
 from rivers.io_handlers.delta.pyspark import PySparkDeltaTypeHandler
 
-class MyTypeHandler(ArrowDeltaTypeHandler[MyType]):
+class MyTypeHandler(PySparkDeltaTypeHandler[MyType]):
     @property
     def supported_types(self) -> Sequence[type[MyType]]:
         return [MyType]

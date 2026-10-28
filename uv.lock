@@ -3084,6 +3084,10 @@ iceberg-polars = [
     { name = "polars" },
     { name = "pyiceberg", extra = ["pyarrow", "pyiceberg-core"] },
 ]
+iceberg-pyspark = [
+    { name = "pyiceberg", extra = ["pyarrow", "pyiceberg-core"] },
+    { name = "pyspark" },
+]
 otel = [
     { name = "opentelemetry-api" },
 ]
@@ -3149,6 +3153,7 @@ requires-dist = [
     { name = "rivers", extras = ["iceberg"], marker = "extra == 'iceberg-duckdb'" },
     { name = "rivers", extras = ["iceberg"], marker = "extra == 'iceberg-pandas'" },
     { name = "rivers", extras = ["iceberg"], marker = "extra == 'iceberg-polars'" },
+    { name = "rivers", extras = ["iceberg"], marker = "extra == 'iceberg-pyspark'" },
     { name = "rivers", extras = ["pandas"], marker = "extra == 'delta-pandas'" },
     { name = "rivers", extras = ["pandas"], marker = "extra == 'iceberg-pandas'" },
     { name = "rivers", extras = ["polars"], marker = "extra == 'delta-polars'" },
@@ -3156,11 +3161,12 @@ requires-dist = [
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyarrow'" },
     { name = "rivers", extras = ["pyarrow"], marker = "extra == 'delta-pyspark'" },
     { name = "rivers", extras = ["pyspark"], marker = "extra == 'delta-pyspark'" },
+    { name = "rivers", extras = ["pyspark"], marker = "extra == 'iceberg-pyspark'" },
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.10.0" },
     { name = "sling", marker = "extra == 'sling'", specifier = ">=1.4.3.post1" },
     { name = "typer", specifier = ">=0.27.0" },
 ]
-provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "dbt", "delta-duckdb", "iceberg", "iceberg-polars", "iceberg-pandas", "iceberg-duckdb", "datadog", "pandera", "dataframely", "sling", "databricks", "dlt"]
+provides-extras = ["polars", "pyarrow", "datafusion", "pandas", "pyspark", "delta", "delta-polars", "delta-pyarrow", "delta-datafusion", "delta-pandas", "delta-pyspark", "otel", "slack", "duckdb", "dbt", "delta-duckdb", "iceberg", "iceberg-pyspark", "iceberg-polars", "iceberg-pandas", "iceberg-duckdb", "datadog", "pandera", "dataframely", "sling", "databricks", "dlt"]
 
 [[package]]
 name = "rivers-workspace"

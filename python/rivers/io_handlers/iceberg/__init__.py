@@ -3,6 +3,12 @@
 Install with ``pip install rivers[iceberg]``. Type-specific conversion is
 delegated to :class:`IcebergTypeHandler` implementations registered in
 :func:`IcebergIOHandler.type_handlers`.
+
+When ``spark_session`` is supplied in ``handler_config``, Spark DataFrame
+operations use Spark's Iceberg Datasource API without opening a PyIceberg
+catalog. Other supported Python data types continue to use their registered
+PyIceberg-backed handlers. Without a Spark session, the standard PyIceberg
+handlers are used.
 """
 
 from __future__ import annotations
@@ -56,6 +62,11 @@ _TYPE_HANDLERS: list[Candidate] = [
     ("rivers.io_handlers.iceberg.polars", "PolarsTypeHandler", []),
     ("rivers.io_handlers.iceberg.pandas", "PandasTypeHandler", []),
     ("rivers.io_handlers.iceberg.duckdb", "DuckDBTypeHandler", ["duckdb"]),
+    (
+        "rivers.io_handlers.iceberg.pyspark",
+        "PySparkIcebergTypeHandler",
+        ["spark_session", "spark_catalog"],
+    ),
 ]
 
 # Keyed by the type's top-level module: ``DataFrame`` is shared by pandas and
@@ -65,11 +76,12 @@ _MODULE_TO_EXTRA: dict[str, str] = {
     "polars": "iceberg-polars",
     "pandas": "iceberg-pandas",
     "_duckdb": "iceberg-duckdb",
+    "pyspark": "iceberg-pyspark",
 }
 
 
 class IcebergIOHandler(BaseIOHandler):
-    """Persist asset outputs as Apache Iceberg tables, through a pyiceberg catalog.
+    """Persist asset outputs as Apache Iceberg tables, through a pyiceberg or spark catalog.
 
     Each asset is the table ``{namespace}.{asset_name}``; the
     ``iceberg/namespace`` and ``iceberg/table`` asset metadata keys override
@@ -118,7 +130,11 @@ class IcebergIOHandler(BaseIOHandler):
     def type_handlers(
         handler_config: dict[str, Any] | None = None,
     ) -> dict[type, IcebergTypeHandler]:
-        """Return the currently registered ``{type: IcebergTypeHandler}`` map."""
+        """Return the currently registered ``{type: IcebergTypeHandler}`` map.
+
+        The PySpark handler is registered only when a Spark session is supplied.
+        Its catalog name is optional because the handler has a default.
+        """
         return discover(_TYPE_HANDLERS, handler_config)
 
     def _resolve_handler(self, target_type: type) -> IcebergTypeHandler:
@@ -128,12 +144,33 @@ class IcebergIOHandler(BaseIOHandler):
         when a known type is requested but its handler library is not
         installed.
         """
-        return resolve(
-            self.type_handlers(self.handler_config), target_type, _MODULE_TO_EXTRA
-        )
+        try:
+            return resolve(
+                self.type_handlers(self.handler_config),
+                target_type,
+                _MODULE_TO_EXTRA,
+            )
+        except TypeError as exc:
+            # A PySpark DataFrame cannot be read or written by the Arrow
+            # handlers implicitly. Explain the missing runtime configuration
+            # instead of suggesting that installing an extra alone is enough.
+            if getattr(target_type, "__module__", "").startswith("pyspark.") and not (
+                self.handler_config or {}
+            ).get("spark_session"):
+                raise TypeError(
+                    "PySpark DataFrame IO requires "
+                    "handler_config={'spark_session': spark}. "
+                    "Without a configured Spark session, use a supported "
+                    "PyIceberg-backed input/output type."
+                ) from exc
+            raise
 
     def catalog(self) -> Catalog:
-        """Load the pyiceberg catalog: ``load_catalog(catalog_name, **catalog_properties)``."""
+        """Load the pyiceberg catalog: ``load_catalog(catalog_name, **catalog_properties)``.
+
+        This method is used only by PyIceberg-backed handlers. Spark DataFrame
+        operations use the configured Spark catalog directly.
+        """
         return load_catalog(self.catalog_name, **(self.catalog_properties or {}))
 
     def table_identifier(
@@ -206,7 +243,7 @@ class IcebergIOHandler(BaseIOHandler):
         return properties
 
     def _write_request(
-        self, context: OutputContext, catalog: Catalog
+        self, context: OutputContext, catalog: Catalog | None
     ) -> IcebergWriteRequest:
         """Resolve the write parameters from the handler and the asset metadata."""
         meta = context.asset_metadata or {}
@@ -266,39 +303,58 @@ class IcebergIOHandler(BaseIOHandler):
         ``iceberg/write_duration_s``, ``iceberg/metadata_location``, and the
         Arrow schema.
         """
+        # Resolve the handler first: a Spark DataFrame must not trigger
+        # PyIceberg catalog construction.
         handler = self._resolve_handler(type(obj))
-        with self.catalog() as catalog:
-            handler.handle_output(
-                context=context, obj=obj, request=self._write_request(context, catalog)
-            )
+        is_spark = handler.__class__.__name__ == "PySparkIcebergTypeHandler"
+
+        if is_spark:
+            catalog = None
+        else:
+            catalog = self.catalog()
+
+        if catalog is None:
+            request = self._write_request(context, None)
+            handler.handle_output(context=context, obj=obj, request=request)
+            return
+
+        with catalog:
+            request = self._write_request(context, catalog)
+            handler.handle_output(context=context, obj=obj, request=request)
 
     def load_input(self, context: InputContext) -> Any:
-        """Read the upstream Iceberg table into the requested Python type.
-
-        Resolves the partition filter, the column projection
-        (``iceberg/columns``), and the snapshot (``iceberg/snapshot_id``) from
-        ``context.asset_metadata``. The read is delegated to the type handler
-        matching ``context.type_hint``, which must be set on the consumer side.
-        """
+        """Read an upstream Iceberg table in the requested Python type."""
         if context.type_hint is None:
             raise TypeError(
                 "No type_hint provided on InputContext. "
                 f"Supported types: {list(self.type_handlers(self.handler_config))}"
             )
+
         handler = self._resolve_handler(context.type_hint)
+        is_spark = handler.__class__.__name__ == "PySparkIcebergTypeHandler"
+
+        if is_spark:
+            catalog = None
+        else:
+            catalog = self.catalog()
 
         meta = context.asset_metadata or {}
         columns = (
             json.loads(meta["iceberg/columns"]) if "iceberg/columns" in meta else None
         )
         snapshot_id = meta.get("iceberg/snapshot_id")
-        with self.catalog() as catalog:
-            request = IcebergReadRequest(
-                catalog=catalog,
-                identifier=self.table_identifier(context.asset_name, meta),
-                partition=context.partition,
-                partition_expr=_resolve_partition_expr(meta, "iceberg/partition_expr"),
-                columns=columns,
-                snapshot_id=int(snapshot_id) if snapshot_id is not None else None,
-            )
+
+        request = IcebergReadRequest(
+            catalog=catalog,
+            identifier=self.table_identifier(context.asset_name, meta),
+            partition=context.partition,
+            partition_expr=_resolve_partition_expr(meta, "iceberg/partition_expr"),
+            columns=columns,
+            snapshot_id=int(snapshot_id) if snapshot_id is not None else None,
+        )
+
+        if catalog is None:
+            return handler.load_input(request, context.type_hint)
+
+        with catalog:
             return handler.load_input(request, context.type_hint)
