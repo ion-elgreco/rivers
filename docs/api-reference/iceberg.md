@@ -62,7 +62,7 @@ io = IcebergIOHandler(
 
 An [action](../concepts/actions.md) gets the asset's resolved handler as `ctx.io_handler`. These methods use the same table and partition resolution as the writes.
 
-#### `catalog()`
+#### `pyiceberg_catalog()`
 
 Loads the pyiceberg catalog: `load_catalog(catalog_name, **catalog_properties)`.
 
