@@ -80,8 +80,6 @@ test: _runtime-bin
 # Run Python tests on free-threaded Python; an import that turns the GIL back on fails
 test-ft: _runtime-bin
     UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest {{ xdist }} -m "not serial and not spark_test" python/
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest {{ xdist }} -m "spark_test and delta_spark" python/
-    UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest {{ xdist }} -m "spark_test and iceberg_spark" python/
     UV_PROJECT_ENVIRONMENT='{{ justfile_directory() }}/.venv-ft' RIVERS_RUNTIME_BIN='{{ runtime_bin }}' PYTHONWARNINGS='error:The global interpreter lock (GIL) has been enabled:RuntimeWarning' uv run --no-sync pytest -m serial python/
 
 test-spark: _runtime-bin
