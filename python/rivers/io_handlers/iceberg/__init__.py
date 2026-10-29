@@ -306,21 +306,13 @@ class IcebergIOHandler(BaseIOHandler):
         # Resolve the handler first: a Spark DataFrame must not trigger
         # PyIceberg catalog construction.
         handler = self._resolve_handler(type(obj))
-        is_spark = handler.__class__.__name__ == "PySparkIcebergTypeHandler"
-
-        if is_spark:
-            catalog = None
-        else:
-            catalog = self.pyiceberg_catalog()
-
-        if catalog is None:
+        if handler.__class__.__name__ == "PySparkIcebergTypeHandler":
             request = self._write_request(context, None)
             handler.handle_output(context=context, obj=obj, request=request)
-            return
-
-        with catalog:
-            request = self._write_request(context, catalog)
-            handler.handle_output(context=context, obj=obj, request=request)
+        else:
+            with self.pyiceberg_catalog() as catalog:
+                request = self._write_request(context, catalog)
+                handler.handle_output(context=context, obj=obj, request=request)
 
     def load_input(self, context: InputContext) -> Any:
         """Read an upstream Iceberg table in the requested Python type."""
