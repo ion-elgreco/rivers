@@ -165,7 +165,7 @@ class IcebergIOHandler(BaseIOHandler):
                 ) from exc
             raise
 
-    def catalog(self) -> Catalog:
+    def pyiceberg_catalog(self) -> Catalog:
         """Load the pyiceberg catalog: ``load_catalog(catalog_name, **catalog_properties)``.
 
         This method is used only by PyIceberg-backed handlers. Spark DataFrame
@@ -194,7 +194,7 @@ class IcebergIOHandler(BaseIOHandler):
         Raises:
             NoSuchTableError: If the table does not exist yet.
         """
-        return self.catalog().load_table(
+        return self.pyiceberg_catalog().load_table(
             self.table_identifier(asset_name, asset_metadata)
         )
 
@@ -311,7 +311,7 @@ class IcebergIOHandler(BaseIOHandler):
         if is_spark:
             catalog = None
         else:
-            catalog = self.catalog()
+            catalog = self.pyiceberg_catalog()
 
         if catalog is None:
             request = self._write_request(context, None)
@@ -336,7 +336,7 @@ class IcebergIOHandler(BaseIOHandler):
         if is_spark:
             catalog = None
         else:
-            catalog = self.catalog()
+            catalog = self.pyiceberg_catalog()
 
         meta = context.asset_metadata or {}
         columns = (

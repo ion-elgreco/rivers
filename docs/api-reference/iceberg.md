@@ -207,7 +207,7 @@ class MyTypeHandler(ArrowIcebergTypeHandler[MyType]):
 Reads with `load_input` and writes with `handle_output`, both are implemented with Spark.
 
 ```python
-from rivers.io_handlers.delta.iceberg import PySparkIcebergTypeHandler
+from rivers.io_handlers.iceberg import PySparkIcebergTypeHandler
 
 class MyTypeHandler(PySparkIcebergTypeHandler[MyType]):
     @property

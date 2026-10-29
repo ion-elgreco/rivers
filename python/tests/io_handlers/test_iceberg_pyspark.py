@@ -161,7 +161,7 @@ def _rows(data: SparkDataFrame) -> list[tuple]:
 
 
 def _create_identified_table(handler, name):
-    with handler.catalog() as catalog:
+    with handler.pyiceberg_catalog() as catalog:
         catalog.create_namespace_if_not_exists(("ns",))
         catalog.create_table(
             ("ns", name),
@@ -439,7 +439,7 @@ def test_validation_failure_does_not_register_data_version(
     )
 
     ctx = rs.OutputContext(asset_name=name)
-    request = invalid_handler._write_request(ctx, invalid_handler.catalog())
+    request = invalid_handler._write_request(ctx, invalid_handler.pyiceberg_catalog())
     data = spark.createDataFrame([(2,)], ["id"])
 
     with pytest.raises(ValueError, match="does not support schema_mode"):
@@ -1117,7 +1117,7 @@ def test_upsert_defaults_join_cols_to_composite_identifier_fields(
     name = _name("upsert_composite_identifier")
     handler = _handler(spark, warehouse, catalog_db, mode="upsert")
 
-    with handler.catalog() as catalog:
+    with handler.pyiceberg_catalog() as catalog:
         catalog.create_namespace_if_not_exists(("ns",))
         catalog.create_table(
             ("ns", name),
@@ -1221,7 +1221,7 @@ def test_active_session_is_used_when_none_is_configured(spark):
 def test_handle_output_rejects_non_dataframe(spark, warehouse, catalog_db):
     io = _handler(spark, warehouse, catalog_db)
     ctx = rs.OutputContext(asset_name=_name("not_df"))
-    request = io._write_request(ctx, io.catalog())
+    request = io._write_request(ctx, io.pyiceberg_catalog())
     with pytest.raises(TypeError, match="must be a PySpark DataFrame"):
         PySparkIcebergTypeHandler(spark_session=spark).handle_output(
             ctx, [1, 2], request
@@ -1253,7 +1253,7 @@ def test_handle_output_rejects_unsupported_write_mode(
 ):
     handler = _handler(spark, warehouse, catalog_db)
     ctx = rs.OutputContext(asset_name=_name("invalid_mode"))
-    request = handler._write_request(ctx, handler.catalog())
+    request = handler._write_request(ctx, handler.pyiceberg_catalog())
     request = replace(request, mode=mode)
 
     data = spark.createDataFrame([(1,)], ["id"])
@@ -1273,7 +1273,7 @@ def test_handle_output_rejects_unsupported_schema_mode(
 ):
     handler = _handler(spark, warehouse, catalog_db)
     ctx = rs.OutputContext(asset_name=_name("invalid_schema_mode"))
-    request = handler._write_request(ctx, handler.catalog())
+    request = handler._write_request(ctx, handler.pyiceberg_catalog())
     request = replace(request, schema_mode=schema_mode)
 
     data = spark.createDataFrame([(1,)], ["id"])
@@ -1302,7 +1302,7 @@ def test_handle_output_rejects_schema_overwrite_with_append(
         ValueError,
         match=r"schema_mode 'overwrite' drops columns, so it needs mode 'overwrite', not 'append'",
     ):
-        request = handler._write_request(ctx, handler.catalog())
+        request = handler._write_request(ctx, handler.pyiceberg_catalog())
         data = spark.createDataFrame([(1,)], ["id"])
         PySparkIcebergTypeHandler(
             spark_session=spark,

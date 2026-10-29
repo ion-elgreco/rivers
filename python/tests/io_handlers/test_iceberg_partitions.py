@@ -406,7 +406,7 @@ def test_partitioned_overwrite_needs_partition_expr(tmp_path):
         _write(
             handler, pa.table({"region": ["us"], "v": [1]}), _ctx(_REGIONS, "us"), {}
         )
-    assert not handler.catalog().table_exists(("ns", "t"))
+    assert not handler.pyiceberg_catalog().table_exists(("ns", "t"))
 
 
 def test_partitioned_append_without_partition_expr(tmp_path):

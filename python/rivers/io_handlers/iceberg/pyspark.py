@@ -363,10 +363,7 @@ def _create_table(
     _ensure_namespace(spark, spark_catalog, request.identifier[:-1])
 
     writer = _writer(obj, request, table_name)
-
-    # SparkSessionCatalog requires an explicit provider for table creation.
-    if spark_catalog == "spark_catalog":
-        writer = writer.using("iceberg")
+    writer = writer.using("iceberg")
 
     properties = dict(request.table_properties)
     if request.schema_mode is not None:
@@ -387,6 +384,7 @@ def _merge(
     request: IcebergWriteRequest,
     spark: SparkSession,
     table_name: str,
+    join_columns: list[str],
 ) -> None:
     """Execute an Iceberg MERGE INTO for configured upsert behavior."""
     if request.schema_mode is not None:
@@ -410,7 +408,6 @@ def _merge(
     if not clauses:
         raise ValueError("Iceberg upsert needs at least one matched/insert clause")
 
-    join_columns = _resolve_join_columns(request, spark, table_name)
     source_columns = set(obj.columns)
     target_columns = set(spark.table(table_name).columns)
 
@@ -490,7 +487,10 @@ class PySparkIcebergTypeHandler(IcebergTypeHandler[DataFrame]):
         self, request: IcebergReadRequest, target_type: type[DataFrame]
     ) -> DataFrame:
         """Load a lazy Spark DataFrame with projection, partition, and snapshot filters."""
-        del target_type
+
+        if target_type is not DataFrame:
+            raise TypeError("target_type must be PySpark DataFrame")
+
         spark = self._get_spark_session()
         table_name = _qualified_table_name(self._spark_catalog, request.identifier)
 
@@ -513,13 +513,9 @@ class PySparkIcebergTypeHandler(IcebergTypeHandler[DataFrame]):
 
         return data
 
-    def handle_output(
-        self,
-        context: OutputContext,
-        obj: DataFrame,
-        request: IcebergWriteRequest,
-    ) -> None:
-        """Write through Spark and attach Rivers output metadata."""
+    def _validate_handle_output_params(
+        self, obj: DataFrame, request: IcebergWriteRequest
+    ):
         if not isinstance(obj, DataFrame):
             raise TypeError("obj must be a PySpark DataFrame")
 
@@ -534,78 +530,60 @@ class PySparkIcebergTypeHandler(IcebergTypeHandler[DataFrame]):
         if request.schema_mode == "overwrite" and request.mode != "overwrite":
             raise ValueError("schema_mode='overwrite' requires mode='overwrite'")
 
-        spark = obj.sparkSession
-        table_name = _qualified_table_name(
-            self._spark_catalog,
-            request.identifier,
-        )
-        table_exists = _table_exists(spark, table_name)
+    def _validate_upsert_request(
+        self,
+        request: IcebergWriteRequest,
+        obj: DataFrame,
+        spark: SparkSession,
+        table_name: str,
+        table_exists: bool,
+    ) -> list[str]:
+        if request.schema_mode is not None:
+            raise ValueError("PySpark Iceberg upsert does not support schema_mode")
 
-        join_columns: list[str] = []
-
-        if request.mode == "upsert":
-            if request.schema_mode is not None:
-                raise ValueError("PySpark Iceberg upsert does not support schema_mode")
-
-            if request.snapshot_properties:
-                raise ValueError(
-                    "PySpark Iceberg MERGE INTO cannot attach custom snapshot "
-                    "properties; use mode='append' or mode='overwrite' "
-                    "for those writes"
-                )
-
-            config = request.upsert_config
-            if not (
-                config.when_matched_update_all or config.when_not_matched_insert_all
-            ):
-                raise ValueError(
-                    "Iceberg upsert needs at least one matched/insert clause"
-                )
-
-            # Explicit join columns take precedence. For an existing table,
-            # fall back to its Iceberg identifier fields when available.
-            join_columns = list(config.join_cols or [])
-
-            if not join_columns and table_exists:
-                join_columns = _resolve_join_columns(
-                    request,
-                    spark,
-                    table_name,
-                )
-
-            if not join_columns:
-                raise ValueError(
-                    "PySpark Iceberg upsert requires iceberg/join_cols when "
-                    "creating a table or when identifier fields are unavailable."
-                )
-
-            if len(set(join_columns)) != len(join_columns):
-                raise ValueError("Iceberg upsert join columns must be unique")
-
-            missing_source = [
-                column for column in join_columns if column not in obj.columns
-            ]
-            if missing_source:
-                raise ValueError(
-                    "Iceberg upsert join columns must exist in both source "
-                    f"and target: {missing_source}"
-                )
-
-            _validate_join_keys(obj, join_columns)
-
-        predicate_sql = None
-        if request.mode == "overwrite" and request.partition is not None:
-            predicate_sql = _build_predicate(
-                request.partition,
-                request.partition_expr,
+        if request.snapshot_properties:
+            raise ValueError(
+                "PySpark Iceberg MERGE INTO cannot attach custom snapshot "
+                "properties; use mode='append' or mode='overwrite' "
+                "for those writes"
             )
 
-            if request.schema_mode == "overwrite":
-                raise ValueError(
-                    "schema_mode='overwrite' cannot be combined with a partition overwrite"
-                )
+        config = request.upsert_config
+        if not (config.when_matched_update_all or config.when_not_matched_insert_all):
+            raise ValueError("Iceberg upsert needs at least one matched/insert clause")
 
-        if request.mode == "upsert" and table_exists:
+        # Explicit join columns take precedence. For an existing table,
+        # fall back to its Iceberg identifier fields when available.
+        join_columns = list(config.join_cols or [])
+
+        if not join_columns and table_exists:
+            join_columns = _resolve_join_columns(
+                request,
+                spark,
+                table_name,
+            )
+
+        if not join_columns:
+            raise ValueError(
+                "PySpark Iceberg upsert requires iceberg/join_cols when "
+                "creating a table or when identifier fields are unavailable."
+            )
+
+        if len(set(join_columns)) != len(join_columns):
+            raise ValueError("Iceberg upsert join columns must be unique")
+
+        missing_source = [
+            column for column in join_columns if column not in obj.columns
+        ]
+        if missing_source:
+            raise ValueError(
+                "Iceberg upsert join columns must exist in both source "
+                f"and target: {missing_source}"
+            )
+
+        _validate_join_keys(obj, join_columns)
+
+        if table_exists:
             target_columns = set(spark.table(table_name).columns)
             missing_target = [
                 column for column in join_columns if column not in target_columns
@@ -616,54 +594,32 @@ class PySparkIcebergTypeHandler(IcebergTypeHandler[DataFrame]):
                     f"and target: {missing_target}"
                 )
 
-        started = time.monotonic()
+        return join_columns
 
-        if not table_exists:
-            # Very first write creates the table and commits its initial rows.
-            _create_table(obj, request, spark, table_name, self._spark_catalog)
-        else:
-            _set_table_properties(spark, request, table_name)
+    def _validate_overwrite_request(self, request: IcebergWriteRequest) -> str | None:
+        if request.partition is not None:
+            predicate_sql = _build_predicate(
+                request.partition,
+                request.partition_expr,
+            )
 
-            if request.mode == "append":
-                _writer(obj, request, table_name).append()
+            if request.schema_mode == "overwrite":
+                raise ValueError(
+                    "schema_mode='overwrite' cannot be combined with a partition overwrite"
+                )
 
-            elif request.mode == "overwrite":
-                writer = _writer(obj, request, table_name)
+            return predicate_sql
 
-                if request.schema_mode == "overwrite":
-                    # Preserve existing Iceberg table and partition spec
-                    # and make its schema match the incoming DataFrame.
-                    source_columns = set(obj.columns)
-                    _validate_schema_overwrite_partition_columns(
-                        spark,
-                        table_name,
-                        source_columns,
-                    )
-                    target_columns = spark.table(table_name).columns
+        return None
 
-                    for column in target_columns:
-                        if column not in source_columns:
-                            spark.sql(
-                                f"ALTER TABLE {table_name} DROP COLUMN "
-                                f"{_quote_part(column)}"
-                            )
-
-                    writer.overwrite(F.lit(True))
-                else:
-                    predicate = (
-                        F.expr(predicate_sql)
-                        if predicate_sql is not None
-                        else F.lit(True)
-                    )
-                    writer.overwrite(predicate)
-
-            elif request.mode == "upsert":
-                _merge(obj, request, spark, table_name)
-
-        duration = time.monotonic() - started
-
-        spark.catalog.refreshTable(table_name)
-
+    def _write_table_metadata(
+        self,
+        spark: SparkSession,
+        table_name: str,
+        context: OutputContext,
+        request: IcebergWriteRequest,
+        duration: float,
+    ):
         try:
             snapshot_info = _snapshot_summary(spark, table_name)
         except Exception as exc:
@@ -718,3 +674,85 @@ class PySparkIcebergTypeHandler(IcebergTypeHandler[DataFrame]):
 
         if snapshot_id is not None:
             context.register_data_version(str(snapshot_id))
+
+    def handle_output(
+        self,
+        context: OutputContext,
+        obj: DataFrame,
+        request: IcebergWriteRequest,
+    ) -> None:
+        """Write through Spark and attach Rivers output metadata."""
+
+        self._validate_handle_output_params(obj, request)
+
+        started = time.monotonic()
+        spark = obj.sparkSession
+        table_name = _qualified_table_name(self._spark_catalog, request.identifier)
+        table_exists = _table_exists(spark, table_name)
+        join_columns: list[str] = []
+        predicate_sql = None
+
+        # Validations
+        match request.mode:
+            case "upsert":
+                join_columns = self._validate_upsert_request(
+                    request=request,
+                    obj=obj,
+                    spark=spark,
+                    table_name=table_name,
+                    table_exists=table_exists,
+                )
+
+            case "overwrite":
+                predicate_sql = self._validate_overwrite_request(request=request)
+
+        # Writing
+        if not table_exists:
+            # Very first write creates the table and commits its initial rows.
+            _create_table(obj, request, spark, table_name, self._spark_catalog)
+        else:
+            _set_table_properties(spark, request, table_name)
+
+            match request.mode:
+                case "append":
+                    _writer(obj, request, table_name).append()
+
+                case "overwrite":
+                    writer = _writer(obj, request, table_name)
+                    if request.schema_mode == "overwrite":
+                        # Preserve existing Iceberg table and partition spec
+                        # and make its schema match the incoming DataFrame.
+                        source_columns = set(obj.columns)
+                        _validate_schema_overwrite_partition_columns(
+                            spark,
+                            table_name,
+                            source_columns,
+                        )
+                        target_columns = spark.table(table_name).columns
+                        for column in target_columns:
+                            if column not in source_columns:
+                                spark.sql(
+                                    f"ALTER TABLE {table_name} DROP COLUMN "
+                                    f"{_quote_part(column)}"
+                                )
+                        writer.overwrite(F.lit(True))
+                    else:
+                        predicate = (
+                            F.expr(predicate_sql)
+                            if predicate_sql is not None
+                            else F.lit(True)
+                        )
+                        writer.overwrite(predicate)
+
+                case "upsert":
+                    _merge(obj, request, spark, table_name, join_columns)
+
+        duration = time.monotonic() - started
+        spark.catalog.refreshTable(table_name)
+        self._write_table_metadata(
+            spark=spark,
+            table_name=table_name,
+            context=context,
+            request=request,
+            duration=duration,
+        )

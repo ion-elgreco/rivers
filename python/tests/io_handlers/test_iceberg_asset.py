@@ -89,7 +89,7 @@ def test_keyless_delete_removes_every_row(tmp_path, storage):
 
 def test_delete_of_a_missing_table_clears_state(tmp_path, storage):
     handler, repo = _materialized_events(tmp_path, storage)
-    handler.catalog().drop_table(("ns", "events"))
+    handler.pyiceberg_catalog().drop_table(("ns", "events"))
 
     assert repo.run_action("delete").success
     assert storage.get_asset_record("events").last_timestamp is None
