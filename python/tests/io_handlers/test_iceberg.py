@@ -128,7 +128,7 @@ def test_namespace_and_table_overrides(tmp_path):
     meta = {"iceberg/namespace": "lake", "iceberg/table": "events_v2"}
     write_output(handler, _TABLE, name="events", asset_metadata=meta)
 
-    catalog = handler.catalog()
+    catalog = handler.pyiceberg_catalog()
     assert catalog.table_exists(("lake", "events_v2"))
     assert not catalog.table_exists(("ns", "events"))
     assert _rows(read_input(handler, name="events", asset_metadata=meta)) == _ROWS

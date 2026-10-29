@@ -26,7 +26,7 @@ def iceberg_handler(tmp_path, **kwargs: Any):
             **kwargs,
         }
     )
-    handler.catalog().close()
+    handler.pyiceberg_catalog().close()
     return handler
 
 

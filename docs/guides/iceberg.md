@@ -133,6 +133,7 @@ All readers and writers use the same properties:
 | `polars.LazyFrame` | `rivers[iceberg-polars]` | `pl.scan_iceberg`, lazy |
 | `pandas.DataFrame` | `rivers[iceberg-pandas]` | a pyiceberg scan, into memory |
 | `duckdb.DuckDBPyRelation` | `rivers[iceberg-duckdb]` | DuckDB's `iceberg_scan`, lazy |
+| `pyspark.sql.DataFrame` | `rivers[iceberg-pyspark]` | Spark's Iceberg reader, lazy |
 
 The type of the returned value selects the writer. The type annotation of the downstream parameter selects the reader.
 
@@ -141,6 +142,10 @@ About writes:
 - A write needs memory for all of its data. pyiceberg 0.12 also reads a `RecordBatchReader` or a DuckDB relation into memory.
 - Iceberg v2 stores timestamps in microseconds, and pyiceberg accepts only UTC time zones. The handler writes nanosecond timestamps as microseconds, and zoned timestamps as UTC.
 - The pandas index is not written.
+
+### Write and read with PySpark
+
+A `pyspark.sql.DataFrame` is written and read through Spark's Iceberg connector, so Spark must have the Iceberg runtime and a catalog configured. Spark's catalog and the handler's `catalog_properties` must point at the same tables. Pass the session and the Spark catalog name in `handler_config={"spark_session": spark, "spark_catalog": "<name>"}`; without a session the handler uses the active one.
 
 ### Read with DuckDB
 

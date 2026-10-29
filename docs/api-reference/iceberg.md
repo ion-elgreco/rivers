@@ -26,7 +26,7 @@ io = IcebergIOHandler(
 | `upsert_config` | `UpsertConfig \| None` | `None` | Join columns and clauses for `mode="upsert"`. |
 | `table_properties` | `dict[str, str] \| None` | `None` | Iceberg table properties, set on create and when they change. |
 | `snapshot_properties` | `dict[str, str] \| None` | `None` | Properties added to the summary of each snapshot that the handler writes. |
-| `handler_config` | `dict[str, Any] \| None` | `None` | Type handler config, such as a `DuckDBResource` as `{"duckdb": ...}`. |
+| `handler_config` | `dict[str, Any] \| None` | `None` | Type handler config: a `DuckDBResource` as `{"duckdb": ...}`, or the Spark session and catalog name as `{"spark_session": ..., "spark_catalog": ...}`. |
 
 **Asset metadata overrides:**
 
@@ -62,7 +62,7 @@ io = IcebergIOHandler(
 
 An [action](../concepts/actions.md) gets the asset's resolved handler as `ctx.io_handler`. These methods use the same table and partition resolution as the writes.
 
-#### `catalog()`
+#### `pyiceberg_catalog()`
 
 Loads the pyiceberg catalog: `load_catalog(catalog_name, **catalog_properties)`.
 
@@ -200,3 +200,32 @@ class MyTypeHandler(ArrowIcebergTypeHandler[MyType]):
 | `PolarsTypeHandler` | `rivers.io_handlers.iceberg.polars` | `polars.DataFrame`, `polars.LazyFrame` |
 | `PandasTypeHandler` | `rivers.io_handlers.iceberg.pandas` | `pandas.DataFrame` |
 | `DuckDBTypeHandler` | `rivers.io_handlers.iceberg.duckdb` | `duckdb.DuckDBPyRelation` |
+
+## `PySparkIcebergTypeHandler`
+
+`IcebergTypeHandler`-based handler class for adding Spark-based type support to `IcebergIOHandler`.
+Reads with `load_input` and writes with `handle_output`, both are implemented with Spark.
+
+```python
+from rivers.io_handlers.iceberg import PySparkIcebergTypeHandler
+
+class MyTypeHandler(PySparkIcebergTypeHandler[MyType]):
+    @property
+    def supported_types(self) -> Sequence[type[MyType]]:
+        return [MyType]
+
+    def load_input(
+        self, request: IcebergReadRequest, target_type: type[MyType]
+    ) -> MyType:
+        """Load a lazy Spark DataFrame with projection, partition, and snapshot filters."""
+        ...
+
+    def handle_output(
+        self,
+        context: OutputContext,
+        obj: DataFrame,
+        request: IcebergWriteRequest,
+    ) -> None:
+        """Write through Spark and attach Rivers output metadata."""
+        ...
+```

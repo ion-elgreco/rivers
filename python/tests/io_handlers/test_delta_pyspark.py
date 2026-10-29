@@ -61,7 +61,7 @@ def spark() -> SparkSession:  # type: ignore[return]
 
     builder = (
         SparkSession.builder.master("local[1]")
-        .appName("rivers-pyspark-tests")
+        .appName("rivers-pyspark-delta-tests")
         .config(
             "spark.sql.extensions",
             "io.delta.sql.DeltaSparkSessionExtension",
@@ -109,6 +109,7 @@ def _collect_sorted(df: SparkDataFrame, sort_col: str) -> dict:
     return df.sort(sort_col).toPandas().to_dict(orient="list")
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_round_trip_pyspark(tmp_path, spark):
@@ -129,6 +130,7 @@ def test_round_trip_pyspark(tmp_path, spark):
     assert result_pa.cast(expected.schema).equals(expected)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyspark_read_pyarrow(tmp_path, spark):
@@ -148,6 +150,7 @@ def test_write_pyspark_read_pyarrow(tmp_path, spark):
     assert result.cast(expected.schema).sort_by("a").equals(expected)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyarrow_read_pyspark(tmp_path, spark):
@@ -168,6 +171,7 @@ def test_write_pyarrow_read_pyspark(tmp_path, spark):
     assert result_dict["b"] == ["x", "y", "z"]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_write_pyspark_read_polars(tmp_path, spark):
@@ -193,6 +197,7 @@ def test_write_pyspark_read_polars(tmp_path, spark):
     )
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_append_mode_pyspark(tmp_path, spark):
@@ -210,6 +215,7 @@ def test_append_mode_pyspark(tmp_path, spark):
     assert result.count() == 4
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_single_partition_isolation_pyspark(tmp_path, spark):
@@ -250,6 +256,7 @@ def test_single_partition_isolation_pyspark(tmp_path, spark):
     assert result_b.toPandas()["val"].tolist() == [20]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_partition_overwrite_pyspark(tmp_path, spark):
@@ -278,6 +285,7 @@ def test_partition_overwrite_pyspark(tmp_path, spark):
     assert result.toPandas()["val"].tolist() == [99]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_daily_partition_isolation_pyspark(tmp_path, spark):
@@ -307,6 +315,7 @@ def test_daily_partition_isolation_pyspark(tmp_path, spark):
     assert result_a.toPandas()["val"].tolist() == [10]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_column_selection_pyspark(tmp_path, spark):
@@ -330,6 +339,7 @@ def test_column_selection_pyspark(tmp_path, spark):
     assert collected["c"].tolist() == [3.0, 4.0]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_table_versioning_pyspark(tmp_path, spark):
@@ -363,6 +373,7 @@ def test_table_versioning_pyspark(tmp_path, spark):
     assert result_latest.toPandas()["a"].tolist() == [2]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_null_values_preserved_pyspark(tmp_path, spark):
@@ -388,6 +399,7 @@ def test_null_values_preserved_pyspark(tmp_path, spark):
     assert math.isnan(collected["val"].iloc[1]) or collected["val"].isna().iloc[1]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_output_metadata_pyspark(tmp_path, spark):
@@ -413,6 +425,7 @@ def test_output_metadata_pyspark(tmp_path, spark):
     assert "a" in schema.names
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_creates_delta_log_pyspark(tmp_path, spark):
@@ -425,6 +438,7 @@ def test_creates_delta_log_pyspark(tmp_path, spark):
     assert (tmp_path / "tbl" / "_delta_log").is_dir()
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_root_name_override_pyspark(tmp_path, spark):
@@ -452,6 +466,7 @@ def test_root_name_override_pyspark(tmp_path, spark):
     assert result.toPandas()["a"].tolist() == [1, 2, 3]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_multi_partition_pyspark(tmp_path, spark):
@@ -478,6 +493,7 @@ def test_multi_partition_pyspark(tmp_path, spark):
     assert result.toPandas()["val"].tolist() == [42]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
@@ -502,6 +518,7 @@ def test_pyspark_handler_with_explicit_spark(tmp_path, spark):
     assert result.count() == 3
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_handler_fallback_to_active_session_with_warn(tmp_path, spark):
@@ -528,6 +545,7 @@ def test_handler_fallback_to_active_session_with_warn(tmp_path, spark):
     )
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
@@ -553,6 +571,7 @@ def test_handler_using_user_spark_correctly(tmp_path, spark, recwarn):
     )
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_get_or_create_spark_no_active_no_delta_raises(monkeypatch):
@@ -583,6 +602,7 @@ def test_get_or_create_spark_no_active_no_delta_raises(monkeypatch):
         )._get_or_create_spark_session()
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_schema_mode_merge_pyspark(tmp_path, spark):
@@ -607,6 +627,7 @@ def test_schema_mode_merge_pyspark(tmp_path, spark):
     assert "b" in result.columns
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update(tmp_path, spark):
@@ -661,6 +682,7 @@ def test_custom_merge_when_matched_update(tmp_path, spark):
     assert rows[1]["status"] == "updated_partial"
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_update_all(tmp_path, spark):
@@ -717,6 +739,7 @@ def test_custom_merge_when_matched_update_all(tmp_path, spark):
     assert rows[2]["val"] == "b_new"
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_matched_delete(tmp_path, spark):
@@ -770,6 +793,7 @@ def test_custom_merge_when_matched_delete(tmp_path, spark):
     assert 3 not in rows
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert(tmp_path, spark):
@@ -828,6 +852,7 @@ def test_custom_merge_when_not_matched_insert(tmp_path, spark):
     assert 100 not in rows
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
@@ -883,6 +908,7 @@ def test_custom_merge_when_not_matched_insert_all(tmp_path, spark):
     assert rows[10]["status"] == "s10"
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
@@ -935,6 +961,7 @@ def test_custom_merge_when_not_matched_by_source_delete(tmp_path, spark):
     assert list(rows.keys()) == [1, 2, 3]
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
@@ -988,6 +1015,7 @@ def test_custom_merge_when_not_matched_by_source_update(tmp_path, spark):
     assert rows[4]["val"] == "d"
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_missing_pyspark_output_error(tmp_path, spark):
@@ -1003,6 +1031,7 @@ def test_missing_pyspark_output_error(tmp_path, spark):
             handler.handle_output(ctx, df)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_missing_pyspark_input_error(tmp_path, spark):
@@ -1025,6 +1054,7 @@ def test_missing_pyspark_input_error(tmp_path, spark):
             handler.load_input(ctx_in)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_merge_upsert_pyspark(tmp_path, spark):
@@ -1047,6 +1077,7 @@ def test_merge_upsert_pyspark(tmp_path, spark):
     assert result.sort_by("id").cast(expected.schema).equals(expected)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
@@ -1071,6 +1102,7 @@ def test_merge_deduplicate_insert_pyspark(tmp_path, spark):
     assert result.sort_by("id").cast(expected.schema).equals(expected)
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_backfill_overwrite_pyspark(tmp_path, spark):
@@ -1127,6 +1159,7 @@ def test_backfill_overwrite_pyspark(tmp_path, spark):
     assert results["c"] == 1, "partition 'c' should NOT have been overwritten"
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_large_pyspark_df_round_trips(tmp_path, spark):
@@ -1146,6 +1179,7 @@ def test_large_pyspark_df_round_trips(tmp_path, spark):
     assert result.count() == n
 
 
+@pytest.mark.delta_spark
 @pytest.mark.spark_test
 @pytest.mark.filterwarnings("ignore::pandas.errors.Pandas4Warning")
 def test_warns_when_user_sets_unsupported_properties(tmp_path, spark):
