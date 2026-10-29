@@ -90,7 +90,7 @@ test-spark: _runtime-bin
 
 # Run Python tests (excluding spark tests)
 test-dev: _runtime-bin
-    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial and not_spark_test" python/
+    RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial and not spark_test" python/
     RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "serial and not spark_test" python/
 
 # Run all Rust workspace tests.
