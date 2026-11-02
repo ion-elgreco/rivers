@@ -56,7 +56,7 @@ kube-client.workspace = true
 k8s-openapi.workspace = true
 # Embedded SurrealDB server behind `rivers dev`. Pinned exactly: SurrealDB
 # calls this crate's API unstable.
-surrealdb-server = { version = "=3.3.0", default-features = false, features = ["storage-rocksdb"], optional = true }
+surrealdb-server = { version = "=3.3.4", default-features = false, features = ["storage-rocksdb"], optional = true }
 axum = { workspace = true, optional = true }
 
 [features]
