@@ -327,7 +327,7 @@ pub struct PyScheduleDefinition {
     pub(crate) evaluation_fn: Option<Py<PyAny>>,
     /// Whether the schedule starts as running or stopped.
     pub(crate) default_status: PyScheduleStatus,
-    /// Timezone for cron evaluation (e.g. `"US/Eastern"`).
+    /// Timezone for cron evaluation (e.g. `"America/New_York"`).
     pub(crate) timezone: Option<String>,
     /// Tags applied to triggered runs.
     pub(crate) tags: Option<HashMap<String, String>>,

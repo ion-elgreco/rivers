@@ -448,4 +448,4 @@ rivers backfill my_pipeline --assets daily_events --from 2024-01-01 --to 2024-01
 rivers db migrate my_pipeline
 ```
 
-The module argument is a Python module path; `--repo-var` (default `repo`) names the `CodeRepository` instance. Flags also come from `RIVERS_<GROUP>_<KEY>` env vars, `rivers.toml`, or `[tool.rivers.*]` in `pyproject.toml`.
+The module argument is a Python module path; `--repo-var` (default `repo`) names the `CodeRepository` instance. Flags also come from `RIVERS_<GROUP>_<KEY>` env vars, `rivers.toml` (also found as `.config/rivers.toml` or `config/rivers.toml`, or set with `--config`/`RIVERS_CONFIG`), `[tool.rivers.*]` in `pyproject.toml`, or a user-level `~/.config/rivers/rivers.toml`.

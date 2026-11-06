@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from typing import ClassVar
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
@@ -52,6 +54,8 @@ class RiversConfig(BaseSettings):
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
 
+    config_file: ClassVar[Path | None] = None
+
     model_config = SettingsConfigDict(
         env_prefix="RIVERS_",
         env_nested_delimiter="_",
@@ -63,6 +67,7 @@ class RiversConfig(BaseSettings):
     @classmethod
     def from_cli(
         cls,
+        config: Path | None = None,
         module: str | None = None,
         repo_var: str | None = None,
         host: str | None = None,
@@ -80,9 +85,16 @@ class RiversConfig(BaseSettings):
         means "flag not passed" and leaves the lower-precedence sources in
         charge of that key.
 
+        Args:
+            config: Path to a ``rivers.toml`` that replaces the discovered one.
+
         Returns:
             RiversConfig: the merged configuration.
         """
+        settings_cls = cls
+        if config is not None:
+            settings_cls = type(cls.__name__, (cls,), {"config_file": config})
+
         groups: dict[str, dict] = {
             "module": {"path": module, "repo_var": repo_var},
             "server": {"host": host, "port": port, "grpc_port": grpc_port},
@@ -94,7 +106,9 @@ class RiversConfig(BaseSettings):
             name: {k: v for k, v in fields.items() if v is not None}
             for name, fields in groups.items()
         }
-        return cls(**{name: fields for name, fields in provided.items() if fields})  # type: ignore
+        return settings_cls(
+            **{name: fields for name, fields in provided.items() if fields}  # type: ignore
+        )
 
     @classmethod
     def settings_customise_sources(
@@ -113,8 +127,15 @@ class RiversConfig(BaseSettings):
         # Using _find_toml() to recursively lookup the TOML configuration files
         # within the current code location. This makes it possible to run operations
         # such as `rivers dev` from any project directory.
-        rivers_toml = _find_toml("rivers.toml")
+        explicit = cls.config_file or os.environ.get("RIVERS_CONFIG")
+        if explicit:
+            rivers_toml = Path(explicit)
+            if not rivers_toml.is_file():
+                raise FileNotFoundError(f"rivers config file not found: {rivers_toml}")
+        else:
+            rivers_toml = _find_toml(*RIVERS_TOML_NAMES)
         pyproject_toml = _find_toml("pyproject.toml")
+        user_toml = _user_config_dir() / "rivers" / "rivers.toml"
 
         if rivers_toml:
             sources.append(
@@ -130,14 +151,28 @@ class RiversConfig(BaseSettings):
                     toml_file=pyproject_toml,
                 )
             )
+        if user_toml.is_file():
+            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=user_toml))
 
         return tuple(sources)
 
 
-def _find_toml(filename: str, start_path: Path = Path.cwd()) -> Path | None:
-    """Recursively lookup TOML-file from current terminal path."""
+RIVERS_TOML_NAMES = ("rivers.toml", ".config/rivers.toml", "config/rivers.toml")
+
+
+def _find_toml(*filenames: str, start_path: Path | None = None) -> Path | None:
+    """Recursively lookup TOML-file from current terminal path.
+
+    In each directory, ``filenames`` are tried in order; the closest directory wins.
+    """
+    start_path = start_path or Path.cwd()
     for directory in [start_path, *start_path.parents]:
-        path = directory / filename
-        if path.exists():
-            return path
+        for filename in filenames:
+            path = directory / filename
+            if path.is_file():
+                return path
     return None
+
+
+def _user_config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")

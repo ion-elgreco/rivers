@@ -20,7 +20,7 @@ def nightly(context: rs.ScheduleEvaluationContext):
 | `job_name` | `str` | required | Name of the job to trigger. |
 | `name` | `str \| None` | `None` | Schedule name. Defaults to the function name. |
 | `default_status` | `ScheduleStatus` | `Stopped` | Whether the schedule starts running or stopped. |
-| `timezone` | `str \| None` | `None` | Timezone for cron evaluation (e.g. `"US/Eastern"`). |
+| `timezone` | `str \| None` | `None` | Timezone for cron evaluation (e.g. `"America/New_York"`). |
 | `tags` | `dict[str, str] \| None` | `None` | Tags for categorization. |
 | `description` | `str \| None` | `None` | Human-readable description. |
 | `eval_mode` | `EvalMode` | `EvalMode.Auto` | Execution mode for the evaluation function. |
@@ -45,7 +45,7 @@ sched = rs.Schedule(
     name="noon_schedule",
     evaluation_fn=my_eval_fn,
     default_status=rs.ScheduleStatus.Running,
-    timezone="US/Eastern",
+    timezone="America/New_York",
     tags={"env": "prod"},
     description="Runs at noon",
 )

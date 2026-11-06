@@ -10,7 +10,7 @@ import time
 
 import pytest
 import rivers as rs
-from rivers._core.storage import Storage
+from rivers.testing import embedded_storage
 from typer.testing import CliRunner
 
 from rivers.cli import app
@@ -40,7 +40,7 @@ def _cloud_env(monkeypatch, path):
     # from any earlier test in this file.
     importlib.invalidate_caches()
     monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", "default")
-    store = Storage.embedded(str(path))
+    store = embedded_storage(str(path))
     monkeypatch.setattr(
         "rivers.cli.run.Storage",
         type("_S", (), {"connect": staticmethod(lambda *a, **k: store)}),
