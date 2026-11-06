@@ -40,13 +40,7 @@ impl From<PyRunStatus> for RunStatus {
     }
 }
 
-#[pyclass(
-    name = "StoredEvent",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StoredEvent", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyStoredEvent {
     pub id: String,
@@ -79,13 +73,7 @@ impl From<StoredEvent> for PyStoredEvent {
     }
 }
 
-#[pyclass(
-    name = "StoredLog",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StoredLog", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyStoredLog {
     pub id: String,
@@ -134,13 +122,7 @@ impl PyStoredLog {
     }
 }
 
-#[pyclass(
-    name = "StaleCause",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StaleCause", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyStaleCause {
     pub asset_key: String,
@@ -165,13 +147,7 @@ impl PyStaleCause {
     }
 }
 
-#[pyclass(
-    name = "AssetRecord",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "AssetRecord", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyAssetRecord {
     pub asset_key: String,
@@ -209,7 +185,7 @@ impl From<AssetRecord> for PyAssetRecord {
 
 /// Who performed a manual action — Python mirror of
 /// `rivers_core::storage::UserRef`.
-#[pyclass(name = "UserRef", frozen, skip_from_py_object, module = "rivers._core")]
+#[pyclass(name = "UserRef", frozen, module = "rivers._core")]
 #[derive(Clone, Debug)]
 pub struct PyUserRef {
     pub(crate) inner: rivers_core::storage::UserRef,
@@ -257,12 +233,7 @@ impl PyUserRef {
 /// (manual runs launched through an authenticated UI session), each `None`
 /// for variants that don't carry them. Use the classmethod constructors
 /// (`LaunchedBy.manual()`, `LaunchedBy.schedule("daily")`, …) to build values.
-#[pyclass(
-    name = "LaunchedBy",
-    frozen,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "LaunchedBy", frozen, module = "rivers._core")]
 #[derive(Clone, Debug)]
 pub struct PyLaunchedBy {
     pub(crate) inner: LaunchedBy,
@@ -391,12 +362,7 @@ impl From<LaunchedBy> for PyLaunchedBy {
     }
 }
 
-#[pyclass(
-    name = "RunRecord",
-    frozen,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "RunRecord", frozen, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyRunRecord {
     #[pyo3(get)]
@@ -463,13 +429,7 @@ impl From<RunRecord> for PyRunRecord {
     }
 }
 
-#[pyclass(
-    name = "StoredTick",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StoredTick", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyStoredTick {
     pub id: String,

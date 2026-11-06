@@ -8,12 +8,7 @@ use crate::partitions::PyPartitionKey;
 use crate::storage::PyRunRecord;
 
 /// One failed step of a run.
-#[pyclass(
-    name = "StepFailure",
-    frozen,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StepFailure", frozen, module = "rivers._core")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PyStepFailure {
     /// Asset (or task) whose step failed.

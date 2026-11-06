@@ -1,12 +1,6 @@
 use pyo3::prelude::*;
 
-#[pyclass(
-    name = "PoolLimit",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "PoolLimit", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyPoolLimit {
     pub pool_key: String,
@@ -24,13 +18,7 @@ impl From<rivers_core::storage::PoolLimit> for PyPoolLimit {
     }
 }
 
-#[pyclass(
-    name = "PoolInfo",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "PoolInfo", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyPoolInfo {
     pub pool_key: String,
@@ -52,13 +40,7 @@ impl From<rivers_core::storage::PoolInfo> for PyPoolInfo {
     }
 }
 
-#[pyclass(
-    name = "SlotHolder",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "SlotHolder", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PySlotHolder {
     pub run_id: String,
@@ -80,13 +62,7 @@ impl From<rivers_core::storage::SlotHolder> for PySlotHolder {
     }
 }
 
-#[pyclass(
-    name = "PoolBlockDetail",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "PoolBlockDetail", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyPoolBlockDetail {
     pub pool_key: String,
@@ -104,13 +80,7 @@ impl From<rivers_core::storage::PoolBlockDetail> for PyPoolBlockDetail {
     }
 }
 
-#[pyclass(
-    name = "BlockReason",
-    frozen,
-    get_all,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "BlockReason", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]
 pub struct PyBlockReason {
     /// "pool_full" or "pools_full"
@@ -174,7 +144,6 @@ impl From<rivers_core::storage::BlockReason> for PyBlockReason {
     name = "ConcurrencyClaimStatus",
     frozen,
     get_all,
-    skip_from_py_object,
     module = "rivers._core"
 )]
 #[derive(Clone)]

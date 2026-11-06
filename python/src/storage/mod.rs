@@ -102,14 +102,7 @@ pub(super) fn format_run_status(s: RunStatus) -> &'static str {
     }
 }
 
-#[pyclass(
-    name = "StorageType",
-    frozen,
-    eq,
-    eq_int,
-    skip_from_py_object,
-    module = "rivers._core"
-)]
+#[pyclass(name = "StorageType", frozen, eq, eq_int, module = "rivers._core")]
 #[derive(Clone, Copy, PartialEq)]
 pub enum PyStorageType {
     Memory,
