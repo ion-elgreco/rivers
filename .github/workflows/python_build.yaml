@@ -152,6 +152,14 @@ jobs:
         # builds the WASM dev-profile to save a few seconds in CI.
         run: just ${{ endsWith(matrix.python-version, 't') && 'develop-ft' || 'develop-fast' }}
 
+      # Runner images default to JDK 25 (ubuntu-26.04), which removed the
+      # Subject.getSubject that Hadoop calls under Spark.
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - name: Run tests
         run: just ${{ endsWith(matrix.python-version, 't') && 'test-ft' || 'test' }}
 
