@@ -566,7 +566,6 @@ mod tests {
                 )),
             )
             .spec
-            .unwrap()
             .template
             .spec
             .unwrap();

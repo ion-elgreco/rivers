@@ -97,7 +97,7 @@ pub(super) async fn observe_deployment<T: Template>(
 
 /// What `deployment`'s pod template runs.
 pub(super) fn template_of<T: Template>(deployment: &Deployment) -> Option<T> {
-    T::of_pod(deployment.spec.as_ref()?.template.spec.as_ref()?)
+    T::of_pod(deployment.spec.template.spec.as_ref()?)
 }
 
 /// The newest failed run of the `workspace` init container among the pods
@@ -188,10 +188,10 @@ pub(super) fn deployment_rollout<T: Template>(deployment: Option<&Deployment>) -
 /// Every pod runs the current template and is ready, and no pod of an older
 /// template is left. Ready counts alone include the old ReplicaSet's pods.
 pub(super) fn rollout_complete(deployment: &Deployment) -> bool {
-    let (Some(spec), Some(status)) = (&deployment.spec, &deployment.status) else {
+    let Some(status) = &deployment.status else {
         return false;
     };
-    let desired = spec.replicas.unwrap_or(1);
+    let desired = deployment.spec.replicas.unwrap_or(1);
     let all = |count: Option<i32>| count.unwrap_or(0) >= desired;
     desired > 0
         && no_old_pods(deployment)
@@ -286,8 +286,8 @@ fn has_progress_deadline_exceeded(d: &DeploymentStatus) -> bool {
         .as_ref()
         .map(|cs| {
             cs.iter().any(|c| {
-                c.type_ == "Progressing"
-                    && c.status == "False"
+                c.type_.as_deref() == Some("Progressing")
+                    && c.status.as_deref() == Some("False")
                     && c.reason.as_deref() == Some("ProgressDeadlineExceeded")
             })
         })
