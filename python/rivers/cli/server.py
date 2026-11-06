@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import os
 import sys
+from pathlib import Path
 
 import typer
 
@@ -36,6 +37,10 @@ def dev(
     synthetic: str | None = typer.Option(
         None, help="Override graph with synthetic DAG (e.g. 100, 1k, 10k, 50k)"
     ),
+    config: Path | None = typer.Option(
+        None,
+        help="Path to a rivers.toml (replaces the discovered one; env: RIVERS_CONFIG)",
+    ),
 ) -> None:
     """Start the rivers development server.
 
@@ -45,6 +50,7 @@ def dev(
     up: press the reload button in the UI.
     """
     cfg = RiversConfig.from_cli(
+        config=config,
         module=module,
         repo_var=repo_var,
         host=host,

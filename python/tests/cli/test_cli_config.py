@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
+import pytest
 from rivers.cli.config import (
+    RIVERS_TOML_NAMES,
     DaemonConfig,
     ModuleConfig,
     RiversConfig,
@@ -13,16 +15,18 @@ from rivers.cli.config import (
 )
 
 
-def _make_rivers_toml(tmp_path: Path, **sections) -> Path:
-    """Write a minimal rivers.toml under 'tmp_path' and return its path."""
+def _make_rivers_toml(tmp_path: Path, name: str = "rivers.toml", **sections) -> Path:
+    """Write a minimal rivers.toml at 'tmp_path / name' and return its path."""
     lines = []
     for section, values in sections.items():
         lines.append(f"[{section}]")
         for k, v in values.items():
             lines.append(f"{k} = {_toml_value(v)}")
         lines.append("")
-    (tmp_path / "rivers.toml").write_text("\n".join(lines))
-    return tmp_path / "rivers.toml"
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+    return path
 
 
 def _make_pyproject_toml(tmp_path: Path, **sections) -> Path:
@@ -78,6 +82,38 @@ class TestFindToml:
             _find_toml("rivers.toml", start_path=child_path)
             == child_path / "rivers.toml"
         )
+
+    @pytest.mark.parametrize("name", RIVERS_TOML_NAMES)
+    def test_finds_each_rivers_toml_location(self, tmp_path, name):
+        _make_rivers_toml(tmp_path, name)
+        assert _find_toml(*RIVERS_TOML_NAMES, start_path=tmp_path) == tmp_path / name
+
+    def test_names_are_tried_in_order_within_a_directory(self, tmp_path):
+        for name in RIVERS_TOML_NAMES:
+            _make_rivers_toml(tmp_path, name)
+        found = _find_toml(*RIVERS_TOML_NAMES, start_path=tmp_path)
+        assert found == tmp_path / "rivers.toml"
+
+        (tmp_path / "rivers.toml").unlink()
+        found = _find_toml(*RIVERS_TOML_NAMES, start_path=tmp_path)
+        assert found == tmp_path / ".config" / "rivers.toml"
+
+    def test_closer_config_dir_beats_parent_rivers_toml(self, tmp_path):
+        child_path = tmp_path / "a"
+        _make_rivers_toml(tmp_path)
+        _make_rivers_toml(child_path, "config/rivers.toml")
+        found = _find_toml(*RIVERS_TOML_NAMES, start_path=child_path)
+        assert found == child_path / "config" / "rivers.toml"
+
+    def test_skips_directory_with_the_file_name(self, tmp_path):
+        (tmp_path / "rivers.toml").mkdir()
+        assert _find_toml("rivers.toml", start_path=tmp_path) is None
+
+    def test_defaults_to_current_working_directory(self, tmp_path, monkeypatch):
+        child_path = tmp_path / "a"
+        _make_rivers_toml(child_path)
+        monkeypatch.chdir(child_path)
+        assert _find_toml("rivers.toml") == child_path / "rivers.toml"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +294,120 @@ class TestRiversToml:
         cfg = RiversConfig()
         assert cfg.server.port == 7070
 
+    @pytest.mark.parametrize("name", [".config/rivers.toml", "config/rivers.toml"])
+    def test_config_directory_in_monorepo_root_is_discovered(
+        self, tmp_path, monkeypatch, name
+    ):
+        """A monorepo root's ``.config/`` or ``config/`` file reaches each project."""
+        project = tmp_path / "projects" / "a"
+        project.mkdir(parents=True)
+        _make_rivers_toml(tmp_path, name, server={"port": 7171})
+        monkeypatch.chdir(project)
+        cfg = RiversConfig()
+        assert cfg.server.port == 7171
+
+
+# ---------------------------------------------------------------------------
+# User-level rivers.toml
+# ---------------------------------------------------------------------------
+
+
+class TestUserConfig:
+    """``$XDG_CONFIG_HOME/rivers/rivers.toml`` (default ``~/.config``) supplies
+    defaults below every project-level source."""
+
+    def test_reads_user_config(self, user_config_dir):
+        _make_rivers_toml(user_config_dir, "rivers/rivers.toml", server={"port": 6060})
+        cfg = RiversConfig()
+        assert cfg.server.port == 6060
+
+    def test_defaults_to_home_config(self, tmp_path_factory, monkeypatch):
+        home = tmp_path_factory.mktemp("home")
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        _make_rivers_toml(home, ".config/rivers/rivers.toml", server={"port": 6161})
+        cfg = RiversConfig()
+        assert cfg.server.port == 6161
+
+    @pytest.mark.parametrize("project_file", ["rivers.toml", "pyproject.toml"])
+    def test_project_config_beats_user_config(
+        self, resolved_tmp_path, user_config_dir, project_file
+    ):
+        """Project files win per key; keys they leave out fall through."""
+        _make_rivers_toml(
+            user_config_dir,
+            "rivers/rivers.toml",
+            server={"port": 6060, "grpc_port": 6061},
+        )
+        if project_file == "rivers.toml":
+            _make_rivers_toml(resolved_tmp_path, server={"port": 1111})
+        else:
+            _make_pyproject_toml(resolved_tmp_path, server={"port": 1111})
+        cfg = RiversConfig()
+        assert cfg.server.port == 1111
+        assert cfg.server.grpc_port == 6061
+
+    def test_env_beats_user_config(self, user_config_dir, monkeypatch):
+        _make_rivers_toml(user_config_dir, "rivers/rivers.toml", server={"port": 6060})
+        monkeypatch.setenv("RIVERS_SERVER_PORT", "6666")
+        cfg = RiversConfig()
+        assert cfg.server.port == 6666
+
+
+# ---------------------------------------------------------------------------
+# Explicit rivers.toml path (--config / RIVERS_CONFIG)
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitConfig:
+    """An explicit path replaces the discovered ``rivers.toml``; it is not
+    merged with it. ``pyproject.toml`` and the user-level file still apply."""
+
+    @pytest.fixture
+    def explicit(self, tmp_path_factory):
+        return _make_rivers_toml(
+            tmp_path_factory.mktemp("explicit"), "custom.toml", server={"port": 3333}
+        )
+
+    @pytest.fixture(params=["from_cli", "env"])
+    def load(self, request, monkeypatch):
+        def load(path: Path) -> RiversConfig:
+            if request.param == "from_cli":
+                return RiversConfig.from_cli(config=path)
+            monkeypatch.setenv("RIVERS_CONFIG", str(path))
+            return RiversConfig()
+
+        return load
+
+    def test_replaces_discovered_rivers_toml(self, resolved_tmp_path, explicit, load):
+        _make_rivers_toml(resolved_tmp_path, server={"port": 1111, "grpc_port": 2222})
+        cfg = load(explicit)
+        assert cfg.server.port == 3333
+        assert cfg.server.grpc_port == 3001
+
+    def test_pyproject_and_user_config_still_apply(
+        self, resolved_tmp_path, user_config_dir, explicit, load
+    ):
+        _make_pyproject_toml(resolved_tmp_path, server={"grpc_port": 4444})
+        _make_rivers_toml(user_config_dir, "rivers/rivers.toml", server={"host": "h"})
+        cfg = load(explicit)
+        assert cfg.server.port == 3333
+        assert cfg.server.grpc_port == 4444
+        assert cfg.server.host == "h"
+
+    def test_env_var_beats_explicit_file(self, explicit, load, monkeypatch):
+        monkeypatch.setenv("RIVERS_SERVER_PORT", "6666")
+        assert load(explicit).server.port == 6666
+
+    def test_missing_file_raises(self, resolved_tmp_path, load):
+        with pytest.raises(FileNotFoundError, match="missing.toml"):
+            load(resolved_tmp_path / "missing.toml")
+
+    def test_from_cli_beats_env_var(self, resolved_tmp_path, explicit, monkeypatch):
+        monkeypatch.setenv("RIVERS_CONFIG", str(resolved_tmp_path / "missing.toml"))
+        assert RiversConfig.from_cli(config=explicit).server.port == 3333
+
 
 # ---------------------------------------------------------------------------
 # pyproject.toml
@@ -267,8 +417,8 @@ class TestRiversToml:
 class TestPyprojectToml:
     """``pyproject.toml`` values are read from the ``[tool.rivers.*]`` tables.
 
-    This source has the lowest priority and is only used when neither init
-    kwargs, env vars, nor ``rivers.toml`` supply a value for a given field.
+    This source is only used when neither init kwargs, env vars, nor
+    ``rivers.toml`` supply a value for a given field.
     """
 
     def test_reads_module_config(self, resolved_tmp_path):
@@ -305,8 +455,9 @@ class TestSourcePriority:
 
     1. Init kwargs
     2. ``RIVERS_*`` environment variables
-    3. ``rivers.toml``
+    3. ``rivers.toml`` (``--config``/``RIVERS_CONFIG``, else discovered)
     4. ``pyproject.toml``
+    5. User-level ``rivers.toml``
     """
 
     def test_rivers_toml_takes_priority_over_pyproject(self, tmp_path, monkeypatch):
