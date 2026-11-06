@@ -50,9 +50,11 @@ class TestLeafConditions:
 
     def test_cron_tick_passed_with_timezone(self):
         cond = rs.AutomationCondition.cron_tick_passed(
-            "0 0 * * *", timezone="US/Eastern"
+            "0 0 * * *", timezone="America/New_York"
         )
-        assert cond.description == "cron_tick_passed('0 0 * * *', tz='US/Eastern')"
+        assert (
+            cond.description == "cron_tick_passed('0 0 * * *', tz='America/New_York')"
+        )
 
     def test_in_latest_time_window(self):
         cond = rs.AutomationCondition.in_latest_time_window()

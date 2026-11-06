@@ -81,7 +81,7 @@ class TestSchedule:
             job_name="daily_job",
             name="noon_schedule",
             default_status=rs.ScheduleStatus.Running,
-            timezone="US/Eastern",
+            timezone="America/New_York",
             tags={"env": "prod"},
             description="Runs at noon",
         )
@@ -89,7 +89,7 @@ class TestSchedule:
         assert sched.job_name == "daily_job"
         assert sched.name == "noon_schedule"
         assert sched.default_status == rs.ScheduleStatus.Running
-        assert sched.timezone == "US/Eastern"
+        assert sched.timezone == "America/New_York"
         assert sched.tags == {"env": "prod"}
         assert sched.description == "Runs at noon"
 
