@@ -11,7 +11,7 @@ license = "Apache-2.0"
 repository = "https://github.com/ion-elgreco/rivers"
 description = "Orchestration platform for tasks and assets fully backed by Rust"
 keywords = ["rivers", "orchestrator", "pipelines", "assets", "tasks"]
-rust-version = "1.91.0"
+rust-version = "1.92.0"
 
 [workspace.dependencies]
 anyhow = "1.0.100"

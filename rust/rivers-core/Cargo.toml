@@ -11,13 +11,12 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
 ordermap = "1"
 jiff.workspace = true
 croner.workspace = true
 futures-util = { workspace = true }
 petgraph.workspace = true
-refinery-core = { version = "0.9", default-features = false }
+refinery-core = { version = "0.10", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 surrealdb = { version = "3.3.0", default-features = false, features = ["kv-rocksdb", "kv-mem", "protocol-ws", "rustls"] }

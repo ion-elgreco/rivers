@@ -6774,11 +6774,10 @@ dependencies = [
 
 [[package]]
 name = "refinery-core"
-version = "0.9.2"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24eeafd893124f29183dd6afa9137a27e7bef59250223b8b660005279c60aea4"
+checksum = "07f0a6b2d031aec7903f7ce81c723bbe7d3d8667441012b2a4388af0f3a70ef3"
 dependencies = [
- "async-trait",
  "cfg-if",
  "log",
  "regex",
@@ -7041,7 +7040,6 @@ name = "rivers-core"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
- "async-trait",
  "croner",
  "futures-util",
  "jiff",
