@@ -24,12 +24,11 @@ struct SurrealMigrate {
     db: Surreal<Any>,
 }
 
-#[async_trait::async_trait]
 impl AsyncTransaction for SurrealMigrate {
     type Error = surrealdb::Error;
 
-    async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
-        &mut self,
+    async fn execute<'a, T: Iterator<Item = &'a str> + Send + 'a>(
+        &'a mut self,
         queries: T,
     ) -> Result<usize, Self::Error> {
         // refinery hands us a migration's SQL + its history INSERT; one
@@ -48,9 +47,8 @@ impl AsyncTransaction for SurrealMigrate {
     }
 }
 
-#[async_trait::async_trait]
 impl AsyncQuery<Vec<Migration>> for SurrealMigrate {
-    async fn query(&mut self, query: &str) -> Result<Vec<Migration>, Self::Error> {
+    async fn query<'a>(&'a mut self, query: &'a str) -> Result<Vec<Migration>, Self::Error> {
         #[derive(SurrealValue)]
         struct HistRow {
             version: i64,
