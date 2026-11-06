@@ -66,7 +66,17 @@ A code location that does not come back (a syntax error, a failed import, a fail
 
 The embedded storage is served on an ephemeral loopback port. With `--surreal-endpoint`, the UI and the code location connect to that server instead and nothing is served locally.
 
-Every flag (and the module argument) can also come from configuration, with CLI flags taking precedence: `RIVERS_<GROUP>_<KEY>` environment variables (e.g. `RIVERS_SERVER_PORT`, `RIVERS_MODULE_PATH`), then the `[module]`/`[server]`/`[storage]`/`[daemon]` tables in `rivers.toml`, then `[tool.rivers.*]` in `pyproject.toml` — both files found by walking up from the current directory.
+Every flag (and the module argument) can also come from configuration. Sources, from highest to lowest precedence:
+
+1. CLI flags.
+2. `RIVERS_<GROUP>_<KEY>` environment variables (e.g. `RIVERS_SERVER_PORT`, `RIVERS_MODULE_PATH`).
+3. The `[module]`/`[server]`/`[storage]`/`[daemon]` tables in `rivers.toml`.
+4. `[tool.rivers.*]` in `pyproject.toml`.
+5. The same tables in a user-level `$XDG_CONFIG_HOME/rivers/rivers.toml` (default `~/.config/rivers/rivers.toml`), for defaults shared by all projects.
+
+`rivers.toml` and `pyproject.toml` are found by walking up from the current directory. In each directory, rivers looks for `rivers.toml`, then `.config/rivers.toml`, then `config/rivers.toml`; the closest directory wins. In a monorepo, one file at the root applies to every project below it.
+
+To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CONFIG=<path>`. That file replaces the discovered `rivers.toml`; `pyproject.toml` and the user-level file still apply. A missing file is an error.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -77,6 +87,7 @@ Every flag (and the module argument) can also come from configuration, with CLI 
 | `--surreal-endpoint` | unset | Connect to a remote SurrealDB instead of using embedded storage. |
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |
+| `--config` | unset | Path to a `rivers.toml` that replaces the discovered one. Env: `RIVERS_CONFIG`. |
 
 ---
 

@@ -4,6 +4,7 @@ The happy path stubs ``_serve_dev``: everything before it (flat CLI args →
 nested ``RiversConfig``, the cwd module lookup) runs for real.
 """
 
+import pytest
 from typer.testing import CliRunner
 
 import rivers.cli.server
@@ -86,3 +87,27 @@ def test_dev_reaches_host_seam_with_flags_applied(resolved_tmp_path, monkeypatch
     assert cfg.server.port == 3210
     assert cfg.server.grpc_port == 3211
     assert cfg.storage.path == str(resolved_tmp_path / "storage")
+
+
+@pytest.mark.parametrize("via", ["flag", "env"])
+def test_dev_reads_config_from_explicit_path(resolved_tmp_path, monkeypatch, via):
+    """``--config`` and ``RIVERS_CONFIG`` both load a rivers.toml outside the walk-up."""
+    config = resolved_tmp_path / "elsewhere" / "custom.toml"
+    config.parent.mkdir()
+    config.write_text('[module]\npath = "from_explicit_config"\n')
+    (resolved_tmp_path / "rivers.toml").write_text('[module]\npath = "discovered"\n')
+
+    args = ["dev"]
+    if via == "flag":
+        args += ["--config", str(config)]
+    else:
+        monkeypatch.setenv("RIVERS_CONFIG", str(config))
+
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    assert "module 'from_explicit_config' not found" in result.output
+
+
+def test_dev_missing_config_file_fails(resolved_tmp_path):
+    result = runner.invoke(app, ["dev", "--config", "missing.toml"])
+    assert isinstance(result.exception, FileNotFoundError)

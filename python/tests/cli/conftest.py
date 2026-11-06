@@ -3,7 +3,6 @@
 import os
 
 import pytest
-from rivers.cli.config import _find_toml
 
 
 @pytest.fixture(autouse=True)
@@ -29,14 +28,7 @@ def clear_rivers_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def resolved_tmp_path(tmp_path, monkeypatch):
-    """Yield a fully resolved ``tmp_path`` and chdir into it.
-
-    On macOS, ``tmp_path`` is typically under ``/var/folders/...`` which is a
-    symlink to ``/private/var/folders/...``. ``Path.cwd()`` returns the
-    resolved path, so ``_find_toml``'s upward walk would never match a
-    ``tmp_path`` that still contains the unresolved symlink. Resolving once
-    here keeps every test consistent without per-test boilerplate.
-    """
+    """Yield a fully resolved ``tmp_path`` and chdir into it."""
     resolved = tmp_path.resolve()
     monkeypatch.chdir(resolved)
 
@@ -46,10 +38,12 @@ def resolved_tmp_path(tmp_path, monkeypatch):
     # PyprojectTomlConfigSettingsSource source is configured.
     (resolved / "pyproject.toml").write_text("[tool]\n")
 
-    original_find_toml = _find_toml
-    monkeypatch.setattr(
-        "rivers.cli.config._find_toml",
-        lambda filename: original_find_toml(filename, start_path=resolved),
-    )
-
     return resolved
+
+
+@pytest.fixture(autouse=True)
+def user_config_dir(tmp_path_factory, monkeypatch):
+    """Point the user-level config directory away from the developer's ``~/.config``."""
+    path = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(path))
+    return path
