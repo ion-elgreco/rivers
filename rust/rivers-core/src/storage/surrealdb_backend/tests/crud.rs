@@ -383,7 +383,7 @@ async fn test_multi_partition_key_dims_order_canonicalized() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let mk = |dims: Vec<(&str, &str)>| PartitionKey::Multi {
         dims: dims
@@ -428,7 +428,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
 
     let materialized = AssetRecord {
@@ -509,7 +509,7 @@ async fn test_partition_row_replaces_on_unique_index() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let pk = PartitionKey::Single {
         keys: vec!["p1".to_string()],
@@ -549,7 +549,7 @@ async fn test_partition_string_lookup_matches_multi_keys() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let pk = PartitionKey::Multi {
         dims: vec![
@@ -598,7 +598,7 @@ async fn test_partition_string_lookup_prefers_structured_multi() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let multi = PartitionKey::Multi {
         dims: vec![

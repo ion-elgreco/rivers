@@ -115,7 +115,7 @@ io = rs.PickleIOHandler(
 
 ## `rivers.testing`
 
-Test-only `Storage` factories that wrap each instance in a dedicated tokio runtime, so dropping the `Storage` synchronously drains its router task — releasing the RocksDB file lock (for embedded backends) and tearing down in-memory state before control returns.
+Test-only `Storage` factories that wrap each instance in a dedicated tokio runtime, so dropping the `Storage` synchronously drains its router task — releasing the SurrealKV file lock (for embedded backends) and tearing down in-memory state before control returns.
 
 Use these in pytest fixtures; production code should keep using `Storage.memory()` / `Storage.embedded()` / `Storage.connect()`, which share the global IO runtime.
 
@@ -135,4 +135,4 @@ def embedded(tmp_path):
 | Function | Returns |
 |----------|---------|
 | `memory_storage()` | `Storage` — in-memory with sync-shutdown on drop. |
-| `embedded_storage(path)` | `Storage` — embedded RocksDB at `path` with sync-shutdown on drop. Commits are not synced to disk. |
+| `embedded_storage(path)` | `Storage` — embedded SurrealKV at `path` with sync-shutdown on drop. Commits are not synced to disk. |

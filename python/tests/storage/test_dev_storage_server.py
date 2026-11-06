@@ -36,7 +36,7 @@ def test_stop_releases_the_store_for_the_next_opener(tmp_path):
     host.stop()
     host.stop()
 
-    # RocksDB takes one lock per process; a stopped host has let go of it.
+    # SurrealKV takes one lock per process; a stopped host has let go of it.
     again = DevHost(path)
     try:
         reader = Storage.connect(again.endpoint)

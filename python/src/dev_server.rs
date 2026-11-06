@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use rivers_core::storage::surrealdb_backend::StoreWrittenBySurrealDb3;
 use tokio_util::sync::CancellationToken;
 
 use crate::dev_supervisor::{ChildSpec, Outcome, Supervisor};
@@ -58,6 +59,9 @@ impl PyDevHost {
                     PyRuntimeError::new_err(format!("failed to create storage dir: {e}"))
                 })?;
                 let (server, addr) = py.detach(|| storage_server::start(&path)).map_err(|e| {
+                    if e.is::<StoreWrittenBySurrealDb3>() {
+                        return crate::storage::to_py_err(e);
+                    }
                     PyRuntimeError::new_err(format!(
                         "embedded storage server failed to start: {e:#}"
                     ))
@@ -200,7 +204,7 @@ fn swallow_interrupt(py: Python<'_>) -> PyResult<()> {
 
 #[cfg(feature = "dev-server")]
 mod storage_server {
-    //! The SurrealDB server over the local RocksDB store, assembled from
+    //! The SurrealDB server over the local SurrealKV store, assembled from
     //! `surrealdb-server`'s public parts and served with our own axum so this
     //! process owns the shutdown order and learns the bound port.
 
@@ -211,7 +215,9 @@ mod storage_server {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use rivers_core::storage::surrealdb_backend::{DEFAULT_DATABASE, DEFAULT_NAMESPACE};
+    use rivers_core::storage::surrealdb_backend::{
+        DEFAULT_DATABASE, DEFAULT_NAMESPACE, SURREALDB_STACK_SIZE, StoreWrittenBySurrealDb3,
+    };
     use surrealdb_server::core::CommunityComposer;
     use surrealdb_server::core::kvs::Datastore;
     use surrealdb_server::ntw::{RouterOptions, SurrealRouter};
@@ -220,9 +226,6 @@ mod storage_server {
 
     use super::STOP_GRACE;
 
-    /// SurrealDB runs on 10 MiB stacks; the 2 MiB default overflows in its
-    /// query executor.
-    const STACK_SIZE: usize = 10 * 1024 * 1024;
     const BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub(super) struct StorageServer {
@@ -238,7 +241,7 @@ mod storage_server {
     }
 
     pub(super) fn start(path: &str) -> Result<(StorageServer, SocketAddr)> {
-        let url = format!("rocksdb://{path}");
+        let url = format!("surrealkv://{path}");
         let stop = CancellationToken::new();
         let stop_for_thread = stop.clone();
         let (addr_tx, addr_rx) = mpsc::channel::<std::result::Result<SocketAddr, String>>();
@@ -248,12 +251,12 @@ mod storage_server {
             .max(4);
         let thread = std::thread::Builder::new()
             .name("rivers-dev-storage".into())
-            .stack_size(STACK_SIZE)
+            .stack_size(SURREALDB_STACK_SIZE)
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .thread_name("rivers-dev-storage")
-                    .thread_stack_size(STACK_SIZE)
+                    .thread_stack_size(SURREALDB_STACK_SIZE)
                     .worker_threads(workers)
                     .build()
                 {
@@ -282,7 +285,8 @@ mod storage_server {
             Ok(addr) => Ok((server, addr)),
             Err(e) => {
                 server.stop();
-                Err(anyhow::anyhow!(e))
+                let e = anyhow::anyhow!(e);
+                Err(StoreWrittenBySurrealDb3::from_open_error(path, &e).map_or(e, Into::into))
             }
         }
     }
@@ -302,9 +306,9 @@ mod storage_server {
             // Started below, once `check_version` has stamped a fresh store.
             .without_maintenance_tasks()
             .with_runtime_worker_threads(workers)
-            .build_with_factory_path_and_router_state(url, CommunityComposer())
+            .build_with_factory_path_and_router_state(url, &CommunityComposer())
             .await
-            .context("opening the embedded RocksDB datastore")?;
+            .context("opening the embedded SurrealKV datastore")?;
         ds.wait_until_serve_ready()
             .await
             .context("waiting for the datastore")?;
@@ -318,7 +322,8 @@ mod storage_server {
                 .context("creating the default namespace and database")?;
         }
         ds.insert_node().await.context("registering the node")?;
-        ds.start_maintenance_tasks();
+        ds.start_maintenance_tasks()
+            .context("starting the datastore's maintenance tasks")?;
 
         let router = SurrealRouter::build::<CommunityComposer>(
             RouterOptions::default(),

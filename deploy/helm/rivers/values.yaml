@@ -62,12 +62,12 @@ surrealdb:
 
   image:
     repository: surrealdb/surrealdb
-    tag: "v3"
+    tag: "v4"
 
   # Subchart values (passed through to the surrealdb chart).
   # See https://github.com/surrealdb/helm-charts/tree/main/charts/surrealdb
   surrealdb:
-    path: rocksdb:///data/rivers.db
+    path: surrealkv:///data/rivers.db
     # Bundled SurrealDB boots authenticated, with bootstrap root creds
     # mounted via `podExtraEnv` (below) from the chart-managed Secret
     # `rivers-surrealdb-bootstrap`. The post-install Job then defines the
@@ -95,7 +95,7 @@ surrealdb:
     enabled: true
     size: 1Gi
     mountPath: /data
-  # RocksDB single-writer requires Recreate so the new pod can attach to the PV.
+  # SurrealKV single-writer requires Recreate so the new pod can attach to the PV.
   strategy:
     type: Recreate
   resources:

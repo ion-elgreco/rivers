@@ -135,7 +135,7 @@ async fn test_fail_backfill_records_error() {
 async fn embedded_storage(temp_dir: &test_temp_dir::TestTempDir) -> SurrealStorage {
     SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage")
+        .expect("failed to create embedded storage")
 }
 
 fn key(k: &str) -> PartitionKey {

@@ -426,7 +426,7 @@ def test_cli_materialize_memory_missing_module():
 def test_migrate_embedded_initializes_store(tmp_path: Path):
     """``Storage.migrate_embedded`` brings up a fresh embedded store.
 
-    Each test opens a unique path exactly once: reopening the same RocksDB path
+    Each test opens a unique path exactly once: reopening the same SurrealKV path
     in-process is flaky (the router task releases the file lock asynchronously),
     so migration correctness — idempotence, downgrade refusal, the lease — is
     covered by the rivers-core tests; this confirms the Python binding is wired.

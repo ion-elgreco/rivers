@@ -95,7 +95,11 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
     """Run the dev host: storage server, web UI, and the supervised code location."""
     from rivers._core import DevHost
 
-    host = DevHost(cfg.storage.path, cfg.storage.endpoint)
+    # A store SurrealDB 3 wrote is converted before the server can serve it.
+    host = _open_or_prompt_migrate(
+        lambda: DevHost(cfg.storage.path, cfg.storage.endpoint),
+        lambda: Storage.migrate_embedded(cfg.storage.path),
+    )
     os.environ["RIVERS_SURREAL_ENDPOINT"] = host.endpoint
     if cfg.storage.endpoint is None:
         atexit.register(_cleanup_storage, cfg.storage.path)

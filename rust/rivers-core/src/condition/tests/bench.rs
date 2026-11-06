@@ -591,9 +591,9 @@ async fn bench_condition_cache_memory() {
 
 #[tokio::test]
 async fn bench_condition_cache_embedded() {
-    eprintln!("\n== Benchmark B: Condition cache + eval (embedded RocksDB) ==\n");
+    eprintln!("\n== Benchmark B: Condition cache + eval (embedded SurrealKV) ==\n");
 
-    // Unique per-run dir: embedded RocksDB takes an exclusive single-process
+    // Unique per-run dir: embedded SurrealKV takes an exclusive single-process
     // lock, so a fixed path collides across concurrent `cargo test` runs.
     let tmp = test_temp_dir::test_temp_dir!();
     let storage = crate::storage::surrealdb_backend::SurrealStorage::new_embedded(

@@ -426,7 +426,7 @@ async fn set_pool_limit_survives_same_key_contention() {
     let storage = std::sync::Arc::new(
         SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
-            .expect("failed to create rocksdb storage"),
+            .expect("failed to create embedded storage"),
     );
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(50));

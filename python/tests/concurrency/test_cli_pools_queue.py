@@ -4,7 +4,7 @@ Tests the storage API methods (get_queued_runs, get_pool_slot_holders,
 cancel_queued_run, get_all_pool_infos) and the CLI commands (pools
 list/info/set, queue list/cancel/why).
 
-Some tests exercise the storage API directly (cheaper, no RocksDB lock
+Some tests exercise the storage API directly (cheaper, no SurrealKV lock
 issues). CLI-via-CliRunner tests use a fresh storage_path per invocation.
 """
 

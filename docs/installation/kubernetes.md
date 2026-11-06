@@ -470,6 +470,34 @@ right after migrating: an image built on an older rivers is refused as a
 writer and its code location stops serving. Schema versions 5 and 6 (asset
 actions) both raise the write floor.
 
+### Upgrading to SurrealDB 4 (schema version 13)
+
+Schema version 13 moves rivers to SurrealDB 4, and raises both floors: every
+`CodeLocation` image and the UI must run the new rivers. The bundled SurrealDB
+image goes from `v3` to `v4`, which stores data in SurrealKV. SurrealDB 4
+refuses a data directory that SurrealDB 3 wrote until you opt in to its
+experimental in-place upgrade. The upgrade is one-way, needs room on the
+volume for a second copy, and keeps the original files in `_rocksdb_backup/`.
+
+1. Back up the database: `surreal export` against the running v3 server.
+2. Make sure the SurrealDB volume can hold two copies of the data
+   (`surrealdb.persistence.size`).
+3. Upgrade the chart. The new SurrealDB pod refuses the old data and restarts.
+4. Opt in once, and wait until the pod is ready:
+
+    ```sh
+    kubectl -n rivers set env deployment/surrealdb SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true
+    ```
+
+    The server answers its probes only after the conversion. On a large
+    store, the liveness probe can restart the pod first; watch the pod log.
+
+5. Run `rivers db migrate --surreal-endpoint ws://surrealdb:8000` from an image
+   with the new rivers, then rebuild every `CodeLocation` image on it.
+
+The next `helm upgrade` removes the opt-in again. Upgrade an external
+SurrealDB server to v4 the same way before you migrate.
+
 ## Uninstall
 
 ```sh

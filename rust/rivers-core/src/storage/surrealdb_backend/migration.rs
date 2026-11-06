@@ -100,7 +100,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -165,6 +165,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V12__backfill_progress_rows.surql"),
         )
         .expect("V12__backfill_progress_rows migration name is well-formed"),
+        Migration::unapplied(
+            "V13__surrealdb_4",
+            include_str!("migrations/V13__surrealdb_4.surql"),
+        )
+        .expect("V13__surrealdb_4 migration name is well-formed"),
     ]
 }
 
@@ -194,7 +199,38 @@ async fn apply_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
         apply(&mut backend, Target::Version(9)).await?;
         rewrite_v10_launch_documents(db).await?;
     }
+    // Indexes a 3.x release built serve ordered and ranged reads only after a
+    // rebuild under 4.0.
+    if before < 13 {
+        apply(&mut backend, Target::Version(12)).await?;
+        rebuild_indexes(db).await?;
+    }
     apply(&mut backend, Target::Latest).await?;
+    Ok(())
+}
+
+/// Rebuild every index of every table in the database.
+async fn rebuild_indexes(db: &Surreal<Any>) -> anyhow::Result<()> {
+    let names = |info: Option<serde_json::Value>, key: &str| -> Vec<String> {
+        info.as_ref()
+            .and_then(|info| info.get(key))
+            .and_then(serde_json::Value::as_object)
+            .map(|defs| defs.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let db_info: Option<serde_json::Value> = db.query("INFO FOR DB").await?.check()?.take(0)?;
+    for table in names(db_info, "tables") {
+        let table_info: Option<serde_json::Value> = db
+            .query(format!("INFO FOR TABLE {table}"))
+            .await?
+            .check()?
+            .take(0)?;
+        for index in names(table_info, "indexes") {
+            db.query(format!("REBUILD INDEX {index} ON TABLE {table}"))
+                .await?
+                .check()?;
+        }
+    }
     Ok(())
 }
 

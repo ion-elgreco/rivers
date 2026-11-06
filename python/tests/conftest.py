@@ -35,7 +35,7 @@ PROTO_PATH = Path(__file__).resolve().parents[2] / "proto"
 @pytest.fixture
 def storage():
     """In-memory Storage. Default for tests that don't need transaction-conflict
-    semantics — avoids the per-test RocksDB resource accumulation that hangs CI
+    semantics — avoids the per-test SurrealKV resource accumulation that hangs CI
     after ~18 tests (router-task shutdown is async; instances pile up faster
     than they drain). Tests that genuinely exercise write-write conflicts
     should request :func:`embedded_storage` instead.
@@ -49,12 +49,12 @@ def storage():
 
 @pytest.fixture
 def embedded_storage(tmp_path):
-    """Embedded RocksDB-backed Storage with a per-test directory.
+    """Embedded SurrealKV-backed Storage with a per-test directory.
 
     Use only when transaction-conflict semantics matter — kv-mem misses some
     write-write conflicts (race in commit-queue check causes lost updates).
 
-    Uses :func:`rivers.testing.embedded_storage` so drop releases the RocksDB
+    Uses :func:`rivers.testing.embedded_storage` so drop releases the SurrealKV
     file lock synchronously, letting the next test open a fresh path without
     contention.
     """

@@ -2,10 +2,10 @@ use super::*;
 
 // ── Claim/Release protocol tests ──
 
-// This test runs against the RocksDB backend rather than `make_storage()`
+// This test runs against the SurrealKV backend rather than `make_storage()`
 // (kv-mem). The kv-mem implementation (surrealmx) has a known race in its
 // commit-queue conflict check that causes occasional lost updates under
-// concurrent writers — production uses RocksDB, so the test exercises the
+// concurrent writers — production uses SurrealKV, so the test exercises the
 // path that actually has to hold up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sentinel_write_write_conflict() {
@@ -17,7 +17,7 @@ async fn test_sentinel_write_write_conflict() {
     let storage = std::sync::Arc::new(
         SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
             .await
-            .expect("failed to create rocksdb storage"),
+            .expect("failed to create embedded storage"),
     );
     storage
         .set_pool_limit(
@@ -718,7 +718,7 @@ async fn test_asset_pool_reclaim_by_same_step_takes_over_its_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
         partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
@@ -810,7 +810,7 @@ async fn test_user_pool_reclaim_by_same_step_takes_over_its_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
     let pools = [("db".to_string(), 1)];
@@ -857,7 +857,7 @@ async fn test_multi_pool_reclaim_by_same_step_takes_over_every_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
     storage
@@ -950,7 +950,7 @@ async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
         partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
@@ -1046,7 +1046,7 @@ async fn test_user_pool_reclaim_by_same_step_does_not_wait_for_its_old_lease() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = AssetScope {
         partitions: Some(vec!["p1".to_string()]),
@@ -1143,7 +1143,7 @@ async fn test_user_pool_reclaim_by_same_step_waits_for_another_steps_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     // (the killed attempt's lease, the re-run step, the other holder)
     let cases = [

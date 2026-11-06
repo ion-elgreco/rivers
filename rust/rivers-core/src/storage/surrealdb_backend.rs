@@ -35,7 +35,7 @@ impl SurrealBackendKind {
     pub fn label(&self) -> String {
         match self {
             SurrealBackendKind::Embedded { path } => {
-                format!("SurrealDB (Embedded RocksDB at {path})")
+                format!("SurrealDB (Embedded SurrealKV at {path})")
             }
             SurrealBackendKind::Memory => "SurrealDB (In-Memory)".to_string(),
             SurrealBackendKind::Remote { endpoint } => {
@@ -54,6 +54,10 @@ impl SurrealBackendKind {
 const REGISTER_ASSETS_CHUNK: usize = 2_000;
 
 pub const DEFAULT_NAMESPACE: &str = "rivers";
+
+/// Thread stack size for every runtime that runs the embedded engine:
+/// SurrealDB's query executor overflows the 2 MiB default.
+pub const SURREALDB_STACK_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default SurrealDB database used by every rivers connection.
 pub const DEFAULT_DATABASE: &str = "main";
@@ -92,6 +96,41 @@ pub enum SurrealCredentials {
     Database { username: String, password: String },
 }
 
+/// The embedded store at `path` was written by SurrealDB 3. Only
+/// `rivers db migrate` converts it, as converting is one-way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreWrittenBySurrealDb3 {
+    pub path: String,
+}
+
+impl std::fmt::Display for StoreWrittenBySurrealDb3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store at {} was written by SurrealDB 3 and must be converted to SurrealDB 4. \
+             Converting needs room for a second copy, and older rivers builds cannot open the \
+             converted store: back it up, then run `rivers db migrate --storage-path {}`",
+            self.path, self.path
+        )
+    }
+}
+
+impl std::error::Error for StoreWrittenBySurrealDb3 {}
+
+impl StoreWrittenBySurrealDb3 {
+    /// `Some` if opening `path` failed with SurrealDB's refusal of a 3.x store.
+    pub fn from_open_error(path: &str, err: &anyhow::Error) -> Option<Self> {
+        err.chain()
+            .any(|e| {
+                e.to_string()
+                    .contains("SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X")
+            })
+            .then(|| Self {
+                path: path.to_string(),
+            })
+    }
+}
+
 pub struct SurrealStorage {
     db: Surreal<Any>,
     retry_config: super::retry::StorageRetryConfig,
@@ -109,7 +148,7 @@ impl Drop for SurrealStorage {
             } else {
                 // The router closes the datastore only when it exits on its
                 // own; shutting the runtime down first cancels it and leaves
-                // the RocksDB files open until the process exits.
+                // the SurrealKV files open until the process exits.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while runtime.metrics().num_alive_tasks() > 0
                     && std::time::Instant::now() < deadline
@@ -129,6 +168,7 @@ fn build_storage_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name(format!("rivers-stg-{id}"))
+        .thread_stack_size(SURREALDB_STACK_SIZE)
         .worker_threads(2)
         .build()
         .expect("Failed to create per-storage tokio runtime.")
@@ -139,7 +179,7 @@ impl SurrealStorage {
         &self.backend_kind
     }
 
-    /// Embedded storage backed by RocksDB at the given path. Opened
+    /// Embedded storage backed by SurrealKV at the given path. Opened
     /// `ReadWrite`; use [`Self::new_embedded_with_capability`] for a read-only
     /// or migrating opener.
     pub async fn new_embedded(path: &str) -> Result<Self> {
@@ -166,8 +206,9 @@ impl SurrealStorage {
         Self::open_embedded(path, "every", retry_config, cap).await
     }
 
-    /// `sync` is RocksDB's sync mode: `"every"` syncs the log to disk at each
-    /// commit; `"never"` leaves it to the OS.
+    /// `sync` is SurrealKV's sync mode: `"every"` syncs the log to disk at each
+    /// commit; `"never"` leaves it to the OS. Only a `Migrate` opener converts
+    /// a store SurrealDB 3 wrote.
     async fn open_embedded(
         path: &str,
         sync: &str,
@@ -184,10 +225,18 @@ impl SurrealStorage {
             "opening surreal storage"
         );
         let db = super::retry::with_retry(&retry_config, || async {
-            tracing::debug!(path = %path, "connecting rocksdb engine");
-            let db = any::connect(format!("rocksdb://{path}?sync={sync}"))
+            tracing::debug!(path = %path, "connecting surrealkv engine");
+            let config = surrealdb::opt::Config::new()
+                .datastore_option("experimental_upgrade_from_3x", cap == Capability::Migrate);
+            let db = any::connect((format!("surrealkv://{path}?sync={sync}"), config))
                 .await
-                .context("failed to open RocksDB")?;
+                .context("failed to open SurrealKV")
+                .map_err(
+                    |e| match StoreWrittenBySurrealDb3::from_open_error(path, &e) {
+                        Some(old) => old.into(),
+                        None => e,
+                    },
+                )?;
             tracing::debug!(
                 ns = DEFAULT_NAMESPACE,
                 db = DEFAULT_DATABASE,

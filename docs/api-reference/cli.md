@@ -23,7 +23,7 @@ rivers materialize my_pipeline --repo-var pipeline_repo
 |------|-------------|
 | `--surreal-endpoint` | Remote SurrealDB endpoint, e.g. `ws://surrealdb:8000`. Also read from `RIVERS_SURREAL_ENDPOINT`. Overrides `--storage-path` and `--memory`. |
 | `--code-location-id` | The code location to record runs, asset state and pool claims under. Also read from `RIVERS_CODE_LOCATION_ID`. Default: `default`. |
-| `--storage-path` | Embedded SurrealDB+RocksDB path. Kept at exit. |
+| `--storage-path` | Embedded SurrealDB+SurrealKV path. Kept at exit. |
 | `--memory` | In-memory storage, lost at exit. |
 
 When `RIVERS_SURREAL_ENDPOINT` and `RIVERS_CODE_LOCATION_ID` are set (the operator sets both on rivers pods), these commands use them without the flags. The endpoint also overrides `--storage-path` and `--memory`.
@@ -83,7 +83,7 @@ To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CO
 | `--host` | `127.0.0.1` | UI/gRPC bind host. |
 | `--port` | `3000` | Web UI port. |
 | `--grpc-port` | `3001` | gRPC backend port. |
-| `--storage-path` | `.rivers/storage/` | Embedded SurrealDB+RocksDB path. |
+| `--storage-path` | `.rivers/storage/` | Embedded SurrealDB+SurrealKV path. |
 | `--surreal-endpoint` | unset | Connect to a remote SurrealDB instead of using embedded storage. |
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |

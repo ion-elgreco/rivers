@@ -411,7 +411,7 @@ async fn test_step_retry_event_round_trips_with_metadata() {
     let retry = read
         .iter()
         .find(|e| e.event_type == EventType::StepRetry)
-        .expect("StepRetry event must survive the SurrealDB + RocksDB round-trip");
+        .expect("StepRetry event must survive the SurrealDB + SurrealKV round-trip");
     let get = |k: &str| {
         retry
             .metadata

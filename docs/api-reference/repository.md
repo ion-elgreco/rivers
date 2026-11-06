@@ -55,7 +55,7 @@ repo = rs.CodeRepository(
 def resolve(self, storage: Storage | None = None) -> None
 ```
 
-Validate the graph and persist topology / metadata into `storage`. Must be called before `materialize()`, `backfill()`, or daemon start. Without an explicit `storage`, an embedded SurrealDB+RocksDB backend is created at `.rivers/storage/`.
+Validate the graph and persist topology / metadata into `storage`. Must be called before `materialize()`, `backfill()`, or daemon start. Without an explicit `storage`, an embedded SurrealDB+SurrealKV backend is created at `.rivers/storage/`.
 
 ### `validate()`
 

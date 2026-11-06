@@ -104,7 +104,7 @@ impl PyCollectStreamLoadSpec {
 /// asset that yielded `DynamicOutput`s. Only set on the single-output path
 /// (multi-asset can't carry DynamicOutputs). The orchestrator persists these
 /// to KV after collecting the result, keyed by the materialization's
-/// `data_version` (loky workers don't write KV themselves — embedded RocksDB
+/// `data_version` (loky workers don't write KV themselves — embedded SurrealKV
 /// is single-process; the orchestrator owns the lock).
 #[pyclass(name = "WorkerResult", frozen, module = "rivers._core")]
 pub struct PyWorkerResult {

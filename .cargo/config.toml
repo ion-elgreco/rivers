@@ -9,3 +9,7 @@ rustflags = ["-C", "symbol-mangling-version=v0"]
 # paths) → client/server hashes mismatch → 404. Pin a stable key.
 [env]
 SERVER_FN_OVERRIDE_KEY = "rivers"
+
+# SurrealDB's query executor overflows 2 MiB thread stacks; test threads and
+# the tokio workers they start take this size.
+RUST_MIN_STACK = "10485760"
