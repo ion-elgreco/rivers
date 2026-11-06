@@ -52,7 +52,7 @@ asyncio_mode = "strict"
 # so exclude them from the default `just test` / `pytest python/` run.
 # Run them explicitly: just k8s-test
 norecursedirs = ["tests/integration/kubernetes"]
-# Per-test timeout so a hang in native (Rust/tokio/rocksdb) code can't lock up
+# Per-test timeout so a hang in native (Rust/tokio/SurrealDB) code can't lock up
 # CI for the whole job. `thread` method runs a watchdog thread that dumps
 # tracebacks of every thread via faulthandler, then exits — pytest's signal
 # method can't interrupt code blocked inside a C extension.

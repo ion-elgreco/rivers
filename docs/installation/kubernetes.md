@@ -491,7 +491,6 @@ volume for a second copy, and keeps the original files in `_rocksdb_backup/`.
 
     The server answers its probes only after the conversion. On a large
     store, the liveness probe can restart the pod first; watch the pod log.
-
 5. Run `rivers db migrate --surreal-endpoint ws://surrealdb:8000` from an image
    with the new rivers, then rebuild every `CodeLocation` image on it.
 

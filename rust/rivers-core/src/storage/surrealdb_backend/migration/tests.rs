@@ -771,13 +771,28 @@ async fn test_v12_moves_backfill_progress_out_of_the_row() {
         .check()
         .expect("a migrated backfill row stays writable");
 
-    let stamps = read_schema_stamps(&db).await.unwrap().unwrap();
+    let stamps = stamps_at(&db, 12).await;
     assert_eq!(
         (stamps.version, stamps.min_reader, stamps.min_writer),
-        (SCHEMA_VERSION, 12, 12)
+        (12, 12, 12)
     );
     assert!(check_compatibility(stamps, Capability::Read, 11).is_err());
     assert!(check_compatibility(stamps, Capability::ReadWrite, 11).is_err());
+}
+
+/// V13 moves storage to SurrealDB 4: neither a V12 reader nor a V12 writer
+/// may open the store.
+#[tokio::test]
+async fn test_v13_raises_both_floors() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let stamps = stamps_at(&storage.db, 13).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (13, 13, 13)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 12).is_err());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 12).is_err());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 13).is_ok());
 }
 
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
@@ -792,6 +807,15 @@ async fn test_v5_backfills_exclusive_on_legacy_slot_rows() {
         .use_db(DEFAULT_DATABASE)
         .await
         .unwrap();
+    // A store holding pre-V5 rows was written by SurrealDB 3, and stays at
+    // its compatibility level once converted.
+    db.query(format!(
+        "DEFINE DATABASE OVERWRITE {DEFAULT_DATABASE} COMPATIBILITY 3"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
 
     let pre_v5: Vec<Migration> = embedded_migrations().into_iter().take(4).collect();
     let mut backend = SurrealMigrate { db: db.clone() };

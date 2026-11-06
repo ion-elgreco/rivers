@@ -2,6 +2,8 @@
 
 import statistics
 
+import pytest
+
 import rivers as rs
 
 
@@ -42,6 +44,7 @@ def _median_gap_seconds(tmp_path, n_partitions: int, tail: int) -> float:
     return statistics.median(gaps[-tail:]) / 1e9
 
 
+@pytest.mark.serial
 def test_backfill_bookkeeping_independent_of_backfill_size(tmp_path):
     small = _median_gap_seconds(tmp_path, 100, tail=50)
     large = _median_gap_seconds(tmp_path, 1_500, tail=50)

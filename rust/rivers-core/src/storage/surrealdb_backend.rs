@@ -226,7 +226,10 @@ impl SurrealStorage {
         );
         let db = super::retry::with_retry(&retry_config, || async {
             tracing::debug!(path = %path, "connecting surrealkv engine");
+            // Spill files stay with the store rather than under the system
+            // temp directory, which they would otherwise outlive.
             let config = surrealdb::opt::Config::new()
+                .temporary_directory(Some(std::path::Path::new(path).join(".spill")))
                 .datastore_option("experimental_upgrade_from_3x", cap == Capability::Migrate);
             let db = any::connect((format!("surrealkv://{path}?sync={sync}"), config))
                 .await

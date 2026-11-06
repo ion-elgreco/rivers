@@ -95,7 +95,9 @@ def _remove_scratch(repo_obj, scratch: str) -> None:
     shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _open_or_prompt_migrate(open_fn: Callable[[], T], migrate_fn: Callable[[], None]) -> T:
+def _open_or_prompt_migrate(
+    open_fn: Callable[[], T], migrate_fn: Callable[[], None]
+) -> T:
     """Open storage; if the database is behind this build, offer to migrate it
     (``rivers dev`` is interactive). Any other error propagates, as
     does a declined prompt. ``serve`` deliberately does not prompt — a cloud
