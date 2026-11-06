@@ -12,7 +12,7 @@ class StorageType(enum.IntEnum):
     Memory = ...
     """Pure in-memory store; data is lost on shutdown."""
     Embedded = ...
-    """SurrealDB+RocksDB embedded in the process — single-process access only."""
+    """SurrealDB+SurrealKV embedded in the process — single-process access only."""
     Remote = ...
     """SurrealDB server / TiKV — supports multi-process access."""
 
@@ -275,7 +275,7 @@ class Storage:
 
     @staticmethod
     def embedded(path: str) -> Storage:
-        """Open or create an embedded SurrealDB+RocksDB database at ``path``."""
+        """Open or create an embedded SurrealDB+SurrealKV database at ``path``."""
         ...
 
     @staticmethod

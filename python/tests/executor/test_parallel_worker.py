@@ -2271,7 +2271,7 @@ def test_mp_io_load_spec_parallel_both_io(tmp_path):
 
 def test_mp_dynamic_keys_round_trip_through_kv(tmp_path):
     """Fan-out source emits DynamicOutputs in a loky worker subprocess.
-    The worker doesn't write KV (embedded RocksDB is single-process); it
+    The worker doesn't write KV (embedded SurrealKV is single-process); it
     surfaces the keys back on `WorkerResult.dynamic_keys`. The orchestrator
     persists them to KV scoped by the materialization's data_version, and
     the downstream fan-out resolver reads them back from KV — so mapped

@@ -8,7 +8,7 @@
 //! cargo test -p rivers-core --profile ci --test log_storage_bench -- --ignored --nocapture
 //! ```
 //!
-//! Every scenario gets a fresh embedded RocksDB with the production V1 schema
+//! Every scenario gets a fresh embedded SurrealKV with the production V1 schema
 //! applied, writes in batches of 64 (EventWriter::BATCH_SIZE) across 8 runs,
 //! then reads logs back per run with the production queries.
 
@@ -170,7 +170,7 @@ fn dir_size_mb(path: &Path) -> f64 {
 }
 
 async fn connect_db(dir: &Path, experimental: bool) -> Surreal<Any> {
-    let url = format!("rocksdb://{}", dir.display());
+    let url = format!("surrealkv://{}", dir.display());
     let db = if experimental {
         let mut caps = Capabilities::default();
         caps.allow_all_experimental_features();

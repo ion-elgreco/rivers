@@ -3,7 +3,7 @@
 Storage factories that wrap each `Storage` instance in a dedicated tokio
 runtime so the router task lives there for the storage's lifetime.
 Dropping the `Storage` then synchronously drains that runtime — releasing
-the RocksDB file lock (for embedded backends) and tearing down the
+the SurrealKV file lock (for embedded backends) and tearing down the
 in-memory router state before control returns. Without this, the shared
 `io_rt()` fills with fire-and-forget shutdown tasks faster than they
 drain across a long test session, and subsequent opens eventually hang.
@@ -50,7 +50,7 @@ def memory_storage() -> Storage:
 
 
 def embedded_storage(path: str) -> Storage:
-    """Embedded RocksDB :class:`Storage` with synchronous-shutdown semantics on drop.
+    """Embedded SurrealKV :class:`Storage` with synchronous-shutdown semantics on drop.
 
     Commits are not synced to disk, so a new store opens fast on slow disks.
     A process crash loses no data; an operating system crash can.

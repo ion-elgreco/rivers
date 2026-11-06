@@ -890,7 +890,7 @@ async fn test_migration_lease_serializes_and_hands_off() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let db = &storage.db;
 
     let holder = try_acquire_migration_lease(db)
@@ -1023,7 +1023,7 @@ async fn test_open_allows_old_reader_but_refuses_old_writer() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     plant_stamps(&storage.db, SCHEMA_VERSION + 2, 1, SCHEMA_VERSION + 2).await;
     assert!(
         ensure_compatible(&storage.db, Capability::Read)
@@ -1045,7 +1045,7 @@ async fn test_migrate_is_idempotent_and_refuses_downgrade() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     migrate_to_current(&storage.db).await.unwrap();
     assert!(matches!(
         read_schema_stamps(&storage.db).await.unwrap(),

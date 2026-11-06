@@ -47,8 +47,16 @@ struct Args {
     registry_token: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(rivers_core::storage::surrealdb_backend::SURREALDB_STACK_SIZE)
+        .build()
+        .expect("failed to build the tokio runtime")
+        .block_on(serve());
+}
+
+async fn serve() {
     let args = Args::parse();
 
     // Default filter mirrors the Python crate (`python/src/lib.rs`) so the

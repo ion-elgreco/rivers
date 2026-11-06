@@ -14,7 +14,7 @@ storage = rs.Storage.memory()
 
 ### `Storage.embedded(path)`
 
-Create an embedded storage backed by RocksDB at the given path.
+Create an embedded storage backed by SurrealKV at the given path.
 
 ```python
 storage = rs.Storage.embedded(".rivers/storage")
@@ -65,6 +65,7 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 | 10 | The run config is the launch document; stored rows are rewritten to it | 2, 10 |
 | 11 | Runs are indexed by code location, status and end time | 2, 10 |
 | 12 | A backfill's requested keys, runs and settled keys move into tables of their own | 12, 12 |
+| 13 | Storage moves to SurrealDB 4 (embedded stores are SurrealKV); indexes are rebuilt | 13, 13 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
@@ -78,6 +79,15 @@ rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
 ```
 
 In K8s, run it as an explicit init/job step before rolling out upgraded code locations. `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
+
+### Embedded stores written by SurrealDB 3
+
+rivers builds at schema version 13 and later embed SurrealDB 4, which stores data in SurrealKV. An embedded store that SurrealDB 3 wrote (RocksDB) does not open until `rivers db migrate --storage-path <path>` converts it in place. The conversion:
+
+- is one-way: an older rivers build finds no data in the converted store.
+- needs disk room for a second copy. The original files stay in `_rocksdb_backup/` inside the store.
+
+Back up the store first. `rivers dev` offers the conversion when it finds such a store.
 
 ### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
 

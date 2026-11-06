@@ -3,7 +3,7 @@ use crate::storage::retry;
 use super::*;
 
 /// Race partitioned materializations against whole-asset deletions per
-/// iteration on the RocksDB backend (kv-mem misses write-write conflicts)
+/// iteration on the SurrealKV backend (kv-mem misses write-write conflicts)
 /// and return each iteration's final asset row + partition set. Retries
 /// keep their full budget but near-zero backoff so contended iterations
 /// stay fast. `mat{r}` writes partition `p{r}`; the seed writes `pseed`.
@@ -25,7 +25,7 @@ async fn race_deletion_against_partitioned_mat(
             Capability::ReadWrite,
         )
         .await
-        .expect("failed to create rocksdb storage"),
+        .expect("failed to create embedded storage"),
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let single = |name: &str| PartitionKey::Single {
@@ -369,7 +369,7 @@ async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     let p0 = order_key();
     let p3 = PartitionKey::Single {
         keys: vec!["2024-01-04".to_string()],
@@ -623,7 +623,7 @@ async fn provenance_applies_in_event_order_apart_from_the_data() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
         .await
-        .expect("failed to create rocksdb storage");
+        .expect("failed to create embedded storage");
     for run_id in ["a2", "a4"] {
         let run = RunRecord {
             action: Some("merge".to_string()),
@@ -799,7 +799,7 @@ async fn conflict_retry_does_not_duplicate_events() {
             Capability::ReadWrite,
         )
         .await
-        .expect("failed to create rocksdb storage"),
+        .expect("failed to create embedded storage"),
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     for i in 0..100 {
@@ -857,7 +857,7 @@ async fn concurrent_observations_stay_consistent() {
             Capability::ReadWrite,
         )
         .await
-        .expect("failed to create rocksdb storage"),
+        .expect("failed to create embedded storage"),
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     for i in 0..100 {

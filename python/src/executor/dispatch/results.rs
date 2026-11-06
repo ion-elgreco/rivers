@@ -824,7 +824,7 @@ pub(crate) fn process_worker_result(
 
     // Single-output dynamic_keys come back at top-level on WorkerResult; the
     // orchestrator persists them to KV (loky workers don't write KV — embedded
-    // RocksDB is single-process and the orchestrator owns the lock).
+    // SurrealKV is single-process and the orchestrator owns the lock).
     let dynamic_keys: Option<Vec<String>> = if is_single {
         worker_result
             .getattr(py, "dynamic_keys")

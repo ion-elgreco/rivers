@@ -92,12 +92,12 @@ fn jittered(backoff: Duration) -> Duration {
 /// Classify a SurrealDB error as transient (worth retrying) or permanent.
 ///
 /// Conflicts arrive as `QueryError::TransactionConflict`. `Internal` errors are
-/// still matched by substring for transient RocksDB/TiKV messages (`"onflict"`,
+/// still matched by substring for transient SurrealKV/TiKV messages (`"onflict"`,
 /// `"Busy"`, `"Try again"`) that carry no dedicated variant. `NotFound(Session)`
 /// covers a startup race in the local engine's `router_loop` where the first
 /// route request can land before `SessionId::Initial` is registered.
 ///
-/// The RocksDB `LOCK` file is also transient: dropping an embedded handle frees
+/// The SurrealKV `LOCK` file is also transient: dropping an embedded handle frees
 /// the lock asynchronously (~tens of ms), so an immediate reopen of the same path
 /// briefly sees a stale lock that a backoff retry clears.
 pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
@@ -112,8 +112,7 @@ pub fn is_transient_surrealdb_error(e: &surrealdb::Error) -> bool {
             s.contains("onflict")
                 || s.contains("Busy")
                 || s.contains("Try again")
-                || s.contains("lock hold by current process")
-                || s.contains("No locks available")
+                || s.contains("is already locked by another")
         }
         _ => false,
     }
@@ -411,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn classifies_internal_rocksdb_conflict_as_transient() {
-        // RocksDB transaction conflicts surface as Internal kind with messages
+    fn classifies_internal_conflict_as_transient() {
+        // Engine transaction conflicts surface as Internal kind with messages
         // like "Conflict" or "Transaction conflict" — substring fallback covers
         // both via the case-insensitive "onflict" check.
         let err = surrealdb::Error::internal("Transaction conflict detected".to_string());

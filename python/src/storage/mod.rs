@@ -26,13 +26,17 @@ use rivers_core::storage::{
 use crate::partitions::PyPartitionKey;
 use crate::runtime::io_rt;
 
-fn to_py_err(e: anyhow::Error) -> PyErr {
-    // The "database is behind this build" case gets a distinct exception (a
+pub(crate) fn to_py_err(e: anyhow::Error) -> PyErr {
+    use rivers_core::storage::surrealdb_backend::{
+        SchemaMigrationNeeded, StoreWrittenBySurrealDb3,
+    };
+    // The "database is behind this build" cases get a distinct exception (a
     // StorageError subclass) so the `rivers dev` prompt can offer the migration
     // by type rather than by message text. anyhow searches the chain.
-    if let Some(m) =
-        e.downcast_ref::<rivers_core::storage::surrealdb_backend::SchemaMigrationNeeded>()
-    {
+    if let Some(m) = e.downcast_ref::<SchemaMigrationNeeded>() {
+        return crate::errors::SchemaMigrationNeededError::new_err(m.to_string());
+    }
+    if let Some(m) = e.downcast_ref::<StoreWrittenBySurrealDb3>() {
         return crate::errors::SchemaMigrationNeededError::new_err(m.to_string());
     }
     StorageError::new_err(format!("{e}"))
@@ -214,7 +218,7 @@ impl PyStorage {
         self.storage_type
     }
 
-    /// Create an embedded storage backed by RocksDB at the given path.
+    /// Create an embedded storage backed by SurrealKV at the given path.
     #[staticmethod]
     fn embedded(py: Python<'_>, path: &str) -> PyResult<Self> {
         std::fs::create_dir_all(path)
@@ -242,7 +246,7 @@ impl PyStorage {
 
     /// Test-only: create an embedded storage on its own dedicated tokio
     /// runtime so the storage owns the router task and its drop releases
-    /// the RocksDB file lock synchronously (via `Runtime::shutdown_timeout`).
+    /// the SurrealKV file lock synchronously (via `Runtime::shutdown_timeout`).
     ///
     /// Used by pytest fixtures that open and tear down many storage
     /// instances per session — without this, the shared `io_rt()` fills

@@ -37,6 +37,7 @@ use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rivers_core::storage::surrealdb_backend::SURREALDB_STACK_SIZE;
 use tokio::runtime::Runtime;
 
 #[inline]
@@ -54,7 +55,11 @@ pub fn rt() -> &'static Runtime {
         );
     }
     TOKIO_RT.get_or_init(|| {
-        let rt = Runtime::new().expect("Failed to create a tokio runtime.");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(SURREALDB_STACK_SIZE)
+            .build()
+            .expect("Failed to create a tokio runtime.");
         tracing::info!(
             target: "rivers::runtime",
             runtime = "main",
@@ -76,6 +81,7 @@ pub fn io_rt() -> &'static Runtime {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("rivers-io")
+            .thread_stack_size(SURREALDB_STACK_SIZE)
             .worker_threads(workers)
             .build()
             .expect("Failed to create a tokio io runtime.");

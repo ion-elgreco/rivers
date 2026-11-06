@@ -16,9 +16,9 @@ rivers is a Rust-powered orchestration platform built around data assets. Define
 - **Parallel & distributed execution** — `Executor.parallel()` for concurrent subprocess workers, `Executor.kubernetes()` for one-pod-per-step on K8s.
 - **Schedules, sensors, and automation conditions** — declarative triggers (cron, event-driven, dep-aware) executed by the rivers daemon.
 - **Backfills** — partition-range execution with multi-run, single-run, and per-dimension strategies.
-- **Persistent storage** — embedded SurrealDB + RocksDB for local dev, SurrealDB server for production.
+- **Persistent storage** — embedded SurrealDB + SurrealKV for local dev, SurrealDB server for production.
 - **Concurrency control** — run-queue limits, tag concurrency, and step-level concurrency pools.
-- **Single-binary dev experience** — `rivers dev <module>` boots SurrealDB (embedded RocksDB), the scheduler, and the web UI on `:3000` in one process.
+- **Single-binary dev experience** — `rivers dev <module>` boots SurrealDB (embedded SurrealKV), the scheduler, and the web UI on `:3000` in one process.
 
 ## Performance
 

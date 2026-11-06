@@ -210,7 +210,7 @@ def test_queue_commands_name_the_verb(resolved_tmp_path, monkeypatch):
         "q-purge", "", "Queued", 1000, node_names=["events"], action="delete"
     )
     storage._create_run("q-etl", "etl", "Queued", 2000)
-    # RocksDB allows one opener per process: hand the CLI the open store.
+    # SurrealKV allows one opener per process: hand the CLI the open store.
     monkeypatch.setattr(
         "rivers.cli.run_queue.Storage",
         type("_S", (), {"embedded": staticmethod(lambda *a, **k: storage)}),

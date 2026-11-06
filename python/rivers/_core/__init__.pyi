@@ -875,7 +875,7 @@ class DevHost:
         """Start the host.
 
         Args:
-            storage_path: Directory of the embedded RocksDB store, served on a
+            storage_path: Directory of the embedded SurrealKV store, served on a
                 loopback ``ws://`` port for the UI and the code location.
             endpoint: An external SurrealDB server to use instead; nothing is
                 served then, and ``storage_path`` is ignored.

@@ -6,13 +6,17 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypeVar
 
 import typer
 
 from rivers._core.storage import Storage
 from rivers.exceptions import SchemaMigrationNeededError
+
+T = TypeVar("T")
 
 
 def _parse_partition_key(raw: str | None):
@@ -91,16 +95,16 @@ def _remove_scratch(repo_obj, scratch: str) -> None:
     shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _open_or_prompt_migrate(open_fn, migrate_fn) -> Storage:
-    """Open storage; if the database is behind this build's schema, offer to
-    migrate it (``rivers dev`` is interactive). Any other error propagates, as
+def _open_or_prompt_migrate(open_fn: Callable[[], T], migrate_fn: Callable[[], None]) -> T:
+    """Open storage; if the database is behind this build, offer to migrate it
+    (``rivers dev`` is interactive). Any other error propagates, as
     does a declined prompt. ``serve`` deliberately does not prompt — a cloud
     deployment migrates via an explicit ``rivers db migrate`` init step.
     """
     try:
         return open_fn()
     except SchemaMigrationNeededError as exc:
-        typer.echo(f"Storage schema is behind this rivers build:\n  {exc}", err=True)
+        typer.echo(f"Storage is behind this rivers build:\n  {exc}", err=True)
         if not typer.confirm("Run the migration now?", default=False):
             raise
         migrate_fn()
