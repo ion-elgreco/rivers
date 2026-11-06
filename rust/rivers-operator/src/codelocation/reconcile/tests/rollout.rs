@@ -125,10 +125,10 @@ fn rollout_completes_only_when_every_pod_runs_the_current_template() {
                 generation: Some(generation),
                 ..Default::default()
             },
-            spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
+            spec: k8s_openapi::api::apps::v1::DeploymentSpec {
                 replicas: Some(replicas),
                 ..Default::default()
-            }),
+            },
             status: Some(DeploymentStatus {
                 observed_generation: Some(observed.into()),
                 replicas: Some(total),
@@ -196,8 +196,8 @@ fn rollout_reads_the_tree_from_the_pod_template() {
         observed_generation: Some(2),
         ready_replicas: Some(1),
         conditions: Some(vec![k8s_openapi::api::apps::v1::DeploymentCondition {
-            type_: "Progressing".into(),
-            status: "False".into(),
+            type_: Some("Progressing".into()),
+            status: Some("False".into()),
             reason: Some("ProgressDeadlineExceeded".into()),
             ..Default::default()
         }]),
@@ -222,8 +222,9 @@ async fn code_location_pods_hand_their_runtime_image_with_their_source() {
 
     let template = state.lock().unwrap().deployments["x"]
         .spec
+        .template
+        .spec
         .clone()
-        .and_then(|d| d.template.spec)
         .unwrap();
     let main = template
         .containers
@@ -298,13 +299,7 @@ async fn new_dependencies_at_the_same_commit_get_and_keep_their_own_tree() {
     let s = state.lock().unwrap();
     let target = template_of::<RunSource>(&s.deployments["x"]).unwrap();
     assert_eq!(target.dependencies.groups, ["test"]);
-    let pod = s.deployments["x"]
-        .spec
-        .clone()
-        .unwrap()
-        .template
-        .spec
-        .unwrap();
+    let pod = s.deployments["x"].spec.clone().template.spec.unwrap();
     let sub_paths: Vec<_> = pod
         .init_containers
         .iter()
@@ -433,7 +428,6 @@ async fn sync_container_gets_the_chart_floors_as_whole_numbers() {
         let pod = state.lock().unwrap().deployments["x"]
             .spec
             .clone()
-            .unwrap()
             .template
             .spec
             .unwrap();
@@ -482,11 +476,7 @@ async fn fallback_pods_ignore_the_chart_floors() {
         )
         .await;
 
-        let template = state.lock().unwrap().deployments["x"]
-            .spec
-            .clone()
-            .unwrap()
-            .template;
+        let template = state.lock().unwrap().deployments["x"].spec.clone().template;
         let sync = &template
             .spec
             .as_ref()
@@ -568,8 +558,9 @@ async fn run_pods_size_their_workspace_like_the_code_location_pods() {
         let cl_pod = Pod {
             spec: state.lock().unwrap().deployments["x"]
                 .spec
-                .clone()
-                .and_then(|d| d.template.spec),
+                .template
+                .spec
+                .clone(),
             ..Default::default()
         };
 

@@ -113,7 +113,7 @@ pub fn build_deployment(
             owner_references: Some(vec![owner_reference(cl)]),
             ..Default::default()
         },
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             replicas: Some(spec.replicas),
             selector: LabelSelector {
                 match_labels: Some(lbls.clone()),
@@ -181,6 +181,7 @@ pub fn build_deployment(
                                     rivers_api::code_location_service_server::SERVICE_NAME
                                         .to_string(),
                                 ),
+                                ..Default::default()
                             }),
                             ..Default::default()
                         }),
@@ -196,7 +197,7 @@ pub fn build_deployment(
                 }),
             },
             ..Default::default()
-        }),
+        },
         status: None,
     }
 }
@@ -489,8 +490,7 @@ mod tests {
             None,
         );
 
-        let env = serde_json::to_value(&d.spec.unwrap().template.spec.unwrap().containers[0].env)
-            .unwrap();
+        let env = serde_json::to_value(&d.spec.template.spec.unwrap().containers[0].env).unwrap();
         let env = env.as_array().unwrap();
         let mut names: Vec<&str> = env.iter().map(|e| e["name"].as_str().unwrap()).collect();
         names.sort_unstable();
@@ -659,18 +659,9 @@ mod tests {
             "limits": { "memory": "2Gi" },
         });
 
-        let container_resources = serde_json::to_value(
-            &d.spec
-                .as_ref()
-                .unwrap()
-                .template
-                .spec
-                .as_ref()
-                .unwrap()
-                .containers[0]
-                .resources,
-        )
-        .unwrap();
+        let container_resources =
+            serde_json::to_value(&d.spec.template.spec.as_ref().unwrap().containers[0].resources)
+                .unwrap();
         assert_eq!(container_resources, expected_resources);
     }
 
@@ -1116,7 +1107,7 @@ mod tests {
 
         // maxSurge stays the Kubernetes default (25%, at least one pod).
         assert_eq!(
-            serde_json::to_value(&d.spec.unwrap().strategy).unwrap(),
+            serde_json::to_value(&d.spec.strategy).unwrap(),
             json!({ "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0 } })
         );
     }
@@ -1171,7 +1162,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(d.spec.unwrap().strategy, None);
+        assert_eq!(d.spec.strategy, None);
     }
 
     #[test]
@@ -1187,7 +1178,7 @@ mod tests {
                 &rivers_k8s::env::OtelPodConfig::default(),
                 Some(&git_pieces(&cl, volume)),
             );
-            let pod = d.spec.unwrap().template.spec.unwrap();
+            let pod = d.spec.template.spec.unwrap();
 
             assert_eq!(
                 serde_json::to_value(&pod.security_context).unwrap(),
@@ -1236,7 +1227,7 @@ mod tests {
                 &rivers_k8s::env::OtelPodConfig::default(),
                 Some(&git_pieces(&cl, volume)),
             );
-            let pod = d.spec.unwrap().template.spec.unwrap();
+            let pod = d.spec.template.spec.unwrap();
             let env: std::collections::HashMap<String, Option<String>> = pod.containers[0]
                 .env
                 .clone()

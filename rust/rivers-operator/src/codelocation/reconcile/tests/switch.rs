@@ -432,7 +432,10 @@ async fn a_git_rollout_waits_until_the_old_workspace_pvc_is_gone() {
         .map(|r| (r.method.as_str(), r.path.as_str()))
         .collect();
     assert_eq!(writes, []);
-    assert_eq!(state.lock().unwrap().deployments["x"].spec, None);
+    assert_eq!(
+        state.lock().unwrap().deployments["x"].spec,
+        Default::default()
+    );
     assert_eq!(requeue, Action::requeue(DEPLOYMENT_ROLLOUT_POLL));
 
     // Kubernetes deletes it once no pod mounts it.
@@ -456,8 +459,9 @@ async fn a_git_rollout_waits_until_the_old_workspace_pvc_is_gone() {
     assert_eq!(created["metadata"].get("deletionTimestamp"), None);
     let claims: Vec<_> = s.deployments["x"]
         .spec
+        .template
+        .spec
         .clone()
-        .and_then(|d| d.template.spec)
         .unwrap()
         .volumes
         .into_iter()

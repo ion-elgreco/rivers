@@ -174,7 +174,7 @@ pub(crate) fn deployment(generation: i64, status: DeploymentStatus) -> Deploymen
             generation: Some(generation),
             ..Default::default()
         },
-        spec: None,
+        spec: Default::default(),
         status: Some(status),
     }
 }
@@ -602,8 +602,9 @@ pub(crate) fn writes(requests: &[ApiRequest]) -> Vec<(&str, &str)> {
 pub(crate) fn main_image(state: &ApiState) -> Option<String> {
     state.lock().unwrap().deployments["x"]
         .spec
+        .template
+        .spec
         .clone()
-        .and_then(|d| d.template.spec)
         .map(|pod| pod.containers[0].image.clone())?
 }
 
