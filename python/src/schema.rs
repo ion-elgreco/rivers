@@ -3,14 +3,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_ipc::convert::fb_to_schema;
+use arrow_ipc::convert::try_fb_to_schema;
 use arrow_schema::Schema;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::PySchema;
 
-#[pyclass(name = "Schema", frozen, skip_from_py_object, module = "rivers._core")]
+#[pyclass(name = "Schema", frozen, module = "rivers._core")]
 #[derive(Clone, Debug)]
 pub struct PySchemaWrapper {
     inner: Arc<Schema>,
@@ -40,7 +40,8 @@ pub fn schema_from_ipc_bytes(data: &[u8]) -> PyResult<Arc<Schema>> {
     let ipc_schema = msg
         .header_as_schema()
         .ok_or_else(|| PyValueError::new_err("IPC message is not a schema"))?;
-    let schema = fb_to_schema(ipc_schema);
+    let schema = try_fb_to_schema(ipc_schema)
+        .map_err(|e| PyValueError::new_err(format!("Invalid IPC schema: {e}")))?;
     Ok(Arc::new(schema))
 }
 
