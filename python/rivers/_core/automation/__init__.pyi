@@ -58,7 +58,7 @@ class AutomationCondition:
 
         Args:
             cron_schedule: Cron expression (e.g. ``"0 * * * *"``).
-            timezone: Optional timezone name (e.g. ``"US/Eastern"``).
+            timezone: Optional timezone name (e.g. ``"America/New_York"``).
 
         Raises:
             ValueError: If ``cron_schedule`` is not a valid cron expression.

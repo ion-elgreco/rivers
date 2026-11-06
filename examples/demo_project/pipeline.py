@@ -1427,7 +1427,7 @@ full_pipeline_job = Job(
     job_name="ingestion",
     name="daily_ingestion_schedule",
     default_status=ScheduleStatus.Running,
-    timezone="US/Eastern",
+    timezone="America/New_York",
     tags={"team": "data-eng"},
     description="Ingest raw data every morning at 6am ET",
 )
@@ -1443,7 +1443,7 @@ def daily_ingestion_schedule(context: ScheduleEvaluationContext):
     job_name="analytics",
     name="daily_analytics_schedule",
     default_status=ScheduleStatus.Stopped,
-    timezone="US/Eastern",
+    timezone="America/New_York",
     description="Run analytics pipeline every morning at 8am ET",
 )
 def daily_analytics_schedule(context: ScheduleEvaluationContext):
