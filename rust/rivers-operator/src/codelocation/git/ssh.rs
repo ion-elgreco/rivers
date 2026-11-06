@@ -181,9 +181,14 @@ impl client::Handler for HostKeyCheck {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        self.0.verify(server_public_key)?;
+        // We never advertise certificate host-key algorithms, so a server
+        // only presents a bare key.
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return Ok(false);
+        };
+        self.0.verify(key)?;
         Ok(true)
     }
 }
@@ -674,7 +679,7 @@ Qjm9zYDGIBlKeGwA==
         async fn auth_publickey(
             &mut self,
             user: &str,
-            key: &russh::keys::PublicKey,
+            key: server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
             let authorized = russh::keys::PublicKey::from_openssh(&format!(
                 "{} t",
@@ -683,7 +688,7 @@ Qjm9zYDGIBlKeGwA==
             .expect("fixture pubkey");
             // key_data comparison — PublicKey's derived eq includes the
             // comment, and the wire key never carries one.
-            if user == "git" && key.key_data() == authorized.key_data() {
+            if user == "git" && key.public_key.key_data() == authorized.key_data() {
                 Ok(Auth::Accept)
             } else {
                 Ok(Auth::Reject {
