@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import ClassVar
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
@@ -53,6 +54,8 @@ class RiversConfig(BaseSettings):
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
 
+    config_file: ClassVar[Path | None] = None
+
     model_config = SettingsConfigDict(
         env_prefix="RIVERS_",
         env_nested_delimiter="_",
@@ -90,11 +93,7 @@ class RiversConfig(BaseSettings):
         """
         settings_cls = cls
         if config is not None:
-            settings_cls = type(
-                cls.__name__,
-                (cls,),
-                {"model_config": SettingsConfigDict(toml_file=config)},
-            )
+            settings_cls = type(cls.__name__, (cls,), {"config_file": config})
 
         groups: dict[str, dict] = {
             "module": {"path": module, "repo_var": repo_var},
@@ -128,7 +127,7 @@ class RiversConfig(BaseSettings):
         # Using _find_toml() to recursively lookup the TOML configuration files
         # within the current code location. This makes it possible to run operations
         # such as `rivers dev` from any project directory.
-        explicit = cls.model_config.get("toml_file") or os.environ.get("RIVERS_CONFIG")
+        explicit = cls.config_file or os.environ.get("RIVERS_CONFIG")
         if explicit:
             rivers_toml = Path(explicit)
             if not rivers_toml.is_file():
