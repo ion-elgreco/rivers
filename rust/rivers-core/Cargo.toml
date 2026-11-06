@@ -28,3 +28,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 test-temp-dir = "0.9"
+tracing-subscriber.workspace = true

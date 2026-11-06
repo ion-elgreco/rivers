@@ -14,6 +14,8 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use rivers_core::storage::surrealdb_backend::SURREALDB_STACK_SIZE;
+
 /// A shared bag of worker-thread join handles. Cheap to clone (`Arc`).
 #[derive(Clone, Default)]
 pub(crate) struct GilThreads {
@@ -32,7 +34,10 @@ impl GilThreads {
     where
         F: FnOnce() + Send + 'static,
     {
-        let handle = std::thread::spawn(f);
+        let handle = std::thread::Builder::new()
+            .stack_size(SURREALDB_STACK_SIZE)
+            .spawn(f)
+            .expect("failed to spawn a worker thread");
         let mut handles = self.handles.lock().unwrap();
         handles.retain(|h| !h.is_finished());
         handles.push(handle);

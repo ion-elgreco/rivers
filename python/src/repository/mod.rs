@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 
 use crate::errors::{AssetDefinitionError, ExecutionError, NodeNotFoundError};
 use rivers_core::repo::CodeRepository;
+use rivers_core::storage::surrealdb_backend::SURREALDB_STACK_SIZE;
 use rivers_core::storage::{BackfillFailurePolicy, LaunchedBy, StorageBackend};
 
 use crate::runtime::{io_rt, rt};
@@ -809,9 +810,14 @@ impl PyCodeRepository {
 
         tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server: spawning std::thread for new tokio Runtime");
         let gil_threads_for_server = gil_threads.clone();
-        let handle = std::thread::spawn(move || {
+        let thread = std::thread::Builder::new().stack_size(SURREALDB_STACK_SIZE);
+        let handle = thread.spawn(move || {
             tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server thread: creating Runtime");
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create gRPC runtime");
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(SURREALDB_STACK_SIZE)
+                .build()
+                .expect("Failed to create gRPC runtime");
             tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server thread: block_on(start_grpc_server)");
             rt.block_on(async move {
                 let server_fut = crate::grpc_server::start_grpc_server(
@@ -853,7 +859,8 @@ impl PyCodeRepository {
             }
             rt.shutdown_timeout(GRPC_SHUTDOWN_GRACE);
             tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server thread: EXIT");
-        });
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("failed to spawn the gRPC server thread: {e}")))?;
         crate::shutdown::register_grpc_handle(handle, server_cancel);
 
         tracing::trace!(target: "rivers::dbg::grpc", "_start_grpc_server: waiting for port via mpsc");

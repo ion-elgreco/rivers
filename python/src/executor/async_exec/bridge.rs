@@ -8,10 +8,11 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use pyo3::exceptions::PyKeyboardInterrupt;
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyCFunction;
 use pyo3_async_runtimes::TaskLocals;
+use rivers_core::storage::surrealdb_backend::SURREALDB_STACK_SIZE;
 
 use crate::runtime::rt;
 
@@ -35,12 +36,17 @@ impl AsyncBridge {
         let task_locals = TaskLocals::new(loop_obj.clone());
 
         let loop_ref = loop_obj.clone().unbind();
-        let loop_thread = std::thread::spawn(move || {
-            Python::try_attach(|py| {
-                let _ = loop_ref.call_method0(py, "run_forever");
-                let _ = loop_ref.call_method0(py, "close");
-            });
-        });
+        let loop_thread = std::thread::Builder::new()
+            .stack_size(SURREALDB_STACK_SIZE)
+            .spawn(move || {
+                Python::try_attach(|py| {
+                    let _ = loop_ref.call_method0(py, "run_forever");
+                    let _ = loop_ref.call_method0(py, "close");
+                });
+            })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to spawn the asyncio thread: {e}"))
+            })?;
 
         Ok(Self {
             task_locals,
