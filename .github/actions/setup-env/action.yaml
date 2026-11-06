@@ -107,7 +107,7 @@ runs:
     - name: Install protoc + wasm tooling
       uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
       with:
-        tool: protoc@3.36.1,wasm-bindgen-cli@0.2.121,wasm-pack@0.14.0
+        tool: protoc@3.36.1,wasm-bindgen-cli@0.2.130,wasm-pack@0.14.0
 
     # Cross-compile linker (cargo-zigbuild + zig) — only release
     # workflows opt into this.

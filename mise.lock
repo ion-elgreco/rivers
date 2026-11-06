@@ -5,7 +5,7 @@ version = "0.22.3"
 backend = "cargo:cargo-zigbuild"
 
 [[tools."cargo:wasm-bindgen-cli"]]
-version = "0.2.121"
+version = "0.2.130"
 backend = "cargo:wasm-bindgen-cli"
 
 [[tools."cargo:wasm-pack"]]
