@@ -444,6 +444,119 @@ async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
     }
 }
 
+/// A partition deletion and an older materialization of that partition, in
+/// flight together: neither snapshot holds the other's writes, and each writes
+/// a row the other only reads (the tombstone, the partition row). They must
+/// still serialize, so the partition row does not outlive the newer deletion.
+/// The materialization's transaction stays open across the deletion to pin
+/// that interleaving; a failed commit is retried as `with_retry` would.
+#[tokio::test]
+async fn a_concurrent_partition_deletion_leaves_no_older_partition_row() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+        .await
+        .expect("failed to create embedded storage");
+    let p = order_key();
+    for batched in [false, true] {
+        let key = format!("orders_{batched}");
+        register(&storage, &[&key]).await;
+
+        let older = mat_at(&key, "r0", 100, Some(&p));
+        let tx = storage.db.clone().begin().await.unwrap();
+        tx.query(format!(
+            "{UPSERT_ASSET_PARTITIONS}; {MATERIALIZE_ASSET_DATA} {MATERIALIZATION_IS_NEWER};"
+        ))
+        .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+        .bind(("asset_key", key.clone()))
+        .bind(("event_id", "older".to_string()))
+        .bind(("run_id", older.run_id.clone()))
+        .bind(("timestamp", older.timestamp))
+        .bind((
+            "data_version",
+            older.event_type.data_version().map(str::to_string),
+        ))
+        .bind(("keys", vec![p.clone()]))
+        .bind(("oldest", older.timestamp))
+        .bind((
+            "rows",
+            vec![DbAssetPartitionWrite {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                asset_key: key.clone(),
+                partition_key: p.clone(),
+                last_event_id: "older".to_string(),
+                last_run_id: older.run_id.clone(),
+                last_timestamp: older.timestamp,
+            }],
+        ))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let deletion = del_at(&key, 200, Some(&p));
+        if batched {
+            storage
+                .store_events(std::slice::from_ref(&deletion))
+                .await
+                .unwrap();
+        } else {
+            storage.store_event(&deletion).await.unwrap();
+        }
+
+        if let Err(e) = tx.commit().await {
+            assert!(
+                retry::is_transient_surrealdb_error(&e),
+                "batched={batched}: {e}"
+            );
+            storage.store_event(&older).await.unwrap();
+        }
+
+        assert_eq!(
+            read_writes(&storage, &key, &p).await,
+            writes(None, Some(200), Some(("r0", 100)), None),
+            "batched={batched}: the partition row outlived the newer partition deletion"
+        );
+    }
+}
+
+/// A partition deletion writes the `assets` row only to conflict with a
+/// concurrent materialization: it leaves the row as it found it.
+#[tokio::test]
+async fn a_partition_deletion_leaves_the_asset_row_as_it_found_it() {
+    let storage = make_storage().await;
+    let p = order_key();
+    for batched in [false, true] {
+        let key = format!("orders_{batched}");
+        register(&storage, &[&key]).await;
+        let event_id = storage
+            .store_event(&mat_at(&key, "mat", 100, Some(&p)))
+            .await
+            .unwrap();
+
+        let deletion = del_at(&key, 200, Some(&p));
+        if batched {
+            storage
+                .store_events(std::slice::from_ref(&deletion))
+                .await
+                .unwrap();
+        } else {
+            storage.store_event(&deletion).await.unwrap();
+        }
+
+        let record = storage
+            .get_asset_record(DEFAULT_CODE_LOCATION_ID, &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.last_event_id, Some(event_id), "batched={batched}");
+        assert_eq!(
+            read_writes(&storage, &key, &p).await,
+            writes(None, Some(200), Some(("mat", 100)), None),
+            "batched={batched}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn in_order_deletes_and_materializations_apply_as_before() {
     let storage = make_storage().await;
