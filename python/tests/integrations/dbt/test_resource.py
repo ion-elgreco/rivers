@@ -70,15 +70,18 @@ def test_cancelling_an_async_run_stops_dbt(tmp_path, monkeypatch, exits):
     started = tmp_path / "started"
     interrupted = tmp_path / "interrupted"
     executable = tmp_path / "dbt"
+    # A SIGINT handler can miss a signal that lands just before time.sleep;
+    # sigwait cannot. SIG_DFL undoes an inherited SIG_IGN, which drops it.
     executable.write_text(
         f"#!{sys.executable}\n"
         "import os, pathlib, signal, sys, time\n"
-        "def interrupt(signum, frame):\n"
-        f"    pathlib.Path({str(interrupted)!r}).touch()\n"
-        f"    if {exits}:\n"
-        "        sys.exit(130)\n"
-        "signal.signal(signal.SIGINT, interrupt)\n"
+        "signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+        "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})\n"
         f"pathlib.Path({str(started)!r}).write_text(str(os.getpid()))\n"
+        "signal.sigwait({signal.SIGINT})\n"
+        f"pathlib.Path({str(interrupted)!r}).touch()\n"
+        f"if {exits}:\n"
+        "    sys.exit(130)\n"
         "time.sleep(30)\n"
     )
     executable.chmod(0o755)
