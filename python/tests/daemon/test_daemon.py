@@ -325,9 +325,8 @@ class TestDaemonE2E:
         daemon = AutomationDaemon(repo=repo, storage=storage)
         daemon.start()
         try:
-            runs = _wait_for_runs(storage, min_count=1, timeout=15)
+            runs = _wait_for_runs(storage, min_count=1, timeout=15, status="Success")
             assert len(runs) >= 1
-            assert any(r.status == "Success" for r in runs)
 
             # Ticks are batch-written; wait for them to flush
             ticks = _wait_for_ticks(
