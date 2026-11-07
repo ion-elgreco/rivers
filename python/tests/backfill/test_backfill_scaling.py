@@ -45,6 +45,9 @@ def _median_gap_seconds(tmp_path, n_partitions: int, tail: int) -> float:
 
 
 @pytest.mark.serial
+# 1,600 runs on an embedded store: on SurrealDB 4 they can take longer than the
+# 60 s project-wide timeout on CI.
+@pytest.mark.timeout(300)
 def test_backfill_bookkeeping_independent_of_backfill_size(tmp_path):
     small = _median_gap_seconds(tmp_path, 100, tail=50)
     large = _median_gap_seconds(tmp_path, 1_500, tail=50)
