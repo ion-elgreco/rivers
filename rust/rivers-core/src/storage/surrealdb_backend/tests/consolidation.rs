@@ -898,17 +898,10 @@ async fn provenance_applies_in_event_order_apart_from_the_data() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conflict_retry_does_not_duplicate_events() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let retry = retry::StorageRetryConfig {
-        max_retries: 10,
-        initial_backoff: std::time::Duration::from_millis(1),
-        max_backoff: std::time::Duration::from_millis(5),
-        backoff_multiplier: 1.0,
-        max_elapsed: None,
-    };
     let storage = std::sync::Arc::new(
         SurrealStorage::new_embedded_with_retry(
             temp_dir.as_path_untracked().to_str().unwrap(),
-            retry,
+            retry::StorageRetryConfig::default().contended(),
             Capability::ReadWrite,
         )
         .await
@@ -956,17 +949,10 @@ async fn conflict_retry_does_not_duplicate_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_observations_stay_consistent() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let retry = retry::StorageRetryConfig {
-        max_retries: 10,
-        initial_backoff: std::time::Duration::from_millis(1),
-        max_backoff: std::time::Duration::from_millis(5),
-        backoff_multiplier: 1.0,
-        max_elapsed: None,
-    };
     let storage = std::sync::Arc::new(
         SurrealStorage::new_embedded_with_retry(
             temp_dir.as_path_untracked().to_str().unwrap(),
-            retry,
+            retry::StorageRetryConfig::default().contended(),
             Capability::ReadWrite,
         )
         .await
