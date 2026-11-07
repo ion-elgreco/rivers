@@ -178,8 +178,9 @@ warehouse = DuckDBResource(database="warehouse.duckdb", extensions=["spatial"])
 | `extensions` | `list[str]` | `[]` | Extensions to install and load on each connection. |
 | `secrets` | `dict[str, dict[str, str \| int \| bool]]` | `{}` | Secret name to `CREATE SECRET` parameters, created on each connection. |
 
-Opening a file that another process holds is retried 10 times, with a delay of 0.1 s
-that doubles each time. After the last try the `duckdb.IOException` is raised; for a
+Opening a file that another process holds, or that another thread is opening or
+releasing, is retried 10 times, with a delay of 0.1 s that doubles each time. After
+the last try the error is raised; for a
 DuckLake catalog in a DuckDB file, the error says that the catalog allows one process.
 
 ### Methods

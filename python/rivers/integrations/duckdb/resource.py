@@ -36,10 +36,13 @@ _shared = _Shared()
 _LOCK_RETRIES = 10
 # DuckDB's error when another process holds the file: a POSIX lock, or a
 # Windows sharing violation (DuckDB names the holder when it can find it).
+# Last, two threads of this process opening or releasing the file at once
+# (duckdb/duckdb#22277): the next try finds the file opened or released.
 _LOCK_MESSAGES = (
     "Could not set lock",
     "being used by another process",
     "File is already open in",
+    "Unique file handle conflict",
 )
 _ONE_PROCESS_HINT = (
     "A DuckLake catalog in a DuckDB file allows one process. Use a PostgreSQL "
@@ -81,8 +84,9 @@ class DuckDBResource(Resource):
     root connection stays open until :meth:`teardown` and until the last
     cursor made from it is gone. Resources with equal fields share it.
 
-    Opening a file that another process holds is retried 10 times, with a
-    delay of 0.1 s that doubles each time.
+    Opening a file that another process holds, or that another thread is
+    opening or releasing, is retried 10 times, with a delay of 0.1 s that
+    doubles each time.
 
     Fields are read from ``DUCKDB_*`` environment variables when not given.
 
@@ -252,12 +256,12 @@ def _same_option(stored: str | None, value: str | int | float | bool) -> bool:
 
 
 def _retry_on_lock(fn: Callable[[], _T], hint: str | None = None) -> _T:
-    """Call ``fn``, retrying while another process holds the database file."""
+    """Call ``fn``, retrying while another process or thread holds the database file."""
     delay = 0.1
     for _ in range(_LOCK_RETRIES):
         try:
             return fn()
-        except duckdb.IOException as e:
+        except duckdb.Error as e:
             if not _is_lock_error(e):
                 raise
         sleep(delay)
@@ -265,11 +269,11 @@ def _retry_on_lock(fn: Callable[[], _T], hint: str | None = None) -> _T:
 
     try:
         return fn()
-    except duckdb.IOException as e:
+    except duckdb.Error as e:
         if hint is None or not _is_lock_error(e):
             raise
         raise duckdb.IOException(f"{e}\n{hint}") from e
 
 
-def _is_lock_error(e: duckdb.IOException) -> bool:
+def _is_lock_error(e: duckdb.Error) -> bool:
     return any(message in str(e) for message in _LOCK_MESSAGES)
