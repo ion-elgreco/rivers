@@ -350,6 +350,10 @@ pub(crate) fn spawn_backfill_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(5);
+        // Zero-run backfills the previous tick saw. Pickup flips a backfill to
+        // InProgress before it links its first run, so one sighting may be a
+        // submission in flight, and re-queuing it would cancel that submission.
+        let mut stalled_last_tick: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -374,13 +378,19 @@ pub(crate) fn spawn_backfill_monitor(
             };
 
             let mut completions = tokio::task::JoinSet::new();
+            let mut stalled = HashSet::new();
             for bf in backfills {
                 // Zero runs = the executor died between the InProgress flip
                 // and run submission; the pickup loop only re-picks Requested,
                 // so nothing else will ever touch it. Flip it back (guarded)
-                // once past the grace period so pickup re-executes it.
+                // once past the grace period and seen on two ticks in a row,
+                // so pickup re-executes it.
                 if bf.run_ids.is_empty() {
                     if now_ts() - bf.create_time > BACKFILL_RESUME_GRACE_NS {
+                        if !stalled_last_tick.contains(&bf.backfill_id) {
+                            stalled.insert(bf.backfill_id);
+                            continue;
+                        }
                         match handle
                             .backend()
                             .resume_stalled_backfill(&bf.backfill_id)
@@ -408,6 +418,7 @@ pub(crate) fn spawn_backfill_monitor(
                     (bf.backfill_id, result)
                 });
             }
+            stalled_last_tick = stalled;
             while let Some(joined) = completions.join_next().await {
                 let Ok((backfill_id, result)) = joined else {
                     continue;
