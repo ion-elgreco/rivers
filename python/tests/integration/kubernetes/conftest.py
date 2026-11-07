@@ -7,6 +7,7 @@ need.
 """
 
 import os
+import socket
 
 import kr8s
 import pytest
@@ -23,6 +24,18 @@ def kube_api() -> kr8s.Api:
     """kr8s client pinned to the test k3d context — never the user's
     accidentally-set kubeconfig default."""
     return kr8s.api(context=KUBECTL_CONTEXT)
+
+
+def free_port() -> int:
+    """Local port for a kr8s port-forward, chosen by the kernel.
+
+    kr8s's ``local_port="auto"`` probes random ports with ``connect``, which
+    misses ports held by the client end of a connection, so its bind can fail
+    with ``EADDRINUSE``.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def cluster_gate(ready: bool, reason: str) -> pytest.MarkDecorator:

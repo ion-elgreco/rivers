@@ -14,7 +14,7 @@ import grpc
 import pytest
 from kr8s.objects import Deployment, Job, Pod, Service
 
-from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, free_port, kube_api
 from .test_k8s_integration import (
     CODE_LOCATION_NAME,
     NAMESPACE,
@@ -110,7 +110,7 @@ class TestRunAndStepPods:
 
 def test_collector_rejects_exports_without_the_bearer_token():
     svc = Service.get(COLLECTOR, namespace=NAMESPACE, api=kube_api())
-    with svc.portforward(remote_port=4317, local_port="auto") as local_port:
+    with svc.portforward(remote_port=4317, local_port=free_port()) as local_port:
         with grpc.insecure_channel(f"127.0.0.1:{local_port}") as channel:
             grpc.channel_ready_future(channel).result(timeout=10)
             export = channel.unary_unary(EXPORT_METHOD)

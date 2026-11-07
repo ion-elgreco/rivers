@@ -32,7 +32,7 @@ import pytest
 from kr8s import NotFoundError
 from kr8s.objects import APIObject, Deployment, Namespace, Secret, Service
 
-from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, free_port, kube_api
 
 NAMESPACE = "rivers"
 REGISTRY_SERVICE_NAME = "rivers-operator-registry"
@@ -270,7 +270,9 @@ class RegistryChannel:
         self._pb2, self._pb2_grpc = grpc_stubs
         self._token = token if token is not None else _registry_token()
         svc = Service.get(REGISTRY_SERVICE_NAME, namespace=NAMESPACE, api=kube_api())
-        self._pf_ctx = svc.portforward(remote_port=REGISTRY_PORT, local_port="auto")
+        self._pf_ctx = svc.portforward(
+            remote_port=REGISTRY_PORT, local_port=free_port()
+        )
         self._channel: grpc.Channel | None = None
 
     def __enter__(self) -> "RegistryChannel":
