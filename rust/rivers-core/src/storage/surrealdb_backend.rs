@@ -638,7 +638,7 @@ impl SurrealStorage {
             .collect();
         // One DELETE per deletion time, not a FOR loop, which costs more. The
         // members of one delete step share a time, so this is one statement.
-        let mut sql = String::from("BEGIN TRANSACTION; ");
+        let mut sql = String::from(BEGIN_PARTITION_DELETIONS);
         for i in 0..by_time.len() {
             sql.push_str(&format!(
                 "DELETE FROM asset_partitions WHERE code_location_id = $cl \

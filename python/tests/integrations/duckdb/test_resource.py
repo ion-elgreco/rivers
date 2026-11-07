@@ -137,6 +137,29 @@ def test_connect_gives_up_after_the_retries(monkeypatch, tmp_path):
     assert delays == [0.1 * 2**i for i in range(10)]
 
 
+def test_connect_retries_a_file_another_thread_opens(monkeypatch, tmp_path):
+    """Two threads opening or releasing one file at once can fail the open
+    (duckdb/duckdb#22277). The next try finds the file opened or released."""
+    connect = duckdb.connect
+    calls: list[str] = []
+
+    def racing(database, **kwargs):
+        calls.append(database)
+        if len(calls) == 1:
+            raise duckdb.BinderException(
+                'Binder Error: Unique file handle conflict: Cannot attach "w" - the '
+                f'database file "{database}" is already attached by database "w"'
+            )
+        return connect(database, **kwargs)
+
+    monkeypatch.setattr(resource_module.duckdb, "connect", racing)
+    monkeypatch.setattr(resource_module, "sleep", lambda _: None)
+    path = str(tmp_path / "w.duckdb")
+    with DuckDBResource(database=path).get_connection() as con:
+        assert con.sql("SELECT 42").fetchone() == (42,)
+    assert calls == [path, path]
+
+
 @pytest.mark.parametrize(
     ("message", "locked"),
     [

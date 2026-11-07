@@ -198,6 +198,7 @@ def test_async_mapped_fan_out_concurrency_timing():
         tasks=[slow_triple, collect_sum],
         jobs=[rs.Job(name="j", assets=assets, executor=rs.Executor.in_process())],
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.get_job("j").execute()
     elapsed = time.monotonic() - start

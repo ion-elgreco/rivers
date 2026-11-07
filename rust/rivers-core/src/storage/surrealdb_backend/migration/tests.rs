@@ -169,7 +169,9 @@ async fn test_v2_moves_logoutput_events_to_run_logs() {
         .check()
         .unwrap();
 
-    apply_migrations(&db).await.expect("apply V2");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply V2");
 
     #[derive(SurrealValue)]
     struct LogRow {
@@ -253,7 +255,9 @@ async fn test_v3_backfill_launched_by_defaults_for_legacy_rows() {
     .unwrap();
 
     // Now migrate to V3 (adds the launched_by field) and read the old row.
-    apply_migrations(&db).await.expect("apply V3");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply V3");
     let rows: Vec<crate::storage::BackfillRecord> = db
         .query("SELECT * FROM backfills WHERE backfill_id = 'bf-legacy'")
         .await
@@ -315,7 +319,9 @@ async fn test_v6_backfills_deletion_tombstones_from_events() {
         .check()
         .unwrap();
 
-    apply_migrations(&db).await.expect("apply V6");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply V6");
 
     #[derive(Debug, SurrealValue)]
     struct AssetRow {
@@ -401,7 +407,9 @@ async fn test_v7_backfills_provenance_timestamp() {
         .check()
         .unwrap();
 
-    apply_migrations(&db).await.expect("apply V7");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply V7");
 
     let provenance_times = async || -> Vec<(String, Option<i64>)> {
         db.query(
@@ -437,7 +445,9 @@ async fn test_v7_backfills_provenance_timestamp() {
         .unwrap()
         .check()
         .unwrap();
-    apply_migrations(&db).await.expect("re-run");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("re-run");
     let v7 = embedded_migrations()
         .into_iter()
         .nth(6)
@@ -625,7 +635,7 @@ async fn test_v10_rewrites_run_config_into_the_launch_document() {
         .check()
         .unwrap();
 
-    apply_migrations(&db).await.unwrap();
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
 
     let rows: Vec<(i64, Option<String>)> = db
         .query("SELECT VALUE [start_time, config] FROM runs ORDER BY start_time")
@@ -715,7 +725,7 @@ async fn test_v12_moves_backfill_progress_out_of_the_row() {
     .check()
     .unwrap();
 
-    apply_migrations(&db).await.unwrap();
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
 
     let read = async |id: &str| -> crate::storage::BackfillRecord {
         let rows: Vec<crate::storage::BackfillRecord> = db
@@ -846,7 +856,9 @@ async fn test_v5_backfills_exclusive_on_legacy_slot_rows() {
         .unwrap();
     }
 
-    apply_migrations(&db).await.expect("apply V5");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply V5");
 
     let exclusive_of = async |step: &str| -> Vec<bool> {
         db.query(format!(
@@ -888,7 +900,9 @@ async fn test_edited_migration_is_refused_as_divergent() {
         .use_db(DEFAULT_DATABASE)
         .await
         .unwrap();
-    apply_migrations(&db).await.expect("apply real V1");
+    apply_migrations(&db, &embedded_migrations())
+        .await
+        .expect("apply real V1");
 
     // Same version + name, different body → different checksum → divergent.
     let edited =
@@ -1037,6 +1051,28 @@ async fn test_uninitialized_store_is_initialized_by_a_reader() {
     assert!(
         matches!(stamps, Some(s) if s.version == SCHEMA_VERSION),
         "first-opener init must reach the current version, got {stamps:?}"
+    );
+}
+
+/// The first open of an empty database applies every migration in one
+/// transaction: a failure leaves the database empty, so the retry sets it up
+/// again instead of finding a store stamped behind this build.
+#[tokio::test]
+async fn test_failed_first_open_leaves_the_database_empty() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let mut failing = embedded_migrations();
+    failing.push(Migration::unapplied("V99__fails", "THROW 'injected failure';").unwrap());
+    apply_migrations(&db, &failing).await.unwrap_err();
+    assert_eq!(read_schema_stamps(&db).await.unwrap(), None);
+
+    ensure_compatible(&db, Capability::ReadWrite).await.unwrap();
+    assert_eq!(
+        read_schema_stamps(&db).await.unwrap().map(|s| s.version),
+        Some(SCHEMA_VERSION)
     );
 }
 

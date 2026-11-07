@@ -672,6 +672,51 @@ class TestBackfillResume:
         finally:
             daemon.stop()
 
+    def test_zero_run_backfill_seen_on_one_tick_is_left_alone(self, storage):
+        """Pickup flips a backfill to InProgress before it links its first
+        run, so one monitor tick can see a submission in flight with no runs.
+        Re-queuing it then canceled the submission, so the monitor re-queues
+        only a backfill it saw stuck on the tick before too."""
+        import time
+
+        @rs.Asset(
+            name="bf_target",
+            io_handler=rs.InMemoryIOHandler(),
+            partitions_def=rs.PartitionsDefinition.static_(["x", "y"]),
+        )
+        def bf_target() -> str:
+            return "data"
+
+        repo = rs.CodeRepository(
+            assets=[bf_target],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=10,
+                dequeue_interval="100ms",
+            ),
+        )
+        repo.resolve(storage=storage)
+        storage._create_backfill(
+            "stuck-bf", ["bf_target"], ["x", "y"], "InProgress", 1_000
+        )
+
+        daemon = AutomationDaemon(
+            repo=repo,
+            storage=storage,
+            condition_eval_interval="1s",
+        )
+        daemon.start()
+        try:
+            # Between the monitor's first tick (5s) and its second (10s).
+            time.sleep(7.5)
+            status = repo.get_backfill("stuck-bf")
+            assert status is not None, "backfill disappeared"
+            assert status.status == "InProgress"
+            runs = storage.get_runs(limit=50)
+            assert [r for r in runs if r.launched_by.kind == "backfill"] == []
+        finally:
+            daemon.stop()
+
 
 class TestRunQueueConfig:
     def test_queued_run_applies_the_config_on_its_record(self, storage):

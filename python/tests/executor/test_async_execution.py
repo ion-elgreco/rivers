@@ -1291,6 +1291,7 @@ def test_parallel_overlaps_sync_workers_with_async(tmp_path):
             )
         ],
     )
+    repo.resolve()  # storage open + schema apply outside the timed window
     start = time.monotonic()
     repo.get_job("j").execute()
     elapsed = time.monotonic() - start

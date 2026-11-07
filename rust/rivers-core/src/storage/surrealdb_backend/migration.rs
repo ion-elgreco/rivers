@@ -173,59 +173,77 @@ fn embedded_migrations() -> Vec<Migration> {
     ]
 }
 
-/// Apply all pending migrations via refinery (idempotent — applied ones are
+/// Apply all pending `migrations` via refinery (idempotent — applied ones are
 /// skipped; an edited applied one aborts on a checksum mismatch).
-async fn apply_migrations(db: &Surreal<Any>) -> anyhow::Result<()> {
-    let migrations = embedded_migrations();
-    let before = read_schema_stamps(db).await?.map_or(0, |s| s.version);
+async fn apply_migrations(db: &Surreal<Any>, migrations: &[Migration]) -> anyhow::Result<()> {
     let mut backend = SurrealMigrate { db: db.clone() };
-    let apply = async |backend: &mut SurrealMigrate, target: Target| {
+    let apply = async |backend: &mut SurrealMigrate, target: Target, grouped: bool| {
         backend
             .migrate(
-                &migrations,
+                migrations,
                 true,  // abort_divergent: an edited applied migration is an error
                 false, // abort_missing: tolerate a DB carrying migrations we don't embed
-                false, // grouped: one transaction per migration
+                grouped,
                 target,
                 REFINERY_HISTORY_TABLE,
             )
             .await
             .context("applying storage migrations")
     };
+    // One transaction leaves an empty database set up or untouched. Applied
+    // one by one, a failed first open left it stamped behind this build, and
+    // then only `rivers db migrate` could finish it. It holds no rows to
+    // rewrite and no index a 3.x release built.
+    if is_empty_database(db).await? {
+        apply(&mut backend, Target::Latest, true).await?;
+        return Ok(());
+    }
+    let before = read_schema_stamps(db).await?.map_or(0, |s| s.version);
     // V10 changes the shape of stored rows. They are rewritten between the
     // DDL before it and its own stamp, so a store never reads as V10 while
     // holding V9 rows.
     if before < 10 {
-        apply(&mut backend, Target::Version(9)).await?;
+        apply(&mut backend, Target::Version(9), false).await?;
         rewrite_v10_launch_documents(db).await?;
     }
     // Indexes a 3.x release built serve ordered and ranged reads only after a
     // rebuild under 4.0.
     if before < 13 {
-        apply(&mut backend, Target::Version(12)).await?;
+        apply(&mut backend, Target::Version(12), false).await?;
         rebuild_indexes(db).await?;
     }
-    apply(&mut backend, Target::Latest).await?;
+    apply(&mut backend, Target::Latest, false).await?;
     Ok(())
+}
+
+/// The names under `key` (`tables`, `indexes`) in an `INFO FOR` result.
+fn defined_names(info: Option<serde_json::Value>, key: &str) -> Vec<String> {
+    info.as_ref()
+        .and_then(|info| info.get(key))
+        .and_then(serde_json::Value::as_object)
+        .map(|defs| defs.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// True if the database defines no table but the migrator's own: the lease's
+/// and refinery's history, which a failed first open leaves behind.
+async fn is_empty_database(db: &Surreal<Any>) -> anyhow::Result<bool> {
+    let info: Option<serde_json::Value> = db.query("INFO FOR DB").await?.check()?.take(0)?;
+    Ok(defined_names(info, "tables")
+        .iter()
+        .all(|table| table == "migration_lock" || table == REFINERY_HISTORY_TABLE))
 }
 
 /// Rebuild every index of every table in the database.
 async fn rebuild_indexes(db: &Surreal<Any>) -> anyhow::Result<()> {
-    let names = |info: Option<serde_json::Value>, key: &str| -> Vec<String> {
-        info.as_ref()
-            .and_then(|info| info.get(key))
-            .and_then(serde_json::Value::as_object)
-            .map(|defs| defs.keys().cloned().collect())
-            .unwrap_or_default()
-    };
     let db_info: Option<serde_json::Value> = db.query("INFO FOR DB").await?.check()?.take(0)?;
-    for table in names(db_info, "tables") {
+    for table in defined_names(db_info, "tables") {
         let table_info: Option<serde_json::Value> = db
             .query(format!("INFO FOR TABLE {table}"))
             .await?
             .check()?
             .take(0)?;
-        for index in names(table_info, "indexes") {
+        for index in defined_names(table_info, "indexes") {
             db.query(format!("REBUILD INDEX {index} ON TABLE {table}"))
                 .await?
                 .check()?;
@@ -565,7 +583,9 @@ async fn migrate_to_current(db: &Surreal<Any>) -> anyhow::Result<()> {
         }
         match try_acquire_migration_lease(db).await? {
             Some(holder) => {
-                let result = with_lease_renewal(db, &holder, apply_migrations(db)).await;
+                let result =
+                    with_lease_renewal(db, &holder, apply_migrations(db, &embedded_migrations()))
+                        .await;
                 // Release on every outcome so a transient failure doesn't wedge
                 // the next opener; a crash is handled by the lease TTL instead.
                 if let Err(err) = release_migration_lease(db, &holder).await {

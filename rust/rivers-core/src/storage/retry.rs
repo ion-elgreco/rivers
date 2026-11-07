@@ -197,7 +197,7 @@ where
                         max = config.max_retries,
                         elapsed_ms = elapsed.as_millis() as u64,
                         out_of_time,
-                        error = %e,
+                        error = %format!("{e:#}"),
                         "storage operation exhausted retries"
                     );
                     return Err(e);
@@ -206,7 +206,7 @@ where
                     attempt = attempts,
                     max = config.max_retries,
                     backoff_ms = backoff.as_millis() as u64,
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "storage operation failed with transient error, retrying"
                 );
                 tokio::time::sleep(jittered(backoff)).await;

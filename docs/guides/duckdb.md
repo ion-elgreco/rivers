@@ -36,7 +36,7 @@ repo = rs.CodeRepository(assets=[top_users], resources={"warehouse": warehouse})
 
 `get_connection()` closes the connection when the block exits. `connect()` returns a connection that you close, or that a relation keeps open.
 
-Each call opens a new connection. In one process, DuckDB shares one database instance per file, and releases the file when the last connection closes. A DuckDB file allows one read-write process at a time. When another process holds the file, the resource tries again 10 times, with a delay of 0.1 s that doubles each time (about 100 s in total).
+Each call opens a new connection. In one process, DuckDB shares one database instance per file, and releases the file when the last connection closes. A DuckDB file allows one read-write process at a time. When another process holds the file, or another thread is opening or releasing it, the resource tries again 10 times, with a delay of 0.1 s that doubles each time (about 100 s in total).
 
 Fields that you do not give are read from `DUCKDB_*` environment variables, for example `DUCKDB_DATABASE`.
 

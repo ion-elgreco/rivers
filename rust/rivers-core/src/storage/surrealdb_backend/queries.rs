@@ -44,6 +44,21 @@ pub(super) const MATERIALIZATION_IS_NEWER: &str =
 /// real materialization landing after it still records its provenance.
 pub(super) const PROVENANCE_IS_NEWER: &str = "AND last_provenance_timestamp <= $provenance_timestamp AND last_deletion_timestamp < $provenance_timestamp";
 
+/// Starts `delete_partitions`' transaction: write the `assets` row and put it
+/// back. A materialization that adds partition rows writes that row too.
+/// Without it, the two write different rows (the tombstone, the partition
+/// row), so both commit from snapshots that miss each other, and the older
+/// partition row outlives the newer deletion. Now one fails and retries. An
+/// UPDATE that changes nothing writes nothing, hence the placeholder.
+pub(super) const BEGIN_PARTITION_DELETIONS: &str = "\
+     BEGIN TRANSACTION; \
+     LET $held = (SELECT VALUE last_event_id FROM assets \
+         WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
+     UPDATE assets SET last_event_id = 'partition deletion' \
+         WHERE code_location_id = $cl AND asset_key = $asset_key; \
+     UPDATE assets SET last_event_id = $held \
+         WHERE code_location_id = $cl AND asset_key = $asset_key; ";
+
 /// Ends `delete_partitions`' transaction: record the tombstones at each
 /// key's newest deletion time. The tombstone outlives the Deletion event:
 /// failure supersession reads it, and deleting the run must not undo the
@@ -63,8 +78,9 @@ pub(super) const RECORD_PARTITION_TOMBSTONES: &str = "\
 /// every partition row's, so a batch no older than it takes the plain upsert.
 /// Only an older batch pays for the per-row time check. Its row update may
 /// write nothing, so it writes the `assets` row and puts it back. A concurrent
-/// whole-asset deletion writes that row too: one of the two then fails to
-/// commit and retries, and the deletion cannot miss this batch's new rows.
+/// deletion, of the whole asset or of partitions, writes that row too: one of
+/// the two then fails to commit and retries, and the deletion cannot miss this
+/// batch's new rows.
 ///
 /// The keys' tombstones are read with an UPDATE that sets nothing, not a
 /// SELECT: only UPDATE and DELETE look up the object-valued `partition_key` on
