@@ -28,7 +28,7 @@ import pytest
 from kr8s import NotFoundError
 from kr8s.objects import APIObject, Deployment, Job, Pod, Secret, Service
 
-from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, free_port, kube_api
 
 NAMESPACE = "rivers"
 # Operator-managed CodeLocation CR applied by `dev/k3d/setup.sh`; the
@@ -79,7 +79,7 @@ class GrpcChannel:
     def __init__(self, grpc_stubs):
         self._pb2, self._pb2_grpc = grpc_stubs
         svc = Service.get(GRPC_SERVICE_NAME, namespace=NAMESPACE, api=kube_api())
-        self._pf_ctx = svc.portforward(remote_port=GRPC_PORT, local_port="auto")
+        self._pf_ctx = svc.portforward(remote_port=GRPC_PORT, local_port=free_port())
         self._channel: grpc.Channel | None = None
 
     def __enter__(self) -> "GrpcChannel":
@@ -232,7 +232,7 @@ def _query_run_events(run_id: str, fields: str = "event_type, asset_key") -> lis
     user = base64.b64decode(secret.raw["data"]["username"]).decode()
     pwd = base64.b64decode(secret.raw["data"]["password"]).decode()
     query = f"SELECT {fields} FROM events WHERE run_id = '{run_id}';"
-    with pod.portforward(remote_port=8000, local_port="auto") as local_port:
+    with pod.portforward(remote_port=8000, local_port=free_port()) as local_port:
         # SurrealDB v3 root-user basic auth doesn't apply to DB-scoped queries;
         # we have to sign in to (ns=rivers, db=main) first and use the JWT.
         si = httpx.post(

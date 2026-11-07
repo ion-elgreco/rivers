@@ -28,7 +28,7 @@ import httpx
 import pytest
 from kr8s.objects import Deployment, Secret, Service
 
-from .conftest import KUBECTL_CONTEXT, cluster_gate, kube_api
+from .conftest import KUBECTL_CONTEXT, cluster_gate, free_port, kube_api
 from .test_k8s_integration import NAMESPACE, _cluster_reachable
 
 UI_DEPLOYMENT = "rivers-ui"
@@ -372,7 +372,7 @@ def ferriskey():
             ]["password"]
         ).decode()
         svc = Service.get("ferriskey-api", namespace=NAMESPACE, api=kube_api())
-        with svc.portforward(remote_port=3333, local_port="auto") as port:
+        with svc.portforward(remote_port=3333, local_port=free_port()) as port:
             base = f"http://127.0.0.1:{port}/api"
             with httpx.Client(base_url=base, timeout=10.0) as c:
                 deadline = time.time() + 120
@@ -406,7 +406,7 @@ def test_oidc_full_login_flow_against_ferriskey(ui_auth_env, ferriskey):
         }
     )
     fk_svc = Service.get("ferriskey-api", namespace=NAMESPACE, api=kube_api())
-    with fk_svc.portforward(remote_port=3333, local_port="auto") as fk_port:
+    with fk_svc.portforward(remote_port=3333, local_port=free_port()) as fk_port:
 
         def to_local(url: str) -> str:
             return url.replace(FERRISKEY_HOST, f"http://127.0.0.1:{fk_port}")
