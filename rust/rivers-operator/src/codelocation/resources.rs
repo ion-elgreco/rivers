@@ -285,6 +285,11 @@ fn build_base_env(
             ..Default::default()
         },
         EnvVar {
+            name: rivers_k8s::env::ENV_CODE_LOCATION_NAMESPACE.to_string(),
+            value: Some(cl.namespace().unwrap_or_default()),
+            ..Default::default()
+        },
+        EnvVar {
             name: "RIVERS_CODE_LOCATION_IMAGE".to_string(),
             value: Some(resolved_image.to_string()),
             ..Default::default()
@@ -449,6 +454,7 @@ mod tests {
                             "env": [
                                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
+                                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:abc" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -497,8 +503,12 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "duplicate env names: {env:?}");
+        let otel = env
+            .iter()
+            .position(|e| e["name"] == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap();
         assert_eq!(
-            serde_json::Value::Array(env[7..].to_vec()),
+            serde_json::Value::Array(env[otel..].to_vec()),
             json!([
                 { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
                 { "name": "RIVERS_OTEL_ENDPOINT", "value": "https://otlp.example.com:4317" },
@@ -608,6 +618,7 @@ mod tests {
                             "env": [
                                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
+                                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:deadbeef" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -821,6 +832,7 @@ mod tests {
             "env": [
                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
+                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
                 { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -925,6 +937,7 @@ mod tests {
             "env": [
                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
+                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
                 { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },

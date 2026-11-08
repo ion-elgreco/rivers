@@ -329,6 +329,13 @@ fn build_job_inner(
                                     value: Some(config.namespace.clone()),
                                     ..Default::default()
                                 },
+                                // Step Jobs run in the Run's namespace, which
+                                // is its CodeLocation's.
+                                EnvVar {
+                                    name: crate::env::ENV_CODE_LOCATION_NAMESPACE.to_string(),
+                                    value: Some(config.namespace.clone()),
+                                    ..Default::default()
+                                },
                                 EnvVar {
                                     name: "RIVERS_MODULE".to_string(),
                                     value: Some(config.module.clone()),
@@ -792,6 +799,10 @@ mod tests {
         );
         assert_eq!(
             env_val(&env, "RIVERS_NAMESPACE"),
+            Some("rivers-test".to_string())
+        );
+        assert_eq!(
+            env_val(&env, "RIVERS_CODE_LOCATION_NAMESPACE"),
             Some("rivers-test".to_string())
         );
         assert_eq!(

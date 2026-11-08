@@ -10,6 +10,7 @@ This page lists user-settable env vars that rivers itself reads. Variables consu
 |----------|---------|-------------|
 | `RIVERS_DEPLOYMENT` | unset (treated as `dev`) | Either `dev` or `cloud`. `cloud` activates strict checks — most importantly, code-location identity becomes mandatory and rivers panics rather than silently writing under a default identity. Set automatically by `rivers serve` / `execute` / `execute-step`. |
 | `RIVERS_CODE_LOCATION_ID` | unset (code location `default`) | The code location that runs, asset state and pool claims are recorded under. The operator sets it on rivers pods to the `spec.identity` of the `CodeLocation`. Outside those pods, set it (or pass `--code-location-id`) when a [CLI](cli.md#storage-flags) command acts on a deployed code location. |
+| `RIVERS_CODE_LOCATION_NAMESPACE` | `dev` outside Kubernetes | The namespace in the code location's `namespace/name`, the name other code locations use to refer to it. The operator sets it on rivers pods to the namespace of the `CodeLocation`. Under `RIVERS_DEPLOYMENT=cloud` without it, rivers uses the pod's namespace. |
 
 ## Daemon and automation
 
