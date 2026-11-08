@@ -33,12 +33,15 @@ pub fn compute_staleness(
 
     // Kahn's algorithm — upstreams must be processed before downstreams so
     // transitive staleness propagates correctly below.
+    // An upstream without a record (a remote asset) must still enter the
+    // queue, or it never releases its downstreams.
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     for r in records {
         in_degree.entry(r.asset_key.as_str()).or_insert(0);
     }
-    for (from, _to) in edges {
+    for (from, to) in edges {
         *in_degree.entry(from.as_str()).or_insert(0) += 1;
+        in_degree.entry(to.as_str()).or_insert(0);
     }
 
     let mut queue: Vec<&str> = in_degree
@@ -313,6 +316,34 @@ mod tests {
 
         assert_eq!(result["a"].0, StaleStatus::Missing);
         assert_eq!(result["b"].0, StaleStatus::Stale);
+    }
+
+    #[test]
+    fn test_upstream_without_record_releases_downstream() {
+        // `a` has no record (a remote asset); b -> a, c -> b. `c` consumed an
+        // old `b`, so it is stale against its local upstream.
+        let mut b = make_record("b");
+        b.last_data_version = Some("dv_b2".to_string());
+
+        let mut c = make_record("c");
+        c.last_data_version = Some("dv_c".to_string());
+        c.last_input_data_versions = vec![("b".to_string(), "dv_b1".to_string())];
+
+        let edges = vec![
+            ("b".to_string(), "a".to_string()),
+            ("c".to_string(), "b".to_string()),
+        ];
+        let result = compute_staleness(&[b, c], &edges);
+
+        assert!(!result.contains_key("a"));
+        assert_eq!(result["b"].0, StaleStatus::UpToDate);
+        assert_eq!(result["c"].0, StaleStatus::Stale);
+        assert_eq!(
+            result["c"].1[0].category,
+            StaleCauseCategory::Data {
+                dependency: "b".to_string()
+            }
+        );
     }
 
     #[test]
