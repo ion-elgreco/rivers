@@ -433,18 +433,8 @@ async fn test_input_versions_from_event_not_storage() {
     use crate::assets::graph::TopologyNode;
     let topology = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "upstream".to_string(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "downstream".to_string(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("upstream", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("downstream", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("downstream".to_string(), "upstream".to_string())],
     };

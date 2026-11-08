@@ -106,13 +106,14 @@ pub fn core_topology(scale: &str) -> rivers_core::assets::graph::GraphTopology {
             .nodes
             .into_iter()
             .map(|n| rivers_core::assets::graph::TopologyNode {
-                name: n.name,
-                kind: n
-                    .kind
-                    .parse()
-                    .expect("synthetic graph produced invalid NodeKind"),
                 group: n.group,
                 parent_graph: n.parent_graph,
+                ..rivers_core::assets::graph::TopologyNode::new(
+                    n.name,
+                    n.kind
+                        .parse()
+                        .expect("synthetic graph produced invalid NodeKind"),
+                )
             })
             .collect(),
         edges: g.edges,

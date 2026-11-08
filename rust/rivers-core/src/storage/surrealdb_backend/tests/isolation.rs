@@ -10,21 +10,11 @@ async fn graph_topology_isolated_per_code_location() {
     let ctx_b = crate::storage::CodeLocationContext::new("22222222-2222-4222-8222-222222222222");
 
     let topo_a = GraphTopology {
-        nodes: vec![TopologyNode {
-            name: "a_only".to_string(),
-            kind: NodeKind::Asset,
-            group: None,
-            parent_graph: None,
-        }],
+        nodes: vec![TopologyNode::new("a_only", NodeKind::Asset)],
         edges: vec![("a_only".to_string(), "shared".to_string())],
     };
     let topo_b = GraphTopology {
-        nodes: vec![TopologyNode {
-            name: "b_only".to_string(),
-            kind: NodeKind::Asset,
-            group: None,
-            parent_graph: None,
-        }],
+        nodes: vec![TopologyNode::new("b_only", NodeKind::Asset)],
         edges: vec![("b_only".to_string(), "shared".to_string())],
     };
 

@@ -6,6 +6,7 @@ use petgraph::graph::{Graph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::remote::RemoteRef;
 use crate::repo::CodeRepository;
 
 /// `ByName` is produced at parse time from annotations; `Resolved` is populated
@@ -89,6 +90,21 @@ pub struct TopologyNode {
     /// For tasks inside a graph asset: the name of the parent graph asset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_graph: Option<String>,
+    /// Set when the node mirrors an asset owned by another code location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteRef>,
+}
+
+impl TopologyNode {
+    pub fn new(name: impl Into<String>, kind: NodeKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            group: None,
+            parent_graph: None,
+            remote: None,
+        }
+    }
 }
 
 pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
@@ -96,12 +112,7 @@ pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
         .node_indices()
         .map(|idx| {
             let node = &graph[idx];
-            TopologyNode {
-                name: node.name.clone(),
-                kind: node.kind,
-                group: None,
-                parent_graph: None,
-            }
+            TopologyNode::new(node.name.clone(), node.kind)
         })
         .collect();
 
@@ -622,12 +633,33 @@ mod tests {
     }
 
     fn topo_node(name: &str) -> TopologyNode {
-        TopologyNode {
-            name: name.into(),
-            kind: NodeKind::Asset,
-            group: None,
-            parent_graph: None,
-        }
+        TopologyNode::new(name, NodeKind::Asset)
+    }
+
+    #[test]
+    fn test_topology_node_without_remote_reads_legacy_json() {
+        let node: TopologyNode = serde_json::from_str(r#"{"name":"a","kind":"asset"}"#).unwrap();
+        assert!(node.remote.is_none());
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"name":"a","kind":"asset"}"#
+        );
+    }
+
+    #[test]
+    fn test_topology_node_with_remote_round_trips() {
+        let mut node = topo_node("orders");
+        node.remote = Some(RemoteRef {
+            code_location: crate::assets::remote::LocationRef::new("team", "wh").unwrap(),
+            asset_key: "raw_orders".into(),
+        });
+        let json = serde_json::to_string(&node).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"orders","kind":"asset","remote":{"code_location":"team/wh","asset_key":"raw_orders"}}"#
+        );
+        let back: TopologyNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.remote, node.remote);
     }
 
     #[test]

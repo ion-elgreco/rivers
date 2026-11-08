@@ -25,18 +25,8 @@ async fn test_cache_detects_in_progress_completion_as_change() {
     use crate::assets::graph::TopologyNode;
     let topo = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "a".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "b".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("a", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("b", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("b".to_string(), "a".to_string())],
     };
@@ -612,18 +602,8 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
     use crate::assets::graph::TopologyNode;
     let topo = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "a".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "b".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("a", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("b", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("b".to_string(), "a".to_string())],
     };
@@ -1647,18 +1627,14 @@ async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealS
             &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
             &serde_json::to_vec(&GraphTopology {
                 nodes: vec![
-                    crate::assets::graph::TopologyNode {
-                        name: "a".into(),
-                        kind: crate::assets::graph::NodeKind::Asset,
-                        group: None,
-                        parent_graph: None,
-                    },
-                    crate::assets::graph::TopologyNode {
-                        name: "b".into(),
-                        kind: crate::assets::graph::NodeKind::Asset,
-                        group: None,
-                        parent_graph: None,
-                    },
+                    crate::assets::graph::TopologyNode::new(
+                        "a",
+                        crate::assets::graph::NodeKind::Asset,
+                    ),
+                    crate::assets::graph::TopologyNode::new(
+                        "b",
+                        crate::assets::graph::NodeKind::Asset,
+                    ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
             })
@@ -1746,18 +1722,14 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
             &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
             &serde_json::to_vec(&GraphTopology {
                 nodes: vec![
-                    crate::assets::graph::TopologyNode {
-                        name: "a".into(),
-                        kind: crate::assets::graph::NodeKind::Asset,
-                        group: None,
-                        parent_graph: None,
-                    },
-                    crate::assets::graph::TopologyNode {
-                        name: "b".into(),
-                        kind: crate::assets::graph::NodeKind::Asset,
-                        group: None,
-                        parent_graph: None,
-                    },
+                    crate::assets::graph::TopologyNode::new(
+                        "a",
+                        crate::assets::graph::NodeKind::Asset,
+                    ),
+                    crate::assets::graph::TopologyNode::new(
+                        "b",
+                        crate::assets::graph::NodeKind::Asset,
+                    ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
             })

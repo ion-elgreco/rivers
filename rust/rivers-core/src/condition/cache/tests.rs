@@ -192,12 +192,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
         .unwrap();
 
     use crate::assets::graph::{GraphTopology, NodeKind, TopologyNode};
-    let node = |name: &str| TopologyNode {
-        name: name.into(),
-        kind: NodeKind::Asset,
-        group: None,
-        parent_graph: None,
-    };
+    let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
     let topo = GraphTopology {
         nodes: vec![node("source"), node("processed")],
         edges: vec![("processed".to_string(), "source".to_string())],
