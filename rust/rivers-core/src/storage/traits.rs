@@ -3,6 +3,8 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use crate::assets::remote::LocationRef;
+
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, ConcurrencyClaimStatus,
     ConditionEvalRecord, ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID,
@@ -496,6 +498,21 @@ pub trait StorageBackend: PerCodeLocationStorage {
     // KV
     fn kv_get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
     fn kv_set(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    // Code location directory
+    /// Record that `location` scopes its rows by `identity`, replacing any
+    /// earlier identity (a recreated CodeLocation gets a new one).
+    fn set_code_location_identity(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Storage identity of `location`, or `None` if it never registered.
+    fn get_code_location_identity(
+        &self,
+        location: &LocationRef,
+    ) -> impl Future<Output = Result<Option<String>>> + Send;
 
     // Ticks (record-keyed; CL is carried on the record).
     fn store_tick(&self, tick: &TickRecord) -> impl Future<Output = Result<String>> + Send;

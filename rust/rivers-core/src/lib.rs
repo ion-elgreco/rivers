@@ -26,6 +26,14 @@ pub fn graph_topology_key(code_location_id: &str) -> String {
     format!("{GRAPH_TOPOLOGY_KEY_PREFIX}{code_location_id}")
 }
 
+pub const CODE_LOCATION_DIRECTORY_KEY_PREFIX: &str = "code_location:";
+
+/// KV key for a code location's directory entry, which maps its
+/// `namespace/name` to the storage identity its rows are scoped by.
+pub fn code_location_directory_key(location: &assets::remote::LocationRef) -> String {
+    format!("{CODE_LOCATION_DIRECTORY_KEY_PREFIX}{location}")
+}
+
 pub const CONDITION_EVAL_STATE_KEY_PREFIX: &str = "condition_eval_state:";
 
 /// KV key for the condition daemon's persisted eval state — per-CL so two

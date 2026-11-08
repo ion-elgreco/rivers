@@ -3,11 +3,12 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use surrealdb::types::{Bytes, SurrealValue};
 
+use crate::assets::remote::LocationRef;
 use crate::storage::retry;
 use crate::storage::{
-    BackfillRecord, BackfillStatus, ConditionEvalRecord, ConditionTickRecord, EventRecord,
-    EventType, LogRecord, PartitionKey, RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome,
-    StorageBackend, StoredEvent, StoredLog, TickRecord,
+    BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry, ConditionEvalRecord,
+    ConditionTickRecord, EventRecord, EventType, LogRecord, PartitionKey, RunOutcome, RunProgress,
+    RunRecord, RunStatus, StepOutcome, StorageBackend, StoredEvent, StoredLog, TickRecord,
 };
 
 use super::run_queue::SettledRunKeys;
@@ -719,6 +720,25 @@ impl StorageBackend for SurrealStorage {
             Ok(())
         })
         .await
+    }
+
+    async fn set_code_location_identity(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+    ) -> Result<()> {
+        let entry = CodeLocationDirectoryEntry {
+            identity: identity.to_string(),
+        };
+        self.kv_set_json(&crate::code_location_directory_key(location), &entry)
+            .await
+    }
+
+    async fn get_code_location_identity(&self, location: &LocationRef) -> Result<Option<String>> {
+        let entry: Option<CodeLocationDirectoryEntry> = self
+            .kv_get_json(&crate::code_location_directory_key(location))
+            .await?;
+        Ok(entry.map(|e| e.identity))
     }
 
     async fn store_tick(&self, tick: &TickRecord) -> Result<String> {

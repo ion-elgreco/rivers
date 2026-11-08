@@ -5,6 +5,7 @@ pub mod surrealdb_backend;
 
 mod asset;
 mod backfill;
+mod directory;
 mod event;
 mod partition_key;
 mod pool;
@@ -15,6 +16,7 @@ mod traits;
 
 pub use asset::*;
 pub use backfill::*;
+pub use directory::*;
 pub use event::*;
 pub use partition_key::*;
 pub use pool::*;
