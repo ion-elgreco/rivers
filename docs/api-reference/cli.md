@@ -64,7 +64,9 @@ Press **Reload code location** in the sidebar of the UI.
 
 A code location that does not come back (a syntax error, a failed import, a failed resolve) does not end the session: the error shows in the console and under the reload button, and the next reload tries again. Only a code location that fails on the first start ends `rivers dev`.
 
-The embedded storage is served on an ephemeral loopback port. With `--surreal-endpoint`, the UI and the code location connect to that server instead and nothing is served locally.
+The embedded storage is served on an ephemeral loopback port, and the console prints it as `Storage: ws://127.0.0.1:<port>`. With `--surreal-endpoint`, the UI and the code location connect to that server instead and nothing is served locally.
+
+The code location writes its gRPC endpoint to the code location directory in storage when it starts, and then every 10 seconds. A wildcard `--host` (`0.0.0.0`) is written as `127.0.0.1`.
 
 Every flag (and the module argument) can also come from configuration. Sources, from highest to lowest precedence:
 
@@ -88,6 +90,8 @@ To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CO
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |
 | `--config` | unset | Path to a `rivers.toml` that replaces the discovered one. Env: `RIVERS_CONFIG`. |
+| `--code-location-id` | `default` | The code location's identity in storage. Env: `RIVERS_CODE_LOCATION_ID`. |
+| `--no-ui` | `False` | Run without the web UI. Reloads then need a restart. |
 
 ---
 

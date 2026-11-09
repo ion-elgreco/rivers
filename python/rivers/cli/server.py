@@ -11,7 +11,11 @@ import typer
 
 from rivers._core.storage import Storage
 from rivers.cli._app import app
-from rivers.cli._common import _cleanup_storage, _open_or_prompt_migrate
+from rivers.cli._common import (
+    _CODE_LOCATION_ID_OPT,
+    _cleanup_storage,
+    _open_or_prompt_migrate,
+)
 from rivers.cli.config import RiversConfig
 
 
@@ -41,6 +45,10 @@ def dev(
         None,
         help="Path to a rivers.toml (replaces the discovered one; env: RIVERS_CONFIG)",
     ),
+    code_location_id: str | None = _CODE_LOCATION_ID_OPT,
+    no_ui: bool = typer.Option(
+        False, help="Run without the web UI, e.g. beside another rivers dev"
+    ),
 ) -> None:
     """Start the rivers development server.
 
@@ -48,6 +56,10 @@ def dev(
     code location (gRPC backend and automation daemon) in a child process. A
     reload restarts that child in a fresh interpreter, so every edit is picked
     up: press the reload button in the UI.
+
+    To run a second code location against the same storage, start another
+    ``rivers dev`` with ``--surreal-endpoint`` set to the storage endpoint the
+    first one prints, its own ``--code-location-id`` and ``--grpc-port``.
     """
     cfg = RiversConfig.from_cli(
         config=config,
@@ -65,6 +77,8 @@ def dev(
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
     if cfg.module.path:
         os.environ["RIVERS_MODULE"] = cfg.module.path
+    if code_location_id:
+        os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
 
     if cfg.module.path is None:
         typer.echo(
@@ -81,7 +95,7 @@ def dev(
         typer.echo(f"Error: module '{cfg.module.path}' not found", err=True)
         raise typer.Exit(1)
 
-    _serve_dev(cfg, cfg.module.path)
+    _serve_dev(cfg, cfg.module.path, ui=not no_ui)
 
 
 def _module_exists(name: str) -> bool:
@@ -91,7 +105,7 @@ def _module_exists(name: str) -> bool:
         return False
 
 
-def _serve_dev(cfg: RiversConfig, module: str) -> None:
+def _serve_dev(cfg: RiversConfig, module: str, *, ui: bool = True) -> None:
     """Run the dev host: storage server, web UI, and the supervised code location."""
     from rivers._core import DevHost
 
@@ -103,6 +117,7 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
     os.environ["RIVERS_SURREAL_ENDPOINT"] = host.endpoint
     if cfg.storage.endpoint is None:
         atexit.register(_cleanup_storage, cfg.storage.path)
+    typer.echo(f"Storage: {host.endpoint}")
 
     try:
         storage = _open_or_prompt_migrate(
@@ -110,13 +125,14 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
             lambda: Storage.migrate_remote(host.endpoint),
         )
         # The UI comes up while the code location imports and resolves.
-        host.start_ui(
-            storage,
-            cfg.server.host,
-            cfg.server.port,
-            f"http://{cfg.server.host}:{cfg.server.grpc_port}",
-            cfg.synthetic.size,
-        )
+        if ui:
+            host.start_ui(
+                storage,
+                cfg.server.host,
+                cfg.server.port,
+                f"http://{cfg.server.host}:{cfg.server.grpc_port}",
+                cfg.synthetic.size,
+            )
         if not host.start_code_location(
             sys.executable,
             module,
@@ -126,7 +142,8 @@ def _serve_dev(cfg: RiversConfig, module: str) -> None:
             cfg.daemon.no_daemon,
         ):
             raise typer.Exit(1)
-        typer.echo(f"Code location {module} is up; reload it from the UI.")
+        reload = "; reload it from the UI." if ui else "."
+        typer.echo(f"Code location {module} is up{reload}")
         host.run()
     finally:
         host.stop_code_location()
