@@ -9,6 +9,7 @@ use crate::storage::{AssetRecord, BackfillStatus, PartitionKey, RunStatus, Stora
 
 mod refresh;
 mod remote;
+mod remote_refresh;
 mod types;
 
 pub use remote::RemoteDep;
@@ -249,7 +250,24 @@ impl AssetConditionCache {
             .cloned()
             .collect();
         for asset_key in local_keys {
-            let entry = remote::fetch_partition_status(&scoped, &asset_key).await?;
+            let mut entry = PartitionStatusEntry::default();
+
+            let timestamps = scoped.get_partition_timestamps(&asset_key).await?;
+            for (pk, ts) in &timestamps {
+                entry.timestamps.insert(pk.clone(), *ts);
+            }
+
+            let in_progress = scoped.get_in_progress_partitions(&asset_key).await?;
+            for pk in &in_progress {
+                entry.in_progress.insert(pk.clone());
+            }
+
+            let failed = scoped
+                .get_failed_partitions(&asset_key, &entry.timestamps)
+                .await?;
+            entry.failed = failed.keys().cloned().collect();
+            entry.failed_timestamps = failed;
+
             self.partition_status.insert(asset_key, entry);
         }
         Ok(())

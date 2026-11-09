@@ -1,15 +1,17 @@
 //! Remote deps: upstream assets owned by another code location. Their
 //! records and partition status are read from the owner's scope and kept
-//! under the local name, so the evaluator sees them like local deps.
+//! under the local name, so the evaluator sees them like local deps. The
+//! owner's runs are tracked per location, apart from this location's own.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::assets::remote::LocationRef;
 use crate::storage::{
-    AssetRecord, CodeLocationContext, ScopedStorage, StorageBackend, resolve_code_locations,
+    AssetRecord, CodeLocationContext, PartitionKey, RunRecord, RunStatus, ScopedStorage, SortOrder,
+    StorageBackend, resolve_code_locations,
 };
 
-use super::{AssetConditionCache, PartitionStatusEntry};
+use super::{AssetConditionCache, PartitionStatusEntry, run_status_is_terminal};
 
 /// Wait before looking up an unregistered location again.
 const RETRY_NANOS: i64 = 5_000_000_000;
@@ -29,7 +31,7 @@ pub struct RemoteDep {
 /// Remote deps grouped by owning location.
 #[derive(Default)]
 pub(super) struct RemoteScopes {
-    slots: HashMap<LocationRef, RemoteSlot>,
+    pub(super) slots: HashMap<LocationRef, RemoteSlot>,
     locals: HashSet<String>,
 }
 
@@ -58,26 +60,42 @@ impl RemoteScopes {
         self.locals.contains(name)
     }
 
-    fn slot_mut(&mut self, location: &LocationRef) -> &mut RemoteSlot {
+    pub(super) fn slot_mut(&mut self, location: &LocationRef) -> &mut RemoteSlot {
         self.slots
             .get_mut(location)
             .expect("refresh only visits registered locations")
     }
 }
 
-struct RemoteSlot {
+pub(super) struct RemoteSlot {
     /// The owner's asset key → the local names bound to it.
-    bindings: HashMap<String, Vec<String>>,
-    state: SlotState,
+    pub(super) bindings: HashMap<String, Vec<String>>,
+    pub(super) state: SlotState,
 }
 
-enum SlotState {
+impl RemoteSlot {
+    /// Partitions of `key` that a live run in the owner is materializing.
+    fn live_partitions(&self, key: &str) -> HashSet<PartitionKey> {
+        let SlotState::Resolved { scope, .. } = &self.state else {
+            return HashSet::new();
+        };
+        scope
+            .live_runs
+            .values()
+            .filter(|run| !run.action && run.asset_keys.iter().any(|k| k == key))
+            .filter_map(|run| run.partition_key.as_ref())
+            .flat_map(|pk| pk.members())
+            .collect()
+    }
+}
+
+pub(super) enum SlotState {
     /// Not looked up yet.
     Pending,
     /// No directory entry.
     Unresolved { next_attempt: i64 },
     Resolved {
-        ctx: CodeLocationContext,
+        scope: RemoteScope,
         next_revalidate: i64,
     },
 }
@@ -95,7 +113,7 @@ impl SlotState {
 
     fn identity(&self) -> Option<&str> {
         match self {
-            Self::Resolved { ctx, .. } => Some(ctx.id()),
+            Self::Resolved { scope, .. } => Some(scope.ctx.id()),
             Self::Pending | Self::Unresolved { .. } => None,
         }
     }
@@ -111,36 +129,97 @@ impl SlotState {
     }
 }
 
-/// One location's state, keyed by local name.
-#[derive(Default)]
-struct RemoteSnapshot {
-    records: Vec<AssetRecord>,
-    partitions: Vec<(String, PartitionStatusEntry)>,
+/// A resolved location: where to read, and how far its runs and
+/// observations have been read.
+pub(super) struct RemoteScope {
+    pub(super) ctx: CodeLocationContext,
+    /// Trails the newest run start_time seen by 1ns, like the local cursor.
+    pub(super) run_cursor: i64,
+    /// Trails the newest observation seen by 1ns.
+    pub(super) observation_cursor: i64,
+    /// Terminal runs already applied (`run_id → start_time`), pruned at the
+    /// run cursor.
+    pub(super) applied_run_ids: HashMap<String, i64>,
+    /// Live runs in the owner that touch a bound key.
+    pub(super) live_runs: HashMap<String, LiveRemoteRun>,
 }
 
-/// Partition status of `asset_key` in `scoped`'s location.
-pub(super) async fn fetch_partition_status<S: StorageBackend>(
-    scoped: &ScopedStorage<'_, S>,
-    asset_key: &str,
-) -> anyhow::Result<PartitionStatusEntry> {
-    let timestamps: HashMap<_, _> = scoped
-        .get_partition_timestamps(asset_key)
-        .await?
-        .into_iter()
-        .collect();
-    let in_progress = scoped
-        .get_in_progress_partitions(asset_key)
-        .await?
-        .into_iter()
-        .collect();
-    let failed_timestamps = scoped.get_failed_partitions(asset_key, &timestamps).await?;
+pub(super) struct LiveRemoteRun {
+    /// The bound keys the run touches.
+    pub(super) asset_keys: Vec<String>,
+    pub(super) partition_key: Option<PartitionKey>,
+    /// An action run is not a materialization attempt. It is watched only to
+    /// re-read its keys when it ends.
+    pub(super) action: bool,
+}
 
-    Ok(PartitionStatusEntry {
-        in_progress,
-        failed: failed_timestamps.keys().cloned().collect(),
-        failed_timestamps,
-        timestamps,
-    })
+impl LiveRemoteRun {
+    /// `run`'s view from here; `None` if it touches no bound key.
+    pub(super) fn of(run: &RunRecord, bindings: &HashMap<String, Vec<String>>) -> Option<Self> {
+        let asset_keys: Vec<String> = run
+            .node_names
+            .iter()
+            .filter(|name| bindings.contains_key(*name))
+            .cloned()
+            .collect();
+        (!asset_keys.is_empty()).then(|| Self {
+            asset_keys,
+            partition_key: run.partition_key.clone(),
+            action: run.is_action(),
+        })
+    }
+}
+
+/// What was read from one location, by the owner's asset key.
+#[derive(Default)]
+pub(super) struct RemoteRead {
+    /// `None`: the owner has no such asset.
+    records: Vec<(String, Option<AssetRecord>)>,
+    /// Read for keys with a partitioned local.
+    partitions: Vec<(String, RemotePartitions)>,
+}
+
+/// An owner's partition rows for one key.
+#[derive(Default, Clone)]
+struct RemotePartitions {
+    /// Rows newer than the cached ones, or every row when `full`.
+    timestamps: Vec<(PartitionKey, i64)>,
+    full: bool,
+    in_progress: HashSet<PartitionKey>,
+    failed: HashMap<PartitionKey, i64>,
+}
+
+impl RemotePartitions {
+    /// Merge into `entry` with `live` added to the in-progress keys.
+    fn apply(self, entry: &mut PartitionStatusEntry, live: &HashSet<PartitionKey>) -> bool {
+        let mut changed = false;
+        if self.full {
+            let timestamps: HashMap<_, _> = self.timestamps.into_iter().collect();
+            changed |= timestamps != entry.timestamps;
+            entry.timestamps = timestamps;
+        } else {
+            for (pk, ts) in self.timestamps {
+                changed |= entry.timestamps.insert(pk, ts) != Some(ts);
+            }
+        }
+
+        let in_progress: HashSet<PartitionKey> = self
+            .in_progress
+            .into_iter()
+            .chain(live.iter().cloned())
+            .collect();
+        let failed_timestamps: HashMap<PartitionKey, i64> = self
+            .failed
+            .into_iter()
+            .filter(|(pk, failed)| entry.timestamps.get(pk).is_none_or(|mat| failed > mat))
+            .collect();
+        changed |= in_progress != entry.in_progress || failed_timestamps != entry.failed_timestamps;
+
+        entry.in_progress = in_progress;
+        entry.failed = failed_timestamps.keys().cloned().collect();
+        entry.failed_timestamps = failed_timestamps;
+        changed
+    }
 }
 
 impl AssetConditionCache {
@@ -149,13 +228,32 @@ impl AssetConditionCache {
         self.remote = RemoteScopes::new(deps);
     }
 
-    /// Bring every due location up to date. Returns `true` if anything
-    /// changed. A failed read is logged and retried; it never fails the tick.
+    /// Local names of remote deps with a live run in their owner.
+    pub fn remote_in_progress_keys(&self) -> impl Iterator<Item = &String> {
+        self.remote.slots.values().flat_map(|slot| {
+            let live_runs = match &slot.state {
+                SlotState::Resolved { scope, .. } => Some(scope.live_runs.values()),
+                SlotState::Pending | SlotState::Unresolved { .. } => None,
+            };
+            live_runs
+                .into_iter()
+                .flatten()
+                .filter(|run| !run.action)
+                .flat_map(|run| &run.asset_keys)
+                .flat_map(|key| &slot.bindings[key])
+        })
+    }
+
+    /// Resolve the due locations, then follow every resolved one. Returns
+    /// `true` if anything changed. A failed read is logged and retried; it
+    /// never fails the tick.
     pub(super) async fn refresh_remotes<S: StorageBackend>(
         &mut self,
         storage: &S,
         now: i64,
     ) -> bool {
+        let mut changed = false;
+
         let due: Vec<LocationRef> = self
             .remote
             .slots
@@ -163,48 +261,67 @@ impl AssetConditionCache {
             .filter(|(_, slot)| slot.state.due(now))
             .map(|(location, _)| location.clone())
             .collect();
-        if due.is_empty() {
-            return false;
+        if !due.is_empty() {
+            match resolve_code_locations(storage, &due).await {
+                Ok(identities) => {
+                    for (location, identity) in identities {
+                        changed |= match identity {
+                            Some(identity) => {
+                                self.resolve_remote(storage, &location, identity, now).await
+                            }
+                            None => self.unresolve_remote(&location, now),
+                        };
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "rivers::conditions",
+                        %error,
+                        "code location directory lookup failed; retrying"
+                    );
+                    for location in &due {
+                        changed |= self.postpone_remote(location, now);
+                    }
+                }
+            }
         }
 
-        let identities = match resolve_code_locations(storage, &due).await {
-            Ok(identities) => identities,
-            Err(error) => {
-                tracing::warn!(
-                    target: "rivers::conditions",
-                    %error,
-                    "code location directory lookup failed; retrying"
-                );
-                let mut changed = false;
-                for location in &due {
-                    changed |= self.postpone_remote(location, now);
-                }
-                return changed;
-            }
-        };
-
-        let mut changed = false;
-        for (location, identity) in identities {
-            changed |= match identity {
-                Some(identity) => self.load_remote(storage, &location, identity, now).await,
-                None => self.unresolve_remote(&location, now),
-            };
+        let resolved: Vec<LocationRef> = self
+            .remote
+            .slots
+            .iter()
+            .filter(|(_, slot)| matches!(slot.state, SlotState::Resolved { .. }))
+            .map(|(location, _)| location.clone())
+            .collect();
+        for location in resolved {
+            changed |= self.refresh_remote_scope(storage, &location).await;
         }
         changed
     }
 
-    /// Read the owner's state for `location` under `identity`.
-    async fn load_remote<S: StorageBackend>(
+    /// `location` is registered under `identity`. A new identity (first
+    /// lookup, or a recreated location) reads everything again.
+    async fn resolve_remote<S: StorageBackend>(
         &mut self,
         storage: &S,
         location: &LocationRef,
         identity: String,
         now: i64,
     ) -> bool {
+        if let SlotState::Resolved {
+            scope,
+            next_revalidate,
+        } = &mut self.remote.slot_mut(location).state
+            && scope.ctx.id() == identity
+        {
+            *next_revalidate = now + REVALIDATE_NANOS;
+            return false;
+        }
+
         let ctx = CodeLocationContext::new(identity);
         let slot = &self.remote.slots[location];
-        let snapshot = match self.fetch_remote_snapshot(storage, &ctx, slot).await {
-            Ok(snapshot) => snapshot,
+        let (scope, read) = match self.load_remote_scope(storage, ctx, slot).await {
+            Ok(loaded) => loaded,
             Err(error) => {
                 tracing::warn!(
                     target: "rivers::conditions",
@@ -218,61 +335,130 @@ impl AssetConditionCache {
 
         let slot = self.remote.slot_mut(location);
         match slot.state.identity() {
-            Some(old) if old == ctx.id() => {}
             Some(old) => tracing::info!(
                 target: "rivers::conditions",
                 %location,
                 old,
-                new = ctx.id(),
+                new = scope.ctx.id(),
                 "remote code location changed identity"
             ),
             None => tracing::info!(
                 target: "rivers::conditions",
                 %location,
-                identity = ctx.id(),
+                identity = scope.ctx.id(),
                 "remote code location resolved"
             ),
         }
         slot.state = SlotState::Resolved {
-            ctx,
+            scope,
             next_revalidate: now + REVALIDATE_NANOS,
         };
 
-        self.apply_remote_snapshot(snapshot)
+        self.apply_remote_read(location, read)
     }
 
-    async fn fetch_remote_snapshot<S: StorageBackend>(
+    async fn load_remote_scope<S: StorageBackend>(
         &self,
         storage: &S,
-        ctx: &CodeLocationContext,
+        ctx: CodeLocationContext,
         slot: &RemoteSlot,
-    ) -> anyhow::Result<RemoteSnapshot> {
-        let scoped = storage.for_code_location(ctx);
-        let mut snapshot = RemoteSnapshot::default();
-        for (asset_key, locals) in &slot.bindings {
-            let record = scoped.get_asset_record(asset_key).await?;
-            let partitions = if locals.iter().any(|local| self.is_partitioned(local)) {
-                Some(fetch_partition_status(&scoped, asset_key).await?)
-            } else {
-                None
-            };
+    ) -> anyhow::Result<(RemoteScope, RemoteRead)> {
+        let scoped = storage.for_code_location(&ctx);
 
-            for local in locals {
-                snapshot.records.push(match &record {
-                    Some(record) => AssetRecord {
-                        asset_key: local.clone(),
-                        ..record.clone()
-                    },
-                    None => self.remote_placeholder(local),
-                });
-                if let Some(entry) = &partitions
-                    && self.is_partitioned(local)
-                {
-                    snapshot.partitions.push((local.clone(), entry.clone()));
+        // Cursors first, as in `initial_load`: a run marked applied here was
+        // terminal before the reads below.
+        let mut run_cursor = 0;
+        let mut applied_run_ids = HashMap::new();
+        if let Some(newest) = scoped.get_runs(1, None).await?.first() {
+            run_cursor = newest.start_time.saturating_sub(1);
+            for run in scoped
+                .get_runs_since(run_cursor, None, SortOrder::Asc)
+                .await?
+            {
+                if run_status_is_terminal(&run.status) {
+                    applied_run_ids.insert(run.run_id, run.start_time);
                 }
             }
         }
-        Ok(snapshot)
+        let observation_cursor = storage
+            .get_latest_observation_ts(ctx.id())
+            .await?
+            .map_or(-1, |ts| ts - 1);
+
+        // Live runs before records: a run that ends in between is still
+        // tracked, and its end re-reads its keys.
+        let mut live_runs = HashMap::new();
+        for status in [RunStatus::Started, RunStatus::NotStarted, RunStatus::Queued] {
+            for run in scoped
+                .get_runs_since(0, Some(status), SortOrder::Asc)
+                .await?
+            {
+                if let Some(live) = LiveRemoteRun::of(&run, &slot.bindings) {
+                    live_runs.insert(run.run_id, live);
+                }
+            }
+        }
+
+        let read = self
+            .read_remote_keys(&scoped, slot, slot.bindings.keys(), |_| true)
+            .await?;
+        let scope = RemoteScope {
+            ctx,
+            run_cursor,
+            observation_cursor,
+            applied_run_ids,
+            live_runs,
+        };
+        Ok((scope, read))
+    }
+
+    /// Read the record of each of `keys` and, for keys with a partitioned
+    /// local, the partition rows: all of them where `full(key)`, otherwise
+    /// those newer than the cached ones.
+    pub(super) async fn read_remote_keys<'k, S: StorageBackend>(
+        &self,
+        scoped: &ScopedStorage<'_, S>,
+        slot: &RemoteSlot,
+        keys: impl IntoIterator<Item = &'k String>,
+        full: impl Fn(&str) -> bool,
+    ) -> anyhow::Result<RemoteRead> {
+        let mut read = RemoteRead::default();
+        for key in keys {
+            read.records
+                .push((key.clone(), scoped.get_asset_record(key).await?));
+
+            let Some(local) = slot.bindings[key]
+                .iter()
+                .find(|local| self.is_partitioned(local))
+            else {
+                continue;
+            };
+            let cached = self
+                .partition_status
+                .get(local)
+                .filter(|_| !full(key))
+                .map(|entry| &entry.timestamps);
+            let since = cached
+                .and_then(|timestamps| timestamps.values().max())
+                .map_or(-1, |newest| newest - 1);
+            let no_rows = HashMap::new();
+            read.partitions.push((
+                key.clone(),
+                RemotePartitions {
+                    timestamps: scoped.get_partition_timestamps_since(key, since).await?,
+                    full: cached.is_none(),
+                    in_progress: scoped
+                        .get_in_progress_partitions(key)
+                        .await?
+                        .into_iter()
+                        .collect(),
+                    failed: scoped
+                        .get_failed_partitions(key, cached.unwrap_or(&no_rows))
+                        .await?,
+                },
+            ));
+        }
+        Ok(read)
     }
 
     /// `location` has no directory entry: its deps count as missing.
@@ -295,39 +481,48 @@ impl AssetConditionCache {
             next_attempt: now + RETRY_NANOS,
         };
 
-        let snapshot = self.remote_placeholders(location);
-        self.apply_remote_snapshot(snapshot)
+        let mut read = RemoteRead::default();
+        for (key, locals) in &self.remote.slots[location].bindings {
+            read.records.push((key.clone(), None));
+            if locals.iter().any(|local| self.is_partitioned(local)) {
+                let nothing = RemotePartitions {
+                    full: true,
+                    ..Default::default()
+                };
+                read.partitions.push((key.clone(), nothing));
+            }
+        }
+        self.apply_remote_read(location, read)
     }
 
     /// Retry `location` soon and keep what is known. A dep with nothing
-    /// known yet gets a placeholder.
+    /// known yet counts as missing.
     fn postpone_remote(&mut self, location: &LocationRef, now: i64) -> bool {
         self.remote
             .slot_mut(location)
             .state
             .retry_at(now + RETRY_NANOS);
 
-        let mut snapshot = self.remote_placeholders(location);
-        snapshot
-            .records
-            .retain(|r| !self.records.contains_key(&r.asset_key));
-        snapshot
-            .partitions
-            .retain(|(local, _)| !self.partition_status.contains_key(local));
-        self.apply_remote_snapshot(snapshot)
-    }
-
-    fn remote_placeholders(&self, location: &LocationRef) -> RemoteSnapshot {
-        let mut snapshot = RemoteSnapshot::default();
-        for local in self.remote.slots[location].bindings.values().flatten() {
-            snapshot.records.push(self.remote_placeholder(local));
-            if self.is_partitioned(local) {
-                snapshot
-                    .partitions
-                    .push((local.clone(), PartitionStatusEntry::default()));
+        let mut changed = false;
+        let locals: Vec<String> = self.remote.slots[location]
+            .bindings
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        for local in locals {
+            if !self.records.contains_key(&local) {
+                let placeholder = self.remote_placeholder(&local);
+                self.records.insert(local.clone(), placeholder);
+                changed = true;
+            }
+            if self.is_partitioned(&local) && !self.partition_status.contains_key(&local) {
+                self.partition_status
+                    .insert(local, PartitionStatusEntry::default());
+                changed = true;
             }
         }
-        snapshot
+        changed
     }
 
     /// A record that was never materialized, so `missing` holds for it. A dep
@@ -350,18 +545,61 @@ impl AssetConditionCache {
         }
     }
 
-    fn apply_remote_snapshot(&mut self, snapshot: RemoteSnapshot) -> bool {
+    /// Store `read` under every local bound to each key.
+    pub(super) fn apply_remote_read(&mut self, location: &LocationRef, read: RemoteRead) -> bool {
+        let slot = &self.remote.slots[location];
+        let mut records = Vec::new();
+        for (key, record) in &read.records {
+            for local in &slot.bindings[key] {
+                records.push(match record {
+                    Some(record) => AssetRecord {
+                        asset_key: local.clone(),
+                        ..record.clone()
+                    },
+                    None => self.remote_placeholder(local),
+                });
+            }
+        }
+        let mut partitions = Vec::new();
+        for (key, patch) in read.partitions {
+            let live = slot.live_partitions(&key);
+            for local in slot.bindings[&key]
+                .iter()
+                .filter(|l| self.is_partitioned(l))
+            {
+                partitions.push((local.clone(), patch.clone(), live.clone()));
+            }
+        }
+
         let mut changed = false;
-        for record in snapshot.records {
+        for record in records {
             if self.records.get(&record.asset_key) != Some(&record) {
                 self.records.insert(record.asset_key.clone(), record);
                 changed = true;
             }
         }
-        for (local, entry) in snapshot.partitions {
-            if self.partition_status.get(&local) != Some(&entry) {
-                self.partition_status.insert(local, entry);
-                changed = true;
+        for (local, patch, live) in partitions {
+            let entry = self.partition_status.entry(local).or_default();
+            changed |= patch.apply(entry, &live);
+        }
+        changed
+    }
+
+    /// Mark the partitions of `key` that live runs materialize as in progress.
+    pub(super) fn add_live_partitions(&mut self, location: &LocationRef, key: &str) -> bool {
+        let slot = &self.remote.slots[location];
+        let live = slot.live_partitions(key);
+        let locals: Vec<String> = slot.bindings[key]
+            .iter()
+            .filter(|local| self.is_partitioned(local))
+            .cloned()
+            .collect();
+
+        let mut changed = false;
+        for local in locals {
+            let entry = self.partition_status.entry(local).or_default();
+            for pk in &live {
+                changed |= entry.in_progress.insert(pk.clone());
             }
         }
         changed

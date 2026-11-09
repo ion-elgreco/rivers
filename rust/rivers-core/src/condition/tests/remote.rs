@@ -437,3 +437,444 @@ async fn neither_the_owners_runs_nor_a_left_over_local_row_hide_an_update() {
         "the owner's data is newer than summary"
     );
 }
+
+/// `warehouse` registered as `wh`, owning `records`.
+async fn warehouse_owning(storage: &SurrealStorage, records: Vec<AssetRecord>) {
+    storage
+        .set_code_location_identity(&warehouse(), "wh")
+        .await
+        .unwrap();
+    register(storage, "wh", records).await;
+}
+
+fn in_progress(cache: &AssetConditionCache) -> HashSet<&str> {
+    cache
+        .remote_in_progress_keys()
+        .map(String::as_str)
+        .collect()
+}
+
+#[tokio::test]
+async fn owners_run_is_in_progress_only_for_the_bound_local_until_it_ends() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    register(
+        &storage,
+        DEFAULT_CODE_LOCATION_ID,
+        vec![make_materialized_record("other", 500)],
+    )
+    .await;
+    warehouse_owning(
+        &storage,
+        vec![
+            make_materialized_record("raw_orders", 1_000),
+            make_materialized_record("other", 1_000),
+        ],
+    )
+    .await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let started = run(
+        "wh",
+        "run-2",
+        RunStatus::Started,
+        &["raw_orders", "other"],
+        None,
+        2_000,
+    );
+    storage.create_run(&started).await.unwrap();
+    assert!(cache.refresh(&storage, SEC).await.unwrap());
+    assert_eq!(in_progress(&cache), HashSet::from(["orders"]));
+    assert!(cache.in_progress_assets.is_empty());
+
+    materialize(&storage, "wh", "raw_orders", "run-2", None, 3_000).await;
+    storage
+        .update_run_status("run-2", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    assert!(cache.refresh(&storage, 2 * SEC).await.unwrap());
+    assert!(in_progress(&cache).is_empty());
+    assert_eq!(cache.records["orders"].last_timestamp, Some(3_000));
+    assert_eq!(cache.records["other"].last_timestamp, Some(500));
+
+    assert!(
+        !cache.refresh(&storage, 3 * SEC).await.unwrap(),
+        "a redelivered run changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn owners_run_that_ended_between_ticks_moves_the_record() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Success,
+            &["raw_orders"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+    materialize(&storage, "wh", "raw_orders", "run-2", None, 2_000).await;
+
+    assert!(cache.refresh(&storage, SEC).await.unwrap());
+    assert_eq!(cache.records["orders"].last_timestamp, Some(2_000));
+}
+
+#[tokio::test]
+async fn deleted_owner_run_stops_counting_as_in_progress() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Started,
+            &["raw_orders"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+    cache.refresh(&storage, SEC).await.unwrap();
+    assert_eq!(in_progress(&cache), HashSet::from(["orders"]));
+
+    storage
+        .update_run_status("run-2", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    assert!(storage.delete_run("run-2").await.unwrap());
+    assert!(cache.refresh(&storage, 2 * SEC).await.unwrap());
+    assert!(in_progress(&cache).is_empty());
+}
+
+#[tokio::test]
+async fn live_run_at_load_is_in_progress() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    storage
+        .create_run(&run(
+            "wh",
+            "run-1",
+            RunStatus::Started,
+            &["raw_orders"],
+            None,
+            500,
+        ))
+        .await
+        .unwrap();
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Success,
+            &["unrelated"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+    assert_eq!(in_progress(&cache), HashSet::from(["orders"]));
+
+    storage
+        .update_run_status("run-1", RunStatus::Failure, Some(3_000))
+        .await
+        .unwrap();
+    assert!(cache.refresh(&storage, SEC).await.unwrap());
+    assert!(in_progress(&cache).is_empty());
+}
+
+#[tokio::test]
+async fn owners_failed_run_sets_no_floor_on_same_named_local_assets() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    register(
+        &storage,
+        DEFAULT_CODE_LOCATION_ID,
+        vec![make_materialized_record("summary", 500)],
+    )
+    .await;
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Failure,
+            &["raw_orders", "summary"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+    cache.refresh(&storage, SEC).await.unwrap();
+
+    assert!(cache.failed_assets.is_empty());
+    assert!(cache.in_progress_assets.is_empty());
+}
+
+#[tokio::test]
+async fn owners_observation_updates_the_record() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(&storage, vec![make_record("raw_orders")]).await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .store_events(&[EventRecord {
+            code_location_id: "wh".into(),
+            event_type: EventType::Observation {
+                data_version: Some("v2".into()),
+            },
+            asset_key: Some("raw_orders".into()),
+            run_id: "observe".into(),
+            partition_key: None,
+            timestamp: 2_000,
+            metadata: vec![],
+            input_data_versions: vec![],
+        }])
+        .await
+        .unwrap();
+
+    assert!(cache.refresh(&storage, SEC).await.unwrap());
+    assert_eq!(
+        cache.records["orders"].last_data_version.as_deref(),
+        Some("v2")
+    );
+    assert!(!cache.refresh(&storage, 2 * SEC).await.unwrap());
+}
+
+#[tokio::test]
+async fn owners_keyed_live_run_marks_the_partition_in_progress() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(&storage, vec![make_record("events")]).await;
+    let mut cache = cache_with(vec![remote("orders", "events")]);
+    cache.set_partitioned_assets(vec!["orders".into()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let day = spk("2024-01-02");
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Started,
+            &["events"],
+            Some(day.clone()),
+            2_000,
+        ))
+        .await
+        .unwrap();
+    assert!(cache.refresh(&storage, SEC).await.unwrap());
+    assert_eq!(
+        cache.partition_status["orders"].in_progress,
+        HashSet::from([day.clone()])
+    );
+
+    materialize(&storage, "wh", "events", "run-2", Some(day.clone()), 3_000).await;
+    storage
+        .update_run_status("run-2", RunStatus::Success, Some(3_000))
+        .await
+        .unwrap();
+    assert!(cache.refresh(&storage, 2 * SEC).await.unwrap());
+    let status = &cache.partition_status["orders"];
+    assert!(status.in_progress.is_empty());
+    assert_eq!(status.timestamps, HashMap::from([(day, 3_000)]));
+}
+
+#[tokio::test]
+async fn eager_waits_for_the_owners_run_then_fires() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    register(
+        &storage,
+        DEFAULT_CODE_LOCATION_ID,
+        vec![make_materialized_record("summary", 2_000)],
+    )
+    .await;
+    set_edges(&storage, &[("summary", "orders")]).await;
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+
+    let mut pass = pass_with(
+        "summary",
+        ConditionNode::eager(),
+        vec![remote("orders", "raw_orders")],
+        ConditionEvalState::default(),
+    );
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    assert!(pass.run(0, false).plan.is_empty());
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Started,
+            &["raw_orders"],
+            None,
+            3_000,
+        ))
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, SEC).await.unwrap();
+    assert!(pass.run(SEC, false).plan.is_empty());
+
+    // Another owner run moves the record while run-2 is still live.
+    storage
+        .create_run(&run(
+            "wh",
+            "run-3",
+            RunStatus::Success,
+            &["raw_orders"],
+            None,
+            3_500,
+        ))
+        .await
+        .unwrap();
+    materialize(&storage, "wh", "raw_orders", "run-3", None, 4_000).await;
+    pass.refresh_cache(&storage, 2 * SEC).await.unwrap();
+    assert_eq!(pass.cache.records["orders"].last_timestamp, Some(4_000));
+    assert!(
+        pass.run(2 * SEC, false).plan.is_empty(),
+        "quiet while an owner run is in flight"
+    );
+
+    storage
+        .update_run_status("run-2", RunStatus::Success, Some(5_000))
+        .await
+        .unwrap();
+    pass.refresh_cache(&storage, 3 * SEC).await.unwrap();
+    assert_eq!(
+        pass.run(3 * SEC, false).plan.unpartitioned,
+        vec!["summary".to_string()]
+    );
+}
+
+fn planned_keys(plan: &crate::condition::pass::MaterializationPlan) -> HashSet<String> {
+    let single = plan.single_partition_groups.keys().cloned();
+    let multi = plan
+        .multi_partition_backfills
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().cloned());
+    single.chain(multi).map(|pk| pk.to_display()).collect()
+}
+
+#[tokio::test]
+async fn eager_maps_the_previous_day_onto_the_owners_partitions() {
+    use crate::condition::pass::{PartitionInfo, PartitionUniverse};
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    register(
+        &storage,
+        DEFAULT_CODE_LOCATION_ID,
+        vec![make_record("summary")],
+    )
+    .await;
+    set_edges(&storage, &[("summary", "events")]).await;
+    warehouse_owning(&storage, vec![make_record("events")]).await;
+    materialize(
+        &storage,
+        "wh",
+        "events",
+        "run-1",
+        Some(spk("2024-01-02")),
+        1_000,
+    )
+    .await;
+
+    let grid = crate::timegrid::TimeGrid {
+        cron_schedule: None,
+        interval_seconds: Some(86_400.0),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+        end: Some(jiff::civil::date(2024, 1, 5).at(0, 0, 0, 0)),
+        fmt: "%Y-%m-%d".into(),
+    };
+    let days: HashSet<PartitionKey> = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+        .into_iter()
+        .map(spk)
+        .collect();
+    let mut pass = ConditionPass::new(
+        cache_with(vec![remote("events", "events")]),
+        ConditionEvalState::default(),
+        vec![AssetConditionInfo {
+            asset_key: "summary".into(),
+            condition: ConditionNode::eager(),
+            partition_info: Some(PartitionInfo {
+                all_keys: days.clone(),
+                mappings: HashMap::from([(
+                    ("summary".into(), "events".into()),
+                    PartitionMappingKind::TimeWindow {
+                        offset: -1,
+                        grid: Some(grid.clone()),
+                    },
+                )]),
+                time_window_fmt: Some(grid.fmt.clone()),
+                universe: PartitionUniverse::Frozen,
+            }),
+            backfill_strategy: None,
+        }],
+        HashMap::from([("events".into(), (days, PartitionUniverse::Frozen))]),
+    );
+
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    let fired = planned_keys(&pass.run(0, false).plan);
+    assert!(fired.contains("2024-01-03"), "{fired:?}");
+    assert!(
+        !fired.contains("2024-01-04"),
+        "the owner has no 2024-01-03: {fired:?}"
+    );
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Success,
+            &["events"],
+            Some(spk("2024-01-03")),
+            2_000,
+        ))
+        .await
+        .unwrap();
+    materialize(
+        &storage,
+        "wh",
+        "events",
+        "run-2",
+        Some(spk("2024-01-03")),
+        2_000,
+    )
+    .await;
+    pass.refresh_cache(&storage, SEC).await.unwrap();
+    let fired = planned_keys(&pass.run(SEC, false).plan);
+    assert!(fired.contains("2024-01-04"), "{fired:?}");
+}
