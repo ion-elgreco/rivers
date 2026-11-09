@@ -75,6 +75,7 @@ async fn set_edges(storage: &SurrealStorage, edges: &[(&str, &str)]) {
             .iter()
             .map(|(down, up)| (down.to_string(), up.to_string()))
             .collect(),
+        ..Default::default()
     };
     storage
         .kv_set(

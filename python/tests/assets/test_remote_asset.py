@@ -126,6 +126,57 @@ def test_topology_records_the_remote_ref(storage):
     assert "remote" not in nodes["report"]
 
 
+def test_topology_stores_each_partitions_definition_once(storage):
+    regions = rs.PartitionsDefinition.static_(["us", "eu"])
+    days = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
+    orders = rs.Asset.remote(
+        "orders", code_location="sales", io_handler=DictIOHandler(), partitions_def=days
+    )
+
+    @rs.Asset(partitions_def=regions)
+    def stores() -> int:
+        return 1
+
+    @rs.Asset(partitions_def=rs.PartitionsDefinition.static_(["eu", "us"]))
+    def staff() -> int:
+        return 1
+
+    @rs.Asset(partitions_def=days)
+    def daily_orders(orders: list) -> int:
+        return len(orders)
+
+    @rs.Asset(
+        partitions_def=rs.PartitionsDefinition.multi({"region": regions, "date": days})
+    )
+    def store_days() -> int:
+        return 1
+
+    @rs.Asset
+    def summary() -> int:
+        return 1
+
+    make_repo([orders, stores, staff, daily_orders, store_days, summary], storage)
+    topology = json.loads(storage.kv_get("graph_topology:default"))
+    nodes = {n["name"]: n for n in topology["nodes"]}
+    table = topology["partitions"]
+
+    static = {"kind": "static", "keys": ["eu", "us"]}
+    daily = table[nodes["orders"]["partitions"]]
+    assert len(table) == 3
+    assert table[nodes["stores"]["partitions"]] == static
+    assert nodes["staff"]["partitions"] == nodes["stores"]["partitions"]
+    assert nodes["daily_orders"]["partitions"] == nodes["orders"]["partitions"]
+    assert daily["kind"] == "time_window"
+    assert daily["cron_schedule"] == "0 0 * * *"
+    assert daily["fmt"] == "%Y-%m-%d"
+    assert daily["start"].startswith("2024-01-01T00:00:00")
+    assert table[nodes["store_days"]["partitions"]] == {
+        "kind": "multi",
+        "dimensions": [["date", daily], ["region", static]],
+    }
+    assert "partitions" not in nodes["summary"]
+
+
 def test_remote_bare_name_resolves_in_the_own_namespace(storage, monkeypatch):
     monkeypatch.setenv("RIVERS_CODE_LOCATION_NAMESPACE", "team-data")
     orders = rs.Asset.remote(

@@ -1,6 +1,7 @@
 //! Asset graph types and traversal utilities.
 
 pub mod graph;
+pub mod partitions_fingerprint;
 pub mod remote;
 pub use graph::{
     ancestors, descendants, find_node_by_name, is_reachable, is_upstream_of,

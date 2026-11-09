@@ -196,6 +196,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
     let topo = GraphTopology {
         nodes: vec![node("source"), node("processed")],
         edges: vec![("processed".to_string(), "source".to_string())],
+        ..Default::default()
     };
     storage
         .kv_set(

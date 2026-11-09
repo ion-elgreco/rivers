@@ -339,7 +339,9 @@ impl PyCodeRepository {
                 }
             }
 
-            for topo_node in &mut topology.nodes {
+            let mut nodes = std::mem::take(&mut topology.nodes);
+            let mut fingerprinted: Vec<(&PartitionsDefinition, usize)> = Vec::new();
+            for topo_node in &mut nodes {
                 if let Some(gn) = node_map.get(&topo_node.name) {
                     topo_node.group = gn.group();
                     topo_node.kind = match gn.asset_type() {
@@ -355,11 +357,22 @@ impl PyCodeRepository {
                         }
                     };
                     topo_node.remote = gn.remote().cloned();
+                    topo_node.partitions = gn.partitions_def().map(|def| {
+                        match fingerprinted.iter().find(|(seen, _)| *seen == def) {
+                            Some((_, index)) => *index,
+                            None => {
+                                let index = topology.intern_partitions(def.fingerprint());
+                                fingerprinted.push((def, index));
+                                index
+                            }
+                        }
+                    });
                 }
                 if let Some(parent) = task_to_graph.get(&topo_node.name) {
                     topo_node.parent_graph = Some(parent.clone());
                 }
             }
+            topology.nodes = nodes;
 
             let _ = io_rt().block_on(storage_handle.scoped().set_graph_topology(&topology));
             Ok(topology)

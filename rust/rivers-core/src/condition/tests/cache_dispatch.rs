@@ -107,6 +107,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
             TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
+        ..Default::default()
     };
     storage
         .kv_set(
@@ -479,6 +480,7 @@ async fn test_materializing_action_triggers_downstream_eager() {
             &serde_json::to_vec(&GraphTopology {
                 nodes: vec![node("events"), node("rollup")],
                 edges: vec![("rollup".to_string(), "events".to_string())],
+                ..Default::default()
             })
             .unwrap(),
         )
@@ -646,6 +648,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
                 &serde_json::to_vec(&GraphTopology {
                     nodes: vec![node("events"), node("daily_summary")],
                     edges: vec![("daily_summary".to_string(), "events".to_string())],
+                    ..Default::default()
                 })
                 .unwrap(),
             )
@@ -1188,6 +1191,7 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
             TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
+        ..Default::default()
     };
     storage
         .kv_set(
@@ -1378,6 +1382,7 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
             TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
+        ..Default::default()
     };
     storage
         .kv_set(

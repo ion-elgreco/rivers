@@ -6,6 +6,7 @@ use petgraph::graph::{Graph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::partitions_fingerprint::PartitionsFingerprint;
 use crate::assets::remote::RemoteRef;
 use crate::repo::CodeRepository;
 
@@ -79,6 +80,9 @@ pub type AssetGraph = Graph<DagNode, (), Directed>;
 pub struct GraphTopology {
     pub nodes: Vec<TopologyNode>,
     pub edges: Vec<(String, String)>, // (from, to) — dependency direction
+    /// The nodes' partitions definitions, each stored once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<PartitionsFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,9 @@ pub struct TopologyNode {
     /// Set when the node mirrors an asset owned by another code location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteRef>,
+    /// Index into [`GraphTopology::partitions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<usize>,
 }
 
 impl TopologyNode {
@@ -103,6 +110,7 @@ impl TopologyNode {
             group: None,
             parent_graph: None,
             remote: None,
+            partitions: None,
         }
     }
 }
@@ -126,7 +134,11 @@ pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
         .collect();
     edges.sort();
 
-    GraphTopology { nodes, edges }
+    GraphTopology {
+        nodes,
+        edges,
+        partitions: Vec::new(),
+    }
 }
 
 /// Format a cycle as "a -> b -> c -> a" using node names from the graph.
@@ -276,6 +288,19 @@ pub fn validate_subgraph_completeness(
 }
 
 impl GraphTopology {
+    pub fn partitions_of(&self, node: &TopologyNode) -> Option<&PartitionsFingerprint> {
+        self.partitions.get(node.partitions?)
+    }
+
+    /// The index of `fingerprint` in [`Self::partitions`], added if new.
+    pub fn intern_partitions(&mut self, fingerprint: PartitionsFingerprint) -> usize {
+        if let Some(index) = self.partitions.iter().position(|p| *p == fingerprint) {
+            return index;
+        }
+        self.partitions.push(fingerprint);
+        self.partitions.len() - 1
+    }
+
     /// (transitive dependencies, transitive dependents) of `node_name`.
     pub fn lineage(&self, node_name: &str) -> (HashSet<String>, HashSet<String>) {
         let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -667,6 +692,7 @@ mod tests {
         let topo = GraphTopology {
             nodes: vec![topo_node("a"), topo_node("b"), topo_node("c")],
             edges: vec![("c".into(), "b".into()), ("b".into(), "a".into())],
+            ..Default::default()
         };
         let (anc, desc) = topo.lineage("b");
         assert_eq!(anc, HashSet::from(["a".into()]));
@@ -688,6 +714,7 @@ mod tests {
                 ("d".into(), "b".into()),
                 ("d".into(), "c".into()),
             ],
+            ..Default::default()
         };
         let (anc, desc) = topo.lineage("d");
         assert_eq!(anc, HashSet::from(["a".into(), "b".into(), "c".into()]));
@@ -703,6 +730,7 @@ mod tests {
         let topo = GraphTopology {
             nodes: vec![],
             edges: vec![],
+            ..Default::default()
         };
         let (anc, desc) = topo.lineage("missing");
         assert!(anc.is_empty());

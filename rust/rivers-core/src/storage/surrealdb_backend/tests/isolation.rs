@@ -12,10 +12,12 @@ async fn graph_topology_isolated_per_code_location() {
     let topo_a = GraphTopology {
         nodes: vec![TopologyNode::new("a_only", NodeKind::Asset)],
         edges: vec![("a_only".to_string(), "shared".to_string())],
+        ..Default::default()
     };
     let topo_b = GraphTopology {
         nodes: vec![TopologyNode::new("b_only", NodeKind::Asset)],
         edges: vec![("b_only".to_string(), "shared".to_string())],
+        ..Default::default()
     };
 
     storage

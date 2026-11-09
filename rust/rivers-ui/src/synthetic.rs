@@ -118,5 +118,6 @@ pub fn core_topology(scale: &str) -> rivers_core::assets::graph::GraphTopology {
             })
             .collect(),
         edges: g.edges,
+        ..Default::default()
     }
 }

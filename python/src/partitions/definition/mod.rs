@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::errors::PartitionDefinitionError;
+use rivers_core::assets::partitions_fingerprint::PartitionsFingerprint;
 use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
@@ -622,6 +623,32 @@ impl PartitionsDefinition {
                 fmt: fmt.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// The definition as the topology stores it.
+    pub fn fingerprint(&self) -> PartitionsFingerprint {
+        match self {
+            Self::Static { keys } => PartitionsFingerprint::static_keys(keys.iter().cloned()),
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => PartitionsFingerprint::TimeWindow(rivers_core::timegrid::TimeGrid {
+                cron_schedule: cron_schedule.clone(),
+                interval_seconds: *interval_seconds,
+                start: *start,
+                end: *end,
+                fmt: fmt.clone(),
+            }),
+            Self::Multi { dimensions } => PartitionsFingerprint::multi(
+                dimensions
+                    .iter()
+                    .map(|(name, def)| (name.clone(), def.fingerprint())),
+            ),
+            Self::Dynamic { name } => PartitionsFingerprint::Dynamic { name: name.clone() },
         }
     }
 

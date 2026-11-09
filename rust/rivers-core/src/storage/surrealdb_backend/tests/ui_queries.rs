@@ -437,6 +437,7 @@ async fn test_input_versions_from_event_not_storage() {
             TopologyNode::new("downstream", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("downstream".to_string(), "upstream".to_string())],
+        ..Default::default()
     };
     let topo_json = serde_json::to_vec(&topology).unwrap();
     storage
@@ -599,6 +600,7 @@ mod remote_staleness {
                         ("order_count".into(), "orders".into()),
                         ("order_count".into(), "ghost".into()),
                     ],
+                    ..Default::default()
                 },
             )
             .await
