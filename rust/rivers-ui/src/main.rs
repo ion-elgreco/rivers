@@ -126,13 +126,7 @@ async fn serve() {
         (Some(_), _) => {
             panic!("--registry-url requires --registry-token (or RIVERS_REGISTRY_TOKEN)")
         }
-        (None, _) => {
-            tracing::warn!(
-                target: "rivers::ui",
-                "no --registry-url provided; UI will show no code locations"
-            );
-            Registry::empty()
-        }
+        (None, _) => Registry::storage(storage.clone(), None),
     };
 
     // Bad RIVERS_AUTH_* config or an unreachable issuer aborts startup

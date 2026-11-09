@@ -672,6 +672,7 @@ fn register_code_location(
     use rivers_core::storage::{CodeLocationDirectoryEntry, RemoteConsumer, StorageBackend};
 
     let entry = CodeLocationDirectoryEntry {
+        module: std::env::var("RIVERS_MODULE").ok(),
         remotes: RemoteConsumer::from_topology(topology),
         ..CodeLocationDirectoryEntry::new(storage_handle.code_location_id())
     };

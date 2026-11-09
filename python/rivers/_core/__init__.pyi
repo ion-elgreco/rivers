@@ -869,7 +869,7 @@ class DevHost:
         host = DevHost(".rivers/storage/")
         storage = Storage.connect(host.endpoint)
         host.start_code_location(sys.executable, "pipeline", "repo", "127.0.0.1", 3001, False)
-        host.start_ui(storage, "127.0.0.1", 3000, "http://127.0.0.1:3001")
+        host.start_ui(storage, "127.0.0.1", 3000)
         host.run()  # until Ctrl-C; the UI reloads the code location
         host.stop_code_location()
         host.stop()
@@ -932,18 +932,23 @@ class DevHost:
         storage: Storage,
         host: str,
         port: int,
-        grpc_url: str,
         synthetic: str | None = None,
     ) -> None:
         """Start the web UI in this process.
+
+        The UI lists every code location in the storage's directory. One that
+        reported in within the last 30 seconds is ``Ready``; this host's own
+        location is ``Pending`` until then, and the others are ``Stopped``.
 
         Args:
             storage: The connection the UI reads from.
             host: Bind host.
             port: Bind port; the next free one of the following 99 is used
                 when it is taken.
-            grpc_url: The code location's gRPC endpoint.
             synthetic: Replace the graph with a synthetic DAG of this size.
+
+        Raises:
+            RuntimeError: The code location namespace or name is not valid.
         """
         ...
 

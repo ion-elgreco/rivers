@@ -60,13 +60,15 @@ A reload replaces the code location with a fresh interpreter, so every edit is p
 
 The previous code location retires first: it stops scheduling and releases its gRPC port, and the new one starts as soon as the port is free, so two daemons never run at the same time. Runs that were in flight finish in the background with no time limit, and the retired process exits on its own; the console prints `Generation N finished.` Queued runs wait in storage for the new code location. Stopping `rivers dev` with Ctrl-C stops every generation, including those still finishing runs, with the usual 30 s cap.
 
-Press **Reload code location** in the sidebar of the UI.
+Press **Reload code location** in the sidebar of the UI. The button shows only on the code location this `rivers dev` runs.
 
 A code location that does not come back (a syntax error, a failed import, a failed resolve) does not end the session: the error shows in the console and under the reload button, and the next reload tries again. Only a code location that fails on the first start ends `rivers dev`.
 
 The embedded storage is served on an ephemeral loopback port, and the console prints it as `Storage: ws://127.0.0.1:<port>`. With `--surreal-endpoint`, the UI and the code location connect to that server instead and nothing is served locally.
 
 The code location writes its gRPC endpoint to the code location directory in storage when it starts, and then every 10 seconds. A wildcard `--host` (`0.0.0.0`) is written as `127.0.0.1`.
+
+The UI lists every code location in that directory, so each `rivers dev` on the same storage shows all of them. A code location that wrote its endpoint in the last 30 seconds is **Ready**. The one this `rivers dev` runs is **Pending** until its first write; the others are **Stopped**.
 
 Every flag (and the module argument) can also come from configuration. Sources, from highest to lowest precedence:
 

@@ -2,10 +2,10 @@
 //! Used by SSR server functions to discover which code locations exist
 //! before dialing their per-location gRPC endpoints.
 //!
-//! Two concrete backends — kept as an enum rather than a trait + dyn dispatch
-//! since the set of implementations is closed: either we're talking to a real
-//! operator (`Grpc`) or we're in `rivers dev` with a single in-process backend
-//! (`Static`).
+//! The backends are an enum rather than a trait + dyn dispatch since the set
+//! is closed: a real operator (`Grpc`), the code location directory in
+//! storage (`Storage`, for `rivers dev` and a UI without an operator), or a
+//! fixed list (`Static`, for tests).
 //!
 //! The `Grpc` backend holds an in-memory cache of all known entries fed by a
 //! background `Watch` stream — every `list()` / `lookup()` is an O(1) read
@@ -19,10 +19,14 @@ use rivers_api::rivers::code_location_event::Type as EventType;
 use rivers_api::rivers::code_location_registry_service_client::CodeLocationRegistryServiceClient;
 use rivers_api::rivers::code_location_service_client::CodeLocationServiceClient;
 use rivers_api::rivers::{CodeLocationEvent, WatchCodeLocationsRequest};
+use rivers_core::assets::remote::LocationRef;
+use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::{CodeLocationDirectoryEntry, StorageBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
@@ -58,29 +62,25 @@ impl Interceptor for BearerAuth {
 /// from it via `AppState::registry`.
 #[derive(Clone)]
 pub enum Registry {
-    /// In-process fixed list. Used by `rivers dev`, where a single synthetic
-    /// entry points at the in-process gRPC server.
+    /// In-process fixed list, for tests.
     Static(Arc<Vec<CodeLocationEntry>>),
     /// Live gRPC connection to the operator. Backed by an in-memory cache fed
     /// by a background `Watch` stream — see [`GrpcRegistry::run_watcher`].
     Grpc(Arc<GrpcRegistry>),
+    /// The code location directory in storage. Used by `rivers dev` and by a
+    /// UI without `--registry-url`.
+    Storage(Arc<StorageRegistry>),
 }
 
 impl Registry {
-    /// Synthetic single-entry registry for `rivers dev` mode. Stamps a fake
-    /// `dev/default` entry pre-marked `Ready` so SSR pages bypass the
-    /// operator-watcher path and dial the in-process gRPC backend directly.
-    pub fn dev_single(endpoint: String, module: String) -> Self {
-        Self::Static(Arc::new(vec![CodeLocationEntry {
-            namespace: "dev".to_string(),
-            name: "default".to_string(),
-            grpc_endpoint: endpoint,
-            image: "local".to_string(),
-            module,
-            phase: "Ready".to_string(),
-            observed_generation: 0,
-            identity: rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
-        }]))
+    /// Read the code location directory in `storage`. `own` is the code
+    /// location this process hosts, listed `Pending` until it reports in.
+    pub fn storage(storage: Arc<SurrealStorage>, own: Option<OwnLocation>) -> Self {
+        Self::Storage(Arc::new(StorageRegistry {
+            storage,
+            own,
+            cache: Mutex::new(None),
+        }))
     }
 
     /// Empty registry — no code locations. Used by tests and as a temporary
@@ -103,29 +103,40 @@ impl Registry {
     /// Code Locations sub-label without exposing the enum to UI code.
     pub fn mode(&self) -> &'static str {
         match self {
-            Self::Static(_) => "embedded",
+            Self::Static(_) | Self::Storage(_) => "embedded",
             Self::Grpc(_) => "grpc",
         }
     }
 
-    /// Snapshot of currently-known entries. O(1) for both backends — `Grpc`
-    /// reads from the in-memory map maintained by the watcher.
+    /// Snapshot of currently-known entries. `Grpc` reads the map its watcher
+    /// maintains; `Storage` reads storage at most every 2 s.
     pub async fn list(&self) -> Result<Vec<CodeLocationEntry>> {
         match self {
             Self::Static(entries) => Ok((**entries).clone()),
             Self::Grpc(g) => Ok(g.snapshot().await),
+            Self::Storage(s) => s.entries().await,
         }
     }
 
     /// Lookup an entry by `(namespace, name)`. Returns `None` if not in the
     /// cache — caller decides whether that's a 404 or a "not yet synced".
     pub async fn lookup(&self, namespace: &str, name: &str) -> Option<CodeLocationEntry> {
-        match self {
-            Self::Static(entries) => entries
+        let find = |entries: &[CodeLocationEntry]| {
+            entries
                 .iter()
                 .find(|e| e.namespace == namespace && e.name == name)
-                .cloned(),
+                .cloned()
+        };
+        match self {
+            Self::Static(entries) => find(entries),
             Self::Grpc(g) => g.lookup(namespace, name).await,
+            Self::Storage(s) => match s.entries().await {
+                Ok(entries) => find(&entries),
+                Err(error) => {
+                    tracing::warn!(target: "rivers::ui", %error, "reading the code location directory failed");
+                    None
+                }
+            },
         }
     }
 
@@ -138,6 +149,111 @@ impl Registry {
             .find(|e| e.is_ready())
             .context("no Ready code location available")
     }
+}
+
+/// How long a read of the directory serves later reads.
+const STORAGE_REFRESH: Duration = Duration::from_secs(2);
+/// A code location that has not reported in for this long is `Stopped`.
+const STALE_AFTER_NANOS: i64 = 30_000_000_000;
+
+/// The code location this process hosts.
+#[derive(Clone, Debug)]
+pub struct OwnLocation {
+    pub location: LocationRef,
+    pub identity: String,
+}
+
+/// The code location directory in storage, cached for [`STORAGE_REFRESH`].
+pub struct StorageRegistry {
+    storage: Arc<SurrealStorage>,
+    own: Option<OwnLocation>,
+    cache: Mutex<Option<(Instant, Vec<CodeLocationEntry>)>>,
+}
+
+impl StorageRegistry {
+    async fn entries(&self) -> Result<Vec<CodeLocationEntry>> {
+        let mut cache = self.cache.lock().await;
+        if let Some((read_at, entries)) = cache.as_ref()
+            && read_at.elapsed() < STORAGE_REFRESH
+        {
+            return Ok(entries.clone());
+        }
+        let listed = self.storage.list_code_locations().await?;
+        let entries = directory_entries(listed, self.own.as_ref(), now_nanos());
+        *cache = Some((Instant::now(), entries.clone()));
+        Ok(entries)
+    }
+}
+
+/// `Ready` for a location that reported in within the last 30 s; else
+/// `Pending` for this process's own location and `Stopped` for others.
+fn directory_entries(
+    listed: Vec<(LocationRef, CodeLocationDirectoryEntry)>,
+    own: Option<&OwnLocation>,
+    now: i64,
+) -> Vec<CodeLocationEntry> {
+    let is_own = |location: &LocationRef| own.is_some_and(|own| &own.location == location);
+    let mut entries: Vec<CodeLocationEntry> = listed
+        .into_iter()
+        .map(|(location, entry)| {
+            let alive = entry.grpc_endpoint.is_some()
+                && entry
+                    .last_seen
+                    .is_some_and(|seen| now - seen < STALE_AFTER_NANOS);
+            let phase = match (alive, is_own(&location)) {
+                (true, _) => "Ready",
+                (false, true) => "Pending",
+                (false, false) => "Stopped",
+            };
+            location_entry(
+                &location,
+                entry.identity,
+                entry.grpc_endpoint,
+                entry.module,
+                phase,
+            )
+        })
+        .collect();
+    if let Some(own) = own
+        && !entries
+            .iter()
+            .any(|e| e.namespace == own.location.namespace() && e.name == own.location.name())
+    {
+        entries.push(location_entry(
+            &own.location,
+            own.identity.clone(),
+            None,
+            None,
+            "Pending",
+        ));
+    }
+    entries.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    entries
+}
+
+fn location_entry(
+    location: &LocationRef,
+    identity: String,
+    grpc_endpoint: Option<String>,
+    module: Option<String>,
+    phase: &str,
+) -> CodeLocationEntry {
+    CodeLocationEntry {
+        namespace: location.namespace().to_string(),
+        name: location.name().to_string(),
+        grpc_endpoint: grpc_endpoint.unwrap_or_default(),
+        image: "local".to_string(),
+        module: module.unwrap_or_default(),
+        phase: phase.to_string(),
+        observed_generation: 0,
+        identity,
+    }
+}
+
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
 }
 
 /// Holds the cache + the lazily-dialed channel used by the watcher. The
@@ -383,13 +499,126 @@ mod tests {
         assert!(r.first_ready().await.is_err());
     }
 
+    fn dir_entry(
+        identity: &str,
+        endpoint: Option<&str>,
+        last_seen: i64,
+    ) -> CodeLocationDirectoryEntry {
+        CodeLocationDirectoryEntry {
+            grpc_endpoint: endpoint.map(str::to_string),
+            module: Some("pkg.mod".into()),
+            last_seen: Some(last_seen),
+            ..CodeLocationDirectoryEntry::new(identity)
+        }
+    }
+
+    fn dev(name: &str) -> LocationRef {
+        LocationRef::new("dev", name).unwrap()
+    }
+
+    fn phases(entries: &[CodeLocationEntry]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|e| (e.name.clone(), e.phase.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn directory_phases_follow_the_last_heartbeat() {
+        let now = 100 * STALE_AFTER_NANOS;
+        let fresh = now - STALE_AFTER_NANOS / 2;
+        let stale = now - STALE_AFTER_NANOS - 1;
+        let listed = vec![
+            (
+                dev("warehouse"),
+                dir_entry("wh-id", Some("127.0.0.1:3001"), fresh),
+            ),
+            (
+                dev("analytics"),
+                dir_entry("an-id", Some("127.0.0.1:3002"), stale),
+            ),
+            (dev("notebook"), CodeLocationDirectoryEntry::new("nb-id")),
+        ];
+
+        let entries = directory_entries(listed, None, now);
+
+        assert_eq!(
+            phases(&entries),
+            [
+                ("analytics".into(), "Stopped".into()),
+                ("notebook".into(), "Stopped".into()),
+                ("warehouse".into(), "Ready".into()),
+            ]
+        );
+        let warehouse = &entries[2];
+        assert_eq!(warehouse.identity, "wh-id");
+        assert_eq!(warehouse.grpc_endpoint, "127.0.0.1:3001");
+        assert_eq!(warehouse.module, "pkg.mod");
+    }
+
+    #[test]
+    fn own_location_is_pending_until_it_reports_in() {
+        let own = OwnLocation {
+            location: dev("analytics"),
+            identity: "an-id".into(),
+        };
+        let now = 100 * STALE_AFTER_NANOS;
+
+        let missing = directory_entries(Vec::new(), Some(&own), now);
+        assert_eq!(phases(&missing), [("analytics".into(), "Pending".into())]);
+        assert_eq!(missing[0].identity, "an-id");
+
+        let stale = vec![(
+            dev("analytics"),
+            dir_entry("an-id", Some("127.0.0.1:3002"), 0),
+        )];
+        assert_eq!(
+            phases(&directory_entries(stale, Some(&own), now)),
+            [("analytics".into(), "Pending".into())]
+        );
+
+        let fresh = vec![(
+            dev("analytics"),
+            dir_entry("an-id", Some("127.0.0.1:3002"), now),
+        )];
+        assert_eq!(
+            phases(&directory_entries(fresh, Some(&own), now)),
+            [("analytics".into(), "Ready".into())]
+        );
+    }
+
     #[tokio::test]
-    async fn dev_single_marks_entry_ready() {
-        let r = Registry::dev_single("http://127.0.0.1:3001".into(), "my.mod".into());
-        let got = r.list().await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(got[0].is_ready());
-        assert_eq!(got[0].module, "my.mod");
+    async fn storage_registry_looks_up_seeded_entries() {
+        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        storage
+            .upsert_code_location_registration(
+                &dev("warehouse"),
+                CodeLocationDirectoryEntry::new("wh-id"),
+            )
+            .await
+            .unwrap();
+        storage
+            .touch_code_location(&dev("warehouse"), "wh-id", "127.0.0.1:3001", now_nanos())
+            .await
+            .unwrap();
+        storage
+            .upsert_code_location_registration(
+                &dev("analytics"),
+                CodeLocationDirectoryEntry::new("an-id"),
+            )
+            .await
+            .unwrap();
+        let registry = Registry::storage(storage, None);
+
+        let warehouse = registry.lookup("dev", "warehouse").await.unwrap();
+        assert!(warehouse.is_ready());
+        assert_eq!(warehouse.grpc_endpoint, "127.0.0.1:3001");
+        assert_eq!(
+            registry.lookup("dev", "analytics").await.unwrap().phase,
+            "Stopped"
+        );
+        assert!(registry.lookup("dev", "nowhere").await.is_none());
+        assert_eq!(registry.first_ready().await.unwrap().name, "warehouse");
     }
 
     #[tokio::test]

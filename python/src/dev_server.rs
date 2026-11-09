@@ -83,23 +83,32 @@ impl PyDevHost {
         self.endpoint.clone()
     }
 
-    #[pyo3(signature = (storage, host, port, grpc_url, synthetic=None))]
+    #[pyo3(signature = (storage, host, port, synthetic=None))]
     fn start_ui(
         &self,
         storage: &PyStorage,
         host: String,
         port: u16,
-        grpc_url: String,
         synthetic: Option<String>,
-    ) {
+    ) -> PyResult<()> {
+        use rivers_ui::code_location_registry::{OwnLocation, Registry};
+
         let storage_arc = Arc::clone(storage.backend());
         let graph = synthetic
             .as_deref()
             .map(rivers_ui::synthetic::core_topology)
             .map(Arc::new);
-        let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
-        let registry = rivers_ui::code_location_registry::Registry::dev_single(grpc_url, module);
-        rivers_ui::dev_reload::enable();
+        let location = rivers_k8s::env::current_code_location_ref()
+            .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+        rivers_ui::dev_reload::enable((
+            location.namespace().to_string(),
+            location.name().to_string(),
+        ));
+        let own = OwnLocation {
+            location,
+            identity: rivers_k8s::env::current_code_location_id(),
+        };
+        let registry = Registry::storage(Arc::clone(&storage_arc), Some(own));
         let stop = CancellationToken::new();
         let shutdown = stop.clone();
         let task = rt().spawn(async move {
@@ -120,6 +129,7 @@ impl PyDevHost {
         if let Some(prev) = self.ui.lock().unwrap().replace(UiServer { stop, task }) {
             prev.stop.cancel();
         }
+        Ok(())
     }
 
     /// Start the first generation of the code location and wait until it

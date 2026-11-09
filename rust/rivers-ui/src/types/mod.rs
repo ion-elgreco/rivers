@@ -53,6 +53,8 @@ pub(crate) fn display_name<'a>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevReloadState {
     pub enabled: bool,
+    /// `(namespace, name)` of the code location the host reloads.
+    pub location: Option<(String, String)>,
     /// Counts code locations that came back up; a reload is done once it moves.
     pub generation: u64,
     /// Why the last attempt did not come back up; cleared by the next attempt.

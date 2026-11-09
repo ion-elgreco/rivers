@@ -53,6 +53,8 @@ def second(first: int) -> int:
 repo = rs.CodeRepository(assets=[first, second])
 """
 
+SERVING = {"enabled": True, "location": ["dev", "default"], "error": None}
+
 MODULE_BROKEN = "import rivers as rs\nrepo = rs.CodeRepository(assets=[not_defined])\n"
 
 # An asset that blocks until RELEASE_PATH exists, then writes MARKER_PATH.
@@ -320,7 +322,7 @@ def test_reload_serves_the_edited_module(dev_host, tmp_path):
     dev_host.wait_ready()
     assert dev_host.asset_names() == {"first"}
     state = dev_host.reload_state()
-    assert state == {"enabled": True, "generation": 0, "error": None}
+    assert state == {**SERVING, "generation": 0}
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_V2)
     dev_host.reload_via_http()
@@ -364,9 +366,7 @@ def test_a_broken_edit_keeps_the_session_alive(dev_host, tmp_path):
         "the fixed module to be served",
     )
     wait_for(
-        lambda: (
-            dev_host.reload_state() == {"enabled": True, "generation": 1, "error": None}
-        ),
+        lambda: dev_host.reload_state() == {**SERVING, "generation": 1},
         30,
         "the host to clear the error",
     )
@@ -429,7 +429,7 @@ def test_a_run_in_flight_finishes_in_the_retired_generation(start_dev_host, tmp_
         30,
         "the retired generation to exit on its own",
     )
-    assert dev_host.reload_state() == {"enabled": True, "generation": 1, "error": None}
+    assert dev_host.reload_state() == {**SERVING, "generation": 1}
 
     code = dev_host.stop()
     logs = dev_host.logs()

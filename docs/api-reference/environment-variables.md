@@ -57,7 +57,7 @@ Read by `rivers-ui` (the standalone UI server, distinct from the in-process UI s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RIVERS_REGISTRY_URL` | unset | Operator's `CodeLocationRegistry` gRPC URL (e.g. `http://rivers-operator-registry.rivers.svc:50052`). When unset, the UI starts with no known code locations. |
+| `RIVERS_REGISTRY_URL` | unset | Operator's `CodeLocationRegistry` gRPC URL (e.g. `http://rivers-operator-registry.rivers.svc:50052`). When unset, the UI lists the code locations in the storage's code location directory. |
 | `RIVERS_REGISTRY_TOKEN` | unset | Bearer token for the registry. Required when `RIVERS_REGISTRY_URL` is set. Passed via env so it doesn't show up in process listings. |
 
 ## Observability

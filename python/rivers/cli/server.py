@@ -126,13 +126,7 @@ def _serve_dev(cfg: RiversConfig, module: str, *, ui: bool = True) -> None:
         )
         # The UI comes up while the code location imports and resolves.
         if ui:
-            host.start_ui(
-                storage,
-                cfg.server.host,
-                cfg.server.port,
-                f"http://{cfg.server.host}:{cfg.server.grpc_port}",
-                cfg.synthetic.size,
-            )
+            host.start_ui(storage, cfg.server.host, cfg.server.port, cfg.synthetic.size)
         if not host.start_code_location(
             sys.executable,
             module,

@@ -13,6 +13,7 @@ _ENV = (
     "RIVERS_NAMESPACE",
     "RIVERS_DEPLOYMENT",
     "RIVERS_RUN_ID",
+    "RIVERS_MODULE",
 )
 
 
@@ -50,6 +51,17 @@ def test_resolve_lists_namespace_and_name(storage, monkeypatch):
 
     assert _entry(storage, "code_location:team/wh") == {"identity": "uuid-1"}
     assert _entry(storage, "code_location:dev/default") is None
+
+
+def test_entry_names_the_module(storage, monkeypatch):
+    monkeypatch.setenv("RIVERS_MODULE", "pipelines.warehouse")
+
+    _repo().resolve(storage=storage)
+
+    assert _entry(storage, "code_location:dev/default") == {
+        "identity": "default",
+        "module": "pipelines.warehouse",
+    }
 
 
 def test_run_pods_do_not_list_the_code_location(storage, monkeypatch):
