@@ -300,7 +300,17 @@ The lineage view draws a remote asset with a dotted border, the owner's name, an
 
 ### Automation
 
-Automation conditions in this code location do not see the owner's materializations. A remote dependency has no asset record here, so `eager()` does not start a run when the owner materializes, and `on_cron()` does not see all dependencies updated. Runs that you start, and runs from schedules and from conditions on local dependencies, load the remote input as usual.
+The condition daemon of this code location follows the owner's runs. Conditions on a remote dependency see the owner's state:
+
+- **`eager()`** starts a run when the owner materializes the remote asset. It waits while an owner run that materializes the remote asset is in progress.
+- **`on_cron()`** counts the owner's materialization as a dependency update.
+- **`any_deps_missing()`** is true until the owner materializes the remote asset (or its partition). It is also true while the owning code location is not registered, so `eager()` starts no run.
+- **`any_deps_match(execution_failed())`** follows the owner's failed runs.
+- **Partition mappings** use the mirrored `partitions_def`.
+
+These conditions read the runs of this code location, so they are false on a remote dependency: `backfill_in_progress()`, `will_be_requested()`, `last_executed_with_tags()`, `has_run_with_tags()`, and `all_runs_have_tags()`.
+
+The daemon finds the owner by name. While the owner is not registered, it tries again every 5 seconds. After that, it checks the owner's identity every 30 seconds, so it follows a redeployed owner.
 
 ## Self-dependent assets
 
