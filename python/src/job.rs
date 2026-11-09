@@ -267,6 +267,13 @@ impl PyJob {
                     self.name, name
                 )));
             }
+            if let Some(remote) = repo_node_map.get(name).and_then(ResolvedNode::remote) {
+                return Err(GraphValidationError::new_err(format!(
+                    "Job '{}': {}",
+                    self.name,
+                    crate::repository::remote_not_materializable(name, remote)
+                )));
+            }
         }
 
         let node_name_set_owned: HashSet<String> = self.node_names.iter().cloned().collect();

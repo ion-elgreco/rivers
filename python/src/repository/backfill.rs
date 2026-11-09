@@ -88,6 +88,7 @@ impl PyCodeRepository {
         } else {
             selection
         };
+        ensure_materializable(&state.node_map, &selection)?;
 
         if let Some(verb) = &action {
             if selection.is_empty() {

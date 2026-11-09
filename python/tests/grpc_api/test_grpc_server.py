@@ -148,6 +148,15 @@ def test_get_assets_info(grpc_channel):
     assert up.is_external is False
 
 
+def test_materialize_remote_returns_error(grpc_channel):
+    channel, pb2, pb2_grpc, _ = grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        stub.Materialize(pb2.MaterializeRequest(selection=["remote_feed"]))
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "Cannot materialize remote asset 'remote_feed'" in exc_info.value.details()
+
+
 def test_get_jobs(grpc_channel):
     channel, pb2, pb2_grpc, _ = grpc_channel
     stub = pb2_grpc.CodeLocationServiceStub(channel)

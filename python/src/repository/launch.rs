@@ -171,6 +171,7 @@ impl PyCodeRepository {
         // collect-step virtual nodes, so we only need to compute the
         // externally-visible selection here.
         let mut selected_names: HashSet<String> = if let Some(ref sel) = selection {
+            ensure_materializable(&state.node_map, sel)?;
             for name in sel {
                 match state.node_map.get(name) {
                     None => {

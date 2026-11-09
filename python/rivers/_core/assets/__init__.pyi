@@ -220,9 +220,13 @@ class Asset:
             asset_key: The asset's key in the owning code location. Defaults
                 to ``name``. Set it to give the asset a different local name,
                 e.g. when two code locations own assets with the same key.
-            io_handler: Loads the asset's data for downstream parameters. Not
-                needed when the asset is only used in ``deps=``.
-            partitions_def: Mirror of the owner's partitions definition.
+            io_handler: Loads the asset's data for downstream parameters.
+                Without it the asset is lineage-only: list it with
+                :meth:`AssetDef.dep`, or set a handler on the consumer's
+                :meth:`AssetDef.input`.
+            partitions_def: Mirror of the owner's partitions definition. Not
+                dynamic, and no dynamic dimension: dynamic keys live in the
+                owning code location.
             metadata: Static metadata.
             group: Group for the UI.
 
@@ -231,8 +235,8 @@ class Asset:
 
         Raises:
             AssetDefinitionError: ``name`` is empty or contains ``/``,
-                ``asset_key`` is empty, or ``code_location`` is not a valid
-                code location reference.
+                ``asset_key`` is empty, ``code_location`` is not a valid
+                code location reference, or ``partitions_def`` is dynamic.
         """
         ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any:

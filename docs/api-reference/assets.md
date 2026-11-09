@@ -233,12 +233,21 @@ def order_count(orders: pl.DataFrame) -> int:
 | `name` | `str` | required | Local name. Unique in this repository; no `/`. |
 | `code_location` | `str` | required | Owning code location: `"name"` in this code location's namespace, or `"namespace/name"`. |
 | `asset_key` | `str \| None` | `name` | The asset's key in the owning code location. Set it to give the asset a different local name. |
-| `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Not needed for `deps=`-only use. |
-| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Mirror of the owner's partition definition. |
+| `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Without it the asset is lineage-only: list it with `AssetDef.dep()`, or set a handler on the consumer's `AssetDef.input()`. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Mirror of the owner's partition definition. Dynamic definitions and dynamic dimensions are rejected: their keys live in the owning code location. |
 | `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
 | `group` | `str \| None` | `None` | Group name for organization. |
 
-Raises `AssetDefinitionError` when `name` is empty or contains `/`, when `asset_key` is empty, or when `code_location` is not `"name"` or `"namespace/name"`. A remote asset takes no function.
+Raises `AssetDefinitionError` when `name` is empty or contains `/`, when `asset_key` is empty, when `code_location` is not `"name"` or `"namespace/name"`, or when `partitions_def` is dynamic. A remote asset takes no function.
+
+The repository rejects these uses:
+
+| Use | Error |
+|-----|-------|
+| A parameter loads a remote without `io_handler`, and the consumer sets no input handler for it | `GraphValidationError` at `resolve()` and `validate()` |
+| The remote in a `materialize()` or `backfill()` selection, or in a gRPC `Materialize` selection | `ExecutionError`: `Cannot materialize remote asset 'x': code location 'ns/name' owns it` |
+| The remote in `Job(assets=...)` | `GraphValidationError` at `resolve()` |
+| The remote in a sensor's `asset_selection` | `SensorDefinitionError` at `resolve()` |
 
 Local names must be unique, also across remotes. When two code locations own assets with the same key, give each one a different local name:
 

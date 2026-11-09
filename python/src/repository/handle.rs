@@ -23,8 +23,9 @@ use super::resolved_node::ResolvedNode;
 use super::results::{PyBackfillStatusResult, PyRunHandle};
 use super::validation::{
     DynamicKeyCheck, assets_supporting_action, dynamic_partition_checks,
-    ensure_assets_support_action, ensure_job_verb, ensure_whole_asset_chosen, resolve_selection,
-    validate_partition_for_verb, verify_dynamic_partition_keys,
+    ensure_assets_support_action, ensure_job_verb, ensure_materializable,
+    ensure_whole_asset_chosen, resolve_selection, validate_partition_for_verb,
+    verify_dynamic_partition_keys,
 };
 
 pub(crate) fn priority_from_tags(tags: &[(String, String)]) -> i32 {
@@ -512,7 +513,7 @@ impl RepoHandle {
     pub(crate) fn validate_assets_exist(&self, asset_names: &[String]) -> PyResult<()> {
         let state = self.resolved()?;
         resolve_selection(&state.node_map, asset_names)?;
-        Ok(())
+        ensure_materializable(&state.node_map, asset_names)
     }
 
     /// GIL-free. Used by gRPC `materialize` to expand empty selection

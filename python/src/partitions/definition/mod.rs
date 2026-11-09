@@ -204,6 +204,15 @@ impl PartitionsDefinition {
         }
     }
 
+    /// Whether the definition is Dynamic or has a Dynamic dimension.
+    pub fn has_dynamic_dimension(&self) -> bool {
+        match self {
+            Self::Dynamic { .. } => true,
+            Self::Multi { dimensions } => dimensions.iter().any(|(_, d)| d.has_dynamic_dimension()),
+            _ => false,
+        }
+    }
+
     /// Check if two definitions are the same variant.
     pub fn same_variant(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)

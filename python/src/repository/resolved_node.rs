@@ -320,6 +320,9 @@ impl ResolvedAsset {
 
         let remote = match asset {
             Asset::Remote(r) => {
+                if let Some(pd) = &partitions_def {
+                    crate::assets::remote_asset::reject_dynamic_mirror(&name, pd)?;
+                }
                 let namespace = rivers_k8s::env::current_code_location_namespace();
                 let code_location =
                     rivers_core::assets::remote::LocationRef::parse(&r.code_location, &namespace)
@@ -910,6 +913,20 @@ impl ResolvedNode {
                     .map(|h| expect_resolved_handler(h, py))
             }
             _ => None,
+        }
+    }
+
+    /// Whether this node sets its own handler for loading `dep`
+    /// (`AssetDef.input(dep, io_handler=...)`). Unlike `input_io_handler`,
+    /// safe before resource keys resolve.
+    pub fn declares_input_io_handler(&self, dep: &str) -> bool {
+        match self {
+            ResolvedNode::Asset(node) => node.input_io_handlers.contains_key(dep),
+            ResolvedNode::Task(node) => node
+                .input_io_handler_override
+                .as_ref()
+                .is_some_and(|m| m.contains_key(dep)),
+            ResolvedNode::BashTask(_) => false,
         }
     }
 

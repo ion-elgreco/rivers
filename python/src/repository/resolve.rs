@@ -52,6 +52,7 @@ impl PyCodeRepository {
         )?;
 
         validate_partition_mappings(py, &node_map, &unresolved_graph)?;
+        validate_remote_inputs(&node_map, &unresolved_graph)?;
 
         // External assets with automation_condition must have an observe_fn.
         for node in node_map.values() {
@@ -112,9 +113,8 @@ impl PyCodeRepository {
             .as_ref()
             .map(|jobs| jobs.iter().map(|j| j.get().name().to_string()).collect())
             .unwrap_or_default();
-        let asset_name_set: HashSet<&str> = node_map.keys().map(String::as_str).collect();
         let job_name_set: HashSet<&str> = job_names_owned.iter().map(String::as_str).collect();
-        validate_sensor_run_targets(py, &self.raw_sensors, &asset_name_set, &job_name_set)?;
+        validate_sensor_run_targets(py, &self.raw_sensors, &node_map, &job_name_set)?;
         validate_schedule_run_targets(py, &self.raw_schedules, &job_name_set)?;
 
         // Plan-build inputs are graph-static; compute once and share across every

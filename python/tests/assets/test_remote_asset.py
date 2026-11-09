@@ -1,13 +1,19 @@
 """Asset.remote: a node another code location materializes."""
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import obstore
 import pytest
 
 import rivers as rs
-from rivers.exceptions import AssetDefinitionError
+from rivers.exceptions import (
+    AssetDefinitionError,
+    ExecutionError,
+    GraphValidationError,
+    SensorDefinitionError,
+)
 
 from _helpers import EXECUTORS, DictIOHandler, make_repo, materialize_beside_sibling
 
@@ -213,3 +219,127 @@ def test_lineage_only_remote_needs_no_io_handler(storage):
     assert result.success
     assert storage.get_asset_record("orders") is None
     assert [r.asset_key for r in storage.get_asset_records()] == ["report"]
+
+
+_NOT_MATERIALIZABLE = (
+    "Cannot materialize remote asset 'orders': code location 'dev/sales' owns it"
+)
+
+
+def _remote_and_consumer():
+    handler = DictIOHandler(store={"orders": [1, 2]})
+    orders = rs.Asset.remote("orders", code_location="sales", io_handler=handler)
+
+    @rs.Asset(io_handler=handler)
+    def order_count(orders: list[int]) -> int:
+        return len(orders)
+
+    return orders, order_count
+
+
+@pytest.mark.parametrize("check", ["validate", "resolve"])
+def test_loading_a_lineage_only_remote_is_rejected(check):
+    orders = rs.Asset.remote("orders", code_location="sales")
+
+    @rs.Asset
+    def order_count(orders: list[int]) -> int:
+        return len(orders)
+
+    repo = rs.CodeRepository(assets=[orders, order_count])
+    with pytest.raises(
+        GraphValidationError, match="'order_count' loads remote asset 'orders'"
+    ):
+        getattr(repo, check)()
+
+
+def test_input_handler_loads_a_lineage_only_remote():
+    handler = DictIOHandler(store={"orders": [1, 2, 3]})
+    orders = rs.Asset.remote("orders", code_location="sales")
+
+    @rs.Asset(
+        io_handler=handler, deps=[rs.AssetDef.input("orders", io_handler=handler)]
+    )
+    def order_count(orders: list[int]) -> int:
+        return len(orders)
+
+    repo = rs.CodeRepository(assets=[orders, order_count])
+    assert repo.materialize().success
+    assert repo.load_node("order_count") == 3
+
+
+def test_materializing_a_remote_is_rejected():
+    repo = rs.CodeRepository(assets=list(_remote_and_consumer()))
+
+    with pytest.raises(ExecutionError, match=_NOT_MATERIALIZABLE):
+        repo.materialize(selection=["orders"])
+    with pytest.raises(ExecutionError, match=_NOT_MATERIALIZABLE):
+        repo.materialize(selection=["order_count", "orders"])
+
+
+def test_backfilling_a_remote_is_rejected():
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+    orders = rs.Asset.remote("orders", code_location="sales", partitions_def=pd)
+
+    @rs.Asset(partitions_def=pd, deps=[rs.AssetDef.dep("orders")])
+    def report() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[orders, report])
+    with pytest.raises(ExecutionError, match=_NOT_MATERIALIZABLE):
+        repo.backfill(
+            selection=["orders"], partition_keys=[rs.PartitionKey.single("a")]
+        )
+
+
+def test_job_with_a_remote_is_rejected():
+    orders, order_count = _remote_and_consumer()
+    job = rs.Job(name="counts", assets=[orders, order_count])
+
+    repo = rs.CodeRepository(assets=[orders, order_count], jobs=[job])
+    with pytest.raises(
+        GraphValidationError, match=f"Job 'counts': {_NOT_MATERIALIZABLE}"
+    ):
+        repo.resolve()
+
+
+def test_sensor_targeting_a_remote_is_rejected():
+    orders, order_count = _remote_and_consumer()
+
+    @rs.Sensor(asset_selection=["orders"], name="watch")
+    def watch(context: rs.SensorEvaluationContext):
+        return rs.RunRequest()
+
+    repo = rs.CodeRepository(assets=[orders, order_count], sensors=[watch])
+    with pytest.raises(
+        SensorDefinitionError, match=f"Sensor 'watch': {_NOT_MATERIALIZABLE}"
+    ):
+        repo.resolve()
+
+
+@pytest.mark.parametrize(
+    "pd",
+    [
+        pytest.param(rs.PartitionsDefinition.dynamic("regions"), id="dynamic"),
+        pytest.param(
+            rs.PartitionsDefinition.multi(
+                {
+                    "date": rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)),
+                    "region": rs.PartitionsDefinition.dynamic("regions"),
+                }
+            ),
+            id="multi-with-dynamic",
+        ),
+    ],
+)
+def test_dynamic_mirror_is_rejected(pd):
+    with pytest.raises(
+        AssetDefinitionError, match="dynamic partitions definition cannot be mirrored"
+    ):
+        rs.Asset.remote("orders", code_location="sales", partitions_def=pd)
+
+    orders = rs.Asset.remote("orders", code_location="sales", partitions_def="mirror")
+    repo = rs.CodeRepository(assets=[orders], partition_defs={"mirror": pd})
+    with pytest.raises(
+        AssetDefinitionError, match="dynamic partitions definition cannot be mirrored"
+    ):
+        repo.resolve()

@@ -5,7 +5,8 @@ use pyo3::prelude::*;
 
 use super::decorator::{Asset, PyAsset};
 use super::io_handler::IOHandler;
-use crate::partitions::PartitionsDefRef;
+use crate::errors::AssetDefinitionError;
+use crate::partitions::{PartitionsDefRef, PartitionsDefinition};
 
 pub struct RemoteAsset {
     /// The local name: unique in this repository, and the name parameters,
@@ -20,6 +21,17 @@ pub struct RemoteAsset {
     pub partitions_def: Option<PartitionsDefRef>,
     pub metadata: Option<HashMap<String, String>>,
     pub group: Option<String>,
+}
+
+/// Dynamic keys live in the owner's scope, so a mirror cannot list them.
+pub(crate) fn reject_dynamic_mirror(name: &str, pd: &PartitionsDefinition) -> PyResult<()> {
+    if pd.has_dynamic_dimension() {
+        return Err(AssetDefinitionError::new_err(format!(
+            "remote asset '{name}': a dynamic partitions definition cannot be mirrored; \
+             its keys live in the owning code location"
+        )));
+    }
+    Ok(())
 }
 
 /// Python-exposed marker subclass created via `Asset.remote(...)`.
