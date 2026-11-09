@@ -8,8 +8,10 @@ use super::node::ConditionNode;
 use crate::storage::{AssetRecord, BackfillStatus, PartitionKey, RunStatus, StorageBackend};
 
 mod refresh;
+mod remote;
 mod types;
 
+pub use remote::RemoteDep;
 pub use types::*;
 
 #[cfg(test)]
@@ -72,6 +74,8 @@ pub struct AssetConditionCache {
     /// guards overwrites so an earlier-finishing overlapping run can't clobber
     /// a later one's tags/asset-names.
     last_run_entry_ts: HashMap<(String, Option<PartitionKey>), i64>,
+    /// Upstream assets owned by other code locations.
+    remote: remote::RemoteScopes,
     /// Test-only rendezvous between `initial_load`'s records read and its
     /// run-status reads, so a test can commit a run completion there.
     #[cfg(test)]
@@ -121,6 +125,7 @@ impl AssetConditionCache {
             pending_grace_nanos: DEFAULT_PENDING_GRACE_NANOS,
             applied_run_ids: HashMap::new(),
             last_run_entry_ts: HashMap::new(),
+            remote: remote::RemoteScopes::default(),
             #[cfg(test)]
             initial_load_gate: None,
         }
@@ -237,26 +242,15 @@ impl AssetConditionCache {
         storage: &S,
     ) -> anyhow::Result<()> {
         let scoped = storage.for_code_location(&self.ctx);
-        for asset_key in &self.partitioned_asset_keys.clone() {
-            let mut entry = PartitionStatusEntry::default();
-
-            let timestamps = scoped.get_partition_timestamps(asset_key).await?;
-            for (pk, ts) in &timestamps {
-                entry.timestamps.insert(pk.clone(), *ts);
-            }
-
-            let in_progress = scoped.get_in_progress_partitions(asset_key).await?;
-            for pk in &in_progress {
-                entry.in_progress.insert(pk.clone());
-            }
-
-            let failed = scoped
-                .get_failed_partitions(asset_key, &entry.timestamps)
-                .await?;
-            entry.failed = failed.keys().cloned().collect();
-            entry.failed_timestamps = failed;
-
-            self.partition_status.insert(asset_key.clone(), entry);
+        let local_keys: Vec<String> = self
+            .partitioned_asset_keys
+            .iter()
+            .filter(|key| !self.remote.is_local(key))
+            .cloned()
+            .collect();
+        for asset_key in local_keys {
+            let entry = remote::fetch_partition_status(&scoped, &asset_key).await?;
+            self.partition_status.insert(asset_key, entry);
         }
         Ok(())
     }
@@ -267,12 +261,16 @@ impl AssetConditionCache {
         storage: &S,
         now: i64,
     ) -> anyhow::Result<bool> {
-        if !self.initialized {
-            return self.initial_load(storage).await.map(|_| true);
-        }
+        let changed = if self.initialized {
+            let delta = self.fetch_refresh_delta(storage, now).await?;
+            self.apply_refresh_delta(delta)
+        } else {
+            self.initial_load(storage).await?;
+            true
+        };
 
-        let delta = self.fetch_refresh_delta(storage, now).await?;
-        Ok(self.apply_refresh_delta(delta))
+        let remote_changed = self.refresh_remotes(storage, now).await;
+        Ok(changed || remote_changed)
     }
 
     /// Full initial load — populates everything from scratch.
@@ -310,9 +308,12 @@ impl AssetConditionCache {
             .map(|ts| ts - 1)
             .unwrap_or(-1);
 
+        // A remote's state comes from its owner. A row of the same name here
+        // is left from when the asset was local, as is its run history below.
         let records = scoped.get_asset_records().await?;
         self.records = records
             .into_iter()
+            .filter(|r| !self.remote.is_local(&r.asset_key))
             .map(|r| (r.asset_key.clone(), r))
             .collect();
 
@@ -379,7 +380,9 @@ impl AssetConditionCache {
             }
             let run_ts = run.end_time.unwrap_or(run.start_time);
             for asset in &run.node_names {
-                if run.partition_key.is_some() && self.is_partitioned(asset) {
+                if self.remote.is_local(asset)
+                    || (run.partition_key.is_some() && self.is_partitioned(asset))
+                {
                     continue;
                 }
                 let record = self.records.get(asset.as_str());
@@ -421,11 +424,13 @@ impl AssetConditionCache {
         // recovered or was deleted while the daemon was down — steady state
         // would have cleared them).
         let records = &self.records;
+        let remote = &self.remote;
         self.failed_asset_timestamps.retain(|asset, ts| {
-            records
-                .get(asset)
-                .and_then(|r| r.last_timestamp)
-                .is_none_or(|mat| mat < *ts)
+            !remote.is_local(asset)
+                && records
+                    .get(asset)
+                    .and_then(|r| r.last_timestamp)
+                    .is_none_or(|mat| mat < *ts)
                 && deletion_ts.get(asset).is_none_or(|&del| del < *ts)
         });
         let floors = &self.failed_asset_timestamps;
