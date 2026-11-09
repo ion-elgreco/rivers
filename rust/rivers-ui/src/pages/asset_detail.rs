@@ -8,6 +8,7 @@ use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_definitions, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
+use crate::components::remote_downstream::RemoteDownstreamSection;
 use crate::components::traceback::TracebackView;
 use crate::components::ui_kit::{
     Crumb, EmptyState, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, RunsGrid,
@@ -19,7 +20,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
-use crate::server_fns::graph::get_graph_topology;
+use crate::server_fns::graph::{get_graph_topology, get_remote_downstream};
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
@@ -161,6 +162,13 @@ pub fn AssetDetailPage() -> impl IntoView {
     let graph = Resource::new(
         move || (loc.get(), live.definitions.get()),
         |((ns, name), _)| async move { get_graph_topology(ns, name).await },
+    );
+    let remote_downstream = Resource::new(
+        move || {
+            params.track();
+            (loc.get(), key(), live.definitions.get())
+        },
+        |((ns, name), key, _)| get_remote_downstream(ns, name, key),
     );
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
@@ -887,7 +895,14 @@ pub fn AssetDetailPage() -> impl IntoView {
                     view! {
                         <div class="lineage-grid">
                             {render_col("UPSTREAM", upstream, "No upstream assets (this is a source asset)", &records_by_key)}
-                            {render_col("DOWNSTREAM", downstream, "No downstream assets", &records_by_key)}
+                            <div>
+                                {render_col("DOWNSTREAM", downstream, "No downstream assets", &records_by_key)}
+                                <Transition fallback=|| ()>
+                                    {move || remote_downstream.get().and_then(Result::ok).map(|rows| view! {
+                                        <RemoteDownstreamSection rows=rows/>
+                                    })}
+                                </Transition>
+                            </div>
                         </div>
                     }.into_any()
                 }}

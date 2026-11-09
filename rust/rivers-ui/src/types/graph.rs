@@ -156,6 +156,29 @@ pub struct RemoteNode {
     pub drift: Option<RemoteDrift>,
 }
 
+/// An asset of another code location that depends on this one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDownstream {
+    /// `"namespace/name"` of the consuming code location.
+    pub code_location: String,
+    pub asset_key: String,
+}
+
+impl RemoteDownstream {
+    /// `(namespace, name)` of the consuming code location.
+    pub fn location(&self) -> (&str, &str) {
+        self.code_location
+            .split_once('/')
+            .unwrap_or(("", &self.code_location))
+    }
+
+    /// The asset's page in the consuming code location.
+    pub fn href(&self) -> String {
+        let (ns, name) = self.location();
+        crate::loc::loc_path(ns, name, &format!("assets/{}", self.asset_key))
+    }
+}
+
 /// A remote node's partitions definition against its owner's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]

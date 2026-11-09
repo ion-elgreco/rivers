@@ -11,7 +11,7 @@ use leptos::server_fn::codec::Json;
 
 #[allow(unused_imports)]
 use crate::components::dag::layout::{LayoutResult, compute_layout};
-use crate::types::GraphTopology;
+use crate::types::{GraphTopology, RemoteDownstream};
 
 #[cfg(feature = "ssr")]
 async fn load_topology(
@@ -148,4 +148,32 @@ pub async fn get_node_lineage(
     let core_topo = load_topology(&loc_ns, &loc_name).await?;
     let topo: GraphTopology = core_topo.into();
     Ok(topo.lineage(&node_name))
+}
+
+/// The assets of other code locations that depend on `asset_key`, from the
+/// remotes each one lists in the code location directory.
+#[server]
+pub async fn get_remote_downstream(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+) -> Result<Vec<RemoteDownstream>, ServerFnError> {
+    use rivers_core::assets::remote::LocationRef;
+    use rivers_core::storage::{StorageBackend, downstream_of};
+
+    let state = expect_context::<crate::state::AppState>();
+    let owner =
+        LocationRef::new(loc_ns, loc_name).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let entries = state
+        .storage
+        .list_code_locations()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(downstream_of(&entries, &owner, &asset_key)
+        .into_iter()
+        .map(|(consumer, asset_key)| RemoteDownstream {
+            code_location: consumer.to_string(),
+            asset_key,
+        })
+        .collect())
 }

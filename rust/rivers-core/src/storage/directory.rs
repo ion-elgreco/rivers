@@ -80,6 +80,33 @@ impl RemoteConsumer {
     }
 }
 
+/// The assets of other code locations that depend on `owner`'s
+/// `asset_key`, as `(consumer, asset)` pairs sorted by both.
+pub fn downstream_of(
+    entries: &[(LocationRef, CodeLocationDirectoryEntry)],
+    owner: &LocationRef,
+    asset_key: &str,
+) -> Vec<(LocationRef, String)> {
+    let mut downstream: Vec<(LocationRef, String)> = entries
+        .iter()
+        .flat_map(|(consumer, entry)| {
+            entry
+                .remotes
+                .iter()
+                .filter(|remote| &remote.code_location == owner && remote.asset_key == asset_key)
+                .flat_map(move |remote| {
+                    remote
+                        .downstream
+                        .iter()
+                        .map(move |asset| (consumer.clone(), asset.clone()))
+                })
+        })
+        .collect();
+    downstream.sort_by_cached_key(|(consumer, asset)| (consumer.to_string(), asset.clone()));
+    downstream.dedup();
+    downstream
+}
+
 /// Storage identity of each location; `None` for a location that never
 /// registered.
 pub async fn resolve_code_locations<'a, S: StorageBackend + ?Sized>(
@@ -101,6 +128,58 @@ mod tests {
     use super::*;
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::assets::remote::RemoteRef;
+
+    #[test]
+    fn downstream_of_lists_consumers_of_one_owner_key() {
+        let warehouse = LocationRef::new("dev", "warehouse").unwrap();
+        let lake = LocationRef::new("dev", "lake").unwrap();
+        let consumes =
+            |location: &LocationRef, key: &str, local: &str, downstream: &[&str]| RemoteConsumer {
+                local: local.into(),
+                code_location: location.clone(),
+                asset_key: key.into(),
+                downstream: downstream.iter().map(|d| d.to_string()).collect(),
+            };
+        let entry = |remotes| CodeLocationDirectoryEntry {
+            remotes,
+            ..CodeLocationDirectoryEntry::new("id")
+        };
+        let entries = vec![
+            (
+                LocationRef::new("dev", "shop").unwrap(),
+                entry(vec![
+                    consumes(&warehouse, "raw_orders", "orders", &["report"]),
+                    consumes(&lake, "raw_orders", "lake_orders", &["lake_report"]),
+                ]),
+            ),
+            (
+                LocationRef::new("dev", "analytics").unwrap(),
+                entry(vec![
+                    consumes(
+                        &warehouse,
+                        "raw_orders",
+                        "wh_orders",
+                        &["order_count", "daily"],
+                    ),
+                    consumes(&warehouse, "customers", "customers", &["churn"]),
+                ]),
+            ),
+        ];
+
+        let downstream: Vec<(String, String)> = downstream_of(&entries, &warehouse, "raw_orders")
+            .into_iter()
+            .map(|(consumer, asset)| (consumer.to_string(), asset))
+            .collect();
+        assert_eq!(
+            downstream,
+            [
+                ("dev/analytics".into(), "daily".into()),
+                ("dev/analytics".into(), "order_count".into()),
+                ("dev/shop".into(), "report".into()),
+            ]
+        );
+        assert!(downstream_of(&entries, &warehouse, "missing").is_empty());
+    }
 
     #[test]
     fn remotes_list_their_downstream_assets() {
