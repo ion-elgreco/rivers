@@ -70,6 +70,8 @@ The code location writes its gRPC endpoint to the code location directory in sto
 
 The UI lists every code location in that directory, so each `rivers dev` on the same storage shows all of them. A code location that wrote its endpoint in the last 30 seconds is **Ready**. The one this `rivers dev` runs is **Pending** until its first write; the others are **Stopped**.
 
+To run a second code location on the same storage, pass it the printed endpoint with `--surreal-endpoint`, and give it another `--code-location-id` and `--grpc-port`. See [Several code locations in `rivers dev`](../guides/code-locations-locally.md).
+
 Every flag (and the module argument) can also come from configuration. Sources, from highest to lowest precedence:
 
 1. CLI flags.

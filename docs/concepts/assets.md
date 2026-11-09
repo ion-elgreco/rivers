@@ -244,7 +244,7 @@ def order_count(raw_orders: pl.DataFrame) -> int:
     return raw_orders.height
 ```
 
-- **`code_location`** — `"name"` for a code location in the same namespace, or `"namespace/name"`. In `rivers dev` the namespace is `dev`.
+- **`code_location`** — `"name"` for a code location in the same namespace, or `"namespace/name"`. In `rivers dev` the namespace is `dev`; [Several code locations in `rivers dev`](../guides/code-locations-locally.md) runs two of them on one storage.
 - **`io_handler`** — reads the owner's output, so configure it to read where the owner writes. `load_input()` gets the owner's key as `InputContext.asset_name` and the owner as `InputContext.code_location`.
 - **Lineage-only** — without `io_handler`, list the remote asset with `AssetDef.dep()`. A parameter that loads it raises `GraphValidationError`, unless the consumer sets a handler with `AssetDef.input(name, io_handler=...)`.
 - **`partitions_def`** — mirrors the owner's partition definition, so partition mappings work as for a local upstream. A dynamic definition cannot be mirrored: its keys live in the owning code location.

@@ -72,6 +72,7 @@ nav:
       - Class-Based Assets: guides/class-assets.md
       - Graph Assets: guides/graph-assets.md
       - Partitioned Assets: guides/partitioned-assets.md
+      - Several Code Locations Locally: guides/code-locations-locally.md
       - Authentication: guides/authentication.md
   - Integrations:
       - integrations/index.md
