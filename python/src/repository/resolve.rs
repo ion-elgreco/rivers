@@ -326,7 +326,7 @@ impl PyCodeRepository {
         node_map: &HashMap<String, ResolvedNode>,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
         storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
-    ) -> PyResult<()> {
+    ) -> PyResult<rivers_core::assets::graph::GraphTopology> {
         py.detach(|| {
             let mut topology = to_topology(resolved_graph);
 
@@ -362,7 +362,7 @@ impl PyCodeRepository {
             }
 
             let _ = io_rt().block_on(storage_handle.scoped().set_graph_topology(&topology));
-            Ok(())
+            Ok(topology)
         })
     }
 
@@ -531,8 +531,8 @@ impl PyCodeRepository {
         // Daemon pod will never set this env var
         let register_catalog = std::env::var("RIVERS_RUN_ID").is_err();
         if register_catalog {
-            self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
-            py.detach(|| register_code_location(&storage_handle));
+            let topology = self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+            py.detach(|| register_code_location(&storage_handle, &topology));
         }
 
         let jobs = self.validate_and_build_job_plans(
@@ -663,17 +663,23 @@ impl PyCodeRepository {
 }
 
 /// List this code location in the code location directory so others can
-/// refer to it by `namespace/name`. A failure leaves `resolve()` intact.
+/// refer to it by `namespace/name`, with the remote assets it consumes. A
+/// failure leaves `resolve()` intact.
 fn register_code_location(
     storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+    topology: &rivers_core::assets::graph::GraphTopology,
 ) {
-    use rivers_core::storage::StorageBackend;
+    use rivers_core::storage::{CodeLocationDirectoryEntry, RemoteConsumer, StorageBackend};
 
+    let entry = CodeLocationDirectoryEntry {
+        remotes: RemoteConsumer::from_topology(topology),
+        ..CodeLocationDirectoryEntry::new(storage_handle.code_location_id())
+    };
     let result = rivers_k8s::env::current_code_location_ref().and_then(|location| {
         io_rt().block_on(
             storage_handle
                 .backend()
-                .set_code_location_identity(&location, storage_handle.code_location_id()),
+                .upsert_code_location_registration(&location, entry),
         )
     });
     if let Err(e) = result {

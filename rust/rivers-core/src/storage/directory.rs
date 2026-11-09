@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use super::StorageBackend;
+use crate::assets::graph::GraphTopology;
 use crate::assets::remote::LocationRef;
 
 /// A code location's entry in the directory. Stored as JSON under
@@ -48,6 +49,37 @@ pub struct RemoteConsumer {
     pub downstream: Vec<String>,
 }
 
+impl RemoteConsumer {
+    /// The remote nodes of `topology`, each with the assets that depend on
+    /// it. A graph task counts as its graph asset.
+    pub fn from_topology(topology: &GraphTopology) -> Vec<Self> {
+        let parents: HashMap<&str, &str> = topology
+            .nodes
+            .iter()
+            .filter_map(|node| Some((node.name.as_str(), node.parent_graph.as_deref()?)))
+            .collect();
+        topology
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let remote = node.remote.as_ref()?;
+                let downstream: BTreeSet<&str> = topology
+                    .edges
+                    .iter()
+                    .filter(|(_, upstream)| *upstream == node.name)
+                    .map(|(from, _)| parents.get(from.as_str()).copied().unwrap_or(from))
+                    .collect();
+                Some(Self {
+                    local: node.name.clone(),
+                    code_location: remote.code_location.clone(),
+                    asset_key: remote.asset_key.clone(),
+                    downstream: downstream.into_iter().map(str::to_string).collect(),
+                })
+            })
+            .collect()
+    }
+}
+
 /// Storage identity of each location; `None` for a location that never
 /// registered.
 pub async fn resolve_code_locations<'a, S: StorageBackend + ?Sized>(
@@ -62,4 +94,51 @@ pub async fn resolve_code_locations<'a, S: StorageBackend + ?Sized>(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::remote::RemoteRef;
+
+    #[test]
+    fn remotes_list_their_downstream_assets() {
+        let warehouse = LocationRef::new("dev", "warehouse").unwrap();
+        let orders = TopologyNode {
+            remote: Some(RemoteRef {
+                code_location: warehouse.clone(),
+                asset_key: "raw_orders".into(),
+            }),
+            ..TopologyNode::new("orders", NodeKind::Asset)
+        };
+        let task = TopologyNode {
+            parent_graph: Some("report".into()),
+            ..TopologyNode::new("report/load", NodeKind::Task)
+        };
+        let topology = GraphTopology {
+            nodes: vec![
+                orders,
+                task,
+                TopologyNode::new("report", NodeKind::GraphAsset),
+                TopologyNode::new("order_count", NodeKind::Asset),
+                TopologyNode::new("doubled", NodeKind::Asset),
+            ],
+            edges: vec![
+                ("order_count".into(), "orders".into()),
+                ("report/load".into(), "orders".into()),
+                ("doubled".into(), "order_count".into()),
+            ],
+        };
+
+        assert_eq!(
+            RemoteConsumer::from_topology(&topology),
+            vec![RemoteConsumer {
+                local: "orders".into(),
+                code_location: warehouse,
+                asset_key: "raw_orders".into(),
+                downstream: vec!["order_count".into(), "report".into()],
+            }]
+        );
+    }
 }

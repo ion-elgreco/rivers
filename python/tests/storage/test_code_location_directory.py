@@ -58,3 +58,52 @@ def test_run_pods_do_not_list_the_code_location(storage, monkeypatch):
     _repo().resolve(storage=storage)
 
     assert _entry(storage, "code_location:dev/default") is None
+
+
+def _consumer(*, with_remote: bool) -> rs.CodeRepository:
+    @rs.Asset
+    def local() -> int:
+        return 1
+
+    if not with_remote:
+        return rs.CodeRepository(assets=[local])
+
+    orders = rs.Asset.remote(
+        "orders",
+        code_location="warehouse",
+        asset_key="raw_orders",
+        io_handler=rs.InMemoryIOHandler(),
+    )
+
+    @rs.Asset
+    def order_count(orders: list[int]) -> int:
+        return len(orders)
+
+    @rs.Asset(deps=[rs.AssetDef.dep("orders")])
+    def report() -> int:
+        return 1
+
+    return rs.CodeRepository(assets=[local, orders, order_count, report])
+
+
+def test_entry_lists_the_remote_assets_the_location_consumes(storage):
+    _consumer(with_remote=True).resolve(storage=storage)
+
+    assert _entry(storage, "code_location:dev/default") == {
+        "identity": "default",
+        "remotes": [
+            {
+                "local": "orders",
+                "code_location": "dev/warehouse",
+                "asset_key": "raw_orders",
+                "downstream": ["order_count", "report"],
+            }
+        ],
+    }
+
+
+def test_resolving_without_the_remote_drops_it(storage):
+    _consumer(with_remote=True).resolve(storage=storage)
+    _consumer(with_remote=False).resolve(storage=storage)
+
+    assert _entry(storage, "code_location:dev/default") == {"identity": "default"}
