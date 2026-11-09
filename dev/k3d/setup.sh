@@ -38,11 +38,23 @@ for img in "${code_location_images[@]}"; do
     docker push "${REGISTRY_HOST}/${img}:latest"
 done
 
+# `k3d image import <image>` fails under Docker's containerd image store
+# (`ctr: content digest sha256:...: not found`); an arm64-only tarball imports.
+import_image() {
+    local tar
+    tar="$(mktemp -d)/image.tar"
+    docker save --platform linux/arm64 "$1" -o "$tar"
+    k3d image import "$tar" -c "${CLUSTER_NAME}"
+    rm -rf "$(dirname "$tar")"
+}
+
 echo "==> Importing operator + UI images directly into k3d (pulled by tag)"
 # RIVERS_K8S_SKIP_UI=1 (CI) drops the UI image — it isn't built or deployed.
 import_images=(rivers-operator:latest)
 [ "${RIVERS_K8S_SKIP_UI:-}" = "1" ] || import_images+=(rivers-ui:latest)
-k3d image import "${import_images[@]}" -c "${CLUSTER_NAME}"
+for img in "${import_images[@]}"; do
+    import_image "$img"
+done
 
 echo "==> Importing external images"
 for img in rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3 otel/opentelemetry-collector-contrib:0.140.0; do
@@ -51,7 +63,7 @@ for img in rustfs/rustfs:latest amazon/aws-cli:latest surrealdb/surrealdb:v3 ote
     if [ "$(docker image inspect --format '{{.Architecture}}' "$img" 2>/dev/null)" != "arm64" ]; then
         docker pull --platform linux/arm64 "$img"
     fi
-    k3d image import "$img" -c "${CLUSTER_NAME}"
+    import_image "$img"
 done
 
 echo "==> helmfile sync (rivers-crds → rivers → rivers-dev)"
