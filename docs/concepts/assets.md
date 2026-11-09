@@ -226,6 +226,82 @@ source_table = rs.Asset.external(
 - **Source-only nodes** — external assets are leaf nodes in the DAG; they provide data to downstream assets but are never materialized themselves
 - **Excluded from materialization** — `materialize()` automatically filters out external assets from the execution selection, but they remain in the dependency graph so downstream assets can load their data via `io_handler.load_input()`
 
+## Remote assets
+
+A remote asset is an asset that another code location materializes. Declare it with `Asset.remote()` so that assets in this code location can depend on it. The lineage view then shows the dependency across the two code locations.
+
+```python
+# Code location "warehouse"
+@rs.Asset(io_handler=warehouse_tables)
+def raw_orders() -> pl.DataFrame: ...
+
+
+# Code location "analytics"
+raw_orders = rs.Asset.remote("raw_orders", code_location="warehouse", io_handler=warehouse_tables)
+
+@rs.Asset
+def order_count(raw_orders: pl.DataFrame) -> int:
+    return raw_orders.height
+```
+
+- **`code_location`** — `"name"` for a code location in the same namespace, or `"namespace/name"`. In `rivers dev` the namespace is `dev`.
+- **`io_handler`** — reads the owner's output, so configure it to read where the owner writes. `load_input()` gets the owner's key as `InputContext.asset_name` and the owner as `InputContext.code_location`.
+- **Lineage-only** — without `io_handler`, list the remote asset with `AssetDef.dep()`. A parameter that loads it raises `GraphValidationError`, unless the consumer sets a handler with `AssetDef.input(name, io_handler=...)`.
+- **`partitions_def`** — mirrors the owner's partition definition, so partition mappings work as for a local upstream. A dynamic definition cannot be mirrored: its keys live in the owning code location.
+- **Never materialized here** — `materialize()` and `backfill()` selections, jobs, and sensor targets that name a remote asset raise an error that names the owning code location. The remote asset gets no asset record in this code location.
+
+### Aliasing
+
+`name` is the **local name**: the node name in this code location, the parameter name, and the name in `deps=`. `asset_key` is the asset's key in the owning code location. It defaults to `name`.
+
+Local names must be unique in a code location, as all asset names must be. Two remote assets with the same local name raise `AssetDefinitionError`, also when they come from different code locations:
+
+```python
+foo = rs.Asset.remote("raw_orders", code_location="foo", io_handler=foo_tables)
+bar = rs.Asset.remote("raw_orders", code_location="bar", io_handler=bar_tables)
+rs.CodeRepository(assets=[foo, bar]).resolve()
+# AssetDefinitionError: duplicate asset name 'raw_orders': two definitions register under it
+```
+
+To use both, give each one a different local name and set `asset_key` to the owner's key:
+
+```python
+foo_orders = rs.Asset.remote("foo_orders", code_location="foo", asset_key="raw_orders", io_handler=foo_tables)
+bar_orders = rs.Asset.remote("bar_orders", code_location="bar", asset_key="raw_orders", io_handler=bar_tables)
+
+@rs.Asset
+def merged_orders(foo_orders: pd.DataFrame, bar_orders: pd.DataFrame) -> pd.DataFrame:
+    return pd.concat([foo_orders, bar_orders])
+```
+
+How each side sees the two remote assets:
+
+| | `foo_orders` | `bar_orders` |
+| --- | --- | --- |
+| Node, parameter, and `deps=` name in this code location | `foo_orders` | `bar_orders` |
+| `InputContext.asset_name` | `"raw_orders"` | `"raw_orders"` |
+| `InputContext.code_location` | `"dev/foo"` | `"dev/bar"` |
+| Lineage node label | `foo · raw_orders` | `bar · raw_orders` |
+
+Both handlers get the same `asset_name`, so each one must read from its owner's storage, for example with a different path prefix.
+
+The same alias resolves a clash with an asset of this code location:
+
+```python
+@rs.Asset
+def raw_orders() -> pd.DataFrame: ...
+
+wh_orders = rs.Asset.remote("wh_orders", code_location="warehouse", asset_key="raw_orders", io_handler=warehouse_tables)
+```
+
+### Lineage view
+
+The lineage view draws a remote asset with a dotted border, the owner's name, and the owner's key. It links to the asset in the owning code location when the UI knows that code location. Otherwise the node shows **not registered**. In `rivers dev`, the UI knows only the local code location.
+
+### Automation
+
+Automation conditions in this code location do not see the owner's materializations. A remote dependency has no asset record here, so `eager()` does not start a run when the owner materializes, and `on_cron()` does not see all dependencies updated. Runs that you start, and runs from schedules and from conditions on local dependencies, load the remote input as usual.
+
 ## Self-dependent assets
 
 An asset can read its own previously persisted value to support incremental patterns (running counters, accumulating windows, append-only state). Declare a parameter named `self` typed as `SelfDependency[T]` — the executor loads the asset's last stored value through its IO handler before invoking the function:

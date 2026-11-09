@@ -58,7 +58,7 @@ To add a second pipeline, write another `CodeLocation` and apply it; to remove o
 
 ### Operator capabilities
 
-- **`CodeLocation` reconciler** — resolves `image:tag` to an immutable digest, reconciles Deployment + Service running `rivers serve`, re-polls on `digestRefreshInterval`. Cross-code-location asset deps (RFC 035) are wired up via the discovery registry.
+- **`CodeLocation` reconciler** — resolves `image:tag` to an immutable digest, reconciles Deployment + Service running `rivers serve`, re-polls on `digestRefreshInterval`. Each code location lists itself in a storage directory, and assets depend on assets of other code locations with [`Asset.remote()`](../concepts/assets.md#remote-assets).
 - **`Run` reconciler** — each `Run` CR becomes a run pod the operator schedules and watches; when the run uses `Executor.kubernetes(...)`, that pod fans out step pods with native concurrency caps (`max_concurrent_steps`), image-pull credentials resolved from cluster secrets, and resource requests/limits per asset.
 - **Admission webhooks** — a mutating webhook stamps `spec.identity` (UUID) on create; a validating webhook rejects identity changes.
 - **Live discovery registry** — the UI dials the operator's gRPC registry; no static workspace file, no restart to pick up new locations.

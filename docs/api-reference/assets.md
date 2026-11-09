@@ -230,9 +230,9 @@ def order_count(orders: pl.DataFrame) -> int:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name` | `str` | required | Local name. Unique in this repository; no `/`. |
+| `name` | `str` | required | Local name: the node, parameter, and `deps=` name in this repository. Unique in this repository, also across remotes; no `/`. See [Aliasing](../concepts/assets.md#aliasing). |
 | `code_location` | `str` | required | Owning code location: `"name"` in this code location's namespace, or `"namespace/name"`. |
-| `asset_key` | `str \| None` | `name` | The asset's key in the owning code location. Set it to give the asset a different local name. |
+| `asset_key` | `str \| None` | `name` | The asset's key in the owning code location. Set it when the local name differs from the owner's key. |
 | `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Its `load_input()` gets `asset_key` as `InputContext.asset_name` and the owner as `InputContext.code_location`. Without it the asset is lineage-only: list it with `AssetDef.dep()`, or set a handler on the consumer's `AssetDef.input()`. |
 | `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Mirror of the owner's partition definition. Dynamic definitions and dynamic dimensions are rejected: their keys live in the owning code location. |
 | `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
