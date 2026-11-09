@@ -11,7 +11,9 @@ use crate::storage::{
     StorageBackend, resolve_code_locations,
 };
 
-use super::{AssetConditionCache, PartitionStatusEntry, run_status_is_terminal};
+use super::{
+    AssetConditionCache, PartitionStatusEntry, derive_failure_floors, run_status_is_terminal,
+};
 
 /// Wait before looking up an unregistered location again.
 const RETRY_NANOS: i64 = 5_000_000_000;
@@ -142,6 +144,8 @@ pub(super) struct RemoteScope {
     pub(super) applied_run_ids: HashMap<String, i64>,
     /// Live runs in the owner that touch a bound key.
     pub(super) live_runs: HashMap<String, LiveRemoteRun>,
+    /// Failure floors by owner key, with the failure's time.
+    pub(super) failed: HashMap<String, i64>,
 }
 
 pub(super) struct LiveRemoteRun {
@@ -177,6 +181,15 @@ pub(super) struct RemoteRead {
     records: Vec<(String, Option<AssetRecord>)>,
     /// Read for keys with a partitioned local.
     partitions: Vec<(String, RemotePartitions)>,
+}
+
+impl RemoteRead {
+    pub(super) fn record(&self, key: &str) -> Option<&AssetRecord> {
+        self.records
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, record)| record.as_ref())
+    }
 }
 
 /// An owner's partition rows for one key.
@@ -242,6 +255,30 @@ impl AssetConditionCache {
                 .flat_map(|run| &run.asset_keys)
                 .flat_map(|key| &slot.bindings[key])
         })
+    }
+
+    /// Local names of remote deps whose owner's latest run failed.
+    pub fn remote_failed_keys(&self) -> impl Iterator<Item = &String> {
+        self.remote.slots.values().flat_map(|slot| {
+            let failed = match &slot.state {
+                SlotState::Resolved { scope, .. } => Some(scope.failed.keys()),
+                SlotState::Pending | SlotState::Unresolved { .. } => None,
+            };
+            failed
+                .into_iter()
+                .flatten()
+                .flat_map(|key| &slot.bindings[key])
+        })
+    }
+
+    /// Owner keys bound to a partitioned local. A keyed run's outcome on
+    /// them lives in the partition status, not in a floor.
+    pub(super) fn partitioned_remote_keys<'s>(&self, slot: &'s RemoteSlot) -> HashSet<&'s str> {
+        slot.bindings
+            .iter()
+            .filter(|(_, locals)| locals.iter().any(|local| self.is_partitioned(local)))
+            .map(|(key, _)| key.as_str())
+            .collect()
     }
 
     /// Resolve the due locations, then follow every resolved one. Returns
@@ -402,12 +439,31 @@ impl AssetConditionCache {
         let read = self
             .read_remote_keys(&scoped, slot, slot.bindings.keys(), |_| true)
             .await?;
+
+        let failed_runs = scoped
+            .get_runs_since(0, Some(RunStatus::Failure), SortOrder::Asc)
+            .await?;
+        let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
+        let partitioned = self.partitioned_remote_keys(slot);
+        let failed = derive_failure_floors(
+            storage,
+            &failed_runs,
+            |run, key| {
+                slot.bindings.contains_key(key)
+                    && !(run.partition_key.is_some() && partitioned.contains(key))
+            },
+            |key| read.record(key),
+            &deletion_ts,
+        )
+        .await?;
+
         let scope = RemoteScope {
             ctx,
             run_cursor,
             observation_cursor,
             applied_run_ids,
             live_runs,
+            failed,
         };
         Ok((scope, read))
     }

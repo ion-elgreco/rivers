@@ -519,6 +519,7 @@ impl ConditionPass {
             .cache
             .failed_assets
             .iter()
+            .chain(self.cache.remote_failed_keys())
             .cloned()
             .chain(
                 self.cache

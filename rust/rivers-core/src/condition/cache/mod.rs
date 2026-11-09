@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use super::node::ConditionNode;
 
-use crate::storage::{AssetRecord, BackfillStatus, PartitionKey, RunStatus, StorageBackend};
+use crate::storage::{
+    AssetRecord, BackfillStatus, PartitionKey, RunRecord, RunStatus, StorageBackend,
+};
 
 mod refresh;
 mod remote;
@@ -97,6 +99,58 @@ pub(crate) fn run_status_is_terminal(status: &RunStatus) -> bool {
         status,
         RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
     )
+}
+
+/// Failure floors left by `failed_runs`, newest per asset, for the assets
+/// `counts` accepts. A failure does not floor an asset it materialized, nor
+/// one a newer materialization or whole-asset deletion outranks.
+async fn derive_failure_floors<'r, S: StorageBackend>(
+    storage: &S,
+    failed_runs: &[RunRecord],
+    counts: impl Fn(&RunRecord, &str) -> bool,
+    record: impl Fn(&str) -> Option<&'r AssetRecord>,
+    deletion_ts: &HashMap<String, i64>,
+) -> anyhow::Result<HashMap<String, i64>> {
+    let mut floors: Vec<(&str, &str, i64)> = Vec::new();
+    for run in failed_runs.iter().filter(|run| !run.is_action()) {
+        let run_ts = run.end_time.unwrap_or(run.start_time);
+        for asset in run.node_names.iter().filter(|asset| counts(run, asset)) {
+            let record = record(asset);
+            let materialized_here =
+                record.and_then(|r| r.last_run_id.as_deref()) == Some(run.run_id.as_str());
+            let outranked = record
+                .and_then(|r| r.last_timestamp)
+                .is_some_and(|mat| mat >= run_ts);
+            let deleted_after = deletion_ts
+                .get(asset.as_str())
+                .is_some_and(|&del| del >= run_ts);
+            if materialized_here || outranked || deleted_after {
+                continue;
+            }
+            floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
+        }
+    }
+
+    // The record no longer names a run that materialized the asset before
+    // a delete or a newer run moved it on. The run's own events still do.
+    if !floors.is_empty() {
+        let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
+        let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        let built = storage.materialized_by_runs(&assets, &runs).await?;
+        floors.retain(|(asset, run_id, _)| {
+            !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
+        });
+    }
+
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for (asset, _, run_ts) in floors {
+        out.entry(asset.to_string())
+            .and_modify(|t| *t = (*t).max(run_ts))
+            .or_insert(run_ts);
+    }
+    Ok(out)
 }
 
 impl AssetConditionCache {
@@ -391,49 +445,21 @@ impl AssetConditionCache {
         // `outranked` would otherwise read, so without this every restart
         // resurrects a deleted asset's long-superseded floors.
         let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
-        let mut floors: Vec<(&str, &str, i64)> = Vec::new();
-        for run in &failed_runs {
-            if run.is_action() {
-                continue;
-            }
-            let run_ts = run.end_time.unwrap_or(run.start_time);
-            for asset in &run.node_names {
-                if self.remote.is_local(asset)
-                    || (run.partition_key.is_some() && self.is_partitioned(asset))
-                {
-                    continue;
-                }
-                let record = self.records.get(asset.as_str());
-                let materialized_here =
-                    record.and_then(|r| r.last_run_id.as_deref()) == Some(run.run_id.as_str());
-                let outranked = record
-                    .and_then(|r| r.last_timestamp)
-                    .is_some_and(|mat| mat >= run_ts);
-                let deleted_after = deletion_ts
-                    .get(asset.as_str())
-                    .is_some_and(|&del| del >= run_ts);
-                if materialized_here || outranked || deleted_after {
-                    continue;
-                }
-                floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
-            }
-        }
-        // The record no longer names a run that materialized the asset before
-        // a delete or a newer run moved it on. The run's own events still do.
-        if !floors.is_empty() {
-            let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
-            let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
-            runs.sort_unstable();
-            runs.dedup();
-            let built = storage.materialized_by_runs(&assets, &runs).await?;
-            floors.retain(|(asset, run_id, _)| {
-                !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
-            });
-        }
-        for (asset, _, run_ts) in floors {
-            self.failed_assets.insert(asset.to_string());
+        let floors = derive_failure_floors(
+            storage,
+            &failed_runs,
+            |run, asset| {
+                !self.remote.is_local(asset)
+                    && !(run.partition_key.is_some() && self.is_partitioned(asset))
+            },
+            |asset| self.records.get(asset),
+            &deletion_ts,
+        )
+        .await?;
+        for (asset, run_ts) in floors {
+            self.failed_assets.insert(asset.clone());
             self.failed_asset_timestamps
-                .entry(asset.to_string())
+                .entry(asset)
                 .and_modify(|t| *t = (*t).max(run_ts))
                 .or_insert(run_ts);
         }

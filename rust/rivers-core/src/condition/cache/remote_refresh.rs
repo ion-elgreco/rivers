@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::assets::remote::LocationRef;
-use crate::storage::{RunRecord, SortOrder, StorageBackend};
+use crate::storage::{RunRecord, RunStatus, ScopedStorage, SortOrder, StorageBackend};
 
 use super::remote::{LiveRemoteRun, RemoteRead, RemoteScope, SlotState};
 use super::{AssetConditionCache, run_status_is_terminal};
@@ -20,6 +20,10 @@ struct ScopeDelta {
     /// because an action run can delete rows.
     touched: HashSet<String>,
     reload: HashSet<String>,
+    /// Owner keys a failed run floors: the newest failure's time and run.
+    failed: HashMap<String, (i64, String)>,
+    /// Owner keys a success or a deletion clears, with its time.
+    cleared: HashMap<String, i64>,
     run_cursor: Option<i64>,
     observation_cursor: Option<i64>,
 }
@@ -31,6 +35,81 @@ impl ScopeDelta {
             self.reload.extend(run.asset_keys.iter().cloned());
         }
     }
+
+    /// `run` ended: re-read its keys, and floor or clear them by its outcome.
+    fn end(&mut self, run: &RunRecord, live: &LiveRemoteRun, partitioned: &HashSet<&str>) {
+        self.touch(live);
+        if live.action {
+            return;
+        }
+        let ts = run.end_time.unwrap_or(run.start_time);
+        for key in &live.asset_keys {
+            if run.partition_key.is_some() && partitioned.contains(key.as_str()) {
+                continue;
+            }
+            match run.status {
+                RunStatus::Failure => {
+                    let newest = self
+                        .failed
+                        .entry(key.clone())
+                        .or_insert((ts, run.run_id.clone()));
+                    if ts > newest.0 {
+                        *newest = (ts, run.run_id.clone());
+                    }
+                }
+                RunStatus::Success => self.clear(key.clone(), ts),
+                _ => {}
+            }
+        }
+    }
+
+    fn clear(&mut self, key: String, ts: i64) {
+        let newest = self.cleared.entry(key).or_insert(ts);
+        *newest = (*newest).max(ts);
+    }
+
+    /// A failed run did not fail a key it materialized itself, and a
+    /// whole-asset deletion clears older floors.
+    async fn settle_floors<S: StorageBackend>(
+        &mut self,
+        storage: &S,
+        scoped: &ScopedStorage<'_, S>,
+        read: &RemoteRead,
+    ) -> anyhow::Result<()> {
+        if !self.failed.is_empty() {
+            let keys: Vec<String> = self.failed.keys().cloned().collect();
+            let mut runs: Vec<String> = self.failed.values().map(|(_, id)| id.clone()).collect();
+            runs.sort_unstable();
+            runs.dedup();
+            let built = storage.materialized_by_runs(&keys, &runs).await?;
+            let materialized: Vec<(String, i64)> = self
+                .failed
+                .iter()
+                .filter(|(key, (_, run_id))| {
+                    read.record(key).and_then(|r| r.last_run_id.as_deref()) == Some(run_id)
+                        || built.get(*key).is_some_and(|runs| runs.contains(run_id))
+                })
+                .map(|(key, (ts, _))| (key.clone(), *ts))
+                .collect();
+            for (key, ts) in materialized {
+                self.failed.remove(&key);
+                self.clear(key, ts);
+            }
+        }
+
+        if !self.reload.is_empty() {
+            let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
+            let deleted: Vec<(String, i64)> = self
+                .reload
+                .iter()
+                .filter_map(|key| Some((key.clone(), *deletion_ts.get(key)?)))
+                .collect();
+            for (key, ts) in deleted {
+                self.clear(key, ts);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RemoteScope {
@@ -38,6 +117,7 @@ impl RemoteScope {
         &self,
         storage: &S,
         bindings: &HashMap<String, Vec<String>>,
+        partitioned: &HashSet<&str>,
     ) -> anyhow::Result<ScopeDelta> {
         let mut delta = ScopeDelta::default();
 
@@ -51,11 +131,13 @@ impl RemoteScope {
             for (run_id, live) in &self.live_runs {
                 match found.get(run_id.as_str()) {
                     Some(run) if !run_status_is_terminal(&run.status) => continue,
-                    Some(run) => delta.applied.push((run.run_id.clone(), run.start_time)),
-                    None => {}
+                    Some(run) => {
+                        delta.applied.push((run.run_id.clone(), run.start_time));
+                        delta.end(run, live, partitioned);
+                    }
+                    None => delta.touch(live),
                 }
                 delta.ended.insert(run_id.clone());
-                delta.touch(live);
             }
         }
 
@@ -79,7 +161,7 @@ impl RemoteScope {
                     delta.ended.insert(run.run_id.clone());
                 }
                 delta.applied.push((run.run_id.clone(), run.start_time));
-                delta.touch(&live);
+                delta.end(run, &live, partitioned);
             }
         }
         delta.run_cursor = new_runs
@@ -119,16 +201,18 @@ impl AssetConditionCache {
         let SlotState::Resolved { scope, .. } = &slot.state else {
             return false;
         };
+        let partitioned = self.partitioned_remote_keys(slot);
         let fetched = async {
-            let delta = scope.fetch_delta(storage, &slot.bindings).await?;
-            let read = self
-                .read_remote_keys(
-                    &storage.for_code_location(&scope.ctx),
-                    slot,
-                    &delta.touched,
-                    |key| delta.reload.contains(key),
-                )
+            let mut delta = scope
+                .fetch_delta(storage, &slot.bindings, &partitioned)
                 .await?;
+            let scoped = storage.for_code_location(&scope.ctx);
+            let read = self
+                .read_remote_keys(&scoped, slot, &delta.touched, |key| {
+                    delta.reload.contains(key)
+                })
+                .await?;
+            delta.settle_floors(storage, &scoped, &read).await?;
             anyhow::Ok((delta, read))
         }
         .await;
@@ -171,6 +255,21 @@ impl AssetConditionCache {
                 }
             }
             scope.live_runs.insert(run_id, run);
+        }
+
+        // Floors before clears: a clear older than the floor leaves it.
+        for (key, (ts, _)) in delta.failed {
+            let floor = scope.failed.entry(key).or_insert_with(|| {
+                changed = true;
+                ts
+            });
+            *floor = (*floor).max(ts);
+        }
+        for (key, ts) in delta.cleared {
+            if scope.failed.get(&key).is_some_and(|&floor| floor <= ts) {
+                scope.failed.remove(&key);
+                changed = true;
+            }
         }
 
         scope.applied_run_ids.extend(delta.applied);

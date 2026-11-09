@@ -878,3 +878,126 @@ async fn eager_maps_the_previous_day_onto_the_owners_partitions() {
     let fired = planned_keys(&pass.run(SEC, false).plan);
     assert!(fired.contains("2024-01-04"), "{fired:?}");
 }
+
+fn failed(cache: &AssetConditionCache) -> HashSet<&str> {
+    cache.remote_failed_keys().map(String::as_str).collect()
+}
+
+#[tokio::test]
+async fn execution_failed_follows_the_owners_runs() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    register(
+        &storage,
+        DEFAULT_CODE_LOCATION_ID,
+        vec![make_materialized_record("summary", 500)],
+    )
+    .await;
+    set_edges(&storage, &[("summary", "orders")]).await;
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+
+    let mut pass = pass_with(
+        "summary",
+        ConditionNode::any_deps_match(ConditionNode::ExecutionFailed),
+        vec![remote("orders", "raw_orders")],
+        ConditionEvalState::default(),
+    );
+    pass.refresh_cache(&storage, 0).await.unwrap();
+    assert!(pass.run(0, false).plan.is_empty());
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Failure,
+            &["raw_orders"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+    assert!(pass.refresh_cache(&storage, SEC).await.unwrap());
+    assert_eq!(
+        pass.run(SEC, false).plan.unpartitioned,
+        vec!["summary".to_string()]
+    );
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-3",
+            RunStatus::Success,
+            &["raw_orders"],
+            None,
+            3_000,
+        ))
+        .await
+        .unwrap();
+    materialize(&storage, "wh", "raw_orders", "run-3", None, 3_000).await;
+    assert!(pass.refresh_cache(&storage, 2 * SEC).await.unwrap());
+    assert!(failed(&pass.cache).is_empty());
+    assert!(pass.run(2 * SEC, false).plan.is_empty());
+}
+
+#[tokio::test]
+async fn owner_failure_floors_its_key_at_load() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Failure,
+            &["raw_orders"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+
+    let mut cache = cache_with(vec![
+        remote("orders", "raw_orders"),
+        remote("orders_again", "raw_orders"),
+    ]);
+    cache.refresh(&storage, 0).await.unwrap();
+    assert_eq!(failed(&cache), HashSet::from(["orders", "orders_again"]));
+    assert!(cache.failed_assets.is_empty());
+}
+
+#[tokio::test]
+async fn owner_failure_that_materialized_the_key_sets_no_floor() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    warehouse_owning(
+        &storage,
+        vec![make_materialized_record("raw_orders", 1_000)],
+    )
+    .await;
+    let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    storage
+        .create_run(&run(
+            "wh",
+            "run-2",
+            RunStatus::Failure,
+            &["raw_orders", "later_step"],
+            None,
+            2_000,
+        ))
+        .await
+        .unwrap();
+    materialize(&storage, "wh", "raw_orders", "run-2", None, 2_000).await;
+    cache.refresh(&storage, SEC).await.unwrap();
+    assert!(failed(&cache).is_empty());
+
+    let mut reloaded = cache_with(vec![remote("orders", "raw_orders")]);
+    reloaded.refresh(&storage, 0).await.unwrap();
+    assert!(failed(&reloaded).is_empty());
+}
