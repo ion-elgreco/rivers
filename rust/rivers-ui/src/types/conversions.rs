@@ -225,6 +225,11 @@ impl From<rivers_core::assets::graph::GraphTopology> for GraphTopology {
                     kind: n.kind.as_str().to_string(),
                     group: n.group,
                     parent_graph: n.parent_graph,
+                    remote: n.remote.map(|r| crate::types::RemoteNode {
+                        code_location: r.code_location.to_string(),
+                        asset_key: r.asset_key,
+                        resolved: false,
+                    }),
                 })
                 .collect(),
             edges: g.edges,

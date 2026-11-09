@@ -337,6 +337,9 @@ fn render_node_full(
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
     let is_changed = changed_keys.contains(&node.id);
+    let remote = node.remote.as_ref();
+    let is_remote = remote.is_some();
+    let is_unresolved = remote.is_some_and(|r| !r.resolved);
 
     // When a node is selected, dim nodes outside the lineage
     let opacity = if has_selection && !is_in_lineage {
@@ -376,7 +379,7 @@ fn render_node_full(
 
     let stroke_color = if let Some(lc) = lineage_stroke {
         lc
-    } else if is_external {
+    } else if is_external || is_remote {
         "#535559"
     } else if is_changed {
         "#ff8f78"
@@ -398,10 +401,11 @@ fn render_node_full(
 
     // Leaf name for primary text (Rivers: a.key.split("/").pop())
     let leaf_name: String = node.id.rsplit('/').next().unwrap_or(&node.id).to_string();
-    let secondary_text: String = match (&node.group, kind_text) {
-        (Some(g), k) if !k.is_empty() => format!("{g} · {k}"),
-        (Some(g), _) => g.clone(),
-        (None, k) => k.to_string(),
+    let secondary_text: String = match (remote, &node.group, kind_text) {
+        (Some(r), _, _) => r.label(),
+        (None, Some(g), k) if !k.is_empty() => format!("{g} · {k}"),
+        (None, Some(g), _) => g.clone(),
+        (None, None, k) => k.to_string(),
     };
 
     // Ellipsis-truncate to fit the available capsule width. The right end of
@@ -436,7 +440,21 @@ fn render_node_full(
             secondary_text
         };
 
-    let tooltip = node.id.clone();
+    let tooltip = match remote {
+        Some(r) if r.resolved => format!("{}: {} in {}", node.id, r.asset_key, r.code_location),
+        Some(r) => format!(
+            "{}: {} in {} (code location not registered)",
+            node.id, r.asset_key, r.code_location
+        ),
+        None => node.id.clone(),
+    };
+    let dash = if is_remote {
+        "2 3"
+    } else if is_external {
+        "5 3"
+    } else {
+        ""
+    };
 
     let node_id_ctx = node.id.clone();
     let node_view = view! {
@@ -469,7 +487,7 @@ fn render_node_full(
                 fill="#171a1d"
                 stroke={stroke_color}
                 stroke-width={stroke_width}
-                stroke-dasharray=move || if is_external { "5 3" } else { "" }
+                stroke-dasharray=dash
                 filter="url(#node-shadow)"
             />
 
@@ -491,11 +509,14 @@ fn render_node_full(
             })}
 
             // Status dot (LEFT side, inside the capsule)
+            // Hollow for a remote: its state lives in the owning code location.
             <circle
                 cx={status_x.to_string()}
                 cy={status_y.to_string()}
                 r="5"
-                fill={status_color}
+                fill={if is_remote { "none" } else { status_color }}
+                stroke={if is_remote { "#8b8f9e" } else { "none" }}
+                stroke-width="1.5"
             >
             </circle>
             // Running ripple (when materialized and within current lineage selection)
@@ -554,6 +575,36 @@ fn render_node_full(
                 }
             })}
 
+            {is_unresolved.then(|| {
+                let chip_w = 72.0;
+                let chip_x = x + w - chip_w - 6.0;
+                let chip_y = y - 6.0;
+                view! {
+                    <g class="dag-node-unregistered">
+                        <rect
+                            x={chip_x.to_string()}
+                            y={chip_y.to_string()}
+                            width={chip_w.to_string()}
+                            height="12"
+                            rx="2"
+                            fill="#24272b"
+                            stroke="#535559"
+                            stroke-width="1"
+                        />
+                        <text
+                            x={(chip_x + chip_w / 2.0).to_string()}
+                            y={(chip_y + 9.0).to_string()}
+                            text-anchor="middle"
+                            fill="#b4b8c2"
+                            font-size="8"
+                            font-family="JetBrains Mono, monospace"
+                        >
+                            "not registered"
+                        </text>
+                    </g>
+                }
+            })}
+
             // "NEW" chip — shown when the deploy view flags this node as changed
             {is_changed.then(|| {
                 let chip_x = x + w - 30.0;
@@ -586,16 +637,28 @@ fn render_node_full(
     };
 
     if on_node_click.is_some() {
-        node_view.into_any()
-    } else {
-        let (lns, lnm) = crate::loc::use_current_location().get();
-        let href = crate::loc::loc_path(&lns, &lnm, &format!("assets/{}", node.id));
-        view! {
+        return node_view.into_any();
+    }
+    let href = match remote {
+        Some(r) if r.resolved => Some(r.href()),
+        Some(_) => None,
+        None => {
+            let (lns, lnm) = crate::loc::use_current_location().get();
+            Some(crate::loc::loc_path(
+                &lns,
+                &lnm,
+                &format!("assets/{}", node.id),
+            ))
+        }
+    };
+    match href {
+        Some(href) => view! {
             <a href={href}>
                 {node_view}
             </a>
         }
-        .into_any()
+        .into_any(),
+        None => node_view.into_any(),
     }
 }
 

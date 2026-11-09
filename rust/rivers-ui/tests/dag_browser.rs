@@ -35,6 +35,7 @@ fn node(id: &str, kind: &str, x: f64, y: f64) -> LayoutNode {
         kind: kind.to_string(),
         group: None,
         parent_graph: None,
+        remote: None,
         x,
         y,
         width: 160.0,
@@ -308,5 +309,67 @@ fn changed_keys_attach_new_chip_to_node() {
     assert!(
         body_text.contains("NEW"),
         "expected NEW chip text, got: {body_text}"
+    );
+}
+
+fn remote_layout(resolved: bool) -> LayoutResult {
+    let mut layout = small_layout();
+    layout.nodes[0].remote = Some(rivers_ui::types::RemoteNode {
+        code_location: "team-sales/warehouse".to_string(),
+        asset_key: "raw_orders".to_string(),
+        resolved,
+    });
+    layout
+}
+
+#[wasm_bindgen_test]
+fn remote_node_shows_its_owner_with_a_dotted_capsule() {
+    let target = fresh_mount_target();
+    let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+    let _handle = mount_to(target.clone(), move || {
+        view! {
+            <DagGraph
+                layout=remote_layout(true)
+                on_node_click=Callback::new(|_| {})
+                viewport=Signal::derive(move || viewport.get())
+            />
+        }
+    });
+
+    assert_eq!(query_all(&target, "rect[stroke-dasharray='2 3']").len(), 1);
+    assert_eq!(
+        query_all(&target, "g.dag-node circle[fill='none']").len(),
+        1
+    );
+    let title = query_one(&target, "g.dag-node title")
+        .text_content()
+        .unwrap_or_default();
+    assert_eq!(title, "upstream: raw_orders in team-sales/warehouse");
+    let text = target.text_content().unwrap_or_default();
+    assert!(text.contains("warehouse · raw_"), "got: {text}");
+    assert!(query_all(&target, "g.dag-node-unregistered").is_empty());
+}
+
+#[wasm_bindgen_test]
+fn unresolved_remote_node_carries_a_not_registered_chip() {
+    let target = fresh_mount_target();
+    let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+    let _handle = mount_to(target.clone(), move || {
+        view! {
+            <DagGraph
+                layout=remote_layout(false)
+                on_node_click=Callback::new(|_| {})
+                viewport=Signal::derive(move || viewport.get())
+            />
+        }
+    });
+
+    let chips = query_all(&target, "g.dag-node-unregistered");
+    assert_eq!(chips.len(), 1);
+    assert!(
+        chips[0]
+            .text_content()
+            .unwrap_or_default()
+            .contains("not registered")
     );
 }

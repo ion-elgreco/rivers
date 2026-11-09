@@ -136,6 +136,40 @@ pub struct TopologyNode {
     pub group: Option<String>,
     #[serde(default)]
     pub parent_graph: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteNode>,
+}
+
+/// The owner of a remote node: another code location materializes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteNode {
+    /// `"namespace/name"`.
+    pub code_location: String,
+    /// The asset's key in the owning code location.
+    pub asset_key: String,
+    /// This UI knows the owning code location, so the node can link to it.
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+impl RemoteNode {
+    /// `(namespace, name)` of the owning code location.
+    pub fn location(&self) -> (&str, &str) {
+        self.code_location
+            .split_once('/')
+            .unwrap_or(("", &self.code_location))
+    }
+
+    /// The asset's page in its owning code location.
+    pub fn href(&self) -> String {
+        let (ns, name) = self.location();
+        crate::loc::loc_path(ns, name, &format!("assets/{}", self.asset_key))
+    }
+
+    /// `"warehouse · raw_orders"`.
+    pub fn label(&self) -> String {
+        format!("{} · {}", self.location().1, self.asset_key)
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +182,7 @@ mod topology_tests {
             kind: "asset".into(),
             group: None,
             parent_graph: None,
+            remote: None,
         }
     }
 
@@ -157,6 +192,7 @@ mod topology_tests {
             kind: "task".into(),
             group: None,
             parent_graph: Some(graph.into()),
+            remote: None,
         }
     }
 
@@ -242,6 +278,21 @@ mod topology_tests {
         let tasks = topo.visible(&["task".into()], &[], &["b".into()]);
         assert_eq!(names(&tasks), vec!["t"]);
         assert!(tasks.edges.is_empty());
+    }
+
+    #[test]
+    fn remote_node_links_to_the_owning_location() {
+        let remote = super::RemoteNode {
+            code_location: "team-sales/warehouse".into(),
+            asset_key: "raw_orders".into(),
+            resolved: true,
+        };
+        assert_eq!(remote.location(), ("team-sales", "warehouse"));
+        assert_eq!(
+            remote.href(),
+            "/locations/team-sales/warehouse/assets/raw_orders"
+        );
+        assert_eq!(remote.label(), "warehouse · raw_orders");
     }
 
     /// `summary` depends on `raw_data` → edge `(summary, raw_data)`. Selecting

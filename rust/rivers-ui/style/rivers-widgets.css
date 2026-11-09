@@ -936,6 +936,7 @@
 .dag-legend-dot--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
 .dag-legend-dot--stale { background: var(--text-muted); opacity: 0.55; }
 .dag-legend-dot--external { background: transparent; border: 1px solid var(--text-muted); }
+.dag-legend-dot--remote { background: transparent; border: 1px dotted var(--text); }
 
 /* Mini-lineage hover popover on asset rows */
 .mini-lineage-host { position: relative; }

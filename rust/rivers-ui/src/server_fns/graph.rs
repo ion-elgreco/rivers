@@ -45,6 +45,28 @@ async fn load_topology(
     Ok(topo)
 }
 
+/// The UI topology, with each remote node marked resolved when the registry
+/// knows its owning code location.
+#[cfg(feature = "ssr")]
+async fn load_ui_topology(loc_ns: &str, loc_name: &str) -> Result<GraphTopology, ServerFnError> {
+    let mut topo: GraphTopology = load_topology(loc_ns, loc_name).await?.into();
+    let state = expect_context::<crate::state::AppState>();
+    let mut known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for remote in topo.nodes.iter_mut().filter_map(|n| n.remote.as_mut()) {
+        let resolved = match known.get(&remote.code_location) {
+            Some(&resolved) => resolved,
+            None => {
+                let (ns, name) = remote.location();
+                let resolved = state.registry.lookup(ns, name).await.is_some();
+                known.insert(remote.code_location.clone(), resolved);
+                resolved
+            }
+        };
+        remote.resolved = resolved;
+    }
+    Ok(topo)
+}
+
 /// Layout of what the lineage page shows: the kind and group filters, with
 /// graph assets outside `expanded` collapsed. See [`GraphTopology::visible`].
 #[server(input = Json)]
@@ -56,8 +78,7 @@ pub async fn get_graph_layout(
     groups: Vec<String>,
     expanded: Vec<String>,
 ) -> Result<LayoutResult, ServerFnError> {
-    let core_topo = load_topology(&loc_ns, &loc_name).await?;
-    let topo: GraphTopology = core_topo.into();
+    let topo = load_ui_topology(&loc_ns, &loc_name).await?;
     Ok(compute_layout(
         &topo.visible(&kinds, &groups, &expanded),
         center_layers,
@@ -69,8 +90,7 @@ pub async fn get_graph_topology(
     loc_ns: String,
     loc_name: String,
 ) -> Result<GraphTopology, ServerFnError> {
-    let core_topo = load_topology(&loc_ns, &loc_name).await?;
-    Ok(core_topo.into())
+    load_ui_topology(&loc_ns, &loc_name).await
 }
 
 /// Returns (ancestors, descendants) for the given node name.

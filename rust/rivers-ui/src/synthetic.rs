@@ -63,6 +63,7 @@ pub fn generate_synthetic_graph(target_nodes: usize) -> GraphTopology {
                 kind: kind.to_string(),
                 group,
                 parent_graph: None,
+                remote: None,
             });
 
             if layer > 0 {

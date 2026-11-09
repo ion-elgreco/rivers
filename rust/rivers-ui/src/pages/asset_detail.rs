@@ -799,6 +799,15 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let current_key = key();
                     let topo = graph.get().and_then(|r| r.ok());
                     let records_by_key = records_by_key.get();
+                    let remotes: std::collections::HashMap<String, crate::types::RemoteNode> = topo
+                        .as_ref()
+                        .map(|t| {
+                            t.nodes
+                                .iter()
+                                .filter_map(|n| n.remote.clone().map(|r| (n.name.clone(), r)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&current_key), t.direct_downstream(&current_key)))
@@ -816,6 +825,27 @@ pub fn AssetDetailPage() -> impl IntoView {
                             }.into_any()
                         } else {
                             let rows: Vec<_> = keys.into_iter().map(|dep| {
+                                if let Some(remote) = remotes.get(&dep) {
+                                    let style = "border-left-color: var(--text-muted); border-left-style: dotted";
+                                    let row = view! {
+                                        <span class="lineage-row-key">{dep}</span>
+                                        <span class="lineage-row-kind">"remote"</span>
+                                        <span class="lineage-row-mat">{remote.label()}</span>
+                                    };
+                                    return if remote.resolved {
+                                        view! {
+                                            <A href=remote.href() attr:class="lineage-row" attr:style=style>{row}</A>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div
+                                                class="lineage-row"
+                                                style=style
+                                                title=format!("Code location {} is not registered with this UI", remote.code_location)
+                                            >{row}</div>
+                                        }.into_any()
+                                    };
+                                }
                                 let href = loc_path(&lns, &lnm, &format!("assets/{}", dep));
                                 let rec = records.get(&dep);
                                 let kind_text = rec
@@ -838,7 +868,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                             <crate::now::RelTimeOpt ts=mat_ts/>
                                         </span>
                                     </A>
-                                }
+                                }.into_any()
                             }).collect();
                             view! {
                                 <div>
