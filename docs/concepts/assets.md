@@ -249,6 +249,7 @@ def order_count(raw_orders: pl.DataFrame) -> int:
 - **Lineage-only** — without `io_handler`, list the remote asset with `AssetDef.dep()`. A parameter that loads it raises `GraphValidationError`, unless the consumer sets a handler with `AssetDef.input(name, io_handler=...)`.
 - **`partitions_def`** — mirrors the owner's partition definition, so partition mappings work as for a local upstream. A dynamic definition cannot be mirrored: its keys live in the owning code location.
 - **Never materialized here** — `materialize()` and `backfill()` selections, jobs, and sensor targets that name a remote asset raise an error that names the owning code location. The remote asset gets no asset record in this code location.
+- **Data versions** — a run records the owner's data version of a remote input under the local name, as for a local input. If the owning code location is not registered, the run loads the input through the handler without its data version. It then writes a warning to the log of each step that loads the input.
 
 ### Aliasing
 

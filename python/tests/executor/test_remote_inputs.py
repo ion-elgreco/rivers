@@ -1,0 +1,219 @@
+"""A run records the data version of a remote input from the owner's scope.
+
+Repositories share one store under the identities ``warehouse`` and ``shop``
+(owners) and ``analytics`` (the consumer).
+"""
+
+from pathlib import Path
+
+import obstore
+import pytest
+
+import rivers as rs
+
+from _helpers import EXECUTORS
+
+_ENV = (
+    "RIVERS_CODE_LOCATION_ID",
+    "RIVERS_CODE_LOCATION_NAME",
+    "RIVERS_CODE_LOCATION_NAMESPACE",
+    "RIVERS_NAMESPACE",
+    "RIVERS_DEPLOYMENT",
+    "RIVERS_RUN_ID",
+)
+
+NOT_REGISTERED = (
+    "code location 'dev/warehouse' is not registered; loading 'raw_orders' "
+    "through the handler without data-version tracking"
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for name in _ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def _pickle_handler(root: Path) -> rs.PickleIOHandler:
+    return rs.PickleIOHandler(store=obstore.store.LocalStore(str(root), mkdir=True))
+
+
+def _resolve_as(assets, storage, monkeypatch, identity, executor=None):
+    repo = rs.CodeRepository(assets=assets, default_executor=executor)
+    monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", identity)
+    repo.resolve(storage=storage)
+    return repo
+
+
+def _owner(handler, storage, monkeypatch, identity="warehouse", rows=(1, 2, 3)):
+    """Materialize ``raw_orders`` as ``identity``; return its data version."""
+
+    @rs.Asset(io_handler=handler)
+    def raw_orders() -> list[int]:
+        return list(rows)
+
+    owner = _resolve_as([raw_orders], storage, monkeypatch, identity)
+    assert owner.materialize().success
+    record = storage._scoped(identity).get_asset_record("raw_orders")
+    assert record is not None and record.last_data_version is not None
+    return record.last_data_version
+
+
+def _sibling(handler) -> rs.SingleAsset:
+    """A second step: the parallel executor runs a lone step in-process."""
+
+    @rs.Asset(io_handler=handler)
+    def sibling() -> int:
+        return 1
+
+    return sibling
+
+
+def _input_versions(storage, asset: str) -> list[tuple[str, str]]:
+    record = storage._scoped("analytics").get_asset_record(asset)
+    assert record is not None
+    return sorted(record.last_input_data_versions)
+
+
+def _logs(storage, run_id: str) -> dict[str, str]:
+    """Each step's Rust log output, across its log rows."""
+    logs: dict[str, str] = {}
+    for log in storage._scoped("analytics").get_run_logs(run_id):
+        logs[log.step_key] = logs.get(log.step_key, "") + (log.logs or "")
+    return logs
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_remote_input_records_the_owners_data_version(
+    executor, embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    owner_dv = _owner(handler, embedded_storage, monkeypatch)
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler
+    )
+
+    @rs.Asset(io_handler=handler)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    consumer = _resolve_as(
+        [orders, order_count, _sibling(handler)],
+        embedded_storage,
+        monkeypatch,
+        "analytics",
+        executor,
+    )
+    result = consumer.materialize()
+
+    assert result.success
+    assert _input_versions(embedded_storage, "order_count") == [
+        ("raw_orders", owner_dv)
+    ]
+    assert NOT_REGISTERED not in "".join(
+        _logs(embedded_storage, result.run_id).values()
+    )
+
+
+def test_aliases_record_each_owners_version_under_the_local_name(
+    embedded_storage, tmp_path, monkeypatch
+):
+    warehouse = _pickle_handler(tmp_path / "warehouse")
+    shop = _pickle_handler(tmp_path / "shop")
+    warehouse_dv = _owner(warehouse, embedded_storage, monkeypatch)
+    shop_dv = _owner(shop, embedded_storage, monkeypatch, identity="shop", rows=(4,))
+    foo_orders = rs.Asset.remote(
+        "foo_orders",
+        code_location="warehouse",
+        asset_key="raw_orders",
+        io_handler=warehouse,
+    )
+    bar_orders = rs.Asset.remote(
+        "bar_orders", code_location="shop", asset_key="raw_orders", io_handler=shop
+    )
+
+    @rs.Asset(io_handler=warehouse)
+    def merged_orders(foo_orders: list[int], bar_orders: list[int]) -> list[int]:
+        return foo_orders + bar_orders
+
+    consumer = _resolve_as(
+        [foo_orders, bar_orders, merged_orders],
+        embedded_storage,
+        monkeypatch,
+        "analytics",
+    )
+
+    assert consumer.materialize().success
+    assert consumer.load_node("merged_orders") == [1, 2, 3, 4]
+    assert _input_versions(embedded_storage, "merged_orders") == [
+        ("bar_orders", shop_dv),
+        ("foo_orders", warehouse_dv),
+    ]
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_unregistered_owner_loads_with_a_warning(
+    executor, storage, embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    _owner(handler, storage, monkeypatch)
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler
+    )
+
+    @rs.Asset(io_handler=handler)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    consumer = _resolve_as(
+        [orders, order_count, _sibling(handler)],
+        embedded_storage,
+        monkeypatch,
+        "analytics",
+        executor,
+    )
+    result = consumer.materialize()
+
+    assert result.success
+    assert consumer.load_node("order_count") == 3
+    assert _input_versions(embedded_storage, "order_count") == []
+    logs = _logs(embedded_storage, result.run_id)
+    assert NOT_REGISTERED in logs["order_count"]
+    assert NOT_REGISTERED not in logs.get("sibling", "")
+
+
+def test_lineage_only_remote_records_the_version_without_loading(
+    embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    owner_dv = _owner(handler, embedded_storage, monkeypatch)
+    orders = rs.Asset.remote("raw_orders", code_location="warehouse")
+
+    @rs.Asset(io_handler=handler, deps=[rs.AssetDef.dep("raw_orders")])
+    def report() -> int:
+        return 1
+
+    consumer = _resolve_as([orders, report], embedded_storage, monkeypatch, "analytics")
+
+    assert consumer.materialize().success
+    assert _input_versions(embedded_storage, "report") == [("raw_orders", owner_dv)]
+
+
+def test_lineage_only_remote_of_an_unregistered_owner_warns_nothing(
+    embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    orders = rs.Asset.remote("raw_orders", code_location="warehouse")
+
+    @rs.Asset(io_handler=handler, deps=[rs.AssetDef.dep("raw_orders")])
+    def report() -> int:
+        return 1
+
+    consumer = _resolve_as([orders, report], embedded_storage, monkeypatch, "analytics")
+    result = consumer.materialize()
+
+    assert result.success
+    assert _input_versions(embedded_storage, "report") == []
+    assert NOT_REGISTERED not in "".join(
+        _logs(embedded_storage, result.run_id).values()
+    )
