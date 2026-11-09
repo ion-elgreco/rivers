@@ -68,6 +68,13 @@ releases:
           - name: {{ env "RIVERS_K8S_DEMO_CODE_LOCATION" | default "demo" }}
             image: k3d-rivers-registry:5000/rivers-demo
             module: demo_project.pipeline
+          # Assets of `demo` as remote assets; same image, another module.
+          - name: {{ env "RIVERS_K8S_DEMO_CODE_LOCATION" | default "demo" }}-downstream
+            image: k3d-rivers-registry:5000/rivers-demo
+            module: demo_project.downstream
+            env:
+              - name: RIVERS_DEMO_CODE_LOCATION
+                value: {{ env "RIVERS_K8S_DEMO_CODE_LOCATION" | default "demo" | quote }}
 {{- end }}
 {{- if eq (env "RIVERS_K8S_AUTH") "1" }}
 

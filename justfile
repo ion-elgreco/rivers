@@ -351,7 +351,7 @@ k8s-code-location project="test": _k8s-wheel
     rm -rf deploy/staging
 
 # Push a code-location image to the k3d local registry and re-roll the
-# code-location deployment with the new digest (test or demo). The operator
+# code-location deployments with the new digest (test, or demo and demo-downstream). The operator
 # resolves digests directly (allowInsecureRegistry=true on this cluster), but
 # its in-memory cache is keyed by (registry, repo, tag) so we restart the
 # operator to drop the cached `latest` digest before reconcile picks up the
@@ -364,11 +364,12 @@ k8s-deploy project="test": (k8s-code-location project)
     if [ "{{ project }}" = "demo" ]; then
         SRC_IMAGE="rivers-demo:latest"
         REPO="rivers-demo"
-        CR_NAME="${RIVERS_K8S_DEMO_CODE_LOCATION:-demo}"
+        DEMO="${RIVERS_K8S_DEMO_CODE_LOCATION:-demo}"
+        CR_NAMES="${DEMO} ${DEMO}-downstream"
     else
         SRC_IMAGE="rivers-code-location:latest"
         REPO="rivers-code-location"
-        CR_NAME="${RIVERS_K8S_TEST_CODE_LOCATION:-k8s-test-pipeline}"
+        CR_NAMES="${RIVERS_K8S_TEST_CODE_LOCATION:-k8s-test-pipeline}"
     fi
     docker tag "$SRC_IMAGE" "${REGISTRY_HOST}/${REPO}:latest"
     docker push "${REGISTRY_HOST}/${REPO}:latest"
@@ -378,17 +379,19 @@ k8s-deploy project="test": (k8s-code-location project)
     # The operator re-resolves the pushed digest on reconcile; `rollout status`
     # alone returns instantly against the still-converged old ReplicaSet, so
     # wait for the new digest to land on the deployment first.
-    CUR=""
-    for _ in $(seq 1 60); do
-        CUR=$(kubectl -n rivers get deployment "${CR_NAME}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d@ -f2 || true)
-        [ "$CUR" = "$DIGEST" ] && break
-        sleep 2
+    for CR_NAME in ${CR_NAMES}; do
+        CUR=""
+        for _ in $(seq 1 60); do
+            CUR=$(kubectl -n rivers get deployment "${CR_NAME}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d@ -f2 || true)
+            [ "$CUR" = "$DIGEST" ] && break
+            sleep 2
+        done
+        if [ "$CUR" != "$DIGEST" ]; then
+            echo "deployment ${CR_NAME} never picked up pushed digest ${DIGEST} (still ${CUR})" >&2
+            exit 1
+        fi
+        kubectl -n rivers rollout status deployment "${CR_NAME}" --timeout=120s
     done
-    if [ "$CUR" != "$DIGEST" ]; then
-        echo "deployment ${CR_NAME} never picked up pushed digest ${DIGEST} (still ${CUR})" >&2
-        exit 1
-    fi
-    kubectl -n rivers rollout status deployment "${CR_NAME}" --timeout=120s
 
 # Full cycle: create cluster, deploy, test, tear down
 k8s-integration: k8s-up k8s-test

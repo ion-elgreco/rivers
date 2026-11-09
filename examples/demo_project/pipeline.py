@@ -7,18 +7,14 @@ Or materialize directly:
     rivers materialize examples.demo_project.pipeline --storage-path .rivers/demo-storage/
 """
 
-import hashlib
 import json
 import logging
-import os
-import pickle
 import time
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-import obstore.store
 import pyarrow as pa
 from deltalake import write_deltalake
 from pydantic import BaseModel, Field, SecretStr, field_validator
@@ -35,7 +31,6 @@ from rivers import (
     BashTask,
     CodeRepository,
     DeltaAsset,
-    DeltaIOHandler,
     Executor,
     Hook,
     HookContext,
@@ -47,7 +42,6 @@ from rivers import (
     PartitionKey,
     PartitionMapping,
     PartitionsDefinition,
-    PickleIOHandler,
     Resource,
     RunQueueConfig,
     RunRequest,
@@ -64,6 +58,8 @@ from rivers import (
     Task,
     action,
 )
+
+from .shared import delta_io, output_io, processed_io, raw_io, repo_kwargs
 
 # =============================================================================
 # Configuration (Config + Pydantic)
@@ -153,61 +149,6 @@ class _ConfigShowcase(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("tags must be unique")
         return value
-
-
-# =============================================================================
-# IO Handlers
-# =============================================================================
-
-
-class VersionedPickleIOHandler(PickleIOHandler):
-    """PickleIOHandler that registers a data version (content hash) on each write."""
-
-    def handle_output(self, context: OutputContext, obj: object) -> None:
-        data_version = hashlib.sha256(pickle.dumps(obj)).hexdigest()
-        context.register_data_version(data_version)
-        super().handle_output(context, obj)
-
-
-_deployment = os.environ.get("RIVERS_DEPLOYMENT", "dev")
-
-if _deployment == "cloud":
-    _s3_store = obstore.store.S3Store(
-        bucket=os.environ.get("RIVERS_S3_BUCKET", "rivers-io"),
-        config={
-            "endpoint": os.environ.get(
-                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
-            ),
-            "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-            "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-            "region": os.environ.get("AWS_REGION", "us-east-1"),
-        },
-        client_options={"allow_http": "true"},
-    )
-    raw_io = VersionedPickleIOHandler(store=_s3_store, prefix="raw")
-    processed_io = VersionedPickleIOHandler(store=_s3_store, prefix="processed")
-    output_io = VersionedPickleIOHandler(store=_s3_store, prefix="output")
-    delta_io = DeltaIOHandler(
-        table_uri=f"s3://{os.environ.get('RIVERS_S3_BUCKET', 'rivers-io')}/delta",
-        mode="append",
-        storage_options={
-            "AWS_ENDPOINT_URL": os.environ.get(
-                "RIVERS_S3_ENDPOINT", "http://rustfs.rivers.svc:9000"
-            ),
-            "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-            "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
-            "AWS_ALLOW_HTTP": "true",
-        },
-    )
-else:
-    _io_root = os.path.join(os.getcwd(), ".rivers", "demo-io")
-    os.makedirs(_io_root, exist_ok=True)
-    _local_store = obstore.store.LocalStore(_io_root)
-    raw_io = VersionedPickleIOHandler(store=_local_store, prefix="raw")
-    processed_io = VersionedPickleIOHandler(store=_local_store, prefix="processed")
-    output_io = VersionedPickleIOHandler(store=_local_store, prefix="output")
-    delta_io = DeltaIOHandler(table_uri=os.path.join(_io_root, "delta"), mode="append")
 
 
 # =============================================================================
@@ -1884,18 +1825,6 @@ all_assets = [
     regional_sku_inventory,
 ]
 
-if _deployment == "cloud":
-    from rivers import RunBackendConfig
-
-    _repo_kwargs = dict(
-        default_executor=Executor.kubernetes(),
-        run_backend=RunBackendConfig.kubernetes(),
-    )
-else:
-    _repo_kwargs = dict(
-        default_executor=Executor.in_process(),
-    )
-
 repo = CodeRepository(
     assets=all_assets,
     tasks=[validate_data, compute_margins, export_report],
@@ -1931,5 +1860,5 @@ repo = CodeRepository(
         "database": 2,
         "compute": 4,
     },
-    **_repo_kwargs,
+    **repo_kwargs(),
 )
