@@ -531,6 +531,7 @@ impl PyCodeRepository {
         let register_catalog = std::env::var("RIVERS_RUN_ID").is_err();
         if register_catalog {
             self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+            py.detach(|| register_code_location(&storage_handle));
         }
 
         let jobs = self.validate_and_build_job_plans(
@@ -657,5 +658,28 @@ impl PyCodeRepository {
         self.state.replace(py, Some(Arc::clone(&state)));
 
         Ok(state)
+    }
+}
+
+/// List this code location in the code location directory so others can
+/// refer to it by `namespace/name`. A failure leaves `resolve()` intact.
+fn register_code_location(
+    storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+) {
+    use rivers_core::storage::StorageBackend;
+
+    let result = rivers_k8s::env::current_code_location_ref().and_then(|location| {
+        io_rt().block_on(
+            storage_handle
+                .backend()
+                .set_code_location_identity(&location, storage_handle.code_location_id()),
+        )
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "rivers::repo",
+            error = %e,
+            "code location not listed in the code location directory"
+        );
     }
 }
