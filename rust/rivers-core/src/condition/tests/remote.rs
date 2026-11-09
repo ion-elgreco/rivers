@@ -1162,6 +1162,36 @@ mod drift {
     }
 
     #[tokio::test]
+    async fn an_interval_start_moved_off_the_mirrors_grid_counts_as_missing() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(
+            &storage,
+            vec![make_materialized_record("raw_orders", 1_000)],
+        )
+        .await;
+        let hourly_from = |hour, minute| {
+            PartitionsFingerprint::TimeWindow(TimeGrid {
+                cron_schedule: None,
+                interval_seconds: Some(3_600.0),
+                start: date(2024, 1, 1).at(hour, minute, 0, 0),
+                end: None,
+                fmt: "%Y-%m-%dT%H:%M".into(),
+            })
+        };
+        owner_topology(&storage, &[("raw_orders", hourly_from(3, 0))]).await;
+        let mut cache = cache_with(vec![mirrored("orders", "raw_orders", hourly_from(0, 0))]);
+        cache.refresh(&storage, 0).await.unwrap();
+        assert_eq!(cache.records["orders"].last_timestamp, Some(1_000));
+
+        owner_topology(&storage, &[("raw_orders", hourly_from(0, 30))]).await;
+        cache.refresh(&storage, 30 * SEC).await.unwrap();
+        assert_eq!(
+            cache.records["orders"].last_timestamp, None,
+            "no mirror key names an owner partition"
+        );
+    }
+
+    #[tokio::test]
     async fn a_key_missing_from_the_owners_topology_counts_as_missing() {
         let storage = SurrealStorage::new_memory().await.unwrap();
         warehouse_owning(

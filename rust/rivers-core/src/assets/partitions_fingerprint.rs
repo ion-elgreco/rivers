@@ -105,10 +105,12 @@ pub fn describe_partitions(fingerprint: Option<&PartitionsFingerprint>) -> Strin
 #[serde(rename_all = "snake_case")]
 pub enum PartitionDrift {
     Same,
-    /// The owner moved `start`/`end` or added static keys: every key of the
-    /// mirror still names an owner partition.
+    /// The owner moved `start`/`end` on the same grid or added static keys.
+    /// A mirror key names an owner partition when it lies in the owner's
+    /// range; the others stay missing.
     Compatible,
-    /// Another kind, schedule, key format or removed static keys.
+    /// Another kind, schedule or key format, an interval `start` moved by
+    /// part of the interval, or removed static keys.
     Incompatible,
     /// The owner has no asset of that key.
     OwnerNodeMissing,
@@ -144,11 +146,7 @@ fn compare(mirror: &PartitionsFingerprint, owner: &PartitionsFingerprint) -> Par
             let mut owner = owner.iter();
             mirror.iter().all(|key| owner.any(|k| k == key))
         }
-        (TimeWindow(mirror), TimeWindow(owner)) => {
-            mirror.cron_schedule == owner.cron_schedule
-                && mirror.interval_seconds == owner.interval_seconds
-                && mirror.fmt == owner.fmt
-        }
+        (TimeWindow(mirror), TimeWindow(owner)) => mirror.aligns_with(owner),
         (Multi { dimensions: mirror }, Multi { dimensions: owner }) => {
             mirror.len() == owner.len()
                 && mirror.iter().zip(owner).all(|((m_name, m), (o_name, o))| {
@@ -265,6 +263,93 @@ mod tests {
                 PartitionDrift::Incompatible
             );
         }
+    }
+
+    #[test]
+    fn an_interval_start_off_the_mirrors_grid_is_incompatible() {
+        let hourly = |start: civil::DateTime, end: Option<civil::DateTime>| TimeGrid {
+            cron_schedule: None,
+            interval_seconds: Some(3_600.0),
+            start,
+            end,
+            fmt: "%Y-%m-%dT%H:%M".into(),
+        };
+        let at = |hour, minute| date(2026, 1, 1).at(hour, minute, 0, 0);
+        let mirror = || Some(window(hourly(at(0, 0), None)));
+
+        let compatible = [
+            hourly(at(3, 0), None),
+            hourly(date(2025, 12, 31).at(21, 0, 0, 0), None),
+            hourly(at(0, 0), Some(at(12, 0))),
+        ];
+        for owner in compatible {
+            assert_eq!(
+                drift(mirror(), Some(window(owner.clone()))),
+                PartitionDrift::Compatible,
+                "{owner:?}"
+            );
+        }
+        let incompatible = [
+            hourly(at(0, 30), None),
+            hourly(date(2025, 12, 31).at(23, 59, 59, 0), Some(at(12, 0))),
+        ];
+        for owner in incompatible {
+            assert_eq!(
+                drift(mirror(), Some(window(owner.clone()))),
+                PartitionDrift::Incompatible,
+                "{owner:?}"
+            );
+        }
+
+        let too_short = |start| TimeGrid {
+            interval_seconds: Some(1e-12),
+            ..hourly(start, None)
+        };
+        assert_eq!(
+            drift(
+                Some(window(too_short(at(0, 0)))),
+                Some(window(too_short(at(3, 0))))
+            ),
+            PartitionDrift::Incompatible
+        );
+        assert_eq!(
+            drift(
+                mirror(),
+                Some(window(hourly(date(1700, 1, 1).at(0, 0, 0, 0), None)))
+            ),
+            PartitionDrift::Incompatible,
+            "a distance past i64 nanoseconds counts as not aligned"
+        );
+
+        let cron_moved = TimeGrid {
+            start: at(0, 30),
+            ..daily()
+        };
+        assert_eq!(
+            drift(Some(window(daily())), Some(window(cron_moved))),
+            PartitionDrift::Compatible
+        );
+
+        let multi = |grid| {
+            PartitionsFingerprint::multi([
+                ("region".to_string(), statics(&["eu"])),
+                ("hour".to_string(), window(grid)),
+            ])
+        };
+        assert_eq!(
+            drift(
+                Some(multi(hourly(at(0, 0), None))),
+                Some(multi(hourly(at(3, 0), None)))
+            ),
+            PartitionDrift::Compatible
+        );
+        assert_eq!(
+            drift(
+                Some(multi(hourly(at(0, 0), None))),
+                Some(multi(hourly(at(0, 30), None)))
+            ),
+            PartitionDrift::Incompatible
+        );
     }
 
     #[test]

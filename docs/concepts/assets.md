@@ -322,8 +322,10 @@ The mirrored `partitions_def` can stop matching the owner's definition, for exam
 | Difference | Examples | Lineage view | Automation | Manual runs |
 | --- | --- | --- | --- | --- |
 | Compatible | The owner moved `start` or `end`, or added static keys. | **range differs** | No change. | No change. |
-| Incompatible | Another kind, schedule, or key format. The owner removed a static key. Only one side is partitioned. | **partitions differ** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+| Incompatible | Another kind, schedule, or key format. The owner removed a static key. Only one side is partitioned. With `interval_seconds`, the owner moved `start` by part of the interval, for example from 00:00 to 00:30 with `interval_seconds=3600`. | **partitions differ** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
 | Owner has no such asset | The owner renamed or removed the asset. | **not found** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+
+With a compatible difference, a consumer partition outside the owner's range stays missing until the owner has that partition.
 
 Select the node in the lineage view to see both definitions. To resume automation, change the mirror to match the owner's definition, or undo the owner's change. The daemon sees an undone change within 30 seconds.
 
