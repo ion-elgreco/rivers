@@ -101,6 +101,21 @@ pub(crate) fn map_partition_key_for_upstream(
         .map_err(|e| PartitionValidationError::new_err(e.to_string()))
 }
 
+/// The name and code location an IO handler sees for an upstream: the
+/// owner's key and code location for a remote, the parameter name otherwise.
+pub(crate) fn upstream_source(
+    param_name: &str,
+    upstream_node: &ResolvedNode,
+) -> (String, Option<String>) {
+    match upstream_node.remote() {
+        Some(remote) => (
+            remote.asset_key.clone(),
+            Some(remote.code_location.to_string()),
+        ),
+        None => (param_name.to_string(), None),
+    }
+}
+
 /// Load the asset's own previous output for a self-dependency parameter.
 /// Returns a `SelfDependency` instance with the loaded value (or None on first run).
 pub(crate) fn load_self_dependency(
@@ -124,6 +139,7 @@ pub(crate) fn load_self_dependency(
         asset_metadata: metadata,
         partition,
         type_hint: Some(type_hint.clone_ref(py)),
+        code_location: None,
     };
 
     // Try loading; if fails (first run / table doesn't exist), inner = None
@@ -171,12 +187,14 @@ pub(crate) fn load_upstream_input(
     } else {
         build_partition_context(upstream_node, &upstream_key)?
     };
+    let (asset_name, code_location) = upstream_source(param_name, upstream_node);
     let ctx = PyInputContext {
-        asset_name: param_name.to_string(),
+        asset_name,
         downstream_asset: downstream_name.to_string(),
         asset_metadata: metadata,
         partition,
         type_hint: Some(type_hint),
+        code_location,
     };
     handler.call_method1(py, "load_input", (ctx,))
 }
@@ -199,6 +217,7 @@ pub(crate) fn load_step_output(
         asset_metadata: node.metadata(),
         partition: build_partition_context(node, partition_key)?,
         type_hint: type_hint.map(|h| h.clone_ref(py)),
+        code_location: None,
     };
     handler.call_method1(py, "load_input", (ctx,))
 }

@@ -221,7 +221,10 @@ class Asset:
                 to ``name``. Set it to give the asset a different local name,
                 e.g. when two code locations own assets with the same key.
             io_handler: Loads the asset's data for downstream parameters.
-                Without it the asset is lineage-only: list it with
+                ``load_input`` gets ``asset_key`` as
+                :attr:`InputContext.asset_name` and the owner as
+                :attr:`InputContext.code_location`. Without it the asset is
+                lineage-only: list it with
                 :meth:`AssetDef.dep`, or set a handler on the consumer's
                 :meth:`AssetDef.input`.
             partitions_def: Mirror of the owner's partitions definition. Not

@@ -141,18 +141,28 @@ pub struct PyInputContext {
     pub asset_metadata: Option<HashMap<String, String>>,
     pub partition: Option<PartitionContext>,
     pub type_hint: Option<Py<PyAny>>,
+    /// The owning code location (`"namespace/name"`) of a remote upstream.
+    pub code_location: Option<String>,
 }
 
 #[pymethods]
 impl PyInputContext {
     #[new]
-    #[pyo3(signature = (asset_name, downstream_asset, asset_metadata=None, partition=None, type_hint=None))]
+    #[pyo3(signature = (
+        asset_name,
+        downstream_asset,
+        asset_metadata=None,
+        partition=None,
+        type_hint=None,
+        code_location=None,
+    ))]
     pub fn new(
         asset_name: String,
         downstream_asset: String,
         asset_metadata: Option<HashMap<String, String>>,
         partition: Option<PartitionContext>,
         type_hint: Option<Py<PyAny>>,
+        code_location: Option<String>,
     ) -> Self {
         Self {
             asset_name,
@@ -160,6 +170,7 @@ impl PyInputContext {
             asset_metadata,
             partition,
             type_hint,
+            code_location,
         }
     }
 
@@ -176,12 +187,16 @@ impl PyInputContext {
         let type_hint: Option<Py<PyAny>> = kwargs
             .get_item("type_hint")?
             .and_then(|v| if v.is_none() { None } else { Some(v.unbind()) });
+        let code_location: Option<String> = kwargs
+            .get_item("code_location")?
+            .and_then(|v| v.extract().ok());
         Ok(Self::new(
             asset_name,
             downstream_asset,
             asset_metadata,
             partition,
             type_hint,
+            code_location,
         ))
     }
 

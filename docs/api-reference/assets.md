@@ -233,7 +233,7 @@ def order_count(orders: pl.DataFrame) -> int:
 | `name` | `str` | required | Local name. Unique in this repository; no `/`. |
 | `code_location` | `str` | required | Owning code location: `"name"` in this code location's namespace, or `"namespace/name"`. |
 | `asset_key` | `str \| None` | `name` | The asset's key in the owning code location. Set it to give the asset a different local name. |
-| `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Without it the asset is lineage-only: list it with `AssetDef.dep()`, or set a handler on the consumer's `AssetDef.input()`. |
+| `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Its `load_input()` gets `asset_key` as `InputContext.asset_name` and the owner as `InputContext.code_location`. Without it the asset is lineage-only: list it with `AssetDef.dep()`, or set a handler on the consumer's `AssetDef.input()`. |
 | `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Mirror of the owner's partition definition. Dynamic definitions and dynamic dimensions are rejected: their keys live in the owning code location. |
 | `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
 | `group` | `str \| None` | `None` | Group name for organization. |

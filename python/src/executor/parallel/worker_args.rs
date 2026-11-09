@@ -277,12 +277,14 @@ fn build_io_load_spec(
         ops::build_partition_context(upstream_node, &upstream_key)?
     };
 
+    let (asset_name, code_location) = ops::upstream_source(param_name, upstream_node);
     let kwargs = PyDict::new(py);
-    kwargs.set_item("asset_name", param_name)?;
+    kwargs.set_item("asset_name", asset_name)?;
     kwargs.set_item("downstream_asset", downstream_name)?;
     kwargs.set_item("asset_metadata", metadata)?;
     kwargs.set_item("partition", partition)?;
     kwargs.set_item("type_hint", type_hint)?;
+    kwargs.set_item("code_location", code_location)?;
 
     let spec = super::worker::PyIOLoadSpec {
         handler: pickled_handler,

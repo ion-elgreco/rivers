@@ -712,10 +712,15 @@ class InputContext:
     """Per-input context passed to :meth:`BaseIOHandler.load_input`."""
 
     asset_name: str
+    """The upstream's name. For a remote upstream, its key in the owning
+    code location (:attr:`RemoteAsset.asset_key`), not the local name."""
     downstream_asset: str
     asset_metadata: dict[str, str] | None
     partition: PartitionContext | None
     type_hint: type | None
+    code_location: str | None
+    """The owning code location (``"namespace/name"``) of a remote upstream;
+    ``None`` for an upstream in this code location."""
     def __init__(
         self,
         asset_name: str,
@@ -723,6 +728,7 @@ class InputContext:
         asset_metadata: dict[str, str] | None = None,
         partition: PartitionContext | None = None,
         type_hint: type | None = None,
+        code_location: str | None = None,
     ) -> None:
         """Build an input context (typically only done by the executor / tests)."""
         ...

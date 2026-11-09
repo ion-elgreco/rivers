@@ -454,12 +454,14 @@ impl PyCodeRepository {
         })?;
         let handler = state.io_handler_registry.for_output(py, node);
         let partition = crate::executor::ops::build_partition_context(node, &partition_key)?;
+        let (asset_name, code_location) = crate::executor::ops::upstream_source(&name, node);
         let ctx = crate::context::io::PyInputContext {
-            asset_name: name.clone(),
+            asset_name,
             downstream_asset: "__load_node__".to_string(),
             asset_metadata: node.metadata(),
             partition,
             type_hint,
+            code_location,
         };
         handler.call_method1(py, "load_input", (ctx,))
     }
