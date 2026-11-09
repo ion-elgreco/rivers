@@ -288,6 +288,13 @@ pub fn validate_subgraph_completeness(
 }
 
 impl GraphTopology {
+    /// The node of an asset this code location owns, not a remote mirror.
+    pub fn owned_node(&self, name: &str) -> Option<&TopologyNode> {
+        self.nodes
+            .iter()
+            .find(|n| n.name == name && n.remote.is_none())
+    }
+
     pub fn partitions_of(&self, node: &TopologyNode) -> Option<&PartitionsFingerprint> {
         self.partitions.get(node.partitions?)
     }

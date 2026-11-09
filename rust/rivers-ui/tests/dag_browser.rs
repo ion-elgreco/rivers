@@ -313,11 +313,16 @@ fn changed_keys_attach_new_chip_to_node() {
 }
 
 fn remote_layout(resolved: bool) -> LayoutResult {
+    drifted_layout(resolved, None)
+}
+
+fn drifted_layout(resolved: bool, drift: Option<rivers_ui::types::RemoteDrift>) -> LayoutResult {
     let mut layout = small_layout();
     layout.nodes[0].remote = Some(rivers_ui::types::RemoteNode {
         code_location: "team-sales/warehouse".to_string(),
         asset_key: "raw_orders".to_string(),
         resolved,
+        drift,
     });
     layout
 }
@@ -372,4 +377,60 @@ fn unresolved_remote_node_carries_a_not_registered_chip() {
             .unwrap_or_default()
             .contains("not registered")
     );
+}
+
+#[wasm_bindgen_test]
+fn drifted_remote_node_carries_a_chip_per_class() {
+    use rivers_ui::types::RemoteDrift;
+
+    let definitions = || {
+        (
+            "daily from 2024-01-01".to_string(),
+            "hourly from 2024-01-01T00:00".to_string(),
+        )
+    };
+    let (mirror, owner) = definitions();
+    let (compatible_mirror, compatible_owner) = definitions();
+    let cases = [
+        (
+            RemoteDrift::Incompatible { mirror, owner },
+            "incompatible",
+            "partitions differ",
+        ),
+        (
+            RemoteDrift::Compatible {
+                mirror: compatible_mirror,
+                owner: compatible_owner,
+            },
+            "compatible",
+            "range differs",
+        ),
+        (RemoteDrift::OwnerNodeMissing, "missing", "not found"),
+    ];
+    for (drift, class, text) in cases {
+        let target = fresh_mount_target();
+        let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+        let layout = drifted_layout(true, Some(drift));
+        let _handle = mount_to(target.clone(), move || {
+            view! {
+                <DagGraph
+                    layout=layout.clone()
+                    on_node_click=Callback::new(|_| {})
+                    viewport=Signal::derive(move || viewport.get())
+                />
+            }
+        });
+
+        let chips = query_all(&target, &format!("g.dag-node-drift--{class}"));
+        assert_eq!(chips.len(), 1, "{class}");
+        assert_eq!(chips[0].text_content().unwrap_or_default(), text);
+        assert!(query_all(&target, "g.dag-node-unregistered").is_empty());
+        let title = query_one(&target, "g.dag-node title")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            title.starts_with("upstream: raw_orders in team-sales/warehouse. "),
+            "got: {title}"
+        );
+    }
 }

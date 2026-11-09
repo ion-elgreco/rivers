@@ -1,6 +1,10 @@
 //! A partitions definition as the topology stores it, and how a remote
 //! asset's mirror compares with the owner's definition.
 
+use std::fmt;
+
+use jiff::civil;
+use jiff::fmt::strtime;
 use serde::{Deserialize, Serialize};
 
 use super::graph::GraphTopology;
@@ -49,6 +53,52 @@ impl PartitionsFingerprint {
     }
 }
 
+/// `"daily from 2024-01-01"`: a time window names its first key, so a
+/// changed key format shows.
+impl fmt::Display for PartitionsFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static { keys } => {
+                let noun = if keys.len() == 1 { "key" } else { "keys" };
+                write!(f, "static ({} {noun})", keys.len())
+            }
+            Self::TimeWindow(grid) => {
+                match (grid.cron_schedule.as_deref(), grid.interval_seconds) {
+                    (Some("0 0 * * *"), _) => f.write_str("daily")?,
+                    (Some("0 * * * *"), _) => f.write_str("hourly")?,
+                    (Some(cron), _) => write!(f, "cron '{cron}'")?,
+                    (None, Some(seconds)) => write!(f, "every {seconds} s")?,
+                    (None, None) => f.write_str("time window")?,
+                }
+                let key = |t: civil::DateTime| {
+                    strtime::format(&grid.fmt, t).unwrap_or_else(|_| t.to_string())
+                };
+                write!(f, " from {}", key(grid.start))?;
+                if let Some(end) = grid.end {
+                    write!(f, " to {}", key(end))?;
+                }
+                Ok(())
+            }
+            Self::Multi { dimensions } => {
+                f.write_str("multi (")?;
+                for (i, (name, dimension)) in dimensions.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name}: {dimension}")?;
+                }
+                f.write_str(")")
+            }
+            Self::Dynamic { name } => write!(f, "dynamic '{name}'"),
+        }
+    }
+}
+
+/// [`PartitionsFingerprint`]'s description, `"unpartitioned"` for `None`.
+pub fn describe_partitions(fingerprint: Option<&PartitionsFingerprint>) -> String {
+    fingerprint.map_or_else(|| "unpartitioned".to_string(), ToString::to_string)
+}
+
 /// How a remote asset's mirrored partitions definition compares with the
 /// owner's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,11 +120,7 @@ pub fn partition_drift(
     asset_key: &str,
     mirror: Option<&PartitionsFingerprint>,
 ) -> PartitionDrift {
-    let Some(node) = owner
-        .nodes
-        .iter()
-        .find(|n| n.name == asset_key && n.remote.is_none())
-    else {
+    let Some(node) = owner.owned_node(asset_key) else {
         return PartitionDrift::OwnerNodeMissing;
     };
     match (mirror, owner.partitions_of(node)) {
@@ -306,6 +352,57 @@ mod tests {
             partition_drift(&owner, "raw_orders", None),
             PartitionDrift::OwnerNodeMissing
         );
+    }
+
+    #[test]
+    fn descriptions_name_the_schedule_and_the_first_key() {
+        let hourly_to = TimeGrid {
+            cron_schedule: Some("0 * * * *".into()),
+            end: Some(date(2026, 2, 1).at(0, 0, 0, 0)),
+            fmt: "%Y-%m-%dT%H:00".into(),
+            ..daily()
+        };
+        let cases = [
+            (window(daily()), "daily from 2026-01-01"),
+            (
+                window(hourly_to),
+                "hourly from 2026-01-01T00:00 to 2026-02-01T00:00",
+            ),
+            (
+                window(TimeGrid {
+                    cron_schedule: Some("0 0 * * 1".into()),
+                    fmt: "%Y%m%d".into(),
+                    ..daily()
+                }),
+                "cron '0 0 * * 1' from 20260101",
+            ),
+            (
+                window(TimeGrid {
+                    cron_schedule: None,
+                    interval_seconds: Some(900.0),
+                    ..daily()
+                }),
+                "every 900 s from 2026-01-01",
+            ),
+            (statics(&["eu"]), "static (1 key)"),
+            (
+                PartitionsFingerprint::multi([
+                    ("region".to_string(), statics(&["eu", "us"])),
+                    ("date".to_string(), window(daily())),
+                ]),
+                "multi (date: daily from 2026-01-01, region: static (2 keys))",
+            ),
+            (
+                PartitionsFingerprint::Dynamic {
+                    name: "customers".into(),
+                },
+                "dynamic 'customers'",
+            ),
+        ];
+        for (fingerprint, description) in cases {
+            assert_eq!(describe_partitions(Some(&fingerprint)), description);
+        }
+        assert_eq!(describe_partitions(None), "unpartitioned");
     }
 
     #[test]

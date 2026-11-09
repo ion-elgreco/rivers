@@ -924,6 +924,10 @@ pub fn GraphPage() -> impl IntoView {
                                     }}
                                 </div>
 
+                                {remote.drift_message().map(|message| view! {
+                                    <div class="dag-sidebar-empty">{message}</div>
+                                })}
+
                                 {sidebar_links("DOWNSTREAM", "↓", downstream, set_selected_nodes)}
 
                                 {remote.resolved.then(|| view! {

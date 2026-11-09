@@ -229,10 +229,44 @@ impl From<rivers_core::assets::graph::GraphTopology> for GraphTopology {
                         code_location: r.code_location.to_string(),
                         asset_key: r.asset_key,
                         resolved: false,
+                        drift: None,
                     }),
                 })
                 .collect(),
             edges: g.edges,
+        }
+    }
+}
+
+impl RemoteDrift {
+    /// `mirror` against `owner`'s definition of `asset_key`; `None` when
+    /// they agree.
+    pub fn between(
+        owner: &rivers_core::assets::graph::GraphTopology,
+        asset_key: &str,
+        mirror: Option<&rivers_core::assets::partitions_fingerprint::PartitionsFingerprint>,
+    ) -> Option<Self> {
+        use rivers_core::assets::partitions_fingerprint::{
+            PartitionDrift, describe_partitions, partition_drift,
+        };
+
+        let describe = || {
+            let owned = owner
+                .owned_node(asset_key)
+                .and_then(|node| owner.partitions_of(node));
+            (describe_partitions(mirror), describe_partitions(owned))
+        };
+        match partition_drift(owner, asset_key, mirror) {
+            PartitionDrift::Same => None,
+            PartitionDrift::Compatible => {
+                let (mirror, owner) = describe();
+                Some(Self::Compatible { mirror, owner })
+            }
+            PartitionDrift::Incompatible => {
+                let (mirror, owner) = describe();
+                Some(Self::Incompatible { mirror, owner })
+            }
+            PartitionDrift::OwnerNodeMissing => Some(Self::OwnerNodeMissing),
         }
     }
 }
@@ -451,6 +485,58 @@ impl From<BackfillFilter> for rivers_core::storage::BackfillFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod remote_drift {
+        use super::RemoteDrift;
+        use rivers_core::assets::graph::{GraphTopology, NodeKind, TopologyNode};
+        use rivers_core::assets::partitions_fingerprint::PartitionsFingerprint;
+
+        fn statics(keys: &[&str]) -> PartitionsFingerprint {
+            PartitionsFingerprint::static_keys(keys.iter().map(|k| k.to_string()))
+        }
+
+        fn owner(keys: &[&str]) -> GraphTopology {
+            let mut owner = GraphTopology::default();
+            let mut node = TopologyNode::new("raw_orders", NodeKind::Asset);
+            node.partitions = Some(owner.intern_partitions(statics(keys)));
+            owner.nodes.push(node);
+            owner
+        }
+
+        #[test]
+        fn each_class_maps_with_both_definitions() {
+            let mirror = statics(&["eu", "us"]);
+            let between =
+                |keys: &[&str], key: &str| RemoteDrift::between(&owner(keys), key, Some(&mirror));
+
+            assert_eq!(between(&["us", "eu"], "raw_orders"), None);
+            assert_eq!(
+                between(&["apac", "eu", "us"], "raw_orders"),
+                Some(RemoteDrift::Compatible {
+                    mirror: "static (2 keys)".into(),
+                    owner: "static (3 keys)".into(),
+                })
+            );
+            assert_eq!(
+                between(&["eu"], "raw_orders"),
+                Some(RemoteDrift::Incompatible {
+                    mirror: "static (2 keys)".into(),
+                    owner: "static (1 key)".into(),
+                })
+            );
+            assert_eq!(
+                between(&["eu"], "elsewhere"),
+                Some(RemoteDrift::OwnerNodeMissing)
+            );
+            assert_eq!(
+                RemoteDrift::between(&owner(&["eu"]), "raw_orders", None),
+                Some(RemoteDrift::Incompatible {
+                    mirror: "unpartitioned".into(),
+                    owner: "static (1 key)".into(),
+                })
+            );
+        }
+    }
 
     /// The UI's filter inputs send `Some("")` when a search box is empty.
     /// The storage layer expects `None` for "no filter" — if the empty

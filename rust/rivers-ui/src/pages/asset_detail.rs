@@ -834,7 +834,12 @@ pub fn AssetDetailPage() -> impl IntoView {
                                     };
                                     return if remote.resolved {
                                         view! {
-                                            <A href=remote.href() attr:class="lineage-row" attr:style=style>{row}</A>
+                                            <A
+                                                href=remote.href()
+                                                attr:class="lineage-row"
+                                                attr:style=style
+                                                attr:title=remote.drift_message()
+                                            >{row}</A>
                                         }.into_any()
                                     } else {
                                         view! {

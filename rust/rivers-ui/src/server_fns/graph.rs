@@ -18,8 +18,6 @@ async fn load_topology(
     loc_ns: &str,
     loc_name: &str,
 ) -> Result<rivers_core::assets::graph::GraphTopology, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-
     let state = expect_context::<crate::state::AppState>();
     if let Some(ref synthetic) = state.graph {
         return Ok((**synthetic).clone());
@@ -33,38 +31,79 @@ async fn load_topology(
                 "code location {loc_ns}/{loc_name} not found in registry"
             ))
         })?;
-    let ctx = rivers_core::storage::CodeLocationContext::new(entry.identity);
-    let topo = state
+    Ok(read_topology(&state, entry.identity).await)
+}
+
+#[cfg(feature = "ssr")]
+async fn read_topology(
+    state: &crate::state::AppState,
+    identity: String,
+) -> rivers_core::assets::graph::GraphTopology {
+    use rivers_core::storage::StorageBackend;
+
+    let ctx = rivers_core::storage::CodeLocationContext::new(identity);
+    state
         .storage
         .for_code_location(&ctx)
         .get_graph_topology()
         .await
         .ok()
         .flatten()
-        .unwrap_or_default();
-    Ok(topo)
+        .unwrap_or_default()
 }
 
-/// The UI topology, with each remote node marked resolved when the registry
-/// knows its owning code location.
+/// The UI topology. A remote node is resolved when the registry knows its
+/// owning code location, and then carries its partition drift against the
+/// owner's topology.
 #[cfg(feature = "ssr")]
 async fn load_ui_topology(loc_ns: &str, loc_name: &str) -> Result<GraphTopology, ServerFnError> {
-    let mut topo: GraphTopology = load_topology(loc_ns, loc_name).await?.into();
+    use std::collections::HashMap;
+
+    use rivers_core::assets::graph::GraphTopology as CoreTopology;
+
+    use crate::types::RemoteDrift;
+
+    let topology = load_topology(loc_ns, loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
-    let mut known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for remote in topo.nodes.iter_mut().filter_map(|n| n.remote.as_mut()) {
-        let resolved = match known.get(&remote.code_location) {
-            Some(&resolved) => resolved,
-            None => {
-                let (ns, name) = remote.location();
-                let resolved = state.registry.lookup(ns, name).await.is_some();
-                known.insert(remote.code_location.clone(), resolved);
-                resolved
-            }
+
+    let mut owners: HashMap<String, Option<CoreTopology>> = HashMap::new();
+    let mut remotes: HashMap<String, (bool, Option<RemoteDrift>)> = HashMap::new();
+    for node in &topology.nodes {
+        let Some(remote) = &node.remote else {
+            continue;
         };
-        remote.resolved = resolved;
+        let location = remote.code_location.to_string();
+        if !owners.contains_key(&location) {
+            let entry = state
+                .registry
+                .lookup(
+                    remote.code_location.namespace(),
+                    remote.code_location.name(),
+                )
+                .await;
+            let owner = match entry {
+                Some(entry) => Some(read_topology(&state, entry.identity).await),
+                None => None,
+            };
+            owners.insert(location.clone(), owner);
+        }
+        let seen = owners[&location].as_ref().map_or((false, None), |owner| {
+            let mirror = topology.partitions_of(node);
+            (true, RemoteDrift::between(owner, &remote.asset_key, mirror))
+        });
+        remotes.insert(node.name.clone(), seen);
     }
-    Ok(topo)
+
+    let mut ui: GraphTopology = topology.into();
+    for node in &mut ui.nodes {
+        if let (Some(remote), Some((resolved, drift))) =
+            (node.remote.as_mut(), remotes.remove(&node.name))
+        {
+            remote.resolved = resolved;
+            remote.drift = drift;
+        }
+    }
+    Ok(ui)
 }
 
 /// Layout of what the lineage page shows: the kind and group filters, with

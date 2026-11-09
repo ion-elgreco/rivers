@@ -339,7 +339,23 @@ fn render_node_full(
     let is_changed = changed_keys.contains(&node.id);
     let remote = node.remote.as_ref();
     let is_remote = remote.is_some();
-    let is_unresolved = remote.is_some_and(|r| !r.resolved);
+    let remote_chip: Option<(&'static str, String, &'static str)> = remote.and_then(|r| {
+        if !r.resolved {
+            return Some((
+                "not registered",
+                "dag-node-unregistered".to_string(),
+                "#b4b8c2",
+            ));
+        }
+        r.drift.as_ref().map(|drift| {
+            let class = format!("dag-node-drift dag-node-drift--{}", drift.class());
+            let fill = match drift {
+                crate::types::RemoteDrift::Incompatible { .. } => "#f59e0b",
+                _ => "#b4b8c2",
+            };
+            (drift.chip(), class, fill)
+        })
+    });
 
     // When a node is selected, dim nodes outside the lineage
     let opacity = if has_selection && !is_in_lineage {
@@ -441,11 +457,17 @@ fn render_node_full(
         };
 
     let tooltip = match remote {
-        Some(r) if r.resolved => format!("{}: {} in {}", node.id, r.asset_key, r.code_location),
-        Some(r) => format!(
+        Some(r) if !r.resolved => format!(
             "{}: {} in {} (code location not registered)",
             node.id, r.asset_key, r.code_location
         ),
+        Some(r) => match r.drift_message() {
+            Some(message) => format!(
+                "{}: {} in {}. {message}",
+                node.id, r.asset_key, r.code_location
+            ),
+            None => format!("{}: {} in {}", node.id, r.asset_key, r.code_location),
+        },
         None => node.id.clone(),
     };
     let dash = if is_remote {
@@ -575,12 +597,12 @@ fn render_node_full(
                 }
             })}
 
-            {is_unresolved.then(|| {
-                let chip_w = 72.0;
+            {remote_chip.map(|(text, class, fill)| {
+                let chip_w = 5.0 * text.len() as f64 + 2.0;
                 let chip_x = x + w - chip_w - 6.0;
                 let chip_y = y - 6.0;
                 view! {
-                    <g class="dag-node-unregistered">
+                    <g class=class>
                         <rect
                             x={chip_x.to_string()}
                             y={chip_y.to_string()}
@@ -595,11 +617,11 @@ fn render_node_full(
                             x={(chip_x + chip_w / 2.0).to_string()}
                             y={(chip_y + 9.0).to_string()}
                             text-anchor="middle"
-                            fill="#b4b8c2"
+                            fill=fill
                             font-size="8"
                             font-family="JetBrains Mono, monospace"
                         >
-                            "not registered"
+                            {text}
                         </text>
                     </g>
                 }
