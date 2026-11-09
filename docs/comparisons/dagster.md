@@ -78,7 +78,7 @@ rivers runs **one daemon per code location**, in-process inside the `rivers serv
 - **Scales with code locations** — daemon capacity grows linearly as you add `CodeLocation` CRs; there's no shared "daemon node" to provision.
 - **Parallel within a tick** — schedules and sensors in the same location evaluate concurrently inside one tick (async on the event loop, sync via a GIL-aware loky pool), rather than serialised one-by-one like the global Dagster daemon.
 
-The run queue, tag concurrency limits, and pool slot tracking are global (they live in SurrealDB), so cross-location fairness is preserved. Only the *evaluation* — the part that runs user Python — is partitioned.
+The run queue, tag concurrency limits, and pool slots live in SurrealDB and are kept per code location, so one location's runs never wait on another location's limits.
 
 ## Web UI
 
