@@ -49,8 +49,9 @@ impl DirectoryGc {
     }
 
     /// Drop each entry in `namespace` that no CR in `state` backs with the
-    /// same identity and that has been silent for [`SWEEP_EVERY`]. Returns how
-    /// many it dropped.
+    /// same identity and that has been silent for [`SWEEP_EVERY`]. A CR
+    /// without an identity backs each entry of its name, because its pod
+    /// registers under the CR name. Returns how many it dropped.
     pub async fn sweep(&self, namespace: &str, state: &DirectoryState) -> anyhow::Result<usize> {
         let cutoff = now_nanos() - SWEEP_EVERY.as_nanos() as i64;
         let mut dropped = 0;
@@ -62,7 +63,9 @@ impl DirectoryGc {
             let backed = state
                 .lookup_code_location(namespace, location.name())
                 .await
-                .is_some_and(|cl| cl.spec.identity == entry.identity);
+                .is_some_and(|cl| {
+                    cl.spec.identity.is_empty() || cl.spec.identity == entry.identity
+                });
             if backed {
                 continue;
             }
@@ -136,9 +139,14 @@ mod tests {
         )
     }
 
-    async fn register(gc: &DirectoryGc, location: &LocationRef, identity: &str, last_seen: i64) {
+    async fn register(
+        gc: &DirectoryGc,
+        location: &LocationRef,
+        identity: &str,
+        last_seen: impl Into<Option<i64>>,
+    ) {
         let entry = CodeLocationDirectoryEntry {
-            last_seen: Some(last_seen),
+            last_seen: last_seen.into(),
             ..CodeLocationDirectoryEntry::new(identity)
         };
         gc.storage
@@ -216,5 +224,26 @@ mod tests {
                 ("rivers/warehouse".into(), "wh-1".into()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_the_entry_of_a_code_location_without_identity() {
+        for last_seen in [None, Some(silent())] {
+            let gc = gc(LeaderGate::leading()).await;
+            let state = DirectoryState::new();
+            state.upsert_code_location(cl("warehouse", "")).await;
+            register(&gc, &location(NS, "warehouse"), "warehouse", last_seen).await;
+
+            assert_eq!(
+                gc.sweep(NS, &state).await.unwrap(),
+                0,
+                "last_seen: {last_seen:?}"
+            );
+            assert_eq!(
+                identities(&gc).await,
+                vec![("rivers/warehouse".into(), "warehouse".into())],
+                "last_seen: {last_seen:?}"
+            );
+        }
     }
 }
