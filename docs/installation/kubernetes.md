@@ -154,6 +154,21 @@ first rollout completes.
     kubectl delete codelocation analytics -n old
     ```
 
+### Deleting a CodeLocation
+
+Each code-location pod writes its gRPC endpoint to the code location
+directory in SurrealDB, which [remote assets](../concepts/assets.md#remote-assets)
+use to find their owner. When you delete a CodeLocation, the operator
+leader drops its directory entry if the entry still names the deleted
+CodeLocation's `spec.identity`. A CodeLocation that you recreate under the
+same name gets a new identity, so its entry stays.
+
+Every 10 minutes the leader also drops entries in its namespace that no
+CodeLocation backs with the same identity and that have not reported in
+for 10 minutes. This removes entries left behind while no operator ran.
+The run history and asset state of the deleted CodeLocation stay in
+storage.
+
 ## Git-sourced CodeLocations
 
 A `CodeLocation` can take its code from a git repository instead of an
