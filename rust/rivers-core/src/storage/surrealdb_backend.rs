@@ -13,6 +13,7 @@ mod migration;
 pub use migration::{Capability, SchemaMigrationNeeded};
 
 mod backend;
+mod directory;
 mod pages;
 mod per_code_location;
 mod pools;
@@ -526,6 +527,21 @@ fn record_id_str(id: &RecordId) -> String {
 /// so `INSERT IGNORE` deduplicates instead of appending.
 fn new_event_record_id() -> RecordId {
     RecordId::new("events", uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// True if a `CREATE` failed because the record id or a unique index value
+/// is already taken. Structural match, with a message fallback.
+fn is_already_exists_error(err: &anyhow::Error) -> bool {
+    use surrealdb::types::ErrorDetails;
+    if err
+        .chain()
+        .find_map(|e| e.downcast_ref::<surrealdb::Error>())
+        .is_some_and(|se| matches!(se.details(), ErrorDetails::AlreadyExists(_)))
+    {
+        return true;
+    }
+    let m = err.to_string();
+    m.contains("already exists") || m.contains("already contains")
 }
 
 fn now_nanos() -> i64 {

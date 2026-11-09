@@ -722,23 +722,57 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    async fn set_code_location_identity(
+    async fn list_code_locations(&self) -> Result<Vec<(LocationRef, CodeLocationDirectoryEntry)>> {
+        self.list_directory().await
+    }
+
+    async fn get_code_location_entry(
         &self,
         location: &LocationRef,
-        identity: &str,
-    ) -> Result<()> {
-        let entry = CodeLocationDirectoryEntry {
-            identity: identity.to_string(),
-        };
-        self.kv_set_json(&crate::code_location_directory_key(location), &entry)
+    ) -> Result<Option<CodeLocationDirectoryEntry>> {
+        self.kv_get_json(&crate::code_location_directory_key(location))
             .await
     }
 
-    async fn get_code_location_identity(&self, location: &LocationRef) -> Result<Option<String>> {
-        let entry: Option<CodeLocationDirectoryEntry> = self
-            .kv_get_json(&crate::code_location_directory_key(location))
-            .await?;
-        Ok(entry.map(|e| e.identity))
+    async fn upsert_code_location_registration(
+        &self,
+        location: &LocationRef,
+        entry: CodeLocationDirectoryEntry,
+    ) -> Result<()> {
+        self.update_directory_entry(location, |current| {
+            let mut next = entry.clone();
+            if let Some(current) = current.filter(|c| c.identity == entry.identity) {
+                next.grpc_endpoint = next.grpc_endpoint.or(current.grpc_endpoint);
+                next.last_seen = next.last_seen.or(current.last_seen);
+            }
+            Some(next)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn touch_code_location(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+        grpc_endpoint: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.update_directory_entry(location, |current| {
+            let mut entry = current.filter(|c| c.identity == identity)?;
+            entry.grpc_endpoint = Some(grpc_endpoint.to_string());
+            entry.last_seen = Some(now);
+            Some(entry)
+        })
+        .await
+    }
+
+    async fn delete_code_location_if(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+    ) -> Result<bool> {
+        self.delete_directory_entry_if(location, identity).await
     }
 
     async fn store_tick(&self, tick: &TickRecord) -> Result<String> {
