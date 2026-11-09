@@ -76,6 +76,12 @@ def ext2():
 
 reveal_type(ext2)
 
+# remote
+rem = rs.Asset.remote(
+    "orders", code_location="team-sales/warehouse", io_handler=DuckHandler()
+)
+reveal_type(rem)
+
 
 # Schedule as decorator (with args, no func)
 @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job")

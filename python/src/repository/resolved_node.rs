@@ -32,6 +32,7 @@ pub(crate) enum AssetKind {
     Multi,
     Graph,
     External,
+    Remote,
 }
 
 pub(crate) struct ResolvedAsset {
@@ -91,6 +92,8 @@ pub(crate) struct ResolvedAsset {
     /// `AssetDef.dep` deps that are not also inputs: they order the asset
     /// but load nothing. Set by `build_unresolved_graph`.
     pub lineage_deps: HashSet<String>,
+    /// For Remote assets: the owning code location and the asset's key there.
+    pub remote: Option<rivers_core::assets::remote::RemoteRef>,
 }
 
 /// Composition tasks carry override fields propagated from their parent
@@ -180,6 +183,7 @@ impl ResolvedAsset {
             Asset::Multi(_) => AssetKind::Multi,
             Asset::Graph(_) => AssetKind::Graph,
             Asset::External(_) => AssetKind::External,
+            Asset::Remote(_) => AssetKind::Remote,
         };
 
         let name = asset
@@ -191,7 +195,7 @@ impl ResolvedAsset {
             Asset::Single(s) => s.is_async,
             Asset::Multi(m) => m.is_async,
             Asset::External(e) => e.is_async_observe,
-            Asset::Graph(_) => false,
+            Asset::Graph(_) | Asset::Remote(_) => false,
         };
 
         let is_observable_external = matches!(
@@ -314,6 +318,24 @@ impl ResolvedAsset {
 
         let automation_condition = asset.automation_condition().cloned();
 
+        let remote = match asset {
+            Asset::Remote(r) => {
+                let namespace = rivers_k8s::env::current_code_location_namespace();
+                let code_location =
+                    rivers_core::assets::remote::LocationRef::parse(&r.code_location, &namespace)
+                        .map_err(|e| {
+                        crate::errors::AssetDefinitionError::new_err(format!(
+                            "remote asset '{name}': {e}"
+                        ))
+                    })?;
+                Some(rivers_core::assets::remote::RemoteRef {
+                    code_location,
+                    asset_key: r.asset_key.clone(),
+                })
+            }
+            _ => None,
+        };
+
         let actions: Vec<crate::assets::action::ResolvedAction> = match kind {
             // Externals carry only the built-in observe, which is never
             // exclusive and is async iff the observe function is.
@@ -386,6 +408,7 @@ impl ResolvedAsset {
             input_io_handlers,
             output_type_hint,
             lineage_deps: HashSet::new(),
+            remote,
         })
     }
 
@@ -425,6 +448,7 @@ impl ResolvedAsset {
                 .collect(),
             output_type_hint: self.output_type_hint.as_ref().map(|h| h.clone_ref(py)),
             lineage_deps: self.lineage_deps.clone(),
+            remote: self.remote.clone(),
         }
     }
 }
@@ -570,6 +594,24 @@ impl ResolvedNode {
         matches!(self, ResolvedNode::Asset(node) if node.is_observable_external)
     }
 
+    pub fn is_remote(&self) -> bool {
+        self.remote().is_some()
+    }
+
+    /// For Remote assets: the owning code location and the asset's key there.
+    pub fn remote(&self) -> Option<&rivers_core::assets::remote::RemoteRef> {
+        match self {
+            ResolvedNode::Asset(node) => node.remote.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether a run of this repository can materialize the node: not a
+    /// remote, and not an external without an observe function.
+    pub fn is_materializable(&self) -> bool {
+        !(self.is_remote() || (self.is_external() && !self.is_observable_external()))
+    }
+
     /// Whether `dep` orders this node without loading data (`AssetDef.dep`).
     pub fn is_lineage_dep(&self, dep: &str) -> bool {
         matches!(self, ResolvedNode::Asset(node) if node.lineage_deps.contains(dep))
@@ -691,6 +733,7 @@ impl ResolvedNode {
                 AssetKind::Multi => "multi",
                 AssetKind::Graph => "graph",
                 AssetKind::External => "external",
+                AssetKind::Remote => "remote",
             },
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => "task",
         }
@@ -737,7 +780,8 @@ impl ResolvedNode {
         }
     }
 
-    /// Returns None for BashTask and ExternalAsset without observe_fn.
+    /// Returns None for BashTask, RemoteAsset, and ExternalAsset without
+    /// observe_fn.
     pub fn annotations<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         match self {
             ResolvedNode::Asset(node) => {
@@ -747,6 +791,7 @@ impl ResolvedNode {
                         Some(ref f) => f.clone_ref(py),
                         None => return Ok(None),
                     },
+                    Asset::Remote(_) => return Ok(None),
                     _ => asset._asset_fn()?.clone_ref(py),
                 };
                 let ann = func.getattr(py, "__annotations__")?;

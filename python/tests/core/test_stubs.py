@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 EXPECTED_TYPES = {
     "ext": "ExternalAsset",
     "ext2": "ExternalAsset",
+    "rem": "RemoteAsset",
     "g": "GraphAsset",
     "g2": "GraphAsset",
     "m": "MultiAsset",

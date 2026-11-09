@@ -1,4 +1,5 @@
-//! Asset types: single assets, multi-assets, graph assets, external assets, and IO handlers.
+//! Asset types: single assets, multi-assets, graph assets, external and
+//! remote assets, and IO handlers.
 pub mod action;
 pub mod class_form;
 pub mod decorator;
@@ -8,6 +9,7 @@ pub mod graph_asset;
 pub mod io_handler;
 pub mod io_handler_registry;
 pub mod multi_asset;
+pub mod remote_asset;
 pub mod self_dependency;
 pub mod single_asset;
 
@@ -20,6 +22,7 @@ use dep_def::DepDef;
 use external_asset::PyExternalAsset;
 use graph_asset::PyGraphAsset;
 use multi_asset::PyMultiAsset;
+use remote_asset::PyRemoteAsset;
 use self_dependency::PySelfDependency;
 use single_asset::PySingleAsset;
 
@@ -37,6 +40,7 @@ pub fn register_asset_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()
         PyMultiAsset as "MultiAsset",
         PyGraphAsset as "GraphAsset",
         PyExternalAsset as "ExternalAsset",
+        PyRemoteAsset as "RemoteAsset",
         PySelfDependency as "SelfDependency",
         PyAssetExecutionContext as "AssetExecutionContext",
         PyAssetAction as "AssetAction",

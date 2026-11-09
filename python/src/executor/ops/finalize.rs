@@ -472,6 +472,7 @@ pub(crate) fn register_assets_from_nodes(
     let code_location_id = storage.code_location_id().to_string();
     let records: Vec<AssetRecord> = node_map
         .iter()
+        .filter(|(_, node)| !node.is_remote())
         .map(|(name, node)| AssetRecord {
             code_location_id: code_location_id.clone(),
             asset_key: name.clone(),

@@ -191,7 +191,7 @@ impl PyCodeRepository {
             state
                 .node_map
                 .iter()
-                .filter(|(_, node)| !node.is_external() || node.is_observable_external())
+                .filter(|(_, node)| node.is_materializable())
                 .map(|(name, _)| name.clone())
                 .collect()
         };
@@ -204,8 +204,7 @@ impl PyCodeRepository {
                     state
                         .node_map
                         .get(name)
-                        .map(|n| !n.is_external() || n.is_observable_external())
-                        .unwrap_or(false)
+                        .is_some_and(|n| n.is_materializable())
                 })
                 .collect();
         };

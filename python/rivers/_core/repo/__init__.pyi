@@ -16,6 +16,7 @@ from rivers._core.assets import (
     ExternalAsset,
     GraphAsset,
     MultiAsset,
+    RemoteAsset,
     SingleAsset,
 )
 from rivers._core.executor import Executor
@@ -152,7 +153,14 @@ class CodeRepository:
     def __init__(
         self,
         assets: Sequence[
-            Union[SingleAsset, MultiAsset, GraphAsset, ExternalAsset, type[Asset]]
+            Union[
+                SingleAsset,
+                MultiAsset,
+                GraphAsset,
+                ExternalAsset,
+                RemoteAsset,
+                type[Asset],
+            ]
         ],
         tasks: Sequence[Union[Task, BashTask]] | None = None,
         jobs: Sequence[Job] | None = None,
@@ -173,7 +181,8 @@ class CodeRepository:
             assets: All assets exposed by this repository — decorator-form
                 instances and/or class-form subclasses of :class:`Asset`,
                 :class:`MultiAsset`, :class:`GraphAsset`, :class:`ExternalAsset`
-                (classes desugar here, at registration).
+                (classes desugar here, at registration), and
+                :class:`RemoteAsset` instances.
             tasks: Standalone tasks that aren't asset producers.
             jobs: Custom jobs (a Job is a named selection over assets/tasks).
             schedules: Schedules attached to the repository.

@@ -522,7 +522,7 @@ impl RepoHandle {
             .resolved()?
             .node_map
             .iter()
-            .filter(|&(_k, n)| matches!(n, ResolvedNode::Asset(_)))
+            .filter(|&(_k, n)| matches!(n, ResolvedNode::Asset(_)) && !n.is_remote())
             .map(|(k, _n)| k.clone())
             .collect())
     }

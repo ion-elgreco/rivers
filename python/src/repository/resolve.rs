@@ -343,7 +343,7 @@ impl PyCodeRepository {
                 if let Some(gn) = node_map.get(&topo_node.name) {
                     topo_node.group = gn.group();
                     topo_node.kind = match gn.asset_type() {
-                        "single" | "multi" | "external" => {
+                        "single" | "multi" | "external" | "remote" => {
                             rivers_core::assets::graph::NodeKind::Asset
                         }
                         "graph" => rivers_core::assets::graph::NodeKind::GraphAsset,
@@ -354,6 +354,7 @@ impl PyCodeRepository {
                             )));
                         }
                     };
+                    topo_node.remote = gn.remote().cloned();
                 }
                 if let Some(parent) = task_to_graph.get(&topo_node.name) {
                     topo_node.parent_graph = Some(parent.clone());

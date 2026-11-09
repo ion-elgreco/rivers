@@ -42,8 +42,9 @@ def grpc_channel(grpc_stubs):
         return upstream + 1
 
     ext = rs.Asset.external(name="ext_feed", io_handler=handler)
+    remote = rs.Asset.remote("remote_feed", code_location="other", io_handler=handler)
 
-    repo = rs.CodeRepository(assets=[upstream, downstream, ext])
+    repo = rs.CodeRepository(assets=[upstream, downstream, ext, remote])
     port = repo._start_grpc_server("127.0.0.1", 0)
 
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
@@ -136,6 +137,7 @@ def test_get_assets_info(grpc_channel):
     assert "upstream" in asset_keys
     assert "downstream" in asset_keys
     assert "ext_feed" in asset_keys
+    assert "remote_feed" not in asset_keys
 
     # Verify ext_feed is external
     ext = next(a for a in response.assets if a.asset_key == "ext_feed")
