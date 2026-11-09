@@ -2,7 +2,11 @@
 
 use std::collections::HashMap;
 
-use rivers_core::assets::remote::RemoteRef;
+use rivers_core::assets::graph::GraphTopology;
+use rivers_core::assets::partitions_fingerprint::{
+    PartitionDrift, describe_partitions, partition_drift,
+};
+use rivers_core::assets::remote::{LocationRef, RemoteRef};
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
 use rivers_core::storage::{CodeLocationContext, StorageBackend, resolve_code_locations};
 
@@ -14,8 +18,9 @@ use super::ops::{self, StorageHandle, now_ts};
 
 /// Put the owner's data version of each remote dep in `remote` into
 /// `data_versions`, under the local name. With `warn_to`, a remote whose
-/// owner is not registered gets a warning in the log of each step that
-/// loads it.
+/// owner is not registered, or whose mirror no longer matches the owner's
+/// partitions definition, gets a warning in the log of each step that loads
+/// it.
 pub(super) fn prefill_remote_dep_versions(
     plan: &ExecutionPlan,
     node_map: &HashMap<String, ResolvedNode>,
@@ -48,13 +53,32 @@ pub(super) fn prefill_remote_dep_versions(
         }
     };
 
-    let mut unresolved = Vec::new();
+    let mut warnings: Vec<(&str, String)> = Vec::new();
+    let mut owners: HashMap<&LocationRef, Option<GraphTopology>> = HashMap::new();
     for &(local, remote) in &refs {
         let Some(identity) = identities.get(&remote.code_location).cloned().flatten() else {
-            unresolved.push((local, remote));
+            warnings.push((
+                local,
+                format!(
+                    "code location '{}' is not registered; loading '{}' through the handler \
+                     without data-version tracking",
+                    remote.code_location, remote.asset_key,
+                ),
+            ));
             continue;
         };
         let ctx = CodeLocationContext::new(&identity);
+        if warn_to.is_some() {
+            let owner = owners
+                .entry(&remote.code_location)
+                .or_insert_with(|| owner_topology(backend, &ctx, &remote.code_location));
+            if let Some(warning) = owner
+                .as_ref()
+                .and_then(|owner| drift_warning(node_map, local, remote, owner))
+            {
+                warnings.push((local, warning));
+            }
+        }
         match io_rt().block_on(
             backend
                 .for_code_location(&ctx)
@@ -76,36 +100,84 @@ pub(super) fn prefill_remote_dep_versions(
     }
 
     if let Some((writer, run_id)) = warn_to {
-        warn_unresolved(plan, node_map, &unresolved, writer, run_id);
+        warn_loading_steps(plan, node_map, &warnings, writer, run_id);
     }
 }
 
-fn warn_unresolved(
+/// The owner's topology; `None` when it has none or reading it failed.
+fn owner_topology<S: StorageBackend>(
+    backend: &S,
+    ctx: &CodeLocationContext,
+    location: &LocationRef,
+) -> Option<GraphTopology> {
+    match io_rt().block_on(backend.for_code_location(ctx).get_graph_topology()) {
+        Ok(topology) => topology,
+        Err(error) => {
+            tracing::warn!(
+                target: "rivers::executor",
+                code_location = %location,
+                %error,
+                "reading a remote code location's topology failed; partition drift is not checked"
+            );
+            None
+        }
+    }
+}
+
+/// Why loading `local` may not read what its mirror describes.
+fn drift_warning(
+    node_map: &HashMap<String, ResolvedNode>,
+    local: &str,
+    remote: &RemoteRef,
+    owner: &GraphTopology,
+) -> Option<String> {
+    let mirror = node_map
+        .get(local)?
+        .partitions_def()
+        .map(|def| def.fingerprint());
+    match partition_drift(owner, &remote.asset_key, mirror.as_ref()) {
+        PartitionDrift::Same | PartitionDrift::Compatible => None,
+        PartitionDrift::Incompatible => {
+            let owned = owner
+                .owned_node(&remote.asset_key)
+                .and_then(|node| owner.partitions_of(node));
+            Some(format!(
+                "partition definition of '{local}' differs from code location '{}' (mirror {}, \
+                 owner {}); loading anyway",
+                remote.code_location,
+                describe_partitions(mirror.as_ref()),
+                describe_partitions(owned),
+            ))
+        }
+        PartitionDrift::OwnerNodeMissing => Some(format!(
+            "code location '{}' has no asset '{}'; loading '{local}' through the handler anyway",
+            remote.code_location, remote.asset_key,
+        )),
+    }
+}
+
+/// Write each warning `(local, message)` into the log of every step that
+/// loads `local`.
+fn warn_loading_steps(
     plan: &ExecutionPlan,
     node_map: &HashMap<String, ResolvedNode>,
-    unresolved: &[(&str, &RemoteRef)],
+    warnings: &[(&str, String)],
     writer: &EventWriter,
     run_id: &str,
 ) {
     for step in &plan.steps {
-        let loaded: Vec<&RemoteRef> = unresolved
+        let messages: Vec<&String> = warnings
             .iter()
             .filter(|(local, _)| loads(node_map, step, local))
-            .map(|(_, remote)| *remote)
+            .map(|(_, message)| message)
             .collect();
-        if loaded.is_empty() {
+        if messages.is_empty() {
             continue;
         }
 
         crate::log_capture::start();
-        for remote in loaded {
-            tracing::warn!(
-                target: "rivers::executor",
-                "code location '{}' is not registered; loading '{}' through the handler \
-                 without data-version tracking",
-                remote.code_location,
-                remote.asset_key,
-            );
+        for message in messages {
+            tracing::warn!(target: "rivers::executor", "{message}");
         }
         let logs = crate::log_capture::take();
         ops::emit_log_output(writer, run_id, &step.name, "", "", &logs, now_ts());

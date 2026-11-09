@@ -182,6 +182,84 @@ def test_unregistered_owner_loads_with_a_warning(
     assert NOT_REGISTERED not in logs.get("sibling", "")
 
 
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_incompatible_mirror_loads_with_a_warning(
+    executor, embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+
+    @rs.Asset(
+        io_handler=handler, partitions_def=rs.PartitionsDefinition.static_(["a", "b"])
+    )
+    def raw_orders() -> list[int]:
+        return [1, 2, 3]
+
+    owner = _resolve_as([raw_orders], embedded_storage, monkeypatch, "warehouse")
+    assert owner.materialize(partition_key=rs.PartitionKey.single("a")).success
+
+    keys = rs.PartitionsDefinition.static_(["a", "b", "c"])
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler, partitions_def=keys
+    )
+
+    @rs.Asset(io_handler=handler, partitions_def=keys)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    @rs.Asset(io_handler=handler, partitions_def=keys)
+    def sibling() -> int:
+        return 1
+
+    consumer = _resolve_as(
+        [orders, order_count, sibling],
+        embedded_storage,
+        monkeypatch,
+        "analytics",
+        executor,
+    )
+    result = consumer.materialize(partition_key=rs.PartitionKey.single("a"))
+
+    assert result.success
+    logs = _logs(embedded_storage, result.run_id)
+    warning = (
+        "partition definition of 'raw_orders' differs from code location "
+        "'dev/warehouse' (mirror static (3 keys), owner static (2 keys)); loading anyway"
+    )
+    assert warning in logs["order_count"]
+    assert warning not in logs.get("sibling", "")
+
+
+def test_owner_without_the_asset_loads_with_a_warning(
+    embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    _owner(handler, embedded_storage, monkeypatch)
+
+    @rs.Asset(io_handler=handler)
+    def replacement() -> int:
+        return 0
+
+    _resolve_as([replacement], embedded_storage, monkeypatch, "warehouse")
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler
+    )
+
+    @rs.Asset(io_handler=handler)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    consumer = _resolve_as(
+        [orders, order_count], embedded_storage, monkeypatch, "analytics"
+    )
+    result = consumer.materialize()
+
+    assert result.success
+    assert (
+        "code location 'dev/warehouse' has no asset 'raw_orders'; loading "
+        "'raw_orders' through the handler anyway"
+    ) in _logs(embedded_storage, result.run_id)["order_count"]
+
+
 def test_lineage_only_remote_records_the_version_without_loading(
     embedded_storage, tmp_path, monkeypatch
 ):

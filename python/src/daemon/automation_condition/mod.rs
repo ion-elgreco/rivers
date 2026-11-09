@@ -158,6 +158,7 @@ pub(in crate::daemon) fn extract_remote_deps(state: &ResolvedState) -> Vec<Remot
                 local: name.clone(),
                 location: remote.code_location.clone(),
                 asset_key: remote.asset_key.clone(),
+                partitions: node.partitions_def().map(|def| def.fingerprint()),
             })
         })
         .collect()

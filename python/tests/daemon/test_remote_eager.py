@@ -202,3 +202,58 @@ def test_unregistered_owner_launches_nothing(storage, handler, monkeypatch):
         daemon.stop()
 
     assert _consumer_runs(storage) == []
+
+
+@pytest.mark.parametrize(
+    ("mirror", "launches"),
+    [
+        pytest.param(["a", "b"], True, id="same"),
+        pytest.param(["a"], True, id="owner-added-keys"),
+        pytest.param(["a", "b", "c"], False, id="owner-removed-a-key"),
+    ],
+)
+def test_incompatible_mirror_pauses_the_consumer(
+    storage, handler, monkeypatch, mirror, launches
+):
+    @rs.Asset(
+        io_handler=handler, partitions_def=rs.PartitionsDefinition.static_(["a", "b"])
+    )
+    def raw_orders(context: rs.AssetExecutionContext) -> str:
+        return f"orders of {context.partition_key}"
+
+    owner = _resolve_as([raw_orders], storage, monkeypatch, "warehouse")
+    assert owner.materialize(partition_key=rs.PartitionKey.single("a")).success
+
+    keys = rs.PartitionsDefinition.static_(mirror)
+    orders = rs.Asset.remote(
+        "orders",
+        code_location="warehouse",
+        asset_key="raw_orders",
+        io_handler=handler,
+        partitions_def=keys,
+    )
+
+    @rs.Asset(
+        io_handler=handler,
+        partitions_def=keys,
+        automation_condition=rs.AutomationCondition.eager(),
+    )
+    def summary(orders: str) -> str:
+        return orders
+
+    consumer = _resolve_as([orders, summary], storage, monkeypatch, "analytics")
+    scoped = storage._scoped("analytics")
+    built = lambda: set(scoped.get_materialized_partitions("summary"))  # noqa: E731
+
+    daemon = _start(consumer, storage)
+    try:
+        if launches:
+            wait_for(
+                lambda: rs.PartitionKey.single("a") in built(), 20, "summary for 'a'"
+            )
+        else:
+            time.sleep(4)
+    finally:
+        daemon.stop()
+
+    assert (rs.PartitionKey.single("a") in built()) == launches

@@ -297,7 +297,7 @@ wh_orders = rs.Asset.remote("wh_orders", code_location="warehouse", asset_key="r
 
 ### Lineage view
 
-The lineage view draws a remote asset with a dotted border, the owner's name, and the owner's key. It links to the asset in the owning code location when the UI knows that code location. Otherwise the node shows **not registered**. In `rivers dev`, the UI knows only the local code location.
+The lineage view draws a remote asset with a dotted border, the owner's name, and the owner's key. It links to the asset in the owning code location when the UI knows that code location. Otherwise the node shows **not registered**. In `rivers dev`, the UI knows every code location that registered in its storage.
 
 ### Automation
 
@@ -305,13 +305,25 @@ The condition daemon of this code location follows the owner's runs. Conditions 
 
 - **`eager()`** starts a run when the owner materializes the remote asset. It waits while an owner run that materializes the remote asset is in progress.
 - **`on_cron()`** counts the owner's materialization as a dependency update.
-- **`any_deps_missing()`** is true until the owner materializes the remote asset (or its partition). It is also true while the owning code location is not registered, so `eager()` starts no run.
+- **`any_deps_missing()`** is true until the owner materializes the remote asset (or its partition). It is also true while the owning code location is not registered, or while the mirror is incompatible with the owner's definition (see [Partition drift](#partition-drift)), so `eager()` starts no run.
 - **`any_deps_match(execution_failed())`** follows the owner's failed runs.
 - **Partition mappings** use the mirrored `partitions_def`.
 
 These conditions read the runs of this code location, so they are false on a remote dependency: `backfill_in_progress()`, `will_be_requested()`, `last_executed_with_tags()`, `has_run_with_tags()`, and `all_runs_have_tags()`.
 
-The daemon finds the owner by name. While the owner is not registered, it tries again every 5 seconds. After that, it checks the owner's identity every 30 seconds, so it follows a redeployed owner.
+The daemon finds the owner by name. While the owner is not registered, it tries again every 5 seconds. After that, it checks the owner's identity and partition definitions every 30 seconds, so it follows a redeployed owner.
+
+### Partition drift
+
+The mirrored `partitions_def` can stop matching the owner's definition, for example when the owner changes a daily definition to an hourly one. rivers compares the two definitions: the lineage view on each page load, and the condition daemon every 30 seconds. The result depends on the difference:
+
+| Difference | Examples | Lineage view | Automation | Manual runs |
+| --- | --- | --- | --- | --- |
+| Compatible | The owner moved `start` or `end`, or added static keys. | **range differs** | No change. | No change. |
+| Incompatible | Another kind, schedule, or key format. The owner removed a static key. Only one side is partitioned. | **partitions differ** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+| Owner has no such asset | The owner renamed or removed the asset. | **not found** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+
+Select the node in the lineage view to see both definitions. To resume automation, change the mirror to match the owner's definition, or undo the owner's change. The daemon sees an undone change within 30 seconds.
 
 ## Self-dependent assets
 

@@ -31,14 +31,16 @@ async fn load_topology(
                 "code location {loc_ns}/{loc_name} not found in registry"
             ))
         })?;
-    Ok(read_topology(&state, entry.identity).await)
+    Ok(read_topology(&state, entry.identity)
+        .await
+        .unwrap_or_default())
 }
 
 #[cfg(feature = "ssr")]
 async fn read_topology(
     state: &crate::state::AppState,
     identity: String,
-) -> rivers_core::assets::graph::GraphTopology {
+) -> Option<rivers_core::assets::graph::GraphTopology> {
     use rivers_core::storage::StorageBackend;
 
     let ctx = rivers_core::storage::CodeLocationContext::new(identity);
@@ -49,12 +51,11 @@ async fn read_topology(
         .await
         .ok()
         .flatten()
-        .unwrap_or_default()
 }
 
 /// The UI topology. A remote node is resolved when the registry knows its
 /// owning code location, and then carries its partition drift against the
-/// owner's topology.
+/// owner's topology, if the owner wrote one.
 #[cfg(feature = "ssr")]
 async fn load_ui_topology(loc_ns: &str, loc_name: &str) -> Result<GraphTopology, ServerFnError> {
     use std::collections::HashMap;
@@ -66,7 +67,8 @@ async fn load_ui_topology(loc_ns: &str, loc_name: &str) -> Result<GraphTopology,
     let topology = load_topology(loc_ns, loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
 
-    let mut owners: HashMap<String, Option<CoreTopology>> = HashMap::new();
+    // Location → `None` when unregistered, `Some(None)` without a topology.
+    let mut owners: HashMap<String, Option<Option<CoreTopology>>> = HashMap::new();
     let mut remotes: HashMap<String, (bool, Option<RemoteDrift>)> = HashMap::new();
     for node in &topology.nodes {
         let Some(remote) = &node.remote else {
@@ -87,10 +89,14 @@ async fn load_ui_topology(loc_ns: &str, loc_name: &str) -> Result<GraphTopology,
             };
             owners.insert(location.clone(), owner);
         }
-        let seen = owners[&location].as_ref().map_or((false, None), |owner| {
-            let mirror = topology.partitions_of(node);
-            (true, RemoteDrift::between(owner, &remote.asset_key, mirror))
-        });
+        let seen = match &owners[&location] {
+            None => (false, None),
+            Some(None) => (true, None),
+            Some(Some(owner)) => {
+                let mirror = topology.partitions_of(node);
+                (true, RemoteDrift::between(owner, &remote.asset_key, mirror))
+            }
+        };
         remotes.insert(node.name.clone(), seen);
     }
 

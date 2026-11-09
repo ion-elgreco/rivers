@@ -5,6 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::partitions_fingerprint::{
+    PartitionDrift, PartitionsFingerprint, describe_partitions, partition_drift,
+};
 use crate::assets::remote::LocationRef;
 use crate::storage::{
     AssetRecord, CodeLocationContext, PartitionKey, RunRecord, RunStatus, ScopedStorage, SortOrder,
@@ -21,27 +24,30 @@ const RETRY_NANOS: i64 = 5_000_000_000;
 const REVALIDATE_NANOS: i64 = 30_000_000_000;
 
 /// An upstream asset owned by another code location.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RemoteDep {
     /// The remote node's name in this location's graph.
     pub local: String,
     pub location: LocationRef,
     /// The asset's key in the owning location.
     pub asset_key: String,
+    /// The mirrored partitions definition.
+    pub partitions: Option<PartitionsFingerprint>,
 }
 
 /// Remote deps grouped by owning location.
 #[derive(Default)]
 pub(super) struct RemoteScopes {
     pub(super) slots: HashMap<LocationRef, RemoteSlot>,
-    locals: HashSet<String>,
+    /// Local name → mirrored partitions definition.
+    mirrors: HashMap<String, Option<PartitionsFingerprint>>,
 }
 
 impl RemoteScopes {
     fn new(deps: Vec<RemoteDep>) -> Self {
         let mut scopes = Self::default();
         for dep in deps {
-            scopes.locals.insert(dep.local.clone());
+            scopes.mirrors.insert(dep.local.clone(), dep.partitions);
             scopes
                 .slots
                 .entry(dep.location)
@@ -59,7 +65,7 @@ impl RemoteScopes {
 
     /// Whether `name` is a remote dep's local name.
     pub(super) fn is_local(&self, name: &str) -> bool {
-        self.locals.contains(name)
+        self.mirrors.contains_key(name)
     }
 
     pub(super) fn slot_mut(&mut self, location: &LocationRef) -> &mut RemoteSlot {
@@ -76,6 +82,12 @@ pub(super) struct RemoteSlot {
 }
 
 impl RemoteSlot {
+    /// Whether automation pauses for `local`: its mirror no longer matches
+    /// the owner's definition.
+    fn paused(&self, local: &str) -> bool {
+        matches!(&self.state, SlotState::Resolved { scope, .. } if scope.paused(local))
+    }
+
     /// Partitions of `key` that a live run in the owner is materializing.
     fn live_partitions(&self, key: &str) -> HashSet<PartitionKey> {
         let SlotState::Resolved { scope, .. } = &self.state else {
@@ -97,7 +109,7 @@ pub(super) enum SlotState {
     /// No directory entry.
     Unresolved { next_attempt: i64 },
     Resolved {
-        scope: RemoteScope,
+        scope: Box<RemoteScope>,
         next_revalidate: i64,
     },
 }
@@ -146,6 +158,30 @@ pub(super) struct RemoteScope {
     pub(super) live_runs: HashMap<String, LiveRemoteRun>,
     /// Failure floors by owner key, with the failure's time.
     pub(super) failed: HashMap<String, i64>,
+    /// Each local's mirror against the owner's partitions definition.
+    pub(super) drift: HashMap<String, PartitionDrift>,
+}
+
+impl RemoteScope {
+    fn paused(&self, local: &str) -> bool {
+        self.drift.get(local).copied().is_some_and(pauses)
+    }
+}
+
+/// Drift that makes a dep count as missing.
+fn pauses(drift: PartitionDrift) -> bool {
+    matches!(
+        drift,
+        PartitionDrift::Incompatible | PartitionDrift::OwnerNodeMissing
+    )
+}
+
+fn paused_locals(drift: &HashMap<String, PartitionDrift>) -> HashSet<&String> {
+    drift
+        .iter()
+        .filter(|(_, d)| pauses(**d))
+        .map(|(local, _)| local)
+        .collect()
 }
 
 pub(super) struct LiveRemoteRun {
@@ -254,6 +290,7 @@ impl AssetConditionCache {
                 .filter(|run| !run.action)
                 .flat_map(|run| &run.asset_keys)
                 .flat_map(|key| &slot.bindings[key])
+                .filter(|local| !slot.paused(local))
         })
     }
 
@@ -268,6 +305,7 @@ impl AssetConditionCache {
                 .into_iter()
                 .flatten()
                 .flat_map(|key| &slot.bindings[key])
+                .filter(|local| !slot.paused(local))
         })
     }
 
@@ -337,7 +375,8 @@ impl AssetConditionCache {
     }
 
     /// `location` is registered under `identity`. A new identity (first
-    /// lookup, or a recreated location) reads everything again.
+    /// lookup, or a recreated location) reads everything again, and so does
+    /// a change in which deps the partition drift pauses.
     async fn resolve_remote<S: StorageBackend>(
         &mut self,
         storage: &S,
@@ -345,19 +384,41 @@ impl AssetConditionCache {
         identity: String,
         now: i64,
     ) -> bool {
-        if let SlotState::Resolved {
-            scope,
-            next_revalidate,
-        } = &mut self.remote.slot_mut(location).state
-            && scope.ctx.id() == identity
-        {
-            *next_revalidate = now + REVALIDATE_NANOS;
-            return false;
+        let ctx = CodeLocationContext::new(identity);
+        let mut drift = None;
+        if self.remote.slots[location].state.identity() == Some(ctx.id()) {
+            let read = self.read_remote_drift(storage, &ctx, location).await;
+            let current = match read {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "rivers::conditions",
+                        %location,
+                        %error,
+                        "reading the remote code location's topology failed; retrying"
+                    );
+                    return self.postpone_remote(location, now);
+                }
+            };
+            if let SlotState::Resolved {
+                scope,
+                next_revalidate,
+            } = &mut self.remote.slot_mut(location).state
+                && paused_locals(&scope.drift) == paused_locals(&current)
+            {
+                let changed = scope.drift != current;
+                scope.drift = current;
+                *next_revalidate = now + REVALIDATE_NANOS;
+                return changed;
+            }
+            drift = Some(current);
         }
 
-        let ctx = CodeLocationContext::new(identity);
         let slot = &self.remote.slots[location];
-        let (scope, read) = match self.load_remote_scope(storage, ctx, slot).await {
+        let loaded = self
+            .load_remote_scope(storage, ctx, location, slot, drift)
+            .await;
+        let (scope, read) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
                 tracing::warn!(
@@ -372,6 +433,7 @@ impl AssetConditionCache {
 
         let slot = self.remote.slot_mut(location);
         match slot.state.identity() {
+            Some(old) if old == scope.ctx.id() => {}
             Some(old) => tracing::info!(
                 target: "rivers::conditions",
                 %location,
@@ -387,19 +449,71 @@ impl AssetConditionCache {
             ),
         }
         slot.state = SlotState::Resolved {
-            scope,
+            scope: Box::new(scope),
             next_revalidate: now + REVALIDATE_NANOS,
         };
 
         self.apply_remote_read(location, read)
     }
 
+    /// Each local's drift against the owner's topology, logging the deps
+    /// it starts or stops pausing. Without a topology no drift is known.
+    async fn read_remote_drift<S: StorageBackend>(
+        &self,
+        storage: &S,
+        ctx: &CodeLocationContext,
+        location: &LocationRef,
+    ) -> anyhow::Result<HashMap<String, PartitionDrift>> {
+        let Some(owner) = storage.for_code_location(ctx).get_graph_topology().await? else {
+            return Ok(HashMap::new());
+        };
+        let slot = &self.remote.slots[location];
+
+        let mut drift = HashMap::new();
+        for (key, locals) in &slot.bindings {
+            for local in locals {
+                let mirror = self.remote.mirrors.get(local).and_then(Option::as_ref);
+                let class = partition_drift(&owner, key, mirror);
+                let was_paused = slot.paused(local);
+                if pauses(class) && !was_paused {
+                    let owned = owner.owned_node(key).and_then(|n| owner.partitions_of(n));
+                    tracing::warn!(
+                        target: "rivers::conditions",
+                        %location,
+                        local,
+                        asset_key = key,
+                        drift = ?class,
+                        mirror = %describe_partitions(mirror),
+                        owner = %describe_partitions(owned),
+                        "remote dep does not match the owner's partitions definition; \
+                         automation pauses for it"
+                    );
+                } else if was_paused && !pauses(class) {
+                    tracing::info!(
+                        target: "rivers::conditions",
+                        %location,
+                        local,
+                        "remote dep matches the owner's partitions definition again"
+                    );
+                }
+                drift.insert(local.clone(), class);
+            }
+        }
+        Ok(drift)
+    }
+
     async fn load_remote_scope<S: StorageBackend>(
         &self,
         storage: &S,
         ctx: CodeLocationContext,
+        location: &LocationRef,
         slot: &RemoteSlot,
+        drift: Option<HashMap<String, PartitionDrift>>,
     ) -> anyhow::Result<(RemoteScope, RemoteRead)> {
+        let drift = match drift {
+            Some(drift) => drift,
+            None => self.read_remote_drift(storage, &ctx, location).await?,
+        };
         let scoped = storage.for_code_location(&ctx);
 
         // Cursors first, as in `initial_load`: a run marked applied here was
@@ -464,6 +578,7 @@ impl AssetConditionCache {
             applied_run_ids,
             live_runs,
             failed,
+            drift,
         };
         Ok((scope, read))
     }
@@ -601,18 +716,19 @@ impl AssetConditionCache {
         }
     }
 
-    /// Store `read` under every local bound to each key.
+    /// Store `read` under every local bound to each key. A paused local
+    /// stays missing.
     pub(super) fn apply_remote_read(&mut self, location: &LocationRef, read: RemoteRead) -> bool {
         let slot = &self.remote.slots[location];
         let mut records = Vec::new();
         for (key, record) in &read.records {
             for local in &slot.bindings[key] {
                 records.push(match record {
-                    Some(record) => AssetRecord {
+                    Some(record) if !slot.paused(local) => AssetRecord {
                         asset_key: local.clone(),
                         ..record.clone()
                     },
-                    None => self.remote_placeholder(local),
+                    _ => self.remote_placeholder(local),
                 });
             }
         }
@@ -623,7 +739,15 @@ impl AssetConditionCache {
                 .iter()
                 .filter(|l| self.is_partitioned(l))
             {
-                partitions.push((local.clone(), patch.clone(), live.clone()));
+                if slot.paused(local) {
+                    let nothing = RemotePartitions {
+                        full: true,
+                        ..Default::default()
+                    };
+                    partitions.push((local.clone(), nothing, HashSet::new()));
+                } else {
+                    partitions.push((local.clone(), patch.clone(), live.clone()));
+                }
             }
         }
 
@@ -647,7 +771,7 @@ impl AssetConditionCache {
         let live = slot.live_partitions(key);
         let locals: Vec<String> = slot.bindings[key]
             .iter()
-            .filter(|local| self.is_partitioned(local))
+            .filter(|local| self.is_partitioned(local) && !slot.paused(local))
             .cloned()
             .collect();
 

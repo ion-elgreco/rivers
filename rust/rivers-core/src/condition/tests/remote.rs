@@ -20,6 +20,7 @@ fn remote(local: &str, asset_key: &str) -> RemoteDep {
         local: local.into(),
         location: warehouse(),
         asset_key: asset_key.into(),
+        partitions: None,
     }
 }
 
@@ -1001,4 +1002,214 @@ async fn owner_failure_that_materialized_the_key_sets_no_floor() {
     let mut reloaded = cache_with(vec![remote("orders", "raw_orders")]);
     reloaded.refresh(&storage, 0).await.unwrap();
     assert!(failed(&reloaded).is_empty());
+}
+
+mod drift {
+    use super::*;
+    use crate::assets::partitions_fingerprint::PartitionsFingerprint;
+    use crate::timegrid::TimeGrid;
+    use jiff::civil::date;
+
+    fn grid(cron: &str) -> TimeGrid {
+        TimeGrid {
+            cron_schedule: Some(cron.into()),
+            interval_seconds: None,
+            start: date(2024, 1, 1).at(0, 0, 0, 0),
+            end: None,
+            fmt: "%Y-%m-%d".into(),
+        }
+    }
+
+    fn daily() -> PartitionsFingerprint {
+        PartitionsFingerprint::TimeWindow(grid("0 0 * * *"))
+    }
+
+    fn hourly() -> PartitionsFingerprint {
+        PartitionsFingerprint::TimeWindow(grid("0 * * * *"))
+    }
+
+    fn mirrored(local: &str, asset_key: &str, mirror: PartitionsFingerprint) -> RemoteDep {
+        RemoteDep {
+            partitions: Some(mirror),
+            ..remote(local, asset_key)
+        }
+    }
+
+    /// The warehouse's topology: `owned` with its partitions definition.
+    async fn owner_topology(storage: &SurrealStorage, owned: &[(&str, PartitionsFingerprint)]) {
+        let mut topology = GraphTopology::default();
+        for (name, fingerprint) in owned {
+            let mut node = TopologyNode::new(*name, NodeKind::Asset);
+            node.partitions = Some(topology.intern_partitions(fingerprint.clone()));
+            topology.nodes.push(node);
+        }
+        storage
+            .kv_set(
+                &crate::graph_topology_key("wh"),
+                &serde_json::to_vec(&topology).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_drift_pauses_eager_until_the_definitions_match() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        register(
+            &storage,
+            DEFAULT_CODE_LOCATION_ID,
+            vec![make_materialized_record("summary", 2_000)],
+        )
+        .await;
+        set_edges(&storage, &[("summary", "orders")]).await;
+        warehouse_owning(
+            &storage,
+            vec![make_materialized_record("raw_orders", 1_000)],
+        )
+        .await;
+        owner_topology(&storage, &[("raw_orders", daily())]).await;
+
+        let mut pass = pass_with(
+            "summary",
+            ConditionNode::eager(),
+            vec![mirrored("orders", "raw_orders", daily())],
+            ConditionEvalState::default(),
+        );
+        pass.refresh_cache(&storage, 0).await.unwrap();
+        assert_eq!(pass.cache.records["orders"].last_timestamp, Some(1_000));
+        assert!(pass.run(0, false).plan.is_empty());
+
+        owner_topology(&storage, &[("raw_orders", hourly())]).await;
+        pass.refresh_cache(&storage, 30 * SEC).await.unwrap();
+        assert_eq!(
+            pass.cache.records["orders"].last_timestamp, None,
+            "an incompatible mirror counts as missing"
+        );
+
+        storage
+            .create_run(&run(
+                "wh",
+                "run-2",
+                RunStatus::Started,
+                &["raw_orders"],
+                None,
+                3_000,
+            ))
+            .await
+            .unwrap();
+        pass.refresh_cache(&storage, 31 * SEC).await.unwrap();
+        assert!(in_progress(&pass.cache).is_empty());
+        storage
+            .update_run_status("run-2", RunStatus::Success, Some(4_000))
+            .await
+            .unwrap();
+        materialize(&storage, "wh", "raw_orders", "run-2", None, 4_000).await;
+        pass.refresh_cache(&storage, 32 * SEC).await.unwrap();
+        assert_eq!(pass.cache.records["orders"].last_timestamp, None);
+        assert!(pass.run(32 * SEC, false).plan.is_empty());
+
+        owner_topology(&storage, &[("raw_orders", daily())]).await;
+        pass.refresh_cache(&storage, 62 * SEC).await.unwrap();
+        assert_eq!(pass.cache.records["orders"].last_timestamp, Some(4_000));
+        assert_eq!(
+            pass.run(62 * SEC, false).plan.unpartitioned,
+            vec!["summary".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_updated_mirror_reads_the_owners_record() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(
+            &storage,
+            vec![make_materialized_record("raw_orders", 1_000)],
+        )
+        .await;
+        owner_topology(&storage, &[("raw_orders", hourly())]).await;
+
+        let mut stale = cache_with(vec![mirrored("orders", "raw_orders", daily())]);
+        stale.refresh(&storage, 0).await.unwrap();
+        assert_eq!(stale.records["orders"].last_timestamp, None);
+
+        let mut updated = cache_with(vec![mirrored("orders", "raw_orders", hourly())]);
+        updated.refresh(&storage, 0).await.unwrap();
+        assert_eq!(updated.records["orders"].last_timestamp, Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn compatible_drift_changes_nothing() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(
+            &storage,
+            vec![make_materialized_record("raw_orders", 1_000)],
+        )
+        .await;
+        owner_topology(&storage, &[("raw_orders", daily())]).await;
+        let mut cache = cache_with(vec![mirrored("orders", "raw_orders", daily())]);
+        cache.refresh(&storage, 0).await.unwrap();
+
+        let extended = PartitionsFingerprint::TimeWindow(TimeGrid {
+            end: Some(date(2030, 1, 1).at(0, 0, 0, 0)),
+            ..grid("0 0 * * *")
+        });
+        owner_topology(&storage, &[("raw_orders", extended)]).await;
+        assert!(
+            cache.refresh(&storage, 30 * SEC).await.unwrap(),
+            "a new drift class reports a change"
+        );
+        assert_eq!(cache.records["orders"].last_timestamp, Some(1_000));
+        assert!(!cache.refresh(&storage, 60 * SEC).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_key_missing_from_the_owners_topology_counts_as_missing() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(
+            &storage,
+            vec![make_materialized_record("raw_orders", 1_000)],
+        )
+        .await;
+        owner_topology(&storage, &[("other", daily())]).await;
+
+        let mut cache = cache_with(vec![mirrored("orders", "raw_orders", daily())]);
+        cache.refresh(&storage, 0).await.unwrap();
+
+        assert_eq!(cache.records["orders"].last_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn paused_partitioned_remote_has_no_partitions() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(&storage, vec![make_record("events")]).await;
+        materialize(
+            &storage,
+            "wh",
+            "events",
+            "run-1",
+            Some(spk("2024-01-01")),
+            1_000,
+        )
+        .await;
+        storage
+            .create_run(&run(
+                "wh",
+                "run-2",
+                RunStatus::Started,
+                &["events"],
+                Some(spk("2024-01-02")),
+                2_000,
+            ))
+            .await
+            .unwrap();
+        owner_topology(&storage, &[("events", hourly())]).await;
+
+        let mut cache = cache_with(vec![mirrored("orders", "events", daily())]);
+        cache.set_partitioned_assets(vec!["orders".into()]);
+        cache.refresh(&storage, 0).await.unwrap();
+
+        let status = &cache.partition_status["orders"];
+        assert!(status.timestamps.is_empty());
+        assert!(status.in_progress.is_empty());
+        assert!(in_progress(&cache).is_empty());
+    }
 }
