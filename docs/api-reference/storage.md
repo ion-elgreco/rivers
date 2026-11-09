@@ -139,6 +139,8 @@ def compute_staleness(self) -> dict[str, tuple[str, list[StaleCause]]]
 
 Compute current staleness for every asset, keyed by asset_key. Each entry is `(status, causes)` where status is one of `"UpToDate"`, `"Stale"`, or `"Missing"`. Staleness is no longer persisted on `AssetRecord` — call this to get the live result.
 
+A [remote asset](../concepts/assets.md#remote-assets) has no entry. A dependency on a remote asset compares the owner's latest data version with the version that the consumer used, so the consumer is `"Stale"` after the owner materializes again. Only the data version counts: when the owner's code version changes, the consumer does not become stale. A remote asset whose owning code location is not registered adds no cause.
+
 ## Async Methods
 
 Every sync method has an `async_` prefixed counterpart that returns a Python awaitable. These use `pyo3_async_runtimes::tokio::future_into_py` under the hood — the Rust future runs on Tokio without holding the GIL, making them safe to use in async Python code.

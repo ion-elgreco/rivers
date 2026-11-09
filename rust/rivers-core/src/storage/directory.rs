@@ -15,7 +15,7 @@ pub struct CodeLocationDirectoryEntry {
 
 /// Storage identity of each location; `None` for a location that never
 /// registered.
-pub async fn resolve_code_locations<'a, S: StorageBackend>(
+pub async fn resolve_code_locations<'a, S: StorageBackend + ?Sized>(
     storage: &S,
     locations: impl IntoIterator<Item = &'a LocationRef>,
 ) -> anyhow::Result<HashMap<LocationRef, Option<String>>> {

@@ -4,6 +4,19 @@ use std::collections::HashMap;
 
 use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
 
+/// The owner's record of a remote asset, under its `local` name. Only the
+/// data version is kept: the owner's code and inputs make the owner stale,
+/// not the consumer.
+pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
+    AssetRecord {
+        asset_key: local.to_string(),
+        code_version: None,
+        last_materialization_code_version: None,
+        last_input_data_versions: Vec::new(),
+        ..owner.clone()
+    }
+}
+
 /// Compute staleness for all assets given their records and the dependency graph edges.
 ///
 /// `edges` are `(from, to)` pairs where `from` depends on `to` (i.e., `to` is upstream of `from`).

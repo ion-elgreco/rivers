@@ -217,3 +217,32 @@ def test_lineage_only_remote_of_an_unregistered_owner_warns_nothing(
     assert NOT_REGISTERED not in "".join(
         _logs(embedded_storage, result.run_id).values()
     )
+
+
+def test_consumer_is_stale_until_it_reads_the_owners_new_version(
+    embedded_storage, tmp_path, monkeypatch
+):
+    handler = _pickle_handler(tmp_path / "io")
+    _owner(handler, embedded_storage, monkeypatch)
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler
+    )
+
+    @rs.Asset(io_handler=handler)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    consumer = _resolve_as(
+        [orders, order_count], embedded_storage, monkeypatch, "analytics"
+    )
+    scoped = embedded_storage._scoped("analytics")
+    assert consumer.materialize().success
+    assert scoped.compute_staleness() == {"order_count": ("UpToDate", [])}
+
+    _owner(handler, embedded_storage, monkeypatch, rows=(1, 2, 3, 4))
+    status, causes = scoped.compute_staleness()["order_count"]
+    assert status == "Stale"
+    assert [(c.category, c.dependency) for c in causes] == [("Data", "raw_orders")]
+
+    assert consumer.materialize().success
+    assert scoped.compute_staleness() == {"order_count": ("UpToDate", [])}

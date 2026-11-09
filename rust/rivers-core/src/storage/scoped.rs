@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
+
+use crate::assets::graph::GraphTopology;
+use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
@@ -464,23 +467,88 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .set_graph_topology(self.code_location_id, topology)
             .await
     }
-
-    /// Compute staleness for every asset in this code location.
-    pub async fn compute_staleness(
-        &self,
-    ) -> Result<std::collections::HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
-        let records = self.get_asset_records().await?;
-        let edges = self
-            .get_graph_topology()
-            .await?
-            .map(|t| t.edges)
-            .unwrap_or_default();
-        Ok(crate::staleness::compute_staleness(&records, &edges))
-    }
 }
 
 /// Per-CL methods that need to reach the unscoped `StorageBackend` KV API.
 impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
+    /// Compute staleness for every asset in this code location.
+    pub async fn compute_staleness(
+        &self,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let records = self.get_asset_records().await?;
+        let topology = self.get_graph_topology().await?;
+        self.staleness_for(&records, topology.as_ref()).await
+    }
+
+    /// Staleness of this code location's `records`. A remote upstream counts
+    /// with its owner's data version, and is left out of the result.
+    pub async fn staleness_for(
+        &self,
+        records: &[AssetRecord],
+        topology: Option<&GraphTopology>,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let Some(topology) = topology else {
+            return Ok(crate::staleness::compute_staleness(records, &[]));
+        };
+        let remote: HashSet<&str> = topology
+            .nodes
+            .iter()
+            .filter(|node| node.remote.is_some())
+            .map(|node| node.name.as_str())
+            .collect();
+        if remote.is_empty() {
+            return Ok(crate::staleness::compute_staleness(
+                records,
+                &topology.edges,
+            ));
+        }
+
+        // A row of a remote's name is left from when the asset was local.
+        let mut all: Vec<AssetRecord> = records
+            .iter()
+            .filter(|record| !remote.contains(record.asset_key.as_str()))
+            .cloned()
+            .collect();
+        all.extend(self.remote_upstream_records(topology).await?);
+        let mut staleness = crate::staleness::compute_staleness(&all, &topology.edges);
+        staleness.retain(|key, _| !remote.contains(key.as_str()));
+        Ok(staleness)
+    }
+
+    /// The owner's record of each remote node in `topology`, under the local
+    /// name (see [`crate::staleness::remote_input_record`]). A remote whose
+    /// owner is not registered, or has no such asset, has none.
+    pub async fn remote_upstream_records(
+        &self,
+        topology: &GraphTopology,
+    ) -> Result<Vec<AssetRecord>> {
+        let remotes: Vec<(&str, &RemoteRef)> = topology
+            .nodes
+            .iter()
+            .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
+            .collect();
+        let locations: Vec<&LocationRef> = remotes
+            .iter()
+            .map(|(_, remote)| &remote.code_location)
+            .collect();
+        let identities = super::resolve_code_locations(self.backend, locations).await?;
+
+        let mut records = Vec::new();
+        for (local, remote) in remotes {
+            let Some(Some(identity)) = identities.get(&remote.code_location) else {
+                continue;
+            };
+            if let Some(owner) = self
+                .backend
+                .get_asset_record(identity, &remote.asset_key)
+                .await?
+            {
+                records.push(crate::staleness::remote_input_record(local, &owner));
+            }
+        }
+        Ok(records)
+    }
+
     fn dynamic_keys_kv_key(
         &self,
         asset_key: &str,
