@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use rivers_core::assets::graph::GraphTopology;
 use rivers_core::assets::partitions_fingerprint::{
-    PartitionDrift, describe_partitions, partition_drift,
+    PartitionDefinitions, PartitionDrift, describe_partitions, partition_drift,
 };
 use rivers_core::assets::remote::{LocationRef, RemoteRef};
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
@@ -54,7 +54,8 @@ pub(super) fn prefill_remote_dep_versions(
     };
 
     let mut warnings: Vec<(&str, String)> = Vec::new();
-    let mut owners: HashMap<&LocationRef, Option<GraphTopology>> = HashMap::new();
+    let mut owners: HashMap<&LocationRef, Option<(GraphTopology, PartitionDefinitions)>> =
+        HashMap::new();
     let mut tracked: Vec<(&str, &str, &RemoteRef)> = Vec::new();
     for &(local, remote) in &refs {
         let Some(identity) = identities
@@ -76,10 +77,9 @@ pub(super) fn prefill_remote_dep_versions(
             let owner = owners
                 .entry(&remote.code_location)
                 .or_insert_with(|| owner_topology(backend, &ctx, &remote.code_location));
-            if let Some(warning) = owner
-                .as_ref()
-                .and_then(|owner| drift_warning(node_map, local, remote, owner))
-            {
+            if let Some(warning) = owner.as_ref().and_then(|(owner, definitions)| {
+                drift_warning(node_map, local, remote, owner, definitions)
+            }) {
                 warnings.push((local, warning));
             }
         }
@@ -138,14 +138,22 @@ fn owner_data_versions<'a, S: StorageBackend>(
     versions
 }
 
-/// The owner's topology; `None` when it has none or reading it failed.
+/// The owner's topology and partitions definitions; `None` when it has no
+/// topology or a read failed.
 fn owner_topology<S: StorageBackend>(
     backend: &S,
     ctx: &CodeLocationContext,
     location: &LocationRef,
-) -> Option<GraphTopology> {
-    match io_rt().block_on(backend.for_code_location(ctx).get_graph_topology()) {
-        Ok(topology) => topology,
+) -> Option<(GraphTopology, PartitionDefinitions)> {
+    let scoped = backend.for_code_location(ctx);
+    let read = io_rt().block_on(async {
+        let Some(topology) = scoped.get_graph_topology().await? else {
+            return anyhow::Ok(None);
+        };
+        Ok(Some((topology, scoped.get_partition_definitions().await?)))
+    });
+    match read {
+        Ok(owner) => owner,
         Err(error) => {
             tracing::warn!(
                 target: "rivers::executor",
@@ -164,17 +172,16 @@ fn drift_warning(
     local: &str,
     remote: &RemoteRef,
     owner: &GraphTopology,
+    definitions: &PartitionDefinitions,
 ) -> Option<String> {
     let mirror = node_map
         .get(local)?
         .partitions_def()
         .map(|def| def.fingerprint());
-    match partition_drift(owner, &remote.asset_key, mirror.as_ref()) {
+    match partition_drift(owner, definitions, &remote.asset_key, mirror.as_ref()) {
         PartitionDrift::Same | PartitionDrift::Compatible => None,
         PartitionDrift::Incompatible => {
-            let owned = owner
-                .owned_node(&remote.asset_key)
-                .and_then(|node| owner.partitions_of(node));
+            let owned = definitions.get(&remote.asset_key);
             Some(format!(
                 "partition definition of '{local}' differs from code location '{}' (mirror {}, \
                  owner {}); loading anyway",

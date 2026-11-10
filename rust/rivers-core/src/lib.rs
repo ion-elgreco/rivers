@@ -26,6 +26,14 @@ pub fn graph_topology_key(code_location_id: &str) -> String {
     format!("{GRAPH_TOPOLOGY_KEY_PREFIX}{code_location_id}")
 }
 
+pub const PARTITION_DEFINITIONS_KEY_PREFIX: &str = "partition_definitions:";
+
+/// KV key for the partitions definitions of a code location's nodes, written
+/// with its topology.
+pub fn partition_definitions_key(code_location_id: &str) -> String {
+    format!("{PARTITION_DEFINITIONS_KEY_PREFIX}{code_location_id}")
+}
+
 pub const CODE_LOCATION_DIRECTORY_KEY_PREFIX: &str = "code_location:";
 
 /// KV key for a code location's directory entry, which maps its

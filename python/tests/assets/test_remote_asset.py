@@ -126,7 +126,15 @@ def test_topology_records_the_remote_ref(storage):
     assert "remote" not in nodes["report"]
 
 
-def test_topology_stores_each_partitions_definition_once(storage):
+def _partition_definitions(storage: rs.Storage) -> tuple[dict[str, int], list[dict]]:
+    """Node name to index, and the definitions it indexes."""
+    raw = storage.kv_get("partition_definitions:default")
+    assert raw is not None
+    row = json.loads(raw)
+    return row["nodes"], row["definitions"]
+
+
+def test_partitions_definitions_are_stored_once(storage):
     regions = rs.PartitionsDefinition.static_(["us", "eu"])
     days = rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1))
     orders = rs.Asset.remote(
@@ -156,25 +164,57 @@ def test_topology_stores_each_partitions_definition_once(storage):
         return 1
 
     make_repo([orders, stores, staff, daily_orders, store_days, summary], storage)
-    topology = json.loads(storage.kv_get("graph_topology:default"))
-    nodes = {n["name"]: n for n in topology["nodes"]}
-    table = topology["partitions"]
+    nodes, table = _partition_definitions(storage)
 
     static = {"kind": "static", "keys": ["eu", "us"]}
-    daily = table[nodes["orders"]["partitions"]]
+    daily = table[nodes["orders"]]
     assert len(table) == 3
-    assert table[nodes["stores"]["partitions"]] == static
-    assert nodes["staff"]["partitions"] == nodes["stores"]["partitions"]
-    assert nodes["daily_orders"]["partitions"] == nodes["orders"]["partitions"]
+    assert table[nodes["stores"]] == static
+    assert nodes["staff"] == nodes["stores"]
+    assert nodes["daily_orders"] == nodes["orders"]
     assert daily["kind"] == "time_window"
     assert daily["cron_schedule"] == "0 0 * * *"
     assert daily["fmt"] == "%Y-%m-%d"
     assert daily["start"].startswith("2024-01-01T00:00:00")
-    assert table[nodes["store_days"]["partitions"]] == {
+    assert table[nodes["store_days"]] == {
         "kind": "multi",
         "dimensions": [["date", daily], ["region", static]],
     }
-    assert "partitions" not in nodes["summary"]
+    assert "summary" not in nodes
+
+
+def test_topology_leaves_the_static_keys_to_the_definitions_row(storage):
+    keys = [f"customer-{i:05}" for i in range(5_000)]
+
+    @rs.Asset(partitions_def=rs.PartitionsDefinition.static_(keys))
+    def customers() -> int:
+        return 1
+
+    @rs.Asset(partitions_def=rs.PartitionsDefinition.daily(start=datetime(2024, 1, 1)))
+    def daily_orders() -> int:
+        return 1
+
+    @rs.Asset
+    def summary() -> int:
+        return 1
+
+    make_repo([customers, daily_orders, summary], storage)
+
+    topology = storage.kv_get("graph_topology:default")
+    assert topology is not None
+    assert b"customer-04999" not in topology
+    assert len(topology) < 1_000, len(topology)
+    assert all("partitions" not in node for node in _topology_nodes(storage).values())
+
+    nodes, table = _partition_definitions(storage)
+    daily = table[nodes["daily_orders"]]
+    assert table[nodes["customers"]] == {"kind": "static", "keys": keys}
+    assert daily["kind"] == "time_window"
+    assert daily["cron_schedule"] == "0 0 * * *"
+    assert daily["start"].startswith("2024-01-01T00:00:00")
+    assert daily["end"] is None
+    assert "summary" not in nodes
+    assert len(table) == 2
 
 
 def test_remote_bare_name_resolves_in_the_own_namespace(storage, monkeypatch):

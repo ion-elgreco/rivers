@@ -456,27 +456,30 @@ impl AssetConditionCache {
         self.apply_remote_read(location, read)
     }
 
-    /// Each local's drift against the owner's topology, logging the deps
-    /// it starts or stops pausing. Without a topology no drift is known.
+    /// Each local's drift against the owner's topology and partitions
+    /// definitions, logging the deps it starts or stops pausing. Without a
+    /// topology no drift is known.
     async fn read_remote_drift<S: StorageBackend>(
         &self,
         storage: &S,
         ctx: &CodeLocationContext,
         location: &LocationRef,
     ) -> anyhow::Result<HashMap<String, PartitionDrift>> {
-        let Some(owner) = storage.for_code_location(ctx).get_graph_topology().await? else {
+        let scoped = storage.for_code_location(ctx);
+        let Some(owner) = scoped.get_graph_topology().await? else {
             return Ok(HashMap::new());
         };
+        let definitions = scoped.get_partition_definitions().await?;
         let slot = &self.remote.slots[location];
 
         let mut drift = HashMap::new();
         for (key, locals) in &slot.bindings {
             for local in locals {
                 let mirror = self.remote.mirrors.get(local).and_then(Option::as_ref);
-                let class = partition_drift(&owner, key, mirror);
+                let class = partition_drift(&owner, &definitions, key, mirror);
                 let was_paused = slot.paused(local);
                 if pauses(class) && !was_paused {
-                    let owned = owner.owned_node(key).and_then(|n| owner.partitions_of(n));
+                    let owned = owner.owned_node(key).and(definitions.get(key));
                     tracing::warn!(
                         target: "rivers::conditions",
                         %location,

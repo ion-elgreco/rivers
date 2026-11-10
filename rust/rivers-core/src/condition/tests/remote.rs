@@ -76,7 +76,6 @@ async fn set_edges(storage: &SurrealStorage, edges: &[(&str, &str)]) {
             .iter()
             .map(|(down, up)| (down.to_string(), up.to_string()))
             .collect(),
-        ..Default::default()
     };
     storage
         .kv_set(
@@ -1006,7 +1005,7 @@ async fn owner_failure_that_materialized_the_key_sets_no_floor() {
 
 mod drift {
     use super::*;
-    use crate::assets::partitions_fingerprint::PartitionsFingerprint;
+    use crate::assets::partitions_fingerprint::{PartitionDefinitions, PartitionsFingerprint};
     use crate::timegrid::TimeGrid;
     use jiff::civil::date;
 
@@ -1035,19 +1034,21 @@ mod drift {
         }
     }
 
-    /// The warehouse's topology: `owned` with its partitions definition.
+    /// The warehouse's topology and partitions definitions: `owned`, each
+    /// with its definition.
     async fn owner_topology(storage: &SurrealStorage, owned: &[(&str, PartitionsFingerprint)]) {
         let mut topology = GraphTopology::default();
+        let mut definitions = PartitionDefinitions::default();
         for (name, fingerprint) in owned {
-            let mut node = TopologyNode::new(*name, NodeKind::Asset);
-            node.partitions = Some(topology.intern_partitions(fingerprint.clone()));
-            topology.nodes.push(node);
+            topology
+                .nodes
+                .push(TopologyNode::new(*name, NodeKind::Asset));
+            let index = definitions.intern(fingerprint.clone());
+            definitions.nodes.insert(name.to_string(), index);
         }
         storage
-            .kv_set(
-                &crate::graph_topology_key("wh"),
-                &serde_json::to_vec(&topology).unwrap(),
-            )
+            .for_code_location(&CodeLocationContext::new("wh"))
+            .set_graph_topology(&topology, &definitions)
             .await
             .unwrap();
     }

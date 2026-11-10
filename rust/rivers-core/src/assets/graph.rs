@@ -6,7 +6,6 @@ use petgraph::graph::{Graph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::partitions_fingerprint::PartitionsFingerprint;
 use crate::assets::remote::RemoteRef;
 use crate::repo::CodeRepository;
 
@@ -75,14 +74,12 @@ impl DagNode {
 pub type AssetGraph = Graph<DagNode, (), Directed>;
 
 /// Serializable graph topology for the UI binary — names + edges only,
-/// no Python callables.
+/// no Python callables. The nodes' partitions definitions are stored apart,
+/// in [`crate::assets::partitions_fingerprint::PartitionDefinitions`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphTopology {
     pub nodes: Vec<TopologyNode>,
     pub edges: Vec<(String, String)>, // (from, to) — dependency direction
-    /// The nodes' partitions definitions, each stored once.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partitions: Vec<PartitionsFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,9 +94,6 @@ pub struct TopologyNode {
     /// Set when the node mirrors an asset owned by another code location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteRef>,
-    /// Index into [`GraphTopology::partitions`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partitions: Option<usize>,
 }
 
 impl TopologyNode {
@@ -110,7 +104,6 @@ impl TopologyNode {
             group: None,
             parent_graph: None,
             remote: None,
-            partitions: None,
         }
     }
 }
@@ -134,11 +127,7 @@ pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
         .collect();
     edges.sort();
 
-    GraphTopology {
-        nodes,
-        edges,
-        partitions: Vec::new(),
-    }
+    GraphTopology { nodes, edges }
 }
 
 /// Format a cycle as "a -> b -> c -> a" using node names from the graph.
@@ -293,19 +282,6 @@ impl GraphTopology {
         self.nodes
             .iter()
             .find(|n| n.name == name && n.remote.is_none())
-    }
-
-    pub fn partitions_of(&self, node: &TopologyNode) -> Option<&PartitionsFingerprint> {
-        self.partitions.get(node.partitions?)
-    }
-
-    /// The index of `fingerprint` in [`Self::partitions`], added if new.
-    pub fn intern_partitions(&mut self, fingerprint: PartitionsFingerprint) -> usize {
-        if let Some(index) = self.partitions.iter().position(|p| *p == fingerprint) {
-            return index;
-        }
-        self.partitions.push(fingerprint);
-        self.partitions.len() - 1
     }
 
     /// (transitive dependencies, transitive dependents) of `node_name`.
@@ -695,11 +671,20 @@ mod tests {
     }
 
     #[test]
+    fn test_topology_with_partitions_decodes() {
+        let older = r#"{"nodes":[{"name":"a","kind":"asset","partitions":0},{"name":"b","kind":"task"}],"edges":[["b","a"]],"partitions":[{"kind":"static","keys":["x"]}]}"#;
+        let topology: GraphTopology = serde_json::from_str(older).unwrap();
+        assert_eq!(
+            serde_json::to_string(&topology).unwrap(),
+            r#"{"nodes":[{"name":"a","kind":"asset"},{"name":"b","kind":"task"}],"edges":[["b","a"]]}"#
+        );
+    }
+
+    #[test]
     fn test_topology_lineage_chain() {
         let topo = GraphTopology {
             nodes: vec![topo_node("a"), topo_node("b"), topo_node("c")],
             edges: vec![("c".into(), "b".into()), ("b".into(), "a".into())],
-            ..Default::default()
         };
         let (anc, desc) = topo.lineage("b");
         assert_eq!(anc, HashSet::from(["a".into()]));
@@ -721,7 +706,6 @@ mod tests {
                 ("d".into(), "b".into()),
                 ("d".into(), "c".into()),
             ],
-            ..Default::default()
         };
         let (anc, desc) = topo.lineage("d");
         assert_eq!(anc, HashSet::from(["a".into(), "b".into(), "c".into()]));
@@ -737,7 +721,6 @@ mod tests {
         let topo = GraphTopology {
             nodes: vec![],
             edges: vec![],
-            ..Default::default()
         };
         let (anc, desc) = topo.lineage("missing");
         assert!(anc.is_empty());

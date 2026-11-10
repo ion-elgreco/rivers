@@ -208,7 +208,6 @@ mod tests {
                 ("report/load".into(), "orders".into()),
                 ("doubled".into(), "order_count".into()),
             ],
-            ..Default::default()
         };
 
         assert_eq!(

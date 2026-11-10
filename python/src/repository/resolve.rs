@@ -14,6 +14,7 @@ use crate::partitions::PartitionsDefinition;
 use crate::runtime::{io_rt, rt};
 use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 use rivers_core::assets::graph::to_topology;
+use rivers_core::assets::partitions_fingerprint::PartitionDefinitions;
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 
@@ -339,9 +340,9 @@ impl PyCodeRepository {
                 }
             }
 
-            let mut nodes = std::mem::take(&mut topology.nodes);
+            let mut definitions = PartitionDefinitions::default();
             let mut fingerprinted: Vec<(&PartitionsDefinition, usize)> = Vec::new();
-            for topo_node in &mut nodes {
+            for topo_node in &mut topology.nodes {
                 if let Some(gn) = node_map.get(&topo_node.name) {
                     topo_node.group = gn.group();
                     topo_node.kind = match gn.asset_type() {
@@ -357,24 +358,28 @@ impl PyCodeRepository {
                         }
                     };
                     topo_node.remote = gn.remote().cloned();
-                    topo_node.partitions = gn.partitions_def().map(|def| {
-                        match fingerprinted.iter().find(|(seen, _)| *seen == def) {
+                    if let Some(def) = gn.partitions_def() {
+                        let index = match fingerprinted.iter().find(|(seen, _)| *seen == def) {
                             Some((_, index)) => *index,
                             None => {
-                                let index = topology.intern_partitions(def.fingerprint());
+                                let index = definitions.intern(def.fingerprint());
                                 fingerprinted.push((def, index));
                                 index
                             }
-                        }
-                    });
+                        };
+                        definitions.nodes.insert(topo_node.name.clone(), index);
+                    }
                 }
                 if let Some(parent) = task_to_graph.get(&topo_node.name) {
                     topo_node.parent_graph = Some(parent.clone());
                 }
             }
-            topology.nodes = nodes;
 
-            let _ = io_rt().block_on(storage_handle.scoped().set_graph_topology(&topology));
+            let _ = io_rt().block_on(
+                storage_handle
+                    .scoped()
+                    .set_graph_topology(&topology, &definitions),
+            );
             Ok(topology)
         })
     }

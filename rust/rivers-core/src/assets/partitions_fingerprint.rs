@@ -1,6 +1,7 @@
-//! A partitions definition as the topology stores it, and how a remote
-//! asset's mirror compares with the owner's definition.
+//! A partitions definition as storage keeps it, and how a remote asset's
+//! mirror compares with the owner's definition.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use jiff::civil;
@@ -94,6 +95,34 @@ impl fmt::Display for PartitionsFingerprint {
     }
 }
 
+/// The partitions definitions of a code location's nodes. Storage keeps them
+/// apart from the topology: static keys make them large, and only partition
+/// drift checks read them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartitionDefinitions {
+    /// Node name → index into [`Self::definitions`]. An unpartitioned node
+    /// has no entry.
+    pub nodes: BTreeMap<String, usize>,
+    /// Each distinct definition once.
+    pub definitions: Vec<PartitionsFingerprint>,
+}
+
+impl PartitionDefinitions {
+    /// The definition of the node `name`.
+    pub fn get(&self, name: &str) -> Option<&PartitionsFingerprint> {
+        self.definitions.get(*self.nodes.get(name)?)
+    }
+
+    /// The index of `fingerprint` in [`Self::definitions`], added if new.
+    pub fn intern(&mut self, fingerprint: PartitionsFingerprint) -> usize {
+        if let Some(index) = self.definitions.iter().position(|d| *d == fingerprint) {
+            return index;
+        }
+        self.definitions.push(fingerprint);
+        self.definitions.len() - 1
+    }
+}
+
 /// [`PartitionsFingerprint`]'s description, `"unpartitioned"` for `None`.
 pub fn describe_partitions(fingerprint: Option<&PartitionsFingerprint>) -> String {
     fingerprint.map_or_else(|| "unpartitioned".to_string(), ToString::to_string)
@@ -116,16 +145,18 @@ pub enum PartitionDrift {
     OwnerNodeMissing,
 }
 
-/// How `mirror` compares with `owner`'s definition of `asset_key`.
+/// How `mirror` compares with the owner's definition of `asset_key`. `owner`
+/// is the owner's topology, `definitions` its partitions definitions.
 pub fn partition_drift(
     owner: &GraphTopology,
+    definitions: &PartitionDefinitions,
     asset_key: &str,
     mirror: Option<&PartitionsFingerprint>,
 ) -> PartitionDrift {
-    let Some(node) = owner.owned_node(asset_key) else {
+    if owner.owned_node(asset_key).is_none() {
         return PartitionDrift::OwnerNodeMissing;
-    };
-    match (mirror, owner.partitions_of(node)) {
+    }
+    match (mirror, definitions.get(asset_key)) {
         (None, None) => PartitionDrift::Same,
         (Some(mirror), Some(owner)) => compare(mirror, owner),
         _ => PartitionDrift::Incompatible,
@@ -187,19 +218,27 @@ mod tests {
         PartitionsFingerprint::TimeWindow(grid)
     }
 
-    fn owner_with(fingerprint: Option<PartitionsFingerprint>) -> GraphTopology {
+    fn owner_with(
+        fingerprint: Option<PartitionsFingerprint>,
+    ) -> (GraphTopology, PartitionDefinitions) {
         let mut owner = GraphTopology::default();
-        let mut node = TopologyNode::new("raw_orders", NodeKind::Asset);
-        node.partitions = fingerprint.map(|f| owner.intern_partitions(f));
-        owner.nodes.push(node);
         owner
+            .nodes
+            .push(TopologyNode::new("raw_orders", NodeKind::Asset));
+        let mut definitions = PartitionDefinitions::default();
+        if let Some(fingerprint) = fingerprint {
+            let index = definitions.intern(fingerprint);
+            definitions.nodes.insert("raw_orders".into(), index);
+        }
+        (owner, definitions)
     }
 
     fn drift(
         mirror: Option<PartitionsFingerprint>,
         owner: Option<PartitionsFingerprint>,
     ) -> PartitionDrift {
-        partition_drift(&owner_with(owner), "raw_orders", mirror.as_ref())
+        let (owner, definitions) = owner_with(owner);
+        partition_drift(&owner, &definitions, "raw_orders", mirror.as_ref())
     }
 
     #[test]
@@ -423,9 +462,9 @@ mod tests {
 
     #[test]
     fn the_owner_node_must_be_an_asset_it_owns() {
-        let mut owner = owner_with(None);
+        let (mut owner, definitions) = owner_with(None);
         assert_eq!(
-            partition_drift(&owner, "elsewhere", None),
+            partition_drift(&owner, &definitions, "elsewhere", None),
             PartitionDrift::OwnerNodeMissing
         );
 
@@ -434,7 +473,7 @@ mod tests {
             asset_key: "raw_orders".into(),
         });
         assert_eq!(
-            partition_drift(&owner, "raw_orders", None),
+            partition_drift(&owner, &definitions, "raw_orders", None),
             PartitionDrift::OwnerNodeMissing
         );
     }
@@ -492,29 +531,29 @@ mod tests {
 
     #[test]
     fn nodes_share_one_entry_per_definition() {
-        let mut topology = GraphTopology::default();
-        let a = topology.intern_partitions(statics(&["x", "y"]));
-        let b = topology.intern_partitions(window(daily()));
-        let c = topology.intern_partitions(statics(&["y", "x"]));
+        let mut definitions = PartitionDefinitions::default();
+        let a = definitions.intern(statics(&["x", "y"]));
+        let b = definitions.intern(window(daily()));
+        let c = definitions.intern(statics(&["y", "x"]));
 
         assert_eq!((a, b, c), (0, 1, 0));
-        assert_eq!(topology.partitions.len(), 2);
+        assert_eq!(definitions.definitions.len(), 2);
     }
 
     #[test]
-    fn the_topology_round_trips_and_older_topologies_decode() {
-        let owner = owner_with(Some(PartitionsFingerprint::multi([
+    fn the_definitions_round_trip() {
+        let mut definitions = PartitionDefinitions::default();
+        let multi = PartitionsFingerprint::multi([
             ("region".to_string(), statics(&["eu"])),
             ("date".to_string(), window(daily())),
-        ])));
-        let json = serde_json::to_string(&owner).unwrap();
-        let back: GraphTopology = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.partitions, owner.partitions);
-        assert_eq!(back.nodes[0].partitions, Some(0));
+        ]);
+        let index = definitions.intern(multi.clone());
+        definitions.nodes.insert("store_days".into(), index);
 
-        let legacy: GraphTopology =
-            serde_json::from_str(r#"{"nodes":[{"name":"a","kind":"asset"}],"edges":[]}"#).unwrap();
-        assert!(legacy.partitions.is_empty());
-        assert_eq!(legacy.nodes[0].partitions, None);
+        let json = serde_json::to_string(&definitions).unwrap();
+        let back: PartitionDefinitions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, definitions);
+        assert_eq!(back.get("store_days"), Some(&multi));
+        assert_eq!(back.get("summary"), None);
     }
 }

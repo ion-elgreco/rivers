@@ -462,9 +462,18 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn set_graph_topology(
         &self,
         topology: &crate::assets::graph::GraphTopology,
+        definitions: &crate::assets::partitions_fingerprint::PartitionDefinitions,
     ) -> Result<()> {
         self.backend
-            .set_graph_topology(self.code_location_id, topology)
+            .set_graph_topology(self.code_location_id, topology, definitions)
+            .await
+    }
+
+    pub async fn get_partition_definitions(
+        &self,
+    ) -> Result<crate::assets::partitions_fingerprint::PartitionDefinitions> {
+        self.backend
+            .get_partition_definitions(self.code_location_id)
             .await
     }
 }

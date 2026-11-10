@@ -1326,12 +1326,47 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%code_location_id))]
     async fn set_graph_topology(
         &self,
         code_location_id: &str,
         topology: &crate::assets::graph::GraphTopology,
+        definitions: &crate::assets::partitions_fingerprint::PartitionDefinitions,
     ) -> Result<()> {
-        self.kv_set_json(&crate::graph_topology_key(code_location_id), topology)
-            .await
+        let topology = surrealdb::types::Bytes::from(serde_json::to_vec(topology)?);
+        let definitions = surrealdb::types::Bytes::from(serde_json::to_vec(definitions)?);
+
+        retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "BEGIN TRANSACTION; \
+                     INSERT INTO kv { key: $topology_key, value: $topology } \
+                     ON DUPLICATE KEY UPDATE value = $input.value; \
+                     INSERT INTO kv { key: $definitions_key, value: $definitions } \
+                     ON DUPLICATE KEY UPDATE value = $input.value; \
+                     COMMIT TRANSACTION;",
+                )
+                .bind(("topology_key", crate::graph_topology_key(code_location_id)))
+                .bind(("topology", topology.clone()))
+                .bind((
+                    "definitions_key",
+                    crate::partition_definitions_key(code_location_id),
+                ))
+                .bind(("definitions", definitions.clone()))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_partition_definitions(
+        &self,
+        code_location_id: &str,
+    ) -> Result<crate::assets::partitions_fingerprint::PartitionDefinitions> {
+        Ok(self
+            .kv_get_json(&crate::partition_definitions_key(code_location_id))
+            .await?
+            .unwrap_or_default())
     }
 }

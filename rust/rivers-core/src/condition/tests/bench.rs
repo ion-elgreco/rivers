@@ -404,7 +404,6 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
             })
             .collect(),
         edges,
-        ..Default::default()
     };
     let json = serde_json::to_vec(&topology).unwrap();
     storage

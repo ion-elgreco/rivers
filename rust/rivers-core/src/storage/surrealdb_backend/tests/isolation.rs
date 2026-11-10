@@ -4,6 +4,7 @@ use super::*;
 #[tokio::test]
 async fn graph_topology_isolated_per_code_location() {
     use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::partitions_fingerprint::PartitionDefinitions;
 
     let storage = make_storage().await;
     let ctx_a = crate::storage::CodeLocationContext::new("11111111-1111-4111-8111-111111111111");
@@ -12,22 +13,20 @@ async fn graph_topology_isolated_per_code_location() {
     let topo_a = GraphTopology {
         nodes: vec![TopologyNode::new("a_only", NodeKind::Asset)],
         edges: vec![("a_only".to_string(), "shared".to_string())],
-        ..Default::default()
     };
     let topo_b = GraphTopology {
         nodes: vec![TopologyNode::new("b_only", NodeKind::Asset)],
         edges: vec![("b_only".to_string(), "shared".to_string())],
-        ..Default::default()
     };
 
     storage
         .for_code_location(&ctx_a)
-        .set_graph_topology(&topo_a)
+        .set_graph_topology(&topo_a, &PartitionDefinitions::default())
         .await
         .unwrap();
     storage
         .for_code_location(&ctx_b)
-        .set_graph_topology(&topo_b)
+        .set_graph_topology(&topo_b, &PartitionDefinitions::default())
         .await
         .unwrap();
 
@@ -48,6 +47,99 @@ async fn graph_topology_isolated_per_code_location() {
         .expect("CL-B topology");
     assert_eq!(read_b.nodes.len(), 1);
     assert_eq!(read_b.nodes[0].name, "b_only");
+}
+
+/// One write sets the topology and the partitions definitions; the next
+/// replaces both.
+#[tokio::test]
+async fn set_graph_topology_writes_and_replaces_both_rows() {
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::partitions_fingerprint::{PartitionDefinitions, PartitionsFingerprint};
+
+    let storage = make_storage().await;
+    let ctx = crate::storage::CodeLocationContext::new("cl-a");
+    let scoped = storage.for_code_location(&ctx);
+    let regions = PartitionsFingerprint::static_keys(["eu".to_string(), "us".to_string()]);
+    let one = PartitionsFingerprint::static_keys(["eu".to_string()]);
+    let write = |names: &[&str], partitioned: &[(&str, &PartitionsFingerprint)]| {
+        let topology = GraphTopology {
+            nodes: names
+                .iter()
+                .map(|name| TopologyNode::new(*name, NodeKind::Asset))
+                .collect(),
+            edges: vec![],
+        };
+        let mut definitions = PartitionDefinitions::default();
+        for (name, fingerprint) in partitioned {
+            let index = definitions.intern((*fingerprint).clone());
+            definitions.nodes.insert(name.to_string(), index);
+        }
+        (topology, definitions)
+    };
+    let names = |topology: Option<GraphTopology>| -> Vec<String> {
+        topology
+            .expect("topology")
+            .nodes
+            .into_iter()
+            .map(|node| node.name)
+            .collect()
+    };
+
+    let (topology, definitions) = write(
+        &["stores", "staff", "summary"],
+        &[("stores", &regions), ("staff", &regions)],
+    );
+    scoped
+        .set_graph_topology(&topology, &definitions)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(scoped.get_graph_topology().await.unwrap()),
+        ["stores", "staff", "summary"]
+    );
+    let read = scoped.get_partition_definitions().await.unwrap();
+    assert_eq!(read, definitions);
+    assert_eq!(read.definitions, std::slice::from_ref(&regions));
+    assert_eq!(read.get("stores"), Some(&regions));
+    assert_eq!(read.get("staff"), Some(&regions));
+    assert_eq!(read.get("summary"), None);
+    let raw = storage
+        .kv_get(&crate::partition_definitions_key("cl-a"))
+        .await
+        .unwrap()
+        .expect("definitions row");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        serde_json::json!({
+            "nodes": { "staff": 0, "stores": 0 },
+            "definitions": [{ "kind": "static", "keys": ["eu", "us"] }],
+        })
+    );
+
+    let (topology, definitions) = write(&["stores", "staff"], &[("stores", &one)]);
+    scoped
+        .set_graph_topology(&topology, &definitions)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(scoped.get_graph_topology().await.unwrap()),
+        ["stores", "staff"]
+    );
+    let read = scoped.get_partition_definitions().await.unwrap();
+    assert_eq!(read.definitions, std::slice::from_ref(&one));
+    assert_eq!(read.get("stores"), Some(&one));
+    assert_eq!(read.get("staff"), None, "staff lost its definition");
+    assert_eq!(read.nodes.len(), 1);
+
+    let other = crate::storage::CodeLocationContext::new("cl-b");
+    assert_eq!(
+        storage
+            .for_code_location(&other)
+            .get_partition_definitions()
+            .await
+            .unwrap(),
+        PartitionDefinitions::default()
+    );
 }
 
 /// `condition_eval_state` is keyed per CL.

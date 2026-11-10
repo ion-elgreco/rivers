@@ -29,7 +29,6 @@ async fn test_cache_detects_in_progress_completion_as_change() {
             TopologyNode::new("b", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("b".to_string(), "a".to_string())],
-        ..Default::default()
     };
     storage
         .kv_set(
@@ -607,7 +606,6 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
             TopologyNode::new("b", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("b".to_string(), "a".to_string())],
-        ..Default::default()
     };
     storage
         .kv_set(
@@ -1639,7 +1637,6 @@ async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealS
                     ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
-                ..Default::default()
             })
             .unwrap(),
         )
@@ -1735,7 +1732,6 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
                     ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
-                ..Default::default()
             })
             .unwrap(),
         )
