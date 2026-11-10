@@ -112,6 +112,8 @@ Connects to a remote SurrealDB instance, starts the gRPC backend, and runs the a
 
 `--surreal-endpoint` may also be set via the `RIVERS_SURREAL_ENDPOINT` env var.
 
+The server writes its gRPC endpoint to the code location directory in storage when it starts, and then every 10 seconds. The endpoint is the value of `RIVERS_CODE_LOCATION_GRPC_ENDPOINT`. The operator sets it to the address of the CodeLocation's Service. Without it, the endpoint is `http://<host>:<grpc-port>`, and a wildcard `--host` (`0.0.0.0`) is written as `127.0.0.1`.
+
 ---
 
 ## `materialize` — synchronous materialization

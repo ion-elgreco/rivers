@@ -809,6 +809,10 @@ mod tests {
             env_val(&env, "RIVERS_MODULE"),
             Some("my_project.definitions".to_string())
         );
+        assert_eq!(
+            env_val(&env, crate::env::ENV_CODE_LOCATION_GRPC_ENDPOINT),
+            None
+        );
     }
 
     #[test]

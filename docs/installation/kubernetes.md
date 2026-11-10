@@ -156,12 +156,16 @@ first rollout completes.
 
 ### Deleting a CodeLocation
 
-Each code-location pod writes its gRPC endpoint to the code location
-directory in SurrealDB, which [remote assets](../concepts/assets.md#remote-assets)
-use to find their owner. When you delete a CodeLocation, the operator
-leader drops its directory entry if the entry still names the deleted
-CodeLocation's `spec.identity`. A CodeLocation that you recreate under the
-same name gets a new identity, so its entry stays.
+Each CodeLocation has an entry in the code location directory in
+SurrealDB, which [remote assets](../concepts/assets.md#remote-assets) use
+to find their owner. Each code-location pod writes the address of its
+CodeLocation's gRPC Service to that entry when it starts, and then every
+10 seconds until it starts to shut down.
+
+When you delete a CodeLocation, the operator leader drops its directory
+entry if the entry still names the deleted CodeLocation's `spec.identity`.
+A CodeLocation that you recreate under the same name gets a new identity,
+so its entry stays.
 
 Every 10 minutes the leader also drops entries in its namespace that no
 CodeLocation backs with the same identity and that have not reported in

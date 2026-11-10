@@ -1,3 +1,5 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
 use rivers_core::assets::remote::LocationRef;
 use rivers_core::storage::surrealdb_backend::{
@@ -16,6 +18,10 @@ pub const ENV_CODE_LOCATION_NAME: &str = "RIVERS_CODE_LOCATION_NAME";
 /// Env var carrying the namespace of the owning `CodeLocation` CR. Stamped
 /// by the operator on code-location, run and step pods.
 pub const ENV_CODE_LOCATION_NAMESPACE: &str = "RIVERS_CODE_LOCATION_NAMESPACE";
+
+/// Env var carrying the address of the code location's gRPC Service, the
+/// endpoint other pods dial. Stamped by the operator on code-location pods only.
+pub const ENV_CODE_LOCATION_GRPC_ENDPOINT: &str = "RIVERS_CODE_LOCATION_GRPC_ENDPOINT";
 
 /// Namespace of code locations that run outside the operator.
 pub const DEV_CODE_LOCATION_NAMESPACE: &str = "dev";
@@ -142,6 +148,25 @@ pub fn current_code_location_ref() -> anyhow::Result<LocationRef> {
         current_code_location_namespace(),
         current_code_location_name(),
     )
+}
+
+/// The gRPC endpoint this code location writes to the code location
+/// directory when it serves on `host:port`: `RIVERS_CODE_LOCATION_GRPC_ENDPOINT`
+/// as it is, else `http://host:port` with loopback for a wildcard host.
+pub fn current_grpc_endpoint(host: &str, port: u16) -> String {
+    if let Some(endpoint) = env_nonempty(ENV_CODE_LOCATION_GRPC_ENDPOINT) {
+        return endpoint;
+    }
+
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return format!("http://{host}:{port}");
+    };
+    let ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, port))
 }
 
 pub fn detect_module() -> String {
@@ -616,6 +641,41 @@ mod tests {
             current_code_location_ref,
         );
         assert!(got.is_err());
+    }
+
+    #[test]
+    fn current_grpc_endpoint_takes_the_operator_endpoint_as_it_is() {
+        let endpoint = "analytics-grpc.team-data.svc.cluster.local:3001";
+        for host in ["0.0.0.0", "127.0.0.1"] {
+            let got = with_vars(&[(ENV_CODE_LOCATION_GRPC_ENDPOINT, Some(endpoint))], || {
+                current_grpc_endpoint(host, 50051)
+            });
+            assert_eq!(got, endpoint, "{host}");
+        }
+    }
+
+    #[test]
+    fn current_grpc_endpoint_without_the_env_var_is_the_bind_address() {
+        for unset in [None, Some("")] {
+            let got = with_vars(&[(ENV_CODE_LOCATION_GRPC_ENDPOINT, unset)], || {
+                [
+                    current_grpc_endpoint("0.0.0.0", 3001),
+                    current_grpc_endpoint("::", 3001),
+                    current_grpc_endpoint("10.0.0.7", 3001),
+                    current_grpc_endpoint("localhost", 3001),
+                ]
+            });
+            assert_eq!(
+                got,
+                [
+                    "http://127.0.0.1:3001",
+                    "http://[::1]:3001",
+                    "http://10.0.0.7:3001",
+                    "http://localhost:3001",
+                ],
+                "{unset:?}"
+            );
+        }
     }
 
     fn env_value_of(env: &[EnvVar], name: &str) -> Option<String> {

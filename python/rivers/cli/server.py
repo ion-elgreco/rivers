@@ -204,13 +204,14 @@ def _import_repo(module: str, repo_var: str):
 def _serve_code_location(
     repo_obj, storage, host: str, grpc_port: int, no_daemon: bool
 ) -> None:
-    """Start the gRPC backend and the automation daemon, then block."""
+    """Start the gRPC backend, its heartbeat and the automation daemon, then block."""
     actual_port = repo_obj._start_grpc_server(host, grpc_port)
     if actual_port != grpc_port:
         typer.echo(
             f"Warning: gRPC port {grpc_port} is in use; serving on {actual_port}",
             err=True,
         )
+    repo_obj._start_heartbeat(host, actual_port)
 
     if not no_daemon:
         from rivers._core import AutomationDaemon

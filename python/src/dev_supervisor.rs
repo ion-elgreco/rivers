@@ -8,9 +8,7 @@
 //! child's settings in `RIVERS_*` environment variables; no Python glue is
 //! involved.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -22,7 +20,6 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::repository::PyCodeRepository;
-use crate::runtime::rt;
 use crate::shutdown::TerminateSignals;
 
 const CHILD_ENTRY: &str = "import rivers._core as c; c.serve_dev_code_location()";
@@ -37,7 +34,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RETIRE_WARN_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How to start a code location.
 pub(crate) struct ChildSpec {
@@ -428,7 +424,7 @@ pub fn serve_dev_code_location(py: Python<'_>) -> PyResult<()> {
     if actual_port != grpc_port {
         eprintln!("Warning: gRPC port {grpc_port} is in use; serving on {actual_port}");
     }
-    start_heartbeat(&repo, &host, actual_port)?;
+    repo.call_method1("_start_heartbeat", (&host, actual_port))?;
 
     // Held until exit: dropping the daemon object stops its loops.
     let _daemon = if no_daemon {
@@ -441,67 +437,6 @@ pub fn serve_dev_code_location(py: Python<'_>) -> PyResult<()> {
         Some(daemon)
     };
     crate::shutdown::py_wait_for_exit(py, true)
-}
-
-/// Advertise this generation's gRPC endpoint in the code location directory,
-/// at once and then every 10 s, until it starts to drain.
-fn start_heartbeat(repo: &Bound<'_, PyAny>, host: &str, port: u16) -> PyResult<()> {
-    use rivers_core::storage::StorageBackend;
-
-    let state = repo
-        .cast::<PyCodeRepository>()?
-        .borrow()
-        .state
-        .get_attached(repo.py())
-        .ok_or_else(|| PyRuntimeError::new_err("the code location is not resolved"))?;
-    let storage = Arc::clone(&*state.storage);
-    let identity = state.code_location_id.clone();
-    let location = rivers_k8s::env::current_code_location_ref()
-        .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
-    let endpoint = advertised_endpoint(host, port);
-    let drain = crate::shutdown::drain_token().clone();
-
-    rt().spawn(async move {
-        let mut ticks = tokio::time::interval(HEARTBEAT_INTERVAL);
-        loop {
-            tokio::select! {
-                _ = drain.cancelled() => return,
-                _ = ticks.tick() => {}
-            }
-            let now = crate::executor::ops::now_ts();
-            match storage
-                .touch_code_location(&location, &identity, &endpoint, now)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
-                    target: "rivers::dev",
-                    %location,
-                    "the directory entry names another code location; gRPC endpoint not advertised"
-                ),
-                Err(error) => tracing::warn!(
-                    target: "rivers::dev",
-                    %location,
-                    %error,
-                    "advertising the gRPC endpoint failed"
-                ),
-            }
-        }
-    });
-    Ok(())
-}
-
-/// `http://host:port`, with loopback for a wildcard host.
-fn advertised_endpoint(host: &str, port: u16) -> String {
-    let Ok(ip) = host.parse::<IpAddr>() else {
-        return format!("http://{host}:{port}");
-    };
-    let ip = match ip {
-        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    format!("http://{}", SocketAddr::new(ip, port))
 }
 
 fn env(name: &str) -> PyResult<String> {

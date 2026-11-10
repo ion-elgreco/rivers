@@ -832,6 +832,7 @@ mod tests {
         assert_eq!(env_map["RIVERS_MODULE"], "my_project.definitions");
         assert_eq!(env_map["RIVERS_RUN_CR_NAME"], "test-run");
         assert_eq!(env_map["RIVERS_RUN_CR_UID"], "");
+        assert!(!env_map.contains_key(rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT));
     }
 
     #[test]
