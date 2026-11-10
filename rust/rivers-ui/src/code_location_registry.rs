@@ -22,6 +22,7 @@ use rivers_api::rivers::{CodeLocationEvent, WatchCodeLocationsRequest};
 use rivers_core::assets::remote::LocationRef;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{CodeLocationDirectoryEntry, StorageBackend};
+use rivers_core::util::now_ts;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,7 +180,7 @@ impl StorageRegistry {
             return Ok(entries.clone());
         }
         let listed = self.storage.list_code_locations().await?;
-        let entries = directory_entries(listed, self.own.as_ref(), now_nanos());
+        let entries = directory_entries(listed, self.own.as_ref(), now_ts());
         *cache = Some((Instant::now(), entries.clone()));
         Ok(entries)
     }
@@ -248,12 +249,6 @@ fn location_entry(
         observed_generation: 0,
         identity,
     }
-}
-
-fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
 }
 
 /// Holds the cache + the lazily-dialed channel used by the watcher. The
@@ -598,7 +593,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .touch_code_location(&dev("warehouse"), "wh-id", "127.0.0.1:3001", now_nanos())
+            .touch_code_location(&dev("warehouse"), "wh-id", "127.0.0.1:3001", now_ts())
             .await
             .unwrap();
         storage

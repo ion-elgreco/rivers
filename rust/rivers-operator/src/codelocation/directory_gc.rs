@@ -2,12 +2,13 @@
 //! location writes its own entry, so nothing else removes it when its CR goes.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use kube_client::ResourceExt;
 use rivers_core::assets::remote::LocationRef;
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::util::now_ts;
 use rivers_k8s::crd::code_location::CodeLocation;
 
 use super::DirectoryState;
@@ -53,7 +54,7 @@ impl DirectoryGc {
     /// without an identity backs each entry of its name, because its pod
     /// registers under the CR name. Returns how many it dropped.
     pub async fn sweep(&self, namespace: &str, state: &DirectoryState) -> anyhow::Result<usize> {
-        let cutoff = now_nanos() - SWEEP_EVERY.as_nanos() as i64;
+        let cutoff = now_ts() - SWEEP_EVERY.as_nanos() as i64;
         let mut dropped = 0;
         for (location, entry) in self.storage.list_code_locations().await? {
             if location.namespace() != namespace || entry.last_seen.is_some_and(|t| t > cutoff) {
@@ -100,12 +101,6 @@ impl DirectoryGc {
             }
         }
     }
-}
-
-fn now_nanos() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
 }
 
 #[cfg(test)]
@@ -169,13 +164,13 @@ mod tests {
     }
 
     fn silent() -> i64 {
-        now_nanos() - 2 * SWEEP_EVERY.as_nanos() as i64
+        now_ts() - 2 * SWEEP_EVERY.as_nanos() as i64
     }
 
     #[tokio::test]
     async fn a_deleted_code_location_drops_its_entry() {
         let gc = gc(LeaderGate::leading()).await;
-        register(&gc, &location(NS, "warehouse"), "wh-1", now_nanos()).await;
+        register(&gc, &location(NS, "warehouse"), "wh-1", now_ts()).await;
 
         assert!(gc.deleted(&cl("warehouse", "wh-1")).await.unwrap());
         assert_eq!(identities(&gc).await, vec![]);
@@ -184,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn an_entry_of_a_recreated_code_location_stays() {
         let gc = gc(LeaderGate::leading()).await;
-        register(&gc, &location(NS, "warehouse"), "wh-2", now_nanos()).await;
+        register(&gc, &location(NS, "warehouse"), "wh-2", now_ts()).await;
 
         assert!(!gc.deleted(&cl("warehouse", "wh-1")).await.unwrap());
         assert_eq!(
@@ -196,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn a_follower_drops_nothing() {
         let gc = gc(LeaderGate::new()).await;
-        register(&gc, &location(NS, "warehouse"), "wh-1", now_nanos()).await;
+        register(&gc, &location(NS, "warehouse"), "wh-1", now_ts()).await;
 
         assert!(!gc.deleted(&cl("warehouse", "wh-1")).await.unwrap());
         assert_eq!(identities(&gc).await.len(), 1);
@@ -212,7 +207,7 @@ mod tests {
         register(&gc, &location(NS, "warehouse"), "wh-1", silent()).await;
         register(&gc, &location(NS, "analytics"), "an-1", silent()).await;
         register(&gc, &location(NS, "gone"), "gone-1", silent()).await;
-        register(&gc, &location(NS, "starting"), "st-1", now_nanos()).await;
+        register(&gc, &location(NS, "starting"), "st-1", now_ts()).await;
         register(&gc, &location("dev", "default"), "default", silent()).await;
 
         assert_eq!(gc.sweep(NS, &state).await.unwrap(), 2);

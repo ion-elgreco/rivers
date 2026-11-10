@@ -167,16 +167,24 @@ pub struct RemoteDownstream {
 impl RemoteDownstream {
     /// `(namespace, name)` of the consuming code location.
     pub fn location(&self) -> (&str, &str) {
-        self.code_location
-            .split_once('/')
-            .unwrap_or(("", &self.code_location))
+        split_location(&self.code_location)
     }
 
     /// The asset's page in the consuming code location.
     pub fn href(&self) -> String {
-        let (ns, name) = self.location();
-        crate::loc::loc_path(ns, name, &format!("assets/{}", self.asset_key))
+        asset_page(&self.code_location, &self.asset_key)
     }
+}
+
+/// `(namespace, name)` of a `"namespace/name"` code location.
+fn split_location(code_location: &str) -> (&str, &str) {
+    code_location.split_once('/').unwrap_or(("", code_location))
+}
+
+/// The page of `asset_key` in a `"namespace/name"` code location.
+fn asset_page(code_location: &str, asset_key: &str) -> String {
+    let (ns, name) = split_location(code_location);
+    crate::loc::loc_path(ns, name, &format!("assets/{asset_key}"))
 }
 
 /// A remote node's partitions definition against its owner's.
@@ -214,15 +222,12 @@ impl RemoteDrift {
 impl RemoteNode {
     /// `(namespace, name)` of the owning code location.
     pub fn location(&self) -> (&str, &str) {
-        self.code_location
-            .split_once('/')
-            .unwrap_or(("", &self.code_location))
+        split_location(&self.code_location)
     }
 
     /// The asset's page in its owning code location.
     pub fn href(&self) -> String {
-        let (ns, name) = self.location();
-        crate::loc::loc_path(ns, name, &format!("assets/{}", self.asset_key))
+        asset_page(&self.code_location, &self.asset_key)
     }
 
     /// `"warehouse · raw_orders"`.
