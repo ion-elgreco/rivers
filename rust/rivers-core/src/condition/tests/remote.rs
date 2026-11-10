@@ -7,7 +7,7 @@ use crate::assets::remote::LocationRef;
 use crate::condition::cache::RemoteDep;
 use crate::condition::pass::{AssetConditionInfo, ConditionPass};
 use crate::storage::surrealdb_backend::SurrealStorage;
-use crate::storage::{CodeLocationContext, EventRecord, EventType};
+use crate::storage::{CodeLocationContext, CodeLocationDirectoryEntry, EventRecord, EventType};
 
 const SEC: i64 = 1_000_000_000;
 
@@ -60,6 +60,13 @@ async fn register(storage: &SurrealStorage, identity: &str, records: Vec<AssetRe
     storage
         .for_code_location(&CodeLocationContext::new(identity))
         .register_assets(&records)
+        .await
+        .unwrap();
+}
+
+async fn register_warehouse(storage: &SurrealStorage, identity: &str) {
+    storage
+        .upsert_code_location_registration(&warehouse(), CodeLocationDirectoryEntry::new(identity))
         .await
         .unwrap();
 }
@@ -165,10 +172,7 @@ async fn unregistered_location_blocks_eager_until_it_registers() {
         "a dep on an unregistered location counts as missing"
     );
 
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(
         &storage,
         "wh",
@@ -186,10 +190,7 @@ async fn unregistered_location_blocks_eager_until_it_registers() {
 #[tokio::test]
 async fn resolved_location_supplies_the_owners_record_under_the_local_name() {
     let storage = SurrealStorage::new_memory().await.unwrap();
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(
         &storage,
         "wh",
@@ -222,10 +223,7 @@ async fn location_registering_later_resolves_after_the_retry_wait() {
     let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
     cache.refresh(&storage, 0).await.unwrap();
 
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(
         &storage,
         "wh",
@@ -258,10 +256,7 @@ async fn identity_change_reloads_the_location() {
         vec![make_materialized_record("raw_orders", 2_000)],
     )
     .await;
-    storage
-        .set_code_location_identity(&warehouse(), "wh-1")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh-1").await;
 
     let mut cache = cache_with(vec![
         remote("orders", "raw_orders"),
@@ -270,10 +265,7 @@ async fn identity_change_reloads_the_location() {
     cache.refresh(&storage, 0).await.unwrap();
     assert_eq!(cache.records["orders"].last_timestamp, Some(1_000));
 
-    storage
-        .set_code_location_identity(&warehouse(), "wh-2")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh-2").await;
     assert!(!cache.refresh(&storage, 29 * SEC).await.unwrap());
     assert_eq!(cache.records["orders"].last_timestamp, Some(1_000));
 
@@ -285,10 +277,7 @@ async fn identity_change_reloads_the_location() {
 #[tokio::test]
 async fn two_local_names_can_bind_one_key() {
     let storage = SurrealStorage::new_memory().await.unwrap();
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(
         &storage,
         "wh",
@@ -311,10 +300,7 @@ async fn two_local_names_can_bind_one_key() {
 #[tokio::test]
 async fn partitioned_remote_takes_the_owners_partition_status() {
     let storage = SurrealStorage::new_memory().await.unwrap();
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(&storage, "wh", vec![make_record("events")]).await;
     materialize(
         &storage,
@@ -401,10 +387,7 @@ async fn neither_the_owners_runs_nor_a_left_over_local_row_hide_an_update() {
         .unwrap();
     set_edges(&storage, &[("summary", "orders")]).await;
 
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(&storage, "wh").await;
     register(&storage, "wh", vec![make_record("raw_orders")]).await;
     storage
         .create_run(&run(
@@ -441,10 +424,7 @@ async fn neither_the_owners_runs_nor_a_left_over_local_row_hide_an_update() {
 
 /// `warehouse` registered as `wh`, owning `records`.
 async fn warehouse_owning(storage: &SurrealStorage, records: Vec<AssetRecord>) {
-    storage
-        .set_code_location_identity(&warehouse(), "wh")
-        .await
-        .unwrap();
+    register_warehouse(storage, "wh").await;
     register(storage, "wh", records).await;
 }
 

@@ -510,16 +510,6 @@ pub trait StorageBackend: PerCodeLocationStorage {
     fn kv_set(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     // Code location directory
-    /// Record that `location` scopes its rows by `identity`, replacing any
-    /// earlier identity (a recreated CodeLocation gets a new one).
-    fn set_code_location_identity(
-        &self,
-        location: &LocationRef,
-        identity: &str,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.upsert_code_location_registration(location, CodeLocationDirectoryEntry::new(identity))
-    }
-
     /// Storage identity of `location`, or `None` if it never registered.
     fn get_code_location_identity(
         &self,

@@ -14,7 +14,7 @@ async fn code_location_identity_round_trips() {
     assert_eq!(storage.get_code_location_identity(&wh).await.unwrap(), None);
 
     storage
-        .set_code_location_identity(&wh, "uuid-1")
+        .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-1"))
         .await
         .unwrap();
     assert_eq!(
@@ -30,11 +30,11 @@ async fn code_location_identity_is_replaced() {
     let wh = loc("team", "wh");
 
     storage
-        .set_code_location_identity(&wh, "uuid-1")
+        .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-1"))
         .await
         .unwrap();
     storage
-        .set_code_location_identity(&wh, "uuid-2")
+        .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-2"))
         .await
         .unwrap();
 
@@ -49,11 +49,17 @@ async fn code_location_identity_is_per_namespace() {
     let storage = make_storage().await;
 
     storage
-        .set_code_location_identity(&loc("team", "wh"), "uuid-team")
+        .upsert_code_location_registration(
+            &loc("team", "wh"),
+            CodeLocationDirectoryEntry::new("uuid-team"),
+        )
         .await
         .unwrap();
     storage
-        .set_code_location_identity(&loc("dev", "wh"), "uuid-dev")
+        .upsert_code_location_registration(
+            &loc("dev", "wh"),
+            CodeLocationDirectoryEntry::new("uuid-dev"),
+        )
         .await
         .unwrap();
 
@@ -79,7 +85,10 @@ async fn code_location_identity_is_per_namespace() {
 async fn code_location_directory_wire_format() {
     let storage = make_storage().await;
     storage
-        .set_code_location_identity(&loc("team", "wh"), "uuid-1")
+        .upsert_code_location_registration(
+            &loc("team", "wh"),
+            CodeLocationDirectoryEntry::new("uuid-1"),
+        )
         .await
         .unwrap();
 
@@ -100,7 +109,10 @@ async fn code_location_directory_range_uses_kv_index() {
     let storage = make_storage().await;
     for (namespace, name) in [("team", "wh"), ("team", "analytics"), ("dev", "default")] {
         storage
-            .set_code_location_identity(&loc(namespace, name), name)
+            .upsert_code_location_registration(
+                &loc(namespace, name),
+                CodeLocationDirectoryEntry::new(name),
+            )
             .await
             .unwrap();
     }

@@ -533,7 +533,7 @@ mod remote_staleness {
     use super::*;
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::assets::remote::{LocationRef, RemoteRef};
-    use crate::storage::{CodeLocationContext, StaleCauseCategory};
+    use crate::storage::{CodeLocationContext, CodeLocationDirectoryEntry, StaleCauseCategory};
 
     fn remote(local: &str, location: &str, asset_key: &str) -> TopologyNode {
         TopologyNode {
@@ -579,7 +579,10 @@ mod remote_staleness {
     async fn setup() -> SurrealStorage {
         let storage = make_storage().await;
         storage
-            .set_code_location_identity(&LocationRef::new("dev", "warehouse").unwrap(), "warehouse")
+            .upsert_code_location_registration(
+                &LocationRef::new("dev", "warehouse").unwrap(),
+                CodeLocationDirectoryEntry::new("warehouse"),
+            )
             .await
             .unwrap();
         register_as(&storage, "warehouse", &["raw_orders"]).await;
@@ -713,7 +716,10 @@ mod remote_staleness {
         let storage = make_storage().await;
         for (location, identity) in [("warehouse", "wh"), ("shop", "sh")] {
             storage
-                .set_code_location_identity(&LocationRef::new("dev", location).unwrap(), identity)
+                .upsert_code_location_registration(
+                    &LocationRef::new("dev", location).unwrap(),
+                    CodeLocationDirectoryEntry::new(identity),
+                )
                 .await
                 .unwrap();
         }
