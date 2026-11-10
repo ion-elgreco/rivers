@@ -10,6 +10,7 @@ use crate::storage::{
     RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
 };
 
+use super::partition_keys::KEY_ROWS_CHANGED;
 use super::pools::PoolContended;
 use super::*;
 
@@ -1326,47 +1327,32 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%code_location_id))]
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%code_location_id, key_lists = key_lists.len()))]
     async fn set_graph_topology(
         &self,
         code_location_id: &str,
         topology: &crate::assets::graph::GraphTopology,
-        definitions: &crate::assets::partitions_fingerprint::PartitionDefinitions,
+        key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>],
     ) -> Result<()> {
         let topology = surrealdb::types::Bytes::from(serde_json::to_vec(topology)?);
-        let definitions = surrealdb::types::Bytes::from(serde_json::to_vec(definitions)?);
 
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "BEGIN TRANSACTION; \
-                     INSERT INTO kv { key: $topology_key, value: $topology } \
-                     ON DUPLICATE KEY UPDATE value = $input.value; \
-                     INSERT INTO kv { key: $definitions_key, value: $definitions } \
-                     ON DUPLICATE KEY UPDATE value = $input.value; \
-                     COMMIT TRANSACTION;",
-                )
-                .bind(("topology_key", crate::graph_topology_key(code_location_id)))
-                .bind(("topology", topology.clone()))
-                .bind((
-                    "definitions_key",
-                    crate::partition_definitions_key(code_location_id),
-                ))
-                .bind(("definitions", definitions.clone()))
-                .await?
-                .check()?;
-            Ok(())
+        let retry_if = |e: &anyhow::Error| {
+            retry::default_should_retry(e) || format!("{e:#}").contains(KEY_ROWS_CHANGED)
+        };
+        retry::with_retry_if(&self.retry_config, retry_if, || async {
+            let stored = self.stored_key_rows(code_location_id).await?;
+            self.write_topology(code_location_id, &topology, key_lists, &stored)
+                .await
         })
         .await
     }
 
-    async fn get_partition_definitions(
+    async fn get_partition_keys(
         &self,
         code_location_id: &str,
-    ) -> Result<crate::assets::partitions_fingerprint::PartitionDefinitions> {
-        Ok(self
-            .kv_get_json(&crate::partition_definitions_key(code_location_id))
-            .await?
-            .unwrap_or_default())
+        digest: &str,
+    ) -> Result<Option<Vec<String>>> {
+        self.kv_get_json(&crate::partition_keys_key(code_location_id, digest))
+            .await
     }
 }

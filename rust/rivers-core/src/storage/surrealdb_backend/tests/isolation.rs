@@ -4,7 +4,6 @@ use super::*;
 #[tokio::test]
 async fn graph_topology_isolated_per_code_location() {
     use crate::assets::graph::{NodeKind, TopologyNode};
-    use crate::assets::partitions_fingerprint::PartitionDefinitions;
 
     let storage = make_storage().await;
     let ctx_a = crate::storage::CodeLocationContext::new("11111111-1111-4111-8111-111111111111");
@@ -21,12 +20,12 @@ async fn graph_topology_isolated_per_code_location() {
 
     storage
         .for_code_location(&ctx_a)
-        .set_graph_topology(&topo_a, &PartitionDefinitions::default())
+        .set_graph_topology(&topo_a, &[])
         .await
         .unwrap();
     storage
         .for_code_location(&ctx_b)
-        .set_graph_topology(&topo_b, &PartitionDefinitions::default())
+        .set_graph_topology(&topo_b, &[])
         .await
         .unwrap();
 
@@ -49,97 +48,238 @@ async fn graph_topology_isolated_per_code_location() {
     assert_eq!(read_b.nodes[0].name, "b_only");
 }
 
-/// One write sets the topology and the partitions definitions; the next
-/// replaces both.
-#[tokio::test]
-async fn set_graph_topology_writes_and_replaces_both_rows() {
-    use crate::assets::graph::{NodeKind, TopologyNode};
-    use crate::assets::partitions_fingerprint::{PartitionDefinitions, PartitionsFingerprint};
+fn key_lists<'a>(lists: &[&[&'a str]]) -> Vec<crate::assets::partitions_fingerprint::KeyList<'a>> {
+    lists
+        .iter()
+        .map(|keys| crate::assets::partitions_fingerprint::KeyList::new(keys.iter().copied()))
+        .collect()
+}
 
-    let storage = make_storage().await;
-    let ctx = crate::storage::CodeLocationContext::new("cl-a");
-    let scoped = storage.for_code_location(&ctx);
-    let regions = PartitionsFingerprint::static_keys(["eu".to_string(), "us".to_string()]);
-    let one = PartitionsFingerprint::static_keys(["eu".to_string()]);
-    let write = |names: &[&str], partitioned: &[(&str, &PartitionsFingerprint)]| {
-        let topology = GraphTopology {
-            nodes: names
-                .iter()
-                .map(|name| TopologyNode::new(*name, NodeKind::Asset))
-                .collect(),
-            edges: vec![],
-        };
-        let mut definitions = PartitionDefinitions::default();
-        for (name, fingerprint) in partitioned {
-            let index = definitions.intern((*fingerprint).clone());
-            definitions.nodes.insert(name.to_string(), index);
-        }
-        (topology, definitions)
-    };
-    let names = |topology: Option<GraphTopology>| -> Vec<String> {
-        topology
-            .expect("topology")
-            .nodes
-            .into_iter()
-            .map(|node| node.name)
-            .collect()
-    };
-
-    let (topology, definitions) = write(
-        &["stores", "staff", "summary"],
-        &[("stores", &regions), ("staff", &regions)],
-    );
-    scoped
-        .set_graph_topology(&topology, &definitions)
-        .await
-        .unwrap();
-    assert_eq!(
-        names(scoped.get_graph_topology().await.unwrap()),
-        ["stores", "staff", "summary"]
-    );
-    let read = scoped.get_partition_definitions().await.unwrap();
-    assert_eq!(read, definitions);
-    assert_eq!(read.definitions, std::slice::from_ref(&regions));
-    assert_eq!(read.get("stores"), Some(&regions));
-    assert_eq!(read.get("staff"), Some(&regions));
-    assert_eq!(read.get("summary"), None);
-    let raw = storage
-        .kv_get(&crate::partition_definitions_key("cl-a"))
+/// The keys of `identity`'s key rows, by digest.
+async fn stored_key_rows(
+    storage: &SurrealStorage,
+    identity: &str,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let prefix = format!("{}{identity}:", crate::PARTITION_KEYS_KEY_PREFIX);
+    let rows: Vec<DbKv> = storage
+        .db
+        .query("SELECT * FROM kv WHERE string::starts_with(key, $prefix)")
+        .bind(("prefix", prefix.clone()))
         .await
         .unwrap()
-        .expect("definitions row");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
-        serde_json::json!({
-            "nodes": { "staff": 0, "stores": 0 },
-            "definitions": [{ "kind": "static", "keys": ["eu", "us"] }],
+        .take(0)
+        .unwrap();
+    rows.into_iter()
+        .filter_map(|row| {
+            let digest = row.key.strip_prefix(&prefix)?;
+            (!digest.contains(':')).then(|| {
+                let keys = serde_json::from_slice(&row.value).unwrap();
+                (digest.to_string(), keys)
+            })
         })
-    );
+        .collect()
+}
 
-    let (topology, definitions) = write(&["stores", "staff"], &[("stores", &one)]);
-    scoped
-        .set_graph_topology(&topology, &definitions)
+/// A topology write keeps one key row per distinct static key list: it
+/// writes the new ones, leaves the stored ones as they are, and deletes the
+/// ones the topology no longer names, of this code location only. Embedded
+/// storage, for the transaction.
+#[tokio::test]
+async fn set_graph_topology_keeps_one_key_row_per_list() {
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::partitions_fingerprint::KeyList;
+
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+        .await
+        .unwrap();
+    let (cl, cl_x) = (
+        crate::storage::CodeLocationContext::new("cl"),
+        crate::storage::CodeLocationContext::new("cl:x"),
+    );
+    let topology = |names: &[&str]| GraphTopology {
+        nodes: names
+            .iter()
+            .map(|name| TopologyNode::new(*name, NodeKind::Asset))
+            .collect(),
+        edges: vec![],
+    };
+    let digest = |keys: &[&str]| KeyList::new(keys.iter().copied()).digest;
+    let regions: &[&str] = &["us", "eu"];
+    let sizes: &[&str] = &["s", "m", "l"];
+
+    storage
+        .for_code_location(&cl_x)
+        .set_graph_topology(&topology(&["other"]), &key_lists(&[regions]))
+        .await
+        .unwrap();
+    storage
+        .for_code_location(&cl)
+        .set_graph_topology(
+            &topology(&["stores", "staff"]),
+            &key_lists(&[regions, sizes, &["eu", "us", "eu"]]),
+        )
         .await
         .unwrap();
     assert_eq!(
-        names(scoped.get_graph_topology().await.unwrap()),
-        ["stores", "staff"]
+        stored_key_rows(&storage, "cl").await,
+        [
+            (digest(regions), vec!["eu".to_string(), "us".to_string()]),
+            (
+                digest(sizes),
+                vec!["l".to_string(), "m".to_string(), "s".to_string()]
+            ),
+        ]
+        .into()
     );
-    let read = scoped.get_partition_definitions().await.unwrap();
-    assert_eq!(read.definitions, std::slice::from_ref(&one));
-    assert_eq!(read.get("stores"), Some(&one));
-    assert_eq!(read.get("staff"), None, "staff lost its definition");
-    assert_eq!(read.nodes.len(), 1);
-
-    let other = crate::storage::CodeLocationContext::new("cl-b");
     assert_eq!(
         storage
-            .for_code_location(&other)
-            .get_partition_definitions()
+            .for_code_location(&cl)
+            .get_partition_keys(&digest(sizes))
             .await
             .unwrap(),
-        PartitionDefinitions::default()
+        Some(vec!["l".to_string(), "m".to_string(), "s".to_string()])
     );
+    assert_eq!(
+        storage
+            .for_code_location(&cl)
+            .get_partition_keys("0".repeat(32).as_str())
+            .await
+            .unwrap(),
+        None
+    );
+
+    let marker = br#"["kept as it was"]"#;
+    storage
+        .kv_set(&crate::partition_keys_key("cl", &digest(regions)), marker)
+        .await
+        .unwrap();
+    storage
+        .for_code_location(&cl)
+        .set_graph_topology(&topology(&["stores"]), &key_lists(&[regions]))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_key_rows(&storage, "cl").await,
+        [(digest(regions), vec!["kept as it was".to_string()])].into(),
+        "the stored row is not written again; the unused one is deleted"
+    );
+    assert_eq!(
+        storage
+            .for_code_location(&cl)
+            .get_graph_topology()
+            .await
+            .unwrap()
+            .unwrap()
+            .nodes[0]
+            .name,
+        "stores"
+    );
+
+    storage
+        .for_code_location(&cl)
+        .set_graph_topology(&topology(&["stores"]), &key_lists(&[&["eu"]]))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_key_rows(&storage, "cl").await,
+        [(digest(&["eu"]), vec!["eu".to_string()])].into()
+    );
+    assert_eq!(
+        stored_key_rows(&storage, "cl:x").await,
+        [(digest(regions), vec!["eu".to_string(), "us".to_string()])].into(),
+        "another code location's rows stay, also when its id starts with this one"
+    );
+}
+
+/// A key row that the write found stored but that is gone at commit fails
+/// the transaction with the error the retry reads again on, and the write
+/// leaves nothing behind.
+#[tokio::test]
+async fn a_key_row_deleted_during_the_write_fails_the_transaction() {
+    use super::super::partition_keys::KEY_ROWS_CHANGED;
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::partitions_fingerprint::KeyList;
+
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
+        .await
+        .unwrap();
+    let regions: &[&str] = &["eu", "us"];
+    let row = crate::partition_keys_key("cl", &KeyList::new(regions.iter().copied()).digest);
+    let topology = GraphTopology {
+        nodes: vec![TopologyNode::new("stores", NodeKind::Asset)],
+        edges: vec![],
+    };
+    let bytes = surrealdb::types::Bytes::from(serde_json::to_vec(&topology).unwrap());
+    let ctx = crate::storage::CodeLocationContext::new("cl");
+
+    let stale = [row].into();
+    let error = storage
+        .write_topology("cl", &bytes, &key_lists(&[regions]), &stale)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), KEY_ROWS_CHANGED);
+    assert!(stored_key_rows(&storage, "cl").await.is_empty());
+    assert!(
+        storage
+            .for_code_location(&ctx)
+            .get_graph_topology()
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    storage
+        .write_topology("cl", &bytes, &key_lists(&[regions]), &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_key_rows(&storage, "cl")
+            .await
+            .into_values()
+            .collect::<Vec<_>>(),
+        [vec!["eu".to_string(), "us".to_string()]]
+    );
+}
+
+/// The read and the delete of a code location's key rows range-scan
+/// `idx_kv_key`.
+#[tokio::test]
+async fn key_rows_range_scan_the_kv_index() {
+    let storage = make_storage().await;
+    for key in [
+        "graph_topology:cl",
+        "partition_keys:cl:x",
+        "partition_keys:cm:x",
+    ] {
+        storage.kv_set(key, b"[]").await.unwrap();
+    }
+
+    let rows = super::super::partition_keys::KEY_ROWS;
+    for statement in [
+        format!("SELECT VALUE key FROM kv WHERE {rows}"),
+        format!("DELETE kv WHERE {rows} AND key NOTINSIDE $used"),
+    ] {
+        let plan: Vec<serde_json::Value> = storage
+            .db
+            .query(format!("{statement} EXPLAIN"))
+            .bind(("key_rows_from", "partition_keys:cl:"))
+            .bind(("key_rows_to", "partition_keys:cl;"))
+            .bind(("key_row_len", 50))
+            .bind(("used", Vec::<String>::new()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("\"index\":\"idx_kv_key\"")
+                && plan.contains(">='partition_keys:cl:' <'partition_keys:cl;'"),
+            "{statement}: {plan}"
+        );
+        assert!(!plan.contains("TableScan"), "{statement}: {plan}");
+    }
 }
 
 /// `condition_eval_state` is keyed per CL.

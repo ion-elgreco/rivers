@@ -56,26 +56,9 @@ async fn read_topology(
         .flatten()
 }
 
-#[cfg(feature = "ssr")]
-async fn read_definitions(
-    state: &crate::state::AppState,
-    identity: &str,
-) -> rivers_core::assets::partitions_fingerprint::PartitionDefinitions {
-    use rivers_core::storage::StorageBackend;
-
-    let ctx = rivers_core::storage::CodeLocationContext::new(identity);
-    state
-        .storage
-        .for_code_location(&ctx)
-        .get_partition_definitions()
-        .await
-        .unwrap_or_default()
-}
-
 /// The UI topology. A remote node is resolved when the registry knows its
 /// owning code location, and then carries its partition drift against the
-/// owner's topology, if the owner wrote one. The partitions definitions are
-/// read only when the topology has a remote node, once per code location.
+/// owner's topology, if the owner wrote one.
 #[cfg(feature = "ssr")]
 async fn load_ui_topology(
     state: &crate::state::AppState,
@@ -85,21 +68,16 @@ async fn load_ui_topology(
     use std::collections::HashMap;
 
     use rivers_core::assets::graph::GraphTopology as CoreTopology;
-    use rivers_core::assets::partitions_fingerprint::PartitionDefinitions;
+    use rivers_core::assets::partitions_fingerprint::partition_drift;
+    use rivers_core::storage::CodeLocationContext;
 
     use crate::types::RemoteDrift;
 
     let (topology, identity) = load_topology(state, loc_ns, loc_name).await?;
-    if topology.nodes.iter().all(|node| node.remote.is_none()) {
-        return Ok(topology.into());
-    }
-    let mirrors = match &identity {
-        Some(identity) => read_definitions(state, identity).await,
-        None => PartitionDefinitions::default(),
-    };
+    let consumer = CodeLocationContext::new(identity.unwrap_or_default());
 
     // Location → `None` when unregistered, `Some(None)` without a topology.
-    type Owner = Option<Option<(CoreTopology, PartitionDefinitions)>>;
+    type Owner = Option<Option<(CodeLocationContext, CoreTopology)>>;
     let mut owners: HashMap<String, Owner> = HashMap::new();
     let mut remotes: HashMap<String, (bool, Option<RemoteDrift>)> = HashMap::new();
     for node in &topology.nodes {
@@ -116,13 +94,11 @@ async fn load_ui_topology(
                 )
                 .await;
             let owner = match entry {
-                Some(entry) => match read_topology(state, &entry.identity).await {
-                    Some(topology) => Some(Some((
-                        topology,
-                        read_definitions(state, &entry.identity).await,
-                    ))),
-                    None => Some(None),
-                },
+                Some(entry) => Some(
+                    read_topology(state, &entry.identity)
+                        .await
+                        .map(|topology| (CodeLocationContext::new(entry.identity), topology)),
+                ),
                 None => None,
             };
             owners.insert(location.clone(), owner);
@@ -130,12 +106,29 @@ async fn load_ui_topology(
         let seen = match &owners[&location] {
             None => (false, None),
             Some(None) => (true, None),
-            Some(Some((owner, definitions))) => {
-                let mirror = mirrors.get(&node.name);
-                (
-                    true,
-                    RemoteDrift::between(owner, definitions, &remote.asset_key, mirror),
-                )
+            Some(Some((owner_ctx, owner))) => {
+                let mirror = node.partitions.as_ref();
+                let check = partition_drift(owner, &remote.asset_key, mirror);
+                let settled = state
+                    .key_comparisons
+                    .settle(state.storage.as_ref(), &consumer, owner_ctx, check)
+                    .await;
+                let drift = match settled {
+                    Ok(drift) => {
+                        let owned = owner.owned_partitions(&remote.asset_key);
+                        RemoteDrift::new(drift, mirror, owned)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "rivers::ui",
+                            node = %node.name,
+                            %error,
+                            "reading static partition keys failed; partition drift is not shown"
+                        );
+                        None
+                    }
+                };
+                (true, drift)
             }
         };
         remotes.insert(node.name.clone(), seen);
@@ -227,9 +220,7 @@ mod tests {
     use std::sync::Arc;
 
     use rivers_core::assets::graph::{GraphTopology, NodeKind, TopologyNode};
-    use rivers_core::assets::partitions_fingerprint::{
-        PartitionDefinitions, PartitionsFingerprint,
-    };
+    use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
     use rivers_core::assets::remote::{LocationRef, RemoteRef};
     use rivers_core::storage::surrealdb_backend::SurrealStorage;
     use rivers_core::storage::{CodeLocationContext, StorageBackend};
@@ -237,10 +228,6 @@ mod tests {
     use crate::code_location_registry::Registry;
     use crate::state::AppState;
     use crate::types::{CodeLocationEntry, RemoteDrift, RemoteNode};
-
-    fn statics(keys: &[&str]) -> PartitionsFingerprint {
-        PartitionsFingerprint::static_keys(keys.iter().map(|k| k.to_string()))
-    }
 
     fn entry(name: &str, identity: &str) -> CodeLocationEntry {
         CodeLocationEntry {
@@ -255,103 +242,142 @@ mod tests {
         }
     }
 
-    fn remote(name: &str, location: &str, asset_key: &str) -> TopologyNode {
+    fn owned(name: &str, keys: &[&str]) -> TopologyNode {
+        TopologyNode {
+            partitions: Some(PartitionsFingerprint::static_keys(keys.iter().copied())),
+            ..TopologyNode::new(name, NodeKind::Asset)
+        }
+    }
+
+    fn remote(name: &str, location: &str, asset_key: &str, keys: &[&str]) -> TopologyNode {
         TopologyNode {
             remote: Some(RemoteRef {
                 code_location: LocationRef::new("dev", location).unwrap(),
                 asset_key: asset_key.into(),
             }),
+            partitions: (!keys.is_empty())
+                .then(|| PartitionsFingerprint::static_keys(keys.iter().copied())),
             ..TopologyNode::new(name, NodeKind::Asset)
         }
     }
 
+    /// `nodes` as the topology of `identity`, with a key row for each list
+    /// of `keys`.
     async fn write(
         storage: &SurrealStorage,
         identity: &str,
         nodes: Vec<TopologyNode>,
-        partitioned: &[(&str, PartitionsFingerprint)],
+        keys: &[&[&str]],
     ) {
-        let mut definitions = PartitionDefinitions::default();
-        for (name, fingerprint) in partitioned {
-            let index = definitions.intern(fingerprint.clone());
-            definitions.nodes.insert(name.to_string(), index);
-        }
+        let key_lists: Vec<KeyList> = keys
+            .iter()
+            .map(|keys| KeyList::new(keys.iter().copied()))
+            .collect();
         let topology = GraphTopology {
             nodes,
             edges: vec![],
         };
         storage
             .for_code_location(&CodeLocationContext::new(identity))
-            .set_graph_topology(&topology, &definitions)
+            .set_graph_topology(&topology, &key_lists)
             .await
             .unwrap();
     }
 
-    /// The mirror comes from the consumer's definitions row and the owner's
-    /// definition from the owner's.
-    #[tokio::test]
-    async fn remote_nodes_carry_the_drift_against_the_owners_definitions() {
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
-        write(
-            &storage,
-            "wh-id",
-            vec![
-                TopologyNode::new("raw_orders", NodeKind::Asset),
-                TopologyNode::new("refunds", NodeKind::Asset),
-            ],
-            &[
-                ("raw_orders", statics(&["eu"])),
-                ("refunds", statics(&["eu", "us"])),
-            ],
-        )
-        .await;
-        write(
-            &storage,
-            "an-id",
-            vec![
-                remote("orders", "warehouse", "raw_orders"),
-                remote("refunds", "warehouse", "refunds"),
-                remote("missing", "warehouse", "no_such_asset"),
-                remote("shop_orders", "shop", "raw_orders"),
-                remote("ghost", "nowhere", "ghost"),
-                TopologyNode::new("report", NodeKind::Asset),
-            ],
-            &[
-                ("orders", statics(&["eu", "us"])),
-                ("refunds", statics(&["us", "eu"])),
-            ],
-        )
-        .await;
-        let state = AppState {
-            storage,
+    fn warehouse() -> Vec<TopologyNode> {
+        vec![
+            owned("raw_orders", &["eu"]),
+            owned("refunds", &["eu", "us"]),
+            owned("regions", &["apac", "eu", "us"]),
+            owned("sites", &["apac", "eu", "uk"]),
+        ]
+    }
+
+    fn analytics() -> Vec<TopologyNode> {
+        vec![
+            remote("orders", "warehouse", "raw_orders", &["eu", "us"]),
+            remote("refunds", "warehouse", "refunds", &["us", "eu"]),
+            remote("regions", "warehouse", "regions", &["eu", "us"]),
+            remote("sites", "warehouse", "sites", &["eu", "us"]),
+            remote("missing", "warehouse", "no_such_asset", &[]),
+            remote("shop_orders", "shop", "raw_orders", &[]),
+            remote("ghost", "nowhere", "ghost", &[]),
+            TopologyNode::new("report", NodeKind::Asset),
+        ]
+    }
+
+    fn state(storage: &Arc<SurrealStorage>) -> AppState {
+        AppState {
+            storage: Arc::clone(storage),
             graph: None,
             registry: Registry::Static(Arc::new(vec![
                 entry("warehouse", "wh-id"),
                 entry("shop", "shop-id"),
                 entry("analytics", "an-id"),
             ])),
-        };
+            key_comparisons: Default::default(),
+        }
+    }
 
-        let ui = super::load_ui_topology(&state, "dev", "analytics")
+    async fn seen(
+        state: &AppState,
+    ) -> impl Fn(&str) -> Option<(bool, Option<RemoteDrift>)> + use<> {
+        let ui = super::load_ui_topology(state, "dev", "analytics")
             .await
             .unwrap();
-        let seen = |name: &str| {
+        move |name: &str| {
             let node = ui.nodes.iter().find(|n| n.name == name).unwrap();
             node.remote
                 .as_ref()
                 .map(|r: &RemoteNode| (r.resolved, r.drift.clone()))
-        };
+        }
+    }
+
+    fn compatible(mirror: &str, owner: &str) -> Option<(bool, Option<RemoteDrift>)> {
+        let (mirror, owner) = (mirror.into(), owner.into());
+        Some((true, Some(RemoteDrift::Compatible { mirror, owner })))
+    }
+
+    fn incompatible(mirror: &str, owner: &str) -> Option<(bool, Option<RemoteDrift>)> {
+        let (mirror, owner) = (mirror.into(), owner.into());
+        Some((true, Some(RemoteDrift::Incompatible { mirror, owner })))
+    }
+
+    /// The mirror comes from the consumer's topology and the owner's
+    /// definition from the owner's. Key rows decide when the owner has more
+    /// static keys.
+    #[tokio::test]
+    async fn remote_nodes_carry_the_drift_against_the_owners_definitions() {
+        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        write(
+            &storage,
+            "wh-id",
+            warehouse(),
+            &[
+                &["eu"],
+                &["eu", "us"],
+                &["apac", "eu", "us"],
+                &["apac", "eu", "uk"],
+            ],
+        )
+        .await;
+        write(&storage, "an-id", analytics(), &[&["eu", "us"]]).await;
+
+        let seen = seen(&state(&storage)).await;
         assert_eq!(
             seen("orders"),
-            Some((
-                true,
-                Some(RemoteDrift::Incompatible {
-                    mirror: "static (2 keys)".into(),
-                    owner: "static (1 key)".into(),
-                })
-            ))
+            incompatible("static (2 keys)", "static (1 key)")
         );
         assert_eq!(seen("refunds"), Some((true, None)));
+        assert_eq!(
+            seen("regions"),
+            compatible("static (2 keys)", "static (3 keys)")
+        );
+        assert_eq!(
+            seen("sites"),
+            incompatible("static (2 keys)", "static (3 keys)"),
+            "'us' is not an owner key"
+        );
         assert_eq!(
             seen("missing"),
             Some((true, Some(RemoteDrift::OwnerNodeMissing)))
@@ -359,5 +385,68 @@ mod tests {
         assert_eq!(seen("shop_orders"), Some((true, None)), "no topology");
         assert_eq!(seen("ghost"), Some((false, None)), "not registered");
         assert_eq!(seen("report"), None);
+    }
+
+    /// A pair of digests compared once is not read again: the answers stay
+    /// after the key rows are gone, and a new state without them finds the
+    /// rows missing.
+    #[tokio::test]
+    async fn the_answer_of_a_key_comparison_is_kept() {
+        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        write(
+            &storage,
+            "wh-id",
+            warehouse(),
+            &[
+                &["eu"],
+                &["eu", "us"],
+                &["apac", "eu", "us"],
+                &["apac", "eu", "uk"],
+            ],
+        )
+        .await;
+        write(&storage, "an-id", analytics(), &[&["eu", "us"]]).await;
+        let kept = state(&storage);
+        let first = seen(&kept).await;
+        assert_eq!(
+            first("regions"),
+            compatible("static (2 keys)", "static (3 keys)")
+        );
+
+        write(&storage, "wh-id", warehouse(), &[]).await;
+        write(&storage, "an-id", analytics(), &[]).await;
+        let without_rows = |identity: &str, keys: &[&str]| {
+            let digest = KeyList::new(keys.iter().copied()).digest;
+            let storage = Arc::clone(&storage);
+            let identity = identity.to_string();
+            async move {
+                storage
+                    .for_code_location(&CodeLocationContext::new(identity))
+                    .get_partition_keys(&digest)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(without_rows("wh-id", &["apac", "eu", "us"]).await, None);
+        assert_eq!(without_rows("an-id", &["eu", "us"]).await, None);
+
+        let again = seen(&kept).await;
+        assert_eq!(
+            again("regions"),
+            compatible("static (2 keys)", "static (3 keys)")
+        );
+        assert_eq!(
+            again("sites"),
+            incompatible("static (2 keys)", "static (3 keys)")
+        );
+        assert_eq!(again("refunds"), Some((true, None)));
+
+        let fresh = seen(&state(&storage)).await;
+        assert_eq!(
+            fresh("regions"),
+            incompatible("static (2 keys)", "static (3 keys)"),
+            "a missing key row is incompatible"
+        );
+        assert_eq!(fresh("refunds"), Some((true, None)), "needs no key row");
     }
 }

@@ -6,6 +6,7 @@ use petgraph::graph::{Graph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::partitions_fingerprint::PartitionsFingerprint;
 use crate::assets::remote::RemoteRef;
 use crate::repo::CodeRepository;
 
@@ -74,8 +75,7 @@ impl DagNode {
 pub type AssetGraph = Graph<DagNode, (), Directed>;
 
 /// Serializable graph topology for the UI binary — names + edges only,
-/// no Python callables. The nodes' partitions definitions are stored apart,
-/// in [`crate::assets::partitions_fingerprint::PartitionDefinitions`].
+/// no Python callables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphTopology {
     pub nodes: Vec<TopologyNode>,
@@ -94,6 +94,8 @@ pub struct TopologyNode {
     /// Set when the node mirrors an asset owned by another code location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<PartitionsFingerprint>,
 }
 
 impl TopologyNode {
@@ -104,6 +106,7 @@ impl TopologyNode {
             group: None,
             parent_graph: None,
             remote: None,
+            partitions: None,
         }
     }
 }
@@ -282,6 +285,11 @@ impl GraphTopology {
         self.nodes
             .iter()
             .find(|n| n.name == name && n.remote.is_none())
+    }
+
+    /// The partitions definition of an asset this code location owns.
+    pub fn owned_partitions(&self, name: &str) -> Option<&PartitionsFingerprint> {
+        self.owned_node(name)?.partitions.as_ref()
     }
 
     /// (transitive dependencies, transitive dependents) of `node_name`.
@@ -671,13 +679,25 @@ mod tests {
     }
 
     #[test]
-    fn test_topology_with_partitions_decodes() {
-        let older = r#"{"nodes":[{"name":"a","kind":"asset","partitions":0},{"name":"b","kind":"task"}],"edges":[["b","a"]],"partitions":[{"kind":"static","keys":["x"]}]}"#;
-        let topology: GraphTopology = serde_json::from_str(older).unwrap();
+    fn test_topology_node_carries_its_partitions_fingerprint() {
+        let mut partitioned = TopologyNode::new("a", NodeKind::Asset);
+        partitioned.partitions = Some(PartitionsFingerprint::static_keys(["y", "x"]));
+        let topology = GraphTopology {
+            nodes: vec![partitioned, TopologyNode::new("b", NodeKind::Task)],
+            edges: vec![("b".into(), "a".into())],
+        };
+
+        let json = serde_json::to_string(&topology).unwrap();
         assert_eq!(
-            serde_json::to_string(&topology).unwrap(),
-            r#"{"nodes":[{"name":"a","kind":"asset"},{"name":"b","kind":"task"}],"edges":[["b","a"]]}"#
+            json,
+            r#"{"nodes":[{"name":"a","kind":"asset","partitions":{"kind":"static","count":2,"digest":"e8f655a7c73f954d35f7350447b030bc"}},{"name":"b","kind":"task"}],"edges":[["b","a"]]}"#
         );
+        let back: GraphTopology = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.owned_partitions("a"),
+            topology.nodes[0].partitions.as_ref()
+        );
+        assert_eq!(back.owned_partitions("b"), None);
     }
 
     #[test]

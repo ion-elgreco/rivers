@@ -378,21 +378,23 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<Option<crate::assets::graph::GraphTopology>>> + Send;
 
-    /// Persist the graph topology blob for this CL and the partitions
-    /// definitions of its nodes, in one transaction.
+    /// Persist the graph topology blob for this CL and a key row for each of
+    /// `key_lists`, in one transaction. A key row that is stored already is
+    /// not written again; this CL's key rows that are not in `key_lists` are
+    /// deleted.
     fn set_graph_topology(
         &self,
         code_location_id: &str,
         topology: &crate::assets::graph::GraphTopology,
-        definitions: &crate::assets::partitions_fingerprint::PartitionDefinitions,
+        key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>],
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Read the partitions definitions of this CL's nodes; empty when none
-    /// were written.
-    fn get_partition_definitions(
+    /// Read the static partition keys this CL stored under `digest`.
+    fn get_partition_keys(
         &self,
         code_location_id: &str,
-    ) -> impl Future<Output = Result<crate::assets::partitions_fingerprint::PartitionDefinitions>> + Send;
+        digest: &str,
+    ) -> impl Future<Output = Result<Option<Vec<String>>>> + Send;
 }
 
 #[allow(private_bounds)]

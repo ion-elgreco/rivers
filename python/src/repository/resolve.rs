@@ -14,7 +14,7 @@ use crate::partitions::PartitionsDefinition;
 use crate::runtime::{io_rt, rt};
 use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 use rivers_core::assets::graph::to_topology;
-use rivers_core::assets::partitions_fingerprint::PartitionDefinitions;
+use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 
@@ -340,8 +340,8 @@ impl PyCodeRepository {
                 }
             }
 
-            let mut definitions = PartitionDefinitions::default();
-            let mut fingerprinted: Vec<(&PartitionsDefinition, usize)> = Vec::new();
+            let mut fingerprints: Vec<(&PartitionsDefinition, PartitionsFingerprint)> = Vec::new();
+            let mut key_lists: Vec<KeyList<'_>> = Vec::new();
             for topo_node in &mut topology.nodes {
                 if let Some(gn) = node_map.get(&topo_node.name) {
                     topo_node.group = gn.group();
@@ -358,17 +358,16 @@ impl PyCodeRepository {
                         }
                     };
                     topo_node.remote = gn.remote().cloned();
-                    if let Some(def) = gn.partitions_def() {
-                        let index = match fingerprinted.iter().find(|(seen, _)| *seen == def) {
-                            Some((_, index)) => *index,
+                    topo_node.partitions = gn.partitions_def().map(|def| {
+                        match fingerprints.iter().find(|(seen, _)| *seen == def) {
+                            Some((_, fingerprint)) => fingerprint.clone(),
                             None => {
-                                let index = definitions.intern(def.fingerprint());
-                                fingerprinted.push((def, index));
-                                index
+                                let fingerprint = def.fingerprint_into(&mut key_lists);
+                                fingerprints.push((def, fingerprint.clone()));
+                                fingerprint
                             }
-                        };
-                        definitions.nodes.insert(topo_node.name.clone(), index);
-                    }
+                        }
+                    });
                 }
                 if let Some(parent) = task_to_graph.get(&topo_node.name) {
                     topo_node.parent_graph = Some(parent.clone());
@@ -378,7 +377,7 @@ impl PyCodeRepository {
             let _ = io_rt().block_on(
                 storage_handle
                     .scoped()
-                    .set_graph_topology(&topology, &definitions),
+                    .set_graph_topology(&topology, &key_lists),
             );
             Ok(topology)
         })

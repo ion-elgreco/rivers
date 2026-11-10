@@ -15,6 +15,7 @@ pub use migration::{Capability, SchemaMigrationNeeded};
 mod backend;
 mod directory;
 mod pages;
+mod partition_keys;
 mod per_code_location;
 mod pools;
 mod queries;

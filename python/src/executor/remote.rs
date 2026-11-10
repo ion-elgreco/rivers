@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use rivers_core::assets::graph::GraphTopology;
 use rivers_core::assets::partitions_fingerprint::{
-    PartitionDefinitions, PartitionDrift, describe_partitions, partition_drift,
+    KeyComparisons, PartitionDrift, PartitionsFingerprint, describe_partitions, partition_drift,
 };
 use rivers_core::assets::remote::{LocationRef, RemoteRef};
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
@@ -54,8 +54,8 @@ pub(super) fn prefill_remote_dep_versions(
     };
 
     let mut warnings: Vec<(&str, String)> = Vec::new();
-    let mut owners: HashMap<&LocationRef, Option<(GraphTopology, PartitionDefinitions)>> =
-        HashMap::new();
+    let mut owners: HashMap<&LocationRef, Option<GraphTopology>> = HashMap::new();
+    let key_comparisons = KeyComparisons::default();
     let mut tracked: Vec<(&str, &str, &RemoteRef)> = Vec::new();
     for &(local, remote) in &refs {
         let Some(identity) = identities
@@ -77,10 +77,24 @@ pub(super) fn prefill_remote_dep_versions(
             let owner = owners
                 .entry(&remote.code_location)
                 .or_insert_with(|| owner_topology(backend, &ctx, &remote.code_location));
-            if let Some(warning) = owner.as_ref().and_then(|(owner, definitions)| {
-                drift_warning(node_map, local, remote, owner, definitions)
-            }) {
-                warnings.push((local, warning));
+            if let Some(owner) = owner.as_ref() {
+                let mirror = node_map
+                    .get(local)
+                    .and_then(ResolvedNode::partitions_def)
+                    .map(|def| def.fingerprint());
+                let owner = (&ctx, owner);
+                let consumer = storage.ctx();
+                if let Some(warning) = drift_warning(
+                    backend,
+                    consumer,
+                    owner,
+                    &key_comparisons,
+                    local,
+                    remote,
+                    mirror.as_ref(),
+                ) {
+                    warnings.push((local, warning));
+                }
             }
         }
         tracked.push((local, identity, remote));
@@ -138,22 +152,14 @@ fn owner_data_versions<'a, S: StorageBackend>(
     versions
 }
 
-/// The owner's topology and partitions definitions; `None` when it has no
-/// topology or a read failed.
+/// The owner's topology; `None` when it has none or reading it failed.
 fn owner_topology<S: StorageBackend>(
     backend: &S,
     ctx: &CodeLocationContext,
     location: &LocationRef,
-) -> Option<(GraphTopology, PartitionDefinitions)> {
-    let scoped = backend.for_code_location(ctx);
-    let read = io_rt().block_on(async {
-        let Some(topology) = scoped.get_graph_topology().await? else {
-            return anyhow::Ok(None);
-        };
-        Ok(Some((topology, scoped.get_partition_definitions().await?)))
-    });
-    match read {
-        Ok(owner) => owner,
+) -> Option<GraphTopology> {
+    match io_rt().block_on(backend.for_code_location(ctx).get_graph_topology()) {
+        Ok(topology) => topology,
         Err(error) => {
             tracing::warn!(
                 target: "rivers::executor",
@@ -166,30 +172,40 @@ fn owner_topology<S: StorageBackend>(
     }
 }
 
-/// Why loading `local` may not read what its mirror describes.
-fn drift_warning(
-    node_map: &HashMap<String, ResolvedNode>,
+/// Why loading `local` may not read what its `mirror` describes. A failed
+/// read of static partition keys skips the check.
+fn drift_warning<S: StorageBackend>(
+    backend: &S,
+    consumer: &CodeLocationContext,
+    (owner_ctx, owner): (&CodeLocationContext, &GraphTopology),
+    key_comparisons: &KeyComparisons,
     local: &str,
     remote: &RemoteRef,
-    owner: &GraphTopology,
-    definitions: &PartitionDefinitions,
+    mirror: Option<&PartitionsFingerprint>,
 ) -> Option<String> {
-    let mirror = node_map
-        .get(local)?
-        .partitions_def()
-        .map(|def| def.fingerprint());
-    match partition_drift(owner, definitions, &remote.asset_key, mirror.as_ref()) {
-        PartitionDrift::Same | PartitionDrift::Compatible => None,
-        PartitionDrift::Incompatible => {
-            let owned = definitions.get(&remote.asset_key);
-            Some(format!(
-                "partition definition of '{local}' differs from code location '{}' (mirror {}, \
-                 owner {}); loading anyway",
-                remote.code_location,
-                describe_partitions(mirror.as_ref()),
-                describe_partitions(owned),
-            ))
+    let check = partition_drift(owner, &remote.asset_key, mirror);
+    let drift = match io_rt().block_on(key_comparisons.settle(backend, consumer, owner_ctx, check))
+    {
+        Ok(drift) => drift,
+        Err(error) => {
+            tracing::warn!(
+                target: "rivers::executor",
+                code_location = %remote.code_location,
+                %error,
+                "reading static partition keys failed; partition drift is not checked"
+            );
+            return None;
         }
+    };
+    match drift {
+        PartitionDrift::Same | PartitionDrift::Compatible => None,
+        PartitionDrift::Incompatible => Some(format!(
+            "partition definition of '{local}' differs from code location '{}' (mirror {}, \
+             owner {}); loading anyway",
+            remote.code_location,
+            describe_partitions(mirror),
+            describe_partitions(owner.owned_partitions(&remote.asset_key)),
+        )),
         PartitionDrift::OwnerNodeMissing => Some(format!(
             "code location '{}' has no asset '{}'; loading '{local}' through the handler anyway",
             remote.code_location, remote.asset_key,

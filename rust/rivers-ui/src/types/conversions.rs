@@ -239,25 +239,17 @@ impl From<rivers_core::assets::graph::GraphTopology> for GraphTopology {
 }
 
 impl RemoteDrift {
-    /// `mirror` against the owner's definition of `asset_key`, from its
-    /// topology and its partitions `definitions`; `None` when they agree.
-    pub fn between(
-        owner: &rivers_core::assets::graph::GraphTopology,
-        definitions: &rivers_core::assets::partitions_fingerprint::PartitionDefinitions,
-        asset_key: &str,
+    /// `drift` of `mirror` against the owner's definition `owner`; `None`
+    /// when they agree.
+    pub fn new(
+        drift: rivers_core::assets::partitions_fingerprint::PartitionDrift,
         mirror: Option<&rivers_core::assets::partitions_fingerprint::PartitionsFingerprint>,
+        owner: Option<&rivers_core::assets::partitions_fingerprint::PartitionsFingerprint>,
     ) -> Option<Self> {
-        use rivers_core::assets::partitions_fingerprint::{
-            PartitionDrift, describe_partitions, partition_drift,
-        };
+        use rivers_core::assets::partitions_fingerprint::{PartitionDrift, describe_partitions};
 
-        let describe = || {
-            (
-                describe_partitions(mirror),
-                describe_partitions(definitions.get(asset_key)),
-            )
-        };
-        match partition_drift(owner, definitions, asset_key, mirror) {
+        let describe = || (describe_partitions(mirror), describe_partitions(owner));
+        match drift {
             PartitionDrift::Same => None,
             PartitionDrift::Compatible => {
                 let (mirror, owner) = describe();
@@ -489,56 +481,38 @@ mod tests {
 
     mod remote_drift {
         use super::RemoteDrift;
-        use rivers_core::assets::graph::{GraphTopology, NodeKind, TopologyNode};
-        use rivers_core::assets::partitions_fingerprint::{
-            PartitionDefinitions, PartitionsFingerprint,
-        };
-
-        fn statics(keys: &[&str]) -> PartitionsFingerprint {
-            PartitionsFingerprint::static_keys(keys.iter().map(|k| k.to_string()))
-        }
-
-        fn owner(keys: &[&str]) -> (GraphTopology, PartitionDefinitions) {
-            let mut owner = GraphTopology::default();
-            owner
-                .nodes
-                .push(TopologyNode::new("raw_orders", NodeKind::Asset));
-            let mut definitions = PartitionDefinitions::default();
-            let index = definitions.intern(statics(keys));
-            definitions.nodes.insert("raw_orders".into(), index);
-            (owner, definitions)
-        }
+        use rivers_core::assets::partitions_fingerprint::{PartitionDrift, PartitionsFingerprint};
 
         #[test]
         fn each_class_maps_with_both_definitions() {
-            let mirror = statics(&["eu", "us"]);
-            let between = |keys: &[&str], key: &str| {
-                let (owner, definitions) = owner(keys);
-                RemoteDrift::between(&owner, &definitions, key, Some(&mirror))
-            };
+            let mirror = PartitionsFingerprint::static_keys(["eu", "us"]);
+            let three = PartitionsFingerprint::static_keys(["apac", "eu", "us"]);
+            let one = PartitionsFingerprint::static_keys(["eu"]);
 
-            assert_eq!(between(&["us", "eu"], "raw_orders"), None);
             assert_eq!(
-                between(&["apac", "eu", "us"], "raw_orders"),
+                RemoteDrift::new(PartitionDrift::Same, Some(&mirror), Some(&mirror)),
+                None
+            );
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::Compatible, Some(&mirror), Some(&three)),
                 Some(RemoteDrift::Compatible {
                     mirror: "static (2 keys)".into(),
                     owner: "static (3 keys)".into(),
                 })
             );
             assert_eq!(
-                between(&["eu"], "raw_orders"),
+                RemoteDrift::new(PartitionDrift::Incompatible, Some(&mirror), Some(&one)),
                 Some(RemoteDrift::Incompatible {
                     mirror: "static (2 keys)".into(),
                     owner: "static (1 key)".into(),
                 })
             );
             assert_eq!(
-                between(&["eu"], "elsewhere"),
+                RemoteDrift::new(PartitionDrift::OwnerNodeMissing, Some(&mirror), None),
                 Some(RemoteDrift::OwnerNodeMissing)
             );
-            let (owner, definitions) = owner(&["eu"]);
             assert_eq!(
-                RemoteDrift::between(&owner, &definitions, "raw_orders", None),
+                RemoteDrift::new(PartitionDrift::Incompatible, None, Some(&one)),
                 Some(RemoteDrift::Incompatible {
                     mirror: "unpartitioned".into(),
                     owner: "static (1 key)".into(),

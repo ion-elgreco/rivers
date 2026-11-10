@@ -79,6 +79,8 @@ pub struct AssetConditionCache {
     last_run_entry_ts: HashMap<(String, Option<PartitionKey>), i64>,
     /// Upstream assets owned by other code locations.
     remote: remote::RemoteScopes,
+    /// Answers of static key comparisons for remote deps.
+    key_comparisons: crate::assets::partitions_fingerprint::KeyComparisons,
     /// Test-only rendezvous between `initial_load`'s records read and its
     /// run-status reads, so a test can commit a run completion there.
     #[cfg(test)]
@@ -181,6 +183,7 @@ impl AssetConditionCache {
             applied_run_ids: HashMap::new(),
             last_run_entry_ts: HashMap::new(),
             remote: remote::RemoteScopes::default(),
+            key_comparisons: Default::default(),
             #[cfg(test)]
             initial_load_gate: None,
         }

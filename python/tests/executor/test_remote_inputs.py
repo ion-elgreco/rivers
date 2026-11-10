@@ -343,6 +343,78 @@ def test_incompatible_mirror_loads_with_a_warning(
     assert warning not in logs.get("sibling", "")
 
 
+@pytest.mark.parametrize("executor", EXECUTORS)
+@pytest.mark.parametrize(
+    ("owner_keys", "incompatible"),
+    [
+        pytest.param(["d", "c", "b", "a"], False, id="owner_added_a_key"),
+        pytest.param(["a", "b"], True, id="owner_removed_a_key"),
+        pytest.param(["a", "b", "d", "e"], True, id="owner_replaced_a_key"),
+    ],
+)
+def test_static_key_drift_of_a_mirror(
+    executor, owner_keys, incompatible, embedded_storage, tmp_path, monkeypatch
+):
+    """The owner's keys against the mirror's ``a, b, c``. With more owner
+    keys, the stored key lists of both code locations decide."""
+    handler = _pickle_handler(tmp_path / "io")
+
+    @rs.Asset(
+        io_handler=handler, partitions_def=rs.PartitionsDefinition.static_(owner_keys)
+    )
+    def raw_orders() -> list[int]:
+        return [1, 2, 3]
+
+    owner = _resolve_as([raw_orders], embedded_storage, monkeypatch, "warehouse")
+    assert owner.materialize(partition_key=rs.PartitionKey.single("a")).success
+    owner_dv = (
+        embedded_storage._scoped("warehouse")
+        .get_asset_record("raw_orders")
+        .last_data_version
+    )
+
+    keys = rs.PartitionsDefinition.static_(["a", "b", "c"])
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler, partitions_def=keys
+    )
+
+    @rs.Asset(io_handler=handler, partitions_def=keys)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    @rs.Asset(io_handler=handler, partitions_def=keys)
+    def sibling() -> int:
+        return 1
+
+    consumer = _resolve_as(
+        [orders, order_count, sibling],
+        embedded_storage,
+        monkeypatch,
+        "analytics",
+        executor,
+    )
+    result = consumer.materialize(partition_key=rs.PartitionKey.single("a"))
+
+    assert result.success
+    assert _input_versions(embedded_storage, "order_count") == [
+        ("raw_orders", owner_dv)
+    ]
+    logs = _logs(embedded_storage, result.run_id)
+    warning = (
+        "partition definition of 'raw_orders' differs from code location "
+        f"'dev/warehouse' (mirror static (3 keys), owner static ({len(owner_keys)} "
+        "keys)); loading anyway"
+    )
+    expected = [f"WARN rivers::executor: {warning}"] if incompatible else []
+    assert _warnings(logs.get("order_count", "")) == expected
+    assert _warnings(logs.get("sibling", "")) == []
+
+
+def _warnings(logs: str) -> list[str]:
+    """Each warning line of ``logs``, from the level on."""
+    return [line[line.index("WARN") :] for line in logs.splitlines() if "WARN" in line]
+
+
 def test_owner_without_the_asset_loads_with_a_warning(
     embedded_storage, tmp_path, monkeypatch
 ):

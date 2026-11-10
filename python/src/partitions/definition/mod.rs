@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::errors::PartitionDefinitionError;
-use rivers_core::assets::partitions_fingerprint::PartitionsFingerprint;
+use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
@@ -628,8 +628,24 @@ impl PartitionsDefinition {
 
     /// The definition as the topology stores it.
     pub fn fingerprint(&self) -> PartitionsFingerprint {
+        self.fingerprint_into(&mut Vec::new())
+    }
+
+    /// [`Self::fingerprint`], adding each static key list it names to
+    /// `key_lists` unless a list of that digest is there already.
+    pub fn fingerprint_into<'a>(
+        &'a self,
+        key_lists: &mut Vec<KeyList<'a>>,
+    ) -> PartitionsFingerprint {
         match self {
-            Self::Static { keys } => PartitionsFingerprint::static_keys(keys.iter().cloned()),
+            Self::Static { keys } => {
+                let list = KeyList::new(keys.iter().map(String::as_str));
+                let fingerprint = list.fingerprint();
+                if !key_lists.iter().any(|seen| seen.digest == list.digest) {
+                    key_lists.push(list);
+                }
+                fingerprint
+            }
             Self::TimeWindow {
                 cron_schedule,
                 interval_seconds,
@@ -646,7 +662,7 @@ impl PartitionsDefinition {
             Self::Multi { dimensions } => PartitionsFingerprint::multi(
                 dimensions
                     .iter()
-                    .map(|(name, def)| (name.clone(), def.fingerprint())),
+                    .map(|(name, def)| (name.clone(), def.fingerprint_into(key_lists))),
             ),
             Self::Dynamic { name } => PartitionsFingerprint::Dynamic { name: name.clone() },
         }

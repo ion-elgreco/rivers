@@ -985,7 +985,7 @@ async fn owner_failure_that_materialized_the_key_sets_no_floor() {
 
 mod drift {
     use super::*;
-    use crate::assets::partitions_fingerprint::{PartitionDefinitions, PartitionsFingerprint};
+    use crate::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
     use crate::timegrid::TimeGrid;
     use jiff::civil::date;
 
@@ -1014,23 +1014,106 @@ mod drift {
         }
     }
 
-    /// The warehouse's topology and partitions definitions: `owned`, each
-    /// with its definition.
+    /// The warehouse's topology: `owned`, each with its definition.
     async fn owner_topology(storage: &SurrealStorage, owned: &[(&str, PartitionsFingerprint)]) {
+        write_topology(storage, "wh", owned, &[]).await;
+    }
+
+    /// `nodes` as the topology of `identity`, each with its definition, and
+    /// a key row for each list of `keys`.
+    async fn write_topology(
+        storage: &SurrealStorage,
+        identity: &str,
+        nodes: &[(&str, PartitionsFingerprint)],
+        keys: &[&[&str]],
+    ) {
         let mut topology = GraphTopology::default();
-        let mut definitions = PartitionDefinitions::default();
-        for (name, fingerprint) in owned {
-            topology
-                .nodes
-                .push(TopologyNode::new(*name, NodeKind::Asset));
-            let index = definitions.intern(fingerprint.clone());
-            definitions.nodes.insert(name.to_string(), index);
+        for (name, fingerprint) in nodes {
+            let mut node = TopologyNode::new(*name, NodeKind::Asset);
+            node.partitions = Some(fingerprint.clone());
+            topology.nodes.push(node);
         }
+        let key_lists: Vec<KeyList> = keys
+            .iter()
+            .map(|keys| KeyList::new(keys.iter().copied()))
+            .collect();
         storage
-            .for_code_location(&CodeLocationContext::new("wh"))
-            .set_graph_topology(&topology, &definitions)
+            .for_code_location(&CodeLocationContext::new(identity))
+            .set_graph_topology(&topology, &key_lists)
             .await
             .unwrap();
+    }
+
+    fn statics(keys: &[&str]) -> PartitionsFingerprint {
+        PartitionsFingerprint::static_keys(keys.iter().copied())
+    }
+
+    /// The owner added `apac` to the mirror's `eu, us`: the key rows of both
+    /// code locations decide, once.
+    #[tokio::test]
+    async fn an_owner_with_more_static_keys_is_compared_by_its_key_rows_once() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(
+            &storage,
+            vec![
+                make_materialized_record("regions", 1_000),
+                make_materialized_record("sites", 2_000),
+            ],
+        )
+        .await;
+        let owned = [
+            ("regions", statics(&["apac", "eu", "us"])),
+            ("sites", statics(&["apac", "eu", "uk"])),
+        ];
+        write_topology(
+            &storage,
+            "wh",
+            &owned,
+            &[&["apac", "eu", "us"], &["apac", "eu", "uk"]],
+        )
+        .await;
+        let mirror = || statics(&["eu", "us"]);
+        write_topology(
+            &storage,
+            DEFAULT_CODE_LOCATION_ID,
+            &[("regions", mirror()), ("sites", mirror())],
+            &[&["eu", "us"]],
+        )
+        .await;
+
+        let mut cache = cache_with(vec![
+            mirrored("regions", "regions", mirror()),
+            mirrored("sites", "sites", mirror()),
+        ]);
+        cache.refresh(&storage, 0).await.unwrap();
+        assert_eq!(cache.records["regions"].last_timestamp, Some(1_000));
+        assert_eq!(
+            cache.records["sites"].last_timestamp, None,
+            "'us' is not an owner key"
+        );
+
+        write_topology(&storage, "wh", &owned, &[]).await;
+        write_topology(
+            &storage,
+            DEFAULT_CODE_LOCATION_ID,
+            &[("regions", mirror()), ("sites", mirror())],
+            &[],
+        )
+        .await;
+        cache.refresh(&storage, 30 * SEC).await.unwrap();
+        assert_eq!(
+            cache.records["regions"].last_timestamp,
+            Some(1_000),
+            "the kept answer needs no key row"
+        );
+        assert_eq!(cache.records["sites"].last_timestamp, None);
+
+        let mut fresh = cache_with(vec![mirrored("regions", "regions", mirror())]);
+        fresh.refresh(&storage, 30 * SEC).await.unwrap();
+        assert_eq!(
+            fresh.records["regions"].last_timestamp, None,
+            "a missing key row counts as incompatible"
+        );
     }
 
     #[tokio::test]

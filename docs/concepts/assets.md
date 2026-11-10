@@ -327,6 +327,8 @@ The mirrored `partitions_def` can stop matching the owner's definition, for exam
 
 With a compatible difference, a consumer partition outside the owner's range stays missing until the owner has that partition.
 
+Each code location stores a hash of each static key list in its graph, and the list itself once. rivers compares the hashes and counts first. It reads the two key lists only when the owner has more static keys than the mirror. If a code location has not stored its key list, the difference is incompatible until that code location resolves again.
+
 Select the node in the lineage view to see both definitions. To resume automation, change the mirror to match the owner's definition, or undo the owner's change. The daemon sees an undone change within 30 seconds.
 
 ## Self-dependent assets

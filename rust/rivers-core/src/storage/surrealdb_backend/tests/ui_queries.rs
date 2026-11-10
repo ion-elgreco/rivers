@@ -603,7 +603,7 @@ mod remote_staleness {
                         ("order_count".into(), "ghost".into()),
                     ],
                 },
-                &Default::default(),
+                &[],
             )
             .await
             .unwrap();

@@ -1,25 +1,29 @@
 //! A partitions definition as storage keeps it, and how a remote asset's
 //! mirror compares with the owner's definition.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hasher;
+use std::sync::{Mutex, PoisonError};
 
 use jiff::civil;
 use jiff::fmt::strtime;
 use serde::{Deserialize, Serialize};
+use siphasher::sip128::{Hasher128, SipHasher24};
 
 use super::graph::GraphTopology;
+use crate::storage::{CodeLocationContext, StorageBackend};
 use crate::timegrid::TimeGrid;
 
 /// A partitions definition in a form two code locations can compare.
-/// Static keys are stored, not hashed, so added and removed keys can be told
-/// apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PartitionsFingerprint {
-    /// Keys sorted, so the order they were declared in does not count.
+    /// The keys are stored apart, in a key row of the code location under
+    /// `digest` (see [`KeyList`]).
     Static {
-        keys: Vec<String>,
+        count: u64,
+        digest: String,
     },
     TimeWindow(TimeGrid),
     /// Dimensions sorted by name.
@@ -32,11 +36,9 @@ pub enum PartitionsFingerprint {
 }
 
 impl PartitionsFingerprint {
-    pub fn static_keys(keys: impl IntoIterator<Item = String>) -> Self {
-        let mut keys: Vec<String> = keys.into_iter().collect();
-        keys.sort_unstable();
-        keys.dedup();
-        Self::Static { keys }
+    /// `keys` in any order, with repeats.
+    pub fn static_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Self {
+        KeyList::new(keys).fingerprint()
     }
 
     pub fn multi(dimensions: impl IntoIterator<Item = (String, Self)>) -> Self {
@@ -54,14 +56,54 @@ impl PartitionsFingerprint {
     }
 }
 
+/// Static keys as a key row stores them: sorted, each once, under their
+/// digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyList<'a> {
+    pub digest: String,
+    pub keys: Vec<&'a str>,
+}
+
+impl<'a> KeyList<'a> {
+    /// `keys` in any order, with repeats.
+    pub fn new(keys: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut keys: Vec<&str> = keys.into_iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Self {
+            digest: digest(&keys),
+            keys,
+        }
+    }
+
+    pub fn fingerprint(&self) -> PartitionsFingerprint {
+        PartitionsFingerprint::Static {
+            count: self.keys.len() as u64,
+            digest: self.digest.clone(),
+        }
+    }
+}
+
+/// 128-bit SipHash-2-4 with fixed keys over the sorted keys, each after its
+/// length in bytes as a little-endian u64; lower-case hex. Code locations on
+/// other builds and platforms compare these, so the bytes are spelled out.
+fn digest(sorted: &[&str]) -> String {
+    let mut hasher = SipHasher24::new_with_keys(0, 0);
+    for key in sorted {
+        hasher.write(&(key.len() as u64).to_le_bytes());
+        hasher.write(key.as_bytes());
+    }
+    format!("{:032x}", hasher.finish128().as_u128())
+}
+
 /// `"daily from 2024-01-01"`: a time window names its first key, so a
 /// changed key format shows.
 impl fmt::Display for PartitionsFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Static { keys } => {
-                let noun = if keys.len() == 1 { "key" } else { "keys" };
-                write!(f, "static ({} {noun})", keys.len())
+            Self::Static { count, .. } => {
+                let noun = if *count == 1 { "key" } else { "keys" };
+                write!(f, "static ({count} {noun})")
             }
             Self::TimeWindow(grid) => {
                 match (grid.cron_schedule.as_deref(), grid.interval_seconds) {
@@ -95,34 +137,6 @@ impl fmt::Display for PartitionsFingerprint {
     }
 }
 
-/// The partitions definitions of a code location's nodes. Storage keeps them
-/// apart from the topology: static keys make them large, and only partition
-/// drift checks read them.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PartitionDefinitions {
-    /// Node name → index into [`Self::definitions`]. An unpartitioned node
-    /// has no entry.
-    pub nodes: BTreeMap<String, usize>,
-    /// Each distinct definition once.
-    pub definitions: Vec<PartitionsFingerprint>,
-}
-
-impl PartitionDefinitions {
-    /// The definition of the node `name`.
-    pub fn get(&self, name: &str) -> Option<&PartitionsFingerprint> {
-        self.definitions.get(*self.nodes.get(name)?)
-    }
-
-    /// The index of `fingerprint` in [`Self::definitions`], added if new.
-    pub fn intern(&mut self, fingerprint: PartitionsFingerprint) -> usize {
-        if let Some(index) = self.definitions.iter().position(|d| *d == fingerprint) {
-            return index;
-        }
-        self.definitions.push(fingerprint);
-        self.definitions.len() - 1
-    }
-}
-
 /// [`PartitionsFingerprint`]'s description, `"unpartitioned"` for `None`.
 pub fn describe_partitions(fingerprint: Option<&PartitionsFingerprint>) -> String {
     fingerprint.map_or_else(|| "unpartitioned".to_string(), ToString::to_string)
@@ -145,63 +159,205 @@ pub enum PartitionDrift {
     OwnerNodeMissing,
 }
 
-/// How `mirror` compares with the owner's definition of `asset_key`. `owner`
-/// is the owner's topology, `definitions` its partitions definitions.
+/// The digests of a mirror's and an owner's static keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyListPair {
+    pub mirror: String,
+    pub owner: String,
+}
+
+/// What the fingerprints alone tell about a mirror.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriftCheck {
+    Decided(PartitionDrift),
+    /// The owner has more static keys than the mirror: `Compatible` when
+    /// each mirror key of every pair is an owner key, else `Incompatible`.
+    KeysNeeded(Vec<KeyListPair>),
+}
+
+/// How `mirror` compares with the owner's definition of `asset_key`, from
+/// the owner's topology.
 pub fn partition_drift(
     owner: &GraphTopology,
-    definitions: &PartitionDefinitions,
     asset_key: &str,
     mirror: Option<&PartitionsFingerprint>,
-) -> PartitionDrift {
-    if owner.owned_node(asset_key).is_none() {
-        return PartitionDrift::OwnerNodeMissing;
-    }
-    match (mirror, definitions.get(asset_key)) {
-        (None, None) => PartitionDrift::Same,
+) -> DriftCheck {
+    let Some(node) = owner.owned_node(asset_key) else {
+        return DriftCheck::Decided(PartitionDrift::OwnerNodeMissing);
+    };
+    match (mirror, node.partitions.as_ref()) {
+        (None, None) => DriftCheck::Decided(PartitionDrift::Same),
         (Some(mirror), Some(owner)) => compare(mirror, owner),
-        _ => PartitionDrift::Incompatible,
+        _ => DriftCheck::Decided(PartitionDrift::Incompatible),
     }
 }
 
-fn compare(mirror: &PartitionsFingerprint, owner: &PartitionsFingerprint) -> PartitionDrift {
+fn compare(mirror: &PartitionsFingerprint, owner: &PartitionsFingerprint) -> DriftCheck {
     use PartitionsFingerprint::*;
 
+    let decided = |compatible: bool| {
+        DriftCheck::Decided(if compatible {
+            PartitionDrift::Compatible
+        } else {
+            PartitionDrift::Incompatible
+        })
+    };
+
     if mirror.has_dynamic() || owner.has_dynamic() {
-        return PartitionDrift::Incompatible;
+        return decided(false);
     }
     if mirror == owner {
-        return PartitionDrift::Same;
+        return DriftCheck::Decided(PartitionDrift::Same);
     }
-    let compatible = match (mirror, owner) {
-        (Static { keys: mirror }, Static { keys: owner }) => {
-            let mut owner = owner.iter();
-            mirror.iter().all(|key| owner.any(|k| k == key))
+    match (mirror, owner) {
+        (
+            Static {
+                count: mirror_count,
+                digest: mirror,
+            },
+            Static {
+                count: owner_count,
+                digest: owner,
+            },
+        ) => {
+            if owner_count <= mirror_count {
+                return decided(false);
+            }
+            DriftCheck::KeysNeeded(vec![KeyListPair {
+                mirror: mirror.clone(),
+                owner: owner.clone(),
+            }])
         }
-        (TimeWindow(mirror), TimeWindow(owner)) => mirror.aligns_with(owner),
+        (TimeWindow(mirror), TimeWindow(owner)) => decided(mirror.aligns_with(owner)),
         (Multi { dimensions: mirror }, Multi { dimensions: owner }) => {
-            mirror.len() == owner.len()
-                && mirror.iter().zip(owner).all(|((m_name, m), (o_name, o))| {
-                    m_name == o_name && compare(m, o) != PartitionDrift::Incompatible
-                })
+            if mirror.len() != owner.len() {
+                return decided(false);
+            }
+            let mut pairs = Vec::new();
+            for ((m_name, m), (o_name, o)) in mirror.iter().zip(owner) {
+                if m_name != o_name {
+                    return decided(false);
+                }
+                match compare(m, o) {
+                    DriftCheck::Decided(PartitionDrift::Incompatible) => return decided(false),
+                    DriftCheck::Decided(_) => {}
+                    DriftCheck::KeysNeeded(more) => pairs.extend(more),
+                }
+            }
+            if pairs.is_empty() {
+                decided(true)
+            } else {
+                DriftCheck::KeysNeeded(pairs)
+            }
         }
-        _ => false,
-    };
-    if compatible {
-        PartitionDrift::Compatible
-    } else {
-        PartitionDrift::Incompatible
+        _ => decided(false),
+    }
+}
+
+/// Answers kept before they are all dropped.
+const MAX_KEY_ANSWERS: usize = 1_024;
+
+/// Settles [`DriftCheck::KeysNeeded`] from the key rows, and keeps the
+/// answer of each pair of digests: the keys under a digest never change.
+#[derive(Debug, Default)]
+pub struct KeyComparisons {
+    answers: Mutex<HashMap<KeyListPair, bool>>,
+}
+
+impl KeyComparisons {
+    /// The drift `check` leads to. A pair not answered before reads the
+    /// mirror's keys from the key rows of `consumer` and the owner's from
+    /// those of `owner`. A missing key row gives `Incompatible`.
+    pub async fn settle<S: StorageBackend>(
+        &self,
+        storage: &S,
+        consumer: &CodeLocationContext,
+        owner: &CodeLocationContext,
+        check: DriftCheck,
+    ) -> anyhow::Result<PartitionDrift> {
+        let pairs = match check {
+            DriftCheck::Decided(drift) => return Ok(drift),
+            DriftCheck::KeysNeeded(pairs) => pairs,
+        };
+        for pair in pairs {
+            if !self.contains(storage, consumer, owner, pair).await? {
+                return Ok(PartitionDrift::Incompatible);
+            }
+        }
+        Ok(PartitionDrift::Compatible)
+    }
+
+    /// Whether each key of the mirror's list is in the owner's.
+    async fn contains<S: StorageBackend>(
+        &self,
+        storage: &S,
+        consumer: &CodeLocationContext,
+        owner: &CodeLocationContext,
+        pair: KeyListPair,
+    ) -> anyhow::Result<bool> {
+        if let Some(&answer) = self.lock().get(&pair) {
+            return Ok(answer);
+        }
+
+        let mirror_keys = storage
+            .for_code_location(consumer)
+            .get_partition_keys(&pair.mirror)
+            .await?;
+        let owner_keys = storage
+            .for_code_location(owner)
+            .get_partition_keys(&pair.owner)
+            .await?;
+        let (Some(mirror_keys), Some(owner_keys)) = (mirror_keys, owner_keys) else {
+            tracing::warn!(
+                target: "rivers::partitions",
+                consumer = consumer.id(),
+                mirror = %pair.mirror,
+                owner_location = owner.id(),
+                owner = %pair.owner,
+                "a static key list is not stored; the mirror counts as incompatible"
+            );
+            return Ok(false);
+        };
+
+        let mut owned = owner_keys.iter();
+        let answer = mirror_keys.iter().all(|key| owned.any(|k| k == key));
+        self.remember(pair, answer);
+        Ok(answer)
+    }
+
+    fn remember(&self, pair: KeyListPair, answer: bool) {
+        let mut answers = self.lock();
+        if answers.len() >= MAX_KEY_ANSWERS {
+            answers.clear();
+        }
+        answers.insert(pair, answer);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<KeyListPair, bool>> {
+        self.answers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::assets::remote::{LocationRef, RemoteRef};
+    use crate::storage::surrealdb_backend::SurrealStorage;
     use jiff::civil::date;
 
+    thread_local! {
+        /// The keys of each digest [`statics`] made, for [`drift`].
+        static KEYS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    }
+
     fn statics(keys: &[&str]) -> PartitionsFingerprint {
-        PartitionsFingerprint::static_keys(keys.iter().map(|k| k.to_string()))
+        let list = KeyList::new(keys.iter().copied());
+        let owned = list.keys.iter().map(|k| k.to_string()).collect();
+        KEYS.with(|known| known.borrow_mut().insert(list.digest.clone(), owned));
+        list.fingerprint()
     }
 
     fn daily() -> TimeGrid {
@@ -218,27 +374,81 @@ mod tests {
         PartitionsFingerprint::TimeWindow(grid)
     }
 
-    fn owner_with(
-        fingerprint: Option<PartitionsFingerprint>,
-    ) -> (GraphTopology, PartitionDefinitions) {
-        let mut owner = GraphTopology::default();
-        owner
-            .nodes
-            .push(TopologyNode::new("raw_orders", NodeKind::Asset));
-        let mut definitions = PartitionDefinitions::default();
-        if let Some(fingerprint) = fingerprint {
-            let index = definitions.intern(fingerprint);
-            definitions.nodes.insert("raw_orders".into(), index);
+    fn owner_with(fingerprint: Option<PartitionsFingerprint>) -> GraphTopology {
+        let mut node = TopologyNode::new("raw_orders", NodeKind::Asset);
+        node.partitions = fingerprint;
+        GraphTopology {
+            nodes: vec![node],
+            edges: vec![],
         }
-        (owner, definitions)
     }
 
+    /// The drift, with the keys of [`statics`] where the check needs them.
     fn drift(
         mirror: Option<PartitionsFingerprint>,
         owner: Option<PartitionsFingerprint>,
     ) -> PartitionDrift {
-        let (owner, definitions) = owner_with(owner);
-        partition_drift(&owner, &definitions, "raw_orders", mirror.as_ref())
+        let pairs = match partition_drift(&owner_with(owner), "raw_orders", mirror.as_ref()) {
+            DriftCheck::Decided(drift) => return drift,
+            DriftCheck::KeysNeeded(pairs) => pairs,
+        };
+        let contained = KEYS.with(|known| {
+            let known = known.borrow();
+            pairs.iter().all(|pair| {
+                let owner = &known[&pair.owner];
+                known[&pair.mirror].iter().all(|key| owner.contains(key))
+            })
+        });
+        if contained {
+            PartitionDrift::Compatible
+        } else {
+            PartitionDrift::Incompatible
+        }
+    }
+
+    /// The check alone, without keys.
+    fn check_of(
+        mirror: Option<PartitionsFingerprint>,
+        owner: Option<PartitionsFingerprint>,
+    ) -> DriftCheck {
+        partition_drift(&owner_with(owner), "raw_orders", mirror.as_ref())
+    }
+
+    fn pair(mirror: &PartitionsFingerprint, owner: &PartitionsFingerprint) -> KeyListPair {
+        let digest = |fingerprint: &PartitionsFingerprint| match fingerprint {
+            PartitionsFingerprint::Static { digest, .. } => digest.clone(),
+            other => panic!("not static: {other:?}"),
+        };
+        KeyListPair {
+            mirror: digest(mirror),
+            owner: digest(owner),
+        }
+    }
+
+    /// One key row of `identity` per list of `keys`, and no other.
+    async fn key_rows(storage: &SurrealStorage, identity: &str, keys: &[&[&str]]) {
+        let key_lists: Vec<KeyList> = keys
+            .iter()
+            .map(|keys| KeyList::new(keys.iter().copied()))
+            .collect();
+        storage
+            .for_code_location(&CodeLocationContext::new(identity))
+            .set_graph_topology(&GraphTopology::default(), &key_lists)
+            .await
+            .unwrap();
+    }
+
+    async fn settle(
+        comparisons: &KeyComparisons,
+        storage: &SurrealStorage,
+        check: DriftCheck,
+    ) -> PartitionDrift {
+        let consumer = CodeLocationContext::new("analytics");
+        let owner = CodeLocationContext::new("warehouse");
+        comparisons
+            .settle(storage, &consumer, &owner, check)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -462,10 +672,10 @@ mod tests {
 
     #[test]
     fn the_owner_node_must_be_an_asset_it_owns() {
-        let (mut owner, definitions) = owner_with(None);
+        let mut owner = owner_with(None);
         assert_eq!(
-            partition_drift(&owner, &definitions, "elsewhere", None),
-            PartitionDrift::OwnerNodeMissing
+            partition_drift(&owner, "elsewhere", None),
+            DriftCheck::Decided(PartitionDrift::OwnerNodeMissing)
         );
 
         owner.nodes[0].remote = Some(RemoteRef {
@@ -473,8 +683,8 @@ mod tests {
             asset_key: "raw_orders".into(),
         });
         assert_eq!(
-            partition_drift(&owner, &definitions, "raw_orders", None),
-            PartitionDrift::OwnerNodeMissing
+            partition_drift(&owner, "raw_orders", None),
+            DriftCheck::Decided(PartitionDrift::OwnerNodeMissing)
         );
     }
 
@@ -530,30 +740,193 @@ mod tests {
     }
 
     #[test]
-    fn nodes_share_one_entry_per_definition() {
-        let mut definitions = PartitionDefinitions::default();
-        let a = definitions.intern(statics(&["x", "y"]));
-        let b = definitions.intern(window(daily()));
-        let c = definitions.intern(statics(&["y", "x"]));
+    fn the_digest_ignores_order_and_repeats() {
+        let digest = |keys: &[&str]| KeyList::new(keys.iter().copied()).digest;
 
-        assert_eq!((a, b, c), (0, 1, 0));
-        assert_eq!(definitions.definitions.len(), 2);
+        assert_eq!(digest(&["us", "eu", "us"]), digest(&["eu", "us"]));
+        assert_eq!(KeyList::new(["us", "eu", "us"]).keys, ["eu", "us"]);
+        assert_eq!(
+            digest(&["eu", "us"]),
+            "7466a968ad7667ffa346774108fbcf30",
+            "a changed digest makes every stored key row unreachable"
+        );
+        assert_eq!(digest(&[]), "f4f2ced447ab02427de0a38047d74950");
+        assert_ne!(
+            digest(&["ab", "c"]),
+            digest(&["a", "bc"]),
+            "lengths separate keys"
+        );
+        assert_ne!(digest(&["eu"]), digest(&["eu", "us"]));
     }
 
     #[test]
-    fn the_definitions_round_trip() {
-        let mut definitions = PartitionDefinitions::default();
-        let multi = PartitionsFingerprint::multi([
-            ("region".to_string(), statics(&["eu"])),
-            ("date".to_string(), window(daily())),
-        ]);
-        let index = definitions.intern(multi.clone());
-        definitions.nodes.insert("store_days".into(), index);
+    fn a_static_fingerprint_holds_the_count_and_digest() {
+        let fingerprint = statics(&["us", "eu"]);
+        assert_eq!(
+            serde_json::to_value(&fingerprint).unwrap(),
+            serde_json::json!({
+                "kind": "static",
+                "count": 2,
+                "digest": KeyList::new(["eu", "us"]).digest,
+            })
+        );
+        let back: PartitionsFingerprint =
+            serde_json::from_value(serde_json::to_value(&fingerprint).unwrap()).unwrap();
+        assert_eq!(back, fingerprint);
+    }
 
-        let json = serde_json::to_string(&definitions).unwrap();
-        let back: PartitionDefinitions = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, definitions);
-        assert_eq!(back.get("store_days"), Some(&multi));
-        assert_eq!(back.get("summary"), None);
+    /// Equal definitions need no key row: none exists here.
+    #[tokio::test]
+    async fn equal_definitions_are_the_same_without_key_rows() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let comparisons = KeyComparisons::default();
+        let multi = || {
+            PartitionsFingerprint::multi([
+                ("region".to_string(), statics(&["eu", "us"])),
+                ("date".to_string(), window(daily())),
+            ])
+        };
+
+        for (mirror, owner) in [
+            (statics(&["eu", "us"]), statics(&["us", "eu"])),
+            (window(daily()), window(daily())),
+            (multi(), multi()),
+        ] {
+            let check = check_of(Some(mirror), Some(owner));
+            assert_eq!(check, DriftCheck::Decided(PartitionDrift::Same));
+            assert_eq!(
+                settle(&comparisons, &storage, check).await,
+                PartitionDrift::Same
+            );
+        }
+    }
+
+    /// A different set of the same or a smaller size cannot hold the mirror:
+    /// the counts decide, with no key row stored.
+    #[tokio::test]
+    async fn a_different_set_of_no_more_keys_is_incompatible_without_key_rows() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let comparisons = KeyComparisons::default();
+        let multi = |regions: &[&str]| {
+            PartitionsFingerprint::multi([
+                ("region".to_string(), statics(regions)),
+                ("date".to_string(), window(daily())),
+            ])
+        };
+
+        for (mirror, owner) in [
+            (statics(&["eu", "us"]), statics(&["eu", "uk"])),
+            (statics(&["eu", "us"]), statics(&["eu"])),
+            (multi(&["eu", "us"]), multi(&["us"])),
+        ] {
+            let check = check_of(Some(mirror), Some(owner));
+            assert_eq!(check, DriftCheck::Decided(PartitionDrift::Incompatible));
+            assert_eq!(
+                settle(&comparisons, &storage, check).await,
+                PartitionDrift::Incompatible
+            );
+        }
+    }
+
+    /// With more owner keys, the key rows of both code locations decide.
+    #[tokio::test]
+    async fn an_owner_with_more_keys_is_decided_by_the_key_rows() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let mirror = statics(&["eu", "us"]);
+        let added = statics(&["apac", "eu", "us"]);
+        let replaced = statics(&["apac", "eu", "uk"]);
+        let unstored = statics(&["eu", "uk", "us"]);
+        key_rows(&storage, "analytics", &[&["eu", "us"]]).await;
+        key_rows(
+            &storage,
+            "warehouse",
+            &[&["apac", "eu", "us"], &["apac", "eu", "uk"]],
+        )
+        .await;
+
+        let cases = [
+            (&mirror, &added, PartitionDrift::Compatible),
+            (&mirror, &replaced, PartitionDrift::Incompatible),
+            (&mirror, &unstored, PartitionDrift::Incompatible),
+        ];
+        for (mirror, owner, expected) in cases {
+            let check = check_of(Some(mirror.clone()), Some(owner.clone()));
+            assert_eq!(check, DriftCheck::KeysNeeded(vec![pair(mirror, owner)]));
+            let comparisons = KeyComparisons::default();
+            assert_eq!(
+                settle(&comparisons, &storage, check).await,
+                expected,
+                "{owner}"
+            );
+        }
+
+        let missing_mirror = statics(&["eu"]);
+        let check = check_of(Some(missing_mirror), Some(added.clone()));
+        assert_eq!(
+            settle(&KeyComparisons::default(), &storage, check).await,
+            PartitionDrift::Incompatible,
+            "the mirror's key row is missing"
+        );
+
+        let multi = |regions: &PartitionsFingerprint| {
+            PartitionsFingerprint::multi([
+                ("region".to_string(), regions.clone()),
+                ("date".to_string(), window(daily())),
+            ])
+        };
+        let check = check_of(Some(multi(&mirror)), Some(multi(&added)));
+        assert_eq!(check, DriftCheck::KeysNeeded(vec![pair(&mirror, &added)]));
+        assert_eq!(
+            settle(&KeyComparisons::default(), &storage, check).await,
+            PartitionDrift::Compatible
+        );
+    }
+
+    /// The answer for a pair of digests is kept: the second check reads no
+    /// key row, here because none is left.
+    #[tokio::test]
+    async fn a_compared_pair_is_not_read_again() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let mirror = statics(&["eu", "us"]);
+        let owner = statics(&["apac", "eu", "us"]);
+        key_rows(&storage, "analytics", &[&["eu", "us"]]).await;
+        key_rows(&storage, "warehouse", &[&["apac", "eu", "us"]]).await;
+        let comparisons = KeyComparisons::default();
+        let check = || check_of(Some(mirror.clone()), Some(owner.clone()));
+        assert_eq!(
+            settle(&comparisons, &storage, check()).await,
+            PartitionDrift::Compatible
+        );
+
+        key_rows(&storage, "analytics", &[]).await;
+        key_rows(&storage, "warehouse", &[]).await;
+        assert_eq!(
+            settle(&comparisons, &storage, check()).await,
+            PartitionDrift::Compatible
+        );
+        assert_eq!(
+            settle(&KeyComparisons::default(), &storage, check()).await,
+            PartitionDrift::Incompatible,
+            "the key rows are gone"
+        );
+    }
+
+    #[test]
+    fn the_answers_are_dropped_at_the_bound() {
+        let comparisons = KeyComparisons::default();
+        let pair = |i: usize| KeyListPair {
+            mirror: format!("m{i}"),
+            owner: format!("o{i}"),
+        };
+        for i in 0..MAX_KEY_ANSWERS {
+            comparisons.remember(pair(i), i % 2 == 0);
+        }
+        assert_eq!(comparisons.lock().len(), MAX_KEY_ANSWERS);
+        assert_eq!(comparisons.lock().get(&pair(2)), Some(&true));
+
+        comparisons.remember(pair(MAX_KEY_ANSWERS), false);
+        let answers = comparisons.lock();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers.get(&pair(MAX_KEY_ANSWERS)), Some(&false));
     }
 }
