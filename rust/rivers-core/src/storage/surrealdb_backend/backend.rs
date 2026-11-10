@@ -743,6 +743,7 @@ impl StorageBackend for SurrealStorage {
             let mut next = entry.clone();
             if let Some(current) = current.filter(|c| c.identity == entry.identity) {
                 next.grpc_endpoint = next.grpc_endpoint.or(current.grpc_endpoint);
+                next.module = next.module.or(current.module);
                 next.last_seen = next.last_seen.or(current.last_seen);
             }
             Some(next)

@@ -533,8 +533,8 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<Option<CodeLocationDirectoryEntry>>> + Send;
 
     /// Record `entry` when `location` registers. If the entry already names
-    /// the same identity, its endpoint and `last_seen` stay unless `entry`
-    /// sets them.
+    /// the same identity, its endpoint, `module`, and `last_seen` stay unless
+    /// `entry` sets them.
     fn upsert_code_location_registration(
         &self,
         location: &LocationRef,

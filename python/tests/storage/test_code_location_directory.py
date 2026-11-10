@@ -64,6 +64,19 @@ def test_entry_names_the_module(storage, monkeypatch):
     }
 
 
+def test_resolving_without_a_module_keeps_the_module(storage, monkeypatch):
+    monkeypatch.setenv("RIVERS_MODULE", "pipelines.warehouse")
+    _consumer(with_remote=True).resolve(storage=storage)
+
+    monkeypatch.delenv("RIVERS_MODULE")
+    _consumer(with_remote=False).resolve(storage=storage)
+
+    assert _entry(storage, "code_location:dev/default") == {
+        "identity": "default",
+        "module": "pipelines.warehouse",
+    }
+
+
 def test_run_pods_do_not_list_the_code_location(storage, monkeypatch):
     monkeypatch.setenv("RIVERS_RUN_ID", "run-1")
 

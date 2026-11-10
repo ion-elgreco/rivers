@@ -227,6 +227,53 @@ async fn registration_keeps_the_endpoint_of_the_same_identity() {
     );
 }
 
+/// A process without `RIVERS_MODULE` (a one-off `rivers materialize`)
+/// registers without a module; the serving location's module stays. Its
+/// remotes follow the registering process.
+#[tokio::test]
+async fn registration_without_a_module_keeps_the_module_of_the_same_identity() {
+    let storage = make_storage().await;
+    let wh = loc("team", "wh");
+    storage
+        .upsert_code_location_registration(&wh, entry("uuid-1"))
+        .await
+        .unwrap();
+
+    storage
+        .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_code_location_entry(&wh).await.unwrap(),
+        Some(CodeLocationDirectoryEntry {
+            module: Some("pipelines".to_string()),
+            ..CodeLocationDirectoryEntry::new("uuid-1")
+        })
+    );
+
+    let renamed = CodeLocationDirectoryEntry {
+        module: Some("warehouse.defs".to_string()),
+        ..entry("uuid-1")
+    };
+    storage
+        .upsert_code_location_registration(&wh, renamed.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_code_location_entry(&wh).await.unwrap(),
+        Some(renamed)
+    );
+
+    storage
+        .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_code_location_entry(&wh).await.unwrap(),
+        Some(CodeLocationDirectoryEntry::new("uuid-2"))
+    );
+}
+
 #[tokio::test]
 async fn touch_needs_an_entry_of_the_same_identity() {
     let storage = make_storage().await;
