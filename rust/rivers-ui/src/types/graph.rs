@@ -122,6 +122,14 @@ impl GraphTopology {
             .map(|(from, _)| from.clone())
             .collect()
     }
+
+    /// Each remote node, by its name here.
+    pub fn remote_nodes(&self) -> std::collections::HashMap<String, RemoteNode> {
+        self.nodes
+            .iter()
+            .filter_map(|n| Some((n.name.clone(), n.remote.clone()?)))
+            .collect()
+    }
 }
 
 /// One node in [`GraphTopology`]. `kind` is one of `"asset"`, `"task"`,

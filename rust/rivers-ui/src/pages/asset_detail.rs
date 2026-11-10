@@ -822,15 +822,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let topo = graph.get().and_then(|r| r.ok());
                     let records_by_key = records_by_key.get();
                     let owner_statuses = remote_statuses.get().and_then(|r| r.ok()).unwrap_or_default();
-                    let remotes: std::collections::HashMap<String, crate::types::RemoteNode> = topo
-                        .as_ref()
-                        .map(|t| {
-                            t.nodes
-                                .iter()
-                                .filter_map(|n| n.remote.clone().map(|r| (n.name.clone(), r)))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let remotes = topo.as_ref().map(|t| t.remote_nodes()).unwrap_or_default();
 
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&current_key), t.direct_downstream(&current_key)))

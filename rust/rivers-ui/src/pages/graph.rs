@@ -229,12 +229,7 @@ pub fn GraphPage() -> impl IntoView {
         topology_value
             .get()
             .and_then(|r| r.ok())
-            .map(|t| {
-                t.nodes
-                    .iter()
-                    .filter_map(|n| n.remote.clone().map(|r| (n.name.clone(), r)))
-                    .collect::<std::collections::HashMap<String, crate::types::RemoteNode>>()
-            })
+            .map(|t| t.remote_nodes())
             .unwrap_or_default()
     });
 
