@@ -85,12 +85,12 @@ impl RemoteSlot {
     /// Whether automation pauses for `local`: its mirror no longer matches
     /// the owner's definition.
     fn paused(&self, local: &str) -> bool {
-        matches!(&self.state, SlotState::Resolved { scope, .. } if scope.paused(local))
+        self.state.scope().is_some_and(|scope| scope.paused(local))
     }
 
     /// Partitions of `key` that a live run in the owner is materializing.
     fn live_partitions(&self, key: &str) -> HashSet<PartitionKey> {
-        let SlotState::Resolved { scope, .. } = &self.state else {
+        let Some(scope) = self.state.scope() else {
             return HashSet::new();
         };
         scope
@@ -125,11 +125,16 @@ impl SlotState {
         }
     }
 
-    fn identity(&self) -> Option<&str> {
+    /// The owner's scope, once the directory entry is resolved.
+    pub(super) fn scope(&self) -> Option<&RemoteScope> {
         match self {
-            Self::Resolved { scope, .. } => Some(scope.ctx.id()),
+            Self::Resolved { scope, .. } => Some(scope),
             Self::Pending | Self::Unresolved { .. } => None,
         }
+    }
+
+    fn identity(&self) -> Option<&str> {
+        self.scope().map(|scope| scope.ctx.id())
     }
 
     fn retry_at(&mut self, at: i64) {
@@ -280,13 +285,10 @@ impl AssetConditionCache {
     /// Local names of remote deps with a live run in their owner.
     pub fn remote_in_progress_keys(&self) -> impl Iterator<Item = &String> {
         self.remote.slots.values().flat_map(|slot| {
-            let live_runs = match &slot.state {
-                SlotState::Resolved { scope, .. } => Some(scope.live_runs.values()),
-                SlotState::Pending | SlotState::Unresolved { .. } => None,
-            };
-            live_runs
+            slot.state
+                .scope()
                 .into_iter()
-                .flatten()
+                .flat_map(|scope| scope.live_runs.values())
                 .filter(|run| !run.action)
                 .flat_map(|run| &run.asset_keys)
                 .flat_map(|key| &slot.bindings[key])
@@ -297,13 +299,10 @@ impl AssetConditionCache {
     /// Local names of remote deps whose owner's latest run failed.
     pub fn remote_failed_keys(&self) -> impl Iterator<Item = &String> {
         self.remote.slots.values().flat_map(|slot| {
-            let failed = match &slot.state {
-                SlotState::Resolved { scope, .. } => Some(scope.failed.keys()),
-                SlotState::Pending | SlotState::Unresolved { .. } => None,
-            };
-            failed
+            slot.state
+                .scope()
                 .into_iter()
-                .flatten()
+                .flat_map(|scope| scope.failed.keys())
                 .flat_map(|key| &slot.bindings[key])
                 .filter(|local| !slot.paused(local))
         })
@@ -365,7 +364,7 @@ impl AssetConditionCache {
             .remote
             .slots
             .iter()
-            .filter(|(_, slot)| matches!(slot.state, SlotState::Resolved { .. }))
+            .filter(|(_, slot)| slot.state.scope().is_some())
             .map(|(location, _)| location.clone())
             .collect();
         for location in resolved {

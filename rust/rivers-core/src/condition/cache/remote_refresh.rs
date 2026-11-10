@@ -198,7 +198,7 @@ impl AssetConditionCache {
         location: &LocationRef,
     ) -> bool {
         let slot = &self.remote.slots[location];
-        let SlotState::Resolved { scope, .. } = &slot.state else {
+        let Some(scope) = slot.state.scope() else {
             return false;
         };
         let partitioned = self.partitioned_remote_keys(slot);
