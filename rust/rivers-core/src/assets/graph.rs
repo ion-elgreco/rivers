@@ -312,20 +312,40 @@ impl GraphTopology {
         }
 
         let walk = |adj: &HashMap<&str, Vec<&str>>| -> HashSet<String> {
-            let mut result = HashSet::new();
-            let mut stack: Vec<&str> = adj.get(node_name).cloned().unwrap_or_default();
-            while let Some(n) = stack.pop() {
-                if result.insert(n.to_string())
-                    && let Some(next) = adj.get(n)
-                {
-                    stack.extend(next.iter());
-                }
-            }
-            result
+            reach(adj, adj.get(node_name).cloned().unwrap_or_default())
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         };
 
         (walk(&deps_of), walk(&dependents_of))
     }
+
+    /// `roots` and every node upstream of them.
+    pub fn with_upstream<'a>(
+        &'a self,
+        roots: impl IntoIterator<Item = &'a str>,
+    ) -> HashSet<&'a str> {
+        let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (from, to) in &self.edges {
+            deps_of.entry(from.as_str()).or_default().push(to.as_str());
+        }
+        reach(&deps_of, roots.into_iter().collect())
+    }
+}
+
+/// `start` and every node that `adj` leads to from it.
+fn reach<'a>(adj: &HashMap<&'a str, Vec<&'a str>>, start: Vec<&'a str>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut stack = start;
+    while let Some(name) = stack.pop() {
+        if seen.insert(name)
+            && let Some(next) = adj.get(name)
+        {
+            stack.extend(next);
+        }
+    }
+    seen
 }
 
 impl CodeRepository {

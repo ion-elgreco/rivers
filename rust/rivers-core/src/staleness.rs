@@ -9,19 +9,7 @@ use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
 /// and the keys in it of the assets that this code location owns (`keys`
 /// included). The owners of its remote nodes hold their records.
 pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, GraphTopology) {
-    let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (from, to) in &topology.edges {
-        deps_of.entry(from.as_str()).or_default().push(to.as_str());
-    }
-    let mut part: HashSet<&str> = HashSet::new();
-    let mut stack: Vec<&str> = keys.iter().map(String::as_str).collect();
-    while let Some(name) = stack.pop() {
-        if part.insert(name)
-            && let Some(deps) = deps_of.get(name)
-        {
-            stack.extend(deps);
-        }
-    }
+    let part = topology.with_upstream(keys.iter().map(String::as_str));
 
     let upstream = GraphTopology {
         nodes: topology
