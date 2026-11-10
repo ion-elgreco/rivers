@@ -43,7 +43,8 @@ impl LocationRef {
     }
 }
 
-fn validate_segment(what: &str, value: &str) -> anyhow::Result<()> {
+/// Check one part (`what`: namespace or name) of a `namespace/name`.
+pub fn validate_segment(what: &str, value: &str) -> anyhow::Result<()> {
     ensure!(!value.is_empty(), "{what} is empty");
     if let Some(c) = value
         .chars()

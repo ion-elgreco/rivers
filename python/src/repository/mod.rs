@@ -930,6 +930,14 @@ impl PyCodeRepository {
     }
 }
 
+/// This code location's `namespace/name` in the code location directory.
+#[pyfunction]
+pub fn code_location_ref() -> PyResult<String> {
+    rivers_k8s::env::current_code_location_ref()
+        .map(|location| location.to_string())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:#}")))
+}
+
 pub fn register_repository_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule!(parent_module, "repo", [
         PyCodeRepository as "CodeRepository",

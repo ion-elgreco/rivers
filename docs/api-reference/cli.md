@@ -94,7 +94,7 @@ To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CO
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |
 | `--config` | unset | Path to a `rivers.toml` that replaces the discovered one. Env: `RIVERS_CONFIG`. |
-| `--code-location-id` | `default` | The code location's identity in storage. Env: `RIVERS_CODE_LOCATION_ID`. |
+| `--code-location-id` | `default` | The code location's identity in storage, and its name in the code location directory. It must not contain `/`, whitespace or control characters. Env: `RIVERS_CODE_LOCATION_ID`. |
 | `--no-ui` | `False` | Run without the web UI. Reloads then need a restart. |
 
 ---
@@ -111,6 +111,8 @@ rivers serve my_pipeline \
 Connects to a remote SurrealDB instance, starts the gRPC backend, and runs the automation daemon. Designed to run inside a code-location pod.
 
 `--surreal-endpoint` may also be set via the `RIVERS_SURREAL_ENDPOINT` env var.
+
+The server stops at start when its `namespace/name` contains `/`, whitespace or a control character. See `RIVERS_CODE_LOCATION_ID` in [Environment Variables](environment-variables.md#deployment).
 
 The server writes its gRPC endpoint to the code location directory in storage when it starts, and then every 10 seconds. The endpoint is the value of `RIVERS_CODE_LOCATION_GRPC_ENDPOINT`. The operator sets it to the address of the CodeLocation's Service. Without it, the endpoint is `http://<host>:<grpc-port>`, and a wildcard `--host` (`0.0.0.0`) is written as `127.0.0.1`.
 

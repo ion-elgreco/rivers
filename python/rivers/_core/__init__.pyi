@@ -991,6 +991,20 @@ def wait_for_exit(retire: bool = False) -> None:
     """
     ...
 
+def code_location_ref() -> str:
+    """Return this code location's ``namespace/name`` in the code location directory.
+
+    The name is ``RIVERS_CODE_LOCATION_NAME``, else the code location id. The
+    namespace is ``RIVERS_CODE_LOCATION_NAMESPACE``, else the pod's namespace
+    under ``RIVERS_DEPLOYMENT=cloud``, else ``dev``.
+
+    Raises:
+        ValueError: When the namespace or the name is empty or contains
+            ``/``, whitespace or a control character. The message names the
+            setting to change.
+    """
+    ...
+
 def serve_dev_code_location() -> None:
     """Entry of the code location that ``rivers dev`` runs in a child process.
 

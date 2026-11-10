@@ -13,6 +13,7 @@ from rivers._core.storage import Storage
 from rivers.cli._app import app
 from rivers.cli._common import (
     _CODE_LOCATION_ID_OPT,
+    _check_code_location_ref,
     _cleanup_storage,
     _open_or_prompt_migrate,
 )
@@ -79,6 +80,7 @@ def dev(
         os.environ["RIVERS_MODULE"] = cfg.module.path
     if code_location_id:
         os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
+    _check_code_location_ref()
 
     if cfg.module.path is None:
         typer.echo(
@@ -170,6 +172,7 @@ def serve(
     os.environ["RIVERS_MODULE"] = module
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
     os.environ["RIVERS_SURREAL_ENDPOINT"] = surreal_endpoint
+    _check_code_location_ref()
 
     storage = Storage.connect(surreal_endpoint)
 

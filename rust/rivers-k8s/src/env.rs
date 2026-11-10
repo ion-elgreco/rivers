@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
-use rivers_core::assets::remote::LocationRef;
+use rivers_core::assets::remote::{LocationRef, validate_segment};
 use rivers_core::storage::surrealdb_backend::{
     DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
 };
@@ -143,11 +143,29 @@ pub fn current_code_location_name() -> String {
 }
 
 /// This code location's `namespace/name` in the code location directory.
+/// The error names the setting to change.
 pub fn current_code_location_ref() -> anyhow::Result<LocationRef> {
-    LocationRef::new(
-        current_code_location_namespace(),
-        current_code_location_name(),
-    )
+    let namespace = current_code_location_namespace();
+    let name = current_code_location_name();
+    let name_setting = if env_nonempty(ENV_CODE_LOCATION_NAME).is_some() {
+        ENV_CODE_LOCATION_NAME
+    } else if in_cloud_deployment() {
+        "RIVERS_CODE_LOCATION_ID"
+    } else {
+        "--code-location-id / RIVERS_CODE_LOCATION_ID"
+    };
+
+    for (part, value, setting) in [
+        ("namespace", &namespace, ENV_CODE_LOCATION_NAMESPACE),
+        ("name", &name, name_setting),
+    ] {
+        validate_segment(part, value).map_err(|e| {
+            anyhow::anyhow!(
+                "code location {e}. Set {setting} to a value without '/', whitespace or control characters."
+            )
+        })?;
+    }
+    LocationRef::new(namespace, name)
 }
 
 /// The gRPC endpoint this code location writes to the code location
@@ -631,16 +649,76 @@ mod tests {
     }
 
     #[test]
-    fn current_code_location_ref_rejects_a_name_with_a_slash() {
-        let got = with_vars(
-            &[
-                (ENV_CODE_LOCATION_NAMESPACE, Some("team-data")),
-                ("RIVERS_CODE_LOCATION_NAME", Some("a/b")),
-                ("RIVERS_DEPLOYMENT", None),
-            ],
-            current_code_location_ref,
-        );
-        assert!(got.is_err());
+    fn current_code_location_ref_error_names_the_setting_to_change() {
+        let rule = "to a value without '/', whitespace or control characters.";
+        let id_setting = "--code-location-id / RIVERS_CODE_LOCATION_ID";
+        // (namespace, pod namespace, name, id, deployment, message)
+        let cases = [
+            (
+                None,
+                None,
+                None,
+                Some("team/analytics"),
+                None,
+                format!(
+                    "code location name 'team/analytics' contains '/'. Set {id_setting} {rule}"
+                ),
+            ),
+            (
+                None,
+                None,
+                None,
+                Some("team analytics"),
+                Some(DEPLOYMENT_CLOUD),
+                format!(
+                    "code location name 'team analytics' contains ' '. Set RIVERS_CODE_LOCATION_ID {rule}"
+                ),
+            ),
+            (
+                Some("team-data"),
+                None,
+                Some("a/b"),
+                Some("uuid-1"),
+                None,
+                format!(
+                    "code location name 'a/b' contains '/'. Set {ENV_CODE_LOCATION_NAME} {rule}"
+                ),
+            ),
+            (
+                Some("team data"),
+                None,
+                Some("wh"),
+                Some("uuid-1"),
+                None,
+                format!(
+                    "code location namespace 'team data' contains ' '. Set {ENV_CODE_LOCATION_NAMESPACE} {rule}"
+                ),
+            ),
+            (
+                None,
+                Some("team\tdata"),
+                Some("wh"),
+                Some("uuid-1"),
+                Some(DEPLOYMENT_CLOUD),
+                format!(
+                    "code location namespace 'team\tdata' contains '\\t'. Set {ENV_CODE_LOCATION_NAMESPACE} {rule}"
+                ),
+            ),
+        ];
+
+        for (namespace, pod_namespace, name, id, deployment, message) in cases {
+            let got = with_vars(
+                &[
+                    (ENV_CODE_LOCATION_NAMESPACE, namespace),
+                    ("RIVERS_NAMESPACE", pod_namespace),
+                    (ENV_CODE_LOCATION_NAME, name),
+                    ("RIVERS_CODE_LOCATION_ID", id),
+                    ("RIVERS_DEPLOYMENT", deployment),
+                ],
+                current_code_location_ref,
+            );
+            assert_eq!(format!("{:#}", got.unwrap_err()), message);
+        }
     }
 
     #[test]
