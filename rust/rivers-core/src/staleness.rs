@@ -37,12 +37,7 @@ pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, G
             .cloned()
             .collect(),
     };
-    let remote: HashSet<&str> = upstream
-        .nodes
-        .iter()
-        .filter(|node| node.remote.is_some())
-        .map(|node| node.name.as_str())
-        .collect();
+    let remote: HashSet<&str> = upstream.remotes().map(|(name, _)| name).collect();
     let mut owned: Vec<String> = part
         .into_iter()
         .filter(|name| !remote.contains(name))

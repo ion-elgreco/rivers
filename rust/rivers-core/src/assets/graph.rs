@@ -287,6 +287,13 @@ impl GraphTopology {
             .find(|n| n.name == name && n.remote.is_none())
     }
 
+    /// Each remote node: its name here, and the asset it mirrors.
+    pub fn remotes(&self) -> impl Iterator<Item = (&str, &RemoteRef)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
+    }
+
     /// The partitions definition of an asset this code location owns.
     pub fn owned_partitions(&self, name: &str) -> Option<&PartitionsFingerprint> {
         self.owned_node(name)?.partitions.as_ref()

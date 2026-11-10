@@ -59,22 +59,20 @@ impl RemoteConsumer {
             .filter_map(|node| Some((node.name.as_str(), node.parent_graph.as_deref()?)))
             .collect();
         topology
-            .nodes
-            .iter()
-            .filter_map(|node| {
-                let remote = node.remote.as_ref()?;
+            .remotes()
+            .map(|(local, remote)| {
                 let downstream: BTreeSet<&str> = topology
                     .edges
                     .iter()
-                    .filter(|(_, upstream)| *upstream == node.name)
+                    .filter(|(_, upstream)| upstream == local)
                     .map(|(from, _)| parents.get(from.as_str()).copied().unwrap_or(from))
                     .collect();
-                Some(Self {
-                    local: node.name.clone(),
+                Self {
+                    local: local.to_string(),
                     code_location: remote.code_location.clone(),
                     asset_key: remote.asset_key.clone(),
                     downstream: downstream.into_iter().map(str::to_string).collect(),
-                })
+                }
             })
             .collect()
     }

@@ -497,12 +497,7 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         let Some(topology) = topology else {
             return Ok(crate::staleness::compute_staleness(records, &[]));
         };
-        let remote: HashSet<&str> = topology
-            .nodes
-            .iter()
-            .filter(|node| node.remote.is_some())
-            .map(|node| node.name.as_str())
-            .collect();
+        let remote: HashSet<&str> = topology.remotes().map(|(name, _)| name).collect();
         if remote.is_empty() {
             return Ok(crate::staleness::compute_staleness(
                 records,
@@ -549,11 +544,7 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         &self,
         topology: &GraphTopology,
     ) -> Result<Vec<AssetRecord>> {
-        let remotes: Vec<(&str, &RemoteRef)> = topology
-            .nodes
-            .iter()
-            .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
-            .collect();
+        let remotes: Vec<(&str, &RemoteRef)> = topology.remotes().collect();
         let locations: Vec<&LocationRef> = remotes
             .iter()
             .map(|(_, remote)| &remote.code_location)

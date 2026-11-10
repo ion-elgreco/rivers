@@ -75,11 +75,7 @@ async fn load_owners<'t>(
     use rivers_core::storage::CodeLocationContext;
 
     let mut owners = HashMap::new();
-    for remote in topology
-        .nodes
-        .iter()
-        .filter_map(|node| node.remote.as_ref())
-    {
+    for (_, remote) in topology.remotes() {
         let location = &remote.code_location;
         if owners.contains_key(location) {
             continue;
@@ -180,11 +176,7 @@ async fn load_remote_statuses(
 
     let (topology, _) = load_topology(state, loc_ns, loc_name).await?;
     let owners = load_owners(state, &topology).await;
-    let remotes: Vec<(&str, &RemoteRef)> = topology
-        .nodes
-        .iter()
-        .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
-        .collect();
+    let remotes: Vec<(&str, &RemoteRef)> = topology.remotes().collect();
 
     let mut keys: HashMap<&LocationRef, Vec<String>> = HashMap::new();
     for (_, remote) in &remotes {
