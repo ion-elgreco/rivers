@@ -384,39 +384,32 @@ impl AssetConditionCache {
         now: i64,
     ) -> bool {
         let ctx = CodeLocationContext::new(identity);
-        let mut drift = None;
-        if self.remote.slots[location].state.identity() == Some(ctx.id()) {
-            let read = self.read_remote_drift(storage, &ctx, location).await;
-            let current = match read {
-                Ok(current) => current,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "rivers::conditions",
-                        %location,
-                        %error,
-                        "reading the remote code location's topology failed; retrying"
-                    );
-                    return self.postpone_remote(location, now);
-                }
-            };
-            if let SlotState::Resolved {
-                scope,
-                next_revalidate,
-            } = &mut self.remote.slot_mut(location).state
-                && paused_locals(&scope.drift) == paused_locals(&current)
-            {
-                let changed = scope.drift != current;
-                scope.drift = current;
-                *next_revalidate = now + REVALIDATE_NANOS;
-                return changed;
+        let drift = match self.read_remote_drift(storage, &ctx, location).await {
+            Ok(drift) => drift,
+            Err(error) => {
+                tracing::warn!(
+                    target: "rivers::conditions",
+                    %location,
+                    %error,
+                    "reading the remote code location's topology failed; retrying"
+                );
+                return self.postpone_remote(location, now);
             }
-            drift = Some(current);
+        };
+        if let SlotState::Resolved {
+            scope,
+            next_revalidate,
+        } = &mut self.remote.slot_mut(location).state
+            && scope.ctx.id() == ctx.id()
+            && paused_locals(&scope.drift) == paused_locals(&drift)
+        {
+            let changed = scope.drift != drift;
+            scope.drift = drift;
+            *next_revalidate = now + REVALIDATE_NANOS;
+            return changed;
         }
 
-        let slot = &self.remote.slots[location];
-        let loaded = self
-            .load_remote_scope(storage, ctx, location, slot, drift)
-            .await;
+        let loaded = self.load_remote_scope(storage, ctx, location, drift).await;
         let (scope, read) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -508,13 +501,9 @@ impl AssetConditionCache {
         storage: &S,
         ctx: CodeLocationContext,
         location: &LocationRef,
-        slot: &RemoteSlot,
-        drift: Option<HashMap<String, PartitionDrift>>,
+        drift: HashMap<String, PartitionDrift>,
     ) -> anyhow::Result<(RemoteScope, RemoteRead)> {
-        let drift = match drift {
-            Some(drift) => drift,
-            None => self.read_remote_drift(storage, &ctx, location).await?,
-        };
+        let slot = &self.remote.slots[location];
         let scoped = storage.for_code_location(&ctx);
 
         // Cursors first, as in `initial_load`: a run marked applied here was
