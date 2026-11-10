@@ -119,7 +119,7 @@ async fn code_location_directory_range_uses_kv_index() {
     for key in [
         "graph_topology:uuid-1",
         "cancel:run-1",
-        "code_locatio",
+        "code_location",
         "code_location;",
         "dynamic_keys:uuid-1:a:_:dv1",
     ] {
