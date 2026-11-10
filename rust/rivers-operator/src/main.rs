@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         namespace.clone(),
         directory_state.clone(),
         Some(synced.clone()),
-        Some(codelocation::DirectoryGc::new(storage, (*leader).clone())),
+        codelocation::DirectoryGc::new(storage, (*leader).clone()),
     )?;
     spawn_webhook_server(
         client.clone(),
@@ -223,7 +223,7 @@ fn spawn_registry_service(
     namespace: String,
     state: Arc<codelocation::DirectoryState>,
     synced: Option<webhook::Synced>,
-    gc: Option<codelocation::DirectoryGc>,
+    gc: codelocation::DirectoryGc,
 ) -> anyhow::Result<()> {
     let token = match std::env::var(REGISTRY_TOKEN_ENV) {
         Ok(t) if !t.is_empty() => t,

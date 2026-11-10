@@ -187,14 +187,14 @@ impl DirectoryState {
 /// the API server doesn't dispatch admission traffic to an un-synced
 /// follower replica.
 ///
-/// `gc` (when provided) drops a deleted CR's storage directory entry, and
-/// sweeps the directory once the stream has synced.
+/// `gc` drops a deleted CR's storage directory entry, and sweeps the
+/// directory once the stream has synced.
 pub async fn run_watcher(
     client: kube_client::Client,
     namespace: String,
     state: Arc<DirectoryState>,
     synced_signal: Option<crate::webhook::Synced>,
-    gc: Option<DirectoryGc>,
+    gc: DirectoryGc,
 ) {
     let api: Api<CodeLocation> = Api::namespaced(client, &namespace);
     let mut stream = watcher::watcher(api, WatcherConfig::default()).boxed();
@@ -211,19 +211,16 @@ pub async fn run_watcher(
                 state.delete(&ns, &name).await;
 
                 // The webhook reads this state; a slow SurrealDB must not stall it.
-                if let Some(gc) = gc.clone() {
-                    tokio::spawn(async move {
-                        if let Err(e) = gc.deleted(&obj).await {
-                            tracing::warn!(error = %e, %ns, %name, "dropping a code location directory entry");
-                        }
-                    });
-                }
+                let gc = gc.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = gc.deleted(&obj).await {
+                        tracing::warn!(error = %e, %ns, %name, "dropping a code location directory entry");
+                    }
+                });
             }
             Ok(Event::Init) => {}
             Ok(Event::InitDone) => {
-                if let Some(gc) = &gc
-                    && !sweeping
-                {
+                if !sweeping {
                     sweeping = true;
                     tokio::spawn(gc.clone().sweep_loop(namespace.clone(), state.clone()));
                 }
