@@ -75,7 +75,12 @@ impl PyCodeRepository {
                 // that defines the verb, mirroring `run_action`.
                 Some(verb) => assets_supporting_action(&state.node_map, verb),
                 None => {
-                    let mut names: Vec<String> = state.node_map.keys().cloned().collect();
+                    let mut names: Vec<String> = state
+                        .node_map
+                        .iter()
+                        .filter(|(_, node)| !node.is_remote())
+                        .map(|(name, _)| name.clone())
+                        .collect();
                     names.sort();
                     names
                 }
@@ -83,6 +88,7 @@ impl PyCodeRepository {
         } else {
             selection
         };
+        ensure_materializable(&state.node_map, &selection)?;
 
         if let Some(verb) = &action {
             if selection.is_empty() {

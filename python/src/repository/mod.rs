@@ -454,12 +454,14 @@ impl PyCodeRepository {
         })?;
         let handler = state.io_handler_registry.for_output(py, node);
         let partition = crate::executor::ops::build_partition_context(node, &partition_key)?;
+        let (asset_name, code_location) = crate::executor::ops::upstream_source(&name, node);
         let ctx = crate::context::io::PyInputContext {
-            asset_name: name.clone(),
+            asset_name,
             downstream_asset: "__load_node__".to_string(),
             asset_metadata: node.metadata(),
             partition,
             type_hint,
+            code_location,
         };
         handler.call_method1(py, "load_input", (ctx,))
     }
@@ -874,12 +876,66 @@ impl PyCodeRepository {
         Ok(actual_port)
     }
 
+    /// Write the gRPC endpoint of a server on `host:port` to the code
+    /// location directory, at once and then every 10 s, until the process
+    /// starts to drain.
+    fn _start_heartbeat(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
+        const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let state = self.state.get_attached(py).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("the code location is not resolved")
+        })?;
+        let storage = Arc::clone(&*state.storage);
+        let identity = state.code_location_id.clone();
+        let location = rivers_k8s::env::current_code_location_ref()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))?;
+        let endpoint = rivers_k8s::env::current_grpc_endpoint(host, port);
+        let drain = crate::shutdown::drain_token().clone();
+
+        rt().spawn(async move {
+            let mut ticks = tokio::time::interval(HEARTBEAT_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = drain.cancelled() => return,
+                    _ = ticks.tick() => {}
+                }
+                let now = crate::executor::ops::now_ts();
+                match storage
+                    .touch_code_location(&location, &identity, &endpoint, now)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        target: "rivers::repo",
+                        %location,
+                        "the directory entry names another code location; gRPC endpoint not advertised"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "rivers::repo",
+                        %location,
+                        %error,
+                        "advertising the gRPC endpoint failed"
+                    ),
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Stop the gRPC server started by [`Self::_start_grpc_server`]: cancel and
     /// join its serve thread, which drains its in-flight runs. No-op if none
     /// running; idempotent.
     fn _stop_grpc_server(&self, py: Python<'_>) {
         py.detach(crate::shutdown::stop_grpc);
     }
+}
+
+/// This code location's `namespace/name` in the code location directory.
+#[pyfunction]
+pub fn code_location_ref() -> PyResult<String> {
+    rivers_k8s::env::current_code_location_ref()
+        .map(|location| location.to_string())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:#}")))
 }
 
 pub fn register_repository_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {

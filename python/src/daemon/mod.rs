@@ -42,7 +42,7 @@ pub use subprocess_eval::{
 
 use automation_condition::{
     ConditionEvalLoopConfig, build_condition_engine, condition_eval_loop, extract_asset_conditions,
-    extract_upstream_partition_keys,
+    extract_remote_deps, extract_upstream_partition_keys,
 };
 use automation_entry::AutomationEntry;
 use batch_writer::{spawn_condition_eval_writer, spawn_tick_writer};
@@ -197,13 +197,13 @@ impl AutomationDaemon {
 
         let (schedules, sensors) = self.extract_automation_info(py, resources.as_ref());
 
-        let (asset_conditions, upstream_partition_keys) = match &state {
+        let (asset_conditions, upstream_partition_keys, remote_deps) = match &state {
             Some(state) => {
                 let conditions = extract_asset_conditions(state);
                 let upstream_pks = extract_upstream_partition_keys(state, &conditions);
-                (conditions, upstream_pks)
+                (conditions, upstream_pks, extract_remote_deps(state))
             }
-            None => (Vec::new(), HashMap::new()),
+            None => (Vec::new(), HashMap::new(), Vec::new()),
         };
 
         if !asset_conditions.is_empty() {
@@ -266,6 +266,7 @@ impl AutomationDaemon {
             sensor_infos: sensors,
             asset_conditions,
             upstream_partition_keys,
+            remote_deps,
             repo: Arc::new(self.repo.clone_ref(py)),
             storage: self.storage.clone(),
             cancel: self.cancel.clone(),
@@ -405,6 +406,7 @@ struct DaemonLoopConfig {
             rivers_core::condition::PartitionUniverse,
         ),
     >,
+    remote_deps: Vec<rivers_core::condition::RemoteDep>,
     repo: Arc<Py<PyCodeRepository>>,
     storage: Arc<SurrealStorage>,
     cancel: CancellationToken,
@@ -430,6 +432,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         sensor_infos,
         asset_conditions,
         upstream_partition_keys,
+        remote_deps,
         repo,
         storage,
         cancel,
@@ -556,6 +559,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
             max_ticks_retained,
             eval_tx,
             upstream_partition_keys,
+            remote_deps,
         })
         .await;
         handles.push(tokio::spawn(condition_eval_loop(

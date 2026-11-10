@@ -15,6 +15,7 @@ mod claims;
 mod consolidation;
 mod coverage;
 mod crud;
+mod directory;
 mod executor_patterns;
 mod isolation;
 mod observations;

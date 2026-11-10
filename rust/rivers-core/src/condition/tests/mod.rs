@@ -31,6 +31,7 @@ mod partition_mappings;
 mod partition_scenarios;
 mod partitions;
 mod presets;
+mod remote;
 mod run_tags;
 mod since;
 mod tree;

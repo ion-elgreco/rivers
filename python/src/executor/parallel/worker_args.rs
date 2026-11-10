@@ -238,14 +238,15 @@ fn build_io_load_spec(
     // Pickle-safe transport. Only wrap with `IOHandlerRef` (which reconstructs
     // by re-importing `module.qualname.io_handler` in the subprocess) when the
     // handler came from upstream's own definition or a graph override — those
-    // ARE re-discoverable via the asset's import path. An `InputOverride` and
-    // the registry `Default` are arbitrary instances with no stable lookup
-    // path; ship them raw and let cloudpickle handle them.
+    // ARE re-discoverable via the asset's import path. An `InputOverride`, the
+    // registry `Default`, and an upstream with no function (an external
+    // without observe) have no stable lookup path; ship them raw and let
+    // cloudpickle handle them.
     let pickled_handler = match source {
-        IOHandlerSource::Definition | IOHandlerSource::GraphOverride => {
-            let upstream_func = upstream_node.callable(py)?;
-            make_io_handler_ref(py, &upstream_func, &handler).unwrap_or(handler)
-        }
+        IOHandlerSource::Definition | IOHandlerSource::GraphOverride => upstream_node
+            .callable(py)
+            .and_then(|upstream_func| make_io_handler_ref(py, &upstream_func, &handler))
+            .unwrap_or(handler),
         IOHandlerSource::InputOverride | IOHandlerSource::Default => handler,
     };
 
@@ -276,12 +277,14 @@ fn build_io_load_spec(
         ops::build_partition_context(upstream_node, &upstream_key)?
     };
 
+    let (asset_name, code_location) = ops::upstream_source(param_name, upstream_node);
     let kwargs = PyDict::new(py);
-    kwargs.set_item("asset_name", param_name)?;
+    kwargs.set_item("asset_name", asset_name)?;
     kwargs.set_item("downstream_asset", downstream_name)?;
     kwargs.set_item("asset_metadata", metadata)?;
     kwargs.set_item("partition", partition)?;
     kwargs.set_item("type_hint", type_hint)?;
+    kwargs.set_item("code_location", code_location)?;
 
     let spec = super::worker::PyIOLoadSpec {
         handler: pickled_handler,

@@ -7,7 +7,7 @@ use crate::storage::{
 
 #[derive(Debug, SurrealValue)]
 pub(super) struct DbKv {
-    key: String,
+    pub(super) key: String,
     pub(super) value: Bytes,
 }
 

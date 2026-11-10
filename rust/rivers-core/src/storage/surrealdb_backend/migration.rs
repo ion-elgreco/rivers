@@ -11,7 +11,7 @@ use surrealdb::types::SurrealValue;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::now_nanos;
+use super::{is_already_exists_error, now_nanos};
 
 /// refinery's history table — one checksummed row per applied migration.
 const REFINERY_HISTORY_TABLE: &str = "refinery_schema_history";
@@ -477,21 +477,6 @@ const MIGRATION_LEASE_RENEW_SECS: u64 = 10;
 /// How long a process waiting on the lease sleeps between attempts.
 const MIGRATION_LEASE_POLL_SECS: u64 = 1;
 
-/// True if `CREATE migration_lock:lease` failed because the id is already taken
-/// (another opener holds it). Structural match, with a message fallback.
-fn is_lease_taken_error(err: &anyhow::Error) -> bool {
-    use surrealdb::types::ErrorDetails;
-    if err
-        .chain()
-        .find_map(|e| e.downcast_ref::<surrealdb::Error>())
-        .is_some_and(|se| matches!(se.details(), ErrorDetails::AlreadyExists(_)))
-    {
-        return true;
-    }
-    let m = err.to_string();
-    m.contains("already exists") || m.contains("already contains")
-}
-
 /// Take the lease: clear any expired one, then `CREATE` the fixed id — one caller
 /// wins, losers get already-exists → `None`. Returns the holder token, or `None`.
 async fn try_acquire_migration_lease(db: &Surreal<Any>) -> anyhow::Result<Option<String>> {
@@ -513,7 +498,7 @@ async fn try_acquire_migration_lease(db: &Surreal<Any>) -> anyhow::Result<Option
     .await;
     match outcome {
         Ok(()) => Ok(Some(holder)),
-        Err(err) if is_lease_taken_error(&err) => Ok(None),
+        Err(err) if is_already_exists_error(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }

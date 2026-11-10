@@ -8,6 +8,7 @@ use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_definitions, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
 use crate::components::pagination::PaginatedView;
+use crate::components::remote_downstream::RemoteDownstreamSection;
 use crate::components::traceback::TracebackView;
 use crate::components::ui_kit::{
     Crumb, EmptyState, EventGlyphTimeline, GlyphEvent, RecentRunsStrip, RunLaunched, RunsGrid,
@@ -19,7 +20,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
-use crate::server_fns::graph::get_graph_topology;
+use crate::server_fns::graph::{get_graph_topology, get_remote_downstream, get_remote_statuses};
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
@@ -34,6 +35,16 @@ fn event_type_class(t: &crate::types::EventType) -> &'static str {
         E::Observation => "info",
         E::Deletion => "warn",
         _ => "muted",
+    }
+}
+
+/// The rail color of a Lineage tab row.
+fn rail_color(status: &crate::types::StaleStatus) -> &'static str {
+    use crate::types::StaleStatus as S;
+    match status {
+        S::UpToDate => "var(--success)",
+        S::Stale => "var(--warning)",
+        S::Missing => "var(--text-muted)",
     }
 }
 
@@ -162,9 +173,45 @@ pub fn AssetDetailPage() -> impl IntoView {
         move || (loc.get(), live.definitions.get()),
         |((ns, name), _)| async move { get_graph_topology(ns, name).await },
     );
+    let remote_downstream = Resource::new(
+        move || {
+            params.track();
+            (loc.get(), key(), live.definitions.get())
+        },
+        |((ns, name), key, _)| get_remote_downstream(ns, name, key),
+    );
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
+    );
+    // The Lineage tab shows the owner's status of a remote upstream. An
+    // asset without one needs no request; until the topology is here, ask.
+    let graph_value = crate::helpers::resource_value(graph);
+    let no_remote_upstream = Memo::new(move |_| {
+        params.track();
+        let current = key();
+        graph_value.get().and_then(|r| r.ok()).is_some_and(|t| {
+            let upstream = t.direct_upstream(&current);
+            !t.nodes
+                .iter()
+                .any(|n| n.remote.is_some() && upstream.contains(&n.name))
+        })
+    });
+    let remote_statuses = Resource::new(
+        move || {
+            (
+                loc.get(),
+                refresh_tick.get(),
+                live.definitions.get(),
+                no_remote_upstream.get(),
+            )
+        },
+        |((ns, name), _, _, no_remote_upstream)| async move {
+            if no_remote_upstream {
+                return Ok(Default::default());
+            }
+            get_remote_statuses(ns, name).await
+        },
     );
     // The materialize dialog's row decoration, from this page's live resource.
     let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
@@ -799,6 +846,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let current_key = key();
                     let topo = graph.get().and_then(|r| r.ok());
                     let records_by_key = records_by_key.get();
+                    let owner_statuses = remote_statuses.get().and_then(|r| r.ok()).unwrap_or_default();
+                    let remotes = topo.as_ref().map(|t| t.remote_nodes()).unwrap_or_default();
 
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&current_key), t.direct_downstream(&current_key)))
@@ -816,20 +865,41 @@ pub fn AssetDetailPage() -> impl IntoView {
                             }.into_any()
                         } else {
                             let rows: Vec<_> = keys.into_iter().map(|dep| {
+                                if let Some(remote) = remotes.get(&dep) {
+                                    let rail = owner_statuses.get(&dep).map_or("var(--text-muted)", rail_color);
+                                    let style = format!("border-left-color: {rail}; border-left-style: dotted");
+                                    let row = view! {
+                                        <span class="lineage-row-key">{dep}</span>
+                                        <span class="lineage-row-kind">"remote"</span>
+                                        <span class="lineage-row-mat">{remote.label()}</span>
+                                    };
+                                    return if remote.resolved {
+                                        view! {
+                                            <A
+                                                href=remote.href()
+                                                attr:class="lineage-row"
+                                                attr:style=style
+                                                attr:title=remote.drift_message()
+                                            >{row}</A>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div
+                                                class="lineage-row"
+                                                style=style
+                                                title=format!("Code location {} is not registered with this UI", remote.code_location)
+                                            >{row}</div>
+                                        }.into_any()
+                                    };
+                                }
                                 let href = loc_path(&lns, &lnm, &format!("assets/{}", dep));
                                 let rec = records.get(&dep);
                                 let kind_text = rec
                                     .and_then(|r| r.kinds.first().cloned())
                                     .unwrap_or_else(|| "asset".to_string());
                                 let mat_ts: Option<i64> = rec.and_then(|r| r.last_timestamp);
-                                let rail_color = rec
-                                    .map(|r| match r.stale_status {
-                                        crate::types::StaleStatus::UpToDate => "var(--success)",
-                                        crate::types::StaleStatus::Stale => "var(--warning)",
-                                        crate::types::StaleStatus::Missing => "var(--text-muted)",
-                                    })
-                                    .unwrap_or("var(--text-muted)");
-                                let style = format!("border-left-color: {rail_color}");
+                                let rail = rec.map_or("var(--text-muted)", |r| rail_color(&r.stale_status));
+                                let style = format!("border-left-color: {rail}");
                                 view! {
                                     <A href=href attr:class="lineage-row" attr:style=style>
                                         <span class="lineage-row-key">{dep}</span>
@@ -838,7 +908,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                                             <crate::now::RelTimeOpt ts=mat_ts/>
                                         </span>
                                     </A>
-                                }
+                                }.into_any()
                             }).collect();
                             view! {
                                 <div>
@@ -852,7 +922,14 @@ pub fn AssetDetailPage() -> impl IntoView {
                     view! {
                         <div class="lineage-grid">
                             {render_col("UPSTREAM", upstream, "No upstream assets (this is a source asset)", &records_by_key)}
-                            {render_col("DOWNSTREAM", downstream, "No downstream assets", &records_by_key)}
+                            <div>
+                                {render_col("DOWNSTREAM", downstream, "No downstream assets", &records_by_key)}
+                                <Transition fallback=|| ()>
+                                    {move || remote_downstream.get().and_then(Result::ok).map(|rows| view! {
+                                        <RemoteDownstreamSection rows=rows/>
+                                    })}
+                                </Transition>
+                            </div>
                         </div>
                     }.into_any()
                 }}

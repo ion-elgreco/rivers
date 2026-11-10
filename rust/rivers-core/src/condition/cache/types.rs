@@ -30,7 +30,7 @@ type LastRunUpdate = (
 );
 
 /// Per-asset partition status, loaded from storage and refreshed incrementally.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct PartitionStatusEntry {
     /// Which partitions are currently being materialized.
     pub in_progress: HashSet<PartitionKey>,

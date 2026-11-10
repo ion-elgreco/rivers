@@ -396,11 +396,11 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
     let topology = GraphTopology {
         nodes: asset_keys
             .iter()
-            .map(|k| crate::assets::graph::TopologyNode {
-                name: k.clone(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
+            .map(|k| {
+                crate::assets::graph::TopologyNode::new(
+                    k.clone(),
+                    crate::assets::graph::NodeKind::Asset,
+                )
             })
             .collect(),
         edges,

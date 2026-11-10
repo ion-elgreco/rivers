@@ -16,7 +16,7 @@ def my_asset():
     return data
 ```
 
-`rs.Asset(...)` without a function is a decorator. Each function it decorates becomes a new asset with the same settings, so you can use one decorator for many functions. `Asset.from_multi()`, `Asset.from_graph()`, and `Asset.external()` without a function work the same way.
+`rs.Asset(...)` without a function is a decorator. Each function it decorates becomes a new asset with the same settings, so you can use one decorator for many functions. `Asset.from_multi()`, `Asset.from_graph()`, and `Asset.external()` without a function work the same way. `Asset.remote()` takes no function.
 
 ```python
 etl = rs.Asset(group="etl", kinds="table")
@@ -86,6 +86,7 @@ Outside a graph body, `orders()` raises `AssetDefinitionError`. `etl()` also rai
 | `is_multi` | `bool` | True for `MultiAsset`. |
 | `is_graph` | `bool` | True for `GraphAsset`. |
 | `is_external` | `bool` | True for `ExternalAsset`. |
+| `is_remote` | `bool` | True for `RemoteAsset`. |
 
 ### `Asset.from_multi()`
 
@@ -213,6 +214,48 @@ def source_table(context: rs.AssetExecutionContext):
 
 The optional observation function receives an `AssetExecutionContext` and can call `context.add_output_metadata(...)` to record metadata about the external data source (e.g., row count, last modified timestamp). Trigger observations via `CodeRepository.observe()`.
 
+### `Asset.remote()`
+
+Declare an asset that another code location materializes. Assets in this repository depend on it by its local name, as a function parameter or in `deps=`. This repository never materializes it and keeps no asset record for it.
+
+```python
+orders = rs.Asset.remote("orders", code_location="sales", io_handler=warehouse)
+
+@rs.Asset
+def order_count(orders: pl.DataFrame) -> int:
+    return orders.height
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | required | Local name: the node, parameter, and `deps=` name in this repository. Unique in this repository, also across remotes; no `/`. See [Aliasing](../concepts/assets.md#aliasing). |
+| `code_location` | `str` | required | Owning code location: `"name"` in this code location's namespace, or `"namespace/name"`. |
+| `asset_key` | `str \| None` | `name` | The asset's key in the owning code location. Set it when the local name differs from the owner's key. |
+| `io_handler` | `BaseIOHandler \| str \| None` | `None` | Loads the data for downstream parameters. Its `load_input()` gets `asset_key` as `InputContext.asset_name` and the owner as `InputContext.code_location`. Without it the asset is lineage-only: list it with `AssetDef.dep()`, or set a handler on the consumer's `AssetDef.input()`. |
+| `partitions_def` | `PartitionsDefinition \| str \| None` | `None` | Mirror of the owner's partition definition. Dynamic definitions and dynamic dimensions are rejected: their keys live in the owning code location. |
+| `metadata` | `dict[str, str] \| None` | `None` | Static metadata passed to IO handlers. |
+| `group` | `str \| None` | `None` | Group name for organization. |
+
+Raises `AssetDefinitionError` when `name` is empty or contains `/`, when `asset_key` is empty, when `code_location` is not `"name"` or `"namespace/name"`, or when `partitions_def` is dynamic. A remote asset takes no function.
+
+The repository rejects these uses:
+
+| Use | Error |
+|-----|-------|
+| A parameter loads a remote without `io_handler`, and the consumer sets no input handler for it | `GraphValidationError` at `resolve()` and `validate()` |
+| The remote in a `materialize()` or `backfill()` selection, or in a gRPC `Materialize` selection | `ExecutionError`: `Cannot materialize remote asset 'x': code location 'ns/name' owns it` |
+| The remote in `Job(assets=...)` | `GraphValidationError` at `resolve()` |
+| The remote in a sensor's `asset_selection` | `SensorDefinitionError` at `resolve()` |
+
+Local names must be unique, also across remotes. When two code locations own assets with the same key, give each one a different local name:
+
+```python
+foo_orders = rs.Asset.remote("foo_orders", code_location="foo", asset_key="raw_orders")
+bar_orders = rs.Asset.remote("bar_orders", code_location="bar", asset_key="raw_orders")
+```
+
 ---
 
 ## `SingleAsset`
@@ -240,6 +283,17 @@ Returned by `Asset.from_graph()`. Inherits every property from `Asset` (no extra
 ## `ExternalAsset`
 
 Returned by `Asset.external()`. Inherits every property from `Asset`. The `observe_fn` property exposes the callable attached when `Asset.external` is used as a decorator.
+
+---
+
+## `RemoteAsset`
+
+Returned by `Asset.remote()`. Inherits every property from `Asset` plus:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `code_location` | `str` | The owning code location as declared: `"name"` or `"namespace/name"`. |
+| `asset_key` | `str` | The asset's key in the owning code location. |
 
 ---
 

@@ -1,4 +1,5 @@
-//! Core `@Asset` decorator and the `Asset` enum (Single, Multi, Graph) that wraps all asset variants.
+//! Core `@Asset` decorator and the `Asset` enum (Single, Multi, Graph,
+//! External, Remote) that wraps all asset variants.
 mod asset_def;
 mod deps;
 
@@ -15,6 +16,7 @@ use super::external_asset::{ExternalAsset, PyExternalAsset};
 use super::graph_asset::{GraphAsset, PyGraphAsset};
 use super::io_handler::IOHandler;
 use super::multi_asset::{MultiAsset, PyMultiAsset};
+use super::remote_asset::{PyRemoteAsset, RemoteAsset};
 use super::single_asset::{PySingleAsset, SingleAsset};
 use crate::automation::PyAutomationCondition;
 use crate::composition::{
@@ -88,17 +90,19 @@ pub enum Asset {
     Multi(MultiAsset),
     Graph(GraphAsset),
     External(ExternalAsset),
+    Remote(RemoteAsset),
 }
 
 /// Base class for all asset types, exposed to Python as `Asset`.
 ///
 /// `Asset` acts as both a decorator (`@Asset`, `@Asset(name=...)`) and a
 /// factory for specialized asset kinds via classmethods: `from_multi`,
-/// `from_graph`, and `external`.
+/// `from_graph`, `external`, and `remote`.
 ///
 /// When called as a decorator it wraps a Python function and produces a
 /// `SingleAsset`. When used as a factory classmethod it produces the
-/// corresponding subclass (`MultiAsset`, `GraphAsset`, `ExternalAsset`).
+/// corresponding subclass (`MultiAsset`, `GraphAsset`, `ExternalAsset`,
+/// `RemoteAsset`).
 /// An asset without a function is a decorator: each call returns a new asset
 /// of the same kind around the given function.
 #[pyclass(name = "Asset", subclass, frozen, module = "rivers._core")]
@@ -112,6 +116,7 @@ impl Asset {
             Asset::Single(asset) => &asset.name,
             Asset::Graph(asset) => &asset.name,
             Asset::External(asset) => &asset.name,
+            Asset::Remote(asset) => &asset.name,
             Asset::Multi(asset) => &asset.name,
         }
     }
@@ -122,7 +127,7 @@ impl Asset {
             Asset::Single(asset) => asset.tags.as_ref(),
             Asset::Graph(asset) => asset.tags.as_ref(),
             Asset::External(asset) => asset.tags.as_ref(),
-            Asset::Multi(_) => None,
+            Asset::Multi(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -139,6 +144,7 @@ impl Asset {
             Asset::Single(a) => a.io_handler.as_ref(),
             Asset::Graph(a) => a.io_handler.as_ref(),
             Asset::External(a) => Some(&a.io_handler),
+            Asset::Remote(a) => a.io_handler.as_ref(),
             Asset::Multi(_) => None,
         }
     }
@@ -155,6 +161,7 @@ impl Asset {
             Asset::Single(a) => a.metadata.as_ref(),
             Asset::Graph(a) => a.metadata.as_ref(),
             Asset::External(a) => a.metadata.as_ref(),
+            Asset::Remote(a) => a.metadata.as_ref(),
             Asset::Multi(_) => None,
         }
     }
@@ -165,7 +172,7 @@ impl Asset {
             Asset::Single(a) => &a.kinds,
             Asset::Graph(a) => &a.kinds,
             Asset::External(a) => &a.kinds,
-            Asset::Multi(_) => {
+            Asset::Multi(_) | Asset::Remote(_) => {
                 static EMPTY: Kinds = Kinds(Vec::new());
                 &EMPTY
             }
@@ -177,6 +184,7 @@ impl Asset {
             Asset::Single(a) => a.group.as_ref(),
             Asset::Graph(a) => a.group.as_ref(),
             Asset::External(a) => a.group.as_ref(),
+            Asset::Remote(a) => a.group.as_ref(),
             Asset::Multi(_) => None,
         }
     }
@@ -185,7 +193,7 @@ impl Asset {
         match self {
             Asset::Single(a) => a.code_version.as_ref(),
             Asset::Graph(a) => a.code_version.as_ref(),
-            Asset::Multi(_) | Asset::External(_) => None,
+            Asset::Multi(_) | Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -195,6 +203,7 @@ impl Asset {
             Asset::Multi(a) => a.backfill_strategy.as_ref(),
             Asset::Graph(a) => a.backfill_strategy.as_ref(),
             Asset::External(a) => a.backfill_strategy.as_ref(),
+            Asset::Remote(_) => None,
         }
     }
 
@@ -204,6 +213,7 @@ impl Asset {
             Asset::Multi(a) => a.partitions_def.as_ref(),
             Asset::Graph(a) => a.partitions_def.as_ref(),
             Asset::External(a) => a.partitions_def.as_ref(),
+            Asset::Remote(a) => a.partitions_def.as_ref(),
         }
     }
 
@@ -212,7 +222,7 @@ impl Asset {
             Asset::Single(a) => a.partition_mapping.as_ref(),
             Asset::Graph(a) => a.partition_mappings.as_ref(),
             Asset::Multi(a) => a.partition_mappings.as_ref(),
-            Asset::External(_) => None,
+            Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -221,7 +231,7 @@ impl Asset {
             Asset::Single(a) => Some(&a.input_io_handlers),
             Asset::Multi(a) => Some(&a.input_io_handlers),
             Asset::Graph(a) => Some(&a.input_io_handlers),
-            Asset::External(_) => None,
+            Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -230,7 +240,7 @@ impl Asset {
             Asset::Single(a) => a.input_metadata.get(param_name),
             Asset::Multi(a) => a.input_metadata.get(param_name),
             Asset::Graph(a) => a.input_metadata.get(param_name),
-            Asset::External(_) => None,
+            Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -240,7 +250,7 @@ impl Asset {
         match self {
             Asset::Single(a) => &a.actions,
             Asset::Graph(a) => &a.actions,
-            Asset::Multi(_) | Asset::External(_) => &[],
+            Asset::Multi(_) | Asset::External(_) | Asset::Remote(_) => &[],
         }
     }
 
@@ -264,7 +274,7 @@ impl Asset {
             Asset::Single(a) => a.hooks.as_ref(),
             Asset::Graph(a) => a.hooks.as_ref(),
             Asset::Multi(a) => a.hooks.as_ref(),
-            Asset::External(_) => None,
+            Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -274,6 +284,7 @@ impl Asset {
             Asset::Graph(a) => a.automation_condition.as_ref(),
             Asset::External(a) => a.automation_condition.as_ref(),
             Asset::Multi(a) => a.automation_condition.as_ref(),
+            Asset::Remote(_) => None,
         }
     }
 
@@ -300,7 +311,7 @@ impl Asset {
             Asset::Single(a) => a.retry.as_ref(),
             Asset::Multi(m) => m.retry.as_ref(),
             Asset::Graph(g) => g.retry.as_ref(),
-            Asset::External(_) => None,
+            Asset::External(_) | Asset::Remote(_) => None,
         }
     }
 
@@ -337,6 +348,9 @@ impl Asset {
             Asset::External(_) => Err(AssetDefinitionError::new_err(
                 "External assets have no compute function",
             )),
+            Asset::Remote(_) => Err(AssetDefinitionError::new_err(
+                "Remote assets have no compute function",
+            )),
             Asset::Multi(asset) => asset
                 .wraps
                 .as_ref()
@@ -351,6 +365,7 @@ impl Asset {
             Asset::Multi(a) => a.wraps.as_ref(),
             Asset::Graph(a) => a.wraps.as_ref(),
             Asset::External(a) => a.observe_fn.as_ref(),
+            Asset::Remote(_) => None,
         }
     }
 
@@ -404,8 +419,15 @@ impl Asset {
                     ..a.clone_ref(py)
                 })
             }
+            Asset::Remote(_) => return Err(remote_takes_no_function(&name)),
         })
     }
+}
+
+fn remote_takes_no_function(name: &str) -> PyErr {
+    AssetDefinitionError::new_err(format!(
+        "remote asset '{name}' takes no function: its code location materializes it"
+    ))
 }
 
 /// Call a graph function during composition, passing InvokedNodeOutput placeholders
@@ -457,6 +479,7 @@ impl PyAsset {
             Asset::External(_) => {
                 Py::new(py, base(inner).add_subclass(PyExternalAsset))?.into_any()
             }
+            Asset::Remote(_) => Py::new(py, base(inner).add_subclass(PyRemoteAsset))?.into_any(),
         })
     }
 }
@@ -873,6 +896,62 @@ impl PyAsset {
         Self::new_object(py, py_asset)
     }
 
+    /// Declare an asset that another code location materializes, so assets
+    /// here can depend on it.
+    #[classmethod]
+    #[pyo3(signature = (
+        name,
+        *,
+        code_location,
+        asset_key = None,
+        io_handler = None,
+        partitions_def = None,
+        metadata = None,
+        group = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn remote(
+        cls: &Bound<'_, PyType>,
+        name: String,
+        code_location: String,
+        asset_key: Option<String>,
+        io_handler: Option<IOHandler>,
+        partitions_def: Option<PartitionsDefRef>,
+        metadata: Option<HashMap<String, String>>,
+        group: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        if name.is_empty() || name.contains('/') {
+            return Err(AssetDefinitionError::new_err(format!(
+                "remote asset name '{name}' must be non-empty and contain no '/'"
+            )));
+        }
+        let asset_key = asset_key.unwrap_or_else(|| name.clone());
+        if asset_key.is_empty() {
+            return Err(AssetDefinitionError::new_err(format!(
+                "remote asset '{name}': asset_key must be non-empty"
+            )));
+        }
+        super::remote_asset::parse_code_location(
+            &name,
+            &code_location,
+            rivers_k8s::env::DEV_CODE_LOCATION_NAMESPACE,
+        )?;
+        if let Some(PartitionsDefRef::Inline(pd)) = &partitions_def {
+            super::remote_asset::reject_dynamic_mirror(&name, pd.get())?;
+        }
+
+        let remote = Asset::Remote(RemoteAsset {
+            name: Some(name),
+            code_location,
+            asset_key,
+            io_handler,
+            partitions_def,
+            metadata,
+            group,
+        });
+        Self::new_object(cls.py(), remote)
+    }
+
     /// On an asset without a function, return a new asset of the same kind
     /// that wraps the given function and keeps this asset's settings.
     ///
@@ -886,6 +965,11 @@ impl PyAsset {
     ) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let asset = slf.get().inner();
+        if let Asset::Remote(r) = asset {
+            return Err(remote_takes_no_function(
+                r.name.as_deref().unwrap_or_default(),
+            ));
+        }
         if asset.func().is_none() {
             let func = decorated_fn(args, kwargs).ok_or_else(needs_one_function)?;
             return Self::new_object(py, asset.wrapping(py, func)?);
@@ -971,7 +1055,7 @@ impl PyAsset {
             Asset::Single(a) => a.is_async,
             Asset::Multi(a) => a.is_async,
             Asset::External(a) => a.is_async_observe,
-            Asset::Graph(_) => false,
+            Asset::Graph(_) | Asset::Remote(_) => false,
         }
     }
 
@@ -993,6 +1077,11 @@ impl PyAsset {
     #[getter]
     fn is_external(&self) -> bool {
         matches!(self.inner, Asset::External(_))
+    }
+
+    #[getter]
+    fn is_remote(&self) -> bool {
+        matches!(self.inner, Asset::Remote(_))
     }
 
     #[getter]

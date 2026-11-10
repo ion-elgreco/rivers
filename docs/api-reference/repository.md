@@ -22,7 +22,7 @@ repo = rs.CodeRepository(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `assets` | `Sequence[SingleAsset \| MultiAsset \| GraphAsset \| ExternalAsset]` | required | All assets to register. |
+| `assets` | `Sequence[SingleAsset \| MultiAsset \| GraphAsset \| ExternalAsset \| RemoteAsset]` | required | All assets to register. |
 | `tasks` | `Sequence[Task \| BashTask] \| None` | `None` | Standalone tasks (not asset producers) to register. |
 | `jobs` | `Sequence[Job] \| None` | `None` | Jobs to validate and register. |
 | `schedules` | `Sequence[Schedule] \| None` | `None` | Schedules to register. |
@@ -366,10 +366,10 @@ Request cancellation of the run. No-op if already in a terminal state.
 
 ## Ad-hoc materialization
 
-`repo.materialize()` runs over all non-external assets without requiring a `Job`. Each call builds an ephemeral execution plan over the selection — the resulting `RunRecord` has `job_name = None`. Use a named `Job` when you want to surface the run target in the UI, share it across schedules, or pin executor/partition behavior.
+`repo.materialize()` runs over all assets except externals and remotes, without requiring a `Job`. Each call builds an ephemeral execution plan over the selection — the resulting `RunRecord` has `job_name = None`. Use a named `Job` when you want to surface the run target in the UI, share it across schedules, or pin executor/partition behavior.
 
 ```python
 repo = rs.CodeRepository(assets=[a, b, c])
-result = repo.materialize()  # all non-external assets, ad-hoc
+result = repo.materialize()  # all but external and remote assets, ad-hoc
 result = repo.materialize(selection=["b"], include_upstream=True)
 ```

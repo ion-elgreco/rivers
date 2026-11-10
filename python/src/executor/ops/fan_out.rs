@@ -139,6 +139,7 @@ pub(crate) fn load_fan_out_source(
         source_node.metadata(),
         partition,
         None,
+        None,
     );
     let ctx_py = Py::new(py, ctx)?;
 
@@ -247,6 +248,7 @@ impl MappedResultsIter {
                 "collect_stream".to_string(),
                 self.metadata.clone(),
                 self.partition.clone(),
+                None,
                 None,
             ),
         )?;

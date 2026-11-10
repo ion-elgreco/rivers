@@ -47,6 +47,24 @@ def storage():
     return _memory_storage_factory()
 
 
+_CODE_LOCATION_ENV = (
+    "RIVERS_CODE_LOCATION_ID",
+    "RIVERS_CODE_LOCATION_NAME",
+    "RIVERS_CODE_LOCATION_NAMESPACE",
+    "RIVERS_NAMESPACE",
+    "RIVERS_DEPLOYMENT",
+    "RIVERS_RUN_ID",
+    "RIVERS_MODULE",
+)
+
+
+@pytest.fixture
+def clean_code_location_env(monkeypatch):
+    """Unset the variables that tell a process which code location it is."""
+    for name in _CODE_LOCATION_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def embedded_storage(tmp_path):
     """Embedded SurrealKV-backed Storage with a per-test directory.

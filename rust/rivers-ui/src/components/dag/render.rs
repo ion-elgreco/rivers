@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::layout::{LayoutEdge, LayoutNode, LayoutResult};
+use crate::types::StaleStatus;
 
 fn kind_accent(kind: &str) -> &'static str {
     match kind {
@@ -68,6 +69,10 @@ pub fn DagGraph(
     #[prop(optional)]
     stale_keys: HashSet<String>,
     #[prop(optional)] external_keys: HashSet<String>,
+    /// The owner's status of each remote node; a remote without one has a
+    /// hollow dot.
+    #[prop(optional)]
+    remote_statuses: HashMap<String, StaleStatus>,
     #[prop(optional)] ancestor_keys: HashSet<String>,
     #[prop(optional)] descendant_keys: HashSet<String>,
     #[prop(optional)] selected_nodes: HashSet<String>,
@@ -274,6 +279,7 @@ pub fn DagGraph(
                     let mat_keys = &materialized_keys;
                     let stl_keys = &stale_keys;
                     let ext_keys = &external_keys;
+                    let rmt_statuses = &remote_statuses;
                     let anc_keys = &ancestor_keys;
                     let desc_keys = &descendant_keys;
                     let sel_nodes = &selected_nodes;
@@ -292,6 +298,7 @@ pub fn DagGraph(
                                 mat_keys,
                                 stl_keys,
                                 ext_keys,
+                                rmt_statuses,
                                 anc_keys,
                                 desc_keys,
                                 sel_nodes,
@@ -316,6 +323,7 @@ fn render_node_full(
     materialized_keys: &HashSet<String>,
     stale_keys: &HashSet<String>,
     external_keys: &HashSet<String>,
+    remote_statuses: &HashMap<String, StaleStatus>,
     ancestor_keys: &HashSet<String>,
     descendant_keys: &HashSet<String>,
     selected_nodes: &HashSet<String>,
@@ -330,13 +338,44 @@ fn render_node_full(
     let is_expanded = expanded_graphs.contains(&node.id);
     let node_id = node.id.clone();
     let is_external = external_keys.contains(&node.id);
-    let is_materialized = materialized_keys.contains(&node.id);
-    let is_stale = stale_keys.contains(&node.id);
+    let remote = node.remote.as_ref();
+    let is_remote = remote.is_some();
+    let remote_status = remote.and(remote_statuses.get(&node.id));
+    let (is_materialized, is_stale) = if is_remote {
+        remote_status.map_or((false, false), |status| {
+            (
+                *status != StaleStatus::Missing,
+                *status == StaleStatus::Stale,
+            )
+        })
+    } else {
+        (
+            materialized_keys.contains(&node.id),
+            stale_keys.contains(&node.id),
+        )
+    };
     let is_selected = selected_nodes.contains(&node.id);
     let is_ancestor = ancestor_keys.contains(&node.id);
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
     let is_changed = changed_keys.contains(&node.id);
+    let remote_chip: Option<(&'static str, String, &'static str)> = remote.and_then(|r| {
+        if !r.resolved {
+            return Some((
+                "not registered",
+                "dag-node-unregistered".to_string(),
+                "#b4b8c2",
+            ));
+        }
+        r.drift.as_ref().map(|drift| {
+            let class = format!("dag-node-drift dag-node-drift--{}", drift.class());
+            let fill = match drift {
+                crate::types::RemoteDrift::Incompatible { .. } => "#f59e0b",
+                _ => "#b4b8c2",
+            };
+            (drift.chip(), class, fill)
+        })
+    });
 
     // When a node is selected, dim nodes outside the lineage
     let opacity = if has_selection && !is_in_lineage {
@@ -376,7 +415,7 @@ fn render_node_full(
 
     let stroke_color = if let Some(lc) = lineage_stroke {
         lc
-    } else if is_external {
+    } else if is_external || is_remote {
         "#535559"
     } else if is_changed {
         "#ff8f78"
@@ -398,10 +437,11 @@ fn render_node_full(
 
     // Leaf name for primary text (Rivers: a.key.split("/").pop())
     let leaf_name: String = node.id.rsplit('/').next().unwrap_or(&node.id).to_string();
-    let secondary_text: String = match (&node.group, kind_text) {
-        (Some(g), k) if !k.is_empty() => format!("{g} · {k}"),
-        (Some(g), _) => g.clone(),
-        (None, k) => k.to_string(),
+    let secondary_text: String = match (remote, &node.group, kind_text) {
+        (Some(r), _, _) => r.label(),
+        (None, Some(g), k) if !k.is_empty() => format!("{g} · {k}"),
+        (None, Some(g), _) => g.clone(),
+        (None, None, k) => k.to_string(),
     };
 
     // Ellipsis-truncate to fit the available capsule width. The right end of
@@ -436,7 +476,34 @@ fn render_node_full(
             secondary_text
         };
 
-    let tooltip = node.id.clone();
+    let tooltip = match remote {
+        Some(r) if !r.resolved => format!(
+            "{}: {} in {} (code location not registered)",
+            node.id, r.asset_key, r.code_location
+        ),
+        Some(r) => {
+            let status = remote_status
+                .map(|status| format!(" ({})", crate::helpers::stale_status_kind(status)))
+                .unwrap_or_default();
+            let drift = r
+                .drift_message()
+                .map(|message| format!(". {message}"))
+                .unwrap_or_default();
+            format!(
+                "{}: {} in {}{status}{drift}",
+                node.id, r.asset_key, r.code_location
+            )
+        }
+        None => node.id.clone(),
+    };
+    let hollow_dot = is_remote && remote_status.is_none();
+    let dash = if is_remote {
+        "2 3"
+    } else if is_external {
+        "5 3"
+    } else {
+        ""
+    };
 
     let node_id_ctx = node.id.clone();
     let node_view = view! {
@@ -469,7 +536,7 @@ fn render_node_full(
                 fill="#171a1d"
                 stroke={stroke_color}
                 stroke-width={stroke_width}
-                stroke-dasharray=move || if is_external { "5 3" } else { "" }
+                stroke-dasharray=dash
                 filter="url(#node-shadow)"
             />
 
@@ -491,11 +558,14 @@ fn render_node_full(
             })}
 
             // Status dot (LEFT side, inside the capsule)
+            // Hollow for a remote whose owner's status is not known.
             <circle
                 cx={status_x.to_string()}
                 cy={status_y.to_string()}
                 r="5"
-                fill={status_color}
+                fill={if hollow_dot { "none" } else { status_color }}
+                stroke={if hollow_dot { "#8b8f9e" } else { "none" }}
+                stroke-width="1.5"
             >
             </circle>
             // Running ripple (when materialized and within current lineage selection)
@@ -554,6 +624,36 @@ fn render_node_full(
                 }
             })}
 
+            {remote_chip.map(|(text, class, fill)| {
+                let chip_w = 5.0 * text.len() as f64 + 2.0;
+                let chip_x = x + w - chip_w - 6.0;
+                let chip_y = y - 6.0;
+                view! {
+                    <g class=class>
+                        <rect
+                            x={chip_x.to_string()}
+                            y={chip_y.to_string()}
+                            width={chip_w.to_string()}
+                            height="12"
+                            rx="2"
+                            fill="#24272b"
+                            stroke="#535559"
+                            stroke-width="1"
+                        />
+                        <text
+                            x={(chip_x + chip_w / 2.0).to_string()}
+                            y={(chip_y + 9.0).to_string()}
+                            text-anchor="middle"
+                            fill=fill
+                            font-size="8"
+                            font-family="JetBrains Mono, monospace"
+                        >
+                            {text}
+                        </text>
+                    </g>
+                }
+            })}
+
             // "NEW" chip — shown when the deploy view flags this node as changed
             {is_changed.then(|| {
                 let chip_x = x + w - 30.0;
@@ -586,16 +686,28 @@ fn render_node_full(
     };
 
     if on_node_click.is_some() {
-        node_view.into_any()
-    } else {
-        let (lns, lnm) = crate::loc::use_current_location().get();
-        let href = crate::loc::loc_path(&lns, &lnm, &format!("assets/{}", node.id));
-        view! {
+        return node_view.into_any();
+    }
+    let href = match remote {
+        Some(r) if r.resolved => Some(r.href()),
+        Some(_) => None,
+        None => {
+            let (lns, lnm) = crate::loc::use_current_location().get();
+            Some(crate::loc::loc_path(
+                &lns,
+                &lnm,
+                &format!("assets/{}", node.id),
+            ))
+        }
+    };
+    match href {
+        Some(href) => view! {
             <a href={href}>
                 {node_view}
             </a>
         }
-        .into_any()
+        .into_any(),
+        None => node_view.into_any(),
     }
 }
 

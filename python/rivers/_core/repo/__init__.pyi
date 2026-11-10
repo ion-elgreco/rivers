@@ -16,6 +16,7 @@ from rivers._core.assets import (
     ExternalAsset,
     GraphAsset,
     MultiAsset,
+    RemoteAsset,
     SingleAsset,
 )
 from rivers._core.executor import Executor
@@ -152,7 +153,14 @@ class CodeRepository:
     def __init__(
         self,
         assets: Sequence[
-            Union[SingleAsset, MultiAsset, GraphAsset, ExternalAsset, type[Asset]]
+            Union[
+                SingleAsset,
+                MultiAsset,
+                GraphAsset,
+                ExternalAsset,
+                RemoteAsset,
+                type[Asset],
+            ]
         ],
         tasks: Sequence[Union[Task, BashTask]] | None = None,
         jobs: Sequence[Job] | None = None,
@@ -173,7 +181,8 @@ class CodeRepository:
             assets: All assets exposed by this repository — decorator-form
                 instances and/or class-form subclasses of :class:`Asset`,
                 :class:`MultiAsset`, :class:`GraphAsset`, :class:`ExternalAsset`
-                (classes desugar here, at registration).
+                (classes desugar here, at registration), and
+                :class:`RemoteAsset` instances.
             tasks: Standalone tasks that aren't asset producers.
             jobs: Custom jobs (a Job is a named selection over assets/tasks).
             schedules: Schedules attached to the repository.
@@ -482,8 +491,26 @@ class CodeRepository:
         """Exit context manager — calls :meth:`shutdown`."""
         ...
 
-    def _start_grpc_server(self, host: str, port: int) -> None:
-        """(Internal) start the in-process gRPC code-location server."""
+    def _start_grpc_server(self, host: str, port: int) -> int:
+        """(Internal) start the in-process gRPC code-location server.
+
+        Returns:
+            The port the server listens on. It is not ``port`` if ``port``
+            was in use.
+        """
+        ...
+
+    def _start_heartbeat(self, host: str, port: int) -> None:
+        """(Internal) write the gRPC endpoint to the code location directory.
+
+        Writes at once and then every 10 seconds, until the process starts
+        to drain. The endpoint is ``RIVERS_CODE_LOCATION_GRPC_ENDPOINT`` if
+        set, else ``http://<host>:<port>`` with loopback for a wildcard host.
+
+        Raises:
+            RuntimeError: The repository is not resolved, or its
+                ``namespace/name`` is not valid.
+        """
         ...
 
 __all__ = [

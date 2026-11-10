@@ -172,6 +172,9 @@
     gap: 28px;
     align-items: flex-start;
 }
+.lineage-remote-downstream {
+    margin-top: 24px;
+}
 .lineage-rows {
     display: flex;
     flex-direction: column;

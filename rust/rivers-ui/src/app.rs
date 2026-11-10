@@ -76,19 +76,19 @@ pub fn shell() -> impl IntoView {
     }
 }
 
-/// Root redirect: resolves the first Ready code location and sends the user
-/// to its overview. Renders a "no Ready code location" message if the
-/// registry is empty or every entry is non-Ready.
+/// Root redirect: sends the user to the overview of the first Ready code
+/// location, else of the first Pending one (under `rivers dev`, the host's
+/// own location until it reports in). Renders a message when there is none.
 #[component]
 fn RootRedirect() -> impl IntoView {
     let first = Resource::new(
         || (),
         |_| async move {
             list_code_locations().await.map(|entries| {
-                entries
+                ["Ready", "Pending"]
                     .into_iter()
-                    .find(|e| e.phase == "Ready")
-                    .map(|e| (e.namespace, e.name))
+                    .find_map(|phase| entries.iter().find(|e| e.phase == phase))
+                    .map(|e| (e.namespace.clone(), e.name.clone()))
             })
         },
     );
@@ -102,7 +102,7 @@ fn RootRedirect() -> impl IntoView {
                 }
                 Ok(None) => view! {
                     <div class="empty-state">
-                        "No Ready code location yet. Apply a CodeLocation CR or wait for the operator to reconcile."
+                        "No code location yet. Start one, or apply a CodeLocation CR and wait for the operator to reconcile."
                     </div>
                 }.into_any(),
                 Err(e) => view! {

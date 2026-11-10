@@ -58,7 +58,7 @@ To add a second pipeline, write another `CodeLocation` and apply it; to remove o
 
 ### Operator capabilities
 
-- **`CodeLocation` reconciler** — resolves `image:tag` to an immutable digest, reconciles Deployment + Service running `rivers serve`, re-polls on `digestRefreshInterval`. Cross-code-location asset deps (RFC 035) are wired up via the discovery registry.
+- **`CodeLocation` reconciler** — resolves `image:tag` to an immutable digest, reconciles Deployment + Service running `rivers serve`, re-polls on `digestRefreshInterval`. Each code location lists itself in a storage directory, and assets depend on assets of other code locations with [`Asset.remote()`](../concepts/assets.md#remote-assets).
 - **`Run` reconciler** — each `Run` CR becomes a run pod the operator schedules and watches; when the run uses `Executor.kubernetes(...)`, that pod fans out step pods with native concurrency caps (`max_concurrent_steps`), image-pull credentials resolved from cluster secrets, and resource requests/limits per asset.
 - **Admission webhooks** — a mutating webhook stamps `spec.identity` (UUID) on create; a validating webhook rejects identity changes.
 - **Live discovery registry** — the UI dials the operator's gRPC registry; no static workspace file, no restart to pick up new locations.
@@ -78,7 +78,7 @@ rivers runs **one daemon per code location**, in-process inside the `rivers serv
 - **Scales with code locations** — daemon capacity grows linearly as you add `CodeLocation` CRs; there's no shared "daemon node" to provision.
 - **Parallel within a tick** — schedules and sensors in the same location evaluate concurrently inside one tick (async on the event loop, sync via a GIL-aware loky pool), rather than serialised one-by-one like the global Dagster daemon.
 
-The run queue, tag concurrency limits, and pool slot tracking are global (they live in SurrealDB), so cross-location fairness is preserved. Only the *evaluation* — the part that runs user Python — is partitioned.
+The run queue, tag concurrency limits, and pool slots live in SurrealDB and are kept per code location, so one location's runs never wait on another location's limits.
 
 ## Web UI
 

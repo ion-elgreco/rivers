@@ -6,6 +6,8 @@ use petgraph::graph::{Graph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::assets::partitions_fingerprint::PartitionsFingerprint;
+use crate::assets::remote::RemoteRef;
 use crate::repo::CodeRepository;
 
 /// `ByName` is produced at parse time from annotations; `Resolved` is populated
@@ -89,6 +91,24 @@ pub struct TopologyNode {
     /// For tasks inside a graph asset: the name of the parent graph asset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_graph: Option<String>,
+    /// Set when the node mirrors an asset owned by another code location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<PartitionsFingerprint>,
+}
+
+impl TopologyNode {
+    pub fn new(name: impl Into<String>, kind: NodeKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            group: None,
+            parent_graph: None,
+            remote: None,
+            partitions: None,
+        }
+    }
 }
 
 pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
@@ -96,12 +116,7 @@ pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
         .node_indices()
         .map(|idx| {
             let node = &graph[idx];
-            TopologyNode {
-                name: node.name.clone(),
-                kind: node.kind,
-                group: None,
-                parent_graph: None,
-            }
+            TopologyNode::new(node.name.clone(), node.kind)
         })
         .collect();
 
@@ -265,6 +280,25 @@ pub fn validate_subgraph_completeness(
 }
 
 impl GraphTopology {
+    /// The node of an asset this code location owns, not a remote mirror.
+    pub fn owned_node(&self, name: &str) -> Option<&TopologyNode> {
+        self.nodes
+            .iter()
+            .find(|n| n.name == name && n.remote.is_none())
+    }
+
+    /// Each remote node: its name here, and the asset it mirrors.
+    pub fn remotes(&self) -> impl Iterator<Item = (&str, &RemoteRef)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
+    }
+
+    /// The partitions definition of an asset this code location owns.
+    pub fn owned_partitions(&self, name: &str) -> Option<&PartitionsFingerprint> {
+        self.owned_node(name)?.partitions.as_ref()
+    }
+
     /// (transitive dependencies, transitive dependents) of `node_name`.
     pub fn lineage(&self, node_name: &str) -> (HashSet<String>, HashSet<String>) {
         let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -278,20 +312,40 @@ impl GraphTopology {
         }
 
         let walk = |adj: &HashMap<&str, Vec<&str>>| -> HashSet<String> {
-            let mut result = HashSet::new();
-            let mut stack: Vec<&str> = adj.get(node_name).cloned().unwrap_or_default();
-            while let Some(n) = stack.pop() {
-                if result.insert(n.to_string())
-                    && let Some(next) = adj.get(n)
-                {
-                    stack.extend(next.iter());
-                }
-            }
-            result
+            reach(adj, adj.get(node_name).cloned().unwrap_or_default())
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         };
 
         (walk(&deps_of), walk(&dependents_of))
     }
+
+    /// `roots` and every node upstream of them.
+    pub fn with_upstream<'a>(
+        &'a self,
+        roots: impl IntoIterator<Item = &'a str>,
+    ) -> HashSet<&'a str> {
+        let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (from, to) in &self.edges {
+            deps_of.entry(from.as_str()).or_default().push(to.as_str());
+        }
+        reach(&deps_of, roots.into_iter().collect())
+    }
+}
+
+/// `start` and every node that `adj` leads to from it.
+fn reach<'a>(adj: &HashMap<&'a str, Vec<&'a str>>, start: Vec<&'a str>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut stack = start;
+    while let Some(name) = stack.pop() {
+        if seen.insert(name)
+            && let Some(next) = adj.get(name)
+        {
+            stack.extend(next);
+        }
+    }
+    seen
 }
 
 impl CodeRepository {
@@ -622,12 +676,55 @@ mod tests {
     }
 
     fn topo_node(name: &str) -> TopologyNode {
-        TopologyNode {
-            name: name.into(),
-            kind: NodeKind::Asset,
-            group: None,
-            parent_graph: None,
-        }
+        TopologyNode::new(name, NodeKind::Asset)
+    }
+
+    #[test]
+    fn test_topology_node_without_remote_reads_legacy_json() {
+        let node: TopologyNode = serde_json::from_str(r#"{"name":"a","kind":"asset"}"#).unwrap();
+        assert!(node.remote.is_none());
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"name":"a","kind":"asset"}"#
+        );
+    }
+
+    #[test]
+    fn test_topology_node_with_remote_round_trips() {
+        let mut node = topo_node("orders");
+        node.remote = Some(RemoteRef {
+            code_location: crate::assets::remote::LocationRef::new("team", "wh").unwrap(),
+            asset_key: "raw_orders".into(),
+        });
+        let json = serde_json::to_string(&node).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"orders","kind":"asset","remote":{"code_location":"team/wh","asset_key":"raw_orders"}}"#
+        );
+        let back: TopologyNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.remote, node.remote);
+    }
+
+    #[test]
+    fn test_topology_node_carries_its_partitions_fingerprint() {
+        let mut partitioned = TopologyNode::new("a", NodeKind::Asset);
+        partitioned.partitions = Some(PartitionsFingerprint::static_keys(["y", "x"]));
+        let topology = GraphTopology {
+            nodes: vec![partitioned, TopologyNode::new("b", NodeKind::Task)],
+            edges: vec![("b".into(), "a".into())],
+        };
+
+        let json = serde_json::to_string(&topology).unwrap();
+        assert_eq!(
+            json,
+            r#"{"nodes":[{"name":"a","kind":"asset","partitions":{"kind":"static","count":2,"digest":"e8f655a7c73f954d35f7350447b030bc"}},{"name":"b","kind":"task"}],"edges":[["b","a"]]}"#
+        );
+        let back: GraphTopology = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.owned_partitions("a"),
+            topology.nodes[0].partitions.as_ref()
+        );
+        assert_eq!(back.owned_partitions("b"), None);
     }
 
     #[test]

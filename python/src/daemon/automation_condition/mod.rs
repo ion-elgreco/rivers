@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rivers_core::assets::graph::NodeRef;
 use rivers_core::condition::{
     AssetConditionCache, AssetConditionInfo, ConditionEvalState, ConditionPass, DimensionKind,
-    DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse,
+    DimensionUniverse, PartitionInfo, PartitionMappingKind, PartitionUniverse, RemoteDep,
 };
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{PartitionKey as CorePartitionKey, ScopedStorageHandle};
@@ -147,6 +147,23 @@ pub(in crate::daemon) fn extract_asset_conditions(
     state.inner_repo.sort_topologically(by_key)
 }
 
+/// Remote assets in the repo, each read from its owner's scope.
+pub(in crate::daemon) fn extract_remote_deps(state: &ResolvedState) -> Vec<RemoteDep> {
+    state
+        .node_map
+        .iter()
+        .filter_map(|(name, node)| {
+            let remote = node.remote()?;
+            Some(RemoteDep {
+                local: name.clone(),
+                location: remote.code_location.clone(),
+                asset_key: remote.asset_key.clone(),
+                partitions: node.partitions_def().map(|def| def.fingerprint()),
+            })
+        })
+        .collect()
+}
+
 /// Extract upstream partition keys for all conditioned assets.
 pub(in crate::daemon) fn extract_upstream_partition_keys(
     state: &ResolvedState,
@@ -278,6 +295,7 @@ pub(super) struct ConditionEvalLoopConfig {
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     /// Upstream partition keys (+ how each set evolves), pre-extracted at daemon start.
     pub upstream_partition_keys: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)>,
+    pub remote_deps: Vec<RemoteDep>,
 }
 
 /// Restore eval state and prime the cache. Awaited in `daemon_main_loop`
@@ -296,10 +314,12 @@ pub(in crate::daemon) async fn build_condition_engine(
         max_ticks_retained,
         eval_tx,
         upstream_partition_keys,
+        remote_deps,
     } = config;
 
     let code_location_id = storage.code_location_id().to_string();
-    let cache = AssetConditionCache::new(code_location_id.clone());
+    let mut cache = AssetConditionCache::new(code_location_id.clone());
+    cache.set_remote_deps(remote_deps);
 
     let fresh = || ConditionEvalState {
         is_initial: true,

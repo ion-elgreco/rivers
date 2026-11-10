@@ -141,6 +141,13 @@ pub fn build_executor_pod(
                             value: Some(spec.code_location_ref.name.clone()),
                             ..Default::default()
                         },
+                        // Admission rejects cross-namespace Runs, so the
+                        // Run's namespace is its CodeLocation's.
+                        EnvVar {
+                            name: rivers_k8s::env::ENV_CODE_LOCATION_NAMESPACE.to_string(),
+                            value: Some(run.namespace().unwrap_or_default()),
+                            ..Default::default()
+                        },
                         EnvVar {
                             name: "RIVERS_NAMESPACE".to_string(),
                             value: Some(run.namespace().unwrap_or_default()),
@@ -832,6 +839,7 @@ mod tests {
             "registry.example.com/my-repo:latest"
         );
         assert_eq!(env_map["RIVERS_CODE_LOCATION_ID"], "demo-id");
+        assert_eq!(env_map["RIVERS_CODE_LOCATION_NAMESPACE"], "");
         assert_eq!(env_map["RIVERS_NAMESPACE"], "");
         assert_eq!(env_map["RIVERS_RUN_ID"], "run-123");
         assert_eq!(
@@ -841,6 +849,7 @@ mod tests {
         assert_eq!(env_map["RIVERS_MODULE"], "my_project.definitions");
         assert_eq!(env_map["RIVERS_RUN_CR_NAME"], "test-run");
         assert_eq!(env_map["RIVERS_RUN_CR_UID"], "");
+        assert!(!env_map.contains_key(rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT));
     }
 
     #[test]

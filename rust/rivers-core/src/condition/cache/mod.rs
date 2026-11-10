@@ -5,11 +5,16 @@ use std::sync::Arc;
 
 use super::node::ConditionNode;
 
-use crate::storage::{AssetRecord, BackfillStatus, PartitionKey, RunStatus, StorageBackend};
+use crate::storage::{
+    AssetRecord, BackfillStatus, PartitionKey, RunRecord, RunStatus, StorageBackend,
+};
 
 mod refresh;
+mod remote;
+mod remote_refresh;
 mod types;
 
+pub use remote::RemoteDep;
 pub use types::*;
 
 #[cfg(test)]
@@ -72,6 +77,10 @@ pub struct AssetConditionCache {
     /// guards overwrites so an earlier-finishing overlapping run can't clobber
     /// a later one's tags/asset-names.
     last_run_entry_ts: HashMap<(String, Option<PartitionKey>), i64>,
+    /// Upstream assets owned by other code locations.
+    remote: remote::RemoteScopes,
+    /// Answers of static key comparisons for remote deps.
+    key_comparisons: crate::assets::partitions_fingerprint::KeyComparisons,
     /// Test-only rendezvous between `initial_load`'s records read and its
     /// run-status reads, so a test can commit a run completion there.
     #[cfg(test)]
@@ -92,6 +101,58 @@ pub(crate) fn run_status_is_terminal(status: &RunStatus) -> bool {
         status,
         RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
     )
+}
+
+/// Failure floors left by `failed_runs`, newest per asset, for the assets
+/// `counts` accepts. A failure does not floor an asset it materialized, nor
+/// one a newer materialization or whole-asset deletion outranks.
+async fn derive_failure_floors<'r, S: StorageBackend>(
+    storage: &S,
+    failed_runs: &[RunRecord],
+    counts: impl Fn(&RunRecord, &str) -> bool,
+    record: impl Fn(&str) -> Option<&'r AssetRecord>,
+    deletion_ts: &HashMap<String, i64>,
+) -> anyhow::Result<HashMap<String, i64>> {
+    let mut floors: Vec<(&str, &str, i64)> = Vec::new();
+    for run in failed_runs.iter().filter(|run| !run.is_action()) {
+        let run_ts = run.end_time.unwrap_or(run.start_time);
+        for asset in run.node_names.iter().filter(|asset| counts(run, asset)) {
+            let record = record(asset);
+            let materialized_here =
+                record.and_then(|r| r.last_run_id.as_deref()) == Some(run.run_id.as_str());
+            let outranked = record
+                .and_then(|r| r.last_timestamp)
+                .is_some_and(|mat| mat >= run_ts);
+            let deleted_after = deletion_ts
+                .get(asset.as_str())
+                .is_some_and(|&del| del >= run_ts);
+            if materialized_here || outranked || deleted_after {
+                continue;
+            }
+            floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
+        }
+    }
+
+    // The record no longer names a run that materialized the asset before
+    // a delete or a newer run moved it on. The run's own events still do.
+    if !floors.is_empty() {
+        let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
+        let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        let built = storage.materialized_by_runs(&assets, &runs).await?;
+        floors.retain(|(asset, run_id, _)| {
+            !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
+        });
+    }
+
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for (asset, _, run_ts) in floors {
+        out.entry(asset.to_string())
+            .and_modify(|t| *t = (*t).max(run_ts))
+            .or_insert(run_ts);
+    }
+    Ok(out)
 }
 
 impl AssetConditionCache {
@@ -121,6 +182,8 @@ impl AssetConditionCache {
             pending_grace_nanos: DEFAULT_PENDING_GRACE_NANOS,
             applied_run_ids: HashMap::new(),
             last_run_entry_ts: HashMap::new(),
+            remote: remote::RemoteScopes::default(),
+            key_comparisons: Default::default(),
             #[cfg(test)]
             initial_load_gate: None,
         }
@@ -237,26 +300,32 @@ impl AssetConditionCache {
         storage: &S,
     ) -> anyhow::Result<()> {
         let scoped = storage.for_code_location(&self.ctx);
-        for asset_key in &self.partitioned_asset_keys.clone() {
+        let local_keys: Vec<String> = self
+            .partitioned_asset_keys
+            .iter()
+            .filter(|key| !self.remote.is_local(key))
+            .cloned()
+            .collect();
+        for asset_key in local_keys {
             let mut entry = PartitionStatusEntry::default();
 
-            let timestamps = scoped.get_partition_timestamps(asset_key).await?;
+            let timestamps = scoped.get_partition_timestamps(&asset_key).await?;
             for (pk, ts) in &timestamps {
                 entry.timestamps.insert(pk.clone(), *ts);
             }
 
-            let in_progress = scoped.get_in_progress_partitions(asset_key).await?;
+            let in_progress = scoped.get_in_progress_partitions(&asset_key).await?;
             for pk in &in_progress {
                 entry.in_progress.insert(pk.clone());
             }
 
             let failed = scoped
-                .get_failed_partitions(asset_key, &entry.timestamps)
+                .get_failed_partitions(&asset_key, &entry.timestamps)
                 .await?;
             entry.failed = failed.keys().cloned().collect();
             entry.failed_timestamps = failed;
 
-            self.partition_status.insert(asset_key.clone(), entry);
+            self.partition_status.insert(asset_key, entry);
         }
         Ok(())
     }
@@ -267,12 +336,16 @@ impl AssetConditionCache {
         storage: &S,
         now: i64,
     ) -> anyhow::Result<bool> {
-        if !self.initialized {
-            return self.initial_load(storage).await.map(|_| true);
-        }
+        let changed = if self.initialized {
+            let delta = self.fetch_refresh_delta(storage, now).await?;
+            self.apply_refresh_delta(delta)
+        } else {
+            self.initial_load(storage).await?;
+            true
+        };
 
-        let delta = self.fetch_refresh_delta(storage, now).await?;
-        Ok(self.apply_refresh_delta(delta))
+        let remote_changed = self.refresh_remotes(storage, now).await;
+        Ok(changed || remote_changed)
     }
 
     /// Full initial load — populates everything from scratch.
@@ -310,9 +383,12 @@ impl AssetConditionCache {
             .map(|ts| ts - 1)
             .unwrap_or(-1);
 
+        // A remote's state comes from its owner. A row of the same name here
+        // is left from when the asset was local, as is its run history below.
         let records = scoped.get_asset_records().await?;
         self.records = records
             .into_iter()
+            .filter(|r| !self.remote.is_local(&r.asset_key))
             .map(|r| (r.asset_key.clone(), r))
             .collect();
 
@@ -372,47 +448,21 @@ impl AssetConditionCache {
         // `outranked` would otherwise read, so without this every restart
         // resurrects a deleted asset's long-superseded floors.
         let deletion_ts = scoped.get_asset_deletion_timestamps().await?;
-        let mut floors: Vec<(&str, &str, i64)> = Vec::new();
-        for run in &failed_runs {
-            if run.is_action() {
-                continue;
-            }
-            let run_ts = run.end_time.unwrap_or(run.start_time);
-            for asset in &run.node_names {
-                if run.partition_key.is_some() && self.is_partitioned(asset) {
-                    continue;
-                }
-                let record = self.records.get(asset.as_str());
-                let materialized_here =
-                    record.and_then(|r| r.last_run_id.as_deref()) == Some(run.run_id.as_str());
-                let outranked = record
-                    .and_then(|r| r.last_timestamp)
-                    .is_some_and(|mat| mat >= run_ts);
-                let deleted_after = deletion_ts
-                    .get(asset.as_str())
-                    .is_some_and(|&del| del >= run_ts);
-                if materialized_here || outranked || deleted_after {
-                    continue;
-                }
-                floors.push((asset.as_str(), run.run_id.as_str(), run_ts));
-            }
-        }
-        // The record no longer names a run that materialized the asset before
-        // a delete or a newer run moved it on. The run's own events still do.
-        if !floors.is_empty() {
-            let assets: Vec<String> = floors.iter().map(|(a, ..)| a.to_string()).collect();
-            let mut runs: Vec<String> = floors.iter().map(|(_, r, _)| r.to_string()).collect();
-            runs.sort_unstable();
-            runs.dedup();
-            let built = storage.materialized_by_runs(&assets, &runs).await?;
-            floors.retain(|(asset, run_id, _)| {
-                !built.get(*asset).is_some_and(|runs| runs.contains(*run_id))
-            });
-        }
-        for (asset, _, run_ts) in floors {
-            self.failed_assets.insert(asset.to_string());
+        let floors = derive_failure_floors(
+            storage,
+            &failed_runs,
+            |run, asset| {
+                !self.remote.is_local(asset)
+                    && !(run.partition_key.is_some() && self.is_partitioned(asset))
+            },
+            |asset| self.records.get(asset),
+            &deletion_ts,
+        )
+        .await?;
+        for (asset, run_ts) in floors {
+            self.failed_assets.insert(asset.clone());
             self.failed_asset_timestamps
-                .entry(asset.to_string())
+                .entry(asset)
                 .and_modify(|t| *t = (*t).max(run_ts))
                 .or_insert(run_ts);
         }
@@ -421,11 +471,13 @@ impl AssetConditionCache {
         // recovered or was deleted while the daemon was down — steady state
         // would have cleared them).
         let records = &self.records;
+        let remote = &self.remote;
         self.failed_asset_timestamps.retain(|asset, ts| {
-            records
-                .get(asset)
-                .and_then(|r| r.last_timestamp)
-                .is_none_or(|mat| mat < *ts)
+            !remote.is_local(asset)
+                && records
+                    .get(asset)
+                    .and_then(|r| r.last_timestamp)
+                    .is_none_or(|mat| mat < *ts)
                 && deletion_ts.get(asset).is_none_or(|&del| del < *ts)
         });
         let floors = &self.failed_asset_timestamps;

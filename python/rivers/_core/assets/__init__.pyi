@@ -195,6 +195,53 @@ class Asset:
         partitions_def: PartitionsDefinition | str | None = None,
         automation_condition: AutomationCondition | None = None,
     ) -> "ExternalAsset": ...
+    @classmethod
+    def remote(
+        cls,
+        name: str,
+        *,
+        code_location: str,
+        asset_key: str | None = None,
+        io_handler: IOHandler | str | None = None,
+        partitions_def: PartitionsDefinition | str | None = None,
+        metadata: dict[str, str] | None = None,
+        group: str | None = None,
+    ) -> "RemoteAsset":
+        """Declare an asset that another code location materializes.
+
+        Assets in this repository depend on it by ``name``, as a function
+        parameter or in ``deps=``. This repository never materializes it.
+
+        Args:
+            name: The local name. It must be unique in this repository and
+                contain no ``/``.
+            code_location: The owning code location: ``"name"``, or
+                ``"namespace/name"`` for a code location in another namespace.
+            asset_key: The asset's key in the owning code location. Defaults
+                to ``name``. Set it to give the asset a different local name,
+                e.g. when two code locations own assets with the same key.
+            io_handler: Loads the asset's data for downstream parameters.
+                ``load_input`` gets ``asset_key`` as
+                :attr:`InputContext.asset_name` and the owner as
+                :attr:`InputContext.code_location`. Without it the asset is
+                lineage-only: list it with
+                :meth:`AssetDef.dep`, or set a handler on the consumer's
+                :meth:`AssetDef.input`.
+            partitions_def: Mirror of the owner's partitions definition. Not
+                dynamic, and no dynamic dimension: dynamic keys live in the
+                owning code location.
+            metadata: Static metadata.
+            group: Group for the UI.
+
+        Returns:
+            The remote asset, to pass to :class:`CodeRepository` ``assets=``.
+
+        Raises:
+            AssetDefinitionError: ``name`` is empty or contains ``/``,
+                ``asset_key`` is empty, ``code_location`` is not a valid
+                code location reference, or ``partitions_def`` is dynamic.
+        """
+        ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Wrap a function, or record a call inside a graph composition.
 
@@ -303,6 +350,11 @@ class Asset:
         """``True`` for :class:`ExternalAsset` instances."""
         ...
 
+    @property
+    def is_remote(self) -> bool:
+        """``True`` for :class:`RemoteAsset` instances."""
+        ...
+
     hooks: list[Hook] | None
     """Hooks attached to this asset."""
     automation_condition: AutomationCondition | None
@@ -353,6 +405,22 @@ class ExternalAsset(Asset):
             AssetDefinitionError: ``f`` is not callable, or this asset already
                 has an observe callable.
         """
+        ...
+
+class RemoteAsset(Asset):
+    """An asset that another code location materializes.
+
+    Construct via :meth:`Asset.remote`.
+    """
+
+    @property
+    def code_location(self) -> str:
+        """The owning code location as declared: ``"name"`` or ``"namespace/name"``."""
+        ...
+
+    @property
+    def asset_key(self) -> str:
+        """The asset's key in the owning code location."""
         ...
 
 class AssetDef:

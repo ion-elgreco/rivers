@@ -1,6 +1,14 @@
+import obstore
+import pytest
+
 import rivers as rs
 
-from _helpers import DictIOHandler, observation_metadata
+from _helpers import (
+    EXECUTORS,
+    DictIOHandler,
+    materialize_beside_sibling,
+    observation_metadata,
+)
 
 
 def test_external_asset_properties():
@@ -57,6 +65,32 @@ def test_external_asset_not_materialized():
     repo.materialize()
 
     assert repo.load_node("downstream") == 43
+
+
+@pytest.mark.parametrize("executor", EXECUTORS)
+def test_external_without_observe_feeds_a_worker_step(executor, tmp_path):
+    """The parallel worker ships the handler raw: the external has no function
+    to re-import it from."""
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    )
+
+    @rs.Asset(io_handler=handler)
+    def source() -> list[int]:
+        return [1, 2, 3]
+
+    rs.CodeRepository(assets=[source]).materialize()
+
+    ext = rs.Asset.external(name="source", io_handler=handler)
+
+    @rs.Asset(io_handler=handler)
+    def total(source: list[int]) -> int:
+        return sum(source)
+
+    repo, result = materialize_beside_sibling(None, executor, handler, ext, total)
+
+    assert result.success
+    assert repo.load_node("total") == 6
 
 
 def test_external_asset_in_job():

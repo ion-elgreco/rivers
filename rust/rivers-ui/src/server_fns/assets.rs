@@ -25,13 +25,14 @@ pub async fn get_assets(
         .get_asset_records()
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let edges = scoped
+    let topology = scoped
         .get_graph_topology()
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .map(|t| t.edges)
-        .unwrap_or_default();
-    let staleness = rivers_core::staleness::compute_staleness(&records, &edges);
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let staleness = scoped
+        .staleness_for(&records, topology.as_ref())
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     if let Some(ref t) = tag {
         records.retain(|r| r.tags.contains(t));
     }
@@ -77,13 +78,14 @@ pub async fn get_asset(
         .get_asset_records()
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let edges = scoped
+    let topology = scoped
         .get_graph_topology()
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .map(|t| t.edges)
-        .unwrap_or_default();
-    let mut staleness = rivers_core::staleness::compute_staleness(&all_records, &edges);
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut staleness = scoped
+        .staleness_for(&all_records, topology.as_ref())
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     let status: crate::types::StaleStatus = staleness
         .remove(&key)
         .map(|(s, _)| s)

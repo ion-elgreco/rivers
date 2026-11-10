@@ -12,6 +12,7 @@ pub mod in_process;
 pub mod kubernetes;
 pub mod ops;
 pub mod parallel;
+mod remote;
 pub(crate) mod run_lifecycle;
 pub(crate) mod traceback;
 
@@ -345,7 +346,9 @@ impl Executor {
                 }
             }
 
-            prefill_external_dep_versions(plan, storage, &mut data_versions);
+            // A step pod's run already warned in the orchestrator.
+            let warn_to = (!in_step_pod()).then_some((&writer, run_id));
+            prefill_external_dep_versions(plan, node_map, storage, warn_to, &mut data_versions);
 
             let mut graph_nodes = GraphNodeMap {
                 final_nodes: HashMap::new(),
@@ -505,10 +508,12 @@ impl Executor {
 
 /// Pre-populate `data_versions` with `last_data_version` from storage for graph
 /// dependencies that are NOT steps in the plan (i.e. loaded via IO handler).
-/// Single batch query instead of N individual lookups.
+/// Local deps take one batch query; remote deps read their owner's scope.
 fn prefill_external_dep_versions(
     plan: &ExecutionPlan,
+    node_map: &HashMap<String, ResolvedNode>,
     storage: StorageHandle,
+    warn_to: Option<(&EventWriter, &str)>,
     data_versions: &mut HashMap<String, String>,
 ) {
     let step_names: HashSet<&str> = plan
@@ -516,15 +521,26 @@ fn prefill_external_dep_versions(
         .iter()
         .flat_map(|s| std::iter::once(s.name.as_str()).chain(s.outputs.iter().map(|o| o.as_str())))
         .collect();
-    let external_deps: Vec<String> = plan
+    let (remote_deps, external_deps): (Vec<&str>, Vec<&str>) = plan
         .steps
         .iter()
         .flat_map(|s| s.graph_dependencies.iter())
-        .filter(|dep| !step_names.contains(dep.as_str()))
-        .cloned()
+        .map(String::as_str)
+        .filter(|dep| !step_names.contains(dep))
         .collect::<HashSet<_>>()
         .into_iter()
-        .collect();
+        .partition(|dep| node_map.get(*dep).is_some_and(ResolvedNode::is_remote));
+
+    remote::prefill_remote_dep_versions(
+        plan,
+        node_map,
+        &remote_deps,
+        storage,
+        warn_to,
+        data_versions,
+    );
+
+    let external_deps: Vec<String> = external_deps.into_iter().map(str::to_string).collect();
     if !external_deps.is_empty()
         && let Ok(records) =
             io_rt().block_on(storage.scoped().get_asset_records_by_keys(&external_deps))

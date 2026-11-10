@@ -189,6 +189,7 @@ mod server {
             storage,
             graph,
             registry,
+            key_comparisons: Default::default(),
         };
 
         let listener = find_available_port(&host, port, port.saturating_add(99)).await?;

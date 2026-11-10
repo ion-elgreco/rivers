@@ -267,6 +267,13 @@ impl PyJob {
                     self.name, name
                 )));
             }
+            if let Some(remote) = repo_node_map.get(name).and_then(ResolvedNode::remote) {
+                return Err(GraphValidationError::new_err(format!(
+                    "Job '{}': {}",
+                    self.name,
+                    crate::repository::remote_not_materializable(name, remote)
+                )));
+            }
         }
 
         let node_name_set_owned: HashSet<String> = self.node_names.iter().cloned().collect();
@@ -286,8 +293,9 @@ impl PyJob {
                     ))
                 })?;
 
-                // External assets are always valid deps (io_handler guaranteed).
-                if dep_node.is_external() {
+                // External and remote assets are always valid deps: this
+                // repository never materializes them.
+                if dep_node.is_external() || dep_node.is_remote() {
                     continue;
                 }
 
@@ -335,7 +343,8 @@ impl PyJob {
                 }
             }
             // Include deps not in the job that have io_handlers (external
-            // assets or allow_incomplete_deps). Lineage-only deps load nothing.
+            // and remote assets, or allow_incomplete_deps). Lineage-only deps
+            // load nothing.
             for name in &self.node_names {
                 let node_idx = match name_to_idx.get(name.as_str()) {
                     Some(&idx) => idx,
@@ -347,7 +356,9 @@ impl PyJob {
                     let loads_data = !node.is_some_and(|n| n.is_lineage_dep(dep_name));
                     if !subset.contains_key(dep_name.as_str())
                         && let Some(dep_node) = repo_node_map.get(dep_name.as_str())
-                        && (dep_node.is_external() || (self.allow_incomplete_deps && loads_data))
+                        && (dep_node.is_external()
+                            || dep_node.is_remote()
+                            || (self.allow_incomplete_deps && loads_data))
                     {
                         subset.insert(dep_name.clone(), dep_node.clone_ref(py));
                     }
