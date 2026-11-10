@@ -1,6 +1,7 @@
 //! Data versions of remote inputs, read from the owning code location's scope.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use rivers_core::assets::graph::GraphTopology;
 use rivers_core::assets::partitions_fingerprint::{
@@ -15,6 +16,10 @@ use crate::runtime::io_rt;
 
 use super::event_writer::EventWriter;
 use super::ops::{self, StorageHandle, now_ts};
+
+/// Kept for the life of the process: the answer for a pair of static key
+/// lists never changes.
+static KEY_COMPARISONS: LazyLock<KeyComparisons> = LazyLock::new(KeyComparisons::default);
 
 /// Put the owner's data version of each remote dep in `remote` into
 /// `data_versions`, under the local name. With `warn_to`, a remote whose
@@ -55,7 +60,6 @@ pub(super) fn prefill_remote_dep_versions(
 
     let mut warnings: Vec<(&str, String)> = Vec::new();
     let mut owners: HashMap<&LocationRef, Option<GraphTopology>> = HashMap::new();
-    let key_comparisons = KeyComparisons::default();
     let mut tracked: Vec<(&str, &str, &RemoteRef)> = Vec::new();
     for &(local, remote) in &refs {
         let Some(identity) = identities
@@ -82,15 +86,9 @@ pub(super) fn prefill_remote_dep_versions(
                     .get(local)
                     .and_then(ResolvedNode::partitions_def)
                     .map(|def| def.fingerprint());
-                if let Some(warning) = drift_warning(
-                    storage,
-                    &ctx,
-                    owner,
-                    &key_comparisons,
-                    local,
-                    remote,
-                    mirror.as_ref(),
-                ) {
+                if let Some(warning) =
+                    drift_warning(storage, &ctx, owner, local, remote, mirror.as_ref())
+                {
                     warnings.push((local, warning));
                 }
             }
@@ -176,12 +174,11 @@ fn drift_warning(
     storage: StorageHandle,
     owner_ctx: &CodeLocationContext,
     owner: &GraphTopology,
-    key_comparisons: &KeyComparisons,
     local: &str,
     remote: &RemoteRef,
     mirror: Option<&PartitionsFingerprint>,
 ) -> Option<String> {
-    let checked = key_comparisons.drift(
+    let checked = KEY_COMPARISONS.drift(
         storage.backend().as_ref(),
         storage.ctx(),
         owner_ctx,
