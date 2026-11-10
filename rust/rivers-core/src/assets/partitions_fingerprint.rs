@@ -144,8 +144,7 @@ pub fn describe_partitions(fingerprint: Option<&PartitionsFingerprint>) -> Strin
 
 /// How a remote asset's mirrored partitions definition compares with the
 /// owner's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionDrift {
     Same,
     /// The owner moved `start`/`end` on the same grid or added static keys.
@@ -161,14 +160,14 @@ pub enum PartitionDrift {
 
 /// The digests of a mirror's and an owner's static keys.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KeyListPair {
-    pub mirror: String,
-    pub owner: String,
+struct KeyListPair {
+    mirror: String,
+    owner: String,
 }
 
 /// What the fingerprints alone tell about a mirror.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DriftCheck {
+enum DriftCheck {
     Decided(PartitionDrift),
     /// The owner has more static keys than the mirror: `Compatible` when
     /// each mirror key of every pair is an owner key, else `Incompatible`.
@@ -177,7 +176,7 @@ pub enum DriftCheck {
 
 /// How `mirror` compares with the owner's definition of `asset_key`, from
 /// the owner's topology.
-pub fn partition_drift(
+fn partition_drift(
     owner: &GraphTopology,
     asset_key: &str,
     mirror: Option<&PartitionsFingerprint>,
@@ -257,18 +256,34 @@ fn compare(mirror: &PartitionsFingerprint, owner: &PartitionsFingerprint) -> Dri
 /// Answers kept before they are all dropped.
 const MAX_KEY_ANSWERS: usize = 1_024;
 
-/// Settles [`DriftCheck::KeysNeeded`] from the key rows, and keeps the
-/// answer of each pair of digests: the keys under a digest never change.
+/// Compares a mirror with its owner. The fingerprints decide, except when
+/// the owner has more static keys: then the key rows decide, and the answer
+/// of each pair of digests is kept, as the keys under a digest never change.
 #[derive(Debug, Default)]
 pub struct KeyComparisons {
     answers: Mutex<HashMap<KeyListPair, bool>>,
 }
 
 impl KeyComparisons {
+    /// How `mirror`, a node of `consumer`, compares with the definition of
+    /// `asset_key` in `owner_topology`.
+    pub async fn drift<S: StorageBackend>(
+        &self,
+        storage: &S,
+        consumer: &CodeLocationContext,
+        owner: &CodeLocationContext,
+        owner_topology: &GraphTopology,
+        asset_key: &str,
+        mirror: Option<&PartitionsFingerprint>,
+    ) -> anyhow::Result<PartitionDrift> {
+        let check = partition_drift(owner_topology, asset_key, mirror);
+        self.settle(storage, consumer, owner, check).await
+    }
+
     /// The drift `check` leads to. A pair not answered before reads the
     /// mirror's keys from the key rows of `consumer` and the owner's from
     /// those of `owner`. A missing key row gives `Incompatible`.
-    pub async fn settle<S: StorageBackend>(
+    async fn settle<S: StorageBackend>(
         &self,
         storage: &S,
         consumer: &CodeLocationContext,

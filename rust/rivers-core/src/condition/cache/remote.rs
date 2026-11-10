@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::assets::partitions_fingerprint::{
-    PartitionDrift, PartitionsFingerprint, describe_partitions, partition_drift,
+    PartitionDrift, PartitionsFingerprint, describe_partitions,
 };
 use crate::assets::remote::LocationRef;
 use crate::storage::{
@@ -473,10 +473,9 @@ impl AssetConditionCache {
         for (key, locals) in &slot.bindings {
             for local in locals {
                 let mirror = self.remote.mirrors.get(local).and_then(Option::as_ref);
-                let check = partition_drift(&owner, key, mirror);
                 let class = self
                     .key_comparisons
-                    .settle(storage, &self.ctx, ctx, check)
+                    .drift(storage, &self.ctx, ctx, &owner, key, mirror)
                     .await?;
                 let was_paused = slot.paused(local);
                 if pauses(class) && !was_paused {

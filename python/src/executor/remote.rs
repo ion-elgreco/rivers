@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use rivers_core::assets::graph::GraphTopology;
 use rivers_core::assets::partitions_fingerprint::{
-    KeyComparisons, PartitionDrift, PartitionsFingerprint, describe_partitions, partition_drift,
+    KeyComparisons, PartitionDrift, PartitionsFingerprint, describe_partitions,
 };
 use rivers_core::assets::remote::{LocationRef, RemoteRef};
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
@@ -82,11 +82,9 @@ pub(super) fn prefill_remote_dep_versions(
                     .get(local)
                     .and_then(ResolvedNode::partitions_def)
                     .map(|def| def.fingerprint());
-                let owner = (&ctx, owner);
-                let consumer = storage.ctx();
                 if let Some(warning) = drift_warning(
-                    backend,
-                    consumer,
+                    storage,
+                    &ctx,
                     owner,
                     &key_comparisons,
                     local,
@@ -174,18 +172,24 @@ fn owner_topology<S: StorageBackend>(
 
 /// Why loading `local` may not read what its `mirror` describes. A failed
 /// read of static partition keys skips the check.
-fn drift_warning<S: StorageBackend>(
-    backend: &S,
-    consumer: &CodeLocationContext,
-    (owner_ctx, owner): (&CodeLocationContext, &GraphTopology),
+fn drift_warning(
+    storage: StorageHandle,
+    owner_ctx: &CodeLocationContext,
+    owner: &GraphTopology,
     key_comparisons: &KeyComparisons,
     local: &str,
     remote: &RemoteRef,
     mirror: Option<&PartitionsFingerprint>,
 ) -> Option<String> {
-    let check = partition_drift(owner, &remote.asset_key, mirror);
-    let drift = match io_rt().block_on(key_comparisons.settle(backend, consumer, owner_ctx, check))
-    {
+    let checked = key_comparisons.drift(
+        storage.backend().as_ref(),
+        storage.ctx(),
+        owner_ctx,
+        owner,
+        &remote.asset_key,
+        mirror,
+    );
+    let drift = match io_rt().block_on(checked) {
         Ok(drift) => drift,
         Err(error) => {
             tracing::warn!(

@@ -105,7 +105,6 @@ async fn load_ui_topology(
     loc_ns: &str,
     loc_name: &str,
 ) -> Result<GraphTopology, ServerFnError> {
-    use rivers_core::assets::partitions_fingerprint::partition_drift;
     use rivers_core::storage::CodeLocationContext;
 
     use crate::types::RemoteDrift;
@@ -124,10 +123,16 @@ async fn load_ui_topology(
             Some((_, None)) => (true, None),
             Some((owner_ctx, Some(owner))) => {
                 let mirror = node.partitions.as_ref();
-                let check = partition_drift(owner, &remote.asset_key, mirror);
                 let settled = state
                     .key_comparisons
-                    .settle(state.storage.as_ref(), &consumer, owner_ctx, check)
+                    .drift(
+                        state.storage.as_ref(),
+                        &consumer,
+                        owner_ctx,
+                        owner,
+                        &remote.asset_key,
+                        mirror,
+                    )
                     .await;
                 let drift = match settled {
                     Ok(drift) => {
