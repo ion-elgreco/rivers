@@ -189,11 +189,18 @@ impl StorageRegistry {
 /// `Ready` for a location that reported in within the last 30 s; else
 /// `Pending` for this process's own location and `Stopped` for others.
 fn directory_entries(
-    listed: Vec<(LocationRef, CodeLocationDirectoryEntry)>,
+    mut listed: Vec<(LocationRef, CodeLocationDirectoryEntry)>,
     own: Option<&OwnLocation>,
     now: i64,
 ) -> Vec<CodeLocationEntry> {
     let is_own = |location: &LocationRef| own.is_some_and(|own| &own.location == location);
+    if let Some(own) = own
+        && !listed.iter().any(|(location, _)| is_own(location))
+    {
+        let unseen = CodeLocationDirectoryEntry::new(own.identity.clone());
+        listed.push((own.location.clone(), unseen));
+    }
+
     let mut entries: Vec<CodeLocationEntry> = listed
         .into_iter()
         .map(|(location, entry)| {
@@ -206,49 +213,20 @@ fn directory_entries(
                 (false, true) => "Pending",
                 (false, false) => "Stopped",
             };
-            location_entry(
-                &location,
-                entry.identity,
-                entry.grpc_endpoint,
-                entry.module,
-                phase,
-            )
+            CodeLocationEntry {
+                namespace: location.namespace().to_string(),
+                name: location.name().to_string(),
+                grpc_endpoint: entry.grpc_endpoint.unwrap_or_default(),
+                image: "local".to_string(),
+                module: entry.module.unwrap_or_default(),
+                phase: phase.to_string(),
+                observed_generation: 0,
+                identity: entry.identity,
+            }
         })
         .collect();
-    if let Some(own) = own
-        && !entries
-            .iter()
-            .any(|e| e.namespace == own.location.namespace() && e.name == own.location.name())
-    {
-        entries.push(location_entry(
-            &own.location,
-            own.identity.clone(),
-            None,
-            None,
-            "Pending",
-        ));
-    }
     entries.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     entries
-}
-
-fn location_entry(
-    location: &LocationRef,
-    identity: String,
-    grpc_endpoint: Option<String>,
-    module: Option<String>,
-    phase: &str,
-) -> CodeLocationEntry {
-    CodeLocationEntry {
-        namespace: location.namespace().to_string(),
-        name: location.name().to_string(),
-        grpc_endpoint: grpc_endpoint.unwrap_or_default(),
-        image: "local".to_string(),
-        module: module.unwrap_or_default(),
-        phase: phase.to_string(),
-        observed_generation: 0,
-        identity,
-    }
 }
 
 /// Holds the cache + the lazily-dialed channel used by the watcher. The
