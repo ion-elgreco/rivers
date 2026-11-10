@@ -34,6 +34,17 @@ pub(crate) fn reject_dynamic_mirror(name: &str, pd: &PartitionsDefinition) -> Py
     Ok(())
 }
 
+/// The code location that the remote asset `name` declares; one without a
+/// namespace is in `namespace`.
+pub(crate) fn parse_code_location(
+    name: &str,
+    code_location: &str,
+    namespace: &str,
+) -> PyResult<rivers_core::assets::remote::LocationRef> {
+    rivers_core::assets::remote::LocationRef::parse(code_location, namespace)
+        .map_err(|e| AssetDefinitionError::new_err(format!("remote asset '{name}': {e}")))
+}
+
 /// Python-exposed marker subclass created via `Asset.remote(...)`.
 #[pyclass(name = "RemoteAsset", extends=PyAsset, frozen, module = "rivers._core")]
 pub struct PyRemoteAsset;

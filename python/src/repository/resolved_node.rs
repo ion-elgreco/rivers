@@ -324,13 +324,11 @@ impl ResolvedAsset {
                     crate::assets::remote_asset::reject_dynamic_mirror(&name, pd)?;
                 }
                 let namespace = rivers_k8s::env::current_code_location_namespace();
-                let code_location =
-                    rivers_core::assets::remote::LocationRef::parse(&r.code_location, &namespace)
-                        .map_err(|e| {
-                        crate::errors::AssetDefinitionError::new_err(format!(
-                            "remote asset '{name}': {e}"
-                        ))
-                    })?;
+                let code_location = crate::assets::remote_asset::parse_code_location(
+                    &name,
+                    &r.code_location,
+                    &namespace,
+                )?;
                 Some(rivers_core::assets::remote::RemoteRef {
                     code_location,
                     asset_key: r.asset_key.clone(),

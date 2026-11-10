@@ -931,11 +931,11 @@ impl PyAsset {
                 "remote asset '{name}': asset_key must be non-empty"
             )));
         }
-        rivers_core::assets::remote::LocationRef::parse(
+        super::remote_asset::parse_code_location(
+            &name,
             &code_location,
             rivers_k8s::env::DEV_CODE_LOCATION_NAMESPACE,
-        )
-        .map_err(|e| AssetDefinitionError::new_err(format!("remote asset '{name}': {e}")))?;
+        )?;
         if let Some(PartitionsDefRef::Inline(pd)) = &partitions_def {
             super::remote_asset::reject_dynamic_mirror(&name, pd.get())?;
         }
