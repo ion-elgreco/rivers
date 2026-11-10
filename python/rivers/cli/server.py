@@ -5,7 +5,6 @@ import importlib
 import importlib.util
 import os
 import sys
-from pathlib import Path
 
 import typer
 
@@ -17,6 +16,7 @@ from rivers.cli.config import RiversConfig
 
 @app.command()
 def dev(
+    ctx: typer.Context,
     module: str | None = typer.Argument(
         None,
         help="Python module path containing CodeRepository",
@@ -37,10 +37,6 @@ def dev(
     synthetic: str | None = typer.Option(
         None, help="Override graph with synthetic DAG (e.g. 100, 1k, 10k, 50k)"
     ),
-    config: Path | None = typer.Option(
-        None,
-        help="Path to a rivers.toml (replaces the discovered one; env: RIVERS_CONFIG)",
-    ),
 ) -> None:
     """Start the rivers development server.
 
@@ -50,7 +46,7 @@ def dev(
     up: press the reload button in the UI.
     """
     cfg = RiversConfig.from_cli(
-        config=config,
+        config=ctx.obj,
         module=module,
         repo_var=repo_var,
         host=host,

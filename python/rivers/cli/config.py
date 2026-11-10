@@ -37,6 +37,17 @@ class SyntheticConfig(BaseModel):
     size: str | None = None
 
 
+# Parameter name of a command -> (table, key) of the value it takes.
+# ``[server]``, ``[daemon]`` and ``[synthetic]`` are for ``rivers dev`` only: a
+# project's file also sits in the image that ``rivers serve`` runs from.
+SHARED_PARAMS = {
+    "module": ("module", "path"),
+    "repo_var": ("module", "repo_var"),
+    "storage_path": ("storage", "path"),
+    "surreal_endpoint": ("storage", "endpoint"),
+}
+
+
 class RiversEnvSource(EnvSettingsSource):
     def _load_env_vars(self):
         env = super()._load_env_vars()
@@ -109,6 +120,33 @@ class RiversConfig(BaseSettings):
         return settings_cls(
             **{name: fields for name, fields in provided.items() if fields}  # type: ignore
         )
+
+    def default_map(self, command) -> dict:
+        """Build the click ``default_map`` for a command tree.
+
+        Holds only the values that a source set, so a command keeps its own
+        default for everything else.
+
+        Args:
+            command: The root click command.
+
+        Returns:
+            dict: per command, the configured value of each parameter it takes.
+        """
+        configured = self.model_dump(exclude_unset=True)
+        values = {
+            param: configured[table][key]
+            for param, (table, key) in SHARED_PARAMS.items()
+            if key in configured.get(table, {})
+        }
+
+        def build(cmd) -> dict:
+            subcommands = getattr(cmd, "commands", None)
+            if subcommands is not None:
+                return {name: build(sub) for name, sub in subcommands.items()}
+            return {p.name: values[p.name] for p in cmd.params if p.name in values}
+
+        return build(command)
 
     @classmethod
     def settings_customise_sources(

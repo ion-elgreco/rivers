@@ -99,7 +99,7 @@ def test_dev_reads_config_from_explicit_path(resolved_tmp_path, monkeypatch, via
 
     args = ["dev"]
     if via == "flag":
-        args += ["--config", str(config)]
+        args = ["--config", str(config), "dev"]
     else:
         monkeypatch.setenv("RIVERS_CONFIG", str(config))
 
@@ -109,5 +109,5 @@ def test_dev_reads_config_from_explicit_path(resolved_tmp_path, monkeypatch, via
 
 
 def test_dev_missing_config_file_fails(resolved_tmp_path):
-    result = runner.invoke(app, ["dev", "--config", "missing.toml"])
+    result = runner.invoke(app, ["--config", "missing.toml", "dev"])
     assert isinstance(result.exception, FileNotFoundError)
