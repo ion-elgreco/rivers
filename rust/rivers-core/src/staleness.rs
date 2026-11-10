@@ -54,12 +54,13 @@ pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
 /// This matches the convention used by `GraphTopology.edges`.
 ///
 /// Returns a map from asset_key to (status, causes).
-pub fn compute_staleness(
-    records: &[AssetRecord],
+pub fn compute_staleness<'a>(
+    records: impl IntoIterator<Item = &'a AssetRecord>,
     edges: &[(String, String)],
 ) -> HashMap<String, (StaleStatus, Vec<StaleCause>)> {
+    let records: Vec<&AssetRecord> = records.into_iter().collect();
     let record_map: HashMap<&str, &AssetRecord> =
-        records.iter().map(|r| (r.asset_key.as_str(), r)).collect();
+        records.iter().map(|r| (r.asset_key.as_str(), *r)).collect();
 
     let mut upstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut downstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -80,7 +81,7 @@ pub fn compute_staleness(
     // An upstream without a record (a remote asset) must still enter the
     // queue, or it never releases its downstreams.
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    for r in records {
+    for r in &records {
         in_degree.entry(r.asset_key.as_str()).or_insert(0);
     }
     for (from, to) in edges {

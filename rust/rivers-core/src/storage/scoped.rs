@@ -505,14 +505,13 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
             ));
         }
 
+        let remote_records = self.remote_upstream_records(topology).await?;
         // A row of a remote's name is left from when the asset was local.
-        let mut all: Vec<AssetRecord> = records
+        let owned = records
             .iter()
-            .filter(|record| !remote.contains(record.asset_key.as_str()))
-            .cloned()
-            .collect();
-        all.extend(self.remote_upstream_records(topology).await?);
-        let mut staleness = crate::staleness::compute_staleness(&all, &topology.edges);
+            .filter(|record| !remote.contains(record.asset_key.as_str()));
+        let mut staleness =
+            crate::staleness::compute_staleness(owned.chain(&remote_records), &topology.edges);
         staleness.retain(|key, _| !remote.contains(key.as_str()));
         Ok(staleness)
     }
