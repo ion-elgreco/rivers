@@ -9,6 +9,8 @@ import typer
 from typer.testing import CliRunner
 
 from rivers.cli import app
+from rivers.testing import memory_storage
+
 from rivers.cli.config import (
     RIVERS_TOML_NAMES,
     DaemonConfig,
@@ -640,9 +642,29 @@ class TestDefaultMap:
         assert self._default_map()["pools"]["list"] == {"storage_path": "from_env"}
 
 
+@pytest.fixture
+def opened(monkeypatch):
+    """Record the store each command opens. Every store is in memory: a new
+    store on disk syncs each migration commit, which is slow on Windows."""
+    calls = []
+
+    def record(kind):
+        def open_store(target=None):
+            calls.append((kind, target))
+            return memory_storage()
+
+        return staticmethod(open_store)
+
+    kinds = ("embedded", "connect", "_scratch", "migrate_embedded", "migrate_remote")
+    stub = type("_Storage", (), {kind: record(kind) for kind in kinds})
+    for module in ("_common", "pools", "run_queue", "db"):
+        monkeypatch.setattr(f"rivers.cli.{module}.Storage", stub)
+    return calls
+
+
 class TestRootConfig:
     def test_materialize_takes_module_and_storage(
-        self, resolved_tmp_path, write_config, repo_module
+        self, write_config, repo_module, opened
     ):
         write_config(
             module={"path": repo_module, "repo_var": "pipeline"},
@@ -653,59 +675,55 @@ class TestRootConfig:
 
         assert result.exit_code == 0, result.output
         assert "tiny" in result.output
-        assert (resolved_tmp_path / "store").is_dir()
+        assert opened == [("embedded", "store")]
 
     def test_materialize_keeps_the_scratch_store_without_storage(
-        self, resolved_tmp_path, write_config, repo_module
+        self, write_config, repo_module, opened
     ):
         write_config(module={"path": repo_module, "repo_var": "pipeline"})
 
         result = runner.invoke(app, ["materialize"])
 
         assert result.exit_code == 0, result.output
-        assert not (resolved_tmp_path / ".rivers").exists()
+        assert [kind for kind, _ in opened] == ["_scratch"]
 
     @pytest.mark.parametrize(
-        "command", [["pools", "list"], ["queue", "list"], ["db", "migrate"]]
+        ("command", "kind"),
+        [
+            (["pools", "list"], "embedded"),
+            (["queue", "list"], "embedded"),
+            (["db", "migrate"], "migrate_embedded"),
+        ],
     )
-    def test_storage_commands_take_the_path(
-        self, resolved_tmp_path, write_config, command
-    ):
+    def test_storage_commands_take_the_path(self, write_config, opened, command, kind):
         write_config(storage={"path": "store"})
 
         result = runner.invoke(app, command)
 
         assert result.exit_code == 0, result.output
-        assert (resolved_tmp_path / "store").is_dir()
-        assert not (resolved_tmp_path / ".rivers").exists()
+        assert opened == [(kind, "store")]
 
-    def test_flag_beats_config(self, resolved_tmp_path, write_config):
+    def test_flag_beats_config(self, write_config, opened):
         write_config(storage={"path": "from_config"})
 
         result = runner.invoke(app, ["pools", "list", "--storage-path", "from_flag"])
 
         assert result.exit_code == 0, result.output
-        assert (resolved_tmp_path / "from_flag").is_dir()
-        assert not (resolved_tmp_path / "from_config").exists()
+        assert opened == [("embedded", "from_flag")]
 
     @pytest.mark.parametrize("env", [None, "ws://from_env"])
-    def test_option_env_var_beats_config(self, write_config, monkeypatch, env):
+    def test_option_env_var_beats_config(self, write_config, monkeypatch, opened, env):
         write_config(storage={"endpoint": "ws://from_config"})
         if env:
             monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", env)
-        migrated = []
-        monkeypatch.setattr(
-            "rivers.cli.db.Storage",
-            type("_S", (), {"migrate_remote": staticmethod(migrated.append)}),
-        )
 
         result = runner.invoke(app, ["db", "migrate"])
 
         assert result.exit_code == 0, result.output
-        assert migrated == [env or "ws://from_config"]
+        assert opened == [("migrate_remote", env or "ws://from_config")]
 
     @pytest.mark.parametrize("via", ["flag", "env"])
-    def test_explicit_config_path(self, resolved_tmp_path, monkeypatch, via):
+    def test_explicit_config_path(self, resolved_tmp_path, monkeypatch, opened, via):
         explicit = _make_rivers_toml(
             resolved_tmp_path, "elsewhere/custom.toml", storage={"path": "explicit"}
         )
@@ -719,8 +737,7 @@ class TestRootConfig:
         result = runner.invoke(app, args)
 
         assert result.exit_code == 0, result.output
-        assert (resolved_tmp_path / "explicit").is_dir()
-        assert not (resolved_tmp_path / "discovered").exists()
+        assert opened == [("embedded", "explicit")]
 
     def test_missing_config_file_fails(self, resolved_tmp_path):
         result = runner.invoke(app, ["--config", "missing.toml", "pools", "list"])
