@@ -19,25 +19,12 @@ import rivers as rs
 
 from _helpers import EXECUTORS
 
-_ENV = (
-    "RIVERS_CODE_LOCATION_ID",
-    "RIVERS_CODE_LOCATION_NAME",
-    "RIVERS_CODE_LOCATION_NAMESPACE",
-    "RIVERS_NAMESPACE",
-    "RIVERS_DEPLOYMENT",
-    "RIVERS_RUN_ID",
-)
+pytestmark = pytest.mark.usefixtures("clean_code_location_env")
 
 NOT_REGISTERED = (
     "code location 'dev/warehouse' is not registered; loading 'raw_orders' "
     "through the handler without data-version tracking"
 )
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for name in _ENV:
-        monkeypatch.delenv(name, raising=False)
 
 
 def _pickle_handler(root: Path) -> rs.PickleIOHandler:
@@ -277,8 +264,7 @@ def _warning_lines(logs: str) -> list[str]:
 def test_unregistered_owner_warning_does_not_depend_on_the_log_filter(
     executor, log_filter, tmp_path
 ):
-    env = {name: value for name, value in os.environ.items() if name not in _ENV}
-    env["RUST_LOG"] = log_filter
+    env = {**os.environ, "RUST_LOG": log_filter}
     proc = subprocess.run(
         [sys.executable, "-c", _TWO_LOADING_STEPS, str(tmp_path), executor],
         env=env,

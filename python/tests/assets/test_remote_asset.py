@@ -18,20 +18,7 @@ from rivers.exceptions import (
 
 from _helpers import EXECUTORS, DictIOHandler, make_repo, materialize_beside_sibling
 
-_ENV = (
-    "RIVERS_CODE_LOCATION_ID",
-    "RIVERS_CODE_LOCATION_NAME",
-    "RIVERS_CODE_LOCATION_NAMESPACE",
-    "RIVERS_NAMESPACE",
-    "RIVERS_DEPLOYMENT",
-    "RIVERS_RUN_ID",
-)
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for name in _ENV:
-        monkeypatch.delenv(name, raising=False)
+pytestmark = pytest.mark.usefixtures("clean_code_location_env")
 
 
 def _pickle_handler(root: Path) -> rs.PickleIOHandler:

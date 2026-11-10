@@ -6,21 +6,7 @@ import pytest
 
 import rivers as rs
 
-_ENV = (
-    "RIVERS_CODE_LOCATION_ID",
-    "RIVERS_CODE_LOCATION_NAME",
-    "RIVERS_CODE_LOCATION_NAMESPACE",
-    "RIVERS_NAMESPACE",
-    "RIVERS_DEPLOYMENT",
-    "RIVERS_RUN_ID",
-    "RIVERS_MODULE",
-)
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for name in _ENV:
-        monkeypatch.delenv(name, raising=False)
+pytestmark = pytest.mark.usefixtures("clean_code_location_env")
 
 
 def _repo() -> rs.CodeRepository:

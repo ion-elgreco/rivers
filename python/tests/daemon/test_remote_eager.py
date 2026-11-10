@@ -17,24 +17,11 @@ from rivers._core import AutomationDaemon
 
 from _polling import wait_for
 
-_ENV = (
-    "RIVERS_CODE_LOCATION_ID",
-    "RIVERS_CODE_LOCATION_NAME",
-    "RIVERS_CODE_LOCATION_NAMESPACE",
-    "RIVERS_NAMESPACE",
-    "RIVERS_DEPLOYMENT",
-    "RIVERS_RUN_ID",
-)
+pytestmark = pytest.mark.usefixtures("clean_code_location_env")
 
 DAILY = rs.PartitionsDefinition.daily(
     start=datetime(2024, 1, 1), end=datetime(2024, 1, 5)
 )
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for name in _ENV:
-        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
