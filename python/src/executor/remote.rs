@@ -55,8 +55,12 @@ pub(super) fn prefill_remote_dep_versions(
 
     let mut warnings: Vec<(&str, String)> = Vec::new();
     let mut owners: HashMap<&LocationRef, Option<GraphTopology>> = HashMap::new();
+    let mut tracked: Vec<(&str, &str, &RemoteRef)> = Vec::new();
     for &(local, remote) in &refs {
-        let Some(identity) = identities.get(&remote.code_location).cloned().flatten() else {
+        let Some(identity) = identities
+            .get(&remote.code_location)
+            .and_then(Option::as_deref)
+        else {
             warnings.push((
                 local,
                 format!(
@@ -67,8 +71,8 @@ pub(super) fn prefill_remote_dep_versions(
             ));
             continue;
         };
-        let ctx = CodeLocationContext::new(&identity);
         if warn_to.is_some() {
+            let ctx = CodeLocationContext::new(identity);
             let owner = owners
                 .entry(&remote.code_location)
                 .or_insert_with(|| owner_topology(backend, &ctx, &remote.code_location));
@@ -79,29 +83,59 @@ pub(super) fn prefill_remote_dep_versions(
                 warnings.push((local, warning));
             }
         }
-        match io_rt().block_on(
-            backend
-                .for_code_location(&ctx)
-                .get_asset_record(&remote.asset_key),
-        ) {
-            Ok(record) => {
-                if let Some(dv) = record.and_then(|r| r.last_data_version) {
-                    data_versions.insert(local.to_string(), dv);
-                }
-            }
-            Err(error) => tracing::warn!(
-                target: "rivers::executor",
-                code_location = %remote.code_location,
-                asset = %remote.asset_key,
-                %error,
-                "reading a remote asset record failed; its data version is not tracked"
-            ),
+        tracked.push((local, identity, remote));
+    }
+
+    let versions = owner_data_versions(backend, &tracked);
+    for (local, identity, remote) in tracked {
+        if let Some(dv) = versions
+            .get(identity)
+            .and_then(|owned| owned.get(&remote.asset_key))
+        {
+            data_versions.insert(local.to_string(), dv.clone());
         }
     }
 
     if let Some((writer, run_id)) = warn_to {
         warn_loading_steps(plan, node_map, &warnings, writer, run_id);
     }
+}
+
+/// The data versions of each owner identity in `tracked`, by owner asset key,
+/// read with one query per owner. An owner whose read failed has none.
+fn owner_data_versions<'a, S: StorageBackend>(
+    backend: &S,
+    tracked: &[(&str, &'a str, &'a RemoteRef)],
+) -> HashMap<&'a str, HashMap<String, String>> {
+    let mut keys: HashMap<&str, (&LocationRef, Vec<String>)> = HashMap::new();
+    for &(_, identity, remote) in tracked {
+        keys.entry(identity)
+            .or_insert_with(|| (&remote.code_location, Vec::new()))
+            .1
+            .push(remote.asset_key.clone());
+    }
+
+    let mut versions = HashMap::new();
+    for (identity, (location, keys)) in keys {
+        let ctx = CodeLocationContext::new(identity);
+        let scoped = backend.for_code_location(&ctx);
+        match io_rt().block_on(scoped.get_asset_records_by_keys(&keys)) {
+            Ok(records) => {
+                let owned = records
+                    .into_iter()
+                    .filter_map(|record| Some((record.asset_key, record.last_data_version?)))
+                    .collect();
+                versions.insert(identity, owned);
+            }
+            Err(error) => tracing::warn!(
+                target: "rivers::executor",
+                code_location = %location,
+                %error,
+                "reading remote asset records failed; their data versions are not tracked"
+            ),
+        }
+    }
+    versions
 }
 
 /// The owner's topology; `None` when it has none or reading it failed.

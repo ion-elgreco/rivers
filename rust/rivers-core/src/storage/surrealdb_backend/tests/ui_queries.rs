@@ -708,6 +708,59 @@ mod remote_staleness {
         );
     }
 
+    /// One record per remote node that has an owner record, in node order.
+    #[tokio::test]
+    async fn upstream_records_follow_the_node_order_across_owners() {
+        let storage = make_storage().await;
+        for (location, identity) in [("warehouse", "wh"), ("shop", "sh")] {
+            storage
+                .set_code_location_identity(&LocationRef::new("dev", location).unwrap(), identity)
+                .await
+                .unwrap();
+        }
+        register_as(&storage, "wh", &["raw_orders", "customers"]).await;
+        register_as(&storage, "sh", &["raw_orders"]).await;
+        materialize(&storage, "wh", "raw_orders", "wh-orders", &[], 100).await;
+        materialize(&storage, "wh", "customers", "wh-customers", &[], 110).await;
+        materialize(&storage, "sh", "raw_orders", "sh-orders", &[], 120).await;
+        let topology = GraphTopology {
+            nodes: vec![
+                remote("shop_orders", "shop", "raw_orders"),
+                remote("orders", "warehouse", "raw_orders"),
+                remote("missing", "warehouse", "no_such_asset"),
+                TopologyNode::new("local", NodeKind::Asset),
+                remote("customers", "warehouse", "customers"),
+                remote("ghost", "nowhere", "ghost"),
+                remote("orders_again", "warehouse", "raw_orders"),
+            ],
+            ..Default::default()
+        };
+
+        let ctx = CodeLocationContext::new("analytics");
+        let records = storage
+            .for_code_location(&ctx)
+            .remote_upstream_records(&topology)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (
+                    r.asset_key.as_str(),
+                    r.code_location_id.as_str(),
+                    r.last_data_version.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shop_orders", "sh", Some("sh-orders")),
+                ("orders", "wh", Some("wh-orders")),
+                ("customers", "wh", Some("wh-customers")),
+                ("orders_again", "wh", Some("wh-orders")),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn unmaterialized_owner_asset_makes_the_consumer_stale() {
         let storage = setup().await;

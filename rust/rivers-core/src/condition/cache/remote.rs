@@ -593,10 +593,17 @@ impl AssetConditionCache {
         keys: impl IntoIterator<Item = &'k String>,
         full: impl Fn(&str) -> bool,
     ) -> anyhow::Result<RemoteRead> {
+        let keys: Vec<String> = keys.into_iter().cloned().collect();
+        let mut records: HashMap<String, AssetRecord> = scoped
+            .get_asset_records_by_keys(&keys)
+            .await?
+            .into_iter()
+            .map(|record| (record.asset_key.clone(), record))
+            .collect();
+
         let mut read = RemoteRead::default();
-        for key in keys {
-            read.records
-                .push((key.clone(), scoped.get_asset_record(key).await?));
+        for key in &keys {
+            read.records.push((key.clone(), records.remove(key)));
 
             let Some(local) = slot.bindings[key]
                 .iter()

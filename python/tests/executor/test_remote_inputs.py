@@ -124,6 +124,7 @@ def test_remote_input_records_the_owners_data_version(
 def test_aliases_record_each_owners_version_under_the_local_name(
     embedded_storage, tmp_path, monkeypatch
 ):
+    """Two aliases share one owner asset; ``ghost`` has no owner record."""
     warehouse = _pickle_handler(tmp_path / "warehouse")
     shop = _pickle_handler(tmp_path / "shop")
     warehouse_dv = _owner(warehouse, embedded_storage, monkeypatch)
@@ -134,25 +135,35 @@ def test_aliases_record_each_owners_version_under_the_local_name(
         asset_key="raw_orders",
         io_handler=warehouse,
     )
+    baz_orders = rs.Asset.remote(
+        "baz_orders",
+        code_location="warehouse",
+        asset_key="raw_orders",
+        io_handler=warehouse,
+    )
     bar_orders = rs.Asset.remote(
         "bar_orders", code_location="shop", asset_key="raw_orders", io_handler=shop
     )
+    ghost = rs.Asset.remote("ghost", code_location="warehouse")
 
-    @rs.Asset(io_handler=warehouse)
-    def merged_orders(foo_orders: list[int], bar_orders: list[int]) -> list[int]:
-        return foo_orders + bar_orders
+    @rs.Asset(io_handler=warehouse, deps=[rs.AssetDef.dep("ghost")])
+    def merged_orders(
+        foo_orders: list[int], baz_orders: list[int], bar_orders: list[int]
+    ) -> list[int]:
+        return foo_orders + baz_orders + bar_orders
 
     consumer = _resolve_as(
-        [foo_orders, bar_orders, merged_orders],
+        [foo_orders, baz_orders, bar_orders, ghost, merged_orders],
         embedded_storage,
         monkeypatch,
         "analytics",
     )
 
     assert consumer.materialize().success
-    assert consumer.load_node("merged_orders") == [1, 2, 3, 4]
+    assert consumer.load_node("merged_orders") == [1, 2, 3, 1, 2, 3, 4]
     assert _input_versions(embedded_storage, "merged_orders") == [
         ("bar_orders", shop_dv),
+        ("baz_orders", warehouse_dv),
         ("foo_orders", warehouse_dv),
     ]
 

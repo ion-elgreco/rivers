@@ -532,21 +532,40 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
             .map(|(_, remote)| &remote.code_location)
             .collect();
         let identities = super::resolve_code_locations(self.backend, locations).await?;
+        let resolved: Vec<(&str, &str, &String)> = remotes
+            .into_iter()
+            .filter_map(|(local, remote)| {
+                let identity = identities.get(&remote.code_location)?.as_deref()?;
+                Some((local, identity, &remote.asset_key))
+            })
+            .collect();
 
-        let mut records = Vec::new();
-        for (local, remote) in remotes {
-            let Some(Some(identity)) = identities.get(&remote.code_location) else {
-                continue;
-            };
-            if let Some(owner) = self
-                .backend
-                .get_asset_record(identity, &remote.asset_key)
-                .await?
-            {
-                records.push(crate::staleness::remote_input_record(local, &owner));
-            }
+        let mut keys: HashMap<&str, Vec<String>> = HashMap::new();
+        for &(_, identity, key) in &resolved {
+            keys.entry(identity).or_default().push(key.clone());
         }
-        Ok(records)
+        let mut owners: HashMap<&str, HashMap<String, AssetRecord>> = HashMap::new();
+        for (identity, keys) in keys {
+            let records = self
+                .backend
+                .get_asset_records_by_keys(identity, &keys)
+                .await?;
+            owners.insert(
+                identity,
+                records
+                    .into_iter()
+                    .map(|record| (record.asset_key.clone(), record))
+                    .collect(),
+            );
+        }
+
+        Ok(resolved
+            .into_iter()
+            .filter_map(|(local, identity, key)| {
+                let owner = owners[identity].get(key)?;
+                Some(crate::staleness::remote_input_record(local, owner))
+            })
+            .collect())
     }
 
     fn dynamic_keys_kv_key(

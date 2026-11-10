@@ -99,13 +99,21 @@ impl PerCodeLocationStorage for SurrealStorage {
     /// location's whole asset set — so an `asset_key IN $keys` clause saves no
     /// reads and costs one list comparison per scanned row. At 3,200 keys that
     /// clause was 473 ms against 9 ms for the same scan filtered here.
+    ///
+    /// One key goes through `get_asset_record`: at 3,000 assets the scan took
+    /// 13 ms against 4 ms for that query.
     async fn get_asset_records_by_keys(
         &self,
         code_location_id: &str,
         keys: &[String],
     ) -> Result<Vec<AssetRecord>> {
-        if keys.is_empty() {
-            return Ok(vec![]);
+        match keys {
+            [] => return Ok(vec![]),
+            [key] => {
+                let record = self.get_asset_record(code_location_id, key).await?;
+                return Ok(record.into_iter().collect());
+            }
+            _ => {}
         }
         let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut result = self
