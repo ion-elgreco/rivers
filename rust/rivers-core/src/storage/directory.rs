@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use super::StorageBackend;
@@ -111,14 +112,12 @@ pub async fn resolve_code_locations<'a, S: StorageBackend + ?Sized>(
     storage: &S,
     locations: impl IntoIterator<Item = &'a LocationRef>,
 ) -> anyhow::Result<HashMap<LocationRef, Option<String>>> {
-    let mut out = HashMap::new();
-    for location in locations {
-        if !out.contains_key(location) {
-            let identity = storage.get_code_location_identity(location).await?;
-            out.insert(location.clone(), identity);
-        }
-    }
-    Ok(out)
+    let unique: HashSet<&LocationRef> = locations.into_iter().collect();
+    let lookups = unique.into_iter().map(|location| async move {
+        let identity = storage.get_code_location_identity(location).await?;
+        anyhow::Ok((location.clone(), identity))
+    });
+    Ok(try_join_all(lookups).await?.into_iter().collect())
 }
 
 #[cfg(test)]
