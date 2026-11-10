@@ -18,7 +18,7 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use common::{flush_effects, fresh_mount_target, query_all, query_one};
 use leptos::mount::mount_to;
@@ -353,6 +353,64 @@ fn remote_node_shows_its_owner_with_a_dotted_capsule() {
     let text = target.text_content().unwrap_or_default();
     assert!(text.contains("warehouse · raw_"), "got: {text}");
     assert!(query_all(&target, "g.dag-node-unregistered").is_empty());
+}
+
+/// `upstream` has its owner's status; `downstream` is a remote without one.
+#[wasm_bindgen_test]
+fn remote_node_dot_shows_the_owners_status() {
+    use rivers_ui::types::StaleStatus;
+
+    let cases = [
+        (StaleStatus::UpToDate, "#22c55e", "up-to-date"),
+        (StaleStatus::Stale, "#f59e0b", "stale"),
+        (StaleStatus::Missing, "#535559", "missing"),
+    ];
+    for (status, fill, word) in cases {
+        let target = fresh_mount_target();
+        let viewport = RwSignal::new((-50.0_f64, -50.0_f64, 800.0_f64, 200.0_f64));
+        let mut layout = remote_layout(true);
+        layout.nodes[2].remote = Some(rivers_ui::types::RemoteNode {
+            code_location: "team-sales/warehouse".to_string(),
+            asset_key: "refunds".to_string(),
+            resolved: true,
+            drift: None,
+        });
+        let statuses: HashMap<String, StaleStatus> =
+            HashMap::from([("upstream".to_string(), status)]);
+        let _handle = mount_to(target.clone(), move || {
+            view! {
+                <DagGraph
+                    layout=layout.clone()
+                    on_node_click=Callback::new(|_| {})
+                    viewport=Signal::derive(move || viewport.get())
+                    remote_statuses=statuses.clone()
+                />
+            }
+        });
+
+        let nodes = query_all(&target, "g.dag-node");
+        let dot = query_one(&nodes[0], "circle");
+        assert_eq!(dot.get_attribute("fill").as_deref(), Some(fill), "{word}");
+        assert_eq!(
+            dot.get_attribute("stroke").as_deref(),
+            Some("none"),
+            "{word}"
+        );
+        let title = query_one(&nodes[0], "title")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(
+            title,
+            format!("upstream: raw_orders in team-sales/warehouse ({word})")
+        );
+        let hollow = query_one(&nodes[2], "circle");
+        assert_eq!(hollow.get_attribute("fill").as_deref(), Some("none"));
+        assert_eq!(
+            query_all(&target, "rect[stroke-dasharray='2 3']").len(),
+            2,
+            "both stay dotted"
+        );
+    }
 }
 
 #[wasm_bindgen_test]

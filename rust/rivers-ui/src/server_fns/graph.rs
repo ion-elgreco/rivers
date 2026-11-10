@@ -6,12 +6,14 @@
 //! override on the standalone UI binary bypasses storage entirely and
 //! serves a fixed in-memory graph for every CL.
 
+use std::collections::HashMap;
+
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
 #[allow(unused_imports)]
 use crate::components::dag::layout::{LayoutResult, compute_layout};
-use crate::types::{GraphTopology, RemoteDownstream};
+use crate::types::{GraphTopology, RemoteDownstream, StaleStatus};
 
 /// The topology of `loc_ns/loc_name`, and the identity it was read under
 /// (`None` for the synthetic graph).
@@ -56,6 +58,48 @@ async fn read_topology(
         .flatten()
 }
 
+/// The code location that owns a remote node: `None` when the registry does
+/// not know it. Its topology is `None` when it wrote none.
+#[cfg(feature = "ssr")]
+type Owner = Option<(
+    rivers_core::storage::CodeLocationContext,
+    Option<rivers_core::assets::graph::GraphTopology>,
+)>;
+
+/// The owner of each remote node of `topology`, by code location.
+#[cfg(feature = "ssr")]
+async fn load_owners<'t>(
+    state: &crate::state::AppState,
+    topology: &'t rivers_core::assets::graph::GraphTopology,
+) -> HashMap<&'t rivers_core::assets::remote::LocationRef, Owner> {
+    use rivers_core::storage::CodeLocationContext;
+
+    let mut owners = HashMap::new();
+    for remote in topology
+        .nodes
+        .iter()
+        .filter_map(|node| node.remote.as_ref())
+    {
+        let location = &remote.code_location;
+        if owners.contains_key(location) {
+            continue;
+        }
+        let entry = state
+            .registry
+            .lookup(location.namespace(), location.name())
+            .await;
+        let owner = match entry {
+            Some(entry) => {
+                let topology = read_topology(state, &entry.identity).await;
+                Some((CodeLocationContext::new(entry.identity), topology))
+            }
+            None => None,
+        };
+        owners.insert(location, owner);
+    }
+    owners
+}
+
 /// The UI topology. A remote node is resolved when the registry knows its
 /// owning code location, and then carries its partition drift against the
 /// owner's topology, if the owner wrote one.
@@ -65,9 +109,6 @@ async fn load_ui_topology(
     loc_ns: &str,
     loc_name: &str,
 ) -> Result<GraphTopology, ServerFnError> {
-    use std::collections::HashMap;
-
-    use rivers_core::assets::graph::GraphTopology as CoreTopology;
     use rivers_core::assets::partitions_fingerprint::partition_drift;
     use rivers_core::storage::CodeLocationContext;
 
@@ -75,38 +116,17 @@ async fn load_ui_topology(
 
     let (topology, identity) = load_topology(state, loc_ns, loc_name).await?;
     let consumer = CodeLocationContext::new(identity.unwrap_or_default());
+    let owners = load_owners(state, &topology).await;
 
-    // Location → `None` when unregistered, `Some(None)` without a topology.
-    type Owner = Option<Option<(CodeLocationContext, CoreTopology)>>;
-    let mut owners: HashMap<String, Owner> = HashMap::new();
     let mut remotes: HashMap<String, (bool, Option<RemoteDrift>)> = HashMap::new();
     for node in &topology.nodes {
         let Some(remote) = &node.remote else {
             continue;
         };
-        let location = remote.code_location.to_string();
-        if !owners.contains_key(&location) {
-            let entry = state
-                .registry
-                .lookup(
-                    remote.code_location.namespace(),
-                    remote.code_location.name(),
-                )
-                .await;
-            let owner = match entry {
-                Some(entry) => Some(
-                    read_topology(state, &entry.identity)
-                        .await
-                        .map(|topology| (CodeLocationContext::new(entry.identity), topology)),
-                ),
-                None => None,
-            };
-            owners.insert(location.clone(), owner);
-        }
-        let seen = match &owners[&location] {
+        let seen = match &owners[&remote.code_location] {
             None => (false, None),
-            Some(None) => (true, None),
-            Some(Some((owner_ctx, owner))) => {
+            Some((_, None)) => (true, None),
+            Some((owner_ctx, Some(owner))) => {
                 let mirror = node.partitions.as_ref();
                 let check = partition_drift(owner, &remote.asset_key, mirror);
                 let settled = state
@@ -146,6 +166,59 @@ async fn load_ui_topology(
     Ok(ui)
 }
 
+/// The owner's status of each remote node, by node name. A node has none
+/// when the registry does not know its owner, or the owner has no record of
+/// the asset.
+#[cfg(feature = "ssr")]
+async fn load_remote_statuses(
+    state: &crate::state::AppState,
+    loc_ns: &str,
+    loc_name: &str,
+) -> Result<HashMap<String, StaleStatus>, ServerFnError> {
+    use rivers_core::assets::remote::{LocationRef, RemoteRef};
+    use rivers_core::storage::StorageBackend;
+
+    let (topology, _) = load_topology(state, loc_ns, loc_name).await?;
+    let owners = load_owners(state, &topology).await;
+    let remotes: Vec<(&str, &RemoteRef)> = topology
+        .nodes
+        .iter()
+        .filter_map(|node| Some((node.name.as_str(), node.remote.as_ref()?)))
+        .collect();
+
+    let mut keys: HashMap<&LocationRef, Vec<String>> = HashMap::new();
+    for (_, remote) in &remotes {
+        let owner_keys = keys.entry(&remote.code_location).or_default();
+        if !owner_keys.contains(&remote.asset_key) {
+            owner_keys.push(remote.asset_key.clone());
+        }
+    }
+
+    let mut staleness = HashMap::new();
+    for (location, keys) in keys {
+        let Some((owner, owner_topology)) = &owners[location] else {
+            continue;
+        };
+        let owner_staleness = state
+            .storage
+            .for_code_location(owner)
+            .staleness_of(&keys, owner_topology.as_ref())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        staleness.insert(location, owner_staleness);
+    }
+
+    Ok(remotes
+        .into_iter()
+        .filter_map(|(name, remote)| {
+            let (status, _) = staleness
+                .get(&remote.code_location)?
+                .get(&remote.asset_key)?;
+            Some((name.to_string(), status.clone().into()))
+        })
+        .collect())
+}
+
 /// Layout of what the lineage page shows: the kind and group filters, with
 /// graph assets outside `expanded` collapsed. See [`GraphTopology::visible`].
 #[server(input = Json)]
@@ -172,6 +245,17 @@ pub async fn get_graph_topology(
 ) -> Result<GraphTopology, ServerFnError> {
     let state = expect_context::<crate::state::AppState>();
     load_ui_topology(&state, &loc_ns, &loc_name).await
+}
+
+/// The owner's status of each remote node, by node name. Only the status
+/// leaves the owner.
+#[server]
+pub async fn get_remote_statuses(
+    loc_ns: String,
+    loc_name: String,
+) -> Result<HashMap<String, StaleStatus>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    load_remote_statuses(&state, &loc_ns, &loc_name).await
 }
 
 /// Returns (ancestors, descendants) for the given node name.
@@ -385,6 +469,125 @@ mod tests {
         assert_eq!(seen("shop_orders"), Some((true, None)), "no topology");
         assert_eq!(seen("ghost"), Some((false, None)), "not registered");
         assert_eq!(seen("report"), None);
+    }
+
+    /// Registers `key` in `identity`; materializes it when `dv` is set.
+    async fn asset(
+        storage: &SurrealStorage,
+        identity: &str,
+        key: &str,
+        code_version: Option<&str>,
+        dv: Option<&str>,
+        inputs: &[(&str, &str)],
+    ) {
+        use rivers_core::storage::{AssetRecord, EventRecord, EventType};
+
+        let record = AssetRecord {
+            code_location_id: identity.into(),
+            asset_key: key.into(),
+            tags: vec![],
+            kinds: vec![],
+            asset_group: None,
+            code_version: code_version.map(str::to_string),
+            last_event_id: None,
+            last_run_id: None,
+            last_timestamp: None,
+            last_data_version: None,
+            last_materialization_code_version: None,
+            last_input_data_versions: vec![],
+            pool: vec![],
+        };
+        storage
+            .for_code_location(&CodeLocationContext::new(identity))
+            .register_assets(&[record])
+            .await
+            .unwrap();
+        let Some(dv) = dv else {
+            return;
+        };
+        storage
+            .store_event(&EventRecord {
+                code_location_id: identity.into(),
+                event_type: EventType::Materialization {
+                    data_version: Some(dv.into()),
+                },
+                asset_key: Some(key.into()),
+                run_id: format!("{identity}-{key}"),
+                partition_key: None,
+                timestamp: 100,
+                metadata: vec![],
+                input_data_versions: inputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `regions` is stale through `seed`, two steps up in its owner. `shop`
+    /// wrote no topology. The warehouse has no record of `refunds` and no
+    /// asset `no_such_asset`; `nowhere` is not registered.
+    #[tokio::test]
+    async fn remote_nodes_get_the_owners_status() {
+        use crate::types::StaleStatus;
+
+        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let mut nodes = warehouse();
+        nodes.push(TopologyNode::new("seed", NodeKind::Asset));
+        nodes.push(TopologyNode::new("clean", NodeKind::Asset));
+        storage
+            .for_code_location(&CodeLocationContext::new("wh-id"))
+            .set_graph_topology(
+                &GraphTopology {
+                    nodes,
+                    edges: vec![edge("clean", "seed"), edge("regions", "clean")],
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        write(&storage, "an-id", analytics(), &[]).await;
+        asset(&storage, "wh-id", "seed", Some("v1"), Some("s1"), &[]).await;
+        asset(&storage, "wh-id", "seed", Some("v2"), None, &[]).await;
+        asset(
+            &storage,
+            "wh-id",
+            "clean",
+            None,
+            Some("c1"),
+            &[("seed", "s1")],
+        )
+        .await;
+        asset(
+            &storage,
+            "wh-id",
+            "regions",
+            None,
+            Some("r1"),
+            &[("clean", "c1")],
+        )
+        .await;
+        asset(&storage, "wh-id", "raw_orders", None, Some("o1"), &[]).await;
+        asset(&storage, "wh-id", "sites", None, None, &[]).await;
+        asset(&storage, "shop-id", "raw_orders", None, Some("p1"), &[]).await;
+
+        let statuses = super::load_remote_statuses(&state(&storage), "dev", "analytics")
+            .await
+            .unwrap();
+
+        let mut statuses: Vec<(String, StaleStatus)> = statuses.into_iter().collect();
+        statuses.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            statuses,
+            [
+                ("orders".to_string(), StaleStatus::UpToDate),
+                ("regions".to_string(), StaleStatus::Stale),
+                ("shop_orders".to_string(), StaleStatus::UpToDate),
+                ("sites".to_string(), StaleStatus::Missing),
+            ]
+        );
     }
 
     /// A pair of digests compared once is not read again: the answers stay

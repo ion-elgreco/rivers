@@ -14,7 +14,9 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
-use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
+use crate::server_fns::graph::{
+    get_graph_layout, get_graph_topology, get_node_lineage, get_remote_statuses,
+};
 use crate::server_fns::overview::get_assets_info;
 
 fn get_element_size(target: &Option<leptos::web_sys::EventTarget>) -> (f64, f64) {
@@ -178,6 +180,10 @@ pub fn GraphPage() -> impl IntoView {
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
+    );
+    let remote_statuses = Resource::new(
+        move || (loc.get(), refresh_tick.get(), live.definitions.get()),
+        |((ns, name), _, _)| get_remote_statuses(ns, name),
     );
 
     // Multi-selection in click order; the last entry is the focused node.
@@ -434,6 +440,13 @@ pub fn GraphPage() -> impl IntoView {
             .unwrap_or_default()
     });
 
+    let remote_status_by_node = Signal::derive(move || {
+        remote_statuses
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
+
     let external_keys = Signal::derive(move || {
         assets_info
             .get()
@@ -631,6 +644,7 @@ pub fn GraphPage() -> impl IntoView {
                                 let mat_keys = materialized_keys.get();
                                 let stl_keys = stale_keys.get();
                                 let ext_keys = external_keys.get();
+                                let rmt_statuses = remote_status_by_node.get();
                                 let anc_keys = ancestor_keys.get();
                                 let desc_keys = descendant_keys.get();
                                 let sel_set: std::collections::HashSet<String> =
@@ -642,7 +656,14 @@ pub fn GraphPage() -> impl IntoView {
 
                                 // Snapshot for the minimap before DagGraph consumes layout_result.
                                 let mini_nodes: Vec<MinimapNode> = layout_result.nodes.iter().map(|n| {
-                                    let status = if ext_keys.contains(&n.id) || n.remote.is_some() { "external" }
+                                    let remote_status = n.remote.as_ref().and(rmt_statuses.get(&n.id));
+                                    let status = if let Some(remote_status) = remote_status {
+                                        match remote_status {
+                                            crate::types::StaleStatus::UpToDate => "success",
+                                            crate::types::StaleStatus::Stale => "stale",
+                                            crate::types::StaleStatus::Missing => "missing",
+                                        }
+                                    } else if ext_keys.contains(&n.id) || n.remote.is_some() { "external" }
                                         else if stl_keys.contains(&n.id) { "stale" }
                                         else if mat_keys.contains(&n.id) { "success" }
                                         else { "missing" }.to_string();
@@ -684,6 +705,7 @@ pub fn GraphPage() -> impl IntoView {
                                         materialized_keys=mat_keys
                                         stale_keys=stl_keys
                                         external_keys=ext_keys
+                                        remote_statuses=rmt_statuses
                                         ancestor_keys=anc_keys
                                         descendant_keys=desc_keys
                                         selected_nodes=sel_set
@@ -897,6 +919,7 @@ pub fn GraphPage() -> impl IntoView {
                         .unwrap_or_default();
 
                     if let Some(remote) = remote_nodes.get().get(&node_name).cloned() {
+                        let owner_status = remote_status_by_node.get().remove(&node_name);
                         return Some(view! {
                             <div class="dag-selected-sidebar">
                                 <div class="dag-sidebar-header">
@@ -915,6 +938,13 @@ pub fn GraphPage() -> impl IntoView {
                                         {format!("{} in {}", remote.asset_key, remote.code_location)}
                                     </div>
                                 </div>
+
+                                {owner_status.map(|status| view! {
+                                    <div class="dag-sidebar-status">
+                                        <StatusChip kind=crate::helpers::stale_status_kind(&status)/>
+                                        {format!("in {}", remote.location().1)}
+                                    </div>
+                                })}
 
                                 <div class="dag-sidebar-empty">
                                     {if remote.resolved {

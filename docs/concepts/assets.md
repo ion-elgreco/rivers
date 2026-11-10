@@ -299,6 +299,8 @@ wh_orders = rs.Asset.remote("wh_orders", code_location="warehouse", asset_key="r
 
 The lineage view draws a remote asset with a dotted border, the owner's name, and the owner's key. It links to the asset in the owning code location when the UI knows that code location. Otherwise the node shows **not registered**. In `rivers dev`, the UI knows every code location that registered in its storage.
 
+The status dot of a remote asset shows the owner's status of the asset: up-to-date, stale, or missing. The dot is hollow when the UI does not know the owner, or when the owner has no record of the asset.
+
 On the owner's side, the **Lineage** tab of an asset lists the assets of other code locations that depend on it, under **In other code locations**. Each code location lists the remote assets it consumes when it resolves.
 
 ### Automation

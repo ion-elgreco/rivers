@@ -1,8 +1,56 @@
 //! Staleness computation for asset records.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::assets::graph::GraphTopology;
 use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
+
+/// What the staleness of `keys` reads: the part of `topology` from `keys` up,
+/// and the keys in it of the assets that this code location owns (`keys`
+/// included). The owners of its remote nodes hold their records.
+pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, GraphTopology) {
+    let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (from, to) in &topology.edges {
+        deps_of.entry(from.as_str()).or_default().push(to.as_str());
+    }
+    let mut part: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = keys.iter().map(String::as_str).collect();
+    while let Some(name) = stack.pop() {
+        if part.insert(name)
+            && let Some(deps) = deps_of.get(name)
+        {
+            stack.extend(deps);
+        }
+    }
+
+    let upstream = GraphTopology {
+        nodes: topology
+            .nodes
+            .iter()
+            .filter(|node| part.contains(node.name.as_str()))
+            .cloned()
+            .collect(),
+        edges: topology
+            .edges
+            .iter()
+            .filter(|(from, _)| part.contains(from.as_str()))
+            .cloned()
+            .collect(),
+    };
+    let remote: HashSet<&str> = upstream
+        .nodes
+        .iter()
+        .filter(|node| node.remote.is_some())
+        .map(|node| node.name.as_str())
+        .collect();
+    let mut owned: Vec<String> = part
+        .into_iter()
+        .filter(|name| !remote.contains(name))
+        .map(str::to_string)
+        .collect();
+    owned.sort();
+    (owned, upstream)
+}
 
 /// The owner's record of a remote asset, under its `local` name. Only the
 /// data version is kept: the owner's code and inputs make the owner stale,
@@ -365,6 +413,68 @@ mod tests {
         a.last_data_version = Some("dv1".to_string());
         let result = compute_staleness(&[a], &[]);
         assert_eq!(result["a"].0, StaleStatus::UpToDate);
+    }
+
+    /// `report` ← `clean` ← `seed`, and `count` ← the remote `orders`.
+    /// `unrelated` is downstream of `report`; `fresh` stands alone.
+    #[test]
+    fn test_upstream_of_reads_only_what_is_above_the_keys() {
+        use crate::assets::graph::{NodeKind, TopologyNode};
+        use crate::assets::remote::{LocationRef, RemoteRef};
+
+        let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
+        let orders = TopologyNode {
+            remote: Some(RemoteRef {
+                code_location: LocationRef::new("dev", "warehouse").unwrap(),
+                asset_key: "raw_orders".to_string(),
+            }),
+            ..node("orders")
+        };
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topology = GraphTopology {
+            nodes: vec![
+                orders,
+                node("seed"),
+                node("clean"),
+                node("report"),
+                node("count"),
+                node("fresh"),
+                node("unrelated"),
+            ],
+            edges: vec![
+                edge("clean", "seed"),
+                edge("report", "clean"),
+                edge("count", "orders"),
+                edge("unrelated", "report"),
+            ],
+        };
+        let keys = ["report", "count", "no_node"].map(String::from);
+
+        let (owned, upstream) = upstream_of(&keys, &topology);
+
+        assert_eq!(owned, ["clean", "count", "no_node", "report", "seed"]);
+        assert_eq!(
+            upstream
+                .nodes
+                .iter()
+                .map(|n| (n.name.as_str(), n.remote.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("orders", true),
+                ("seed", false),
+                ("clean", false),
+                ("report", false),
+                ("count", false),
+            ]
+        );
+        assert_eq!(
+            upstream.edges,
+            [
+                edge("clean", "seed"),
+                edge("report", "clean"),
+                edge("count", "orders"),
+            ]
+        );
     }
 
     #[test]

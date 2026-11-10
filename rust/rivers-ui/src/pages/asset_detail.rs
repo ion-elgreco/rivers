@@ -20,7 +20,7 @@ use crate::helpers::{
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
-use crate::server_fns::graph::{get_graph_topology, get_remote_downstream};
+use crate::server_fns::graph::{get_graph_topology, get_remote_downstream, get_remote_statuses};
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
 use crate::server_fns::overview::{get_assets_info, get_partition_status};
 use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
@@ -35,6 +35,16 @@ fn event_type_class(t: &crate::types::EventType) -> &'static str {
         E::Observation => "info",
         E::Deletion => "warn",
         _ => "muted",
+    }
+}
+
+/// The rail color of a Lineage tab row.
+fn rail_color(status: &crate::types::StaleStatus) -> &'static str {
+    use crate::types::StaleStatus as S;
+    match status {
+        S::UpToDate => "var(--success)",
+        S::Stale => "var(--warning)",
+        S::Missing => "var(--text-muted)",
     }
 }
 
@@ -173,6 +183,10 @@ pub fn AssetDetailPage() -> impl IntoView {
     let all_assets = Resource::new(
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
+    );
+    let remote_statuses = Resource::new(
+        move || (loc.get(), refresh_tick.get(), live.definitions.get()),
+        |((ns, name), _, _)| get_remote_statuses(ns, name),
     );
     // The materialize dialog's row decoration, from this page's live resource.
     let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
@@ -807,6 +821,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let current_key = key();
                     let topo = graph.get().and_then(|r| r.ok());
                     let records_by_key = records_by_key.get();
+                    let owner_statuses = remote_statuses.get().and_then(|r| r.ok()).unwrap_or_default();
                     let remotes: std::collections::HashMap<String, crate::types::RemoteNode> = topo
                         .as_ref()
                         .map(|t| {
@@ -834,7 +849,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                         } else {
                             let rows: Vec<_> = keys.into_iter().map(|dep| {
                                 if let Some(remote) = remotes.get(&dep) {
-                                    let style = "border-left-color: var(--text-muted); border-left-style: dotted";
+                                    let rail = owner_statuses.get(&dep).map_or("var(--text-muted)", rail_color);
+                                    let style = format!("border-left-color: {rail}; border-left-style: dotted");
                                     let row = view! {
                                         <span class="lineage-row-key">{dep}</span>
                                         <span class="lineage-row-kind">"remote"</span>
@@ -865,14 +881,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                     .and_then(|r| r.kinds.first().cloned())
                                     .unwrap_or_else(|| "asset".to_string());
                                 let mat_ts: Option<i64> = rec.and_then(|r| r.last_timestamp);
-                                let rail_color = rec
-                                    .map(|r| match r.stale_status {
-                                        crate::types::StaleStatus::UpToDate => "var(--success)",
-                                        crate::types::StaleStatus::Stale => "var(--warning)",
-                                        crate::types::StaleStatus::Missing => "var(--text-muted)",
-                                    })
-                                    .unwrap_or("var(--text-muted)");
-                                let style = format!("border-left-color: {rail_color}");
+                                let rail = rec.map_or("var(--text-muted)", |r| rail_color(&r.stale_status));
+                                let style = format!("border-left-color: {rail}");
                                 view! {
                                     <A href=href attr:class="lineage-row" attr:style=style>
                                         <span class="lineage-row-key">{dep}</span>

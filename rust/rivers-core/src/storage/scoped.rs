@@ -522,6 +522,26 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         Ok(staleness)
     }
 
+    /// Staleness of `keys` of this code location, as [`Self::staleness_for`]
+    /// gives it over all records. Reads only the records of `keys` and of the
+    /// assets upstream of them. A key without a record has no entry.
+    pub async fn staleness_of(
+        &self,
+        keys: &[String],
+        topology: Option<&GraphTopology>,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let Some(topology) = topology else {
+            let records = self.get_asset_records_by_keys(keys).await?;
+            return self.staleness_for(&records, None).await;
+        };
+
+        let (owned, upstream) = crate::staleness::upstream_of(keys, topology);
+        let records = self.get_asset_records_by_keys(&owned).await?;
+        let mut staleness = self.staleness_for(&records, Some(&upstream)).await?;
+        staleness.retain(|key, _| keys.contains(key));
+        Ok(staleness)
+    }
+
     /// The owner's record of each remote node in `topology`, under the local
     /// name (see [`crate::staleness::remote_input_record`]). A remote whose
     /// owner is not registered, or has no such asset, has none.

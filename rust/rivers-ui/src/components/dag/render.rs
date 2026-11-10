@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::layout::{LayoutEdge, LayoutNode, LayoutResult};
+use crate::types::StaleStatus;
 
 fn kind_accent(kind: &str) -> &'static str {
     match kind {
@@ -68,6 +69,10 @@ pub fn DagGraph(
     #[prop(optional)]
     stale_keys: HashSet<String>,
     #[prop(optional)] external_keys: HashSet<String>,
+    /// The owner's status of each remote node; a remote without one has a
+    /// hollow dot.
+    #[prop(optional)]
+    remote_statuses: HashMap<String, StaleStatus>,
     #[prop(optional)] ancestor_keys: HashSet<String>,
     #[prop(optional)] descendant_keys: HashSet<String>,
     #[prop(optional)] selected_nodes: HashSet<String>,
@@ -274,6 +279,7 @@ pub fn DagGraph(
                     let mat_keys = &materialized_keys;
                     let stl_keys = &stale_keys;
                     let ext_keys = &external_keys;
+                    let rmt_statuses = &remote_statuses;
                     let anc_keys = &ancestor_keys;
                     let desc_keys = &descendant_keys;
                     let sel_nodes = &selected_nodes;
@@ -292,6 +298,7 @@ pub fn DagGraph(
                                 mat_keys,
                                 stl_keys,
                                 ext_keys,
+                                rmt_statuses,
                                 anc_keys,
                                 desc_keys,
                                 sel_nodes,
@@ -316,6 +323,7 @@ fn render_node_full(
     materialized_keys: &HashSet<String>,
     stale_keys: &HashSet<String>,
     external_keys: &HashSet<String>,
+    remote_statuses: &HashMap<String, StaleStatus>,
     ancestor_keys: &HashSet<String>,
     descendant_keys: &HashSet<String>,
     selected_nodes: &HashSet<String>,
@@ -330,15 +338,27 @@ fn render_node_full(
     let is_expanded = expanded_graphs.contains(&node.id);
     let node_id = node.id.clone();
     let is_external = external_keys.contains(&node.id);
-    let is_materialized = materialized_keys.contains(&node.id);
-    let is_stale = stale_keys.contains(&node.id);
+    let remote = node.remote.as_ref();
+    let is_remote = remote.is_some();
+    let remote_status = remote.and(remote_statuses.get(&node.id));
+    let (is_materialized, is_stale) = if is_remote {
+        remote_status.map_or((false, false), |status| {
+            (
+                *status != StaleStatus::Missing,
+                *status == StaleStatus::Stale,
+            )
+        })
+    } else {
+        (
+            materialized_keys.contains(&node.id),
+            stale_keys.contains(&node.id),
+        )
+    };
     let is_selected = selected_nodes.contains(&node.id);
     let is_ancestor = ancestor_keys.contains(&node.id);
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
     let is_changed = changed_keys.contains(&node.id);
-    let remote = node.remote.as_ref();
-    let is_remote = remote.is_some();
     let remote_chip: Option<(&'static str, String, &'static str)> = remote.and_then(|r| {
         if !r.resolved {
             return Some((
@@ -461,15 +481,22 @@ fn render_node_full(
             "{}: {} in {} (code location not registered)",
             node.id, r.asset_key, r.code_location
         ),
-        Some(r) => match r.drift_message() {
-            Some(message) => format!(
-                "{}: {} in {}. {message}",
+        Some(r) => {
+            let status = remote_status
+                .map(|status| format!(" ({})", crate::helpers::stale_status_kind(status)))
+                .unwrap_or_default();
+            let drift = r
+                .drift_message()
+                .map(|message| format!(". {message}"))
+                .unwrap_or_default();
+            format!(
+                "{}: {} in {}{status}{drift}",
                 node.id, r.asset_key, r.code_location
-            ),
-            None => format!("{}: {} in {}", node.id, r.asset_key, r.code_location),
-        },
+            )
+        }
         None => node.id.clone(),
     };
+    let hollow_dot = is_remote && remote_status.is_none();
     let dash = if is_remote {
         "2 3"
     } else if is_external {
@@ -531,13 +558,13 @@ fn render_node_full(
             })}
 
             // Status dot (LEFT side, inside the capsule)
-            // Hollow for a remote: its state lives in the owning code location.
+            // Hollow for a remote whose owner's status is not known.
             <circle
                 cx={status_x.to_string()}
                 cy={status_y.to_string()}
                 r="5"
-                fill={if is_remote { "none" } else { status_color }}
-                stroke={if is_remote { "#8b8f9e" } else { "none" }}
+                fill={if hollow_dot { "none" } else { status_color }}
+                stroke={if hollow_dot { "#8b8f9e" } else { "none" }}
                 stroke-width="1.5"
             >
             </circle>
