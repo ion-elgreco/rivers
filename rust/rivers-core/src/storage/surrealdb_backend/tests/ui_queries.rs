@@ -433,18 +433,8 @@ async fn test_input_versions_from_event_not_storage() {
     use crate::assets::graph::TopologyNode;
     let topology = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "upstream".to_string(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "downstream".to_string(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("upstream", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("downstream", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("downstream".to_string(), "upstream".to_string())],
     };
@@ -535,4 +525,375 @@ async fn test_input_versions_from_event_not_storage() {
     let (status, causes) = staleness.get("downstream").unwrap();
     assert_eq!(status, &StaleStatus::Stale);
     assert!(!causes.is_empty());
+}
+
+mod remote_staleness {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::assets::graph::{NodeKind, TopologyNode};
+    use crate::assets::remote::{LocationRef, RemoteRef};
+    use crate::storage::{CodeLocationContext, CodeLocationDirectoryEntry, StaleCauseCategory};
+
+    fn remote(local: &str, location: &str, asset_key: &str) -> TopologyNode {
+        TopologyNode {
+            remote: Some(RemoteRef {
+                code_location: LocationRef::new("dev", location).unwrap(),
+                asset_key: asset_key.to_string(),
+            }),
+            ..TopologyNode::new(local, NodeKind::Asset)
+        }
+    }
+
+    async fn materialize(
+        storage: &SurrealStorage,
+        identity: &str,
+        asset: &str,
+        dv: &str,
+        inputs: &[(&str, &str)],
+        ts: i64,
+    ) {
+        storage
+            .store_event(&EventRecord {
+                code_location_id: identity.to_string(),
+                event_type: EventType::Materialization {
+                    data_version: Some(dv.to_string()),
+                },
+                input_data_versions: inputs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..make_event(asset, &format!("{identity}-{ts}"), ts)
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn register_as(storage: &SurrealStorage, identity: &str, keys: &[&str]) {
+        let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
+        storage.register_assets(identity, &records).await.unwrap();
+    }
+
+    /// `analytics` reads `raw_orders` of `warehouse` as `orders`, and
+    /// `ghost` of a location that never registered.
+    async fn setup() -> SurrealStorage {
+        let storage = make_storage().await;
+        storage
+            .upsert_code_location_registration(
+                &LocationRef::new("dev", "warehouse").unwrap(),
+                CodeLocationDirectoryEntry::new("warehouse"),
+            )
+            .await
+            .unwrap();
+        register_as(&storage, "warehouse", &["raw_orders"]).await;
+        // `orders` was local once and left a row.
+        register_as(&storage, "analytics", &["orders", "order_count"]).await;
+        materialize(&storage, "analytics", "orders", "local-dv", &[], 50).await;
+        storage
+            .set_graph_topology(
+                "analytics",
+                &GraphTopology {
+                    nodes: vec![
+                        remote("orders", "warehouse", "raw_orders"),
+                        remote("ghost", "nowhere", "ghost"),
+                        TopologyNode::new("order_count", NodeKind::Asset),
+                    ],
+                    edges: vec![
+                        ("order_count".into(), "orders".into()),
+                        ("order_count".into(), "ghost".into()),
+                    ],
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
+    async fn staleness(
+        storage: &SurrealStorage,
+    ) -> HashMap<String, (StaleStatus, Vec<crate::storage::StaleCause>)> {
+        let ctx = CodeLocationContext::new("analytics");
+        storage
+            .for_code_location(&ctx)
+            .compute_staleness()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumer_follows_the_owners_data_version() {
+        let storage = setup().await;
+        materialize(&storage, "warehouse", "raw_orders", "a1", &[], 100).await;
+        materialize(
+            &storage,
+            "analytics",
+            "order_count",
+            "b1",
+            &[("orders", "a1")],
+            200,
+        )
+        .await;
+
+        let result = staleness(&storage).await;
+        assert_eq!(result.keys().collect::<Vec<_>>(), vec!["order_count"]);
+        assert_eq!(result["order_count"], (StaleStatus::UpToDate, vec![]));
+
+        materialize(&storage, "warehouse", "raw_orders", "a2", &[], 300).await;
+        let (status, causes) = &staleness(&storage).await["order_count"];
+        assert_eq!(status, &StaleStatus::Stale);
+        assert_eq!(
+            causes
+                .iter()
+                .map(|c| (&c.category, c.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                &StaleCauseCategory::Data {
+                    dependency: "orders".into()
+                },
+                "upstream 'orders' has new data version"
+            )]
+        );
+
+        materialize(
+            &storage,
+            "analytics",
+            "order_count",
+            "b2",
+            &[("orders", "a2")],
+            400,
+        )
+        .await;
+        assert_eq!(
+            staleness(&storage).await["order_count"],
+            (StaleStatus::UpToDate, vec![])
+        );
+    }
+
+    /// The owner's code and inputs make the owner stale, not the consumer.
+    #[tokio::test]
+    async fn owners_code_version_is_not_the_consumers() {
+        let storage = setup().await;
+        let mut owner = make_asset_record("raw_orders");
+        owner.code_version = Some("v1".into());
+        storage
+            .register_assets("warehouse", &[owner.clone()])
+            .await
+            .unwrap();
+        materialize(&storage, "warehouse", "raw_orders", "a1", &[], 100).await;
+        owner.code_version = Some("v2".into());
+        storage
+            .register_assets("warehouse", &[owner])
+            .await
+            .unwrap();
+        let owner_scope = CodeLocationContext::new("warehouse");
+        let owner_staleness = storage
+            .for_code_location(&owner_scope)
+            .compute_staleness()
+            .await
+            .unwrap();
+        assert_eq!(owner_staleness["raw_orders"].0, StaleStatus::Stale);
+
+        materialize(
+            &storage,
+            "analytics",
+            "order_count",
+            "b1",
+            &[("orders", "a1")],
+            200,
+        )
+        .await;
+
+        assert_eq!(
+            staleness(&storage).await["order_count"],
+            (StaleStatus::UpToDate, vec![])
+        );
+    }
+
+    /// One record per remote node that has an owner record, in node order.
+    #[tokio::test]
+    async fn upstream_records_follow_the_node_order_across_owners() {
+        let storage = make_storage().await;
+        for (location, identity) in [("warehouse", "wh"), ("shop", "sh")] {
+            storage
+                .upsert_code_location_registration(
+                    &LocationRef::new("dev", location).unwrap(),
+                    CodeLocationDirectoryEntry::new(identity),
+                )
+                .await
+                .unwrap();
+        }
+        register_as(&storage, "wh", &["raw_orders", "customers"]).await;
+        register_as(&storage, "sh", &["raw_orders"]).await;
+        materialize(&storage, "wh", "raw_orders", "wh-orders", &[], 100).await;
+        materialize(&storage, "wh", "customers", "wh-customers", &[], 110).await;
+        materialize(&storage, "sh", "raw_orders", "sh-orders", &[], 120).await;
+        let topology = GraphTopology {
+            nodes: vec![
+                remote("shop_orders", "shop", "raw_orders"),
+                remote("orders", "warehouse", "raw_orders"),
+                remote("missing", "warehouse", "no_such_asset"),
+                TopologyNode::new("local", NodeKind::Asset),
+                remote("customers", "warehouse", "customers"),
+                remote("ghost", "nowhere", "ghost"),
+                remote("orders_again", "warehouse", "raw_orders"),
+            ],
+            ..Default::default()
+        };
+
+        let ctx = CodeLocationContext::new("analytics");
+        let records = storage
+            .for_code_location(&ctx)
+            .remote_upstream_records(&topology)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (
+                    r.asset_key.as_str(),
+                    r.code_location_id.as_str(),
+                    r.last_data_version.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shop_orders", "sh", Some("sh-orders")),
+                ("orders", "wh", Some("wh-orders")),
+                ("customers", "wh", Some("wh-customers")),
+                ("orders_again", "wh", Some("wh-orders")),
+            ]
+        );
+    }
+
+    /// `report` is stale through `seed`, two steps up; `order_count` through
+    /// the remote `orders`. `orders` keeps the row from when it was local.
+    #[tokio::test]
+    async fn staleness_of_keys_equals_the_staleness_of_all_assets() {
+        let storage = setup().await;
+        let mut seed = make_asset_record("seed");
+        seed.code_version = Some("v1".into());
+        storage
+            .register_assets("analytics", &[seed.clone()])
+            .await
+            .unwrap();
+        register_as(
+            &storage,
+            "analytics",
+            &["clean", "report", "fresh", "never", "unrelated"],
+        )
+        .await;
+        materialize(&storage, "analytics", "seed", "s1", &[], 100).await;
+        seed.code_version = Some("v2".into());
+        storage.register_assets("analytics", &[seed]).await.unwrap();
+        materialize(&storage, "analytics", "clean", "c1", &[("seed", "s1")], 110).await;
+        materialize(
+            &storage,
+            "analytics",
+            "report",
+            "r1",
+            &[("clean", "c1")],
+            120,
+        )
+        .await;
+        materialize(&storage, "analytics", "fresh", "f1", &[], 130).await;
+        materialize(
+            &storage,
+            "analytics",
+            "unrelated",
+            "u1",
+            &[("report", "r1")],
+            140,
+        )
+        .await;
+        materialize(&storage, "warehouse", "raw_orders", "a1", &[], 150).await;
+        materialize(
+            &storage,
+            "analytics",
+            "order_count",
+            "b1",
+            &[("orders", "a1")],
+            160,
+        )
+        .await;
+        materialize(&storage, "warehouse", "raw_orders", "a2", &[], 170).await;
+
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topology = GraphTopology {
+            nodes: vec![
+                remote("orders", "warehouse", "raw_orders"),
+                remote("ghost", "nowhere", "ghost"),
+                TopologyNode::new("order_count", NodeKind::Asset),
+                TopologyNode::new("seed", NodeKind::Asset),
+                TopologyNode::new("clean", NodeKind::Asset),
+                TopologyNode::new("report", NodeKind::Asset),
+                TopologyNode::new("fresh", NodeKind::Asset),
+                TopologyNode::new("never", NodeKind::Asset),
+                TopologyNode::new("unrelated", NodeKind::Asset),
+            ],
+            edges: vec![
+                edge("order_count", "orders"),
+                edge("order_count", "ghost"),
+                edge("clean", "seed"),
+                edge("report", "clean"),
+                edge("unrelated", "report"),
+            ],
+        };
+        storage
+            .set_graph_topology("analytics", &topology, &[])
+            .await
+            .unwrap();
+        let ctx = CodeLocationContext::new("analytics");
+        let scoped = storage.for_code_location(&ctx);
+        let keys = [
+            "report",
+            "order_count",
+            "fresh",
+            "never",
+            "orders",
+            "no_record",
+        ]
+        .map(String::from);
+        let only_keys = |all: HashMap<String, (StaleStatus, Vec<crate::storage::StaleCause>)>| {
+            all.into_iter()
+                .filter(|(key, _)| keys.contains(key))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let some = scoped.staleness_of(&keys, Some(&topology)).await.unwrap();
+
+        let mut statuses: Vec<(&str, &StaleStatus)> = some
+            .iter()
+            .map(|(key, (status, _))| (key.as_str(), status))
+            .collect();
+        statuses.sort_by_key(|(key, _)| *key);
+        assert_eq!(
+            statuses,
+            [
+                ("fresh", &StaleStatus::UpToDate),
+                ("never", &StaleStatus::Missing),
+                ("order_count", &StaleStatus::Stale),
+                ("report", &StaleStatus::Stale),
+            ]
+        );
+        assert_eq!(some, only_keys(scoped.compute_staleness().await.unwrap()));
+
+        let records = scoped.get_asset_records().await.unwrap();
+        let without_topology = scoped.staleness_of(&keys, None).await.unwrap();
+        assert_eq!(without_topology["report"].0, StaleStatus::UpToDate);
+        assert_eq!(
+            without_topology,
+            only_keys(scoped.staleness_for(&records, None).await.unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn unmaterialized_owner_asset_makes_the_consumer_stale() {
+        let storage = setup().await;
+        materialize(&storage, "analytics", "order_count", "b1", &[], 200).await;
+
+        let (status, causes) = &staleness(&storage).await["order_count"];
+        assert_eq!(status, &StaleStatus::Stale);
+        assert_eq!(causes[0].reason, "upstream 'orders' is stale");
+    }
 }

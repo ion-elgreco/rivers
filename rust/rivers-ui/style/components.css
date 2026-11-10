@@ -194,6 +194,14 @@ tr:hover td { background: var(--bg-hover); }
     gap: 6px;
     flex-wrap: wrap;
 }
+.dag-sidebar-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+}
 .dag-sidebar-section {
     display: flex;
     flex-direction: column;

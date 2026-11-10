@@ -1,6 +1,6 @@
 //! Layered DAG layout algorithm.
 
-use crate::types::GraphTopology;
+use crate::types::{GraphTopology, RemoteNode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +27,8 @@ pub struct LayoutNode {
     pub kind: String,
     pub group: Option<String>,
     pub parent_graph: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteNode>,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -155,6 +157,7 @@ fn grid_cluster(topology: &GraphTopology) -> LayoutResult {
             kind: nd.kind.clone(),
             group: nd.group.clone(),
             parent_graph: nd.parent_graph.clone(),
+            remote: nd.remote.clone(),
             x: (i / rows) as f64 * LAYER_GAP_X,
             y: (i % rows) as f64 * step_y,
             width: NODE_WIDTH,
@@ -986,6 +989,7 @@ fn layout_cluster(topology: &GraphTopology, center_layers: bool) -> LayoutResult
             kind: topology.nodes[i].kind.clone(),
             group: topology.nodes[i].group.clone(),
             parent_graph: topology.nodes[i].parent_graph.clone(),
+            remote: topology.nodes[i].remote.clone(),
             x: PADDING + layer[i] as f64 * LAYER_GAP_X,
             y: y_pos[i],
             width: NODE_WIDTH,
@@ -1347,6 +1351,7 @@ mod tests {
             kind: kind.to_string(),
             group: group.map(|s| s.to_string()),
             parent_graph: None,
+            remote: None,
         }
     }
 

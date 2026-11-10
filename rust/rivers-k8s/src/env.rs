@@ -1,4 +1,7 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+use rivers_core::assets::remote::{LocationRef, validate_segment};
 use rivers_core::storage::surrealdb_backend::{
     DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
 };
@@ -11,6 +14,17 @@ const K8S_NAMESPACE_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/
 /// Stamped onto run pods by the operator (see `pod_builder.rs`) and onto
 /// CodeLocation daemon pods by the CodeLocation reconciler.
 pub const ENV_CODE_LOCATION_NAME: &str = "RIVERS_CODE_LOCATION_NAME";
+
+/// Env var carrying the namespace of the owning `CodeLocation` CR. Stamped
+/// by the operator on code-location, run and step pods.
+pub const ENV_CODE_LOCATION_NAMESPACE: &str = "RIVERS_CODE_LOCATION_NAMESPACE";
+
+/// Env var carrying the address of the code location's gRPC Service, the
+/// endpoint other pods dial. Stamped by the operator on code-location pods only.
+pub const ENV_CODE_LOCATION_GRPC_ENDPOINT: &str = "RIVERS_CODE_LOCATION_GRPC_ENDPOINT";
+
+/// Namespace of code locations that run outside the operator.
+pub const DEV_CODE_LOCATION_NAMESPACE: &str = "dev";
 
 /// SurrealDB connection envs stamped on every rivers pod.
 pub const ENV_SURREAL_ENDPOINT: &str = "RIVERS_SURREAL_ENDPOINT";
@@ -98,6 +112,79 @@ pub fn current_code_location_id() -> String {
          would write events under the wrong scope."
     );
     rivers_core::storage::DEFAULT_CODE_LOCATION_ID.to_string()
+}
+
+/// Namespace this code location is listed under in the code location
+/// directory: `RIVERS_CODE_LOCATION_NAMESPACE`; in cloud mode, the pod's
+/// namespace (`RIVERS_NAMESPACE`, then the service-account mount); else
+/// [`DEV_CODE_LOCATION_NAMESPACE`]. Unlike [`detect_namespace`] it never
+/// falls back to the operator's namespace.
+pub fn current_code_location_namespace() -> String {
+    env_nonempty(ENV_CODE_LOCATION_NAMESPACE)
+        .or_else(|| {
+            in_cloud_deployment()
+                .then(|| {
+                    env_nonempty("RIVERS_NAMESPACE").or_else(|| {
+                        std::fs::read_to_string(K8S_NAMESPACE_PATH)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| DEV_CODE_LOCATION_NAMESPACE.to_string())
+}
+
+/// Name this code location is listed under in the code location directory:
+/// `RIVERS_CODE_LOCATION_NAME`, else its identity.
+pub fn current_code_location_name() -> String {
+    env_nonempty(ENV_CODE_LOCATION_NAME).unwrap_or_else(current_code_location_id)
+}
+
+/// This code location's `namespace/name` in the code location directory.
+/// The error names the setting to change.
+pub fn current_code_location_ref() -> anyhow::Result<LocationRef> {
+    let namespace = current_code_location_namespace();
+    let name = current_code_location_name();
+    let name_setting = if env_nonempty(ENV_CODE_LOCATION_NAME).is_some() {
+        ENV_CODE_LOCATION_NAME
+    } else if in_cloud_deployment() {
+        "RIVERS_CODE_LOCATION_ID"
+    } else {
+        "--code-location-id / RIVERS_CODE_LOCATION_ID"
+    };
+
+    for (part, value, setting) in [
+        ("namespace", &namespace, ENV_CODE_LOCATION_NAMESPACE),
+        ("name", &name, name_setting),
+    ] {
+        validate_segment(part, value).map_err(|e| {
+            anyhow::anyhow!(
+                "code location {e}. Set {setting} to a value without '/', whitespace or control characters."
+            )
+        })?;
+    }
+    LocationRef::new(namespace, name)
+}
+
+/// The gRPC endpoint this code location writes to the code location
+/// directory when it serves on `host:port`: `RIVERS_CODE_LOCATION_GRPC_ENDPOINT`
+/// as it is, else `http://host:port` with loopback for a wildcard host.
+pub fn current_grpc_endpoint(host: &str, port: u16) -> String {
+    if let Some(endpoint) = env_nonempty(ENV_CODE_LOCATION_GRPC_ENDPOINT) {
+        return endpoint;
+    }
+
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return format!("http://{host}:{port}");
+    };
+    let ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, port))
 }
 
 pub fn detect_module() -> String {
@@ -462,6 +549,211 @@ mod tests {
     #[should_panic(expected = "RIVERS_CODE_LOCATION_ID is required")]
     fn current_code_location_id_panics_in_cloud_when_unset() {
         with_env(None, None, Some(DEPLOYMENT_CLOUD), current_code_location_id);
+    }
+
+    fn with_namespace_env<R>(
+        cl_namespace: Option<&str>,
+        pod_namespace: Option<&str>,
+        deployment: Option<&str>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        with_vars(
+            &[
+                (ENV_CODE_LOCATION_NAMESPACE, cl_namespace),
+                ("RIVERS_NAMESPACE", pod_namespace),
+                ("RIVERS_DEPLOYMENT", deployment),
+            ],
+            f,
+        )
+    }
+
+    #[test]
+    fn current_code_location_namespace_uses_explicit_namespace() {
+        for deployment in [Some("dev"), Some(DEPLOYMENT_CLOUD)] {
+            let got = with_namespace_env(
+                Some("team-data"),
+                Some("other"),
+                deployment,
+                current_code_location_namespace,
+            );
+            assert_eq!(got, "team-data", "{deployment:?}");
+        }
+    }
+
+    #[test]
+    fn current_code_location_namespace_uses_pod_namespace_in_cloud() {
+        let got = with_namespace_env(
+            None,
+            Some("team-data"),
+            Some(DEPLOYMENT_CLOUD),
+            current_code_location_namespace,
+        );
+        assert_eq!(got, "team-data");
+    }
+
+    #[test]
+    fn current_code_location_namespace_ignores_pod_namespace_in_dev() {
+        let got = with_namespace_env(
+            None,
+            Some("team-data"),
+            Some("dev"),
+            current_code_location_namespace,
+        );
+        assert_eq!(got, DEV_CODE_LOCATION_NAMESPACE);
+    }
+
+    #[test]
+    fn current_code_location_namespace_defaults_to_dev() {
+        for deployment in [None, Some("dev"), Some(DEPLOYMENT_CLOUD)] {
+            let got = with_namespace_env(None, None, deployment, current_code_location_namespace);
+            assert_eq!(got, DEV_CODE_LOCATION_NAMESPACE, "{deployment:?}");
+        }
+    }
+
+    #[test]
+    fn current_code_location_name_falls_back_to_id_then_default() {
+        let named = with_env(Some("uuid-1"), Some("wh"), None, current_code_location_name);
+        assert_eq!(named, "wh");
+
+        let by_id = with_env(Some("uuid-1"), None, None, current_code_location_name);
+        assert_eq!(by_id, "uuid-1");
+
+        let unset = with_env(None, None, None, current_code_location_name);
+        assert_eq!(unset, rivers_core::storage::DEFAULT_CODE_LOCATION_ID);
+    }
+
+    #[test]
+    fn current_code_location_ref_combines_namespace_and_name() {
+        let got = with_vars(
+            &[
+                (ENV_CODE_LOCATION_NAMESPACE, Some("team-data")),
+                ("RIVERS_CODE_LOCATION_NAME", Some("wh")),
+                ("RIVERS_CODE_LOCATION_ID", Some("uuid-1")),
+                ("RIVERS_DEPLOYMENT", Some(DEPLOYMENT_CLOUD)),
+            ],
+            current_code_location_ref,
+        );
+        assert_eq!(got.unwrap().to_string(), "team-data/wh");
+
+        let dev = with_vars(
+            &[
+                (ENV_CODE_LOCATION_NAMESPACE, None),
+                ("RIVERS_NAMESPACE", None),
+                ("RIVERS_CODE_LOCATION_NAME", None),
+                ("RIVERS_CODE_LOCATION_ID", None),
+                ("RIVERS_DEPLOYMENT", None),
+            ],
+            current_code_location_ref,
+        );
+        assert_eq!(dev.unwrap().to_string(), "dev/default");
+    }
+
+    #[test]
+    fn current_code_location_ref_error_names_the_setting_to_change() {
+        let rule = "to a value without '/', whitespace or control characters.";
+        let id_setting = "--code-location-id / RIVERS_CODE_LOCATION_ID";
+        // (namespace, pod namespace, name, id, deployment, message)
+        let cases = [
+            (
+                None,
+                None,
+                None,
+                Some("team/analytics"),
+                None,
+                format!(
+                    "code location name 'team/analytics' contains '/'. Set {id_setting} {rule}"
+                ),
+            ),
+            (
+                None,
+                None,
+                None,
+                Some("team analytics"),
+                Some(DEPLOYMENT_CLOUD),
+                format!(
+                    "code location name 'team analytics' contains ' '. Set RIVERS_CODE_LOCATION_ID {rule}"
+                ),
+            ),
+            (
+                Some("team-data"),
+                None,
+                Some("a/b"),
+                Some("uuid-1"),
+                None,
+                format!(
+                    "code location name 'a/b' contains '/'. Set {ENV_CODE_LOCATION_NAME} {rule}"
+                ),
+            ),
+            (
+                Some("team data"),
+                None,
+                Some("wh"),
+                Some("uuid-1"),
+                None,
+                format!(
+                    "code location namespace 'team data' contains ' '. Set {ENV_CODE_LOCATION_NAMESPACE} {rule}"
+                ),
+            ),
+            (
+                None,
+                Some("team\tdata"),
+                Some("wh"),
+                Some("uuid-1"),
+                Some(DEPLOYMENT_CLOUD),
+                format!(
+                    "code location namespace 'team\tdata' contains '\\t'. Set {ENV_CODE_LOCATION_NAMESPACE} {rule}"
+                ),
+            ),
+        ];
+
+        for (namespace, pod_namespace, name, id, deployment, message) in cases {
+            let got = with_vars(
+                &[
+                    (ENV_CODE_LOCATION_NAMESPACE, namespace),
+                    ("RIVERS_NAMESPACE", pod_namespace),
+                    (ENV_CODE_LOCATION_NAME, name),
+                    ("RIVERS_CODE_LOCATION_ID", id),
+                    ("RIVERS_DEPLOYMENT", deployment),
+                ],
+                current_code_location_ref,
+            );
+            assert_eq!(format!("{:#}", got.unwrap_err()), message);
+        }
+    }
+
+    #[test]
+    fn current_grpc_endpoint_takes_the_operator_endpoint_as_it_is() {
+        let endpoint = "analytics-grpc.team-data.svc.cluster.local:3001";
+        for host in ["0.0.0.0", "127.0.0.1"] {
+            let got = with_vars(&[(ENV_CODE_LOCATION_GRPC_ENDPOINT, Some(endpoint))], || {
+                current_grpc_endpoint(host, 50051)
+            });
+            assert_eq!(got, endpoint, "{host}");
+        }
+    }
+
+    #[test]
+    fn current_grpc_endpoint_without_the_env_var_is_the_bind_address() {
+        for unset in [None, Some("")] {
+            let got = with_vars(&[(ENV_CODE_LOCATION_GRPC_ENDPOINT, unset)], || {
+                [
+                    current_grpc_endpoint("0.0.0.0", 3001),
+                    current_grpc_endpoint("::", 3001),
+                    current_grpc_endpoint("10.0.0.7", 3001),
+                    current_grpc_endpoint("localhost", 3001),
+                ]
+            });
+            assert_eq!(
+                got,
+                [
+                    "http://127.0.0.1:3001",
+                    "http://[::1]:3001",
+                    "http://10.0.0.7:3001",
+                    "http://localhost:3001",
+                ],
+                "{unset:?}"
+            );
+        }
     }
 
     fn env_value_of(env: &[EnvVar], name: &str) -> Option<String> {

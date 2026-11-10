@@ -39,3 +39,6 @@ codeLocations: []
   #   image: k3d-rivers-registry:5000/rivers-code-location
   #   module: k8s_test_pipeline.pipeline
   #   replicas: 1
+  #   env:                # added after the S3 env
+  #     - name: FOO
+  #       value: bar

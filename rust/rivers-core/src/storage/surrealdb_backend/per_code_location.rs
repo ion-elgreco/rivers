@@ -10,6 +10,7 @@ use crate::storage::{
     RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
 };
 
+use super::partition_keys::KEY_ROWS_CHANGED;
 use super::pools::PoolContended;
 use super::*;
 
@@ -99,13 +100,21 @@ impl PerCodeLocationStorage for SurrealStorage {
     /// location's whole asset set — so an `asset_key IN $keys` clause saves no
     /// reads and costs one list comparison per scanned row. At 3,200 keys that
     /// clause was 473 ms against 9 ms for the same scan filtered here.
+    ///
+    /// One key goes through `get_asset_record`: at 3,000 assets the scan took
+    /// 13 ms against 4 ms for that query.
     async fn get_asset_records_by_keys(
         &self,
         code_location_id: &str,
         keys: &[String],
     ) -> Result<Vec<AssetRecord>> {
-        if keys.is_empty() {
-            return Ok(vec![]);
+        match keys {
+            [] => return Ok(vec![]),
+            [key] => {
+                let record = self.get_asset_record(code_location_id, key).await?;
+                return Ok(record.into_iter().collect());
+            }
+            _ => {}
         }
         let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut result = self
@@ -1318,12 +1327,32 @@ impl PerCodeLocationStorage for SurrealStorage {
             .await
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%code_location_id, key_lists = key_lists.len()))]
     async fn set_graph_topology(
         &self,
         code_location_id: &str,
         topology: &crate::assets::graph::GraphTopology,
+        key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>],
     ) -> Result<()> {
-        self.kv_set_json(&crate::graph_topology_key(code_location_id), topology)
+        let topology = surrealdb::types::Bytes::from(serde_json::to_vec(topology)?);
+
+        let retry_if = |e: &anyhow::Error| {
+            retry::default_should_retry(e) || format!("{e:#}").contains(KEY_ROWS_CHANGED)
+        };
+        retry::with_retry_if(&self.retry_config, retry_if, || async {
+            let stored = self.stored_key_rows(code_location_id).await?;
+            self.write_topology(code_location_id, &topology, key_lists, &stored)
+                .await
+        })
+        .await
+    }
+
+    async fn get_partition_keys(
+        &self,
+        code_location_id: &str,
+        digest: &str,
+    ) -> Result<Option<Vec<String>>> {
+        self.kv_get_json(&crate::partition_keys_key(code_location_id, digest))
             .await
     }
 }

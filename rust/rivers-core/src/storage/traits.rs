@@ -3,12 +3,15 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use crate::assets::remote::LocationRef;
+
 use super::{
-    AssetRecord, AssetScope, BackfillRecord, BackfillStatus, ConcurrencyClaimStatus,
-    ConditionEvalRecord, ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID,
-    EventRecord, LogRecord, PartitionKey, PoolInfo, PoolLimit, RunOutcome, RunProgress, RunRecord,
-    RunStatus, ScopedStorage, SlotHolder, SortOrder, StepAttempts, StepOutcome,
-    StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
+    AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry,
+    ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord, CoordinatorRunInfo,
+    DEFAULT_CODE_LOCATION_ID, EventRecord, LogRecord, PartitionKey, PoolInfo, PoolLimit,
+    RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder,
+    StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog,
+    StoredTick, TickRecord,
 };
 
 /// A code-location identity bound for the lifetime of a logical operation.
@@ -375,12 +378,23 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
     ) -> impl Future<Output = Result<Option<crate::assets::graph::GraphTopology>>> + Send;
 
-    /// Persist the graph topology blob for this CL.
+    /// Persist the graph topology blob for this CL and a key row for each of
+    /// `key_lists`, in one transaction. A key row that is stored already is
+    /// not written again; this CL's key rows that are not in `key_lists` are
+    /// deleted.
     fn set_graph_topology(
         &self,
         code_location_id: &str,
         topology: &crate::assets::graph::GraphTopology,
+        key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>],
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Read the static partition keys this CL stored under `digest`.
+    fn get_partition_keys(
+        &self,
+        code_location_id: &str,
+        digest: &str,
+    ) -> impl Future<Output = Result<Option<Vec<String>>>> + Send;
 }
 
 #[allow(private_bounds)]
@@ -496,6 +510,56 @@ pub trait StorageBackend: PerCodeLocationStorage {
     // KV
     fn kv_get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
     fn kv_set(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    // Code location directory
+    /// Storage identity of `location`, or `None` if it never registered.
+    fn get_code_location_identity(
+        &self,
+        location: &LocationRef,
+    ) -> impl Future<Output = Result<Option<String>>> + Send {
+        async move {
+            let entry = self.get_code_location_entry(location).await?;
+            Ok(entry.map(|e| e.identity))
+        }
+    }
+
+    /// Every entry in the directory. An entry that does not decode is left out.
+    fn list_code_locations(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(LocationRef, CodeLocationDirectoryEntry)>>> + Send;
+
+    fn get_code_location_entry(
+        &self,
+        location: &LocationRef,
+    ) -> impl Future<Output = Result<Option<CodeLocationDirectoryEntry>>> + Send;
+
+    /// Record `entry` when `location` registers. If the entry already names
+    /// the same identity, its endpoint, `module`, and `last_seen` stay unless
+    /// `entry` sets them.
+    fn upsert_code_location_registration(
+        &self,
+        location: &LocationRef,
+        entry: CodeLocationDirectoryEntry,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Record that `location`, still under `identity`, is alive at
+    /// `grpc_endpoint`. Returns `false`, and writes nothing, if the entry is
+    /// missing or names another identity.
+    fn touch_code_location(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+        grpc_endpoint: &str,
+        now: i64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Delete `location`'s entry if it still names `identity`. Returns
+    /// whether it did.
+    fn delete_code_location_if(
+        &self,
+        location: &LocationRef,
+        identity: &str,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     // Ticks (record-keyed; CL is carried on the record).
     fn store_tick(&self, tick: &TickRecord) -> impl Future<Output = Result<String>> + Send;

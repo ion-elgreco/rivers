@@ -218,6 +218,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(shutdown::py_wait_for_exit, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(repository::code_location_ref, m)?)?;
     m.add_class::<dev_server::PyDevHost>()?;
     m.add_function(pyo3::wrap_pyfunction!(
         dev_supervisor::serve_dev_code_location,

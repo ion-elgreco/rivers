@@ -14,6 +14,7 @@ use crate::partitions::PartitionsDefinition;
 use crate::runtime::{io_rt, rt};
 use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 use rivers_core::assets::graph::to_topology;
+use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 
@@ -52,6 +53,7 @@ impl PyCodeRepository {
         )?;
 
         validate_partition_mappings(py, &node_map, &unresolved_graph)?;
+        validate_remote_inputs(&node_map, &unresolved_graph)?;
 
         // External assets with automation_condition must have an observe_fn.
         for node in node_map.values() {
@@ -112,9 +114,8 @@ impl PyCodeRepository {
             .as_ref()
             .map(|jobs| jobs.iter().map(|j| j.get().name().to_string()).collect())
             .unwrap_or_default();
-        let asset_name_set: HashSet<&str> = node_map.keys().map(String::as_str).collect();
         let job_name_set: HashSet<&str> = job_names_owned.iter().map(String::as_str).collect();
-        validate_sensor_run_targets(py, &self.raw_sensors, &asset_name_set, &job_name_set)?;
+        validate_sensor_run_targets(py, &self.raw_sensors, &node_map, &job_name_set)?;
         validate_schedule_run_targets(py, &self.raw_schedules, &job_name_set)?;
 
         // Plan-build inputs are graph-static; compute once and share across every
@@ -326,7 +327,7 @@ impl PyCodeRepository {
         node_map: &HashMap<String, ResolvedNode>,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
         storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
-    ) -> PyResult<()> {
+    ) -> PyResult<rivers_core::assets::graph::GraphTopology> {
         py.detach(|| {
             let mut topology = to_topology(resolved_graph);
 
@@ -339,11 +340,13 @@ impl PyCodeRepository {
                 }
             }
 
+            let mut fingerprints: Vec<(&PartitionsDefinition, PartitionsFingerprint)> = Vec::new();
+            let mut key_lists: Vec<KeyList<'_>> = Vec::new();
             for topo_node in &mut topology.nodes {
                 if let Some(gn) = node_map.get(&topo_node.name) {
                     topo_node.group = gn.group();
                     topo_node.kind = match gn.asset_type() {
-                        "single" | "multi" | "external" => {
+                        "single" | "multi" | "external" | "remote" => {
                             rivers_core::assets::graph::NodeKind::Asset
                         }
                         "graph" => rivers_core::assets::graph::NodeKind::GraphAsset,
@@ -354,14 +357,29 @@ impl PyCodeRepository {
                             )));
                         }
                     };
+                    topo_node.remote = gn.remote().cloned();
+                    topo_node.partitions = gn.partitions_def().map(|def| {
+                        match fingerprints.iter().find(|(seen, _)| *seen == def) {
+                            Some((_, fingerprint)) => fingerprint.clone(),
+                            None => {
+                                let fingerprint = def.fingerprint_into(&mut key_lists);
+                                fingerprints.push((def, fingerprint.clone()));
+                                fingerprint
+                            }
+                        }
+                    });
                 }
                 if let Some(parent) = task_to_graph.get(&topo_node.name) {
                     topo_node.parent_graph = Some(parent.clone());
                 }
             }
 
-            let _ = io_rt().block_on(storage_handle.scoped().set_graph_topology(&topology));
-            Ok(())
+            let _ = io_rt().block_on(
+                storage_handle
+                    .scoped()
+                    .set_graph_topology(&topology, &key_lists),
+            );
+            Ok(topology)
         })
     }
 
@@ -530,7 +548,8 @@ impl PyCodeRepository {
         // Daemon pod will never set this env var
         let register_catalog = std::env::var("RIVERS_RUN_ID").is_err();
         if register_catalog {
-            self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+            let topology = self.persist_topology(py, &node_map, resolved_graph, &storage_handle)?;
+            py.detach(|| register_code_location(&storage_handle, &topology));
         }
 
         let jobs = self.validate_and_build_job_plans(
@@ -657,5 +676,35 @@ impl PyCodeRepository {
         self.state.replace(py, Some(Arc::clone(&state)));
 
         Ok(state)
+    }
+}
+
+/// List this code location in the code location directory so others can
+/// refer to it by `namespace/name`, with the remote assets it consumes. A
+/// failure leaves `resolve()` intact.
+fn register_code_location(
+    storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+    topology: &rivers_core::assets::graph::GraphTopology,
+) {
+    use rivers_core::storage::{CodeLocationDirectoryEntry, RemoteConsumer, StorageBackend};
+
+    let entry = CodeLocationDirectoryEntry {
+        module: std::env::var("RIVERS_MODULE").ok(),
+        remotes: RemoteConsumer::from_topology(topology),
+        ..CodeLocationDirectoryEntry::new(storage_handle.code_location_id())
+    };
+    let result = rivers_k8s::env::current_code_location_ref().and_then(|location| {
+        io_rt().block_on(
+            storage_handle
+                .backend()
+                .upsert_code_location_registration(&location, entry),
+        )
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "rivers::repo",
+            error = %e,
+            "code location not listed in the code location directory"
+        );
     }
 }

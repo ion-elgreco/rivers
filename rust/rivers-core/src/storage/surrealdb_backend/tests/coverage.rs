@@ -161,6 +161,12 @@ async fn test_get_asset_records_by_keys() {
         assert_eq!(*r, expected);
     }
 
+    let single = storage
+        .get_asset_records_by_keys(crate::storage::DEFAULT_CODE_LOCATION_ID, &["b".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(single, vec![make_asset_record("b")]);
+
     // Unknown keys
     let empty = storage
         .get_asset_records_by_keys(

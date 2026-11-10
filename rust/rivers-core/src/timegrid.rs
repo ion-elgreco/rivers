@@ -25,6 +25,27 @@ impl TimeGrid {
         self.end.unwrap_or_else(|| jiff::Zoned::now().datetime())
     }
 
+    /// Whether `other` puts its keys at the same times as this grid, in the
+    /// same format; `start` and `end` may differ. Interval ticks are
+    /// `start + n * interval`, so the two starts must lie a whole number of
+    /// intervals apart.
+    pub fn aligns_with(&self, other: &TimeGrid) -> bool {
+        if self.cron_schedule != other.cron_schedule
+            || self.interval_seconds != other.interval_seconds
+            || self.fmt != other.fmt
+        {
+            return false;
+        }
+
+        let Some(secs) = self.interval_seconds else {
+            return true;
+        };
+        let interval_ns = (secs * 1_000_000_000.0) as i64;
+        interval_ns > 0
+            && nanos_between(self.start, other.start)
+                .is_some_and(|ns| ns.rem_euclid(interval_ns) == 0)
+    }
+
     /// Shift `key` by `offset` windows (negative = earlier).
     pub fn shift_key(&self, key: &str, offset: i64) -> Result<String> {
         let dt = crate::util::parse_key_datetime(key, &self.fmt)

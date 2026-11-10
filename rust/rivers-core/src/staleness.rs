@@ -1,8 +1,52 @@
 //! Staleness computation for asset records.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::assets::graph::GraphTopology;
 use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
+
+/// What the staleness of `keys` reads: the part of `topology` from `keys` up,
+/// and the keys in it of the assets that this code location owns (`keys`
+/// included). The owners of its remote nodes hold their records.
+pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, GraphTopology) {
+    let part = topology.with_upstream(keys.iter().map(String::as_str));
+
+    let upstream = GraphTopology {
+        nodes: topology
+            .nodes
+            .iter()
+            .filter(|node| part.contains(node.name.as_str()))
+            .cloned()
+            .collect(),
+        edges: topology
+            .edges
+            .iter()
+            .filter(|(from, _)| part.contains(from.as_str()))
+            .cloned()
+            .collect(),
+    };
+    let remote: HashSet<&str> = upstream.remotes().map(|(name, _)| name).collect();
+    let mut owned: Vec<String> = part
+        .into_iter()
+        .filter(|name| !remote.contains(name))
+        .map(str::to_string)
+        .collect();
+    owned.sort();
+    (owned, upstream)
+}
+
+/// The owner's record of a remote asset, under its `local` name. Only the
+/// data version is kept: the owner's code and inputs make the owner stale,
+/// not the consumer.
+pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
+    AssetRecord {
+        asset_key: local.to_string(),
+        code_version: None,
+        last_materialization_code_version: None,
+        last_input_data_versions: Vec::new(),
+        ..owner.clone()
+    }
+}
 
 /// Compute staleness for all assets given their records and the dependency graph edges.
 ///
@@ -10,12 +54,13 @@ use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
 /// This matches the convention used by `GraphTopology.edges`.
 ///
 /// Returns a map from asset_key to (status, causes).
-pub fn compute_staleness(
-    records: &[AssetRecord],
+pub fn compute_staleness<'a>(
+    records: impl IntoIterator<Item = &'a AssetRecord>,
     edges: &[(String, String)],
 ) -> HashMap<String, (StaleStatus, Vec<StaleCause>)> {
+    let records: Vec<&AssetRecord> = records.into_iter().collect();
     let record_map: HashMap<&str, &AssetRecord> =
-        records.iter().map(|r| (r.asset_key.as_str(), r)).collect();
+        records.iter().map(|r| (r.asset_key.as_str(), *r)).collect();
 
     let mut upstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut downstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -33,12 +78,15 @@ pub fn compute_staleness(
 
     // Kahn's algorithm — upstreams must be processed before downstreams so
     // transitive staleness propagates correctly below.
+    // An upstream without a record (a remote asset) must still enter the
+    // queue, or it never releases its downstreams.
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    for r in records {
+    for r in &records {
         in_degree.entry(r.asset_key.as_str()).or_insert(0);
     }
-    for (from, _to) in edges {
+    for (from, to) in edges {
         *in_degree.entry(from.as_str()).or_insert(0) += 1;
+        in_degree.entry(to.as_str()).or_insert(0);
     }
 
     let mut queue: Vec<&str> = in_degree
@@ -316,11 +364,101 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_without_record_releases_downstream() {
+        // `a` has no record (a remote asset); b -> a, c -> b. `c` consumed an
+        // old `b`, so it is stale against its local upstream.
+        let mut b = make_record("b");
+        b.last_data_version = Some("dv_b2".to_string());
+
+        let mut c = make_record("c");
+        c.last_data_version = Some("dv_c".to_string());
+        c.last_input_data_versions = vec![("b".to_string(), "dv_b1".to_string())];
+
+        let edges = vec![
+            ("b".to_string(), "a".to_string()),
+            ("c".to_string(), "b".to_string()),
+        ];
+        let result = compute_staleness(&[b, c], &edges);
+
+        assert!(!result.contains_key("a"));
+        assert_eq!(result["b"].0, StaleStatus::UpToDate);
+        assert_eq!(result["c"].0, StaleStatus::Stale);
+        assert_eq!(
+            result["c"].1[0].category,
+            StaleCauseCategory::Data {
+                dependency: "b".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn test_no_code_version_no_staleness_check() {
         let mut a = make_record("a");
         a.last_data_version = Some("dv1".to_string());
         let result = compute_staleness(&[a], &[]);
         assert_eq!(result["a"].0, StaleStatus::UpToDate);
+    }
+
+    /// `report` ← `clean` ← `seed`, and `count` ← the remote `orders`.
+    /// `unrelated` is downstream of `report`; `fresh` stands alone.
+    #[test]
+    fn test_upstream_of_reads_only_what_is_above_the_keys() {
+        use crate::assets::graph::{NodeKind, TopologyNode};
+        use crate::assets::remote::{LocationRef, RemoteRef};
+
+        let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
+        let orders = TopologyNode {
+            remote: Some(RemoteRef {
+                code_location: LocationRef::new("dev", "warehouse").unwrap(),
+                asset_key: "raw_orders".to_string(),
+            }),
+            ..node("orders")
+        };
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topology = GraphTopology {
+            nodes: vec![
+                orders,
+                node("seed"),
+                node("clean"),
+                node("report"),
+                node("count"),
+                node("fresh"),
+                node("unrelated"),
+            ],
+            edges: vec![
+                edge("clean", "seed"),
+                edge("report", "clean"),
+                edge("count", "orders"),
+                edge("unrelated", "report"),
+            ],
+        };
+        let keys = ["report", "count", "no_node"].map(String::from);
+
+        let (owned, upstream) = upstream_of(&keys, &topology);
+
+        assert_eq!(owned, ["clean", "count", "no_node", "report", "seed"]);
+        assert_eq!(
+            upstream
+                .nodes
+                .iter()
+                .map(|n| (n.name.as_str(), n.remote.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("orders", true),
+                ("seed", false),
+                ("clean", false),
+                ("report", false),
+                ("count", false),
+            ]
+        );
+        assert_eq!(
+            upstream.edges,
+            [
+                edge("clean", "seed"),
+                edge("report", "clean"),
+                edge("count", "orders"),
+            ]
+        );
     }
 
     #[test]

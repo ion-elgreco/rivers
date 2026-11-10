@@ -113,6 +113,6 @@ pub(crate) use invoke::{
 pub(crate) use io::{
     OutOfProcess, build_mapped_partition_context, build_partition_context, handle_step_output,
     is_in_memory, load_self_dependency, load_step_output, map_partition_key_for_upstream,
-    write_output,
+    upstream_source, write_output,
 };
 pub(crate) use outputs::{OutputItem, for_each_output, run_async_generator};

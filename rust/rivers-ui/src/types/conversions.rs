@@ -225,9 +225,41 @@ impl From<rivers_core::assets::graph::GraphTopology> for GraphTopology {
                     kind: n.kind.as_str().to_string(),
                     group: n.group,
                     parent_graph: n.parent_graph,
+                    remote: n.remote.map(|r| crate::types::RemoteNode {
+                        code_location: r.code_location.to_string(),
+                        asset_key: r.asset_key,
+                        resolved: false,
+                        drift: None,
+                    }),
                 })
                 .collect(),
             edges: g.edges,
+        }
+    }
+}
+
+impl RemoteDrift {
+    /// `drift` of `mirror` against the owner's definition `owner`; `None`
+    /// when they agree.
+    pub fn new(
+        drift: rivers_core::assets::partitions_fingerprint::PartitionDrift,
+        mirror: Option<&rivers_core::assets::partitions_fingerprint::PartitionsFingerprint>,
+        owner: Option<&rivers_core::assets::partitions_fingerprint::PartitionsFingerprint>,
+    ) -> Option<Self> {
+        use rivers_core::assets::partitions_fingerprint::{PartitionDrift, describe_partitions};
+
+        let describe = || (describe_partitions(mirror), describe_partitions(owner));
+        match drift {
+            PartitionDrift::Same => None,
+            PartitionDrift::Compatible => {
+                let (mirror, owner) = describe();
+                Some(Self::Compatible { mirror, owner })
+            }
+            PartitionDrift::Incompatible => {
+                let (mirror, owner) = describe();
+                Some(Self::Incompatible { mirror, owner })
+            }
+            PartitionDrift::OwnerNodeMissing => Some(Self::OwnerNodeMissing),
         }
     }
 }
@@ -446,6 +478,48 @@ impl From<BackfillFilter> for rivers_core::storage::BackfillFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod remote_drift {
+        use super::RemoteDrift;
+        use rivers_core::assets::partitions_fingerprint::{PartitionDrift, PartitionsFingerprint};
+
+        #[test]
+        fn each_class_maps_with_both_definitions() {
+            let mirror = PartitionsFingerprint::static_keys(["eu", "us"]);
+            let three = PartitionsFingerprint::static_keys(["apac", "eu", "us"]);
+            let one = PartitionsFingerprint::static_keys(["eu"]);
+
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::Same, Some(&mirror), Some(&mirror)),
+                None
+            );
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::Compatible, Some(&mirror), Some(&three)),
+                Some(RemoteDrift::Compatible {
+                    mirror: "static (2 keys)".into(),
+                    owner: "static (3 keys)".into(),
+                })
+            );
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::Incompatible, Some(&mirror), Some(&one)),
+                Some(RemoteDrift::Incompatible {
+                    mirror: "static (2 keys)".into(),
+                    owner: "static (1 key)".into(),
+                })
+            );
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::OwnerNodeMissing, Some(&mirror), None),
+                Some(RemoteDrift::OwnerNodeMissing)
+            );
+            assert_eq!(
+                RemoteDrift::new(PartitionDrift::Incompatible, None, Some(&one)),
+                Some(RemoteDrift::Incompatible {
+                    mirror: "unpartitioned".into(),
+                    owner: "static (1 key)".into(),
+                })
+            );
+        }
+    }
 
     /// The UI's filter inputs send `Some("")` when a search box is empty.
     /// The storage layer expects `None` for "no filter" — if the empty

@@ -496,7 +496,7 @@ impl CodeLocationService for CodeLocationImpl {
                     .ok_or("repository not resolved")?;
 
                 let mut assets = Vec::new();
-                for (name, node) in &state.node_map {
+                for (name, node) in state.node_map.iter().filter(|(_, n)| !n.is_remote()) {
                     let partition_def = node.partitions_def().map(node_partition_def_info);
 
                     let mut hooks = Vec::new();

@@ -166,10 +166,11 @@ fn CurrentUserChip(collapsed: Signal<bool>) -> impl IntoView {
 }
 
 /// Under `rivers dev`, restarts the code location in a fresh interpreter so
-/// edits take effect. Rendered only when the host can reload.
+/// edits take effect. Rendered only on the location the host can reload.
 #[component]
 fn ReloadLocationButton(collapsed: Signal<bool>) -> impl IntoView {
     let state = Resource::new(|| (), |_| get_dev_reload_state());
+    let current = use_current_location();
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
 
@@ -188,7 +189,7 @@ fn ReloadLocationButton(collapsed: Signal<bool>) -> impl IntoView {
 
     view! {
         <Transition fallback=|| ()>
-            {move || state.get().and_then(|r| r.ok()).filter(|s| s.enabled).map(|_| view! {
+            {move || state.get().and_then(|r| r.ok()).filter(|s| s.enabled && s.location.as_ref() == Some(&current.get())).map(|_| view! {
                 <button
                     class="locations-reload"
                     title="Restart the code location to pick up edits"

@@ -13,6 +13,7 @@ use crate::types::DevReloadState;
 
 static STATE: Mutex<DevReloadState> = Mutex::new(DevReloadState {
     enabled: false,
+    location: None,
     generation: 0,
     error: None,
 });
@@ -22,8 +23,11 @@ static REQUESTED: Notify = Notify::const_new();
 /// Wakes the callers waiting for a verdict.
 static SETTLED: Notify = Notify::const_new();
 
-pub fn enable() {
-    STATE.lock().unwrap().enabled = true;
+/// The host reloads the code location `(namespace, name)`.
+pub fn enable(location: (String, String)) {
+    let mut state = STATE.lock().unwrap();
+    state.enabled = true;
+    state.location = Some(location);
 }
 
 pub fn disable() {
@@ -106,6 +110,10 @@ mod tests {
         TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn dev_default() -> (String, String) {
+        ("dev".into(), "default".into())
+    }
+
     #[tokio::test]
     async fn a_request_is_dropped_while_no_host_listens() {
         let _turn = lock();
@@ -121,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn requests_collapse_into_one_wait() {
         let _turn = lock();
-        enable();
+        enable(dev_default());
         assert!(request().is_some());
         assert!(request().is_some());
         assert!(
@@ -140,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_wakes_a_waiting_host() {
         let _turn = lock();
-        enable();
+        enable(dev_default());
         let waiter = tokio::spawn(timeout(Duration::from_secs(5), requested()));
         sleep(Duration::from_millis(50)).await;
         assert!(request().is_some());
@@ -151,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn the_state_reports_the_outcome_of_the_last_attempt() {
         let _turn = lock();
-        enable();
+        enable(dev_default());
         let before = state().generation;
         failed("exit code 1".into());
         assert_eq!(state().error.as_deref(), Some("exit code 1"));
@@ -162,6 +170,7 @@ mod tests {
         assert_eq!(after.generation, before + 1);
         assert_eq!(after.error, None);
         assert!(after.enabled);
+        assert_eq!(after.location, Some(dev_default()));
         disable();
         assert!(!state().enabled);
     }
@@ -169,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn a_waiter_settles_on_the_verdict() {
         let _turn = lock();
-        enable();
+        enable(dev_default());
 
         let before = request().unwrap();
         let waiter = tokio::spawn(settled(before));

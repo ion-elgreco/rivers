@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::errors::PartitionDefinitionError;
+use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use rivers_core::util::parse_key_datetime;
 
 use super::key::PyPartitionKey;
@@ -201,6 +202,15 @@ impl PartitionsDefinition {
             Self::TimeWindow { .. } => "TimeWindow",
             Self::Multi { .. } => "Multi",
             Self::Dynamic { .. } => "Dynamic",
+        }
+    }
+
+    /// Whether the definition is Dynamic or has a Dynamic dimension.
+    pub fn has_dynamic_dimension(&self) -> bool {
+        match self {
+            Self::Dynamic { .. } => true,
+            Self::Multi { dimensions } => dimensions.iter().any(|(_, d)| d.has_dynamic_dimension()),
+            _ => false,
         }
     }
 
@@ -613,6 +623,48 @@ impl PartitionsDefinition {
                 fmt: fmt.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// The definition as the topology stores it.
+    pub fn fingerprint(&self) -> PartitionsFingerprint {
+        self.fingerprint_into(&mut Vec::new())
+    }
+
+    /// [`Self::fingerprint`], adding each static key list it names to
+    /// `key_lists` unless a list of that digest is there already.
+    pub fn fingerprint_into<'a>(
+        &'a self,
+        key_lists: &mut Vec<KeyList<'a>>,
+    ) -> PartitionsFingerprint {
+        match self {
+            Self::Static { keys } => {
+                let list = KeyList::new(keys.iter().map(String::as_str));
+                let fingerprint = list.fingerprint();
+                if !key_lists.iter().any(|seen| seen.digest == list.digest) {
+                    key_lists.push(list);
+                }
+                fingerprint
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => PartitionsFingerprint::TimeWindow(rivers_core::timegrid::TimeGrid {
+                cron_schedule: cron_schedule.clone(),
+                interval_seconds: *interval_seconds,
+                start: *start,
+                end: *end,
+                fmt: fmt.clone(),
+            }),
+            Self::Multi { dimensions } => PartitionsFingerprint::multi(
+                dimensions
+                    .iter()
+                    .map(|(name, def)| (name.clone(), def.fingerprint_into(key_lists))),
+            ),
+            Self::Dynamic { name } => PartitionsFingerprint::Dynamic { name: name.clone() },
         }
     }
 

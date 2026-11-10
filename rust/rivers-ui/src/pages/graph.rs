@@ -14,7 +14,9 @@ use crate::helpers::{
 };
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::{get_asset, get_assets};
-use crate::server_fns::graph::{get_graph_layout, get_graph_topology, get_node_lineage};
+use crate::server_fns::graph::{
+    get_graph_layout, get_graph_topology, get_node_lineage, get_remote_statuses,
+};
 use crate::server_fns::overview::get_assets_info;
 
 fn get_element_size(target: &Option<leptos::web_sys::EventTarget>) -> (f64, f64) {
@@ -100,6 +102,40 @@ fn apply_node_click(selected: &[String], node: &str, additive: bool) -> Vec<Stri
     next
 }
 
+/// One sidebar section listing neighbours; clicking one selects it.
+fn sidebar_links(
+    label: &'static str,
+    arrow: &'static str,
+    names: Vec<String>,
+    set_selected_nodes: WriteSignal<Vec<String>>,
+) -> impl IntoView {
+    let count = names.len();
+    view! {
+        <div class="dag-sidebar-section">
+            <div class="section-header-label">{format!("{label} · {count}")}</div>
+            {if names.is_empty() {
+                view! { <span class="dag-sidebar-empty">"—"</span> }.into_any()
+            } else {
+                view! {
+                    <div class="dag-sidebar-links">
+                        {names.into_iter().map(|n| {
+                            let n_for_click = n.clone();
+                            view! {
+                                <button
+                                    class="dag-sidebar-link"
+                                    on:click=move |_| set_selected_nodes.set(vec![n_for_click.clone()])
+                                >
+                                    <span class="dag-sidebar-link-arrow">{arrow}</span>{n}
+                                </button>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
 #[component]
 pub fn GraphPage() -> impl IntoView {
     let (center_layers, set_center_layers) = signal(false);
@@ -182,6 +218,41 @@ pub fn GraphPage() -> impl IntoView {
             })
             .unwrap_or_default()
     });
+
+    // Remote nodes are another code location's assets: selectable for
+    // lineage, never materialized here.
+    let remote_nodes = Memo::new(move |_| {
+        topology_value
+            .get()
+            .and_then(|r| r.ok())
+            .map(|t| t.remote_nodes())
+            .unwrap_or_default()
+    });
+
+    // The owner's status of each remote node. A topology without a remote
+    // node needs no request; until the topology is here, ask.
+    let no_remote_nodes = Memo::new(move |_| {
+        topology_value
+            .get()
+            .and_then(|r| r.ok())
+            .is_some_and(|t| t.nodes.iter().all(|n| n.remote.is_none()))
+    });
+    let remote_statuses = Resource::new(
+        move || {
+            (
+                loc.get(),
+                refresh_tick.get(),
+                live.definitions.get(),
+                no_remote_nodes.get(),
+            )
+        },
+        |((ns, name), _, _, no_remote_nodes)| async move {
+            if no_remote_nodes {
+                return Ok(Default::default());
+            }
+            get_remote_statuses(ns, name).await
+        },
+    );
 
     // ViewBox-based zoom/pan state.
     // vb_scale = SVG units per screen pixel (higher = more zoomed out).
@@ -307,7 +378,11 @@ pub fn GraphPage() -> impl IntoView {
     let open_dialog: Callback<(Vec<String>, DialogVerb, bool)> = Callback::new(
         move |(keys, verb, destructive): (Vec<String>, DialogVerb, bool)| {
             let tasks = task_node_names.get_untracked();
-            let keys: Vec<String> = keys.into_iter().filter(|k| !tasks.contains(k)).collect();
+            let remotes = remote_nodes.get_untracked();
+            let keys: Vec<String> = keys
+                .into_iter()
+                .filter(|k| !tasks.contains(k) && !remotes.contains_key(k))
+                .collect();
             if keys.is_empty() {
                 return;
             }
@@ -378,6 +453,13 @@ pub fn GraphPage() -> impl IntoView {
                     .map(|r| r.asset_key.clone())
                     .collect::<std::collections::HashSet<String>>()
             })
+            .unwrap_or_default()
+    });
+
+    let remote_status_by_node = Signal::derive(move || {
+        remote_statuses
+            .get()
+            .and_then(|r| r.ok())
             .unwrap_or_default()
     });
 
@@ -578,6 +660,7 @@ pub fn GraphPage() -> impl IntoView {
                                 let mat_keys = materialized_keys.get();
                                 let stl_keys = stale_keys.get();
                                 let ext_keys = external_keys.get();
+                                let rmt_statuses = remote_status_by_node.get();
                                 let anc_keys = ancestor_keys.get();
                                 let desc_keys = descendant_keys.get();
                                 let sel_set: std::collections::HashSet<String> =
@@ -589,7 +672,14 @@ pub fn GraphPage() -> impl IntoView {
 
                                 // Snapshot for the minimap before DagGraph consumes layout_result.
                                 let mini_nodes: Vec<MinimapNode> = layout_result.nodes.iter().map(|n| {
-                                    let status = if ext_keys.contains(&n.id) { "external" }
+                                    let remote_status = n.remote.as_ref().and(rmt_statuses.get(&n.id));
+                                    let status = if let Some(remote_status) = remote_status {
+                                        match remote_status {
+                                            crate::types::StaleStatus::UpToDate => "success",
+                                            crate::types::StaleStatus::Stale => "stale",
+                                            crate::types::StaleStatus::Missing => "missing",
+                                        }
+                                    } else if ext_keys.contains(&n.id) || n.remote.is_some() { "external" }
                                         else if stl_keys.contains(&n.id) { "stale" }
                                         else if mat_keys.contains(&n.id) { "success" }
                                         else { "missing" }.to_string();
@@ -631,6 +721,7 @@ pub fn GraphPage() -> impl IntoView {
                                         materialized_keys=mat_keys
                                         stale_keys=stl_keys
                                         external_keys=ext_keys
+                                        remote_statuses=rmt_statuses
                                         ancestor_keys=anc_keys
                                         descendant_keys=desc_keys
                                         selected_nodes=sel_set
@@ -666,6 +757,7 @@ pub fn GraphPage() -> impl IntoView {
                         <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--running"></span>"running"</span>
                         <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--stale"></span>"stale"</span>
                         <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--external"></span>"external"</span>
+                        <span class="dag-legend-item"><span class="dag-legend-dot dag-legend-dot--remote"></span>"remote"</span>
                     </div>
                 </div>
 
@@ -674,27 +766,30 @@ pub fn GraphPage() -> impl IntoView {
                         let name_for_mat = node_name.clone();
                         let name_for_ctx_label = node_name.clone();
                         let name_for_detail = node_name.clone();
+                        let is_remote = remote_nodes.get_untracked().contains_key(&node_name);
                         view! {
                             <div class="context-menu" style=format!("left: {x}px; top: {y}px")>
-                                <button class="context-menu-item" on:click=move |_| {
-                                    // Right-clicking inside a multi-selection acts on the
-                                    // whole selection; outside it, on just that node.
-                                    let sel = selected_nodes.get_untracked();
-                                    let targets = if sel.contains(&name_for_mat) {
-                                        sel
-                                    } else {
-                                        vec![name_for_mat.clone()]
-                                    };
-                                    start_materialize.run(targets);
-                                    set_ctx_menu.set(None);
-                                }>{move || {
-                                    let sel = selected_nodes.get();
-                                    if sel.len() > 1 && sel.contains(&name_for_ctx_label) {
-                                        format!("Materialize {} assets…", sel.len())
-                                    } else {
-                                        "Materialize…".to_string()
-                                    }
-                                }}</button>
+                                {(!is_remote).then(|| view! {
+                                    <button class="context-menu-item" on:click=move |_| {
+                                        // Right-clicking inside a multi-selection acts on the
+                                        // whole selection; outside it, on just that node.
+                                        let sel = selected_nodes.get_untracked();
+                                        let targets = if sel.contains(&name_for_mat) {
+                                            sel
+                                        } else {
+                                            vec![name_for_mat.clone()]
+                                        };
+                                        start_materialize.run(targets);
+                                        set_ctx_menu.set(None);
+                                    }>{move || {
+                                        let sel = selected_nodes.get();
+                                        if sel.len() > 1 && sel.contains(&name_for_ctx_label) {
+                                            format!("Materialize {} assets…", sel.len())
+                                        } else {
+                                            "Materialize…".to_string()
+                                        }
+                                    }}</button>
+                                })}
                                 <button class="context-menu-item" on:click=move |_| {
                                     set_selected_nodes.set(vec![name_for_detail.clone()]);
                                     set_ctx_menu.set(None);
@@ -742,10 +837,15 @@ pub fn GraphPage() -> impl IntoView {
                 // one asset's detail, so it's obvious what a materialize would cover.
                 if sel.len() > 1 {
                     let tasks = task_node_names.get();
-                    let mat_keys: Vec<String> =
-                        sel.iter().filter(|k| !tasks.contains(*k)).cloned().collect();
+                    let remotes = remote_nodes.get();
+                    let mat_keys: Vec<String> = sel
+                        .iter()
+                        .filter(|k| !tasks.contains(*k) && !remotes.contains_key(*k))
+                        .cloned()
+                        .collect();
                     let n_mat = mat_keys.len();
-                    let n_skipped = sel.len() - n_mat;
+                    let n_remote = sel.iter().filter(|k| remotes.contains_key(*k)).count();
+                    let n_skipped = sel.len() - n_mat - n_remote;
                     let sel_for_list = sel.clone();
                     return Some(view! {
                         <div class="dag-selected-sidebar">
@@ -791,6 +891,11 @@ pub fn GraphPage() -> impl IntoView {
                                     {format!("{} can't be materialized directly", crate::helpers::plural(n_skipped as u64, "task node", "task nodes"))}
                                 </div>
                             })}
+                            {(n_remote > 0).then(|| view! {
+                                <div class="dag-sidebar-empty">
+                                    {format!("{} materialized by other code locations", crate::helpers::plural(n_remote as u64, "remote asset", "remote assets"))}
+                                </div>
+                            })}
 
                             <div class="dag-sidebar-footer">
                                 {sorted_verbs(common_actions(&mat_keys, &asset_info_by_key.get())).into_iter().map(|act| {
@@ -828,6 +933,59 @@ pub fn GraphPage() -> impl IntoView {
                     let (upstream, downstream): (Vec<String>, Vec<String>) = topo
                         .map(|t| (t.direct_upstream(&node_name), t.direct_downstream(&node_name)))
                         .unwrap_or_default();
+
+                    if let Some(remote) = remote_nodes.get().get(&node_name).cloned() {
+                        let owner_status = remote_status_by_node.get().remove(&node_name);
+                        return Some(view! {
+                            <div class="dag-selected-sidebar">
+                                <div class="dag-sidebar-header">
+                                    <span class="section-header-label">"REMOTE ASSET"</span>
+                                    <button
+                                        class="icon-btn"
+                                        on:click=move |_| set_selected_nodes.set(Vec::new())
+                                        title="Close"
+                                        aria-label="Close"
+                                    >"×"</button>
+                                </div>
+
+                                <div>
+                                    <div class="dag-sidebar-title">{node_name.clone()}</div>
+                                    <div class="dag-sidebar-subtitle">
+                                        {format!("{} in {}", remote.asset_key, remote.code_location)}
+                                    </div>
+                                </div>
+
+                                {owner_status.map(|status| view! {
+                                    <div class="dag-sidebar-status">
+                                        <StatusChip kind=crate::helpers::stale_status_kind(&status)/>
+                                        {format!("in {}", remote.location().1)}
+                                    </div>
+                                })}
+
+                                <div class="dag-sidebar-empty">
+                                    {if remote.resolved {
+                                        "Another code location materializes this asset.".to_string()
+                                    } else {
+                                        format!("Code location {} is not registered with this UI.", remote.code_location)
+                                    }}
+                                </div>
+
+                                {remote.drift_message().map(|message| view! {
+                                    <div class="dag-sidebar-empty">{message}</div>
+                                })}
+
+                                {sidebar_links("DOWNSTREAM", "↓", downstream, set_selected_nodes)}
+
+                                {remote.resolved.then(|| view! {
+                                    <div class="dag-sidebar-footer">
+                                        <A href=remote.href() attr:class="btn dag-sidebar-action">
+                                            {format!("Open in {}", remote.location().1)}
+                                        </A>
+                                    </div>
+                                })}
+                            </div>
+                        }.into_any());
+                    }
 
                     Some(view! {
                         <div class="dag-selected-sidebar">
@@ -884,51 +1042,8 @@ pub fn GraphPage() -> impl IntoView {
                                                     {tags.into_iter().map(|t| view! { <Tag label=t/> }).collect::<Vec<_>>()}
                                                 </div>
 
-                                                <div class="dag-sidebar-section">
-                                                    <div class="section-header-label">{format!("UPSTREAM · {}", ups.len())}</div>
-                                                    {if ups.is_empty() {
-                                                        view! { <span class="dag-sidebar-empty">"—"</span> }.into_any()
-                                                    } else {
-                                                        view! {
-                                                            <div class="dag-sidebar-links">
-                                                                {ups.into_iter().map(|u| {
-                                                                    let u_for_click = u.clone();
-                                                                    view! {
-                                                                        <button
-                                                                            class="dag-sidebar-link"
-                                                                            on:click=move |_| set_selected_nodes.set(vec![u_for_click.clone()])
-                                                                        >
-                                                                            <span class="dag-sidebar-link-arrow">"↑"</span>{u}
-                                                                        </button>
-                                                                    }
-                                                                }).collect::<Vec<_>>()}
-                                                            </div>
-                                                        }.into_any()
-                                                    }}
-                                                </div>
-
-                                                <div class="dag-sidebar-section">
-                                                    <div class="section-header-label">{format!("DOWNSTREAM · {}", downs.len())}</div>
-                                                    {if downs.is_empty() {
-                                                        view! { <span class="dag-sidebar-empty">"—"</span> }.into_any()
-                                                    } else {
-                                                        view! {
-                                                            <div class="dag-sidebar-links">
-                                                                {downs.into_iter().map(|d| {
-                                                                    let d_for_click = d.clone();
-                                                                    view! {
-                                                                        <button
-                                                                            class="dag-sidebar-link"
-                                                                            on:click=move |_| set_selected_nodes.set(vec![d_for_click.clone()])
-                                                                        >
-                                                                            <span class="dag-sidebar-link-arrow">"↓"</span>{d}
-                                                                        </button>
-                                                                    }
-                                                                }).collect::<Vec<_>>()}
-                                                            </div>
-                                                        }.into_any()
-                                                    }}
-                                                </div>
+                                                {sidebar_links("UPSTREAM", "↑", ups, set_selected_nodes)}
+                                                {sidebar_links("DOWNSTREAM", "↓", downs, set_selected_nodes)}
 
                                                 <div class="dag-sidebar-footer">
                                                     <A href={href} attr:class="btn dag-sidebar-action">"Details"</A>

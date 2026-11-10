@@ -226,6 +226,113 @@ source_table = rs.Asset.external(
 - **Source-only nodes** — external assets are leaf nodes in the DAG; they provide data to downstream assets but are never materialized themselves
 - **Excluded from materialization** — `materialize()` automatically filters out external assets from the execution selection, but they remain in the dependency graph so downstream assets can load their data via `io_handler.load_input()`
 
+## Remote assets
+
+A remote asset is an asset that another code location materializes. Declare it with `Asset.remote()` so that assets in this code location can depend on it. The lineage view then shows the dependency across the two code locations.
+
+```python
+# Code location "warehouse"
+@rs.Asset(io_handler=warehouse_tables)
+def raw_orders() -> pl.DataFrame: ...
+
+
+# Code location "analytics"
+raw_orders = rs.Asset.remote("raw_orders", code_location="warehouse", io_handler=warehouse_tables)
+
+@rs.Asset
+def order_count(raw_orders: pl.DataFrame) -> int:
+    return raw_orders.height
+```
+
+- **`code_location`** — `"name"` for a code location in the same namespace, or `"namespace/name"`. In `rivers dev` the namespace is `dev`; [Several code locations in `rivers dev`](../guides/code-locations-locally.md) runs two of them on one storage.
+- **`io_handler`** — reads the owner's output, so configure it to read where the owner writes. `load_input()` gets the owner's key as `InputContext.asset_name` and the owner as `InputContext.code_location`.
+- **Lineage-only** — without `io_handler`, list the remote asset with `AssetDef.dep()`. A parameter that loads it raises `GraphValidationError`, unless the consumer sets a handler with `AssetDef.input(name, io_handler=...)`.
+- **`partitions_def`** — mirrors the owner's partition definition, so partition mappings work as for a local upstream. A dynamic definition cannot be mirrored: its keys live in the owning code location.
+- **Never materialized here** — `materialize()` and `backfill()` selections, jobs, and sensor targets that name a remote asset raise an error that names the owning code location. The remote asset gets no asset record in this code location.
+- **Data versions** — a run records the owner's data version of a remote input under the local name, as for a local input. If the owning code location is not registered, the run loads the input through the handler without its data version. It then writes a warning to the log of each step that loads the input.
+
+### Aliasing
+
+`name` is the **local name**: the node name in this code location, the parameter name, and the name in `deps=`. `asset_key` is the asset's key in the owning code location. It defaults to `name`.
+
+Local names must be unique in a code location, as all asset names must be. Two remote assets with the same local name raise `AssetDefinitionError`, also when they come from different code locations:
+
+```python
+foo = rs.Asset.remote("raw_orders", code_location="foo", io_handler=foo_tables)
+bar = rs.Asset.remote("raw_orders", code_location="bar", io_handler=bar_tables)
+rs.CodeRepository(assets=[foo, bar]).resolve()
+# AssetDefinitionError: duplicate asset name 'raw_orders': two definitions register under it
+```
+
+To use both, give each one a different local name and set `asset_key` to the owner's key:
+
+```python
+foo_orders = rs.Asset.remote("foo_orders", code_location="foo", asset_key="raw_orders", io_handler=foo_tables)
+bar_orders = rs.Asset.remote("bar_orders", code_location="bar", asset_key="raw_orders", io_handler=bar_tables)
+
+@rs.Asset
+def merged_orders(foo_orders: pd.DataFrame, bar_orders: pd.DataFrame) -> pd.DataFrame:
+    return pd.concat([foo_orders, bar_orders])
+```
+
+How each side sees the two remote assets:
+
+| | `foo_orders` | `bar_orders` |
+| --- | --- | --- |
+| Node, parameter, and `deps=` name in this code location | `foo_orders` | `bar_orders` |
+| `InputContext.asset_name` | `"raw_orders"` | `"raw_orders"` |
+| `InputContext.code_location` | `"dev/foo"` | `"dev/bar"` |
+| Lineage node label | `foo · raw_orders` | `bar · raw_orders` |
+
+Both handlers get the same `asset_name`, so each one must read from its owner's storage, for example with a different path prefix.
+
+The same alias resolves a clash with an asset of this code location:
+
+```python
+@rs.Asset
+def raw_orders() -> pd.DataFrame: ...
+
+wh_orders = rs.Asset.remote("wh_orders", code_location="warehouse", asset_key="raw_orders", io_handler=warehouse_tables)
+```
+
+### Lineage view
+
+The lineage view draws a remote asset with a dotted border, the owner's name, and the owner's key. It links to the asset in the owning code location when the UI knows that code location. Otherwise the node shows **not registered**. In `rivers dev`, the UI knows every code location that registered in its storage.
+
+The status dot of a remote asset shows the owner's status of the asset: up-to-date, stale, or missing. The dot is hollow when the UI does not know the owner, or when the owner has no record of the asset.
+
+On the owner's side, the **Lineage** tab of an asset lists the assets of other code locations that depend on it, under **In other code locations**. Each code location lists the remote assets it consumes when it resolves.
+
+### Automation
+
+The condition daemon of this code location follows the owner's runs. Conditions on a remote dependency see the owner's state:
+
+- **`eager()`** starts a run when the owner materializes the remote asset. It waits while an owner run that materializes the remote asset is in progress.
+- **`on_cron()`** counts the owner's materialization as a dependency update.
+- **`any_deps_missing()`** is true until the owner materializes the remote asset (or its partition). It is also true while the owning code location is not registered, or while the mirror is incompatible with the owner's definition (see [Partition drift](#partition-drift)), so `eager()` starts no run.
+- **`any_deps_match(execution_failed())`** follows the owner's failed runs.
+- **Partition mappings** use the mirrored `partitions_def`.
+
+These conditions read the runs of this code location, so they are false on a remote dependency: `backfill_in_progress()`, `will_be_requested()`, `last_executed_with_tags()`, `has_run_with_tags()`, and `all_runs_have_tags()`.
+
+The daemon finds the owner by name. While the owner is not registered, it tries again every 5 seconds. After that, it checks the owner's identity and partition definitions every 30 seconds, so it follows a redeployed owner.
+
+### Partition drift
+
+The mirrored `partitions_def` can stop matching the owner's definition, for example when the owner changes a daily definition to an hourly one. rivers compares the two definitions: the lineage view on each page load, and the condition daemon every 30 seconds. The result depends on the difference:
+
+| Difference | Examples | Lineage view | Automation | Manual runs |
+| --- | --- | --- | --- | --- |
+| Compatible | The owner moved `start` or `end`, or added static keys. | **range differs** | No change. | No change. |
+| Incompatible | Another kind, schedule, or key format. The owner removed a static key. Only one side is partitioned. With `interval_seconds`, the owner moved `start` by part of the interval, for example from 00:00 to 00:30 with `interval_seconds=3600`. | **partitions differ** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+| Owner has no such asset | The owner renamed or removed the asset. | **not found** | Paused: the dependency counts as missing. | The run loads the input and writes a warning to the step's log. |
+
+With a compatible difference, a consumer partition outside the owner's range stays missing until the owner has that partition.
+
+Each code location stores a hash of each static key list in its graph, and the list itself once. rivers compares the hashes and counts first. It reads the two key lists only when the owner has more static keys than the mirror. If a code location has not stored its key list, the difference is incompatible until that code location resolves again.
+
+Select the node in the lineage view to see both definitions. To resume automation, change the mirror to match the owner's definition, or undo the owner's change. The daemon sees an undone change within 30 seconds.
+
 ## Self-dependent assets
 
 An asset can read its own previously persisted value to support incremental patterns (running counters, accumulating windows, append-only state). Declare a parameter named `self` typed as `SelfDependency[T]` — the executor loads the asset's last stored value through its IO handler before invoking the function:

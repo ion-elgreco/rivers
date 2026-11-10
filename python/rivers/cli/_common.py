@@ -13,6 +13,7 @@ from typing import TypeVar
 
 import typer
 
+from rivers._core import code_location_ref
 from rivers._core.storage import Storage
 from rivers.exceptions import SchemaMigrationNeededError
 
@@ -47,6 +48,19 @@ def _cleanup_storage(path: str) -> None:
         parent = p.parent
         if parent.name == ".rivers" and parent.exists() and not any(parent.iterdir()):
             parent.rmdir()
+
+
+def _check_code_location_ref() -> None:
+    """Exit with code 1 when this code location's ``namespace/name`` is not valid.
+
+    A serving code location lists itself under that name in the code location
+    directory.
+    """
+    try:
+        code_location_ref()
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 _CODE_LOCATION_ID_OPT = typer.Option(

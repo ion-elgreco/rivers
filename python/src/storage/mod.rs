@@ -285,6 +285,17 @@ impl PyStorage {
         Ok(Self::from_storage(storage, PyStorageType::Memory))
     }
 
+    /// Test-only: the same store, scoped to another code location identity.
+    fn _scoped(&self, code_location_id: &str) -> Self {
+        Self {
+            handle: DetachOnClose::new(ScopedStorageHandle::new(
+                Arc::clone(self.backend()),
+                CodeLocationContext::new(code_location_id),
+            )),
+            storage_type: self.storage_type,
+        }
+    }
+
     /// Connect to a remote SurrealDB server (e.g. "ws://host:8000").
     ///
     /// Resolution per field: explicit kwarg → `RIVERS_SURREAL_*` env var →

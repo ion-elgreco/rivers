@@ -11,6 +11,8 @@ use crate::errors::{
 use crate::executor::ops::{enumerate_params, get_annotations, is_context_annotation};
 use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey};
 use crate::runtime::io_rt;
+use rivers_core::assets::graph::NodeRef;
+use rivers_core::assets::remote::RemoteRef;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{BackfillRecord, PartitionKey, StorageBackend};
 
@@ -160,6 +162,62 @@ pub(super) fn resolve_selection<'a>(
             })
         })
         .collect()
+}
+
+pub(crate) fn remote_not_materializable(name: &str, remote: &RemoteRef) -> String {
+    format!(
+        "Cannot materialize remote asset '{name}': code location '{}' owns it",
+        remote.code_location
+    )
+}
+
+/// Reject remote assets in a selection to run. Unknown names pass;
+/// `resolve_selection` reports them.
+pub(super) fn ensure_materializable<'a>(
+    node_map: &HashMap<String, ResolvedNode>,
+    names: impl IntoIterator<Item = &'a String>,
+) -> PyResult<()> {
+    for name in names {
+        if let Some(remote) = node_map.get(name).and_then(ResolvedNode::remote) {
+            return Err(ExecutionError::new_err(remote_not_materializable(
+                name, remote,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A remote without an `io_handler` is lineage-only: a downstream may list it
+/// in `deps=` but not load it, unless it sets its own input handler.
+pub(super) fn validate_remote_inputs(
+    node_map: &HashMap<String, ResolvedNode>,
+    unresolved_graph: &std::collections::BTreeMap<String, Vec<NodeRef>>,
+) -> PyResult<()> {
+    for (node_name, deps) in unresolved_graph {
+        let Some(node) = node_map.get(node_name) else {
+            continue;
+        };
+        for dep in deps {
+            let NodeRef::ByName(dep_name) = dep else {
+                continue;
+            };
+            let Some(upstream) = node_map.get(dep_name) else {
+                continue;
+            };
+            if upstream.is_remote()
+                && !upstream.has_io_handler()
+                && !node.is_lineage_dep(dep_name)
+                && !node.declares_input_io_handler(dep_name)
+            {
+                return Err(GraphValidationError::new_err(format!(
+                    "'{node_name}' loads remote asset '{dep_name}', which has no io_handler. \
+                     Set io_handler on Asset.remote, or depend on it with \
+                     AssetDef.dep('{dep_name}') to load nothing"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every selected asset must exist and define `verb` — the shared boundary
@@ -592,7 +650,7 @@ pub(super) fn validate_schedule_sensor_resource_references(
 pub(super) fn validate_sensor_run_targets(
     py: Python,
     sensors: &HashMap<String, Py<PySensorDefinition>>,
-    asset_names: &HashSet<&str>,
+    node_map: &HashMap<String, ResolvedNode>,
     job_names: &HashSet<&str>,
 ) -> PyResult<()> {
     for (name, sensor) in sensors {
@@ -632,11 +690,18 @@ pub(super) fn validate_sensor_run_targets(
 
         if let Some(selection) = s.asset_selection.as_ref() {
             for asset in selection {
-                if !asset_names.contains(asset.as_str()) {
+                let Some(node) = node_map.get(asset) else {
                     return Err(crate::errors::SensorDefinitionError::new_err(format!(
                         "Sensor '{}' references unknown asset '{}' in \
                          `asset_selection`.",
                         name, asset
+                    )));
+                };
+                if let Some(remote) = node.remote() {
+                    return Err(crate::errors::SensorDefinitionError::new_err(format!(
+                        "Sensor '{}': {}",
+                        name,
+                        remote_not_materializable(asset, remote)
                     )));
                 }
             }

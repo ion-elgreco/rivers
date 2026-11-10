@@ -8,6 +8,8 @@ use rivers_api::rivers::code_location_service_client::CodeLocationServiceClient;
 #[cfg(feature = "ssr")]
 use rivers_core::assets::graph::GraphTopology;
 #[cfg(feature = "ssr")]
+use rivers_core::assets::partitions_fingerprint::KeyComparisons;
+#[cfg(feature = "ssr")]
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 #[cfg(feature = "ssr")]
 use std::sync::Arc;
@@ -34,6 +36,8 @@ pub struct AppState {
     /// the registry and read `kv["graph_topology:<id>"]`.
     pub graph: Option<Arc<GraphTopology>>,
     pub registry: Registry,
+    /// Answers of the static key comparisons behind partition drift.
+    pub key_comparisons: Arc<KeyComparisons>,
 }
 
 #[cfg(feature = "ssr")]

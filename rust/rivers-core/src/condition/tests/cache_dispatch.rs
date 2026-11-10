@@ -103,18 +103,8 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     use crate::assets::graph::TopologyNode;
     let topo = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "raw".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "dst".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("raw", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
     };
@@ -482,12 +472,7 @@ async fn test_materializing_action_triggers_downstream_eager() {
         .register_assets(&[make_record("events"), make_record("rollup")])
         .await
         .unwrap();
-    let node = |name: &str| TopologyNode {
-        name: name.into(),
-        kind: NodeKind::Asset,
-        group: None,
-        parent_graph: None,
-    };
+    let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
     storage
         .kv_set(
             &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
@@ -596,12 +581,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
     use crate::storage::surrealdb_backend::SurrealStorage;
     use crate::storage::{EventRecord, EventType};
 
-    let node = |name: &str| TopologyNode {
-        name: name.into(),
-        kind: NodeKind::Asset,
-        group: None,
-        parent_graph: None,
-    };
+    let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
     let event = |run_id: &str, asset: &str, ts: i64, materialized: bool| EventRecord {
         code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
         event_type: if materialized {
@@ -1204,18 +1184,8 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     use crate::assets::graph::TopologyNode;
     let topo = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "raw".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "dst".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("raw", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
     };
@@ -1404,18 +1374,8 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
     use crate::assets::graph::TopologyNode;
     let topo = GraphTopology {
         nodes: vec![
-            TopologyNode {
-                name: "raw".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
-            TopologyNode {
-                name: "dst".into(),
-                kind: crate::assets::graph::NodeKind::Asset,
-                group: None,
-                parent_graph: None,
-            },
+            TopologyNode::new("raw", crate::assets::graph::NodeKind::Asset),
+            TopologyNode::new("dst", crate::assets::graph::NodeKind::Asset),
         ],
         edges: vec![("dst".to_string(), "raw".to_string())],
     };

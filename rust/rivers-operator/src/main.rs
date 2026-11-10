@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let run_ctx = Arc::new(run::Context {
         client: client.clone(),
         namespace: namespace.clone(),
-        storage,
+        storage: storage.clone(),
         directory: directory_state.clone(),
         workspace: workspace_cfg.clone(),
         surreal_pod_cfg: surreal_pod_cfg.clone(),
@@ -156,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         namespace.clone(),
         directory_state.clone(),
         Some(synced.clone()),
+        codelocation::DirectoryGc::new(storage, (*leader).clone()),
     )?;
     spawn_webhook_server(
         client.clone(),
@@ -222,6 +223,7 @@ fn spawn_registry_service(
     namespace: String,
     state: Arc<codelocation::DirectoryState>,
     synced: Option<webhook::Synced>,
+    gc: codelocation::DirectoryGc,
 ) -> anyhow::Result<()> {
     let token = match std::env::var(REGISTRY_TOKEN_ENV) {
         Ok(t) if !t.is_empty() => t,
@@ -240,6 +242,7 @@ fn spawn_registry_service(
         namespace,
         state.clone(),
         synced,
+        gc,
     ));
     tokio::spawn(async move {
         if let Err(e) = codelocation::directory::serve(state, addr, token).await {

@@ -71,6 +71,8 @@ You can also build conditions from leaf primitives (`missing()`, `code_version_c
 
 Unlike schedules and sensors, automation conditions don't go through `RunRequest`s — the daemon launches matching assets directly via the run coordinator.
 
+A dependency on a [remote asset](assets.md#remote-assets) follows the runs of the code location that owns it, so `eager()` fires when the owner materializes it. See [Automation](assets.md#automation) for the conditions that are false on a remote dependency.
+
 ## Picking between them
 
 The three triggers overlap. A rough decision rule:

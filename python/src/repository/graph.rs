@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use pyo3::prelude::*;
 
 use crate::assets::decorator::{Asset, PyAsset, validate_multi_output_partition_defs};
+use crate::assets::external_asset::ExternalAsset;
 use crate::assets::io_handler::IOHandler;
+use crate::assets::remote_asset::RemoteAsset;
 use crate::errors::{AssetDefinitionError, PartitionValidationError};
 use crate::executor::ops::{enumerate_params, is_context_annotation};
 use crate::partitions::mapping::PartitionMapping;
@@ -194,8 +196,9 @@ pub(crate) fn build_unresolved_graph(
                 resolved.lineage_deps = lineage_only(&graph_asset.dep_only_names, &inputs);
                 node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
             }
-            Asset::External(ext) => {
-                let asset_name = ext.name.clone().unwrap();
+            Asset::External(ExternalAsset { name, .. })
+            | Asset::Remote(RemoteAsset { name, .. }) => {
+                let asset_name = name.clone().unwrap();
                 claim(&mut claimed, &asset_name)?;
                 unresolved_graph.insert(asset_name.clone(), Vec::new());
                 node_map.insert(

@@ -67,11 +67,12 @@ Passed to `load_input()` with information about the asset being loaded.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `asset_name` | `str` | Name of the upstream asset. |
+| `asset_name` | `str` | Name of the upstream asset. For a remote upstream, its key in the owning code location (`asset_key`), not the local name. |
 | `downstream_asset` | `str` | Name of the asset requesting the load. |
 | `asset_metadata` | `dict[str, str] \| None` | Static metadata from the upstream asset. |
 | `partition` | `PartitionContext \| None` | Partition info, if partitioned. |
 | `type_hint` | `type \| None` | Type annotation on the downstream parameter. |
+| `code_location` | `str \| None` | Owning code location (`"namespace/name"`) of a remote upstream. `None` for an upstream in this code location. |
 
 ---
 

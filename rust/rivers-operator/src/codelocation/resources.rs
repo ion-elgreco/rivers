@@ -273,6 +273,7 @@ fn build_base_env(
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Vec<EnvVar> {
+    let namespace = cl.namespace().unwrap_or_default();
     let mut env = vec![
         EnvVar {
             name: "RIVERS_CODE_LOCATION_NAME".to_string(),
@@ -282,6 +283,16 @@ fn build_base_env(
         EnvVar {
             name: "RIVERS_CODE_LOCATION_ID".to_string(),
             value: Some(cl.spec.identity.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: rivers_k8s::env::ENV_CODE_LOCATION_NAMESPACE.to_string(),
+            value: Some(namespace.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT.to_string(),
+            value: Some(grpc_endpoint(&cl.name_any(), &namespace, cl.spec.grpc_port)),
             ..Default::default()
         },
         EnvVar {
@@ -449,6 +460,8 @@ mod tests {
                             "env": [
                                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
+                                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
+                                { "name": "RIVERS_CODE_LOCATION_GRPC_ENDPOINT", "value": "analytics-grpc.team-data.svc.cluster.local:3001" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:abc" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -497,8 +510,12 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "duplicate env names: {env:?}");
+        let otel = env
+            .iter()
+            .position(|e| e["name"] == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap();
         assert_eq!(
-            serde_json::Value::Array(env[7..].to_vec()),
+            serde_json::Value::Array(env[otel..].to_vec()),
             json!([
                 { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://team-collector:4317" },
                 { "name": "RIVERS_OTEL_ENDPOINT", "value": "https://otlp.example.com:4317" },
@@ -608,6 +625,8 @@ mod tests {
                             "env": [
                                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
+                                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
+                                { "name": "RIVERS_CODE_LOCATION_GRPC_ENDPOINT", "value": "analytics-grpc.team-data.svc.cluster.local:50051" },
                                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/acme/pipeline@sha256:deadbeef" },
                                 { "name": "RIVERS_MODULE", "value": "acme.pipeline" },
                                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -821,6 +840,8 @@ mod tests {
             "env": [
                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "550e8400-e29b-41d4-a716-446655440000" },
+                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
+                { "name": "RIVERS_CODE_LOCATION_GRPC_ENDPOINT", "value": "analytics-grpc.team-data.svc.cluster.local:50051" },
                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
                 { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -925,6 +946,8 @@ mod tests {
             "env": [
                 { "name": "RIVERS_CODE_LOCATION_NAME", "value": "analytics" },
                 { "name": "RIVERS_CODE_LOCATION_ID", "value": "" },
+                { "name": "RIVERS_CODE_LOCATION_NAMESPACE", "value": "team-data" },
+                { "name": "RIVERS_CODE_LOCATION_GRPC_ENDPOINT", "value": "analytics-grpc.team-data.svc.cluster.local:3001" },
                 { "name": "RIVERS_CODE_LOCATION_IMAGE", "value": "ghcr.io/rt@sha256:1a2b3c4dff" },
                 { "name": "RIVERS_MODULE", "value": "analytics.pipeline" },
                 { "name": "RIVERS_SURREAL_ENDPOINT", "value": "ws://surrealdb.rivers.svc:8000" },
@@ -1142,6 +1165,45 @@ mod tests {
                 workspace.is_some()
             );
             assert_eq!(main["terminationMessagePolicy"], "FallbackToLogsOnError");
+        }
+    }
+
+    #[test]
+    fn pod_advertises_the_service_endpoint_that_the_status_names() {
+        let image_cl = make_cl(
+            json!({ "image": "ghcr.io/acme/pipeline", "tag": "v1.0.0", "grpcPort": 4000 }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let git_cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
+        let pieces = git_pieces(&git_cl, shared_volume());
+        for (cl, workspace) in [(&image_cl, None), (&git_cl, Some(&pieces))] {
+            let d = build_deployment(
+                cl,
+                "ghcr.io/rt@sha256:1a2b3c4dff",
+                "rivers-code-location",
+                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::OtelPodConfig::default(),
+                workspace,
+            );
+            let env = d.spec.template.spec.unwrap().containers[0]
+                .env
+                .clone()
+                .unwrap();
+
+            let advertised: Vec<_> = env
+                .iter()
+                .filter(|e| e.name == rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT)
+                .map(|e| e.value.as_deref())
+                .collect();
+            let endpoint = grpc_endpoint("analytics", "team-data", cl.spec.grpc_port);
+            assert_eq!(
+                advertised,
+                [Some(endpoint.as_str())],
+                "git: {}",
+                workspace.is_some()
+            );
         }
     }
 

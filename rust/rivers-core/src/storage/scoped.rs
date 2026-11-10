@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
+
+use crate::assets::graph::GraphTopology;
+use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
@@ -459,28 +462,129 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn set_graph_topology(
         &self,
         topology: &crate::assets::graph::GraphTopology,
+        key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>],
     ) -> Result<()> {
         self.backend
-            .set_graph_topology(self.code_location_id, topology)
+            .set_graph_topology(self.code_location_id, topology, key_lists)
             .await
     }
 
-    /// Compute staleness for every asset in this code location.
-    pub async fn compute_staleness(
-        &self,
-    ) -> Result<std::collections::HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
-        let records = self.get_asset_records().await?;
-        let edges = self
-            .get_graph_topology()
-            .await?
-            .map(|t| t.edges)
-            .unwrap_or_default();
-        Ok(crate::staleness::compute_staleness(&records, &edges))
+    pub async fn get_partition_keys(&self, digest: &str) -> Result<Option<Vec<String>>> {
+        self.backend
+            .get_partition_keys(self.code_location_id, digest)
+            .await
     }
 }
 
 /// Per-CL methods that need to reach the unscoped `StorageBackend` KV API.
 impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
+    /// Compute staleness for every asset in this code location.
+    pub async fn compute_staleness(
+        &self,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let records = self.get_asset_records().await?;
+        let topology = self.get_graph_topology().await?;
+        self.staleness_for(&records, topology.as_ref()).await
+    }
+
+    /// Staleness of this code location's `records`. A remote upstream counts
+    /// with its owner's data version, and is left out of the result.
+    pub async fn staleness_for(
+        &self,
+        records: &[AssetRecord],
+        topology: Option<&GraphTopology>,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let Some(topology) = topology else {
+            return Ok(crate::staleness::compute_staleness(records, &[]));
+        };
+        let remote: HashSet<&str> = topology.remotes().map(|(name, _)| name).collect();
+        if remote.is_empty() {
+            return Ok(crate::staleness::compute_staleness(
+                records,
+                &topology.edges,
+            ));
+        }
+
+        let remote_records = self.remote_upstream_records(topology).await?;
+        // A row of a remote's name is left from when the asset was local.
+        let owned = records
+            .iter()
+            .filter(|record| !remote.contains(record.asset_key.as_str()));
+        let mut staleness =
+            crate::staleness::compute_staleness(owned.chain(&remote_records), &topology.edges);
+        staleness.retain(|key, _| !remote.contains(key.as_str()));
+        Ok(staleness)
+    }
+
+    /// Staleness of `keys` of this code location, as [`Self::staleness_for`]
+    /// gives it over all records. Reads only the records of `keys` and of the
+    /// assets upstream of them. A key without a record has no entry.
+    pub async fn staleness_of(
+        &self,
+        keys: &[String],
+        topology: Option<&GraphTopology>,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        let Some(topology) = topology else {
+            let records = self.get_asset_records_by_keys(keys).await?;
+            return self.staleness_for(&records, None).await;
+        };
+
+        let (owned, upstream) = crate::staleness::upstream_of(keys, topology);
+        let records = self.get_asset_records_by_keys(&owned).await?;
+        let mut staleness = self.staleness_for(&records, Some(&upstream)).await?;
+        staleness.retain(|key, _| keys.contains(key));
+        Ok(staleness)
+    }
+
+    /// The owner's record of each remote node in `topology`, under the local
+    /// name (see [`crate::staleness::remote_input_record`]). A remote whose
+    /// owner is not registered, or has no such asset, has none.
+    pub async fn remote_upstream_records(
+        &self,
+        topology: &GraphTopology,
+    ) -> Result<Vec<AssetRecord>> {
+        let remotes: Vec<(&str, &RemoteRef)> = topology.remotes().collect();
+        let locations: Vec<&LocationRef> = remotes
+            .iter()
+            .map(|(_, remote)| &remote.code_location)
+            .collect();
+        let identities = super::resolve_code_locations(self.backend, locations).await?;
+        let resolved: Vec<(&str, &str, &String)> = remotes
+            .into_iter()
+            .filter_map(|(local, remote)| {
+                let identity = identities.get(&remote.code_location)?.as_deref()?;
+                Some((local, identity, &remote.asset_key))
+            })
+            .collect();
+
+        let mut keys: HashMap<&str, Vec<String>> = HashMap::new();
+        for &(_, identity, key) in &resolved {
+            keys.entry(identity).or_default().push(key.clone());
+        }
+        let mut owners: HashMap<&str, HashMap<String, AssetRecord>> = HashMap::new();
+        for (identity, keys) in keys {
+            let records = self
+                .backend
+                .get_asset_records_by_keys(identity, &keys)
+                .await?;
+            owners.insert(
+                identity,
+                records
+                    .into_iter()
+                    .map(|record| (record.asset_key.clone(), record))
+                    .collect(),
+            );
+        }
+
+        Ok(resolved
+            .into_iter()
+            .filter_map(|(local, identity, key)| {
+                let owner = owners[identity].get(key)?;
+                Some(crate::staleness::remote_input_record(local, owner))
+            })
+            .collect())
+    }
+
     fn dynamic_keys_kv_key(
         &self,
         asset_key: &str,

@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -51,6 +52,8 @@ def second(first: int) -> int:
 
 repo = rs.CodeRepository(assets=[first, second])
 """
+
+SERVING = {"enabled": True, "location": ["dev", "default"], "error": None}
 
 MODULE_BROKEN = "import rivers as rs\nrepo = rs.CodeRepository(assets=[not_defined])\n"
 
@@ -203,6 +206,20 @@ class DevHostProcess:
                 self.pb2.GetBackfillStatusRequest(backfill_id=backfill_id), timeout=10
             )
 
+    def storage_endpoint(self) -> str:
+        """The storage endpoint the host prints at start."""
+        prefix = "Storage: "
+
+        def printed():
+            self.out_file.flush()
+            lines = self.out_path.read_text(errors="replace").splitlines()
+            return next(
+                (ln[len(prefix) :] for ln in lines if ln.startswith(prefix)), None
+            )
+
+        wait_for(printed, 60, "the storage endpoint")
+        return printed()
+
     def ui_up(self) -> bool:
         try:
             with urllib.request.urlopen(
@@ -305,7 +322,7 @@ def test_reload_serves_the_edited_module(dev_host, tmp_path):
     dev_host.wait_ready()
     assert dev_host.asset_names() == {"first"}
     state = dev_host.reload_state()
-    assert state == {"enabled": True, "generation": 0, "error": None}
+    assert state == {**SERVING, "generation": 0}
 
     (tmp_path / "pipe_mod.py").write_text(MODULE_V2)
     dev_host.reload_via_http()
@@ -349,9 +366,7 @@ def test_a_broken_edit_keeps_the_session_alive(dev_host, tmp_path):
         "the fixed module to be served",
     )
     wait_for(
-        lambda: (
-            dev_host.reload_state() == {"enabled": True, "generation": 1, "error": None}
-        ),
+        lambda: dev_host.reload_state() == {**SERVING, "generation": 1},
         30,
         "the host to clear the error",
     )
@@ -414,7 +429,7 @@ def test_a_run_in_flight_finishes_in_the_retired_generation(start_dev_host, tmp_
         30,
         "the retired generation to exit on its own",
     )
-    assert dev_host.reload_state() == {"enabled": True, "generation": 1, "error": None}
+    assert dev_host.reload_state() == {**SERVING, "generation": 1}
 
     code = dev_host.stop()
     logs = dev_host.logs()
@@ -463,3 +478,36 @@ def test_a_backfill_completes_across_a_reload(start_dev_host, tmp_path):
 
     code = dev_host.stop()
     assert code == 0, dev_host.logs()
+
+
+def test_the_code_location_advertises_its_grpc_endpoint(dev_host, tmp_path):
+    import rivers as rs
+
+    dev_host.wait_ready()
+    storage = rs.Storage.connect(dev_host.storage_endpoint())
+    advertised = f"http://127.0.0.1:{dev_host.grpc_port}"
+
+    def entry() -> dict:
+        raw = storage.kv_get("code_location:dev/default")
+        return {} if raw is None else json.loads(raw)
+
+    try:
+        wait_for(
+            lambda: entry().get("grpc_endpoint") == advertised,
+            30,
+            "the code location to advertise its gRPC endpoint",
+        )
+        first_seen = entry()["last_seen"]
+        assert abs(time.time_ns() - first_seen) < 30 * 10**9
+
+        (tmp_path / "pipe_mod.py").write_text(MODULE_V2)
+        assert dev_host.reload_via_http() is None
+        wait_for(
+            lambda: entry()["last_seen"] > first_seen,
+            30,
+            "the next generation's heartbeat",
+        )
+        assert entry()["grpc_endpoint"] == advertised
+    finally:
+        # The client closes before the server it talks to.
+        storage = None

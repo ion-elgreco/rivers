@@ -11,6 +11,8 @@ rivers has four concurrency layers that compose. Each operates at a different sc
 
 The first two are **run-level gates** — they decide whether a run is allowed to *start*. The other two are **step-level gates** — they decide whether a step inside an already-running run is allowed to *execute*. A run can clear the queue gates and still have its individual steps wait on the executor's step budget or on pool slots.
 
+Each code location has its own run queue, tag limits, and pools. Its runs and steps count only against its own limits, so two code locations with a pool of the same name each get the full slot limit.
+
 Synchronous `repo.materialize()` calls bypass the run-level gates (they run immediately and don't go through the queue), but step-level gates still apply because they're enforced inside the executor for every step.
 
 ## Run queue
@@ -58,7 +60,7 @@ These compose with `max_concurrent_runs`: a queued run is admitted only if both 
 
 ## Executor step parallelism
 
-Within a single run, the chosen `Executor` decides how many steps from the same DAG level can execute in parallel. This is independent from the run queue (which gates *runs*) and from pools (which gate *steps that share a resource across the whole system*).
+Within a single run, the chosen `Executor` decides how many steps from the same DAG level can execute in parallel. This is independent from the run queue (which gates *runs*) and from pools (which gate *steps that share a resource across the code location*).
 
 ### `Executor.parallel(max_workers, max_async_concurrent)`
 

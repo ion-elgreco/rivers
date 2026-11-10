@@ -24,4 +24,7 @@ spec:
       value: {{ $.Values.s3.secretKey | quote }}
     - name: AWS_REGION
       value: {{ $.Values.s3.region | quote }}
+    {{- with .env }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 {{- end }}

@@ -424,6 +424,8 @@ pub fn serve_dev_code_location(py: Python<'_>) -> PyResult<()> {
     if actual_port != grpc_port {
         eprintln!("Warning: gRPC port {grpc_port} is in use; serving on {actual_port}");
     }
+    repo.call_method1("_start_heartbeat", (&host, actual_port))?;
+
     // Held until exit: dropping the daemon object stops its loops.
     let _daemon = if no_daemon {
         None
