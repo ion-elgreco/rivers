@@ -181,10 +181,6 @@ pub fn GraphPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
-    let remote_statuses = Resource::new(
-        move || (loc.get(), refresh_tick.get(), live.definitions.get()),
-        |((ns, name), _, _)| get_remote_statuses(ns, name),
-    );
 
     // Multi-selection in click order; the last entry is the focused node.
     let (selected_nodes, set_selected_nodes) = signal(Vec::<String>::new());
@@ -232,6 +228,31 @@ pub fn GraphPage() -> impl IntoView {
             .map(|t| t.remote_nodes())
             .unwrap_or_default()
     });
+
+    // The owner's status of each remote node. A topology without a remote
+    // node needs no request; until the topology is here, ask.
+    let no_remote_nodes = Memo::new(move |_| {
+        topology_value
+            .get()
+            .and_then(|r| r.ok())
+            .is_some_and(|t| t.nodes.iter().all(|n| n.remote.is_none()))
+    });
+    let remote_statuses = Resource::new(
+        move || {
+            (
+                loc.get(),
+                refresh_tick.get(),
+                live.definitions.get(),
+                no_remote_nodes.get(),
+            )
+        },
+        |((ns, name), _, _, no_remote_nodes)| async move {
+            if no_remote_nodes {
+                return Ok(Default::default());
+            }
+            get_remote_statuses(ns, name).await
+        },
+    );
 
     // ViewBox-based zoom/pan state.
     // vb_scale = SVG units per screen pixel (higher = more zoomed out).

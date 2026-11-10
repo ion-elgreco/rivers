@@ -184,9 +184,34 @@ pub fn AssetDetailPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
+    // The Lineage tab shows the owner's status of a remote upstream. An
+    // asset without one needs no request; until the topology is here, ask.
+    let graph_value = crate::helpers::resource_value(graph);
+    let no_remote_upstream = Memo::new(move |_| {
+        params.track();
+        let current = key();
+        graph_value.get().and_then(|r| r.ok()).is_some_and(|t| {
+            let upstream = t.direct_upstream(&current);
+            !t.nodes
+                .iter()
+                .any(|n| n.remote.is_some() && upstream.contains(&n.name))
+        })
+    });
     let remote_statuses = Resource::new(
-        move || (loc.get(), refresh_tick.get(), live.definitions.get()),
-        |((ns, name), _, _)| get_remote_statuses(ns, name),
+        move || {
+            (
+                loc.get(),
+                refresh_tick.get(),
+                live.definitions.get(),
+                no_remote_upstream.get(),
+            )
+        },
+        |((ns, name), _, _, no_remote_upstream)| async move {
+            if no_remote_upstream {
+                return Ok(Default::default());
+            }
+            get_remote_statuses(ns, name).await
+        },
     );
     // The materialize dialog's row decoration, from this page's live resource.
     let (records_by_key, records_failed) = crate::helpers::records_by_key(all_assets);
