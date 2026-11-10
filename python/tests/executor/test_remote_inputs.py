@@ -4,6 +4,12 @@ Repositories share one store under the identities ``warehouse`` and ``shop``
 (owners) and ``analytics`` (the consumer).
 """
 
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import obstore
@@ -180,6 +186,103 @@ def test_unregistered_owner_loads_with_a_warning(
     logs = _logs(embedded_storage, result.run_id)
     assert NOT_REGISTERED in logs["order_count"]
     assert NOT_REGISTERED not in logs.get("sibling", "")
+
+
+# The log filter is read once, at `import rivers`, so each case runs in its
+# own process.
+_TWO_LOADING_STEPS = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+
+    import obstore
+    import rivers as rs
+    from rivers.testing import embedded_storage, memory_storage
+
+    root, executor = sys.argv[1], sys.argv[2]
+    handler = rs.PickleIOHandler(
+        store=obstore.store.LocalStore(os.path.join(root, "io"), mkdir=True)
+    )
+
+    @rs.Asset(io_handler=handler)
+    def raw_orders() -> list[int]:
+        return [1, 2, 3]
+
+    os.environ["RIVERS_CODE_LOCATION_ID"] = "warehouse"
+    owner = rs.CodeRepository(assets=[raw_orders])
+    owner.resolve(storage=memory_storage())
+    assert owner.materialize().success
+
+    orders = rs.Asset.remote(
+        "raw_orders", code_location="warehouse", io_handler=handler
+    )
+
+    @rs.Asset(io_handler=handler)
+    def order_count(raw_orders: list[int]) -> int:
+        return len(raw_orders)
+
+    @rs.Asset(io_handler=handler)
+    def order_total(raw_orders: list[int]) -> int:
+        return sum(raw_orders)
+
+    @rs.Asset(io_handler=handler)
+    def sibling() -> int:
+        return 1
+
+    executors = {
+        "in_process": rs.Executor.in_process(),
+        "parallel": rs.Executor.parallel(max_workers=2),
+    }
+    os.environ["RIVERS_CODE_LOCATION_ID"] = "analytics"
+    storage = embedded_storage(os.path.join(root, "db"))
+    consumer = rs.CodeRepository(
+        assets=[orders, order_count, order_total, sibling],
+        default_executor=executors[executor],
+    )
+    consumer.resolve(storage=storage)
+    result = consumer.materialize()
+    assert result.success
+
+    logs = {}
+    for log in storage._scoped("analytics").get_run_logs(result.run_id):
+        logs[log.step_key] = logs.get(log.step_key, "") + (log.logs or "")
+    print(json.dumps(logs))
+    """
+)
+
+
+def _warning_lines(logs: str) -> list[str]:
+    """The lines of ``logs`` with the warning, the timestamp masked."""
+    return [
+        re.sub(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", "<ts>", line)
+        for line in logs.splitlines()
+        if NOT_REGISTERED in line
+    ]
+
+
+@pytest.mark.parametrize("log_filter", ["error", "rivers=info"])
+@pytest.mark.parametrize("executor", ["in_process", "parallel"])
+def test_unregistered_owner_warning_does_not_depend_on_the_log_filter(
+    executor, log_filter, tmp_path
+):
+    env = {name: value for name, value in os.environ.items() if name not in _ENV}
+    env["RUST_LOG"] = log_filter
+    proc = subprocess.run(
+        [sys.executable, "-c", _TWO_LOADING_STEPS, str(tmp_path), executor],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    logs = json.loads(proc.stdout.splitlines()[-1])
+    expected = [f"<ts>  WARN rivers::executor: {NOT_REGISTERED}"]
+    assert _warning_lines(logs.get("order_count", "")) == expected
+    assert _warning_lines(logs.get("order_total", "")) == expected
+    assert _warning_lines(logs.get("sibling", "")) == []
+    assert proc.stderr.count(NOT_REGISTERED) == (0 if log_filter == "error" else 1)
 
 
 @pytest.mark.parametrize("executor", EXECUTORS)

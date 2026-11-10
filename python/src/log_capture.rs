@@ -46,6 +46,12 @@ pub fn take() -> String {
         .unwrap_or_default()
 }
 
+/// A warn line for a step's log, shaped like a captured line without color.
+/// Unlike a captured line, it does not depend on the process log filter.
+pub fn warn_line(target: &str, message: &str) -> String {
+    format!("{:.6}  WARN {target}: {message}\n", jiff::Timestamp::now())
+}
+
 /// Wrap pyo3-pylogger's `logging.host_log`, which hands each Python log
 /// record to Rust: on a thread that does not capture, a record logged in a
 /// step's context goes to that step's buffer.

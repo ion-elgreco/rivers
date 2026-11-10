@@ -157,7 +157,7 @@ fn drift_warning(
 }
 
 /// Write each warning `(local, message)` into the log of every step that
-/// loads `local`.
+/// loads `local`, and once into the process log.
 fn warn_loading_steps(
     plan: &ExecutionPlan,
     node_map: &HashMap<String, ResolvedNode>,
@@ -165,21 +165,18 @@ fn warn_loading_steps(
     writer: &EventWriter,
     run_id: &str,
 ) {
-    for step in &plan.steps {
-        let messages: Vec<&String> = warnings
-            .iter()
-            .filter(|(local, _)| loads(node_map, step, local))
-            .map(|(_, message)| message)
-            .collect();
-        if messages.is_empty() {
-            continue;
-        }
-
-        crate::log_capture::start();
-        for message in messages {
+    for (local, message) in warnings {
+        if plan.steps.iter().any(|step| loads(node_map, step, local)) {
             tracing::warn!(target: "rivers::executor", "{message}");
         }
-        let logs = crate::log_capture::take();
+    }
+
+    for step in &plan.steps {
+        let logs: String = warnings
+            .iter()
+            .filter(|(local, _)| loads(node_map, step, local))
+            .map(|(_, message)| crate::log_capture::warn_line("rivers::executor", message))
+            .collect();
         ops::emit_log_output(writer, run_id, &step.name, "", "", &logs, now_ts());
     }
 }
