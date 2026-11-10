@@ -287,6 +287,12 @@ otel:
     existingSecret: ""
     secretKey: headers
 
+# rivers.toml for code-location, run, and step pods. Replaces a rivers.toml
+# in the image. Empty mounts nothing.
+riversToml: {}
+#  module:
+#    repo_var: pipeline
+
 executor:
   serviceAccountName: rivers-executor
   defaultRunResources:

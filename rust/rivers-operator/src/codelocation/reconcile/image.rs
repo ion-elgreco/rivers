@@ -233,6 +233,7 @@ mod tests {
             runs: kube_runtime::reflector::store().0,
             surreal_pod_cfg: Default::default(),
             otel_pod_cfg: Default::default(),
+            config_file_cfg: Default::default(),
         }
     }
 

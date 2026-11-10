@@ -1,0 +1,12 @@
+{{- if .Values.riversToml }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rivers.configMapName" . }}
+  namespace: {{ include "rivers.namespace" . }}
+  labels:
+    {{- include "rivers.labels" . | nindent 4 }}
+data:
+  rivers.toml: |
+    {{- toToml .Values.riversToml | nindent 4 }}
+{{- end }}

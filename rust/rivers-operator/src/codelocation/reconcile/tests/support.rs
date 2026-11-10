@@ -280,6 +280,7 @@ pub(crate) async fn reconcile_in(
         runs,
         surreal_pod_cfg: Default::default(),
         otel_pod_cfg: Default::default(),
+        config_file_cfg: Default::default(),
     };
     let requeue = reconcile(Arc::new(cl), Arc::new(ctx)).await.unwrap();
     (requeue, state.lock().unwrap().requests[seen..].to_vec())

@@ -49,6 +49,8 @@ To use a `rivers.toml` at another path, pass `--config <path>` before the subcom
 rivers --config deploy/rivers.toml materialize
 ```
 
+In Kubernetes, the Helm chart can mount one `rivers.toml` into every rivers pod: see [`rivers.toml` from the chart](../installation/kubernetes.md#riverstoml-from-the-chart).
+
 ---
 
 ## Loading a repository

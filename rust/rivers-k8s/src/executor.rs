@@ -24,6 +24,7 @@ pub struct K8sStepExecutorConfig {
     /// in memory.
     pub surreal_pod_cfg: crate::env::SurrealPodConfig,
     pub otel_pod_cfg: crate::env::OtelPodConfig,
+    pub config_file_cfg: crate::env::ConfigFilePodConfig,
     pub run_id: String,
     pub run_cr_name: String,
     pub run_cr_uid: String,
@@ -255,10 +256,12 @@ fn build_job_inner(
                         .as_ref()
                         .filter(|p| !p.init_containers.is_empty())
                         .map(|p| p.init_containers.clone()),
-                    volumes: workspace_pieces
-                        .as_ref()
-                        .filter(|p| !p.volumes.is_empty())
-                        .map(|p| p.volumes.clone()),
+                    volumes: config.config_file_cfg.with_volume(
+                        workspace_pieces
+                            .as_ref()
+                            .filter(|p| !p.volumes.is_empty())
+                            .map(|p| p.volumes.clone()),
+                    ),
                     containers: vec![Container {
                         name: "step".to_string(),
                         image: Some(config.worker_image.clone()),
@@ -270,10 +273,12 @@ fn build_job_inner(
                         working_dir: workspace_pieces
                             .as_ref()
                             .map(|p| p.main_working_dir.clone()),
-                        volume_mounts: workspace_pieces
-                            .as_ref()
-                            .filter(|p| !p.main_mounts.is_empty())
-                            .map(|p| p.main_mounts.clone()),
+                        volume_mounts: config.config_file_cfg.with_mount(
+                            workspace_pieces
+                                .as_ref()
+                                .filter(|p| !p.main_mounts.is_empty())
+                                .map(|p| p.main_mounts.clone()),
+                        ),
                         args: Some(args),
                         resources: Some({
                             let cpu = overrides
@@ -340,6 +345,7 @@ fn build_job_inner(
                                 env.extend(pieces.main_env.iter().cloned());
                             }
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
+                            env.extend(crate::env::build_config_file_env(&config.config_file_cfg));
                             crate::env::merge_env(env, config.extra_env.iter().cloned())
                         }),
                         ..Default::default()
@@ -368,6 +374,7 @@ mod tests {
             surreal_pod_cfg: crate::env::SurrealPodConfig::default()
                 .with_endpoint("ws://surrealdb:8000"),
             otel_pod_cfg: crate::env::OtelPodConfig::default(),
+            config_file_cfg: crate::env::ConfigFilePodConfig::default(),
             run_id: "abc-123".to_string(),
             run_cr_name: "rivers-run-abc-123".to_string(),
             run_cr_uid: "uid-456".to_string(),
@@ -886,6 +893,89 @@ mod tests {
             .map(|e| e.value.as_deref())
             .collect();
         assert_eq!(endpoints, vec![Some("http://team-collector:4317")]);
+    }
+
+    fn config_file_step_pod(mut config: K8sStepExecutorConfig) -> serde_json::Value {
+        config.config_file_cfg = crate::env::ConfigFilePodConfig {
+            config_map: "rivers-config".to_string(),
+            checksum: "abc123".to_string(),
+        };
+        let pod = build_step_job(&config, "step")
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        serde_json::to_value(pod).unwrap()
+    }
+
+    fn names(items: &serde_json::Value) -> Vec<&str> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn step_job_mounts_the_chart_config_file() {
+        let pod = config_file_step_pod(test_config());
+        let container = &pod["containers"][0];
+
+        assert_eq!(
+            pod["volumes"],
+            serde_json::json!([{ "name": "rivers-config", "configMap": { "name": "rivers-config" } }])
+        );
+        assert_eq!(
+            container["volumeMounts"],
+            serde_json::json!([{ "name": "rivers-config", "mountPath": "/etc/rivers/config", "readOnly": true }])
+        );
+        assert!(container["env"].as_array().unwrap().contains(
+            &serde_json::json!({ "name": "RIVERS_CONFIG", "value": "/etc/rivers/config/rivers.toml" })
+        ));
+    }
+
+    #[test]
+    fn git_step_job_keeps_the_workspace_next_to_the_config_file() {
+        let mut config = test_config();
+        config.workspace = Some(git_workspace(
+            crate::workspace::WorkspaceVolume::SharedPvc {
+                claim_name: "analytics-workspace".to_string(),
+            },
+        ));
+        let pod = config_file_step_pod(config);
+
+        let volumes = names(&pod["volumes"]);
+        let mounts = names(&pod["containers"][0]["volumeMounts"]);
+        assert!(
+            volumes.len() > 1 && volumes.ends_with(&["rivers-config"]),
+            "{volumes:?}"
+        );
+        assert!(
+            mounts.len() > 1 && mounts.ends_with(&["rivers-config"]),
+            "{mounts:?}"
+        );
+    }
+
+    #[test]
+    fn extra_env_replaces_the_chart_config_file() {
+        let mut config = test_config();
+        config.extra_env = vec![EnvVar {
+            name: "RIVERS_CONFIG".to_string(),
+            value: Some("/app/rivers.toml".to_string()),
+            ..Default::default()
+        }];
+        let pod = config_file_step_pod(config);
+
+        let values: Vec<_> = pod["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "RIVERS_CONFIG")
+            .map(|e| e["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["/app/rivers.toml"]);
     }
 
     #[test]

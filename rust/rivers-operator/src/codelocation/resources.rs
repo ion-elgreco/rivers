@@ -86,6 +86,7 @@ pub fn build_deployment(
     code_location_service_account: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
+    config_file_cfg: &rivers_k8s::env::ConfigFilePodConfig,
     workspace: Option<&rivers_k8s::workspace::WorkspacePodPieces>,
 ) -> Deployment {
     let name = deployment_name(&cl.name_any());
@@ -103,6 +104,7 @@ pub fn build_deployment(
     if let Some(pieces) = workspace {
         env.extend(pieces.main_env.iter().cloned());
     }
+    env.extend(rivers_k8s::env::build_config_file_env(config_file_cfg));
     let env = rivers_k8s::env::merge_env(env, spec.env.iter().cloned());
 
     Deployment {
@@ -132,6 +134,7 @@ pub fn build_deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(lbls.clone()),
+                    annotations: config_file_cfg.annotations(),
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
@@ -143,7 +146,7 @@ pub fn build_deployment(
                     image_pull_secrets: pull_secrets,
                     security_context: workspace.map(|p| p.pod_security_context.clone()),
                     init_containers: workspace.map(|p| p.init_containers.clone()),
-                    volumes: workspace.map(|p| p.volumes.clone()),
+                    volumes: config_file_cfg.with_volume(workspace.map(|p| p.volumes.clone())),
                     containers: vec![Container {
                         name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_image.to_string()),
@@ -190,7 +193,8 @@ pub fn build_deployment(
                         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
                         resources: Some(spec.resources.clone()),
                         env: Some(env),
-                        volume_mounts: workspace.map(|p| p.main_mounts.clone()),
+                        volume_mounts: config_file_cfg
+                            .with_mount(workspace.map(|p| p.main_mounts.clone())),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -407,6 +411,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             None,
         );
 
@@ -487,6 +492,7 @@ mod tests {
                 headers_secret_name: "otel-headers".to_string(),
                 headers_secret_key: "headers".to_string(),
             },
+            &Default::default(),
             None,
         );
 
@@ -506,6 +512,78 @@ mod tests {
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_NAME", "value": "otel-headers" },
                 { "name": "RIVERS_OTEL_HEADERS_SECRET_KEY", "value": "headers" },
             ])
+        );
+    }
+
+    fn config_file_deployment(env: serde_json::Value) -> serde_json::Value {
+        let cl = make_cl(
+            json!({
+                "image": "ghcr.io/acme/pipeline",
+                "tag": "v1.0.0",
+                "module": "acme.pipeline",
+                "env": env,
+            }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/acme/pipeline@sha256:abc",
+            "rivers-code-location",
+            &Default::default(),
+            &Default::default(),
+            &rivers_k8s::env::ConfigFilePodConfig {
+                config_map: "rivers-config".to_string(),
+                checksum: "abc123".to_string(),
+            },
+            None,
+        );
+        serde_json::to_value(d).unwrap()["spec"]["template"].take()
+    }
+
+    fn env_values<'a>(container: &'a serde_json::Value, name: &str) -> Vec<&'a str> {
+        container["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == name)
+            .map(|e| e["value"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn deployment_mounts_the_chart_config_file() {
+        let pod = config_file_deployment(json!([]));
+        let container = &pod["spec"]["containers"][0];
+
+        assert_eq!(
+            pod["spec"]["volumes"],
+            json!([{ "name": "rivers-config", "configMap": { "name": "rivers-config" } }])
+        );
+        assert_eq!(
+            container["volumeMounts"],
+            json!([{ "name": "rivers-config", "mountPath": "/etc/rivers/config", "readOnly": true }])
+        );
+        assert_eq!(
+            env_values(container, "RIVERS_CONFIG"),
+            ["/etc/rivers/config/rivers.toml"]
+        );
+        assert_eq!(
+            pod["metadata"]["annotations"]["rivers.io/config-checksum"],
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn deployment_spec_env_replaces_the_chart_config_file() {
+        let pod = config_file_deployment(
+            json!([{ "name": "RIVERS_CONFIG", "value": "/app/rivers.toml" }]),
+        );
+
+        assert_eq!(
+            env_values(&pod["spec"]["containers"][0], "RIVERS_CONFIG"),
+            ["/app/rivers.toml"]
         );
     }
 
@@ -559,6 +637,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             None,
         );
 
@@ -652,6 +731,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             None,
         );
 
@@ -760,6 +840,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &otel_endpoint(),
+            &Default::default(),
             Some(&git_pieces(&cl, shared_volume())),
         );
 
@@ -883,6 +964,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             Some(&git_pieces(&cl, fallback_volume())),
         );
 
@@ -986,6 +1068,7 @@ mod tests {
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &otel_endpoint(),
+                &Default::default(),
                 workspace,
             ))
             .unwrap()
@@ -1102,6 +1185,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             Some(&git_pieces(&cl, shared_volume())),
         );
 
@@ -1129,6 +1213,7 @@ mod tests {
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
+                &Default::default(),
                 workspace,
             );
             let main = serde_json::to_value(&d).unwrap()["spec"]["template"]["spec"]["containers"]
@@ -1159,6 +1244,7 @@ mod tests {
             "rivers-code-location",
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
             None,
         );
 
@@ -1176,6 +1262,7 @@ mod tests {
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
+                &Default::default(),
                 Some(&git_pieces(&cl, volume)),
             );
             let pod = d.spec.template.spec.unwrap();
@@ -1225,6 +1312,7 @@ mod tests {
                 "rivers-code-location",
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
+                &Default::default(),
                 Some(&git_pieces(&cl, volume)),
             );
             let pod = d.spec.template.spec.unwrap();
