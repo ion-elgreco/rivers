@@ -58,20 +58,21 @@ async fn read_topology(
         .flatten()
 }
 
-/// The code location that owns a remote node: `None` when the registry does
-/// not know it. Its topology is `None` when it wrote none.
+/// The code location that owns a remote node. `topology` is `None` when
+/// the owner wrote none.
 #[cfg(feature = "ssr")]
-type Owner = Option<(
-    rivers_core::storage::CodeLocationContext,
-    Option<rivers_core::assets::graph::GraphTopology>,
-)>;
+struct Owner {
+    ctx: rivers_core::storage::CodeLocationContext,
+    topology: Option<rivers_core::assets::graph::GraphTopology>,
+}
 
-/// The owner of each remote node of `topology`, by code location.
+/// The owner of each remote node of `topology`, by code location: `None`
+/// when the registry does not know the code location.
 #[cfg(feature = "ssr")]
 async fn load_owners<'t>(
     state: &crate::state::AppState,
     topology: &'t rivers_core::assets::graph::GraphTopology,
-) -> HashMap<&'t rivers_core::assets::remote::LocationRef, Owner> {
+) -> HashMap<&'t rivers_core::assets::remote::LocationRef, Option<Owner>> {
     use rivers_core::storage::CodeLocationContext;
 
     let mut owners = HashMap::new();
@@ -85,10 +86,10 @@ async fn load_owners<'t>(
             .lookup(location.namespace(), location.name())
             .await;
         let owner = match entry {
-            Some(entry) => {
-                let topology = read_topology(state, &entry.identity).await;
-                Some((CodeLocationContext::new(entry.identity), topology))
-            }
+            Some(entry) => Some(Owner {
+                topology: read_topology(state, &entry.identity).await,
+                ctx: CodeLocationContext::new(entry.identity),
+            }),
             None => None,
         };
         owners.insert(location, owner);
@@ -113,30 +114,33 @@ async fn load_ui_topology(
     let consumer = CodeLocationContext::new(identity.unwrap_or_default());
     let owners = load_owners(state, &topology).await;
 
-    let mut remotes: HashMap<String, (bool, Option<RemoteDrift>)> = HashMap::new();
+    // The drift of each remote node whose owner the registry knows.
+    let mut resolved: HashMap<String, Option<RemoteDrift>> = HashMap::new();
     for node in &topology.nodes {
         let Some(remote) = &node.remote else {
             continue;
         };
-        let seen = match &owners[&remote.code_location] {
-            None => (false, None),
-            Some((_, None)) => (true, None),
-            Some((owner_ctx, Some(owner))) => {
-                let mirror = node.partitions.as_ref();
-                let settled = state
+        let Some(owner) = &owners[&remote.code_location] else {
+            continue;
+        };
+        let mirror = node.partitions.as_ref();
+        let drift = match &owner.topology {
+            None => None,
+            Some(owner_topology) => {
+                let checked = state
                     .key_comparisons
                     .drift(
                         state.storage.as_ref(),
                         &consumer,
-                        owner_ctx,
-                        owner,
+                        &owner.ctx,
+                        owner_topology,
                         &remote.asset_key,
                         mirror,
                     )
                     .await;
-                let drift = match settled {
+                match checked {
                     Ok(drift) => {
-                        let owned = owner.owned_partitions(&remote.asset_key);
+                        let owned = owner_topology.owned_partitions(&remote.asset_key);
                         RemoteDrift::new(drift, mirror, owned)
                     }
                     Err(error) => {
@@ -148,19 +152,16 @@ async fn load_ui_topology(
                         );
                         None
                     }
-                };
-                (true, drift)
+                }
             }
         };
-        remotes.insert(node.name.clone(), seen);
+        resolved.insert(node.name.clone(), drift);
     }
 
     let mut ui: GraphTopology = topology.into();
     for node in &mut ui.nodes {
-        if let (Some(remote), Some((resolved, drift))) =
-            (node.remote.as_mut(), remotes.remove(&node.name))
-        {
-            remote.resolved = resolved;
+        if let (Some(remote), Some(drift)) = (node.remote.as_mut(), resolved.remove(&node.name)) {
+            remote.resolved = true;
             remote.drift = drift;
         }
     }
@@ -193,13 +194,13 @@ async fn load_remote_statuses(
 
     let mut staleness = HashMap::new();
     for (location, keys) in keys {
-        let Some((owner, owner_topology)) = &owners[location] else {
+        let Some(owner) = &owners[location] else {
             continue;
         };
         let owner_staleness = state
             .storage
-            .for_code_location(owner)
-            .staleness_of(&keys, owner_topology.as_ref())
+            .for_code_location(&owner.ctx)
+            .staleness_of(&keys, owner.topology.as_ref())
             .await
             .map_err(|e| ServerFnError::new(e.to_string()))?;
         staleness.insert(location, owner_staleness);
