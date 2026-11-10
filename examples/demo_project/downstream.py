@@ -20,6 +20,7 @@ from rivers import (
     MetadataValue,
     PartitionMapping,
     PartitionsDefinition,
+    RunQueueConfig,
 )
 
 from .shared import output_io, pickle_io, processed_io, repo_kwargs
@@ -154,5 +155,7 @@ repo = CodeRepository(
         pnl_alerts,
         snapshot_heartbeat,
     ],
+    # In the cluster, only a queued run starts as a Run with its own pod.
+    run_queue=RunQueueConfig(),
     **repo_kwargs(),
 )
