@@ -649,7 +649,7 @@ def opened(monkeypatch):
     calls = []
 
     def record(kind):
-        def open_store(target=None):
+        def open_store(target=None, **_options):
             calls.append((kind, target))
             return memory_storage()
 
