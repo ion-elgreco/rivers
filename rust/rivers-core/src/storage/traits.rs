@@ -7,9 +7,9 @@ use crate::assets::remote::LocationRef;
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry,
-    ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord, CoordinatorRunInfo,
-    DEFAULT_CODE_LOCATION_ID, EventRecord, LogRecord, PartitionKey, PoolInfo, PoolLimit,
-    RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder,
+    ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord,
+    CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EventRecord, LogRecord, PartitionKey, PoolInfo,
+    PoolLimit, RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder,
     StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog,
     StoredTick, TickRecord,
 };
@@ -560,6 +560,20 @@ pub trait StorageBackend: PerCodeLocationStorage {
         location: &LocationRef,
         identity: &str,
     ) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Record that component `name` (the operator, the UI) started on this
+    /// build at `now`. `writes`: it opens the store to write.
+    fn record_component(
+        &self,
+        name: &str,
+        writes: bool,
+        now: i64,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Every recorded component, by name.
+    fn list_components(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(String, ComponentRecord)>>> + Send;
 
     // Ticks (record-keyed; CL is carried on the record).
     fn store_tick(&self, tick: &TickRecord) -> impl Future<Output = Result<String>> + Send;

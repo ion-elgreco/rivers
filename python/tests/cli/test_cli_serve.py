@@ -89,12 +89,17 @@ def test_serve_writes_its_endpoint_at_start_and_every_10_s(
         wait_for(heartbeat, 60, "the first heartbeat")
         first = entry()
         first_seen = first.pop("last_seen")
+        first_schema = first.pop("schema_version")
+        assert first_schema > 0
+        assert first.pop("rivers_version")
         assert first == expected
         assert abs(time.time_ns() - first_seen) < 30 * 10**9
 
         wait_for(lambda: (heartbeat() or 0) > first_seen, 30, "the next heartbeat")
         later = entry()
         assert later.pop("last_seen") > first_seen
+        assert later.pop("schema_version") == first_schema
+        assert later.pop("rivers_version")
         assert later == expected
     except AssertionError as e:
         log = err_path.read_text(errors="replace")[-4000:]

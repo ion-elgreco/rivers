@@ -4,6 +4,7 @@ use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use super::StorageBackend;
+use super::surrealdb_backend::SCHEMA_VERSION;
 use crate::assets::graph::GraphTopology;
 use crate::assets::remote::LocationRef;
 
@@ -25,15 +26,44 @@ pub struct CodeLocationDirectoryEntry {
     /// The remote assets the location consumes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<RemoteConsumer>,
+    /// The schema version of the build the location runs. `None`: a build
+    /// that does not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+    /// The rivers version of that build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rivers_version: Option<String>,
 }
 
 impl CodeLocationDirectoryEntry {
+    /// An entry of a location that runs this build.
     pub fn new(identity: impl Into<String>) -> Self {
-        Self {
+        let mut entry = Self {
             identity: identity.into(),
             ..Self::default()
-        }
+        };
+        entry.set_build();
+        entry
     }
+
+    /// Record this build as the one the location runs.
+    pub fn set_build(&mut self) {
+        self.schema_version = Some(SCHEMA_VERSION);
+        self.rivers_version = Some(crate::RIVERS_VERSION.to_string());
+    }
+}
+
+/// A process without a directory entry that opens the store: the operator
+/// or the UI. Stored as JSON under [`crate::COMPONENT_KEY_PREFIX`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentRecord {
+    /// The schema version of the build the component runs.
+    pub schema_version: u32,
+    pub rivers_version: String,
+    /// Whether it opens the store to write. Otherwise it only reads.
+    pub writes: bool,
+    /// When it started, in nanoseconds.
+    pub started_at: i64,
 }
 
 /// A remote asset, as the location that consumes it declares it.

@@ -5,7 +5,7 @@ use anyhow::Result;
 use surrealdb::types::Bytes;
 
 use crate::assets::remote::LocationRef;
-use crate::storage::{CodeLocationDirectoryEntry, StorageBackend, retry};
+use crate::storage::{CodeLocationDirectoryEntry, ComponentRecord, StorageBackend, retry};
 
 use super::*;
 
@@ -13,6 +13,9 @@ use super::*;
 /// range-scans `idx_kv_key` (pinned by `tests/directory.rs`).
 pub(super) const DIRECTORY_RANGE: &str =
     "SELECT * FROM kv WHERE key >= 'code_location:' AND key < 'code_location;'";
+
+/// Every component row, and no other kv row.
+const COMPONENT_RANGE: &str = "SELECT * FROM kv WHERE key >= 'component:' AND key < 'component;'";
 
 /// Attempts before giving up on an entry that other writers keep changing.
 const ATTEMPTS: usize = 16;
@@ -41,6 +44,21 @@ impl SurrealStorage {
                     );
                 }
                 Some((location?, entry?))
+            })
+            .collect())
+    }
+
+    pub(super) async fn list_component_records(&self) -> Result<Vec<(String, ComponentRecord)>> {
+        let rows: Vec<DbKv> = retry::with_retry(&self.retry_config, || async {
+            Ok(self.db.query(COMPONENT_RANGE).await?.take(0)?)
+        })
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = row.key.strip_prefix(crate::COMPONENT_KEY_PREFIX)?;
+                let record = serde_json::from_slice(&row.value).ok()?;
+                Some((name.to_string(), record))
             })
             .collect())
     }
