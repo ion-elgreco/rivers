@@ -74,7 +74,7 @@ thiserror = "2"
 once_cell = "1"
 
 [profile.release]
-lto = true
+lto = "thin"
 strip = true
 codegen-units = 1
 opt-level = "s"
