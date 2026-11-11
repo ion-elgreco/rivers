@@ -1117,3 +1117,208 @@ async fn test_migrate_is_idempotent_and_refuses_downgrade() {
         "downgrade must be refused"
     );
 }
+
+/// The floor constants are the floors the newest migration records.
+#[tokio::test]
+async fn test_build_stamps_match_the_newest_migration() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    assert_eq!(stamps_at(&storage.db, SCHEMA_VERSION).await, BUILD_STAMPS);
+    assert_eq!(
+        read_schema_stamps(&storage.db).await.unwrap(),
+        Some(BUILD_STAMPS)
+    );
+}
+
+/// A migration stops a process only when it raises that process's floor
+/// above its build. Literal versions, so the matrix is independent of this build.
+#[test]
+fn test_migration_stops_matrix() {
+    let s = |version, min_reader, min_writer| SchemaStamps {
+        version,
+        min_reader,
+        min_writer,
+    };
+    let (writer, reader) = (true, false);
+
+    // The write floor rises from 10 to 12.
+    let (from, to) = (s(11, 2, 10), s(12, 2, 12));
+    assert!(migration_stops(from, to, writer, Some(11)));
+    assert!(!migration_stops(from, to, writer, Some(12)));
+    assert!(migration_stops(from, to, writer, None));
+    // The read floor stays: no reader stops, known or not.
+    assert!(!migration_stops(from, to, reader, Some(2)));
+    assert!(!migration_stops(from, to, reader, None));
+
+    // Both floors rise.
+    let (from, to) = (s(12, 2, 12), s(13, 13, 13));
+    assert!(migration_stops(from, to, reader, Some(12)));
+    assert!(!migration_stops(from, to, reader, Some(13)));
+
+    // No floor rises: nothing stops.
+    let (from, to) = (s(10, 2, 10), s(11, 2, 10));
+    assert!(!migration_stops(from, to, writer, Some(10)));
+    assert!(!migration_stops(from, to, writer, None));
+
+    // The store is current or ahead: there is no migration.
+    assert!(!migration_stops(s(12, 2, 12), s(12, 2, 12), writer, None));
+    assert!(!migration_stops(
+        s(13, 13, 13),
+        s(12, 2, 12),
+        writer,
+        Some(1)
+    ));
+}
+
+/// Rewind the stamps to `version` with the given floors, as a store that an
+/// older build migrated last.
+async fn rewind_stamps(db: &Surreal<Any>, version: u32, min_reader: u32, min_writer: u32) {
+    db.query(format!(
+        "DELETE {MIGRATION_META_TABLE} WHERE version >= {version}"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    plant_stamps(db, version, min_reader, min_writer).await;
+}
+
+#[tokio::test]
+async fn test_schema_status_lists_what_a_migration_stops() {
+    use crate::assets::remote::LocationRef;
+    use crate::storage::CodeLocationDirectoryEntry;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let location = |name: &str| LocationRef::new("team", name).unwrap();
+    storage
+        .upsert_code_location_registration(&location("new"), CodeLocationDirectoryEntry::new("a"))
+        .await
+        .unwrap();
+    storage
+        .kv_set(
+            "code_location:team/old",
+            br#"{"identity":"b","last_seen":7}"#,
+        )
+        .await
+        .unwrap();
+    storage.record_component("ui", false, 5).await.unwrap();
+
+    let current = storage.schema_status().await.unwrap();
+    assert_eq!(current.stamps, Some(BUILD_STAMPS));
+    assert_eq!(
+        current.processes.iter().filter(|p| p.stops).count(),
+        0,
+        "a current store has no migration: {current:?}"
+    );
+
+    rewind_stamps(&storage.db, SCHEMA_VERSION - 1, 1, 1).await;
+    let behind = storage.schema_status().await.unwrap();
+    assert_eq!(behind.stamps.map(|s| s.version), Some(SCHEMA_VERSION - 1));
+    let stops: Vec<_> = behind
+        .processes
+        .iter()
+        .map(|p| (p.name.as_str(), p.code_location, p.seen, p.stops))
+        .collect();
+    assert_eq!(
+        stops,
+        vec![
+            ("team/new", true, None, false),
+            ("team/old", true, Some(7), true),
+            ("ui", false, Some(5), false),
+        ]
+    );
+}
+
+/// `rivers db status` must not change the store: an inspect open neither
+/// initializes an empty store nor refuses one that is behind.
+#[tokio::test]
+async fn test_inspect_neither_initializes_nor_refuses() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    ensure_compatible(&db, Capability::Inspect).await.unwrap();
+    assert_eq!(read_schema_stamps(&db).await.unwrap(), None);
+
+    ensure_compatible(&db, Capability::ReadWrite).await.unwrap();
+    rewind_stamps(&db, SCHEMA_VERSION - 1, 1, 1).await;
+    assert!(ensure_compatible(&db, Capability::ReadWrite).await.is_err());
+    ensure_compatible(&db, Capability::Inspect).await.unwrap();
+    assert_eq!(
+        read_schema_stamps(&db).await.unwrap().map(|s| s.version),
+        Some(SCHEMA_VERSION - 1)
+    );
+}
+
+#[tokio::test]
+async fn test_a_migration_that_stops_a_process_is_blocked() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .kv_set("code_location:team/old", br#"{"identity":"b"}"#)
+        .await
+        .unwrap();
+    storage.record_component("ui", false, 5).await.unwrap();
+
+    storage.ensure_migration_stops_nothing().await.unwrap();
+
+    rewind_stamps(&storage.db, SCHEMA_VERSION - 1, 1, 1).await;
+    let err = storage.ensure_migration_stops_nothing().await.unwrap_err();
+    let blocked = err.downcast_ref::<MigrationBlocked>().unwrap();
+    let names: Vec<_> = blocked.processes.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["team/old"]);
+    assert_eq!(
+        err.to_string(),
+        "the migration stops team/old: update them first, or migrate with force"
+    );
+    assert_eq!(
+        read_schema_stamps(&storage.db)
+            .await
+            .unwrap()
+            .map(|s| s.version),
+        Some(SCHEMA_VERSION - 1)
+    );
+}
+
+/// The floors do not rise, so the old build keeps working after the migration.
+#[tokio::test]
+async fn test_a_migration_that_keeps_the_floors_is_not_blocked() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    storage
+        .kv_set("code_location:team/old", br#"{"identity":"b"}"#)
+        .await
+        .unwrap();
+
+    rewind_stamps(&storage.db, SCHEMA_VERSION - 1, MIN_READER, MIN_WRITER).await;
+
+    storage.ensure_migration_stops_nothing().await.unwrap();
+}
+
+/// The chart upgrades the operator and the UI with the migration, and their
+/// records are from the builds before it. They must not block it.
+#[tokio::test]
+async fn test_an_old_operator_or_ui_record_does_not_block_a_migration() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    for (name, writes) in [("operator", true), ("ui", false)] {
+        let record = format!(
+            r#"{{"schema_version":1,"rivers_version":"0.1.0","writes":{writes},"started_at":5}}"#
+        );
+        storage
+            .kv_set(&format!("component:{name}"), record.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    rewind_stamps(&storage.db, SCHEMA_VERSION - 1, 1, 1).await;
+
+    storage.ensure_migration_stops_nothing().await.unwrap();
+    let status = storage.schema_status().await.unwrap();
+    let rows: Vec<_> = status
+        .processes
+        .iter()
+        .map(|p| (p.name.as_str(), p.schema_version, p.stops))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("operator", Some(1), false), ("ui", Some(1), false)]
+    );
+}

@@ -17,6 +17,7 @@ use k8s_openapi::api::core::v1::{Pod, Service};
 use kube_client::{Api, Client};
 use kube_runtime::Controller;
 use kube_runtime::watcher::Config as WatcherConfig;
+use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
@@ -73,6 +74,12 @@ async fn main() -> anyhow::Result<()> {
         "connecting to SurrealDB"
     );
     let storage = Arc::new(SurrealStorage::connect(surreal_config).await?);
+    if let Err(error) = storage
+        .record_component("operator", true, rivers_core::util::now_ts())
+        .await
+    {
+        tracing::warn!(%error, "could not record the operator's build in storage");
+    }
 
     let runs: Api<Run> = Api::namespaced(client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);

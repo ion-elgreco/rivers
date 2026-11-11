@@ -278,6 +278,15 @@ codeLocation:
     # Whole number with s, m or h; the operator does not start otherwise.
     minTreeAge: 1h
 
+# Storage schema migration as a Job.
+migration:
+  # Run `rivers db migrate` on each install and upgrade.
+  enabled: false
+  # Image with the rivers CLI. Empty: the chart's rivers-runtime image.
+  image: ""
+  # Migrate even when it stops a code location.
+  force: false
+
 # OpenTelemetry trace export from code-location, run, and step pods.
 otel:
   # OTLP/gRPC endpoint, e.g. https://otlp.example.com:4317. Empty disables export.

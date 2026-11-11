@@ -7,6 +7,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
+use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::{Capability, SurrealStorage};
 use rivers_ui::code_location_registry::Registry;
 use std::sync::Arc;
@@ -88,6 +89,12 @@ async fn serve() {
         let storage = SurrealStorage::connect_with_capability(config, Capability::Read)
             .await
             .expect("Failed to connect to remote SurrealDB");
+        if let Err(error) = storage
+            .record_component("ui", false, rivers_core::util::now_ts())
+            .await
+        {
+            tracing::warn!(%error, "could not record the UI's build in storage");
+        }
         tracing::info!(
             target: "rivers::storage",
             backend = "remote",

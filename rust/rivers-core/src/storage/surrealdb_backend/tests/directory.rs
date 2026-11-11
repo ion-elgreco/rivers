@@ -1,6 +1,6 @@
 use super::*;
 use crate::assets::remote::LocationRef;
-use crate::storage::{CodeLocationDirectoryEntry, RemoteConsumer};
+use crate::storage::{CodeLocationDirectoryEntry, ComponentRecord, RemoteConsumer};
 
 fn loc(namespace: &str, name: &str) -> LocationRef {
     LocationRef::new(namespace, name).unwrap()
@@ -98,7 +98,14 @@ async fn code_location_directory_wire_format() {
         .unwrap()
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert_eq!(value, serde_json::json!({ "identity": "uuid-1" }));
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "identity": "uuid-1",
+            "schema_version": SCHEMA_VERSION,
+            "rivers_version": crate::RIVERS_VERSION,
+        })
+    );
 }
 
 /// Listing every directory entry must range-scan `idx_kv_key`, not walk the
@@ -183,8 +190,73 @@ async fn phase_one_entry_decodes() {
             .get_code_location_entry(&loc("team", "wh"))
             .await
             .unwrap(),
-        Some(CodeLocationDirectoryEntry::new("uuid-1"))
+        Some(CodeLocationDirectoryEntry {
+            identity: "uuid-1".to_string(),
+            ..Default::default()
+        })
     );
+}
+
+/// A build that does not know the version fields writes the entry back
+/// without them. The next heartbeat of this build records them again.
+#[tokio::test]
+async fn touch_records_the_build_again() {
+    let storage = make_storage().await;
+    let wh = loc("team", "wh");
+    storage
+        .kv_set("code_location:team/wh", br#"{"identity":"uuid-1"}"#)
+        .await
+        .unwrap();
+
+    assert!(
+        storage
+            .touch_code_location(&wh, "uuid-1", "127.0.0.1:50051", 100)
+            .await
+            .unwrap()
+    );
+
+    let entry = storage.get_code_location_entry(&wh).await.unwrap().unwrap();
+    assert_eq!(entry.schema_version, Some(SCHEMA_VERSION));
+    assert_eq!(entry.rivers_version.as_deref(), Some(crate::RIVERS_VERSION));
+}
+
+#[tokio::test]
+async fn components_round_trip() {
+    let storage = make_storage().await;
+    assert_eq!(storage.list_components().await.unwrap(), vec![]);
+
+    storage.record_component("ui", false, 100).await.unwrap();
+    storage
+        .record_component("operator", true, 200)
+        .await
+        .unwrap();
+    storage
+        .record_component("operator", true, 300)
+        .await
+        .unwrap();
+    storage
+        .upsert_code_location_registration(&wh_entry_location(), entry("uuid-1"))
+        .await
+        .unwrap();
+
+    let build = |writes, started_at| ComponentRecord {
+        schema_version: SCHEMA_VERSION,
+        rivers_version: crate::RIVERS_VERSION.to_string(),
+        writes,
+        started_at,
+    };
+    assert_eq!(
+        storage.list_components().await.unwrap(),
+        vec![
+            ("operator".to_string(), build(true, 300)),
+            ("ui".to_string(), build(false, 100)),
+        ]
+    );
+    assert_eq!(storage.list_code_locations().await.unwrap().len(), 1);
+}
+
+fn wh_entry_location() -> LocationRef {
+    loc("team", "wh")
 }
 
 #[tokio::test]

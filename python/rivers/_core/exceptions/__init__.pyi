@@ -49,6 +49,14 @@ class SchemaMigrationNeededError(StorageError):
     database forward; ``rivers dev`` catches this to offer the migration.
     """
 
+class MigrationBlockedError(StorageError):
+    """Raised when a migration would stop a code location.
+
+    A subclass of :class:`StorageError`. The migration raises the oldest
+    rivers build that can use the database above the build of a code
+    location. ``rivers db status`` lists them.
+    """
+
 class TaskDefinitionError(Exception):
     """Raised when a ``Task`` / ``BashTask`` definition is invalid."""
 

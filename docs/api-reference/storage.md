@@ -46,9 +46,9 @@ Each persistent database carries a **schema stamp** — the schema version it wa
 
 **The open contract** (`floor ≤ build ≤ version`):
 
-| Situation | Read open (UI) | Read/write open (code locations, daemon) |
+| Situation | Read open (UI) | Read/write open (code locations, daemon, operator) |
 |-----------|----------------|-------------------------------------------|
-| Build at the database's version | proceeds | proceeds |
+| Build equal to the database version | proceeds | proceeds |
 | Build newer than the database | refused — run `rivers db migrate` | refused — run `rivers db migrate` |
 | Database ahead, build ≥ its floor | proceeds (reader/writer split) | proceeds |
 | Build below the relevant floor | refused — upgrade rivers | refused — upgrade rivers |
@@ -78,7 +78,34 @@ rivers db migrate                              # embedded (--storage-path, defau
 rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
 ```
 
-In K8s, run it as an explicit init/job step before rolling out upgraded code locations. `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
+In K8s, run it by hand or with the chart's [migration Job](../installation/kubernetes.md#upgrade). `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
+
+A migration that raises a floor stops each process on an older build. For a remote database, `rivers db migrate` first reads the builds that the code locations recorded. If the migration stops one of them, the command changes nothing, lists them, and exits with code 1. The operator and the UI are listed but never block: their records are from their last start, and a chart upgrade replaces them. `--force` migrates anyway. An embedded store has one owner process, so it has no check.
+
+### `rivers db status`
+
+Shows the schema stamp of the database, the schema version and floors of this build, and each process that uses the database. The database is not changed.
+
+```bash
+rivers db status --surreal-endpoint ws://surrealdb:8000
+```
+
+```text
+Database:   schema 12 (read floor 12, write floor 12)
+This build: schema 13 (read floor 13, write floor 13)
+State:      migration needed: run `rivers db migrate`
+
+NAME              KIND           SCHEMA  RIVERS  SEEN
+rivers/analytics  code location  13      0.6.0   4 s ago
+rivers/billing    code location  12      0.5.2   7 s ago          stops after migration
+rivers/legacy     code location  ?       ?       2 s ago          stops after migration (version unknown)
+operator          component      13      0.6.0   started 3 h ago
+ui                component      13      0.6.0   started 3 h ago
+```
+
+- A code location records its build in its directory entry when it starts and with each heartbeat. The operator and the UI record theirs when they start.
+- `?` is a build older than this feature. Its version is not known, so a migration that raises a floor counts it as stopped.
+- `SEEN` is the last heartbeat of a code location. In Kubernetes, the operator removes the entry of a deleted `CodeLocation`. Outside a cluster, an entry of a code location that no longer runs stays; use `--force` when only such entries block the migration.
 
 ### Embedded stores written by SurrealDB 3
 
@@ -91,12 +118,24 @@ Back up the store first. `rivers dev` offers the conversion when it finds such a
 
 ### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
 
-The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`.
+The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`. It raises `MigrationBlockedError` (a `StorageError`) when the migration stops a code location; `force=True` migrates anyway.
 
 ```python
 rs.Storage.migrate_embedded(".rivers/storage")
 rs.Storage.migrate_remote("ws://surrealdb.rivers.svc.cluster.local:8000")
 ```
+
+### `Storage.schema_status_embedded(path)` / `Storage.schema_status_remote(endpoint, ...)`
+
+The programmatic form of `rivers db status`. Returns a `SchemaStatus`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version`, `min_reader`, `min_writer` | `int \| None` | The stamp of the database. `None`: not initialized. |
+| `build_version`, `build_min_reader`, `build_min_writer` | `int` | The schema version of this build and the floors a migration to it sets. |
+| `processes` | `list[ProcessStatus]` | Each code location and component. |
+
+A `ProcessStatus` has `name`, `code_location`, `writes`, `schema_version`, `rivers_version`, `seen` (nanoseconds) and `stops` (a migration to this build stops it; always `False` for a component).
 
 ### `storage.type`
 

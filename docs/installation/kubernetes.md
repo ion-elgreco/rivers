@@ -491,20 +491,50 @@ helm upgrade rivers \
 Existing `CodeLocation` resources are re-reconciled against the new
 operator without re-creation.
 
-Then migrate the storage schema once, before the upgraded UI and code
-locations open the database — a newer build refuses an older database until
-it is migrated. Run it from any image that has the new rivers:
-
-```sh
-rivers db migrate --surreal-endpoint ws://surrealdb:8000
-```
-
-A migration can also raise the oldest build allowed to *write* (see
+A newer operator, UI or code location refuses an older database until it is
+migrated. The operator restarts until the migration is done. A migration can
+also raise the oldest build that can read or write the database (see
 [Schema versioning](../api-reference/storage.md#schema-versioning-migration)).
-When it does, rebuild every `CodeLocation` image on the new rivers version
-right after migrating: an image built on an older rivers is refused as a
-writer and its code location stops serving. Schema versions 5 and 6 (asset
-actions) both raise the write floor.
+A `CodeLocation` image on an older rivers then stops serving. Each code
+location, the operator and the UI record their build in the database, so you
+can see the effect before you migrate:
+
+1. Run `rivers db status` from the new `rivers-runtime` image. It lists each
+   process and marks the code locations that the migration stops.
+
+    ```sh
+    kubectl -n rivers run db-status --rm -it --restart=Never \
+      --image ghcr.io/ion-elgreco/rivers-runtime:0.2.0-py3.12 \
+      --env RIVERS_SURREAL_USERNAME=... --env RIVERS_SURREAL_PASSWORD=... \
+      -- db status --surreal-endpoint ws://surrealdb:8000
+    ```
+
+2. Build new images for the marked code locations.
+3. Upgrade the chart with the migration Job:
+
+    ```sh
+    helm upgrade rivers oci://ghcr.io/ion-elgreco/charts/rivers \
+      --version 0.2.0 -n rivers --set migration.enabled=true
+    ```
+
+    The Job runs `rivers db migrate` with the chart's database credentials.
+    It refuses a migration that stops a code location. When step 1 marks
+    one, add `--set migration.force=true`. You can also run
+    `rivers db migrate --surreal-endpoint ws://surrealdb:8000` by hand.
+4. Roll out the new code location images.
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `migration.enabled` | `false` | Run `rivers db migrate` in a Job on each install and upgrade. |
+| `migration.image` | `""` | Image with the rivers CLI. Empty: the chart's `rivers-runtime` image. |
+| `migration.force` | `false` | Migrate even when it stops a code location. |
+
+Do not set `migration.image` to a rivers newer than the chart: the check
+does not cover the operator and the UI, and a migration that raises a floor
+above their build stops them.
+
+The UI shows the same data: the **Deployment** page lists the schema version
+and floors of the database, and the rivers build of each code location.
 
 ### Upgrading to SurrealDB 4 (schema version 13)
 

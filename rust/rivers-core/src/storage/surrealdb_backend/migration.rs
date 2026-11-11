@@ -11,7 +11,8 @@ use surrealdb::types::SurrealValue;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{is_already_exists_error, now_nanos};
+use super::{SurrealConnectConfig, SurrealStorage, is_already_exists_error, now_nanos};
+use crate::storage::StorageBackend;
 
 /// refinery's history table — one checksummed row per applied migration.
 const REFINERY_HISTORY_TABLE: &str = "refinery_schema_history";
@@ -100,7 +101,18 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 13;
+
+/// The floors the [`SCHEMA_VERSION`] migration records; a test pins them to it.
+pub const MIN_READER: u32 = 13;
+pub const MIN_WRITER: u32 = 13;
+
+/// What a migration to this build stamps on the store.
+pub const BUILD_STAMPS: SchemaStamps = SchemaStamps {
+    version: SCHEMA_VERSION,
+    min_reader: MIN_READER,
+    min_writer: MIN_WRITER,
+};
 
 /// One compat row per migration (the floors it set), folded by the open guard.
 const MIGRATION_META_TABLE: &str = "migration_meta";
@@ -312,16 +324,168 @@ pub enum Capability {
     ReadWrite,
     /// The migrator (`rivers db migrate`) — may advance `version`, exempt from the refusal.
     Migrate,
+    /// Reads [`SurrealStorage::schema_status`] (`rivers db status`). Not
+    /// gated, and never initializes the store.
+    Inspect,
 }
 
 /// The compat triple the open guard checks: the applied version and its floors,
 /// read from the latest `migration_meta` row (floors are cumulative — they only rise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SchemaStamps {
-    version: u32,
-    min_reader: u32,
-    min_writer: u32,
+pub struct SchemaStamps {
+    pub version: u32,
+    pub min_reader: u32,
+    pub min_writer: u32,
 }
+
+/// A process that recorded its build in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessStatus {
+    /// `namespace/name` of a code location, or the name of a component.
+    pub name: String,
+    pub code_location: bool,
+    /// Whether it opens the store to write. Otherwise it only reads.
+    pub writes: bool,
+    /// `None`: a build that does not record it.
+    pub schema_version: Option<u32>,
+    pub rivers_version: Option<String>,
+    /// When a code location was last alive, or a component started, in nanoseconds.
+    pub seen: Option<i64>,
+    /// Whether a migration to this build stops it. Always `false` for a
+    /// component.
+    pub stops: bool,
+}
+
+/// The stamps of a store and the processes that use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaStatus {
+    /// `None`: the store is not initialized.
+    pub stamps: Option<SchemaStamps>,
+    pub processes: Vec<ProcessStatus>,
+}
+
+/// Whether a migration from `stamps` to `target` stops a process on a build
+/// at `schema_version`: its floor rises above that build. An unknown build
+/// counts as stopped.
+fn migration_stops(
+    stamps: SchemaStamps,
+    target: SchemaStamps,
+    writes: bool,
+    schema_version: Option<u32>,
+) -> bool {
+    let floor = |s: SchemaStamps| if writes { s.min_writer } else { s.min_reader };
+    if target.version <= stamps.version || floor(target) <= floor(stamps) {
+        return false;
+    }
+    schema_version.is_none_or(|build| build < floor(target))
+}
+
+impl SurrealStorage {
+    /// The stamps of the store. `None`: the store is not initialized.
+    pub async fn schema_stamps(&self) -> anyhow::Result<Option<SchemaStamps>> {
+        read_schema_stamps(&self.db).await
+    }
+
+    /// The stamps of the store, and each code location and component with
+    /// what a migration to this build does to it.
+    pub async fn schema_status(&self) -> anyhow::Result<SchemaStatus> {
+        let Some(stamps) = read_schema_stamps(&self.db).await? else {
+            return Ok(SchemaStatus {
+                stamps: None,
+                processes: Vec::new(),
+            });
+        };
+
+        let code_locations =
+            self.list_code_locations()
+                .await?
+                .into_iter()
+                .map(|(location, entry)| ProcessStatus {
+                    name: location.to_string(),
+                    code_location: true,
+                    writes: true,
+                    schema_version: entry.schema_version,
+                    rivers_version: entry.rivers_version,
+                    seen: entry.last_seen,
+                    stops: false,
+                });
+        let components = self
+            .list_components()
+            .await?
+            .into_iter()
+            .map(|(name, record)| ProcessStatus {
+                name,
+                code_location: false,
+                writes: record.writes,
+                schema_version: Some(record.schema_version),
+                rivers_version: Some(record.rivers_version),
+                seen: Some(record.started_at),
+                stops: false,
+            });
+
+        let processes = code_locations
+            .chain(components)
+            .map(|process| ProcessStatus {
+                // A component's record is from its last start, and the chart
+                // replaces the operator and the UI with the migration.
+                stops: process.code_location
+                    && migration_stops(
+                        stamps,
+                        BUILD_STAMPS,
+                        process.writes,
+                        process.schema_version,
+                    ),
+                ..process
+            })
+            .collect();
+        Ok(SchemaStatus {
+            stamps: Some(stamps),
+            processes,
+        })
+    }
+
+    /// Fails with [`MigrationBlocked`] when a migration to this build stops a
+    /// code location that uses the store.
+    pub async fn ensure_migration_stops_nothing(&self) -> anyhow::Result<()> {
+        let mut processes = self.schema_status().await?.processes;
+        processes.retain(|process| process.stops);
+        if processes.is_empty() {
+            return Ok(());
+        }
+        Err(MigrationBlocked { processes }.into())
+    }
+
+    /// Migrate a remote database to this build (`rivers db migrate`). Unless
+    /// `force`, a migration that stops a code location fails with
+    /// [`MigrationBlocked`] and changes nothing.
+    pub async fn migrate_remote(config: SurrealConnectConfig, force: bool) -> anyhow::Result<()> {
+        let storage = Self::connect_with_capability(config, Capability::Inspect).await?;
+        if !force {
+            storage.ensure_migration_stops_nothing().await?;
+        }
+        migrate_to_current(&storage.db).await
+    }
+}
+
+/// A migration to this build stops `processes`. Typed so the PyO3 boundary
+/// maps it to `MigrationBlockedError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationBlocked {
+    pub processes: Vec<ProcessStatus>,
+}
+
+impl std::fmt::Display for MigrationBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<_> = self.processes.iter().map(|p| p.name.as_str()).collect();
+        write!(
+            f,
+            "the migration stops {}: update them first, or migrate with force",
+            names.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MigrationBlocked {}
 
 /// Read the compat stamps — the latest applied migration's `migration_meta` row,
 /// whose floors are the current contract (each migration records the cumulative
@@ -459,6 +623,9 @@ pub(super) async fn ensure_compatible(db: &Surreal<Any>, cap: Capability) -> any
     // `rivers db migrate` opens `Migrate`: always run the setup/upgrade.
     if cap == Capability::Migrate {
         return migrate_to_current(db).await;
+    }
+    if cap == Capability::Inspect {
+        return Ok(());
     }
     match read_schema_stamps(db).await? {
         Some(stamps) => check_compatibility(stamps, cap, SCHEMA_VERSION),

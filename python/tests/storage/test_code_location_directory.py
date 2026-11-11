@@ -18,8 +18,14 @@ def _repo() -> rs.CodeRepository:
 
 
 def _entry(storage: rs.Storage, key: str) -> dict | None:
+    """The entry without the build it names, which every entry has."""
     raw = storage.kv_get(key)
-    return None if raw is None else json.loads(raw)
+    if raw is None:
+        return None
+    entry = json.loads(raw)
+    assert entry.pop("schema_version") > 0
+    assert entry.pop("rivers_version")
+    return entry
 
 
 def test_resolve_lists_dev_code_location(storage):

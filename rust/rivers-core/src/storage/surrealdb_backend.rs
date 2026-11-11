@@ -10,7 +10,10 @@ use surrealdb::types::{RecordId, SurrealValue};
 use super::{BackfillRecord, EventRecord, PartitionKey, StorageBackend};
 
 mod migration;
-pub use migration::{Capability, SchemaMigrationNeeded};
+pub use migration::{
+    BUILD_STAMPS, Capability, MigrationBlocked, ProcessStatus, SCHEMA_VERSION,
+    SchemaMigrationNeeded, SchemaStamps, SchemaStatus,
+};
 
 mod backend;
 mod directory;

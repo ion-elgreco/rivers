@@ -6,9 +6,10 @@ use surrealdb::types::{Bytes, SurrealValue};
 use crate::assets::remote::LocationRef;
 use crate::storage::retry;
 use crate::storage::{
-    BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry, ConditionEvalRecord,
-    ConditionTickRecord, EventRecord, EventType, LogRecord, PartitionKey, RunOutcome, RunProgress,
-    RunRecord, RunStatus, StepOutcome, StorageBackend, StoredEvent, StoredLog, TickRecord,
+    BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry, ComponentRecord,
+    ConditionEvalRecord, ConditionTickRecord, EventRecord, EventType, LogRecord, PartitionKey,
+    RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome, StorageBackend, StoredEvent,
+    StoredLog, TickRecord,
 };
 
 use super::run_queue::SettledRunKeys;
@@ -763,6 +764,7 @@ impl StorageBackend for SurrealStorage {
             let mut entry = current.filter(|c| c.identity == identity)?;
             entry.grpc_endpoint = Some(grpc_endpoint.to_string());
             entry.last_seen = Some(now);
+            entry.set_build();
             Some(entry)
         })
         .await
@@ -774,6 +776,24 @@ impl StorageBackend for SurrealStorage {
         identity: &str,
     ) -> Result<bool> {
         self.delete_directory_entry_if(location, identity).await
+    }
+
+    async fn record_component(&self, name: &str, writes: bool, now: i64) -> Result<()> {
+        let record = ComponentRecord {
+            schema_version: SCHEMA_VERSION,
+            rivers_version: crate::RIVERS_VERSION.to_string(),
+            writes,
+            started_at: now,
+        };
+        self.kv_set(
+            &format!("{}{name}", crate::COMPONENT_KEY_PREFIX),
+            &serde_json::to_vec(&record)?,
+        )
+        .await
+    }
+
+    async fn list_components(&self) -> Result<Vec<(String, ComponentRecord)>> {
+        self.list_component_records().await
     }
 
     async fn store_tick(&self, tick: &TickRecord) -> Result<String> {
