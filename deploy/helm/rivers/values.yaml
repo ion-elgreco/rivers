@@ -284,7 +284,7 @@ migration:
   enabled: false
   # Image with the rivers CLI. Empty: the chart's rivers-runtime image.
   image: ""
-  # Migrate even when it stops a code location, the operator or the UI.
+  # Migrate even when it stops a code location.
   force: false
 
 # OpenTelemetry trace export from code-location, run, and step pods.

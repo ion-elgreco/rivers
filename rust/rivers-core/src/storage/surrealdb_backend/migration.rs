@@ -351,7 +351,8 @@ pub struct ProcessStatus {
     pub rivers_version: Option<String>,
     /// When a code location was last alive, or a component started, in nanoseconds.
     pub seen: Option<i64>,
-    /// Whether a migration to this build stops it.
+    /// Whether a migration to this build stops it. Always `false` for a
+    /// component.
     pub stops: bool,
 }
 
@@ -425,12 +426,15 @@ impl SurrealStorage {
         let processes = code_locations
             .chain(components)
             .map(|process| ProcessStatus {
-                stops: migration_stops(
-                    stamps,
-                    BUILD_STAMPS,
-                    process.writes,
-                    process.schema_version,
-                ),
+                // A component's record is from its last start, and the chart
+                // replaces the operator and the UI with the migration.
+                stops: process.code_location
+                    && migration_stops(
+                        stamps,
+                        BUILD_STAMPS,
+                        process.writes,
+                        process.schema_version,
+                    ),
                 ..process
             })
             .collect();
@@ -441,7 +445,7 @@ impl SurrealStorage {
     }
 
     /// Fails with [`MigrationBlocked`] when a migration to this build stops a
-    /// process that uses the store.
+    /// code location that uses the store.
     pub async fn ensure_migration_stops_nothing(&self) -> anyhow::Result<()> {
         let mut processes = self.schema_status().await?.processes;
         processes.retain(|process| process.stops);
@@ -452,7 +456,7 @@ impl SurrealStorage {
     }
 
     /// Migrate a remote database to this build (`rivers db migrate`). Unless
-    /// `force`, a migration that stops a process fails with
+    /// `force`, a migration that stops a code location fails with
     /// [`MigrationBlocked`] and changes nothing.
     pub async fn migrate_remote(config: SurrealConnectConfig, force: bool) -> anyhow::Result<()> {
         let storage = Self::connect_with_capability(config, Capability::Inspect).await?;

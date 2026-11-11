@@ -80,7 +80,7 @@ rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
 
 In K8s, run it by hand or with the chart's [migration Job](../installation/kubernetes.md#upgrade). `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
 
-A migration that raises a floor stops each process on an older build. For a remote database, `rivers db migrate` first reads the builds that the processes recorded. If the migration stops one of them, the command changes nothing, lists them, and exits with code 1. `--force` migrates anyway. An embedded store has one owner process, so it has no check.
+A migration that raises a floor stops each process on an older build. For a remote database, `rivers db migrate` first reads the builds that the code locations recorded. If the migration stops one of them, the command changes nothing, lists them, and exits with code 1. The operator and the UI are listed but never block: their records are from their last start, and a chart upgrade replaces them. `--force` migrates anyway. An embedded store has one owner process, so it has no check.
 
 ### `rivers db status`
 
@@ -118,7 +118,7 @@ Back up the store first. `rivers dev` offers the conversion when it finds such a
 
 ### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
 
-The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`. It raises `MigrationBlockedError` (a `StorageError`) when the migration stops a process; `force=True` migrates anyway.
+The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`. It raises `MigrationBlockedError` (a `StorageError`) when the migration stops a code location; `force=True` migrates anyway.
 
 ```python
 rs.Storage.migrate_embedded(".rivers/storage")
@@ -135,7 +135,7 @@ The programmatic form of `rivers db status`. Returns a `SchemaStatus`:
 | `build_version`, `build_min_reader`, `build_min_writer` | `int` | The schema version of this build and the floors a migration to it sets. |
 | `processes` | `list[ProcessStatus]` | Each code location and component. |
 
-A `ProcessStatus` has `name`, `code_location`, `writes`, `schema_version`, `rivers_version`, `seen` (nanoseconds) and `stops` (a migration to this build stops it).
+A `ProcessStatus` has `name`, `code_location`, `writes`, `schema_version`, `rivers_version`, `seen` (nanoseconds) and `stops` (a migration to this build stops it; always `False` for a component).
 
 ### `storage.type`
 

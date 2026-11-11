@@ -224,7 +224,8 @@ class ProcessStatus:
     """When a code location was last alive, or a component started, in
     nanoseconds."""
     stops: bool
-    """Whether a migration to this build stops it."""
+    """Whether a migration to this build stops it. Always ``False`` for a
+    component: its record is from its last start."""
 
 class SchemaStatus:
     """The schema stamps of a store and the processes that use it."""
@@ -364,12 +365,11 @@ class Storage:
         env → default).
 
         Args:
-            force: Migrate even when the migration stops a code location,
-                the operator or the UI.
+            force: Migrate even when the migration stops a code location.
 
         Raises:
-            MigrationBlockedError: the migration stops a process that uses
-                the database, and ``force`` is not set. Nothing is changed.
+            MigrationBlockedError: the migration stops a code location that
+                uses the database, and ``force`` is not set. Nothing is changed.
         """
         ...
 

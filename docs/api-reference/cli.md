@@ -280,11 +280,11 @@ In Kubernetes, run it by hand or with the chart's [migration Job](../installatio
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--force` | off | Migrate a remote database even when the migration stops a code location, the operator or the UI. Without it, the command lists them, changes nothing, and exits with code 1. |
+| `--force` | off | Migrate a remote database even when the migration stops a code location. Without it, the command lists them, changes nothing, and exits with code 1. |
 
 ## `db status` — schema version and running builds
 
-Shows the schema version of the database and of this build, and the rivers build of each code location, the operator and the UI. It marks the ones that a migration to this build stops. The database is not changed. See [Storage › `rivers db status`](storage.md#rivers-db-status).
+Shows the schema version of the database and of this build, and the rivers build of each code location, the operator and the UI. It marks the code locations that a migration to this build stops. The database is not changed. See [Storage › `rivers db status`](storage.md#rivers-db-status).
 
 ```bash
 rivers db status                                          # embedded (default .rivers/storage/)

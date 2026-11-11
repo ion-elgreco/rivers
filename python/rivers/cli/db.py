@@ -94,8 +94,8 @@ def db_status(
     """Show the storage schema version and what a migration stops.
 
     Lists each code location, and the operator and the UI, with the rivers
-    build it runs. A migration to this build stops the ones it marks. The
-    database is not changed.
+    build it runs. A migration to this build stops the code locations it
+    marks. The database is not changed.
     """
     if surreal_endpoint:
         status = Storage.schema_status_remote(surreal_endpoint)
@@ -119,7 +119,7 @@ def db_migrate(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Migrate even when it stops a code location, the operator or the UI",
+        help="Migrate even when it stops a code location",
     ),
 ) -> None:
     """Apply pending storage schema migrations.
@@ -129,8 +129,8 @@ def db_migrate(
     database is already current. Run this after upgrading rivers when a code
     location or the UI reports that the database needs migration.
 
-    A migration of a remote database that stops a code location, the operator
-    or the UI is refused. `rivers db status` lists them; `--force` migrates.
+    A migration of a remote database that stops a code location is refused.
+    `rivers db status` lists them; `--force` migrates.
     """
     target = surreal_endpoint or storage_path
     if surreal_endpoint:
@@ -142,7 +142,7 @@ def db_migrate(
             for line in _process_table(stopped, time.time_ns()):
                 typer.echo(line, err=True)
             typer.echo(
-                "\nNot migrated: the migration stops the processes above. "
+                "\nNot migrated: the migration stops the code locations above. "
                 "Update them to a newer rivers, or migrate with --force.",
                 err=True,
             )

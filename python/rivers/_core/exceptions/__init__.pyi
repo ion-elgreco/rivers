@@ -50,11 +50,11 @@ class SchemaMigrationNeededError(StorageError):
     """
 
 class MigrationBlockedError(StorageError):
-    """Raised when a migration would stop a process that uses the database.
+    """Raised when a migration would stop a code location.
 
     A subclass of :class:`StorageError`. The migration raises the oldest
     rivers build that can use the database above the build of a code
-    location, the operator or the UI. ``rivers db status`` lists them.
+    location. ``rivers db status`` lists them.
     """
 
 class TaskDefinitionError(Exception):

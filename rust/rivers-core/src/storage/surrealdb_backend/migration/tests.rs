@@ -1292,3 +1292,33 @@ async fn test_a_migration_that_keeps_the_floors_is_not_blocked() {
 
     storage.ensure_migration_stops_nothing().await.unwrap();
 }
+
+/// The chart upgrades the operator and the UI with the migration, and their
+/// records are from the builds before it. They must not block it.
+#[tokio::test]
+async fn test_an_old_operator_or_ui_record_does_not_block_a_migration() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    for (name, writes) in [("operator", true), ("ui", false)] {
+        let record = format!(
+            r#"{{"schema_version":1,"rivers_version":"0.1.0","writes":{writes},"started_at":5}}"#
+        );
+        storage
+            .kv_set(&format!("component:{name}"), record.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    rewind_stamps(&storage.db, SCHEMA_VERSION - 1, 1, 1).await;
+
+    storage.ensure_migration_stops_nothing().await.unwrap();
+    let status = storage.schema_status().await.unwrap();
+    let rows: Vec<_> = status
+        .processes
+        .iter()
+        .map(|p| (p.name.as_str(), p.schema_version, p.stops))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("operator", Some(1), false), ("ui", Some(1), false)]
+    );
+}

@@ -500,7 +500,7 @@ location, the operator and the UI record their build in the database, so you
 can see the effect before you migrate:
 
 1. Run `rivers db status` from the new `rivers-runtime` image. It lists each
-   process and marks the ones that the migration stops.
+   process and marks the code locations that the migration stops.
 
     ```sh
     kubectl -n rivers run db-status --rm -it --restart=Never \
@@ -518,8 +518,8 @@ can see the effect before you migrate:
     ```
 
     The Job runs `rivers db migrate` with the chart's database credentials.
-    It refuses a migration that stops a process. When the list of step 1 is
-    not empty, add `--set migration.force=true`. You can also run
+    It refuses a migration that stops a code location. When step 1 marks
+    one, add `--set migration.force=true`. You can also run
     `rivers db migrate --surreal-endpoint ws://surrealdb:8000` by hand.
 4. Roll out the new code location images.
 
@@ -527,11 +527,11 @@ can see the effect before you migrate:
 |-------|---------|-------------|
 | `migration.enabled` | `false` | Run `rivers db migrate` in a Job on each install and upgrade. |
 | `migration.image` | `""` | Image with the rivers CLI. Empty: the chart's `rivers-runtime` image. |
-| `migration.force` | `false` | Migrate even when it stops a code location, the operator or the UI. |
+| `migration.force` | `false` | Migrate even when it stops a code location. |
 
-Do not set `migration.image` to a rivers newer than the chart, unless
-`rivers db status` from that image shows that it stops neither the operator
-nor the UI.
+Do not set `migration.image` to a rivers newer than the chart: the check
+does not cover the operator and the UI, and a migration that raises a floor
+above their build stops them.
 
 The UI shows the same data: the **Deployment** page lists the schema version
 and floors of the database, and the rivers build of each code location.
