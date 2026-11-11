@@ -356,11 +356,20 @@ class Storage:
         password: str | None = None,
         namespace: str | None = None,
         database: str | None = None,
+        force: bool = False,
     ) -> None:
         """Remote counterpart of :meth:`migrate_embedded`.
 
         Same field resolution as :meth:`connect` (kwarg → ``RIVERS_SURREAL_*``
         env → default).
+
+        Args:
+            force: Migrate even when the migration stops a code location,
+                the operator or the UI.
+
+        Raises:
+            MigrationBlockedError: the migration stops a process that uses
+                the database, and ``force`` is not set. Nothing is changed.
         """
         ...
 

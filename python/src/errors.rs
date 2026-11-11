@@ -77,6 +77,7 @@ create_exception!(
 // Subclass of StorageError so `except StorageError` still catches it; the
 // `rivers dev` prompt catches this specific type to offer `rivers db migrate`.
 create_exception!(rivers.exceptions, SchemaMigrationNeededError, StorageError);
+create_exception!(rivers.exceptions, MigrationBlockedError, StorageError);
 create_exception!(
     rivers.exceptions,
     TaskDefinitionError,
@@ -141,6 +142,10 @@ pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> 
     child.add(
         "SchemaMigrationNeededError",
         py.get_type::<SchemaMigrationNeededError>(),
+    )?;
+    child.add(
+        "MigrationBlockedError",
+        py.get_type::<MigrationBlockedError>(),
     )?;
     child.add("TaskDefinitionError", py.get_type::<TaskDefinitionError>())?;
     child.add("WorkerStepError", py.get_type::<WorkerStepError>())?;

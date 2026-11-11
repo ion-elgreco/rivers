@@ -11,7 +11,7 @@ use surrealdb::types::SurrealValue;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{SurrealStorage, is_already_exists_error, now_nanos};
+use super::{SurrealConnectConfig, SurrealStorage, is_already_exists_error, now_nanos};
 use crate::storage::StorageBackend;
 
 /// refinery's history table — one checksummed row per applied migration.
@@ -434,7 +434,49 @@ impl SurrealStorage {
             processes,
         })
     }
+
+    /// Fails with [`MigrationBlocked`] when a migration to this build stops a
+    /// process that uses the store.
+    pub async fn ensure_migration_stops_nothing(&self) -> anyhow::Result<()> {
+        let mut processes = self.schema_status().await?.processes;
+        processes.retain(|process| process.stops);
+        if processes.is_empty() {
+            return Ok(());
+        }
+        Err(MigrationBlocked { processes }.into())
+    }
+
+    /// Migrate a remote database to this build (`rivers db migrate`). Unless
+    /// `force`, a migration that stops a process fails with
+    /// [`MigrationBlocked`] and changes nothing.
+    pub async fn migrate_remote(config: SurrealConnectConfig, force: bool) -> anyhow::Result<()> {
+        let storage = Self::connect_with_capability(config, Capability::Inspect).await?;
+        if !force {
+            storage.ensure_migration_stops_nothing().await?;
+        }
+        migrate_to_current(&storage.db).await
+    }
 }
+
+/// A migration to this build stops `processes`. Typed so the PyO3 boundary
+/// maps it to `MigrationBlockedError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationBlocked {
+    pub processes: Vec<ProcessStatus>,
+}
+
+impl std::fmt::Display for MigrationBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<_> = self.processes.iter().map(|p| p.name.as_str()).collect();
+        write!(
+            f,
+            "the migration stops {}: update them first, or migrate with force",
+            names.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MigrationBlocked {}
 
 /// Read the compat stamps — the latest applied migration's `migration_meta` row,
 /// whose floors are the current contract (each migration records the cumulative

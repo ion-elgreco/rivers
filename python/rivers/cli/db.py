@@ -6,6 +6,7 @@ import typer
 
 from rivers._core.storage import ProcessStatus, SchemaStatus, Storage
 from rivers.cli._app import db_app
+from rivers.exceptions import MigrationBlockedError
 
 
 # ── Database commands ──
@@ -115,6 +116,11 @@ def db_migrate(
         envvar="RIVERS_SURREAL_ENDPOINT",
         help="Remote SurrealDB endpoint (overrides --storage-path)",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Migrate even when it stops a code location, the operator or the UI",
+    ),
 ) -> None:
     """Apply pending storage schema migrations.
 
@@ -122,10 +128,25 @@ def db_migrate(
     data-heal steps under a cross-process lease. Idempotent — a no-op when the
     database is already current. Run this after upgrading rivers when a code
     location or the UI reports that the database needs migration.
+
+    A migration of a remote database that stops a code location, the operator
+    or the UI is refused. `rivers db status` lists them; `--force` migrates.
     """
     target = surreal_endpoint or storage_path
     if surreal_endpoint:
-        Storage.migrate_remote(surreal_endpoint)
+        try:
+            Storage.migrate_remote(surreal_endpoint, force=force)
+        except MigrationBlockedError:
+            status = Storage.schema_status_remote(surreal_endpoint)
+            stopped = [process for process in status.processes if process.stops]
+            for line in _process_table(stopped, time.time_ns()):
+                typer.echo(line, err=True)
+            typer.echo(
+                "\nNot migrated: the migration stops the processes above. "
+                "Update them to a newer rivers, or migrate with --force.",
+                err=True,
+            )
+            raise typer.Exit(1) from None
     else:
         Storage.migrate_embedded(storage_path)
     typer.echo(f"Storage schema is up to date ({target}).")

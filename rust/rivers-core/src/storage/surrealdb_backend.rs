@@ -11,8 +11,8 @@ use super::{BackfillRecord, EventRecord, PartitionKey, StorageBackend};
 
 mod migration;
 pub use migration::{
-    BUILD_STAMPS, Capability, ProcessStatus, SCHEMA_VERSION, SchemaMigrationNeeded, SchemaStamps,
-    SchemaStatus,
+    BUILD_STAMPS, Capability, MigrationBlocked, ProcessStatus, SCHEMA_VERSION,
+    SchemaMigrationNeeded, SchemaStamps, SchemaStatus,
 };
 
 mod backend;

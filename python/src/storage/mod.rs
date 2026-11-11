@@ -30,7 +30,7 @@ use crate::runtime::io_rt;
 
 pub(crate) fn to_py_err(e: anyhow::Error) -> PyErr {
     use rivers_core::storage::surrealdb_backend::{
-        SchemaMigrationNeeded, StoreWrittenBySurrealDb3,
+        MigrationBlocked, SchemaMigrationNeeded, StoreWrittenBySurrealDb3,
     };
     // The "database is behind this build" cases get a distinct exception (a
     // StorageError subclass) so the `rivers dev` prompt can offer the migration
@@ -40,6 +40,9 @@ pub(crate) fn to_py_err(e: anyhow::Error) -> PyErr {
     }
     if let Some(m) = e.downcast_ref::<StoreWrittenBySurrealDb3>() {
         return crate::errors::SchemaMigrationNeededError::new_err(m.to_string());
+    }
+    if let Some(m) = e.downcast_ref::<MigrationBlocked>() {
+        return crate::errors::MigrationBlockedError::new_err(m.to_string());
     }
     StorageError::new_err(format!("{e}"))
 }
@@ -359,9 +362,10 @@ impl PyStorage {
     }
 
     /// Remote counterpart of [`migrate_embedded`](Self::migrate_embedded); same
-    /// field resolution as [`connect`](Self::connect).
+    /// field resolution as [`connect`](Self::connect). Unless `force`, a
+    /// migration that stops a process that uses the database is refused.
     #[staticmethod]
-    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None))]
+    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None, force=false))]
     fn migrate_remote(
         py: Python<'_>,
         endpoint: &str,
@@ -369,17 +373,14 @@ impl PyStorage {
         password: Option<String>,
         namespace: Option<String>,
         database: Option<String>,
+        force: bool,
     ) -> PyResult<()> {
-        use rivers_core::storage::surrealdb_backend::Capability;
         let endpoint_owned = endpoint.to_string();
         let authenticated = py.detach(|| -> PyResult<_> {
             let (config, authenticated) =
                 resolve_remote_config(endpoint_owned, username, password, namespace, database);
             io_rt()
-                .block_on(SurrealStorage::connect_with_capability(
-                    config,
-                    Capability::Migrate,
-                ))
+                .block_on(SurrealStorage::migrate_remote(config, force))
                 .map_err(to_py_err)?;
             Ok(authenticated)
         })?;

@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 import rivers as rs
 from rivers.cli import app
-from rivers.exceptions import StorageError
+from rivers.exceptions import MigrationBlockedError, StorageError
 
 runner = CliRunner()
 
@@ -43,16 +43,24 @@ def _status(version=12, floors=(12, 12), processes=()):
 def storage(monkeypatch):
     """Stub ``Storage`` of the db commands; records each call."""
     calls = []
-    stub = SimpleNamespace(calls=calls, status=_status())
+    stub = SimpleNamespace(calls=calls, status=_status(), blocked=False)
 
     def record(kind):
         def call(target, **kwargs):
             calls.append((kind, target, kwargs))
-            return stub.status
+            if kind.startswith("schema_status"):
+                return stub.status
+            if stub.blocked and not kwargs.get("force"):
+                raise MigrationBlockedError("the migration stops rivers/billing")
 
         return staticmethod(call)
 
-    kinds = ("schema_status_embedded", "schema_status_remote")
+    kinds = (
+        "schema_status_embedded",
+        "schema_status_remote",
+        "migrate_embedded",
+        "migrate_remote",
+    )
     monkeypatch.setattr(
         "rivers.cli.db.Storage", type("_Storage", (), {k: record(k) for k in kinds})
     )
@@ -144,3 +152,49 @@ def test_schema_status_embedded_needs_a_store(resolved_tmp_path):
     with pytest.raises(StorageError, match="no storage at"):
         rs.Storage.schema_status_embedded(str(resolved_tmp_path / "missing"))
     assert not (resolved_tmp_path / "missing").exists()
+
+
+def test_migrate_embedded_has_no_check(storage):
+    result = runner.invoke(app, ["db", "migrate", "--storage-path", "store"])
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("migrate_embedded", "store", {})]
+    assert "Storage schema is up to date (store)." in result.output
+
+
+def test_migrate_remote_refuses_to_stop_a_process(storage):
+    storage.blocked = True
+    storage.status = _status(
+        processes=[
+            _process("rivers/analytics"),
+            _process("rivers/billing", schema_version=12, stops=True),
+        ]
+    )
+
+    result = runner.invoke(app, ["db", "migrate", "--surreal-endpoint", "ws://db:8000"])
+
+    assert result.exit_code == 1, result.output
+    assert storage.calls == [
+        ("migrate_remote", "ws://db:8000", {"force": False}),
+        ("schema_status_remote", "ws://db:8000", {}),
+    ]
+    assert "rivers/billing  code location  12" in result.output
+    assert "rivers/analytics" not in result.output
+    assert "migrate with --force" in result.output
+    assert "up to date" not in result.output
+
+
+def test_migrate_remote_with_force(storage):
+    storage.blocked = True
+
+    result = runner.invoke(
+        app, ["db", "migrate", "--surreal-endpoint", "ws://db:8000", "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("migrate_remote", "ws://db:8000", {"force": True})]
+    assert "Storage schema is up to date (ws://db:8000)." in result.output
+
+
+def test_migration_blocked_error_is_a_storage_error():
+    assert issubclass(MigrationBlockedError, StorageError)
