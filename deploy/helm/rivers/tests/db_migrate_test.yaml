@@ -1,0 +1,66 @@
+suite: storage migration Job
+templates:
+  - templates/db-migrate-job.yaml
+release:
+  name: rivers
+  namespace: rivers
+  revision: 4
+chart:
+  appVersion: 1.2.3
+tests:
+  - it: is off by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: runs `rivers db migrate` from the runtime image with the database credentials
+    set:
+      migration.enabled: true
+    asserts:
+      - isKind:
+          of: Job
+      - equal:
+          path: metadata.name
+          value: rivers-db-migrate-r4
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/ion-elgreco/rivers-runtime:1.2.3-py3.12
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["db", "migrate"]
+      - notExists:
+          path: spec.template.spec.containers[0].command
+      - equal:
+          path: spec.template.spec.restartPolicy
+          value: OnFailure
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: ws://surrealdb.rivers.svc:8000
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: rivers-surrealdb-auth
+                key: password
+
+  - it: takes a custom image
+    set:
+      migration.enabled: true
+      migration.image: registry.example.com/rivers-runtime:2.0.0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/rivers-runtime:2.0.0
+
+  - it: force adds the flag
+    set:
+      migration.enabled: true
+      migration.force: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["db", "migrate", "--force"]
