@@ -276,4 +276,17 @@ rivers db migrate --storage-path /data/rivers              # embedded, explicit 
 rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote (or RIVERS_SURREAL_ENDPOINT)
 ```
 
-In Kubernetes, run this as an init/job step before rolling out upgraded code locations. `rivers dev` offers to run it interactively when it finds the database behind the build.
+In Kubernetes, run it by hand or with the chart's [migration Job](../installation/kubernetes.md#upgrade). `rivers dev` offers to run it interactively when it finds the database behind the build.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--force` | off | Migrate a remote database even when the migration stops a code location, the operator or the UI. Without it, the command lists them, changes nothing, and exits with code 1. |
+
+## `db status` — schema version and running builds
+
+Shows the schema version of the database and of this build, and the rivers build of each code location, the operator and the UI. It marks the ones that a migration to this build stops. The database is not changed. See [Storage › `rivers db status`](storage.md#rivers-db-status).
+
+```bash
+rivers db status                                          # embedded (default .rivers/storage/)
+rivers db status --surreal-endpoint ws://surrealdb:8000   # remote (or RIVERS_SURREAL_ENDPOINT)
+```
