@@ -89,10 +89,12 @@ async fn serve() {
         let storage = SurrealStorage::connect_with_capability(config, Capability::Read)
             .await
             .expect("Failed to connect to remote SurrealDB");
-        storage
+        if let Err(error) = storage
             .record_component("ui", false, rivers_core::util::now_ts())
             .await
-            .expect("Failed to record the UI in storage");
+        {
+            tracing::warn!(%error, "could not record the UI's build in storage");
+        }
         tracing::info!(
             target: "rivers::storage",
             backend = "remote",

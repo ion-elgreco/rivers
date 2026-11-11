@@ -74,9 +74,12 @@ async fn main() -> anyhow::Result<()> {
         "connecting to SurrealDB"
     );
     let storage = Arc::new(SurrealStorage::connect(surreal_config).await?);
-    storage
+    if let Err(error) = storage
         .record_component("operator", true, rivers_core::util::now_ts())
-        .await?;
+        .await
+    {
+        tracing::warn!(%error, "could not record the operator's build in storage");
+    }
 
     let runs: Api<Run> = Api::namespaced(client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
