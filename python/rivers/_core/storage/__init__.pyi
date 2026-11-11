@@ -208,6 +208,38 @@ class RunRecord:
     ``{"assets": {name: {"config": {...}, "metadata": {...}}}, "resources":
     {key: {...}}}``. ``None`` means the definitions as they are."""
 
+class ProcessStatus:
+    """A process that recorded its build in the store."""
+
+    name: str
+    """``namespace/name`` of a code location, or the name of a component
+    (``operator``, ``ui``)."""
+    code_location: bool
+    writes: bool
+    """Whether it opens the store to write. Otherwise it only reads."""
+    schema_version: int | None
+    """``None``: a build that does not record it."""
+    rivers_version: str | None
+    seen: int | None
+    """When a code location was last alive, or a component started, in
+    nanoseconds."""
+    stops: bool
+    """Whether a migration to this build stops it."""
+
+class SchemaStatus:
+    """The schema stamps of a store and the processes that use it."""
+
+    version: int | None
+    """The schema version of the store. ``None``: not initialized."""
+    min_reader: int | None
+    min_writer: int | None
+    build_version: int
+    """The schema version of this rivers build, and the floors a migration
+    to it sets."""
+    build_min_reader: int
+    build_min_writer: int
+    processes: list[ProcessStatus]
+
 class PoolLimit:
     """Configuration of a concurrency pool."""
 
@@ -326,6 +358,34 @@ class Storage:
         database: str | None = None,
     ) -> None:
         """Remote counterpart of :meth:`migrate_embedded`.
+
+        Same field resolution as :meth:`connect` (kwarg → ``RIVERS_SURREAL_*``
+        env → default).
+        """
+        ...
+
+    @staticmethod
+    def schema_status_embedded(path: str) -> SchemaStatus:
+        """The schema stamps of the embedded store at ``path`` and the
+        processes that use it. Backs ``rivers db status``.
+
+        The store is not changed: it is neither migrated nor initialized.
+
+        Raises:
+            StorageError: there is no store at ``path``.
+        """
+        ...
+
+    @staticmethod
+    def schema_status_remote(
+        endpoint: str,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+    ) -> SchemaStatus:
+        """Remote counterpart of :meth:`schema_status_embedded`.
 
         Same field resolution as :meth:`connect` (kwarg → ``RIVERS_SURREAL_*``
         env → default).
@@ -593,7 +653,9 @@ __all__ = [
     "PoolBlockDetail",
     "PoolInfo",
     "PoolLimit",
+    "ProcessStatus",
     "RunRecord",
+    "SchemaStatus",
     "SlotHolder",
     "StaleCause",
     "Storage",

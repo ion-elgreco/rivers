@@ -8,9 +8,11 @@
 //! `async_*` variant for `await`-friendly use from `asyncio`.
 mod pools;
 mod records;
+mod schema;
 
 pub use pools::*;
 pub use records::*;
+pub use schema::*;
 
 use std::sync::Arc;
 
@@ -383,6 +385,55 @@ impl PyStorage {
         })?;
         tracing::info!(target: "rivers::storage", backend = "remote", endpoint = %endpoint, authenticated, "storage schema migrated");
         Ok(())
+    }
+
+    /// The schema stamps of an embedded store, and the processes that use it
+    /// with what a migration to this build does to each. Backs
+    /// `rivers db status`; the store is not changed.
+    #[staticmethod]
+    fn schema_status_embedded(py: Python<'_>, path: &str) -> PyResult<PySchemaStatus> {
+        use rivers_core::storage::surrealdb_backend::Capability;
+        if !std::path::Path::new(path).is_dir() {
+            return Err(StorageError::new_err(format!("no storage at {path}")));
+        }
+
+        py.detach(|| {
+            let storage = io_rt().block_on(SurrealStorage::new_embedded_with_capability(
+                path,
+                Capability::Inspect,
+            ))?;
+            io_rt().block_on(storage.schema_status())
+        })
+        .map(Into::into)
+        .map_err(to_py_err)
+    }
+
+    /// Remote counterpart of [`schema_status_embedded`](Self::schema_status_embedded);
+    /// same field resolution as [`connect`](Self::connect).
+    #[staticmethod]
+    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None))]
+    fn schema_status_remote(
+        py: Python<'_>,
+        endpoint: &str,
+        username: Option<String>,
+        password: Option<String>,
+        namespace: Option<String>,
+        database: Option<String>,
+    ) -> PyResult<PySchemaStatus> {
+        use rivers_core::storage::surrealdb_backend::Capability;
+        let endpoint = endpoint.to_string();
+
+        py.detach(|| {
+            let (config, _) =
+                resolve_remote_config(endpoint, username, password, namespace, database);
+            let storage = io_rt().block_on(SurrealStorage::connect_with_capability(
+                config,
+                Capability::Inspect,
+            ))?;
+            io_rt().block_on(storage.schema_status())
+        })
+        .map(Into::into)
+        .map_err(to_py_err)
     }
 
     #[pyo3(signature = (asset_key, limit=100))]
@@ -1311,5 +1362,7 @@ pub fn register_storage_module(parent_module: &Bound<'_, PyModule>) -> PyResult<
         PySlotHolder,
         PyBlockReason,
         PyConcurrencyClaimStatus,
+        PyProcessStatus,
+        PySchemaStatus,
     ])
 }
