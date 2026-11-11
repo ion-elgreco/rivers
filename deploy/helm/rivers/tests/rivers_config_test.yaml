@@ -1,0 +1,79 @@
+suite: rivers.toml from the chart
+templates:
+  - templates/rivers-config-configmap.yaml
+  - templates/operator-deployment.yaml
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: renders no ConfigMap and no env by default
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/rivers-config-configmap.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_CONFIG_MAP_NAME
+          any: true
+        template: templates/operator-deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_CONFIG_CHECKSUM
+          any: true
+        template: templates/operator-deployment.yaml
+
+  - it: renders the tables as rivers.toml
+    set:
+      riversToml:
+        module:
+          repo_var: pipeline
+    asserts:
+      - isKind:
+          of: ConfigMap
+        template: templates/rivers-config-configmap.yaml
+      - equal:
+          path: metadata.name
+          value: rivers-config
+        template: templates/rivers-config-configmap.yaml
+      - equal:
+          path: metadata.namespace
+          value: rivers
+        template: templates/rivers-config-configmap.yaml
+      - matchRegex:
+          path: data["rivers.toml"]
+          pattern: '\[module\]\s+repo_var = "pipeline"'
+        template: templates/rivers-config-configmap.yaml
+
+  - it: hands the ConfigMap name and a checksum to the operator
+    set:
+      riversToml:
+        module:
+          repo_var: pipeline
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_CONFIG_MAP_NAME
+            value: rivers-config
+        template: templates/operator-deployment.yaml
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_CONFIG_CHECKSUM
+            value: 0ecf8de60055c485e9ce48f9cc182b4c993509963404830bc89c7f0dc6390342
+        template: templates/operator-deployment.yaml
+
+  - it: a changed value changes the checksum
+    set:
+      riversToml:
+        module:
+          repo_var: other
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_CONFIG_CHECKSUM
+            value: 0ecf8de60055c485e9ce48f9cc182b4c993509963404830bc89c7f0dc6390342
+        template: templates/operator-deployment.yaml

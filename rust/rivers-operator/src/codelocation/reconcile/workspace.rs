@@ -285,6 +285,7 @@ pub(super) async fn apply_git_workspace(
         &ctx.code_location_service_account,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
+        &ctx.config_file_cfg,
         Some(&pieces),
     );
     let service = build_service(cl);

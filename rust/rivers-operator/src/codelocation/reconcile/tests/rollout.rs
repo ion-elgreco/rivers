@@ -189,6 +189,7 @@ fn rollout_reads_the_tree_from_the_pod_template() {
         "rivers-code-location",
         &Default::default(),
         &Default::default(),
+        &Default::default(),
         Some(&pieces),
     );
     d.metadata.generation = Some(2);
@@ -580,6 +581,7 @@ async fn run_pods_size_their_workspace_like_the_code_location_pods() {
             "run-1",
             false,
             &cl.spec,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &WorkspaceConfig::default(),

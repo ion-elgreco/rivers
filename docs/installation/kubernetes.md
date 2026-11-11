@@ -446,6 +446,23 @@ for example `analytics`. Its run and step pods get the same name. The
 [environment variable reference](../api-reference/environment-variables.md#observability)
 lists every variable rivers reads.
 
+## `rivers.toml` from the chart
+
+The `riversToml` value holds the content of a [`rivers.toml`](../api-reference/cli.md#configuration). The chart writes it to the ConfigMap `rivers-config`, and the operator mounts that file into every code-location, run and step pod.
+
+```yaml
+riversToml:
+  module:
+    repo_var: pipeline
+```
+
+- The file replaces a `rivers.toml` in the image or in the git source. `[tool.rivers]` in the image's `pyproject.toml` still applies below it.
+- The operator passes the module and the SurrealDB endpoint to each pod, so `[module] path` and `[storage]` have no effect there. `[module] repo_var` does.
+- A variable in `CodeLocation.spec.env` overrides the file. To make one code location use its own file, set `RIVERS_CONFIG` there to a path in the image.
+- A changed value restarts the code-location pods on `helm upgrade`. A run pod that is in progress does not read the file again; step pods that start later get the changed file.
+
+With an empty `riversToml` (the default), the chart creates no ConfigMap and the pods mount nothing.
+
 ## Open ports
 
 | Port    | Component         | Purpose                                       |

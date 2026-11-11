@@ -40,6 +40,7 @@ pub struct Context {
     /// creates.
     pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
     pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
+    pub config_file_cfg: rivers_k8s::env::ConfigFilePodConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +153,7 @@ async fn reconcile_pending(
         &cl_spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
+        &ctx.config_file_cfg,
         &ctx.workspace,
     );
     match pods_api.create(&PostParams::default(), &pod).await {

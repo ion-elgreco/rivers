@@ -5,7 +5,6 @@ import importlib
 import importlib.util
 import os
 import sys
-from pathlib import Path
 
 import typer
 
@@ -22,6 +21,7 @@ from rivers.cli.config import RiversConfig
 
 @app.command()
 def dev(
+    ctx: typer.Context,
     module: str | None = typer.Argument(
         None,
         help="Python module path containing CodeRepository",
@@ -42,10 +42,6 @@ def dev(
     synthetic: str | None = typer.Option(
         None, help="Override graph with synthetic DAG (e.g. 100, 1k, 10k, 50k)"
     ),
-    config: Path | None = typer.Option(
-        None,
-        help="Path to a rivers.toml (replaces the discovered one; env: RIVERS_CONFIG)",
-    ),
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
     no_ui: bool = typer.Option(
         False, help="Run without the web UI, e.g. beside another rivers dev"
@@ -63,7 +59,7 @@ def dev(
     first one prints, its own ``--code-location-id`` and ``--grpc-port``.
     """
     cfg = RiversConfig.from_cli(
-        config=config,
+        config=ctx.obj,
         module=module,
         repo_var=repo_var,
         host=host,

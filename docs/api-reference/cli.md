@@ -6,6 +6,53 @@ The `rivers` console script is installed by `pip install rivers`. It exposes dev
 rivers --help
 ```
 
+## Configuration
+
+The `rivers` command reads its configuration before it runs a subcommand. Sources, from highest to lowest precedence:
+
+1. CLI flags.
+2. Environment variables: the variable of the flag (e.g. `RIVERS_SURREAL_ENDPOINT`), then `RIVERS_<GROUP>_<KEY>` (e.g. `RIVERS_MODULE_PATH`, `RIVERS_STORAGE_PATH`).
+3. The tables in `rivers.toml`.
+4. `[tool.rivers.*]` in `pyproject.toml`.
+5. The same tables in a user-level `$XDG_CONFIG_HOME/rivers/rivers.toml` (default `~/.config/rivers/rivers.toml`), for defaults shared by all projects.
+
+```toml
+[module]
+path = "my_pipeline"       # the module argument
+repo_var = "repo"          # --repo-var
+
+[storage]
+path = ".rivers/storage/"  # --storage-path
+endpoint = "ws://db:8000"  # --surreal-endpoint
+```
+
+| Table | Applies to |
+|-------|------------|
+| `[module]`, `[storage]` | Every command that takes the matching argument or flag. |
+| `[server]`, `[daemon]`, `[synthetic]` | `dev` only. |
+
+With `[module] path` set, the module argument is optional:
+
+```bash
+rivers dev
+rivers materialize
+rivers backfill --partitions 2026-01-01
+```
+
+A command keeps its own default for each key that is not set. For example, without `[storage]`, `materialize` still uses a scratch store. `[storage] endpoint` has the same effect as `--surreal-endpoint`: it overrides `--storage-path` and `--memory`.
+
+`rivers.toml` and `pyproject.toml` are found by walking up from the current directory. In each directory, rivers looks for `rivers.toml`, then `.config/rivers.toml`, then `config/rivers.toml`; the closest directory wins. In a monorepo, one file at the root applies to every project below it.
+
+To use a `rivers.toml` at another path, pass `--config <path>` before the subcommand or set `RIVERS_CONFIG=<path>`. That file replaces the discovered `rivers.toml`; `pyproject.toml` and the user-level file still apply. A missing file is an error.
+
+```bash
+rivers --config deploy/rivers.toml materialize
+```
+
+In Kubernetes, the Helm chart can mount one `rivers.toml` into every rivers pod: see [`rivers.toml` from the chart](../installation/kubernetes.md#riverstoml-from-the-chart).
+
+---
+
 ## Loading a repository
 
 Most commands take a Python module path as the first argument and a `--repo-var` flag (default `repo`) naming the `CodeRepository` instance:
@@ -72,17 +119,7 @@ The UI lists every code location in that directory, so each `rivers dev` on the 
 
 To run a second code location on the same storage, pass it the printed endpoint with `--surreal-endpoint`, and give it another `--code-location-id` and `--grpc-port`. See [Several code locations in `rivers dev`](../guides/code-locations-locally.md).
 
-Every flag (and the module argument) can also come from configuration. Sources, from highest to lowest precedence:
-
-1. CLI flags.
-2. `RIVERS_<GROUP>_<KEY>` environment variables (e.g. `RIVERS_SERVER_PORT`, `RIVERS_MODULE_PATH`).
-3. The `[module]`/`[server]`/`[storage]`/`[daemon]` tables in `rivers.toml`.
-4. `[tool.rivers.*]` in `pyproject.toml`.
-5. The same tables in a user-level `$XDG_CONFIG_HOME/rivers/rivers.toml` (default `~/.config/rivers/rivers.toml`), for defaults shared by all projects.
-
-`rivers.toml` and `pyproject.toml` are found by walking up from the current directory. In each directory, rivers looks for `rivers.toml`, then `.config/rivers.toml`, then `config/rivers.toml`; the closest directory wins. In a monorepo, one file at the root applies to every project below it.
-
-To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CONFIG=<path>`. That file replaces the discovered `rivers.toml`; `pyproject.toml` and the user-level file still apply. A missing file is an error.
+Every flag and the module argument can also come from [configuration](#configuration). `dev` also reads the `[server]`, `[daemon]` and `[synthetic]` tables.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -93,7 +130,6 @@ To use a `rivers.toml` at another path, pass `--config <path>` or set `RIVERS_CO
 | `--surreal-endpoint` | unset | Connect to a remote SurrealDB instead of using embedded storage. |
 | `--no-daemon` | `False` | Disable the automation daemon. |
 | `--synthetic` | unset | Override the graph with a synthetic DAG (`100`, `1k`, `10k`, `50k`) for benchmarking. |
-| `--config` | unset | Path to a `rivers.toml` that replaces the discovered one. Env: `RIVERS_CONFIG`. |
 | `--code-location-id` | `default` | The code location's identity in storage, and its name in the code location directory. It must not contain `/`, whitespace or control characters. Env: `RIVERS_CODE_LOCATION_ID`. |
 | `--no-ui` | `False` | Run without the web UI. Reloads then need a restart. |
 

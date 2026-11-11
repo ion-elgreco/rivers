@@ -127,6 +127,7 @@ pub async fn handle_executor_failure(
         &cl_spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
+        &ctx.config_file_cfg,
         &ctx.workspace,
     );
     match pods_api.create(&PostParams::default(), &pod).await {

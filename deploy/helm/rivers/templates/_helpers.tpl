@@ -224,6 +224,24 @@ OTEL_EXPORTER_OTLP_ENDPOINT on the operator pod must not reach child pods.
 {{- end }}
 {{- end -}}
 
+{{- define "rivers.configMapName" -}}
+rivers-config
+{{- end -}}
+
+{{/*
+Coordinates of the chart's rivers.toml for the operator, which mounts the
+ConfigMap into every code-location, run, and step pod. The checksum rolls
+the code-location pods when the content changes.
+*/}}
+{{- define "rivers.configEnv" -}}
+{{- if .Values.riversToml -}}
+- name: RIVERS_CONFIG_MAP_NAME
+  value: {{ include "rivers.configMapName" . | quote }}
+- name: RIVERS_CONFIG_CHECKSUM
+  value: {{ toToml .Values.riversToml | sha256sum | quote }}
+{{- end }}
+{{- end -}}
+
 {{- define "rivers.uiAuthCookieSecretName" -}}
 rivers-ui-auth
 {{- end -}}

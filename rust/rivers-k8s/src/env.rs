@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+use k8s_openapi::api::core::v1::{
+    ConfigMapVolumeSource, EnvVar, EnvVarSource, SecretKeySelector, Volume, VolumeMount,
+};
 use rivers_core::assets::remote::{LocationRef, validate_segment};
 use rivers_core::storage::surrealdb_backend::{
     DEFAULT_DATABASE, DEFAULT_NAMESPACE, SurrealConnectConfig,
@@ -40,6 +43,15 @@ pub const ENV_RIVERS_OTEL_ENDPOINT: &str = "RIVERS_OTEL_ENDPOINT";
 pub const ENV_OTEL_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 pub const ENV_OTEL_HEADERS_SECRET_NAME: &str = "RIVERS_OTEL_HEADERS_SECRET_NAME";
 pub const ENV_OTEL_HEADERS_SECRET_KEY: &str = "RIVERS_OTEL_HEADERS_SECRET_KEY";
+/// Path of the `rivers.toml` the `rivers` CLI reads.
+pub const ENV_CONFIG: &str = "RIVERS_CONFIG";
+pub const ENV_CONFIG_MAP_NAME: &str = "RIVERS_CONFIG_MAP_NAME";
+pub const ENV_CONFIG_CHECKSUM: &str = "RIVERS_CONFIG_CHECKSUM";
+pub const CONFIG_CHECKSUM_ANNOTATION: &str = "rivers.io/config-checksum";
+
+const CONFIG_VOLUME: &str = "rivers-config";
+const CONFIG_MOUNT_DIR: &str = "/etc/rivers/config";
+const CONFIG_FILE: &str = "rivers.toml";
 
 /// Read `name` from the process environment, treating empty strings as
 /// unset (so a `valueFrom.secretKeyRef` that resolves to "" doesn't shadow
@@ -410,6 +422,80 @@ pub fn build_otel_pod_env(cfg: &OtelPodConfig) -> Vec<EnvVar> {
         ]);
     }
     env
+}
+
+/// The chart's `rivers.toml`: a ConfigMap mounted into every code-location,
+/// run, and step pod. Empty `config_map` mounts nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigFilePodConfig {
+    pub config_map: String,
+    /// Changes with the file's content; rolls the code-location pods.
+    pub checksum: String,
+}
+
+impl ConfigFilePodConfig {
+    pub fn from_env() -> Self {
+        Self {
+            config_map: env_nonempty(ENV_CONFIG_MAP_NAME).unwrap_or_default(),
+            checksum: env_nonempty(ENV_CONFIG_CHECKSUM).unwrap_or_default(),
+        }
+    }
+
+    /// `volumes` plus the ConfigMap volume.
+    pub fn with_volume(&self, volumes: Option<Vec<Volume>>) -> Option<Vec<Volume>> {
+        if self.config_map.is_empty() {
+            return volumes;
+        }
+
+        let mut volumes = volumes.unwrap_or_default();
+        volumes.push(Volume {
+            name: CONFIG_VOLUME.to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: self.config_map.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        Some(volumes)
+    }
+
+    /// `mounts` plus the mount of the ConfigMap volume.
+    pub fn with_mount(&self, mounts: Option<Vec<VolumeMount>>) -> Option<Vec<VolumeMount>> {
+        if self.config_map.is_empty() {
+            return mounts;
+        }
+
+        let mut mounts = mounts.unwrap_or_default();
+        mounts.push(VolumeMount {
+            name: CONFIG_VOLUME.to_string(),
+            mount_path: CONFIG_MOUNT_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        Some(mounts)
+    }
+
+    /// Pod-template annotations of a pod that restarts when the file changes.
+    pub fn annotations(&self) -> Option<BTreeMap<String, String>> {
+        (!self.config_map.is_empty() && !self.checksum.is_empty()).then(|| {
+            BTreeMap::from([(
+                CONFIG_CHECKSUM_ANNOTATION.to_string(),
+                self.checksum.clone(),
+            )])
+        })
+    }
+}
+
+/// `RIVERS_CONFIG` for the pod's own CLI, and the ConfigMap name for the pods
+/// it launches.
+pub fn build_config_file_env(cfg: &ConfigFilePodConfig) -> Vec<EnvVar> {
+    if cfg.config_map.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        value_env(ENV_CONFIG, format!("{CONFIG_MOUNT_DIR}/{CONFIG_FILE}")),
+        value_env(ENV_CONFIG_MAP_NAME, &cfg.config_map),
+    ]
 }
 
 fn value_env(name: &str, value: impl Into<String>) -> EnvVar {
@@ -1020,6 +1106,7 @@ mod tests {
             module: "analytics.pipeline".to_string(),
             surreal_pod_cfg: SurrealPodConfig::default(),
             otel_pod_cfg: OtelPodConfig::default(),
+            config_file_cfg: ConfigFilePodConfig::default(),
             run_id: "run-1".to_string(),
             run_cr_name: "run-1".to_string(),
             run_cr_uid: "uid-1".to_string(),
@@ -1265,5 +1352,86 @@ mod tests {
             env_value_of(&env, ENV_OTEL_HEADERS_SECRET_KEY).as_deref(),
             Some("headers")
         );
+    }
+
+    fn config_file() -> ConfigFilePodConfig {
+        ConfigFilePodConfig {
+            config_map: "rivers-config".into(),
+            checksum: "abc123".into(),
+        }
+    }
+
+    #[test]
+    fn config_file_unset_adds_nothing() {
+        let cfg = ConfigFilePodConfig::default();
+
+        assert!(build_config_file_env(&cfg).is_empty());
+        assert!(cfg.with_volume(None).is_none());
+        assert!(cfg.with_mount(None).is_none());
+        assert!(cfg.annotations().is_none());
+    }
+
+    #[test]
+    fn config_file_env_points_the_cli_at_the_mounted_file() {
+        let env = build_config_file_env(&config_file());
+
+        assert_eq!(
+            env_value_of(&env, ENV_CONFIG).as_deref(),
+            Some("/etc/rivers/config/rivers.toml")
+        );
+        assert_eq!(
+            env_value_of(&env, ENV_CONFIG_MAP_NAME).as_deref(),
+            Some("rivers-config")
+        );
+    }
+
+    #[test]
+    fn config_file_volume_and_mount_keep_the_existing_ones() {
+        let cfg = config_file();
+        let workspace = Volume {
+            name: "workspace".into(),
+            ..Default::default()
+        };
+        let workspace_mount = VolumeMount {
+            name: "workspace".into(),
+            mount_path: "/workspace".into(),
+            ..Default::default()
+        };
+
+        let volumes = cfg.with_volume(Some(vec![workspace])).unwrap();
+        let mounts = cfg.with_mount(Some(vec![workspace_mount])).unwrap();
+
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].name, "workspace");
+        assert_eq!(
+            volumes[1].config_map.as_ref().map(|c| c.name.as_str()),
+            Some("rivers-config")
+        );
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[1].name, volumes[1].name);
+        assert_eq!(mounts[1].mount_path, "/etc/rivers/config");
+        assert_eq!(mounts[1].read_only, Some(true));
+    }
+
+    #[test]
+    fn config_file_annotation_carries_the_checksum() {
+        assert_eq!(
+            config_file().annotations().unwrap()[CONFIG_CHECKSUM_ANNOTATION],
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn config_file_from_env_reads_the_coordinates() {
+        let cfg = with_vars(
+            &[
+                (ENV_CONFIG_MAP_NAME, Some("rivers-config")),
+                (ENV_CONFIG_CHECKSUM, Some("abc123")),
+            ],
+            ConfigFilePodConfig::from_env,
+        );
+
+        assert_eq!(cfg.config_map, "rivers-config");
+        assert_eq!(cfg.checksum, "abc123");
     }
 }
