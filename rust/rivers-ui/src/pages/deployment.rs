@@ -100,10 +100,25 @@ pub fn DeploymentPage() -> impl IntoView {
 
                                 <DeployCard label="STORAGE">
                                     <DeployRow label="Backend".to_string() value=info.storage_type.clone() mono=true/>
+                                    {info.schema.map(|schema| view! {
+                                        <DeployRow label="Schema version".to_string() value=schema.version.to_string() mono=true/>
+                                        <DeployRow label="Read floor".to_string() value=schema.min_reader.to_string() mono=true/>
+                                        <DeployRow label="Write floor".to_string() value=schema.min_writer.to_string() mono=true/>
+                                    })}
                                     <DeployRow label="Assets".to_string() value=info.asset_count.to_string() mono=true/>
                                     <DeployRow label="Runs".to_string() value=info.run_count.to_string() mono=true/>
                                     <DeployRow label="Events".to_string() value=info.event_count.to_string() mono=true/>
                                     <DeployRow label="Ticks".to_string() value=info.tick_count.to_string() mono=true/>
+                                </DeployCard>
+
+                                <DeployCard label="CODE LOCATION BUILDS">
+                                    {info.code_locations.iter().map(|cl| view! {
+                                        <DeployRow
+                                            label=format!("{}/{}", cl.namespace, cl.name)
+                                            value=cl.summary()
+                                            mono=true
+                                        />
+                                    }).collect_view()}
                                 </DeployCard>
                             </div>
                         }.into_any()

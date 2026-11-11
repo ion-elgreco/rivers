@@ -6,6 +6,81 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, ResourceInfo};
 
+/// The schema version of the database and the oldest rivers build, by schema
+/// version, that can read and write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaInfo {
+    pub version: u32,
+    pub min_reader: u32,
+    pub min_writer: u32,
+}
+
+/// The rivers build of one code location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeLocationVersion {
+    pub namespace: String,
+    pub name: String,
+    pub phase: String,
+    /// `None`: a build that does not record it, or one that never started.
+    pub rivers_version: Option<String>,
+    pub schema_version: Option<u32>,
+    /// Whether its build can write the database. `None`: not known.
+    pub can_write: Option<bool>,
+}
+
+impl CodeLocationVersion {
+    /// The row text of the deployment page.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.phase != "Ready" && !self.phase.is_empty() {
+            parts.push(self.phase.clone());
+        }
+        match (&self.rivers_version, self.schema_version) {
+            (Some(rivers), Some(schema)) => parts.push(format!("{rivers} · schema {schema}")),
+            _ => parts.push("unknown".into()),
+        }
+        if self.can_write == Some(false) {
+            parts.push("below write floor".into());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Each registry entry with the build that its directory entry records.
+#[cfg(feature = "ssr")]
+fn code_location_versions(
+    registry: &[crate::types::CodeLocationEntry],
+    directory: &[(
+        rivers_core::assets::remote::LocationRef,
+        rivers_core::storage::CodeLocationDirectoryEntry,
+    )],
+    schema: Option<SchemaInfo>,
+) -> Vec<CodeLocationVersion> {
+    registry
+        .iter()
+        .map(|entry| {
+            let recorded = directory
+                .iter()
+                .find(|(location, _)| {
+                    location.namespace() == entry.namespace && location.name() == entry.name
+                })
+                .map(|(_, recorded)| recorded);
+            let schema_version = recorded.and_then(|r| r.schema_version);
+
+            CodeLocationVersion {
+                namespace: entry.namespace.clone(),
+                name: entry.name.clone(),
+                phase: entry.phase.clone(),
+                rivers_version: recorded.and_then(|r| r.rivers_version.clone()),
+                schema_version,
+                can_write: schema_version
+                    .zip(schema)
+                    .map(|(build, schema)| build >= schema.min_writer),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
     pub version: String,
@@ -23,6 +98,9 @@ pub struct DeploymentInfo {
     pub daemon_active: bool,
     pub daemon_schedules: usize,
     pub daemon_sensors: usize,
+    /// `None`: the store could not be read.
+    pub schema: Option<SchemaInfo>,
+    pub code_locations: Vec<CodeLocationVersion>,
 }
 
 /// The resources a launch document may override, for the launch dialogs.
@@ -454,6 +532,24 @@ pub async fn get_deployment_info(
     let code_locations_total = registry_entries.len();
     let code_locations_ready = registry_entries.iter().filter(|e| e.is_ready()).count();
 
+    let schema = state
+        .storage
+        .schema_stamps()
+        .await
+        .ok()
+        .flatten()
+        .map(|stamps| SchemaInfo {
+            version: stamps.version,
+            min_reader: stamps.min_reader,
+            min_writer: stamps.min_writer,
+        });
+    let directory = state
+        .storage
+        .list_code_locations()
+        .await
+        .unwrap_or_default();
+    let code_locations = code_location_versions(&registry_entries, &directory, schema);
+
     if let Ok((entry, mut client)) = state.connect_to(&loc_ns, &loc_name).await {
         grpc_url = entry.grpc_endpoint.clone();
         grpc_connected = client.ping(PingRequest {}).await.is_ok();
@@ -506,6 +602,8 @@ pub async fn get_deployment_info(
         daemon_active,
         daemon_schedules,
         daemon_sensors,
+        schema,
+        code_locations,
     })
 }
 
@@ -513,6 +611,78 @@ pub async fn get_deployment_info(
 mod tests {
     use super::partition_key_members;
     use rivers_core::storage::PartitionKey;
+
+    #[test]
+    fn code_location_versions_join_the_registry_with_the_directory() {
+        use super::{CodeLocationVersion, SchemaInfo, code_location_versions};
+        use crate::types::CodeLocationEntry;
+        use rivers_core::assets::remote::LocationRef;
+        use rivers_core::storage::CodeLocationDirectoryEntry;
+
+        let registered = |name: &str, phase: &str| CodeLocationEntry {
+            namespace: "team".into(),
+            name: name.into(),
+            grpc_endpoint: String::new(),
+            image: String::new(),
+            module: String::new(),
+            phase: phase.into(),
+            observed_generation: 0,
+            identity: name.into(),
+        };
+        let recorded = |namespace: &str, name: &str, schema: Option<u32>| {
+            (
+                LocationRef::new(namespace, name).unwrap(),
+                CodeLocationDirectoryEntry {
+                    schema_version: schema,
+                    rivers_version: schema.map(|v| format!("0.{v}.0")),
+                    ..CodeLocationDirectoryEntry::new(name)
+                },
+            )
+        };
+        let registry = [
+            registered("current", "Ready"),
+            registered("behind", "Ready"),
+            registered("old-build", "Ready"),
+            registered("starting", "Deploying"),
+        ];
+        let directory = [
+            recorded("team", "current", Some(13)),
+            recorded("team", "behind", Some(12)),
+            recorded("team", "old-build", None),
+            recorded("other", "starting", Some(13)),
+        ];
+        let schema = SchemaInfo {
+            version: 13,
+            min_reader: 12,
+            min_writer: 13,
+        };
+
+        let versions = code_location_versions(&registry, &directory, Some(schema));
+
+        let rows: Vec<_> = versions
+            .iter()
+            .map(|v| (v.name.as_str(), v.schema_version, v.can_write, v.summary()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("current", Some(13), Some(true), "0.13.0 · schema 13".into()),
+                (
+                    "behind",
+                    Some(12),
+                    Some(false),
+                    "0.12.0 · schema 12 · below write floor".into()
+                ),
+                ("old-build", None, None, "unknown".into()),
+                ("starting", None, None, "Deploying · unknown".into()),
+            ]
+        );
+
+        let no_schema: Vec<CodeLocationVersion> =
+            code_location_versions(&registry[..1], &directory, None);
+        assert_eq!(no_schema[0].can_write, None);
+        assert_eq!(no_schema[0].summary(), "0.13.0 · schema 13");
+    }
 
     /// Heatmap classification compares these member strings against the gRPC window keys.
     #[test]

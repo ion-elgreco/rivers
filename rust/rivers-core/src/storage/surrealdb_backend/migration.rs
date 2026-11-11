@@ -380,6 +380,11 @@ fn migration_stops(
 }
 
 impl SurrealStorage {
+    /// The stamps of the store. `None`: the store is not initialized.
+    pub async fn schema_stamps(&self) -> anyhow::Result<Option<SchemaStamps>> {
+        read_schema_stamps(&self.db).await
+    }
+
     /// The stamps of the store, and each code location and component with
     /// what a migration to this build does to it.
     pub async fn schema_status(&self) -> anyhow::Result<SchemaStatus> {
