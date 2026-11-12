@@ -48,3 +48,42 @@ async fn message_above_the_limit_is_rejected() {
     assert_eq!(storage.kv_get("small").await.unwrap(), Some(small));
     assert_eq!(storage.kv_get("large").await.unwrap(), None);
 }
+
+/// The showcase backfill: 265 zones over half a year of hours, one run for
+/// each zone. The queue insert is one message with every run and its
+/// `RunQueued` event.
+#[tokio::test]
+async fn queue_insert_of_265_runs_of_half_a_year_of_hours_fits_in_one_message() {
+    let Some(storage) = limited_storage().await else {
+        return;
+    };
+    let zones: Vec<String> = (1..=265).map(|zone| format!("{zone:03}")).collect();
+    let zones: Vec<&str> = zones.iter().map(String::as_str).collect();
+    let (written_out, with_spans) = span_keys::zone_run_keys(&zones);
+    storage
+        .create_backfill(&make_backfill("bf", BackfillStatus::InProgress, 100), &[])
+        .await
+        .unwrap();
+
+    // With every hour written out, the insert is about 46 MB.
+    let error = storage
+        .enqueue_backfill_runs(&span_keys::queued_runs(&written_out), "bf")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("too long"), "{error:#}");
+    assert!(storage.get_all_queued_runs().await.unwrap().is_empty());
+
+    let live = storage
+        .enqueue_backfill_runs(&span_keys::queued_runs(&with_spans), "bf")
+        .await
+        .unwrap();
+
+    assert!(live);
+    let queued = storage.get_all_queued_runs().await.unwrap();
+    assert_eq!(queued.len(), 265);
+    let partitions: usize = queued
+        .iter()
+        .map(|run| run.partition_key.as_ref().unwrap().member_count())
+        .sum();
+    assert_eq!(partitions, 265 * span_keys::HOURS);
+}

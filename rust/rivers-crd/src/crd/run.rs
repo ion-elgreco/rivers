@@ -88,6 +88,8 @@ pub struct RunSpec {
     #[schemars(schema_with = "preserve_unknown_object_schema")]
     pub parameters: Option<serde_json::Value>,
 
+    // Written by code locations of older releases only: the pod reads the
+    // key from the run record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_key: Option<String>,
 

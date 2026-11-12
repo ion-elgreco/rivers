@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use rivers_core::assets::graph::AssetGraph;
 use rivers_core::execution::plan::{ExecutionPlan, StepKind};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{LaunchedBy, ScopedStorageHandle};
+use rivers_core::storage::{LaunchedBy, ScopedStorageHandle, StorageBackend};
 
 use rivers_core::execution::retry::{RetryPolicy, RetryRef};
 
@@ -26,6 +26,7 @@ use crate::executor::Executor;
 use crate::partitions::PyPartitionKey;
 use crate::repository::PyRunResult;
 use crate::repository::resolved_node::ResolvedNode;
+use crate::runtime::io_rt;
 use crate::storage::DetachOnClose;
 use crate::task::{PyBashTask, PyTask};
 
@@ -601,10 +602,19 @@ impl PyJob {
         resume: bool,
         raise_on_error: bool,
     ) -> PyResult<PyRunResult> {
+        let storage = self
+            .storage
+            .as_deref()
+            .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
+        let stored_key = py
+            .detach(|| io_rt().block_on(storage.backend().get_run(run_id)))
+            .map_err(|e| ExecutionError::new_err(format!("Failed to load run: {e}")))?
+            .and_then(|run| run.partition_key);
+
         self.run_inner(
             py,
             run_id.to_string(),
-            RunInit::Existing,
+            RunInit::Existing { stored_key },
             partition_key,
             Vec::new(),
             config,

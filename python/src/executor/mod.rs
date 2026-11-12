@@ -244,6 +244,7 @@ impl Executor {
         plan: &ExecutionPlan,
         node_map: &HashMap<String, ResolvedNode>,
         partition_key: &Option<PyPartitionKey>,
+        stored_key: Option<&rivers_core::storage::PartitionKey>,
         storage: StorageHandle,
         run_id: &str,
         resources: &HashMap<String, ResourceVariant>,
@@ -449,6 +450,7 @@ impl Executor {
                         scope: dispatch::RunScope {
                             run_id,
                             partition_key,
+                            stored_key,
                             plan,
                             completed_steps: &completed_steps,
                             resume,

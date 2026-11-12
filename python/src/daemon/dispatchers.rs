@@ -203,6 +203,7 @@ impl DirectRunDispatcher {
                             Some(assets),
                             py_pk,
                             None,
+                            None,
                             false,
                             config,
                             Some(run_id.clone()),
@@ -215,6 +216,7 @@ impl DirectRunDispatcher {
                         .materialize_with_launcher(
                             Some(assets),
                             py_pk,
+                            None,
                             None,
                             false,
                             config,

@@ -103,10 +103,6 @@ def test_backfill_of_127_200_partitions_stays_under_the_message_limit(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="The queue insert holds every hour of every run twice: about 5 MB.",
-)
 def test_queued_backfill_of_127_200_partitions_stays_under_the_message_limit(
     limited_storage,
 ):

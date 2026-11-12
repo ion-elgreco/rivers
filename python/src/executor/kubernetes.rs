@@ -125,7 +125,6 @@ impl KubernetesBackend {
     fn build_config(
         &self,
         run_id: &str,
-        partition_key: Option<String>,
     ) -> PyResult<(
         kube_client::Client,
         rivers_k8s::executor::K8sStepExecutorConfig,
@@ -160,7 +159,6 @@ impl KubernetesBackend {
             run_cr_uid: self.run_cr_uid.clone(),
             code_location_id: self.code_location_id.clone(),
             extra_env,
-            partition_key,
         }
         .with_detected_workspace();
         Ok((client, config))
@@ -668,8 +666,7 @@ impl ExecutorBackend for KubernetesBackend {
     ) {
         // Step pods reject an InMemoryIOHandler where a value would cross
         // into or out of them (`OutOfProcess::Kubernetes`).
-        let pk_string = ctx.scope.partition_key.as_ref().map(|pk| pk.to_json());
-        let (client, config) = match py.detach(|| self.build_config(ctx.scope.run_id, pk_string)) {
+        let (client, config) = match py.detach(|| self.build_config(ctx.scope.run_id)) {
             Ok(c) => c,
             Err(e) => {
                 for inst in &instances {

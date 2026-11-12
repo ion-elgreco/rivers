@@ -9,7 +9,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
 
 use crate::storage::retry;
-use crate::storage::{BackfillRecord, BackfillStatus, PartitionKey};
+use crate::storage::{BackfillRecord, BackfillStatus, KeyItem, PartitionKey};
 
 use super::*;
 
@@ -41,8 +41,18 @@ fn key_pages(keys: &[PartitionKey]) -> Vec<Vec<PartitionKey>> {
 fn key_bytes(key: &PartitionKey) -> usize {
     const PER_KEY: usize = 32;
     const PER_VALUE: usize = 4;
+    const PER_SPAN: usize = 160;
 
     let values = |values: &[String]| -> usize { values.iter().map(|v| v.len() + PER_VALUE).sum() };
+    let items = |items: &[KeyItem]| -> usize {
+        items
+            .iter()
+            .map(|item| match item {
+                KeyItem::Value(value) => value.len() + PER_VALUE,
+                KeyItem::Span(_) => PER_SPAN,
+            })
+            .sum()
+    };
     match key {
         PartitionKey::Single { keys } => PER_KEY + values(keys),
         PartitionKey::Multi { dims } => {
@@ -53,6 +63,14 @@ fn key_bytes(key: &PartitionKey) -> usize {
                     .sum::<usize>()
         }
         PartitionKey::Set { keys } => PER_KEY + keys.iter().map(key_bytes).sum::<usize>(),
+        PartitionKey::SingleItems { items: held } => PER_KEY + items(held),
+        PartitionKey::MultiItems { dims } => {
+            PER_KEY
+                + dims
+                    .iter()
+                    .map(|(name, held)| name.len() + PER_VALUE + items(held))
+                    .sum::<usize>()
+        }
     }
 }
 

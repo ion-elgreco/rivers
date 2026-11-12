@@ -103,13 +103,14 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
     }
 }
 
-/// `keys` with each `Set` replaced by the keys it holds.
+/// `keys` with each `Set` replaced by the keys it holds, and each span
+/// written out: the planner reads `Single` and `Multi` keys only.
 fn without_sets(keys: &[PartitionKey]) -> Vec<PartitionKey> {
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         match key {
             PartitionKey::Set { keys } => out.extend(without_sets(keys)),
-            key => out.push(key.clone()),
+            key => out.push(key.expanded().into_owned()),
         }
     }
     out
@@ -308,6 +309,43 @@ mod tests {
             multi_run: multi_run.iter().map(|d| d.to_string()).collect(),
             single_run: single_run.iter().map(|d| d.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn a_requested_key_with_a_span_is_planned_as_its_expanded_key() {
+        use crate::storage::{KeyItem, KeySpan, SpanStep};
+
+        let span = KeySpan::new(
+            "2024-01-01",
+            "2024-01-04",
+            SpanStep::Seconds(86_400),
+            "%Y-%m-%d",
+        )
+        .unwrap();
+        let with_span = PartitionKey::MultiItems {
+            dims: vec![
+                ("date".into(), vec![KeyItem::Span(span)]),
+                (
+                    "region".into(),
+                    vec![KeyItem::Value("eu".into()), KeyItem::Value("us".into())],
+                ),
+            ],
+        };
+        let expanded = with_span.expanded().into_owned();
+
+        for strategy in [
+            BackfillStrategy::MultiRun,
+            BackfillStrategy::SingleRun,
+            per_dimension(&["region"], &["date"]),
+        ] {
+            let plan = plan_runs(&strategy, std::slice::from_ref(&with_span));
+            assert_eq!(plan, plan_runs(&strategy, std::slice::from_ref(&expanded)));
+            assert_eq!(
+                plan.iter().map(PartitionKey::member_count).sum::<usize>(),
+                8
+            );
+        }
+        assert_eq!(bundle_keys(std::slice::from_ref(&with_span)), expanded);
     }
 
     #[test]

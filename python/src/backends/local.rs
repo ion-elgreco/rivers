@@ -62,6 +62,7 @@ impl RunBackend for LocalRunBackend {
                         Some(node_names),
                         partition_key,
                         None,
+                        None,
                         false,
                         config,
                         Some(run_id.clone()),
@@ -74,6 +75,7 @@ impl RunBackend for LocalRunBackend {
                     .materialize_with_launcher(
                         Some(node_names),
                         partition_key,
+                        None,
                         None,
                         false,
                         config,

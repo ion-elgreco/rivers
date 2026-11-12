@@ -240,6 +240,10 @@ impl From<&rivers_core::storage::PartitionKey> for PyPartitionKey {
             rivers_core::storage::PartitionKey::Set { keys } => Self::Set {
                 keys: keys.iter().map(PyPartitionKey::from).collect(),
             },
+            key @ (rivers_core::storage::PartitionKey::SingleItems { .. }
+            | rivers_core::storage::PartitionKey::MultiItems { .. }) => {
+                Self::from(key.expanded().as_ref())
+            }
         }
     }
 }
