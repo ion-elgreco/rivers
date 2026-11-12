@@ -10,7 +10,7 @@ use crate::executor::Executor;
 use crate::job::PyJob;
 use crate::partitions::PyPartitionKey;
 use crate::runtime::{io_rt, rt};
-use rivers_core::storage::{LaunchedBy, StorageBackend};
+use rivers_core::storage::{LaunchedBy, PartitionKey, StorageBackend};
 
 use super::*;
 
@@ -86,6 +86,7 @@ impl PyCodeRepository {
     /// Shared tail of the two launcher paths: reuse the caller's run id (a
     /// queue- or dispatcher-created record) or mint one, write the record when
     /// it's new, then execute the prepared plan. The job carries the verb.
+    /// A new record holds `stored_key` when given, else `partition_key`.
     #[allow(clippy::too_many_arguments)]
     fn launch_prepared_job(
         &self,
@@ -93,6 +94,7 @@ impl PyCodeRepository {
         synthetic_job: PyJob,
         run_id_override: Option<String>,
         partition_key: Option<PyPartitionKey>,
+        stored_key: Option<PartitionKey>,
         tags: Option<Vec<(String, String)>>,
         config: Option<String>,
         launched_by: LaunchedBy,
@@ -109,26 +111,30 @@ impl PyCodeRepository {
             None => (uuid::Uuid::new_v4().to_string(), None),
         };
         let tags_vec = tags.unwrap_or_default();
-        if existing.is_none() {
-            let core_pk = partition_key.as_ref().map(|pk| pk.into());
-            let asset_selection: Vec<String> = synthetic_job.asset_names();
-            io_rt().block_on(create_materialization_run(
-                state,
-                asset_selection,
-                core_pk,
-                tags_vec.clone(),
-                launched_by,
-                run_id.clone(),
-                synthetic_job.action.clone(),
-                config.clone(),
-            ))?;
-        }
+        let stored_key = match existing {
+            Some(run) => run.partition_key,
+            None => {
+                let stored_key = stored_key.or_else(|| partition_key.as_ref().map(Into::into));
+                let asset_selection: Vec<String> = synthetic_job.asset_names();
+                io_rt().block_on(create_materialization_run(
+                    state,
+                    asset_selection,
+                    stored_key.clone(),
+                    tags_vec.clone(),
+                    launched_by,
+                    run_id.clone(),
+                    synthetic_job.action.clone(),
+                    config.clone(),
+                ))?;
+                stored_key
+            }
+        };
 
         Python::attach(|py| {
             synthetic_job.run_inner(
                 py,
                 run_id,
-                crate::executor::run_lifecycle::RunInit::Existing,
+                crate::executor::run_lifecycle::RunInit::Existing { stored_key },
                 partition_key,
                 tags_vec,
                 config,
@@ -141,12 +147,14 @@ impl PyCodeRepository {
     /// Internal counterpart of the pymethod `materialize`, accepting an
     /// explicit `LaunchedBy` so internal callers (backfill executor, condition
     /// daemon) can stamp the run origin. The pymethod version delegates here
-    /// with `LaunchedBy::Manual`.
+    /// with `LaunchedBy::Manual`. `stored_key` is `partition_key` in the form
+    /// for a new run record: a planned run of a backfill can hold spans.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_with_launcher(
         &self,
         selection: Option<Vec<String>>,
         partition_key: Option<PyPartitionKey>,
+        stored_key: Option<PartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
         config: Option<String>,
@@ -244,6 +252,7 @@ impl PyCodeRepository {
             true,
             run_id_override,
             partition_key,
+            stored_key,
             tags,
             config,
             launched_by,
@@ -265,6 +274,7 @@ impl PyCodeRepository {
         resolve_retry_defaults: bool,
         run_id_override: Option<String>,
         partition_key: Option<PyPartitionKey>,
+        stored_key: Option<PartitionKey>,
         tags: Option<Vec<(String, String)>>,
         config: Option<String>,
         launched_by: LaunchedBy,
@@ -299,6 +309,7 @@ impl PyCodeRepository {
             synthetic_job,
             run_id_override,
             partition_key,
+            stored_key,
             tags,
             config,
             launched_by,
@@ -312,12 +323,14 @@ impl PyCodeRepository {
     /// `run_id_override` follows the same seam contract as
     /// `materialize_with_launcher`: a pre-linked id (backfill children) is
     /// reused so cancellation observed before start skips execution.
+    /// `stored_key` is as in `materialize_with_launcher`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_action_with_launcher(
         &self,
         action: String,
         selection: Option<Vec<String>>,
         partition_key: Option<PyPartitionKey>,
+        stored_key: Option<PartitionKey>,
         tags: Option<Vec<(String, String)>>,
         raise_on_error: bool,
         config: Option<String>,
@@ -380,6 +393,7 @@ impl PyCodeRepository {
             false,
             run_id_override,
             partition_key,
+            stored_key,
             tags,
             config,
             launched_by,

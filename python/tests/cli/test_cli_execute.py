@@ -7,6 +7,7 @@ test that does).
 """
 
 import time
+from datetime import datetime
 
 import pytest
 import rivers as rs
@@ -348,3 +349,234 @@ def test_execute_step_without_a_run_record_fails_loudly(resolved_tmp_path, monke
     assert result.exit_code == 1
     assert "no run record for 'absent'" in result.output
     assert not (resolved_tmp_path / "cfg_seen.txt").exists()
+
+
+TRIPS_REPO_MODULE = """
+from datetime import datetime
+from pathlib import Path
+
+import rivers as rs
+
+
+@rs.Asset(
+    name="trips",
+    partitions_def=rs.PartitionsDefinition.multi(
+        {
+            "hour": rs.PartitionsDefinition.hourly(
+                start=datetime(2024, 1, 1), end=datetime(2024, 1, 3)
+            ),
+            "zone": rs.PartitionsDefinition.static_(["132", "7"]),
+        }
+    ),
+)
+def trips(context: rs.AssetExecutionContext) -> None:
+    if Path("trips_fail").exists():
+        raise ValueError("no trips")
+    keys = sorted(str(key) for key in context.partition.keys)
+    Path("trips_seen.txt").write_text("\\n".join(keys))
+
+
+repo = rs.CodeRepository(
+    assets=[trips],
+    jobs=[rs.Job(name="trips_job", assets=[trips])],
+    default_executor=rs.Executor.in_process(),
+)
+"""
+
+TRIPS_HOURS = [
+    f"2024-01-{day:02d}T{hour:02d}:00" for day in (1, 2) for hour in range(24)
+]
+
+
+def _queue_trips_backfill(store):
+    """Queue the two runs of a backfill of `trips`, one for each zone, as a
+    daemon does. Returns the id of the run of zone 132."""
+    seed = rs.CodeRepository(
+        assets=[
+            rs.Asset(
+                name="trips",
+                partitions_def=rs.PartitionsDefinition.multi(
+                    {
+                        "hour": rs.PartitionsDefinition.hourly(
+                            start=datetime(2024, 1, 1), end=datetime(2024, 1, 3)
+                        ),
+                        "zone": rs.PartitionsDefinition.static_(["132", "7"]),
+                    }
+                ),
+            )(lambda context: None)
+        ],
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+    )
+    seed.resolve(storage=store)
+    launched = seed.backfill(
+        selection=["trips"],
+        partition_range=rs.PartitionKeyRange.multi(
+            {"hour": (TRIPS_HOURS[0], TRIPS_HOURS[-1])}
+        ),
+        strategy=rs.BackfillStrategy.per_dimension(
+            multi_run=["zone"], single_run=["hour"]
+        ),
+        block=False,
+    )
+    seed.execute_backfill_queued(launched.backfill_id)
+
+    span = f"hour={TRIPS_HOURS[0]}..{TRIPS_HOURS[-1]}|zone=132"
+    (run_id,) = [
+        run.run_id
+        for run in store.get_queued_runs()
+        if store._stored_keys(run.run_id)[0] == span
+    ]
+    return run_id
+
+
+def _assert_zone_132_ran(resolved_tmp_path, store, hours=TRIPS_HOURS):
+    members = [f"hour={hour}|zone=132" for hour in hours]
+    assert (resolved_tmp_path / "trips_seen.txt").read_text().split("\n") == members
+    assert sorted(str(key) for key in store.get_materialized_partitions("trips")) == (
+        members
+    )
+
+
+def test_execute_takes_the_partition_key_from_the_run_record(
+    resolved_tmp_path, monkeypatch
+):
+    """The key of a run of half a year of hours does not fit in the arguments
+    of a pod, so the pod gets none: the run record names the partitions."""
+    (resolved_tmp_path / "defs_trips.py").write_text(TRIPS_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_trips")
+    run_id = _queue_trips_backfill(store)
+
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            "defs_trips",
+            "--run-id",
+            run_id,
+            "--target",
+            "trips",
+            "--surreal-endpoint",
+            "ws://unused",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    _assert_zone_132_ran(resolved_tmp_path, store)
+    outcome = store.kv_get(f"run_outcome:{run_id}")
+    assert outcome is not None and b"Success" in outcome
+
+
+def test_execute_job_takes_the_partition_key_from_the_run_record(
+    resolved_tmp_path, monkeypatch
+):
+    (resolved_tmp_path / "defs_trips_job.py").write_text(TRIPS_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_trips_job")
+    hours = TRIPS_HOURS[:6]
+    store._create_run(
+        "pod-trips-job",
+        "trips_job",
+        "NotStarted",
+        time.time_ns(),
+        node_names=["trips"],
+        partition_key=rs.PartitionKey.multi({"hour": hours, "zone": "132"}),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "execute",
+            "defs_trips_job",
+            "--run-id",
+            "pod-trips-job",
+            "--job",
+            "trips_job",
+            "--surreal-endpoint",
+            "ws://unused",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    _assert_zone_132_ran(resolved_tmp_path, store, hours)
+
+
+def test_execute_step_takes_the_partition_key_from_the_run_record(
+    resolved_tmp_path, monkeypatch
+):
+    """A step pod runs one step of the run: the same record names its
+    partitions."""
+    (resolved_tmp_path / "defs_trips_step.py").write_text(TRIPS_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_trips_step")
+    monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", "ws://unused")
+    run_id = _queue_trips_backfill(store)
+
+    result = runner.invoke(
+        app,
+        ["execute-step", "defs_trips_step", "--step-key", "trips", "--run-id", run_id],
+    )
+
+    assert result.exit_code == 0, result.output
+    _assert_zone_132_ran(resolved_tmp_path, store)
+
+
+@pytest.mark.parametrize("command", ["execute", "execute-step"])
+def test_a_partition_key_argument_still_names_the_partitions(
+    resolved_tmp_path, monkeypatch, command
+):
+    """A Run object that an older code location wrote holds the key, and the
+    operator passes it on."""
+    module = f"defs_trips_arg_{command.replace('-', '_')}"
+    (resolved_tmp_path / f"{module}.py").write_text(TRIPS_REPO_MODULE)
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_trips_arg")
+    monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", "ws://unused")
+    hours = TRIPS_HOURS[:6]
+    key = rs.PartitionKey.multi({"hour": hours, "zone": "132"})
+    store._create_run(
+        "pod-trips-arg", "", "Queued", 1, node_names=["trips"], partition_key=key
+    )
+    args = {
+        "execute": ["--target", "trips", "--surreal-endpoint", "ws://unused"],
+        "execute-step": ["--step-key", "trips"],
+    }[command]
+
+    result = runner.invoke(
+        app,
+        [command, module, "--run-id", "pod-trips-arg", *args]
+        + ["--partition-key", key.to_json()],
+    )
+
+    assert result.exit_code == 0, result.output
+    _assert_zone_132_ran(resolved_tmp_path, store, hours)
+
+
+@pytest.mark.parametrize("with_argument", [False, True])
+def test_the_failure_of_a_run_names_the_partitions_that_ran(
+    resolved_tmp_path, monkeypatch, with_argument
+):
+    """The failure holds the key of the run record, as the record holds it.
+    With a key in the arguments, that key ran."""
+    module = f"defs_trips_fail_{int(with_argument)}"
+    (resolved_tmp_path / f"{module}.py").write_text(TRIPS_REPO_MODULE)
+    (resolved_tmp_path / "trips_fail").touch()
+    store = _cloud_env(monkeypatch, resolved_tmp_path / "storage_trips_fail")
+    run_id = _queue_trips_backfill(store)
+    args = []
+    failed = f"hour={TRIPS_HOURS[0]}..{TRIPS_HOURS[-1]}|zone=132"
+    if with_argument:
+        hours = TRIPS_HOURS[:6]
+        key = rs.PartitionKey.multi({"hour": hours, "zone": "132"})
+        args = ["--partition-key", key.to_json()]
+        failed = f"hour={','.join(hours)}|zone=132"
+
+    result = runner.invoke(
+        app,
+        ["execute", module, "--run-id", run_id, "--target", "trips"]
+        + ["--surreal-endpoint", "ws://unused", *args],
+    )
+
+    assert result.exit_code == 0, result.output
+    outcome = store.kv_get(f"run_outcome:{run_id}")
+    assert outcome is not None and b"Failure" in outcome
+    failures = [
+        key for kind, key in store._stored_keys(run_id)[1] if kind == "StepFailure"
+    ]
+    assert failures == [failed]

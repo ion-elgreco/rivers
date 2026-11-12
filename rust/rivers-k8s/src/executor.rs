@@ -35,7 +35,6 @@ pub struct K8sStepExecutorConfig {
     /// verbatim onto every step pod's container so `valueFrom.secretKeyRef` /
     /// `configMapKeyRef` / `fieldRef` semantics are preserved end-to-end.
     pub extra_env: Vec<EnvVar>,
-    pub partition_key: Option<String>,
     /// Git-mode workspace: when set, each step Job mounts the
     /// materialized tree (read-only in shared mode; built per pod in
     /// fallback mode) and runs the venv's `rivers` from the checkout.
@@ -206,9 +205,6 @@ fn build_job_inner(
     ];
     for key in step_keys {
         args.extend(["--step-key".to_string(), key.clone()]);
-    }
-    if let Some(ref pk) = config.partition_key {
-        args.extend(["--partition-key".to_string(), pk.clone()]);
     }
     if let Some(key) = mapping_key {
         args.extend(["--mapping-key".to_string(), key.to_string()]);
@@ -387,7 +383,6 @@ mod tests {
             run_cr_uid: "uid-456".to_string(),
             code_location_id: "demo-id".to_string(),
             extra_env: vec![],
-            partition_key: None,
             workspace: None,
         }
     }
@@ -1062,22 +1057,9 @@ mod tests {
         assert_eq!(sanitize_k8s_label(""), "");
     }
 
+    /// The step pod reads the key from the run record.
     #[test]
-    fn step_job_includes_partition_key() {
-        let mut config = test_config();
-        config.partition_key = Some(r#"{"single":["2025-01-16"]}"#.to_string());
-        let job = build_step_job(&config, "daily_events");
-        let args = job.spec.unwrap().template.spec.unwrap().containers[0]
-            .args
-            .as_ref()
-            .unwrap()
-            .clone();
-        let pk_idx = args.iter().position(|a| a == "--partition-key").unwrap();
-        assert_eq!(args[pk_idx + 1], r#"{"single":["2025-01-16"]}"#);
-    }
-
-    #[test]
-    fn step_job_omits_partition_key_when_none() {
+    fn step_job_has_no_partition_key_argument() {
         let config = test_config();
         let job = build_step_job(&config, "raw_users");
         let args = job.spec.unwrap().template.spec.unwrap().containers[0]

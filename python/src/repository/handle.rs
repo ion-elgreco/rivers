@@ -149,7 +149,8 @@ pub(crate) struct RepoHandle {
 pub(crate) struct RunSubmission {
     /// `None` = all assets.
     pub(crate) selection: Option<Vec<String>>,
-    pub(crate) partition_key: Option<PyPartitionKey>,
+    /// The key as the run record holds it.
+    pub(crate) partition_key: Option<rivers_core::storage::PartitionKey>,
     pub(crate) tags: Option<Vec<(String, String)>>,
     /// `Some(job)` enqueues the run as a job execution (resolved with the job's
     /// plan + executor on dequeue); `None` for an ad-hoc materialization.
@@ -402,6 +403,7 @@ impl RepoHandle {
             &state,
             job_name,
             partition_key,
+            None,
             launched_by,
             run_id_override,
             config,
@@ -974,7 +976,6 @@ pub(super) async fn submit_runs(
             let run_id = uuid::Uuid::new_v4().to_string();
             let run_tags = sub.tags.clone().unwrap_or_default();
             let priority = priority_from_tags(&run_tags);
-            let core_pk = sub.partition_key.as_ref().map(|pk| pk.into());
 
             records.push(RunRecord {
                 run_id,
@@ -986,7 +987,7 @@ pub(super) async fn submit_runs(
                 tags: run_tags,
                 node_names: asset_names,
                 priority,
-                partition_key: core_pk,
+                partition_key: sub.partition_key.clone(),
                 block_reason: None,
                 launched_by: launched_by.clone(),
                 action,
@@ -1030,11 +1031,13 @@ pub(super) async fn submit_runs(
     Ok(run_ids)
 }
 
-/// See [`RepoHandle::create_started_run`].
+/// See [`RepoHandle::create_started_run`]. The record holds `stored_key`
+/// when given, else `partition_key`.
 pub(super) async fn create_started_run(
     state: &ResolvedState,
     job_name: &str,
     partition_key: Option<&PyPartitionKey>,
+    stored_key: Option<rivers_core::storage::PartitionKey>,
     launched_by: LaunchedBy,
     run_id_override: Option<String>,
     config: Option<String>,
@@ -1058,7 +1061,7 @@ pub(super) async fn create_started_run(
 
         let run_id = run_id_override.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_ts();
-        let core_pk = partition_key.map(|pk| pk.into());
+        let core_pk = stored_key.or_else(|| partition_key.map(|pk| pk.into()));
 
         let record = RunRecord {
             run_id,

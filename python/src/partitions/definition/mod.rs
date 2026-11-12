@@ -626,6 +626,21 @@ impl PartitionsDefinition {
         }
     }
 
+    /// The grid of each time dimension of the definition, by dimension name.
+    pub fn time_grids(&self) -> Vec<rivers_core::execution::backfill_spans::DimensionGrid> {
+        match self {
+            Self::Multi { dimensions } => dimensions
+                .iter()
+                .filter_map(|(name, def)| Some((Some(name.clone()), def.time_grid()?)))
+                .collect(),
+            _ => self
+                .time_grid()
+                .map(|grid| (None, grid))
+                .into_iter()
+                .collect(),
+        }
+    }
+
     /// The definition as the topology stores it.
     pub fn fingerprint(&self) -> PartitionsFingerprint {
         self.fingerprint_into(&mut Vec::new())

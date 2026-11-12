@@ -92,6 +92,10 @@ repo.backfill(
 
 This creates 7 runs (one per date), each processing all 3 regions within a single run.
 
+### Runs over many time windows
+
+A run of a `SingleRun` or `PerDimension` backfill can hold many time windows, for example half a year of hours. Storage keeps three or more consecutive windows as one span, `first..last`, so the run record stays small. The web UI shows the first partitions of the run and the total, and the span on the events of the run. Your asset function and `RunRecord.partition_key` get every window.
+
 ## Partition key ranges
 
 Specify which partitions to backfill using `PartitionKeyRange`.

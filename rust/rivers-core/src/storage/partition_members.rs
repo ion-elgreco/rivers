@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 
-use super::PartitionKey;
+use super::key_item::SpanWindows;
+use super::{KeyItem, PartitionKey};
 
 /// The partitions that a list of keys names. A key can name many partitions;
 /// this answers "is this partition one of them" without building them.
@@ -14,8 +15,43 @@ pub struct NamedPartitions<'a> {
 }
 
 enum Batched<'a> {
-    Single(HashSet<&'a str>),
-    Multi(Vec<(&'a str, HashSet<&'a str>)>),
+    Single(ValueSet<'a>),
+    Multi(Vec<(&'a str, ValueSet<'a>)>),
+}
+
+/// The values of one dimension of a key. A span is asked, not written out.
+struct ValueSet<'a> {
+    values: HashSet<&'a str>,
+    spans: Vec<SpanWindows<'a>>,
+}
+
+impl<'a> ValueSet<'a> {
+    fn of_values(values: &'a [String]) -> Self {
+        Self {
+            values: values.iter().map(String::as_str).collect(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn of_items(items: &'a [KeyItem]) -> Self {
+        let mut set = Self {
+            values: HashSet::new(),
+            spans: Vec::new(),
+        };
+        for item in items {
+            match item {
+                KeyItem::Value(value) => {
+                    set.values.insert(value.as_str());
+                }
+                KeyItem::Span(span) => set.spans.extend(span.prepared()),
+            }
+        }
+        set
+    }
+
+    fn contains(&self, value: &str) -> bool {
+        self.values.contains(value) || self.spans.iter().any(|span| span.contains(value))
+    }
 }
 
 impl<'a> NamedPartitions<'a> {
@@ -33,17 +69,25 @@ impl<'a> NamedPartitions<'a> {
     fn add(&mut self, key: &'a PartitionKey) {
         match key {
             PartitionKey::Set { keys } => keys.iter().for_each(|member| self.add(member)),
+            // A key with items is not equal to the partition that it names,
+            // also when it names only one.
+            PartitionKey::SingleItems { items } => self
+                .batched
+                .push(Batched::Single(ValueSet::of_items(items))),
+            PartitionKey::MultiItems { dims } => self.batched.push(Batched::Multi(
+                dims.iter()
+                    .map(|(name, items)| (name.as_str(), ValueSet::of_items(items)))
+                    .collect(),
+            )),
             _ if key.member_count() == 1 => {
                 self.single.insert(key);
             }
             PartitionKey::Single { keys } => self
                 .batched
-                .push(Batched::Single(keys.iter().map(String::as_str).collect())),
+                .push(Batched::Single(ValueSet::of_values(keys))),
             PartitionKey::Multi { dims } => self.batched.push(Batched::Multi(
                 dims.iter()
-                    .map(|(name, values)| {
-                        (name.as_str(), values.iter().map(String::as_str).collect())
-                    })
+                    .map(|(name, values)| (name.as_str(), ValueSet::of_values(values)))
                     .collect(),
             )),
         }
@@ -59,7 +103,7 @@ impl Batched<'_> {
     fn contains(&self, partition: &PartitionKey) -> bool {
         match (self, partition) {
             (Self::Single(values), PartitionKey::Single { keys }) => {
-                matches!(keys.as_slice(), [value] if values.contains(value.as_str()))
+                matches!(keys.as_slice(), [value] if values.contains(value))
             }
             (
                 Self::Multi(dims),
@@ -73,7 +117,7 @@ impl Batched<'_> {
                             return false;
                         };
                         dims.iter()
-                            .any(|(dim, allowed)| dim == name && allowed.contains(value.as_str()))
+                            .any(|(dim, allowed)| dim == name && allowed.contains(value))
                     })
             }
             _ => false,
@@ -140,6 +184,57 @@ mod tests {
 
         assert!(named.contains(&single(&["a"])));
         assert!(named.contains(&multi(&[("date", &["d2"]), ("region", &["eu"])])));
+        assert!(!named.contains(&single(&["b"])));
+    }
+
+    fn hours(first: &str, last: &str) -> KeyItem {
+        let step = crate::storage::SpanStep::Cron("0 * * * *".into());
+        KeyItem::Span(crate::storage::KeySpan::new(first, last, step, "%Y-%m-%d-%H:%M").unwrap())
+    }
+
+    #[test]
+    fn a_span_names_its_windows_without_writing_them_out() {
+        let keys = [
+            PartitionKey::MultiItems {
+                dims: vec![
+                    (
+                        "hour".into(),
+                        vec![
+                            hours("2024-01-01-00:00", "2024-06-30-23:00"),
+                            KeyItem::Value("2024-08-01-00:00".into()),
+                        ],
+                    ),
+                    ("zone".into(), vec![KeyItem::Value("132".into())]),
+                ],
+            },
+            PartitionKey::SingleItems {
+                items: vec![hours("2025-01-01-00:00", "2025-01-01-02:00")],
+            },
+        ];
+        let named = NamedPartitions::new(&keys);
+        let at = |hour: &str, zone: &str| multi(&[("hour", &[hour]), ("zone", &[zone])]);
+
+        assert!(named.contains(&at("2024-01-01-00:00", "132")));
+        assert!(named.contains(&at("2024-03-10-07:00", "132")));
+        assert!(named.contains(&at("2024-06-30-23:00", "132")));
+        assert!(named.contains(&at("2024-08-01-00:00", "132")));
+        assert!(named.contains(&single(&["2025-01-01-01:00"])));
+
+        assert!(!named.contains(&at("2024-07-01-00:00", "132")));
+        assert!(!named.contains(&at("2024-03-10-07:30", "132")));
+        assert!(!named.contains(&at("2024-03-10-07:00", "7")));
+        assert!(!named.contains(&single(&["2024-03-10-07:00"])));
+        assert!(!named.contains(&single(&["2025-01-01-03:00"])));
+    }
+
+    #[test]
+    fn a_key_with_items_that_names_one_partition_names_that_partition() {
+        let keys = [PartitionKey::SingleItems {
+            items: vec![KeyItem::Value("a".into())],
+        }];
+        let named = NamedPartitions::new(&keys);
+
+        assert!(named.contains(&single(&["a"])));
         assert!(!named.contains(&single(&["b"])));
     }
 

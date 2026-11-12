@@ -8,6 +8,7 @@ use crate::executor::ops::now_ts;
 use crate::job::PyJob;
 use crate::partitions::{PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange};
 use crate::runtime::{io_rt, rt};
+use rivers_core::execution::backfill_spans::{DimensionGrid, with_spans};
 use rivers_core::storage::{
     BackfillFailurePolicy, BackfillRecord, BackfillRunOutcome, BackfillStatus, LaunchedBy,
     PartitionKey, StorageBackend, UnstartedBackfillRun, tag_keys,
@@ -46,9 +47,19 @@ fn validate_backfill_keys(
     Ok(())
 }
 
+/// The time grids of the first partitioned asset of `selection` that has one.
+fn time_grids(state: &ResolvedState, selection: &[String]) -> Vec<DimensionGrid> {
+    iter_partitioned_assets(&state.node_map, selection.iter().map(String::as_str))
+        .into_iter()
+        .map(|(_, def)| def.time_grids())
+        .find(|grids| !grids.is_empty())
+        .unwrap_or_default()
+}
+
 /// Plan the runs of a `Requested` backfill and move it to `InProgress`.
-/// Returns its requested keys and one key per run, in run order. A backfill
-/// whose keys name no partition is failed: no run can end it.
+/// Returns its requested keys and one key per run, in run order, with each
+/// row of time windows as a span. A backfill whose keys name no partition is
+/// failed: no run can end it.
 fn start_backfill(
     state: &ResolvedState,
     record: &BackfillRecord,
@@ -60,6 +71,7 @@ fn start_backfill(
         .block_on(state.storage.get_backfill_keys(backfill_id))
         .map_err(storage_err)?;
     let run_keys = rivers_core::execution::backfill::plan_runs(&record.strategy, &requested);
+    let run_keys = with_spans(run_keys, &time_grids(state, &record.asset_selection));
 
     if run_keys.is_empty() {
         let error = format!("Backfill '{backfill_id}' names no partition");
@@ -362,15 +374,17 @@ impl PyCodeRepository {
         state: &ResolvedState,
         job: &Py<PyJob>,
         job_name: &str,
-        py_pk: PyPartitionKey,
+        run_key: &PartitionKey,
         config: Option<String>,
         backfill_id: &str,
         run_id: String,
     ) -> PyResult<PyRunResult> {
+        let py_pk = PyPartitionKey::from(run_key);
         let run_id = io_rt().block_on(create_started_run(
             state,
             job_name,
             Some(&py_pk),
+            Some(run_key.clone()),
             LaunchedBy::Backfill {
                 backfill_id: backfill_id.to_string(),
             },
@@ -478,7 +492,6 @@ impl PyCodeRepository {
                 ));
             }
 
-            let batch_pk = PyPartitionKey::from(run_key);
             let run_config = record.config.clone();
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
@@ -486,7 +499,7 @@ impl PyCodeRepository {
                         state,
                         job,
                         job_name,
-                        batch_pk,
+                        run_key,
                         run_config,
                         backfill_id,
                         run_id.clone(),
@@ -500,7 +513,8 @@ impl PyCodeRepository {
                     Some(verb) => self.run_action_with_launcher(
                         verb.clone(),
                         Some(record.asset_selection.clone()),
-                        Some(batch_pk),
+                        Some(PyPartitionKey::from(run_key)),
+                        Some(run_key.clone()),
                         Some(run_tags.clone()),
                         false,
                         run_config,
@@ -512,7 +526,8 @@ impl PyCodeRepository {
                     ),
                     None => self.materialize_with_launcher(
                         Some(record.asset_selection.clone()),
-                        Some(batch_pk),
+                        Some(PyPartitionKey::from(run_key)),
+                        Some(run_key.clone()),
                         Some(run_tags.clone()),
                         false,
                         run_config,
@@ -620,7 +635,7 @@ impl PyCodeRepository {
                 .iter()
                 .map(|run_key| RunSubmission {
                     selection: Some(record.asset_selection.clone()),
-                    partition_key: Some(PyPartitionKey::from(run_key)),
+                    partition_key: Some(run_key.clone()),
                     tags: Some(run_tags.clone()),
                     job_name: record.job_name.clone(),
                     action: record.action.clone(),

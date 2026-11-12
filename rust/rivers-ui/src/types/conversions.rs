@@ -671,6 +671,83 @@ mod tests {
         );
     }
 
+    /// Half a year of hours for one zone, as the planner of a backfill writes it.
+    fn span_key() -> rivers_core::storage::PartitionKey {
+        use rivers_core::storage::{KeyItem, KeySpan, PartitionKey, SpanStep};
+
+        let hours = KeySpan::new(
+            "2024-01-01T00:00",
+            "2024-06-30T23:00",
+            SpanStep::Cron("0 * * * *".into()),
+            "%Y-%m-%dT%H:00",
+        )
+        .unwrap();
+        PartitionKey::MultiItems {
+            dims: vec![
+                ("hour".into(), vec![KeyItem::Span(hours)]),
+                ("zone".into(), vec![KeyItem::Value("132".into())]),
+            ],
+        }
+    }
+
+    /// A run of a span of time windows shows its first partitions and the
+    /// total, as a run of the same windows written out does.
+    #[test]
+    fn run_record_with_a_span_key_shows_a_preview_and_the_total() {
+        let core = rivers_core::storage::RunRecord {
+            run_id: "r1".into(),
+            code_location_id: rivers_core::storage::default_code_location_id(),
+            job_name: None,
+            status: rivers_core::storage::RunStatus::Success,
+            start_time: 0,
+            end_time: None,
+            tags: vec![],
+            node_names: vec![],
+            priority: 0,
+            partition_key: Some(span_key()),
+            block_reason: None,
+            launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
+        };
+
+        let ui: RunRecord = core.into();
+
+        let preview = ui.partition_key.expect("a partitioned run");
+        assert_eq!(
+            preview.preview,
+            vec![
+                "hour=2024-01-01T00:00|zone=132",
+                "hour=2024-01-01T01:00|zone=132",
+                "hour=2024-01-01T02:00|zone=132",
+            ]
+        );
+        assert_eq!(preview.total, 4368);
+    }
+
+    /// An event of a whole run names the span, not each window.
+    #[test]
+    fn stored_event_with_a_span_key_shows_the_span() {
+        let core = rivers_core::storage::StoredEvent {
+            id: rivers_core::surrealdb::types::RecordId::new("events", "e1"),
+            event_type: rivers_core::storage::EventType::RunQueued,
+            asset_key: None,
+            run_id: "r1".into(),
+            partition_key: Some(span_key()),
+            timestamp: 0,
+            metadata: vec![],
+            code_version: None,
+            input_data_versions: vec![],
+        };
+
+        let ui: StoredEvent = core.into();
+
+        assert_eq!(
+            ui.partition_key.as_deref(),
+            Some("hour=2024-01-01T00:00..2024-06-30T23:00|zone=132")
+        );
+    }
+
     /// The UI reads the traceback JSON the executor writes.
     #[test]
     fn run_log_reads_the_stored_traceback() {

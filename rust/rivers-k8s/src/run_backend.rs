@@ -79,8 +79,6 @@ impl K8sRunBackendConfig {
         let mut labels = self.labels.clone();
         labels.insert("rivers.io/run-id".to_string(), run_info.run_id.clone());
 
-        let partition_key = run_info.partition_key.as_ref().map(|pk| pk.to_json());
-
         Run {
             metadata: ObjectMeta {
                 name: Some(Self::cr_name(&run_info.run_id)),
@@ -102,7 +100,8 @@ impl K8sRunBackendConfig {
                 surreal_endpoint: self.surreal_endpoint.clone(),
                 executor: Executor::Kubernetes,
                 parameters: None,
-                partition_key,
+                // The pod reads the key from the run record.
+                partition_key: None,
                 run_id: Some(run_info.run_id.clone()),
                 timeout_seconds: None,
                 max_restarts: crate::defaults::MAX_RESTARTS,
@@ -377,39 +376,31 @@ mod tests {
         assert_eq!(run.spec.action.as_deref(), Some("compact"));
     }
 
+    /// The pod reads the key from the run record: a key of half a year of
+    /// hours is larger than the arguments of a pod can hold.
     #[test]
-    fn build_cr_with_single_partition_key() {
+    fn build_cr_does_not_hold_the_partition_key() {
         use rivers_core::storage::PartitionKey;
 
-        let mut info = test_run_info();
-        info.partition_key = Some(PartitionKey::Single {
-            keys: vec!["2024-01-15".to_string()],
-        });
-
-        let run = test_config().build_run_cr(&info);
-        assert_eq!(
-            run.spec.partition_key,
-            Some(r#"{"single":["2024-01-15"]}"#.to_string())
-        );
-    }
-
-    #[test]
-    fn build_cr_with_multi_partition_key() {
-        use rivers_core::storage::PartitionKey;
-
+        let without_key = test_config().build_run_cr(&test_run_info());
         let mut info = test_run_info();
         info.partition_key = Some(PartitionKey::Multi {
             dims: vec![
-                ("region".to_string(), vec!["us".to_string()]),
-                ("date".to_string(), vec!["2025-03".to_string()]),
+                (
+                    "hour".to_string(),
+                    (0..4368).map(|hour| format!("hour-{hour:04}")).collect(),
+                ),
+                ("zone".to_string(), vec!["132".to_string()]),
             ],
         });
 
         let run = test_config().build_run_cr(&info);
-        let pk = run.spec.partition_key.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&pk).unwrap();
-        assert_eq!(parsed["multi"]["date"], serde_json::json!(["2025-03"]));
-        assert_eq!(parsed["multi"]["region"], serde_json::json!(["us"]));
+
+        assert_eq!(run.spec.partition_key, None);
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            serde_json::to_string(&without_key).unwrap()
+        );
     }
 
     #[test]

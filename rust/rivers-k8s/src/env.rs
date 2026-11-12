@@ -1113,7 +1113,6 @@ mod tests {
             run_cr_uid: "uid-1".to_string(),
             code_location_id: "cl-1".to_string(),
             extra_env: vec![],
-            partition_key: None,
             workspace: None,
         }
     }

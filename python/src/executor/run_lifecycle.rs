@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
-use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend};
+use rivers_core::storage::{
+    LaunchedBy, PartitionKey, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
+};
 
 use super::Executor;
 use super::ops::now_ts;
@@ -33,8 +35,9 @@ pub(crate) enum RunInit {
     Create { launched_by: LaunchedBy },
     /// The record already exists (created by `Job::create_run` or by the queue
     /// dequeuer); transition its status to `Started` — unless it was canceled
-    /// while waiting, in which case the run is skipped.
-    Existing,
+    /// while waiting, in which case the run is skipped. `stored_key` is the
+    /// partition key as the record holds it.
+    Existing { stored_key: Option<PartitionKey> },
 }
 
 pub(crate) struct RunPlanArgs<'a> {
@@ -108,7 +111,7 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRunResult> {
     let node_names = args.plan.all_asset_names();
 
-    let started = py.detach(|| -> PyResult<bool> {
+    let (started, stored_key) = py.detach(|| -> PyResult<(bool, Option<PartitionKey>)> {
         match args.init {
             RunInit::Create { launched_by } => {
                 let priority = priority_from_tags(&args.tags);
@@ -133,13 +136,16 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
                     .map_err(|e| {
                         ExecutionError::new_err(format!("Failed to create run record: {e}"))
                     })?;
-                Ok(true)
+                Ok((true, None))
             }
-            RunInit::Existing => io_rt()
-                .block_on(args.storage.backend().try_start_run(&args.run_id))
-                .map_err(|e| {
-                    ExecutionError::new_err(format!("Failed to transition run to Started: {e}"))
-                }),
+            RunInit::Existing { stored_key } => {
+                let started = io_rt()
+                    .block_on(args.storage.backend().try_start_run(&args.run_id))
+                    .map_err(|e| {
+                        ExecutionError::new_err(format!("Failed to transition run to Started: {e}"))
+                    })?;
+                Ok((started, stored_key))
+            }
         }
     })?;
 
@@ -162,6 +168,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
         args.plan,
         applied.node_map,
         &args.partition_key,
+        stored_key.as_ref(),
         args.storage,
         &args.run_id,
         applied.resources,

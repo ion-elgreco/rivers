@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use rivers_core::storage::{AssetRecord, EventRecord, EventType, LogRecord, ScopedStorageHandle};
+use rivers_core::storage::{
+    AssetRecord, EventRecord, EventType, LogRecord, PartitionKey, ScopedStorageHandle,
+};
 pub(crate) use rivers_core::util::now_ts;
 
 use crate::executor::event_writer::EventWriter;
@@ -27,14 +29,14 @@ fn emit_step_event(
     event_type: EventType,
     metadata: Vec<(String, String)>,
     ts: i64,
-    partition_key: Option<&PyPartitionKey>,
+    partition_key: Option<PartitionKey>,
 ) {
     writer.emit(EventRecord {
         code_location_id: String::new(),
         event_type,
         asset_key: Some(step_name.to_string()),
         run_id: run_id.to_string(),
-        partition_key: partition_key.map(|k| k.into()),
+        partition_key,
         timestamp: ts,
         metadata,
         input_data_versions: vec![],
@@ -305,7 +307,7 @@ pub(crate) fn emit_partition_failure(
     writer: &EventWriter,
     run_id: &str,
     step_name: &str,
-    partition_key: &PyPartitionKey,
+    partition_key: PartitionKey,
     error: &str,
     ts: i64,
 ) {

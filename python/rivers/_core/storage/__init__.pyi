@@ -573,8 +573,19 @@ class Storage:
         node_names: list[str] = ...,
         action: str | None = None,
         config: dict[str, Any] | None = None,
+        partition_key: PartitionKey | None = None,
     ) -> None:
         """(Internal) create a run record directly — test helper."""
+        ...
+
+    def _stored_keys(self, run_id: str) -> tuple[str | None, list[tuple[str, str]]]:
+        """(Internal) the partition key of a run and of its keyed events, as storage holds them — test helper.
+
+        Returns:
+            The key of the run as text, and one ``(event_type, key)`` pair for
+            each event of the run that has a key. A span of time windows shows
+            as ``first..last``.
+        """
         ...
 
     def get_queued_runs(self) -> list[RunRecord]:

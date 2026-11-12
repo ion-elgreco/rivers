@@ -620,7 +620,6 @@ mod tests {
                     run_cr_uid: String::new(),
                     code_location_id: run.spec.code_location_ref.identity.clone(),
                     extra_env: cl.spec.env.clone(),
-                    partition_key: None,
                     workspace: Some(tree()),
                 },
                 "train",

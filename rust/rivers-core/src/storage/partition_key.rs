@@ -1,5 +1,9 @@
+use std::borrow::Cow;
+
 use anyhow::Result;
 use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
+
+use super::key_item::{self, KeyItem};
 
 /// Partition key stored alongside events and asset partition records.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -10,9 +14,81 @@ pub enum PartitionKey {
     Multi { dims: Vec<(String, Vec<String>)> },
     /// Explicit set of concrete keys (each member a single Single/Multi key, never nested).
     Set { keys: Vec<PartitionKey> },
+    /// `Single` whose values can be spans of time windows. The planner of a
+    /// backfill writes it, as the key of a run, and a rerun of that run
+    /// copies it; [`Self::expanded`] gives the `Single`.
+    SingleItems { items: Vec<KeyItem> },
+    /// `Multi` whose dimensions can hold spans of time windows.
+    MultiItems { dims: Vec<(String, Vec<KeyItem>)> },
+}
+
+/// The values of one dimension of a key, in order.
+#[derive(Clone, Copy)]
+enum Values<'a> {
+    Plain(&'a [String]),
+    Items(&'a [KeyItem]),
+}
+
+impl Values<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Plain(values) => values.len(),
+            Self::Items(items) => key_item::count(items),
+        }
+    }
+
+    /// The values from place `skip` on, at most `take` of them.
+    fn range(self, skip: usize, take: usize) -> Vec<String> {
+        match self {
+            Self::Plain(values) => values.iter().skip(skip).take(take).cloned().collect(),
+            Self::Items(items) => key_item::values(items, skip, take),
+        }
+    }
+
+    fn display(self) -> String {
+        match self {
+            Self::Plain(values) => values.join(","),
+            Self::Items(items) => key_item::display(items),
+        }
+    }
+}
+
+/// What a key holds: the values of its one dimension, the values of its
+/// named dimensions sorted by name, or other keys.
+enum Shape<'a> {
+    One(Values<'a>),
+    Named(Vec<(&'a str, Values<'a>)>),
+    Set(&'a [PartitionKey]),
+}
+
+/// `dims` sorted by name.
+fn by_name<T>(dims: &[(String, T)]) -> Vec<&(String, T)> {
+    let mut sorted: Vec<&(String, T)> = dims.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted
 }
 
 impl PartitionKey {
+    fn shape(&self) -> Shape<'_> {
+        match self {
+            Self::Single { keys } => Shape::One(Values::Plain(keys)),
+            Self::SingleItems { items } => Shape::One(Values::Items(items)),
+            Self::Multi { dims } => Shape::Named(
+                by_name(dims)
+                    .into_iter()
+                    .map(|(name, values)| (name.as_str(), Values::Plain(values)))
+                    .collect(),
+            ),
+            Self::MultiItems { dims } => Shape::Named(
+                by_name(dims)
+                    .into_iter()
+                    .map(|(name, items)| (name.as_str(), Values::Items(items)))
+                    .collect(),
+            ),
+            Self::Set { keys } => Shape::Set(keys),
+        }
+    }
+
     /// Expand a possibly-batched key into its individual single-valued members.
     pub fn members(&self) -> Vec<PartitionKey> {
         self.members_preview(usize::MAX)
@@ -20,13 +96,13 @@ impl PartitionKey {
 
     /// Number of members this key expands to, without building them.
     pub fn member_count(&self) -> usize {
-        match self {
-            Self::Single { keys } => keys.len(),
-            Self::Multi { dims } => dims
+        match self.shape() {
+            Shape::One(values) => values.len(),
+            Shape::Named(dims) => dims
                 .iter()
-                .map(|(_, vs)| vs.len())
+                .map(|(_, values)| values.len())
                 .fold(1usize, |a, n| a.saturating_mul(n)),
-            Self::Set { keys } => keys.iter().map(Self::member_count).sum(),
+            Shape::Set(keys) => keys.iter().map(Self::member_count).sum(),
         }
     }
 
@@ -35,26 +111,24 @@ impl PartitionKey {
         if limit == 0 {
             return Vec::new();
         }
-        match self {
-            Self::Single { keys } => keys
-                .iter()
-                .take(limit)
-                .map(|k| Self::Single {
-                    keys: vec![k.clone()],
-                })
+        match self.shape() {
+            Shape::One(values) => values
+                .range(0, limit)
+                .into_iter()
+                .map(|value| Self::Single { keys: vec![value] })
                 .collect(),
-            Self::Multi { dims } => {
-                let mut sorted = dims.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            Shape::Named(dims) => {
                 let mut combos: Vec<Vec<(String, Vec<String>)>> = vec![Vec::new()];
-                for (name, vals) in &sorted {
+                for (name, values) in dims {
+                    // The first `limit` members hold no value past that place.
+                    let values = values.range(0, limit);
                     combos = combos
                         .into_iter()
                         .flat_map(|combo| {
-                            vals.iter().map(move |v| {
-                                let mut c = combo.clone();
-                                c.push((name.clone(), vec![v.clone()]));
-                                c
+                            values.iter().map(move |value| {
+                                let mut combo = combo.clone();
+                                combo.push((name.to_string(), vec![value.clone()]));
+                                combo
                             })
                         })
                         .take(limit)
@@ -65,7 +139,7 @@ impl PartitionKey {
                     .map(|dims| Self::Multi { dims })
                     .collect()
             }
-            Self::Set { keys } => {
+            Shape::Set(keys) => {
                 let mut out = Vec::new();
                 for k in keys {
                     for m in k.members_preview(limit - out.len()) {
@@ -82,28 +156,28 @@ impl PartitionKey {
 
     /// The member at `index` in `members()` order, without the members before it.
     pub fn member_at(&self, index: usize) -> Option<PartitionKey> {
-        match self {
-            Self::Single { keys } => keys.get(index).map(|key| Self::Single {
-                keys: vec![key.clone()],
-            }),
-            Self::Multi { dims } => {
+        match self.shape() {
+            Shape::One(values) => values
+                .range(index, 1)
+                .pop()
+                .map(|value| Self::Single { keys: vec![value] }),
+            Shape::Named(dims) => {
                 if index >= self.member_count() {
                     return None;
                 }
-                let mut sorted: Vec<&(String, Vec<String>)> = dims.iter().collect();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
                 // The last dimension changes with each member.
                 let mut rest = index;
-                let mut member: Vec<(String, Vec<String>)> = Vec::with_capacity(sorted.len());
-                for (name, values) in sorted.into_iter().rev() {
-                    member.push((name.clone(), vec![values[rest % values.len()].clone()]));
-                    rest /= values.len();
+                let mut member: Vec<(String, Vec<String>)> = Vec::with_capacity(dims.len());
+                for (name, values) in dims.into_iter().rev() {
+                    let len = values.len();
+                    member.push((name.to_string(), values.range(rest % len, 1)));
+                    rest /= len;
                 }
                 member.reverse();
                 Some(Self::Multi { dims: member })
             }
-            Self::Set { keys } => {
+            Shape::Set(keys) => {
                 let mut rest = index;
                 for key in keys {
                     let count = key.member_count();
@@ -117,20 +191,46 @@ impl PartitionKey {
         }
     }
 
-    /// Canonical key-as-string encoding for display and string matching.
-    pub fn to_display(&self) -> String {
+    /// The key with each span written out as its values: a `Single`, a
+    /// `Multi`, or a `Set` of those. A key without spans is not copied.
+    pub fn expanded(&self) -> Cow<'_, PartitionKey> {
         match self {
-            Self::Single { keys } => keys.join(","),
-            Self::Multi { dims } => {
-                let mut sorted = dims.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                sorted
+            Self::SingleItems { items } => Cow::Owned(Self::Single {
+                keys: key_item::values(items, 0, usize::MAX),
+            }),
+            Self::MultiItems { dims } => Cow::Owned(Self::Multi {
+                dims: dims
                     .iter()
-                    .map(|(dim, vals)| format!("{}={}", dim, vals.join(",")))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            }
-            Self::Set { keys } => keys
+                    .map(|(name, items)| (name.clone(), key_item::values(items, 0, usize::MAX)))
+                    .collect(),
+            }),
+            Self::Set { keys } if keys.iter().any(Self::has_items) => Cow::Owned(Self::Set {
+                keys: keys.iter().map(|key| key.expanded().into_owned()).collect(),
+            }),
+            Self::Single { .. } | Self::Multi { .. } | Self::Set { .. } => Cow::Borrowed(self),
+        }
+    }
+
+    /// Whether the key, or a key that it holds, is written with items.
+    fn has_items(&self) -> bool {
+        match self {
+            Self::SingleItems { .. } | Self::MultiItems { .. } => true,
+            Self::Set { keys } => keys.iter().any(Self::has_items),
+            Self::Single { .. } | Self::Multi { .. } => false,
+        }
+    }
+
+    /// Canonical key-as-string encoding for display and string matching. A
+    /// span shows as `first..last`.
+    pub fn to_display(&self) -> String {
+        match self.shape() {
+            Shape::One(values) => values.display(),
+            Shape::Named(dims) => dims
+                .iter()
+                .map(|(name, values)| format!("{name}={}", values.display()))
+                .collect::<Vec<_>>()
+                .join("|"),
+            Shape::Set(keys) => keys
                 .iter()
                 .map(|k| k.to_display())
                 .collect::<Vec<_>>()
@@ -172,7 +272,8 @@ impl PartitionKey {
         out
     }
 
-    /// Serialize to JSON for CLI args / K8s CRD fields.
+    /// Serialize to JSON for CLI args / K8s CRD fields. The JSON has no form
+    /// for a span: a key with spans gives the JSON of its expanded key.
     pub fn to_json(&self) -> String {
         match self {
             Self::Single { keys } => serde_json::json!({"single": keys}).to_string(),
@@ -188,6 +289,7 @@ impl PartitionKey {
                     .collect();
                 serde_json::json!({ "set": members }).to_string()
             }
+            Self::SingleItems { .. } | Self::MultiItems { .. } => self.expanded().to_json(),
         }
     }
 
@@ -225,17 +327,12 @@ impl PartialEq for PartitionKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Single { keys: a }, Self::Single { keys: b }) => a == b,
-            (Self::Multi { dims: a }, Self::Multi { dims: b }) => {
-                if a.len() != b.len() {
-                    return false;
-                }
-                let mut a_sorted = a.clone();
-                let mut b_sorted = b.clone();
-                a_sorted.sort_by(|x, y| x.0.cmp(&y.0));
-                b_sorted.sort_by(|x, y| x.0.cmp(&y.0));
-                a_sorted == b_sorted
-            }
+            (Self::Multi { dims: a }, Self::Multi { dims: b }) => by_name(a) == by_name(b),
             (Self::Set { keys: a }, Self::Set { keys: b }) => a == b,
+            (Self::SingleItems { items: a }, Self::SingleItems { items: b }) => a == b,
+            (Self::MultiItems { dims: a }, Self::MultiItems { dims: b }) => {
+                by_name(a) == by_name(b)
+            }
             _ => false,
         }
     }
@@ -248,12 +345,10 @@ impl std::hash::Hash for PartitionKey {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Single { keys } => keys.hash(state),
-            Self::Multi { dims } => {
-                let mut sorted = dims.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                sorted.hash(state);
-            }
+            Self::Multi { dims } => by_name(dims).hash(state),
             Self::Set { keys } => keys.hash(state),
+            Self::SingleItems { items } => items.hash(state),
+            Self::MultiItems { dims } => by_name(dims).hash(state),
         }
     }
 }
@@ -278,6 +373,18 @@ impl SurrealValue for PartitionKey {
             Self::Set { keys } => {
                 map.insert("variant".to_string(), "Set".to_string().into_value());
                 map.insert("keys".to_string(), keys.into_value());
+            }
+            Self::SingleItems { items } => {
+                map.insert(
+                    "variant".to_string(),
+                    "SingleItems".to_string().into_value(),
+                );
+                map.insert("items".to_string(), items.into_value());
+            }
+            Self::MultiItems { mut dims } => {
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
+                map.insert("variant".to_string(), "MultiItems".to_string().into_value());
+                map.insert("dims".to_string(), dims.into_value());
             }
         }
         Value::Object(map.into())
@@ -318,6 +425,22 @@ impl SurrealValue for PartitionKey {
                     .unwrap_or_default();
                 Ok(Self::Set { keys })
             }
+            "SingleItems" => {
+                let items = map
+                    .get("items")
+                    .map(|v| Vec::<KeyItem>::from_value(v.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(Self::SingleItems { items })
+            }
+            "MultiItems" => {
+                let dims = map
+                    .get("dims")
+                    .map(|v| Vec::<(String, Vec<KeyItem>)>::from_value(v.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(Self::MultiItems { dims })
+            }
             _ => Err(SurrealError::internal(format!(
                 "unknown PartitionKey variant: {variant}"
             ))),
@@ -326,95 +449,4 @@ impl SurrealValue for PartitionKey {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::PartitionKey;
-
-    #[test]
-    fn single_displays_bare_value() {
-        let pk = PartitionKey::Single {
-            keys: vec!["2024-01-01".into()],
-        };
-        assert_eq!(pk.to_display(), "2024-01-01");
-    }
-
-    #[test]
-    fn batched_single_joins_values_with_comma() {
-        let pk = PartitionKey::Single {
-            keys: vec!["a".into(), "b".into()],
-        };
-        assert_eq!(pk.to_display(), "a,b");
-    }
-
-    #[test]
-    fn multi_sorts_dims_and_pipe_joins() {
-        let pk = PartitionKey::Multi {
-            dims: vec![
-                ("region".into(), vec!["us".into(), "eu".into()]),
-                ("date".into(), vec!["2024-01-01".into()]),
-            ],
-        };
-        assert_eq!(pk.to_display(), "date=2024-01-01|region=us,eu");
-    }
-
-    #[test]
-    fn member_at_follows_the_order_of_members() {
-        let multi = PartitionKey::Multi {
-            dims: vec![
-                ("region".into(), vec!["us".into(), "eu".into()]),
-                ("date".into(), vec!["d1".into(), "d2".into(), "d3".into()]),
-                ("kind".into(), vec!["a".into()]),
-            ],
-        };
-        let keys = [
-            PartitionKey::Single {
-                keys: vec!["a".into(), "b".into(), "c".into()],
-            },
-            multi.clone(),
-            PartitionKey::Multi { dims: vec![] },
-            PartitionKey::Set {
-                keys: vec![
-                    PartitionKey::Single {
-                        keys: vec!["x".into(), "y".into()],
-                    },
-                    multi,
-                ],
-            },
-        ];
-
-        for key in keys {
-            let members = key.members();
-            for (index, member) in members.iter().enumerate() {
-                let at = key.member_at(index).expect("a member at each index");
-                assert_eq!(&at, member, "{} at {index}", key.to_display());
-                assert_eq!(at.to_json(), member.to_json(), "same dimension order");
-            }
-            assert_eq!(key.member_at(members.len()), None);
-        }
-    }
-
-    #[test]
-    fn member_at_of_a_dimension_with_no_values_is_none() {
-        let key = PartitionKey::Multi {
-            dims: vec![
-                ("date".into(), vec![]),
-                ("region".into(), vec!["us".into()]),
-            ],
-        };
-        assert_eq!(key.member_at(0), None);
-    }
-
-    #[test]
-    fn set_joins_member_displays() {
-        let pk = PartitionKey::Set {
-            keys: vec![
-                PartitionKey::Single {
-                    keys: vec!["a".into()],
-                },
-                PartitionKey::Multi {
-                    dims: vec![("d".into(), vec!["x".into()])],
-                },
-            ],
-        };
-        assert_eq!(pk.to_display(), "a, d=x");
-    }
-}
+mod tests;

@@ -17,6 +17,17 @@ from rivers.cli._common import (
 )
 
 
+def _run_partition_key(raw: str | None, record):
+    """The partition key of the run of a pod.
+
+    The run record names the partitions. A key in the arguments is used in
+    its place: the Run object of an older code location holds one.
+    """
+    if raw is not None:
+        return _parse_partition_key(raw)
+    return record.partition_key
+
+
 @app.command()
 def execute(
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
@@ -35,7 +46,9 @@ def execute(
         help="Job name to execute — runs the actual job so job-level config "
         "(retry, executor) applies; takes precedence over --target",
     ),
-    partition_key: str | None = typer.Option(None, help="Partition key to materialize"),
+    partition_key: str | None = typer.Option(
+        None, help="Partition key (default: the key of the run record)"
+    ),
     resume: bool = typer.Option(
         False, help="Resume a crashed run, skipping completed steps"
     ),
@@ -65,7 +78,6 @@ def execute(
 
     repo_obj.resolve(storage=storage)
 
-    pk = _parse_partition_key(partition_key)
     selection = [a.strip() for a in target.split(",")] if target else None
 
     # The run record is the only place the verb lives; without the record
@@ -77,6 +89,7 @@ def execute(
         raise typer.Exit(1)
     action = record.action
     config = record.config
+    pk = _run_partition_key(partition_key, record)
 
     try:
         if job:
@@ -161,7 +174,9 @@ def execute_step(
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
     ),
-    partition_key: str | None = typer.Option(None, help="Partition key"),
+    partition_key: str | None = typer.Option(
+        None, help="Partition key (default: the key of the run record)"
+    ),
     mapping_key: str | None = typer.Option(
         None, help="Mapping key for mapped step instances"
     ),
@@ -195,8 +210,6 @@ def execute_step(
 
     repo_obj.resolve(storage=storage)
 
-    pk = _parse_partition_key(partition_key)
-
     if mapping_key:
         os.environ["RIVERS_MAPPING_KEY"] = mapping_key
 
@@ -205,6 +218,7 @@ def execute_step(
     if record is None:
         typer.echo(f"Error: no run record for '{run_id}' — cannot execute", err=True)
         raise typer.Exit(1)
+    pk = _run_partition_key(partition_key, record)
 
     name = ", ".join(step_key)
     label = f"{name}[{mapping_key}]" if mapping_key else name

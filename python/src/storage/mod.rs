@@ -885,7 +885,7 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None, partition_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
@@ -900,6 +900,7 @@ impl PyStorage {
         node_names: Vec<String>,
         action: Option<String>,
         config: Option<Py<PyAny>>,
+        partition_key: Option<PyPartitionKey>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
         let config = crate::config::run_config::run_config_to_json(py, config.as_ref())?;
@@ -917,7 +918,7 @@ impl PyStorage {
             tags,
             node_names,
             priority,
-            partition_key: None,
+            partition_key: partition_key.as_ref().map(Into::into),
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
             action,
@@ -926,6 +927,39 @@ impl PyStorage {
         py.detach(|| {
             io_rt()
                 .block_on(self.backend().create_run(&record))
+                .map_err(to_py_err)
+        })
+    }
+
+    /// The partition key of a run, and of each of its events that has one
+    /// (with the event type), as text in the form that storage holds: a span
+    /// of time windows shows as `first..last` (test helper). Not part of the
+    /// public API.
+    #[pyo3(name = "_stored_keys")]
+    #[allow(clippy::type_complexity)]
+    fn stored_keys(
+        &self,
+        py: Python<'_>,
+        run_id: &str,
+    ) -> PyResult<(Option<String>, Vec<(String, String)>)> {
+        py.detach(|| {
+            io_rt()
+                .block_on(async {
+                    let run = self.backend().get_run(run_id).await?;
+                    let events = self.backend().get_events_for_run(run_id).await?;
+
+                    let run_key = run
+                        .and_then(|run| run.partition_key)
+                        .map(|key| key.to_display());
+                    let event_keys = events
+                        .into_iter()
+                        .filter_map(|event| {
+                            let key = event.partition_key?.to_display();
+                            Some((event.event_type.type_name().to_string(), key))
+                        })
+                        .collect();
+                    anyhow::Ok((run_key, event_keys))
+                })
                 .map_err(to_py_err)
         })
     }

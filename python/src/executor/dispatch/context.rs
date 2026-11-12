@@ -27,6 +27,9 @@ use super::super::{GraphNodeMap, in_step_pod};
 pub(crate) struct RunScope<'a> {
     pub run_id: &'a str,
     pub partition_key: &'a Option<PyPartitionKey>,
+    /// The key that the run record holds, when the record came first. A key
+    /// in the arguments of a pod can differ from it.
+    pub stored_key: Option<&'a rivers_core::storage::PartitionKey>,
     pub plan: &'a ExecutionPlan,
     /// Steps already completed before this batch (resume case). Read-only.
     pub completed_steps: &'a HashSet<String>,
@@ -330,9 +333,10 @@ impl<'a> BatchContext<'a> {
     }
 
     /// A failed partitioned step materialized none of its partitions, so record
-    /// them all with one StepFailure carrying the whole key (a `Set` for a batched
-    /// run); `get_failed_partitions` expands it. The None-keyed step-level failure
-    /// (emitted separately) still drives run/step status.
+    /// them all with one StepFailure carrying the whole key, in the form of
+    /// the run record when the record holds this key; `get_failed_partitions`
+    /// expands it. The None-keyed step-level failure (emitted separately)
+    /// still drives run/step status.
     ///
     /// Action runs are skipped because the run record already says every member
     /// failed — backfill accounting reads `RunStatus::Failure` directly and never
@@ -346,11 +350,15 @@ impl<'a> BatchContext<'a> {
             return;
         }
         if let Some(pk) = self.scope.partition_key {
+            let key = match self.scope.stored_key {
+                Some(stored) if PyPartitionKey::from(stored) == *pk => stored.clone(),
+                _ => pk.into(),
+            };
             ops::emit_partition_failure(
                 self.sink.writer,
                 self.scope.run_id,
                 step_name,
-                pk,
+                key,
                 error,
                 ts,
             );
@@ -492,7 +500,7 @@ impl<'a> BatchContext<'a> {
                         self.sink.writer,
                         self.scope.run_id,
                         step_name,
-                        member,
+                        member.into(),
                         error,
                         ts,
                     );
