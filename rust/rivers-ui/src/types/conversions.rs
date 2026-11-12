@@ -402,14 +402,10 @@ impl From<rivers_core::storage::BackfillRecord> for BackfillInfo {
             strategy_code,
             job_name: b.job_name,
             asset_selection: b.asset_selection,
-            total_partitions: b
-                .partition_keys
-                .iter()
-                .map(|pk| pk.member_count())
-                .sum::<usize>() as u32,
-            completed_partitions: b.completed_partitions.len() as u32,
-            failed_partitions: b.failed_partitions.len() as u32,
-            canceled_partitions: b.canceled_partitions.len() as u32,
+            total_partitions: b.num_partitions,
+            completed_partitions: b.completed_partitions,
+            failed_partitions: b.failed_partitions,
+            canceled_partitions: b.canceled_partitions,
             max_concurrency: b.max_concurrency as u32,
             run_ids: b.run_ids,
             tags: b.tags,
@@ -584,13 +580,12 @@ mod tests {
             failure_policy: rivers_core::storage::BackfillFailurePolicy::Continue,
             asset_selection: vec!["orders".into()],
             job_name: None,
-            partition_keys: vec![rivers_core::storage::PartitionKey::Single {
-                keys: vec!["p1".into()],
-            }],
+            num_partitions: 5,
+            planned_runs: 5,
             run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
+            completed_partitions: 3,
+            failed_partitions: 1,
+            canceled_partitions: 0,
             max_concurrency: 4,
             tags: vec![],
             create_time: 0,
@@ -602,6 +597,15 @@ mod tests {
         };
         let ui: BackfillInfo = core.into();
         assert_eq!(ui.action.as_deref(), Some("purge"));
+        assert_eq!(
+            (
+                ui.total_partitions,
+                ui.completed_partitions,
+                ui.failed_partitions,
+                ui.canceled_partitions
+            ),
+            (5, 3, 1, 0)
+        );
     }
 
     /// Run-list partition labels must use the same canonical `dim=v|dim=v`

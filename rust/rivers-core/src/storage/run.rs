@@ -261,7 +261,10 @@ pub struct CoordinatorRunInfo {
     pub job_name: Option<String>,
     #[serde(default)]
     pub priority: i32,
+    /// Set for a run that is launched. The poll over the queue does not read
+    /// it: a key can name thousands of partitions.
     #[serde(default)]
+    #[surreal(default)]
     pub partition_key: Option<PartitionKey>,
     #[serde(default)]
     pub start_time: i64,

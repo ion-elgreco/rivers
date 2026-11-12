@@ -80,6 +80,7 @@ fn resolve_remote_config(
         namespace,
         database,
         credentials: None,
+        max_message_size: None,
     };
     if let (Some(u), Some(p)) = (username, password) {
         config = config.with_credentials(u, p);
@@ -308,9 +309,10 @@ impl PyStorage {
     /// credentials (matching `DEFINE USER ... ON DATABASE`); when either
     /// is missing on both kwarg AND env, the connection is unauthenticated
     /// (`--unauthenticated` SurrealDB). `namespace` / `database` default to
-    /// `"rivers"` / `"main"`.
+    /// `"rivers"` / `"main"`. `max_message_size` is the largest message, in
+    /// bytes, that the connection sends or accepts (default 64 MiB).
     #[staticmethod]
-    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None))]
+    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None, max_message_size=None))]
     fn connect(
         py: Python<'_>,
         endpoint: &str,
@@ -318,14 +320,16 @@ impl PyStorage {
         password: Option<String>,
         namespace: Option<String>,
         database: Option<String>,
+        max_message_size: Option<usize>,
     ) -> PyResult<Self> {
         // Whole body runs detached: env-var resolution + config building touch
         // nothing Python, and the GIL must stay released across `block_on` to
         // avoid the daemon-task deadlock (see `Self::embedded`).
         let endpoint_owned = endpoint.to_string();
         let (storage, authenticated) = py.detach(|| -> PyResult<_> {
-            let (config, authenticated) =
+            let (mut config, authenticated) =
                 resolve_remote_config(endpoint_owned, username, password, namespace, database);
+            config.max_message_size = max_message_size;
             let storage = io_rt()
                 .block_on(SurrealStorage::connect(config))
                 .map_err(to_py_err)?;
@@ -957,14 +961,12 @@ impl PyStorage {
             failure_policy: BackfillFailurePolicy::Continue,
             asset_selection,
             job_name: None,
-            partition_keys: partition_keys
-                .into_iter()
-                .map(|k| PartitionKey::Single { keys: vec![k] })
-                .collect(),
+            num_partitions: 0,
+            planned_runs: 0,
             run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
+            completed_partitions: 0,
+            failed_partitions: 0,
+            canceled_partitions: 0,
             max_concurrency: 4,
             tags: vec![],
             create_time,
@@ -974,9 +976,13 @@ impl PyStorage {
             action: None,
             config: None,
         };
+        let partition_keys: Vec<PartitionKey> = partition_keys
+            .into_iter()
+            .map(|k| PartitionKey::Single { keys: vec![k] })
+            .collect();
         py.detach(|| {
             io_rt()
-                .block_on(self.backend().create_backfill(&record))
+                .block_on(self.backend().create_backfill(&record, &partition_keys))
                 .map_err(to_py_err)
         })
     }

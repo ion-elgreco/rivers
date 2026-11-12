@@ -46,18 +46,6 @@ pub async fn get_run(run_id: String) -> Result<Option<RunRecord>, ServerFnError>
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-#[server]
-pub async fn get_runs_by_ids(run_ids: Vec<String>) -> Result<Vec<RunRecord>, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-    let state = expect_context::<crate::state::AppState>();
-    state
-        .storage
-        .get_runs_by_ids(&run_ids, None)
-        .await
-        .map(|runs| runs.into_iter().map(Into::into).collect())
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
 /// Step events for a run — backs the timeline/DAG.
 #[server]
 pub async fn get_run_step_events(run_id: String) -> Result<Vec<StoredEvent>, ServerFnError> {

@@ -37,6 +37,11 @@ def backfill(
         "continue", "--on-failure", help="continue or stop_on_failure"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without executing"),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help="Record the backfill and return; the daemon of the code location runs it",
+    ),
     action: str | None = typer.Option(
         None, "--action", help="Run this verb instead of materializing"
     ),
@@ -54,6 +59,17 @@ def backfill(
 ) -> None:
     """Backfill partitions for selected assets."""
     from rivers import PartitionKey, PartitionKeyRange
+
+    kept_store = surreal_endpoint is not None or (
+        storage_path is not None and not memory
+    )
+    if detach and not dry_run and not kept_store:
+        typer.echo(
+            "Error: --detach leaves the backfill to a daemon; pass "
+            "--surreal-endpoint or --storage-path, the store that daemon reads",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     repo_obj = _load_repo(
         module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
@@ -97,7 +113,7 @@ def backfill(
         strategy=resolved_strategy,
         failure_policy=on_failure,
         max_concurrency=concurrency,
-        block=True,
+        block=not detach,
         dry_run=dry_run,
         action=action,
     )
@@ -105,6 +121,11 @@ def backfill(
     if dry_run:
         typer.echo(
             f"Dry run: {result.num_partitions} partitions, {result.num_runs} runs"
+        )
+    elif detach:
+        typer.echo(
+            f"Backfill {result.backfill_id}: {result.status} — "
+            f"{result.num_partitions} partitions, {result.num_runs} runs"
         )
     else:
         typer.echo(

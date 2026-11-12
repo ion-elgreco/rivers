@@ -13,7 +13,7 @@ use rivers_core::util::parse_key_datetime;
 use crate::errors::{ExecutionError, PartitionDefinitionError};
 
 use super::PyPartitionKey;
-use super::definition::{PartitionsDefinition, cartesian_product};
+use super::definition::PartitionsDefinition;
 
 /// Def-aware `[from, to]` membership for one single-dimension key value:
 /// positional for Static (keys aren't necessarily lexicographic),
@@ -328,23 +328,20 @@ impl PyPartitionKeyRange {
         }
     }
 
-    /// Resolve this range into concrete partition keys using the given
-    /// definition's ordering (positional for Static, chronological for
-    /// TimeWindow — see [`resolve_single_dim_range`]).
-    pub fn resolve(&self, parts_def: &PartitionsDefinition) -> PyResult<Vec<PyPartitionKey>> {
+    /// Resolve this range into one batched key that holds every partition of
+    /// the range, using the given definition's ordering (positional for
+    /// Static, chronological for TimeWindow — see [`resolve_single_dim_range`]).
+    pub fn resolve(&self, parts_def: &PartitionsDefinition) -> PyResult<PyPartitionKey> {
         match &self.inner {
             PartitionKeyRangeInner::Single { from_key, to_key } => {
-                let filtered: Vec<PyPartitionKey> =
-                    resolve_single_dim_range(parts_def, from_key, to_key, None)?
-                        .into_iter()
-                        .map(|k| PyPartitionKey::Single { key: vec![k] })
-                        .collect();
-                if filtered.is_empty() {
+                let mut key = resolve_single_dim_range(parts_def, from_key, to_key, None)?;
+                if key.is_empty() {
                     return Err(ExecutionError::new_err(format!(
                         "No partition keys found in range [{from_key}, {to_key}]"
                     )));
                 }
-                Ok(filtered)
+                key.sort();
+                Ok(PyPartitionKey::Single { key })
             }
             PartitionKeyRangeInner::Multi {
                 dimensions: dim_selections,
@@ -369,9 +366,9 @@ impl PyPartitionKeyRange {
                     )));
                 }
 
-                let mut resolved_dims: Vec<(String, Vec<String>)> = Vec::new();
+                let mut resolved_dims: HashMap<String, Vec<String>> = HashMap::new();
                 for (dim_name, dim_def) in dim_defs {
-                    let dim_keys = if let Some(sel) = dim_selections.get(dim_name) {
+                    let mut dim_keys = if let Some(sel) = dim_selections.get(dim_name) {
                         match sel {
                             DimensionSelection::Range { from_key, to_key } => {
                                 let keys = resolve_single_dim_range(
@@ -405,24 +402,18 @@ impl PyPartitionKeyRange {
                         // Omitted dimension: include all keys
                         dim_def.enumerate_single_dim_keys()?
                     };
-                    resolved_dims.push((dim_name.clone(), dim_keys));
+                    if dim_keys.is_empty() {
+                        return Err(ExecutionError::new_err(
+                            "Partition range resolved to zero keys",
+                        ));
+                    }
+                    dim_keys.sort();
+                    resolved_dims.insert(dim_name.clone(), dim_keys);
                 }
 
-                let combos = cartesian_product(&resolved_dims);
-                if combos.is_empty() {
-                    return Err(ExecutionError::new_err(
-                        "Partition range resolved to zero keys",
-                    ));
-                }
-                Ok(combos
-                    .into_iter()
-                    .map(|dim_map| PyPartitionKey::Multi {
-                        keys: dim_map
-                            .into_iter()
-                            .map(|(name, val)| (name, vec![val]))
-                            .collect(),
-                    })
-                    .collect())
+                Ok(PyPartitionKey::Multi {
+                    keys: resolved_dims,
+                })
             }
         }
     }

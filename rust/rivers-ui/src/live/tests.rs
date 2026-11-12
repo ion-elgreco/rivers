@@ -548,11 +548,12 @@ async fn every_channel_delivers_sse_events_over_http() {
                     failure_policy: BackfillFailurePolicy::Continue,
                     asset_selection: vec!["sse_asset".into()],
                     job_name: None,
-                    partition_keys: vec![],
+                    num_partitions: 0,
+                    planned_runs: 0,
                     run_ids: vec![],
-                    completed_partitions: vec![],
-                    failed_partitions: vec![],
-                    canceled_partitions: vec![],
+                    completed_partitions: 0,
+                    failed_partitions: 0,
+                    canceled_partitions: 0,
                     max_concurrency: 1,
                     tags: vec![],
                     create_time: 1,
@@ -562,7 +563,10 @@ async fn every_channel_delivers_sse_events_over_http() {
                     action: None,
                     config: None,
                 };
-                storage.create_backfill(&bf).await.expect("create_backfill");
+                storage
+                    .create_backfill(&bf, &[])
+                    .await
+                    .expect("create_backfill");
             },
             &["event: backfills-changed"],
         )

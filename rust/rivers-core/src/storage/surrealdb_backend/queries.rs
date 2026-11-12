@@ -123,22 +123,109 @@ pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
          }; \
      }";
 
-/// The requested keys, linked runs and settled keys of the backfills `$ids`.
-/// `IN` on the leading index column is one index scan per id.
+/// One page of an asset's events of the types `$types`, newest first. The
+/// events are read in time order off `idx_events_loc_asset_ts` until the page
+/// is full: few reads when most events of the asset have one of the types.
+pub(super) const ASSET_EVENTS_PAGE: &str = "\
+     SELECT * FROM events \
+     WHERE code_location_id = $cl AND asset_key = $ak AND event_type IN $types \
+     ORDER BY timestamp DESC, sort_order DESC, id DESC LIMIT $limit START $offset";
+
+/// The same page for one type that few events of the asset have. In time
+/// order the engine reads every event of the asset to find them. This reads
+/// the events of the type only, then sorts them.
+pub(super) const ASSET_EVENTS_PAGE_OF_RARE_TYPE: &str = "\
+     SELECT * FROM events WITH INDEX idx_events_loc_asset_type \
+     WHERE code_location_id = $cl AND asset_key = $ak AND event_type = $type \
+     ORDER BY timestamp DESC, sort_order DESC, id DESC LIMIT $limit START $offset";
+
+/// How many events of the type `$type` an asset has, counted on
+/// `idx_events_loc_asset_type`. A count over a list of types reads every
+/// event of the asset.
+pub(super) const COUNT_ASSET_EVENTS_OF_TYPE: &str = "\
+     SELECT count() AS total FROM events \
+     WHERE code_location_id = $cl AND asset_key = $ak AND event_type = $type GROUP ALL";
+
+/// The materialization time and last run of the partition `$partition` of an
+/// asset. Read by key through
+/// [`SurrealStorage::select_by_partitions`](super::SurrealStorage).
+pub(super) const PARTITION_TIMESTAMPS_OF_KEY: &str = "\
+     SELECT partition_key, last_timestamp, last_run_id FROM asset_partitions \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key = $partition AND last_timestamp IS NOT NONE";
+
+/// The linked runs and the counts per outcome of the backfills `$ids`. `IN` on
+/// the leading index column is one index scan per id. The last statement
+/// counts the rows per partition of a backfill that ended before V14.
 pub(super) const LOAD_BACKFILL_PROGRESS: &str = "\
-     SELECT backfill_id, partition_keys FROM backfill_keys WHERE backfill_id IN $ids; \
      SELECT backfill_id, run_id, linked_at FROM backfill_runs \
          WHERE backfill_id IN $ids ORDER BY linked_at; \
-     SELECT backfill_id, partition_key, outcome FROM backfill_outcomes WHERE backfill_id IN $ids;";
+     SELECT backfill_id, outcome, math::sum(member_count) AS members, \
+         math::sum(failed_members) AS failed_members FROM backfill_run_outcomes \
+         WHERE backfill_id IN $ids GROUP BY backfill_id, outcome; \
+     SELECT backfill_id, outcome, count() AS members FROM backfill_outcomes \
+         WHERE backfill_id IN $ids GROUP BY backfill_id, outcome;";
 
 /// The `backfills` columns kept in their own tables (see [`LOAD_BACKFILL_PROGRESS`]).
-pub(super) const BACKFILL_PROGRESS_COLUMNS: &str = "['partition_keys', 'run_ids', \
-     'completed_partitions', 'failed_partitions', 'canceled_partitions']";
+pub(super) const BACKFILL_PROGRESS_COLUMNS: &str =
+    "['run_ids', 'completed_partitions', 'failed_partitions', 'canceled_partitions']";
 
 /// Link `$links` (`BackfillRunRow`s) to their backfill; a link that exists keeps its place.
 pub(super) const LINK_BACKFILL_RUNS: &str =
     "INSERT INTO backfill_runs $links ON DUPLICATE KEY UPDATE linked_at = linked_at";
 
-/// Record `$outcomes` (`BackfillOutcomeRow`s); a key settled again takes the new outcome.
-pub(super) const RECORD_BACKFILL_OUTCOMES: &str =
-    "INSERT INTO backfill_outcomes $outcomes ON DUPLICATE KEY UPDATE outcome = $input.outcome";
+/// Record `$outcomes` (`BackfillRunOutcomeRow`s) of planned runs that ended
+/// before they started; a planned run that has an outcome keeps it.
+pub(super) const RECORD_UNSTARTED_BACKFILL_RUNS: &str =
+    "INSERT INTO backfill_run_outcomes $outcomes ON DUPLICATE KEY UPDATE outcome = outcome";
+
+/// Inside the transaction that writes the final status of one run: record
+/// the outcome of the run when a backfill planned it. `$final` holds the
+/// updated row (`run_id`, `status`, `launched_by`), or no row. One
+/// transaction, so the count of outcome rows tells when a backfill is
+/// complete. A run settled again takes the new outcome. A successful run
+/// counts the partitions it failed one by one: the distinct keys of its keyed
+/// `StepFailure` events.
+///
+/// No `FOR` loop: the engine runs the statements of a loop several times slower.
+pub(super) const RECORD_BACKFILL_RUN_OUTCOME: &str = "\
+     LET $run = $final[0]; \
+     LET $link = IF $run.launched_by.kind = 'backfill' \
+             AND $run.status IN ['Success', 'Failure', 'Canceled'] { \
+         (SELECT run_number, member_count FROM backfill_runs \
+             WHERE backfill_id = $run.launched_by.backfill_id AND run_id = $run.run_id)[0] \
+     } ELSE { NONE }; \
+     LET $members = $link.member_count ?? 0; \
+     LET $failed_members = IF $link.run_number != NONE AND $run.status = 'Success' { \
+         math::min([$members, array::len(array::distinct( \
+             SELECT VALUE partition_key FROM events WHERE run_id = $run.run_id \
+             AND event_type = 'StepFailure' AND partition_key IS NOT NONE))]) \
+     } ELSE { 0 }; \
+     INSERT INTO backfill_run_outcomes (IF $link.run_number != NONE { [{ \
+         backfill_id: $run.launched_by.backfill_id, \
+         run_number: $link.run_number, \
+         outcome: IF $run.status = 'Success' { 'Completed' } \
+             ELSE IF $run.status = 'Failure' { 'Failed' } ELSE { 'Canceled' }, \
+         member_count: $members, \
+         failed_members: $failed_members \
+     }] } ELSE { [] }) ON DUPLICATE KEY UPDATE outcome = $input.outcome, \
+         member_count = $input.member_count, failed_members = $input.failed_members;";
+
+/// One transaction: set the final status of the `InProgress` backfill `$id`
+/// when each of its planned runs has an outcome. The last statement returns
+/// the new status, or NONE.
+pub(super) const COMPLETE_BACKFILL: &str = "\
+     BEGIN TRANSACTION; \
+     LET $backfill = (SELECT status, planned_runs FROM backfills WHERE backfill_id = $id)[0]; \
+     LET $outcomes = (SELECT outcome, count() AS runs, math::sum(failed_members) AS failed_members \
+         FROM backfill_run_outcomes WHERE backfill_id = $id GROUP BY outcome); \
+     LET $status = IF $outcomes[WHERE outcome = 'Failed' OR failed_members > 0] != [] { 'CompletedFailed' } \
+         ELSE IF $outcomes[WHERE outcome = 'Canceled'] != [] { 'Canceled' } \
+         ELSE { 'CompletedSuccess' }; \
+     LET $completed = IF $backfill.status = 'InProgress' AND $backfill.planned_runs > 0 \
+             AND math::sum($outcomes.runs) >= $backfill.planned_runs { \
+         UPDATE backfills SET status = $status, end_time = $now \
+             WHERE backfill_id = $id AND status = 'InProgress' RETURN status \
+     } ELSE { [] }; \
+     COMMIT TRANSACTION; \
+     RETURN $completed[0].status;";

@@ -1,6 +1,6 @@
 use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
 
-use super::{LaunchedBy, PartitionKey, default_code_location_id};
+use super::{LaunchedBy, default_code_location_id};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BackfillStatus {
@@ -165,6 +165,60 @@ pub struct BackfillsSummary {
     pub canceled: u64,
 }
 
+/// How a planned run of a backfill ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillRunOutcome {
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl BackfillRunOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+
+    pub fn parse(outcome: &str) -> anyhow::Result<Self> {
+        match outcome {
+            "Completed" => Ok(Self::Completed),
+            "Failed" => Ok(Self::Failed),
+            "Canceled" => Ok(Self::Canceled),
+            other => anyhow::bail!("unknown backfill outcome '{other}'"),
+        }
+    }
+}
+
+/// A planned run of a backfill that ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedBackfillRun {
+    /// Place of the run in the plan.
+    pub run_number: usize,
+    /// The linked run. `None` when the run was not linked before it ended.
+    pub run_id: Option<String>,
+    pub outcome: BackfillRunOutcome,
+    /// Partitions the run holds.
+    pub member_count: usize,
+    /// Partitions that failed alone inside a run that succeeded.
+    pub failed_members: usize,
+}
+
+/// A planned run of a backfill that ended before it started: canceled before
+/// its launch, or a launch that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnstartedBackfillRun {
+    /// Place of the run in the plan.
+    pub run_number: usize,
+    /// Partitions the run holds.
+    pub member_count: usize,
+    pub outcome: BackfillRunOutcome,
+}
+
+/// A backfill without its requested keys: those are read with
+/// `get_backfill_keys`, by the callers that need them.
 #[derive(Debug, Clone, PartialEq, SurrealValue, serde::Serialize, serde::Deserialize)]
 pub struct BackfillRecord {
     pub backfill_id: String,
@@ -178,23 +232,28 @@ pub struct BackfillRecord {
     /// Set when the backfill targets a named `Job`.
     #[serde(default)]
     pub job_name: Option<String>,
-    /// This and the four fields after it are kept in their own tables, not
-    /// on the `backfills` row; storage fills them in on read.
+    /// Partitions the requested keys name.
     #[serde(default)]
     #[surreal(default)]
-    pub partition_keys: Vec<PartitionKey>,
+    pub num_partitions: u64,
+    /// Runs in the plan. Zero until the backfill starts.
+    #[serde(default)]
+    #[surreal(default)]
+    pub planned_runs: u64,
+    /// This and the three counts after it are kept in their own tables, not
+    /// on the `backfills` row; storage fills them in on read.
     #[serde(default)]
     #[surreal(default)]
     pub run_ids: Vec<String>,
     #[serde(default)]
     #[surreal(default)]
-    pub completed_partitions: Vec<PartitionKey>,
+    pub completed_partitions: u64,
     #[serde(default)]
     #[surreal(default)]
-    pub failed_partitions: Vec<PartitionKey>,
+    pub failed_partitions: u64,
     #[serde(default)]
     #[surreal(default)]
-    pub canceled_partitions: Vec<PartitionKey>,
+    pub canceled_partitions: u64,
     pub max_concurrency: i64,
     pub tags: Vec<(String, String)>,
     pub create_time: i64,

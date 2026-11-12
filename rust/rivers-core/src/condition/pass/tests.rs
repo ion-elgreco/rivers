@@ -1071,7 +1071,7 @@ fn eager_does_not_fire_for_a_partition_an_active_backfill_covers() {
     cache
         .backfill
         .partition_keys
-        .insert("bf1".to_string(), vec![spk("a"), spk("b"), spk("c")]);
+        .insert("bf1".to_string(), vec![spk("a"), spk("b"), spk("c")].into());
     assert!(
         cache.in_progress_assets.is_empty(),
         "precondition: the gap tick has no tracked sub-run"

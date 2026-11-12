@@ -246,22 +246,6 @@ fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String>
         .collect()
 }
 
-/// Tri-state heatmap label for one partition.
-#[cfg(feature = "ssr")]
-fn partition_status_label(
-    key: &str,
-    materialized: &std::collections::HashSet<String>,
-    failed: &std::collections::HashSet<String>,
-) -> &'static str {
-    if failed.contains(key) {
-        "Failed"
-    } else if materialized.contains(key) {
-        "Materialized"
-    } else {
-        "Missing"
-    }
-}
-
 /// Tri-state per-partition status (Materialized / Failed / Missing) for the asset-detail partition heatmap.
 #[server]
 pub async fn get_partition_status(
@@ -272,19 +256,14 @@ pub async fn get_partition_status(
     dynamic_name: String,
 ) -> Result<PartitionStatus, ServerFnError> {
     use rivers_api::rivers::GetPartitionKeysRequest;
+    use rivers_core::execution::asset_partitions::{PartitionState, asset_partitions_page};
     use rivers_core::storage::StorageBackend;
-    use std::collections::HashSet;
 
     const HEATMAP_PAGE: u64 = 1000;
 
     let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
     let scoped = state.storage.for_code_location(&ctx);
-
-    let materialized_count = scoped
-        .count_materialized_partitions(&asset_key)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))? as usize;
 
     let mut window_keys: Vec<String> = Vec::new();
     let mut total: usize = 0;
@@ -313,53 +292,43 @@ pub async fn get_partition_status(
         window_keys = resp.keys;
     }
 
-    let materialized_spks = scoped
-        .get_materialized_partitions(&asset_key)
+    // The definition gave no keys, for example because the code location
+    // does not answer: the page shows the materialized partitions.
+    let from_definition = total > 0;
+    if !from_definition {
+        window_keys = scoped
+            .get_materialized_partitions_page(&asset_key, offset, HEATMAP_PAGE)
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .iter()
+            .flat_map(partition_key_members)
+            .collect();
+    }
+
+    let page = asset_partitions_page(&scoped, &asset_key, &window_keys)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let materialized_keys: HashSet<String> = materialized_spks
-        .iter()
-        .flat_map(partition_key_members)
-        .collect();
+    if !from_definition {
+        total = page.materialized as usize;
+    }
 
-    let partition_timestamps: std::collections::HashMap<rivers_core::storage::PartitionKey, i64> =
-        scoped
-            .get_partition_timestamps(&asset_key)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-    let failed_keys: HashSet<String> = scoped
-        .get_failed_partitions(&asset_key, &partition_timestamps)
-        .await
-        .unwrap_or_default()
-        .keys()
-        .flat_map(partition_key_members)
-        .collect();
-    let failed_count = failed_keys.len();
-
-    let detail_keys: Vec<String> = if total == 0 {
-        total = materialized_keys.len();
-        materialized_keys
-            .iter()
-            .take(HEATMAP_PAGE as usize)
-            .cloned()
-            .collect()
-    } else {
-        window_keys
-    };
-
-    let partition_details: Vec<PartitionDetail> = detail_keys
-        .iter()
-        .map(|key| PartitionDetail {
-            key: key.clone(),
-            status: partition_status_label(key, &materialized_keys, &failed_keys).to_string(),
+    let partition_details: Vec<PartitionDetail> = window_keys
+        .into_iter()
+        .zip(page.states)
+        .map(|(key, state)| PartitionDetail {
+            key,
+            status: match state {
+                PartitionState::Materialized => "Materialized",
+                PartitionState::Failed => "Failed",
+                PartitionState::Missing => "Missing",
+            }
+            .to_string(),
             last_timestamp: None,
         })
         .collect();
 
-    let materialized = materialized_count.min(total);
-    let failed = failed_count.min(total - materialized);
+    let materialized = (page.materialized as usize).min(total);
+    let failed = (page.failed as usize).min(total - materialized);
     let missing = total - materialized - failed;
     Ok(PartitionStatus {
         asset_key,
@@ -721,27 +690,5 @@ mod tests {
             keys: vec!["a".into(), "b".into()],
         };
         assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
-    }
-
-    /// Failed wins over Materialized.
-    #[test]
-    fn failed_status_wins_over_materialized() {
-        use super::partition_status_label;
-        use std::collections::HashSet;
-        let materialized: HashSet<String> =
-            ["p".to_string(), "q".to_string()].into_iter().collect();
-        let failed: HashSet<String> = ["p".to_string()].into_iter().collect();
-        assert_eq!(
-            partition_status_label("p", &materialized, &failed),
-            "Failed"
-        );
-        assert_eq!(
-            partition_status_label("q", &materialized, &failed),
-            "Materialized"
-        );
-        assert_eq!(
-            partition_status_label("z", &materialized, &failed),
-            "Missing"
-        );
     }
 }

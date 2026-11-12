@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::ThreadId;
 
@@ -15,17 +15,17 @@ use crate::storage::{DetachOnClose, PyStorageType};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{
-    BackfillFailurePolicy, BackfillStatus, LaunchedBy, PartitionKey, RunRecord, RunStatus,
-    StorageBackend, tag_keys,
+    BackfillFailurePolicy, BackfillRecord, BackfillStatus, LaunchedBy, PartitionKey, RunRecord,
+    RunStatus, StorageBackend, tag_keys,
 };
 
 use super::resolved_node::ResolvedNode;
 use super::results::{PyBackfillStatusResult, PyRunHandle};
 use super::validation::{
-    DynamicKeyCheck, assets_supporting_action, dynamic_partition_checks,
-    ensure_assets_support_action, ensure_job_verb, ensure_materializable,
-    ensure_whole_asset_chosen, resolve_selection, validate_partition_for_verb,
-    verify_dynamic_partition_keys,
+    assets_supporting_action, dynamic_partition_checks, ensure_assets_support_action,
+    ensure_job_verb, ensure_materializable, ensure_whole_asset_chosen, resolve_selection,
+    unregistered_dynamic_keys, valid_part_for_verb, validate_partition_for_verb,
+    verify_dynamic_partition_keys, without_dynamic_values,
 };
 
 pub(crate) fn priority_from_tags(tags: &[(String, String)]) -> i32 {
@@ -553,10 +553,10 @@ impl RepoHandle {
         Ok(record.map(|r| PyBackfillStatusResult {
             backfill_id: r.backfill_id,
             status: format!("{:?}", r.status),
-            total_partitions: r.partition_keys.len(),
-            completed_partitions: r.completed_partitions.len(),
-            failed_partitions: r.failed_partitions.len(),
-            canceled_partitions: r.canceled_partitions.len(),
+            total_partitions: r.num_partitions as usize,
+            completed_partitions: r.completed_partitions as usize,
+            failed_partitions: r.failed_partitions as usize,
+            canceled_partitions: r.canceled_partitions as usize,
             run_ids: r.run_ids,
             error: r.error,
             tags: r.tags,
@@ -565,29 +565,105 @@ impl RepoHandle {
         }))
     }
 
-    /// Load the original `BackfillRecord` and convert it to a
-    /// `BackfillRequestData` for resubmission. Appends `tag_keys::RERUN_OF`
-    /// pointing at the original backfill id.
+    /// The record of `backfill_id` and the keys that a rerun of it replays.
+    ///
+    /// Definitions can change after a backfill. A value that left a
+    /// definition, or a dynamic value that is no longer registered, leaves its
+    /// key; the rest of the key stays. A rerun with no partition left is
+    /// refused.
+    pub(crate) async fn rerun_source(
+        &self,
+        backfill_id: &str,
+    ) -> PyResult<(BackfillRecord, Vec<PyPartitionKey>)> {
+        let state = self.resolved()?;
+        let load_failed = |e| ExecutionError::new_err(format!("Failed to load backfill: {e}"));
+        let record = state
+            .storage
+            .get_backfill(backfill_id)
+            .await
+            .map_err(load_failed)?
+            .ok_or_else(|| {
+                ExecutionError::new_err(format!("backfill '{backfill_id}' not found"))
+            })?;
+        let requested = state
+            .storage
+            .get_backfill_keys(backfill_id)
+            .await
+            .map_err(load_failed)?;
+        let total: usize = requested.iter().map(PartitionKey::member_count).sum();
+
+        let asset_names: Vec<String> = match &record.job_name {
+            Some(name) => state
+                .jobs_info
+                .get(name)
+                .map(|job| job.asset_names.clone())
+                .ok_or_else(|| ExecutionError::new_err(format!("Job '{name}' not found")))?,
+            None => record.asset_selection.clone(),
+        };
+
+        let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(requested.len());
+        let mut kept = 0usize;
+        for key in &requested {
+            let Some(key) = valid_part_for_verb(
+                &state,
+                &asset_names,
+                &PyPartitionKey::from(key),
+                record.action.as_deref(),
+            ) else {
+                continue;
+            };
+
+            // Only a value that is not registered is retired. A storage
+            // failure says nothing about the value and must end the rerun.
+            let checks = dynamic_partition_checks(
+                &state,
+                asset_names.iter().map(String::as_str),
+                Some(&key),
+            );
+            let unregistered =
+                unregistered_dynamic_keys(&state.storage, &state.code_location_id, &checks).await?;
+            let retired: HashSet<(&str, &str)> = unregistered
+                .iter()
+                .map(|(_, namespace, value)| (namespace.as_str(), value.as_str()))
+                .collect();
+            let Some(key) = without_dynamic_values(&state, &asset_names, &key, &retired) else {
+                continue;
+            };
+
+            kept += PartitionKey::from(&key).member_count();
+            partition_keys.push(key);
+        }
+
+        if kept < total {
+            tracing::warn!(
+                target: "rivers::repo",
+                backfill_id = %backfill_id,
+                dropped = total - kept,
+                kept,
+                "rerun skipping partitions no longer valid for the current definitions"
+            );
+        }
+        if partition_keys.is_empty() {
+            return Err(ExecutionError::new_err(format!(
+                "Cannot rerun backfill '{backfill_id}': none of its {total} partitions \
+                 are valid for the current definitions"
+            )));
+        }
+
+        Ok((record, partition_keys))
+    }
+
+    /// The request that launches `backfill_id` again: the keys of
+    /// [`Self::rerun_source`] and the settings of the record, with a
+    /// `tag_keys::RERUN_OF` tag that names the original.
     pub(crate) async fn build_rerun_request(
         &self,
         backfill_id: &str,
         dry_run: bool,
         launched_by: rivers_core::storage::LaunchedBy,
     ) -> PyResult<crate::daemon::BackfillRequestData> {
-        let storage = self.resolved()?.storage.clone();
-        let record = storage
-            .get_backfill(backfill_id)
-            .await
-            .map_err(|e| ExecutionError::new_err(format!("Failed to load backfill: {e}")))?
-            .ok_or_else(|| {
-                ExecutionError::new_err(format!("backfill '{backfill_id}' not found"))
-            })?;
+        let (record, partition_keys) = self.rerun_source(backfill_id).await?;
 
-        let partition_keys: Vec<PyPartitionKey> = record
-            .partition_keys
-            .iter()
-            .map(PyPartitionKey::from)
-            .collect();
         let strategy = PyBackfillStrategy::from_core(&record.strategy);
         let failure_policy = match record.failure_policy {
             BackfillFailurePolicy::Continue => "continue".to_string(),
@@ -793,38 +869,19 @@ impl RepoHandle {
         // id with no row yet is a run mid-creation: canceling it now plants
         // the flag the executor honors at startup.
         if status == BackfillStatus::Canceled {
-            let record = storage
-                .get_backfill(&backfill_id)
+            let open_runs = storage
+                .get_open_backfill_runs(&backfill_id)
                 .await
                 .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
-            if let Some(record) = record {
-                let runs = storage
-                    .get_runs_by_ids(&record.run_ids, None)
-                    .await
-                    .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
-                let terminal: std::collections::HashSet<&str> = runs
-                    .iter()
-                    .filter(|r| {
-                        matches!(
-                            r.status,
-                            RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
-                        )
-                    })
-                    .map(|r| r.run_id.as_str())
-                    .collect();
-                for run_id in &record.run_ids {
-                    if terminal.contains(run_id.as_str()) {
-                        continue;
-                    }
-                    if let Err(e) = self.cancel_run(run_id).await {
-                        tracing::warn!(
-                            target: "rivers::repo",
-                            backfill_id = %backfill_id,
-                            run_id = %run_id,
-                            error = %e,
-                            "backfill child run cancel failed"
-                        );
-                    }
+            for run_id in &open_runs {
+                if let Err(e) = self.cancel_run(run_id).await {
+                    tracing::warn!(
+                        target: "rivers::repo",
+                        backfill_id = %backfill_id,
+                        run_id = %run_id,
+                        error = %e,
+                        "backfill child run cancel failed"
+                    );
                 }
             }
         }
@@ -888,13 +945,15 @@ impl RepoHandle {
     }
 }
 
-/// Batched storage write.
+/// Batched storage write. The caller has checked the partition keys: the
+/// runs of one backfill share most of their values, so a check per run
+/// repeats the same work.
 pub(super) async fn submit_runs(
     state: &ResolvedState,
     runs: Vec<RunSubmission>,
     launched_by: LaunchedBy,
 ) -> PyResult<Vec<String>> {
-    let (records, storage, dyn_checks) = {
+    let (records, storage) = {
         let graph = state
             .inner_repo
             .graph
@@ -908,22 +967,10 @@ pub(super) async fn submit_runs(
             .collect();
 
         let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
-        let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
 
         for sub in &runs {
             let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
             let action = sub.action.clone();
-            validate_partition_for_verb(
-                state,
-                asset_names.iter().map(String::as_str),
-                sub.partition_key.as_ref(),
-                action.as_deref(),
-            )?;
-            dyn_checks.extend(dynamic_partition_checks(
-                state,
-                asset_names.iter().map(String::as_str),
-                sub.partition_key.as_ref(),
-            ));
             let run_id = uuid::Uuid::new_v4().to_string();
             let run_tags = sub.tags.clone().unwrap_or_default();
             let priority = priority_from_tags(&run_tags);
@@ -946,12 +993,8 @@ pub(super) async fn submit_runs(
                 config: sub.config.clone(),
             });
         }
-        (records, state.storage.clone(), dyn_checks)
+        (records, state.storage.clone())
     };
-
-    if let Some(first) = records.first() {
-        verify_dynamic_partition_keys(&storage, &first.code_location_id, &dyn_checks).await?;
-    }
 
     // Backfill runs carry the run_ids link on the backfill record in the
     // same transaction, so the link can never lie about what exists.

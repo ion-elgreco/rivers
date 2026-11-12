@@ -240,6 +240,17 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn get_materialized_partitions_page(
+        &self,
+        asset_key: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<PartitionKey>> {
+        self.backend
+            .get_materialized_partitions_page(self.code_location_id, asset_key, offset, limit)
+            .await
+    }
+
     pub async fn count_materialized_partitions(&self, asset_key: &str) -> Result<u64> {
         self.backend
             .count_materialized_partitions(self.code_location_id, asset_key)
@@ -284,6 +295,15 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn get_in_progress_partitions(&self, asset_key: &str) -> Result<Vec<PartitionKey>> {
         self.backend
             .get_in_progress_partitions(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn get_partition_failures(
+        &self,
+        asset_key: &str,
+    ) -> Result<HashMap<PartitionKey, i64>> {
+        self.backend
+            .get_partition_failures(self.code_location_id, asset_key)
             .await
     }
 

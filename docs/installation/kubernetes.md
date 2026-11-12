@@ -563,6 +563,14 @@ volume for a second copy, and keeps the original files in `_rocksdb_backup/`.
 The next `helm upgrade` removes the opt-in again. Upgrade an external
 SurrealDB server to v4 the same way before you migrate.
 
+### Upgrading to schema version 14
+
+Schema version 14 stores a backfill in a new form and raises both floors:
+every `CodeLocation` image and the UI must run the new rivers. A backfill
+that a daemon runs continues after the migration. A `rivers backfill`
+command that runs its backfill itself (without `--detach`) is not in the
+list of `rivers db status`: let it end, or stop it, before you migrate.
+
 ## Uninstall
 
 ```sh

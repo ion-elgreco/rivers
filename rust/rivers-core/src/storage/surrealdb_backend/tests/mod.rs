@@ -10,6 +10,7 @@ use super::super::{
 use super::*;
 use crate::assets::graph::GraphTopology;
 
+mod asset_events;
 mod backfills;
 mod claims;
 mod consolidation;
@@ -18,7 +19,9 @@ mod crud;
 mod directory;
 mod executor_patterns;
 mod isolation;
+mod message_limit;
 mod observations;
+mod partition_reads;
 mod pools;
 mod run_progress;
 mod run_queue;
@@ -80,11 +83,12 @@ fn make_backfill(id: &str, status: BackfillStatus, create_time: i64) -> Backfill
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["a".to_string()],
         job_name: None,
-        partition_keys: vec![],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 1,
         tags: vec![],
         create_time,
@@ -129,11 +133,12 @@ fn mk_isolation_backfill(
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["a".to_string()],
         job_name: None,
-        partition_keys: vec![],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 1,
         tags: vec![],
         create_time,

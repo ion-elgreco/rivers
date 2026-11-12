@@ -448,7 +448,8 @@ impl AssetConditionCache {
         // BackfillStatus has two live states and load_active_backfills returns
         // every backfill in them, so the fresh query IS the new state — a
         // tracked id that is terminal (or deleted) simply stops appearing.
-        let new_backfill = Self::load_active_backfills(storage, &self.ctx).await?;
+        let new_backfill =
+            Self::load_active_backfills(storage, &self.ctx, &self.backfill.partition_keys).await?;
         if new_backfill != self.backfill {
             delta.changed = true;
             // Assets whose last active backfill ended may still carry the

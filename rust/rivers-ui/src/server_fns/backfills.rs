@@ -4,7 +4,8 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
 use crate::types::{
-    BackfillFilter, BackfillInfo, BackfillPartitionsPage, BackfillsPage, BackfillsSummary,
+    BackfillFilter, BackfillInfo, BackfillPartitionsPage, BackfillsPage, BackfillsSummary, Page,
+    RunRecord,
 };
 
 #[server]
@@ -19,16 +20,18 @@ pub async fn get_backfill(backfill_id: String) -> Result<Option<BackfillInfo>, S
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// A window of a backfill's partitions with real display keys + exact status
-/// (from the record's completed/failed/canceled sets), for the heatmap.
+/// One page of the partitions of a backfill, each with what happened to it,
+/// for the heatmap.
 #[server]
 pub async fn get_backfill_partitions(
     backfill_id: String,
     offset: u64,
     limit: u64,
 ) -> Result<BackfillPartitionsPage, ServerFnError> {
-    use rivers_core::storage::{PartitionKey, StorageBackend};
-    use std::collections::HashSet;
+    use rivers_core::execution::backfill_partitions::{
+        BackfillPartitionState, backfill_partitions_page,
+    };
+    use rivers_core::storage::StorageBackend;
     let state = expect_context::<crate::state::AppState>();
     let record = state
         .storage
@@ -37,38 +40,57 @@ pub async fn get_backfill_partitions(
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .ok_or_else(|| ServerFnError::new("backfill not found"))?;
 
-    let completed: HashSet<&PartitionKey> = record.completed_partitions.iter().collect();
-    let failed: HashSet<&PartitionKey> = record.failed_partitions.iter().collect();
-    let canceled: HashSet<&PartitionKey> = record.canceled_partitions.iter().collect();
-
-    let total: u64 = record
-        .partition_keys
-        .iter()
-        .map(|pk| pk.member_count() as u64)
-        .sum();
-    let rows: Vec<crate::types::BackfillPartitionCell> = record
-        .partition_keys
-        .iter()
-        .flat_map(|pk| pk.members_preview(offset as usize + limit as usize))
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(|m| {
-            let status = if completed.contains(&m) {
-                "done"
-            } else if failed.contains(&m) {
-                "failed"
-            } else if canceled.contains(&m) {
-                "canceled"
-            } else {
-                "pending"
+    let rows = backfill_partitions_page(&*state.storage, &record, offset, limit)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .map(|(partition, state)| {
+            let status = match state {
+                BackfillPartitionState::Completed => "done",
+                BackfillPartitionState::Failed => "failed",
+                BackfillPartitionState::Canceled => "canceled",
+                BackfillPartitionState::Pending => "pending",
             };
             crate::types::BackfillPartitionCell {
-                key: crate::types::partition_key_to_display(m),
+                key: crate::types::partition_key_to_display(partition),
                 status: status.to_string(),
             }
         })
         .collect();
-    Ok(BackfillPartitionsPage { rows, total })
+    Ok(BackfillPartitionsPage {
+        rows,
+        total: record.num_partitions,
+    })
+}
+
+/// One page of the runs of a backfill, the run linked last first.
+#[server]
+pub async fn get_backfill_runs(
+    backfill_id: String,
+    offset: u64,
+    limit: u64,
+) -> Result<Page<RunRecord>, ServerFnError> {
+    use rivers_core::execution::backfill_runs::backfill_runs_page;
+    use rivers_core::storage::StorageBackend;
+    let state = expect_context::<crate::state::AppState>();
+    let record = state
+        .storage
+        .get_backfill(&backfill_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("backfill not found"))?;
+
+    let rows: Vec<RunRecord> = backfill_runs_page(&*state.storage, &record, offset, limit)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+
+    Ok(Page {
+        rows,
+        total: record.run_ids.len() as u64,
+    })
 }
 
 /// Paginated + filtered backfills list. JSON codec because `BackfillFilter`
@@ -100,20 +122,15 @@ pub async fn get_backfills_summary() -> Result<BackfillsSummary, ServerFnError> 
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Mark a backfill `Canceled` with a current end-time stamp. Returns `true`
-/// on success. Doesn't kill in-flight per-partition runs — those continue
-/// to completion; the cancellation is only visible to subsequent dispatch.
+/// Cancel a backfill. One whose runs all ended keeps its own final status.
+/// Runs in flight go on to their end; the cancel stops the runs not started.
 #[server]
 pub async fn cancel_backfill(backfill_id: String) -> Result<bool, ServerFnError> {
-    use rivers_core::storage::{BackfillStatus, StorageBackend};
+    use rivers_core::storage::StorageBackend;
     let state = expect_context::<crate::state::AppState>();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
     state
         .storage
-        .update_backfill_status(&backfill_id, BackfillStatus::Canceled, Some(now))
+        .cancel_backfill(&backfill_id)
         .await
         .map(|_| true)
         .map_err(|e| ServerFnError::new(e.to_string()))

@@ -6,13 +6,12 @@ use surrealdb::types::{Bytes, SurrealValue};
 use crate::assets::remote::LocationRef;
 use crate::storage::retry;
 use crate::storage::{
-    BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry, ComponentRecord,
-    ConditionEvalRecord, ConditionTickRecord, EventRecord, EventType, LogRecord, PartitionKey,
-    RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome, StorageBackend, StoredEvent,
-    StoredLog, TickRecord,
+    BackfillRecord, BackfillRunOutcome, BackfillStatus, CodeLocationDirectoryEntry,
+    ComponentRecord, ConditionEvalRecord, ConditionTickRecord, EndedBackfillRun, EventRecord,
+    EventType, LogRecord, PartitionKey, RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome,
+    StorageBackend, StoredEvent, StoredLog, TickRecord, UnstartedBackfillRun,
 };
 
-use super::run_queue::SettledRunKeys;
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -455,33 +454,38 @@ impl StorageBackend for SurrealStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> Result<()> {
-        let runs: Vec<RunRecord> = retry::with_retry(&self.retry_config, || async {
-            let status_str = format!("{:?}", status);
-            let mut response = if let Some(end) = end_time {
-                self.db
-                    .query(
-                        "UPDATE runs SET status = $status, end_time = $end_time \
-                         WHERE run_id = $run_id RETURN AFTER",
-                    )
-                    .bind(("run_id", run_id.to_string()))
-                    .bind(("status", status_str))
-                    .bind(("end_time", end))
-                    .await?
-            } else {
-                self.db
-                    .query("UPDATE runs SET status = $status WHERE run_id = $run_id RETURN AFTER")
-                    .bind(("run_id", run_id.to_string()))
-                    .bind(("status", status_str))
-                    .await?
-            };
-            Ok(response.take(0)?)
-        })
-        .await?;
+        let set_end_time = if end_time.is_some() {
+            ", end_time = $end_time"
+        } else {
+            ""
+        };
+        let update =
+            format!("UPDATE runs SET status = $status{set_end_time} WHERE run_id = $run_id");
+        let query = if matches!(
+            status,
+            RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+        ) {
+            format!(
+                "BEGIN TRANSACTION;\n\
+                 LET $final = ({update} RETURN run_id, status, launched_by);\n\
+                 {RECORD_BACKFILL_RUN_OUTCOME}\n\
+                 COMMIT TRANSACTION;"
+            )
+        } else {
+            format!("{update} RETURN NONE")
+        };
 
-        for run in &runs {
-            self.record_backfill_run_outcome(run).await;
-        }
-        Ok(())
+        retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(&query)
+                .bind(("run_id", run_id.to_string()))
+                .bind(("status", format!("{:?}", status)))
+                .bind(("end_time", end_time))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn update_run_block_reason(&self, run_id: &str, reason: Option<&str>) -> Result<()> {
@@ -860,270 +864,66 @@ impl StorageBackend for SurrealStorage {
 
     // ── Backfills ──
 
-    async fn create_backfill(&self, backfill: &BackfillRecord) -> Result<()> {
-        let links = BackfillRunRow::linked_now(&backfill.backfill_id, &backfill.run_ids);
-        let outcomes = BackfillOutcomeRow::settled(
-            &backfill.backfill_id,
-            &backfill.completed_partitions,
-            &backfill.failed_partitions,
-            &backfill.canceled_partitions,
-        );
-        let result = retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     CREATE backfills CONTENT object::remove($backfill, {BACKFILL_PROGRESS_COLUMNS});\n\
-                     CREATE backfill_keys CONTENT {{ backfill_id: $id, partition_keys: $keys }};\n\
-                     {LINK_BACKFILL_RUNS};\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("backfill", backfill.clone()))
-                .bind(("id", backfill.backfill_id.clone()))
-                .bind(("keys", backfill.partition_keys.clone()))
-                .bind(("links", links.clone()))
-                .bind(("outcomes", outcomes.clone()))
-                .await
-                .context("failed to create backfill")?
-                .check()?;
-            Ok(())
-        })
-        .await;
-        swallow_phantom_commit(result, "create_backfill", &backfill.backfill_id)
+    async fn create_backfill(
+        &self,
+        backfill: &BackfillRecord,
+        partition_keys: &[PartitionKey],
+    ) -> Result<()> {
+        self.create_backfill_rows(backfill, partition_keys).await
     }
 
-    async fn update_backfill_status(
-        &self,
-        backfill_id: &str,
-        status: BackfillStatus,
-        end_time: Option<i64>,
-    ) -> Result<()> {
-        retry::with_retry(&self.retry_config, || async {
-            let status_str = format!("{:?}", status);
-            if let Some(end) = end_time {
-                self.db
-                    .query("UPDATE backfills SET status = $status, end_time = $end_time WHERE backfill_id = $id")
-                    .bind(("id", backfill_id.to_string()))
-                    .bind(("status", status_str))
-                    .bind(("end_time", end))
-                    .await?;
-            } else {
-                self.db
-                    .query("UPDATE backfills SET status = $status WHERE backfill_id = $id")
-                    .bind(("id", backfill_id.to_string()))
-                    .bind(("status", status_str))
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
+    async fn get_backfill_keys(&self, backfill_id: &str) -> Result<Vec<PartitionKey>> {
+        self.read_backfill_keys(backfill_id).await
     }
 
-    async fn update_backfill_progress(
+    async fn start_backfill(&self, backfill_id: &str, planned_runs: usize) -> Result<bool> {
+        self.start_backfill_row(backfill_id, planned_runs).await
+    }
+
+    async fn settle_unstarted_backfill_runs(
         &self,
         backfill_id: &str,
-        run_ids: &[String],
-        completed: &[PartitionKey],
-        failed: &[PartitionKey],
-        canceled: &[PartitionKey],
+        runs: &[UnstartedBackfillRun],
     ) -> Result<()> {
-        let links = BackfillRunRow::linked_now(backfill_id, run_ids);
-        let outcomes = BackfillOutcomeRow::settled(backfill_id, completed, failed, canceled);
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     {LINK_BACKFILL_RUNS};\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("links", links.clone()))
-                .bind(("outcomes", outcomes.clone()))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await
+        self.record_unstarted_backfill_runs(backfill_id, runs).await
     }
 
     async fn get_backfill(&self, backfill_id: &str) -> Result<Option<BackfillRecord>> {
-        retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query("SELECT * FROM backfills WHERE backfill_id = $id LIMIT 1")
-                .bind(("id", backfill_id.to_string()))
-                .await?;
-            let rows: Vec<BackfillRecord> = result.take(0)?;
-            Ok(load_backfill_progress(&self.db, rows).await?.pop())
-        })
-        .await
+        self.read_backfill(backfill_id).await
     }
 
-    async fn try_complete_backfill(
+    async fn get_ended_backfill_runs(
         &self,
         backfill_id: &str,
-        extra_canceled: &[PartitionKey],
-    ) -> Result<Option<BackfillStatus>> {
-        let backfill = self
-            .get_backfill(backfill_id)
-            .await?
-            .context("backfill not found")?;
+        first: usize,
+        last: usize,
+    ) -> Result<Vec<EndedBackfillRun>> {
+        self.ended_backfill_runs(backfill_id, first, last).await
+    }
 
-        if backfill.status != BackfillStatus::InProgress {
-            return Ok(None);
-        }
+    async fn get_backfill_partition_outcomes(
+        &self,
+        backfill_id: &str,
+        partitions: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, BackfillRunOutcome)>> {
+        self.backfill_partition_outcomes(backfill_id, partitions)
+            .await
+    }
 
-        let runs = if backfill.run_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.get_runs_by_ids(&backfill.run_ids, None).await?
-        };
-        let all_terminal = runs.iter().all(|r| {
-            matches!(
-                r.status,
-                RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
-            )
-        });
-        if !all_terminal {
-            return Ok(None);
-        }
-        // Nothing to finalize: no terminal runs and no externally-canceled keys.
-        if runs.is_empty() && extra_canceled.is_empty() {
-            return Ok(None);
-        }
+    async fn get_run_failed_partitions(&self, run_id: &str) -> Result<Vec<PartitionKey>> {
+        self.run_failed_partitions(run_id).await
+    }
 
-        // Every requested partition must be accounted for: run by a linked run
-        // that exists, passed in as canceled, or settled without a run (a group
-        // whose link failed). Otherwise groups are still to be launched.
-        let ran: HashSet<PartitionKey> = runs
-            .iter()
-            .filter_map(|r| r.partition_key.as_ref())
-            .flat_map(PartitionKey::members)
-            .collect();
-        let extra: HashSet<PartitionKey> = extra_canceled
-            .iter()
-            .flat_map(PartitionKey::members)
-            .collect();
-        let settled_without_run = |keys: &[PartitionKey]| -> Vec<PartitionKey> {
-            keys.iter()
-                .flat_map(PartitionKey::members)
-                .filter(|k| !ran.contains(k) && !extra.contains(k))
-                .collect()
-        };
-        let failed_without_run = settled_without_run(&backfill.failed_partitions);
-        let canceled_without_run = settled_without_run(&backfill.canceled_partitions);
-        let accounted = |k: &PartitionKey| {
-            ran.contains(k)
-                || extra.contains(k)
-                || failed_without_run.contains(k)
-                || canceled_without_run.contains(k)
-        };
-        if !backfill
-            .partition_keys
-            .iter()
-            .flat_map(PartitionKey::members)
-            .all(|k| accounted(&k))
-        {
-            return Ok(None);
-        }
+    async fn get_open_backfill_runs(&self, backfill_id: &str) -> Result<Vec<String>> {
+        self.open_backfill_runs(backfill_id).await
+    }
 
-        let mut completed_pks: Vec<PartitionKey> = Vec::new();
-        let mut failed_pks: Vec<PartitionKey> = Vec::new();
-        let mut canceled_pks: Vec<PartitionKey> = Vec::new();
-        let mut any_failed = false;
-        let mut any_canceled = false;
-
-        let success_run_ids: Vec<String> = runs
-            .iter()
-            .filter(|r| matches!(r.status, RunStatus::Success))
-            .map(|r| r.run_id.clone())
-            .collect();
-        let failed_by_run = self.step_failed_members(success_run_ids).await?;
-
-        for run in &runs {
-            if run.partition_key.is_none() {
-                match run.status {
-                    RunStatus::Failure => any_failed = true,
-                    RunStatus::Canceled => any_canceled = true,
-                    _ => {}
-                }
-                continue;
-            }
-            let settled = SettledRunKeys::of(run, failed_by_run.get(&run.run_id));
-            any_failed |= !settled.failed.is_empty();
-            any_canceled |= !settled.canceled.is_empty();
-            completed_pks.extend(settled.completed);
-            failed_pks.extend(settled.failed);
-            canceled_pks.extend(settled.canceled);
-        }
-
-        if !extra_canceled.is_empty() {
-            canceled_pks.extend(extra_canceled.iter().cloned());
-            any_canceled = true;
-        }
-        any_failed |= !failed_without_run.is_empty();
-        any_canceled |= !canceled_without_run.is_empty();
-        failed_pks.extend(failed_without_run);
-        canceled_pks.extend(canceled_without_run);
-
-        let new_status = if any_failed {
-            BackfillStatus::CompletedFailed
-        } else if any_canceled {
-            BackfillStatus::Canceled
-        } else {
-            BackfillStatus::CompletedSuccess
-        };
-
-        let outcomes =
-            BackfillOutcomeRow::settled(backfill_id, &completed_pks, &failed_pks, &canceled_pks);
-        let now = now_nanos();
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     DELETE backfill_outcomes WHERE backfill_id = $id;\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     UPDATE backfills SET status = $status, end_time = $end_time \
-                         WHERE backfill_id = $id;\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("id", backfill_id.to_string()))
-                .bind(("outcomes", outcomes.clone()))
-                .bind(("status", format!("{new_status:?}")))
-                .bind(("end_time", now))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await?;
-        Ok(Some(new_status))
+    async fn try_complete_backfill(&self, backfill_id: &str) -> Result<Option<BackfillStatus>> {
+        self.complete_backfill(backfill_id).await
     }
 
     async fn cancel_backfill(&self, backfill_id: &str) -> Result<BackfillStatus> {
-        // Settle first: if every run already finished, the cancel prevented
-        // nothing and the derived outcome wins.
-        if let Some(settled) = self.try_complete_backfill(backfill_id, &[]).await? {
-            return Ok(settled);
-        }
-        let now = now_nanos();
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "UPDATE backfills SET status = 'Canceled', end_time = $now \
-                     WHERE backfill_id = $id AND status IN ['Requested', 'InProgress']",
-                )
-                .bind(("id", backfill_id.to_string()))
-                .bind(("now", now))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await?;
-        Ok(self
-            .get_backfill(backfill_id)
-            .await?
-            .with_context(|| format!("backfill '{backfill_id}' not found"))?
-            .status)
+        self.cancel_backfill_row(backfill_id).await
     }
 
     // Concurrency pools
@@ -1208,30 +1008,31 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn cancel_queued_run(&self, run_id: &str) -> Result<bool> {
-        let canceled = retry::with_retry(&self.retry_config, || async {
+        retry::with_retry(&self.retry_config, || async {
             let now_ns = now_nanos();
             let mut result = self
                 .db
-                .query(
-                    "UPDATE runs SET status = $new_status, end_time = $now \
-                         WHERE run_id = $run_id AND status IN ['Queued', 'NotStarted']; \
-                     DELETE FROM pending_steps WHERE run_id = $run_id; \
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     LET $final = (UPDATE runs SET status = $new_status, end_time = $now \
+                         WHERE run_id = $run_id AND status IN ['Queued', 'NotStarted'] \
+                         RETURN run_id, status, launched_by);\n\
+                     DELETE FROM pending_steps WHERE run_id = $run_id;\n\
+                     {RECORD_BACKFILL_RUN_OUTCOME}\n\
+                     COMMIT TRANSACTION;\n\
                      SELECT count() AS total FROM runs \
-                         WHERE run_id = $run_id AND status = $new_status GROUP ALL",
-                )
+                         WHERE run_id = $run_id AND status = $new_status GROUP ALL;"
+                ))
                 .bind(("run_id", run_id.to_string()))
                 .bind(("new_status", RunStatus::Canceled))
                 .bind(("now", now_ns))
-                .await?;
-            let count: Option<u32> = result.take((2, "total"))?;
+                .await?
+                .check()?;
+            let last = result.num_statements() - 1;
+            let count: Option<u32> = result.take((last, "total"))?;
             Ok(count.unwrap_or(0) > 0)
         })
-        .await?;
-
-        if canceled && let Some(run) = self.get_run(run_id).await? {
-            self.record_backfill_run_outcome(&run).await;
-        }
-        Ok(canceled)
+        .await
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<bool> {

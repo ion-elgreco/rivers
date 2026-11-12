@@ -221,6 +221,7 @@ pub fn detect_surreal_connect_config() -> SurrealConnectConfig {
         database: env_nonempty(ENV_SURREAL_DATABASE)
             .unwrap_or_else(|| DEFAULT_DATABASE.to_string()),
         credentials: None,
+        max_message_size: None,
     };
     if let (Some(u), Some(p)) = (
         env_nonempty(ENV_SURREAL_USERNAME),

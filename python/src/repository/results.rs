@@ -124,22 +124,42 @@ impl PyRunHandle {
     }
 }
 
-#[pyclass(name = "BackfillResult", frozen, get_all, module = "rivers._core")]
+#[pyclass(name = "BackfillResult", frozen, module = "rivers._core")]
 pub struct PyBackfillResult {
+    #[pyo3(get)]
     pub backfill_id: String,
+    #[pyo3(get)]
     pub num_partitions: usize,
+    #[pyo3(get)]
     pub num_runs: usize,
+    #[pyo3(get)]
     pub status: String,
+    #[pyo3(get)]
     pub completed: usize,
+    #[pyo3(get)]
     pub failed: usize,
+    #[pyo3(get)]
     pub canceled: usize,
+    #[pyo3(get)]
     pub run_ids: Vec<String>,
+    #[pyo3(get)]
     pub is_dry_run: bool,
-    pub partition_keys: Vec<PyPartitionKey>,
+    /// The requested keys. A key range is one batched key.
+    pub requested_keys: Vec<PyPartitionKey>,
 }
 
 #[pymethods]
 impl PyBackfillResult {
+    /// The partitions of the backfill, one key each. Built on each read:
+    /// `num_partitions` gives the count without them.
+    #[getter]
+    fn partition_keys(&self) -> Vec<PyPartitionKey> {
+        self.requested_keys
+            .iter()
+            .flat_map(PyPartitionKey::members)
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         if self.is_dry_run {
             format!(

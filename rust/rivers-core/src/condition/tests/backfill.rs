@@ -216,7 +216,7 @@ fn test_backfill_in_progress_partitioned_targets_subset() {
     let deps = HashMap::new();
     let bf = crate::condition::cache::BackfillState {
         assets: HashMap::from([("a".to_string(), vec!["bf-1".to_string()])]),
-        partition_keys: HashMap::from([("bf-1".to_string(), vec![spk("p1"), spk("p2")])]),
+        partition_keys: HashMap::from([("bf-1".to_string(), vec![spk("p1"), spk("p2")].into())]),
     };
     let data = OwnedPartitionData::new(
         &["p1", "p2", "p3"],
@@ -261,6 +261,56 @@ fn test_backfill_in_progress_partitioned_targets_subset() {
 }
 
 #[test]
+fn test_backfill_in_progress_partitioned_key_that_names_several_partitions() {
+    // A backfill of a range stores one key that names each of its partitions.
+    let record = make_materialized_record("a", 100);
+    let records = HashMap::from([("a".to_string(), record.clone())]);
+    let deps = HashMap::new();
+    let requested = PartitionKey::Single {
+        keys: vec!["p1".to_string(), "p2".to_string()],
+    };
+    let bf = crate::condition::cache::BackfillState {
+        assets: HashMap::from([("a".to_string(), vec!["bf-1".to_string()])]),
+        partition_keys: HashMap::from([("bf-1".to_string(), vec![requested].into())]),
+    };
+    let data = OwnedPartitionData::new(
+        &["p1", "p2", "p3"],
+        &["p1", "p2", "p3"],
+        &[("p1", 10), ("p2", 20), ("p3", 30)],
+    );
+    let pctx = data.as_eval_ctx();
+    let ctx = EvalContext {
+        target_key: "a",
+        root_key: "a",
+        target_record: &record,
+        cache: CacheSnapshot {
+            records: &records,
+            upstream_deps: &deps,
+            in_progress_assets: &EMPTY_SET,
+            failed_assets: &EMPTY_SET,
+            failed_asset_timestamps: &EMPTY_FAILED_TS,
+            backfill: &bf,
+        },
+        tags: empty_tag_snapshot(),
+        prev_state: &DEFAULT_STATE,
+        all_asset_states: &EMPTY_ASSET_STATES,
+        requested_this_tick: &EMPTY_REQUESTED,
+        now: 2_000_000_000_000,
+        is_initial: false,
+        partitions: Some(&pctx),
+        root_partition_floor: None,
+    };
+
+    let result = evaluate(&ConditionNode::BackfillInProgress, &ctx);
+
+    assert!(result.fired);
+    assert_eq!(
+        result.selection.unwrap(),
+        PartitionSelection::from_keys(HashSet::from([spk("p1"), spk("p2")]))
+    );
+}
+
+#[test]
 fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
     // Backfill with empty partition_keys targets the whole asset
     let record = make_materialized_record("a", 100);
@@ -268,7 +318,7 @@ fn test_backfill_in_progress_partitioned_empty_keys_selects_all() {
     let deps = HashMap::new();
     let bf = crate::condition::cache::BackfillState {
         assets: HashMap::from([("a".to_string(), vec!["bf-1".to_string()])]),
-        partition_keys: HashMap::from([("bf-1".to_string(), vec![])]),
+        partition_keys: HashMap::from([("bf-1".to_string(), Vec::new().into())]),
     };
     let data = OwnedPartitionData::new(
         &["p1", "p2", "p3"],
@@ -314,7 +364,7 @@ fn test_backfill_in_progress_partitioned_disjoint_keys() {
     let deps = HashMap::new();
     let bf = crate::condition::cache::BackfillState {
         assets: HashMap::from([("a".to_string(), vec!["bf-1".to_string()])]),
-        partition_keys: HashMap::from([("bf-1".to_string(), vec![spk("x1"), spk("x2")])]),
+        partition_keys: HashMap::from([("bf-1".to_string(), vec![spk("x1"), spk("x2")].into())]),
     };
     let data = OwnedPartitionData::new(
         &["p1", "p2", "p3"],
@@ -361,8 +411,8 @@ fn test_backfill_in_progress_multiple_backfills_union_partitions() {
             vec!["bf-1".to_string(), "bf-2".to_string()],
         )]),
         partition_keys: HashMap::from([
-            ("bf-1".to_string(), vec![spk("p1")]),
-            ("bf-2".to_string(), vec![spk("p3")]),
+            ("bf-1".to_string(), vec![spk("p1")].into()),
+            ("bf-2".to_string(), vec![spk("p3")].into()),
         ]),
     };
     let data = OwnedPartitionData::new(
@@ -417,8 +467,8 @@ fn test_backfill_in_progress_one_backfill_empty_keys_short_circuits() {
             vec!["bf-1".to_string(), "bf-2".to_string()],
         )]),
         partition_keys: HashMap::from([
-            ("bf-1".to_string(), vec![spk("p1")]),
-            ("bf-2".to_string(), vec![]),
+            ("bf-1".to_string(), vec![spk("p1")].into()),
+            ("bf-2".to_string(), Vec::new().into()),
         ]),
     };
     let data = OwnedPartitionData::new(

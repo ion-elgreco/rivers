@@ -8,6 +8,10 @@ use crate::storage::{
 
 use super::*;
 
+/// The events of one type up to which a page of an asset's events reads them
+/// all and sorts them.
+const RARE_TYPE_EVENTS: u64 = 10_000;
+
 impl SurrealStorage {
     /// Paginated, filtered slice of runs plus total matching row count.
     pub async fn get_all_runs_page(
@@ -125,7 +129,8 @@ impl SurrealStorage {
         .await
     }
 
-    /// A page of an asset's events (newest first) restricted to `event_types`, plus the total count.
+    /// One page of an asset's events of the types `event_types`, newest
+    /// first, and how many such events the asset has.
     pub async fn get_events_for_asset_page(
         &self,
         code_location_id: &str,
@@ -135,29 +140,70 @@ impl SurrealStorage {
         limit: u64,
     ) -> Result<(Vec<StoredEvent>, u64)> {
         retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query(
-                    "SELECT * FROM events \
-                     WHERE code_location_id = $cl AND asset_key = $ak AND event_type IN $types \
-                     ORDER BY timestamp DESC, sort_order DESC, id DESC LIMIT $limit START $offset; \
-                     SELECT count() AS total FROM events \
-                     WHERE code_location_id = $cl AND asset_key = $ak AND event_type IN $types GROUP ALL;",
-                )
+            let counts = self
+                .count_asset_events(code_location_id, asset_key, event_types)
+                .await?;
+            let total: u64 = counts.iter().sum();
+            if offset >= total {
+                return Ok((vec![], total));
+            }
+
+            let found: Vec<String> = event_types
+                .iter()
+                .zip(&counts)
+                .filter(|(_, count)| **count > 0)
+                .map(|(event_type, _)| event_type.clone())
+                .collect();
+            let page = match found.as_slice() {
+                [rare] if total <= RARE_TYPE_EVENTS => self
+                    .db
+                    .query(ASSET_EVENTS_PAGE_OF_RARE_TYPE)
+                    .bind(("type", rare.clone())),
+                _ => self.db.query(ASSET_EVENTS_PAGE).bind(("types", found)),
+            };
+
+            let mut result = page
                 .bind(("cl", code_location_id.to_string()))
                 .bind(("ak", asset_key.to_string()))
-                .bind(("types", event_types.to_vec()))
                 .bind(("limit", limit))
                 .bind(("offset", offset))
                 .await?;
             let events: Vec<DbStoredEvent> = result.take(0)?;
-            let total: Option<u64> = result.take((1, "total"))?;
             Ok((
                 events.into_iter().map(|e| e.into_stored_event()).collect(),
-                total.unwrap_or(0),
+                total,
             ))
         })
         .await
+    }
+
+    /// How many events of each of `event_types` an asset has.
+    async fn count_asset_events(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        event_types: &[String],
+    ) -> Result<Vec<u64>> {
+        if event_types.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let statements: String = (0..event_types.len())
+            .map(|i| COUNT_ASSET_EVENTS_OF_TYPE.replace("$type", &format!("$types[{i}]")) + ";")
+            .collect();
+
+        let mut result = self
+            .db
+            .query(statements)
+            .bind(("cl", code_location_id.to_string()))
+            .bind(("ak", asset_key.to_string()))
+            .bind(("types", event_types.to_vec()))
+            .await?
+            .check()?;
+
+        (0..event_types.len())
+            .map(|i| Ok(result.take::<Option<u64>>((i, "total"))?.unwrap_or(0)))
+            .collect()
     }
 
     /// A run's step events (`StepStart`/`Success`/`Failure`) — backs the timeline/DAG.

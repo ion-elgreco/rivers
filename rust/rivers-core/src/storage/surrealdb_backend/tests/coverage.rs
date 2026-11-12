@@ -1991,13 +1991,12 @@ async fn test_backfill_crud() {
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["my_asset".to_string()],
         job_name: None,
-        partition_keys: vec![PartitionKey::Single {
-            keys: vec!["2024-01-15".to_string()],
-        }],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 4,
         tags: vec![("team".to_string(), "data".to_string())],
         create_time: 1000,
@@ -2013,14 +2012,21 @@ async fn test_backfill_crud() {
         action: None,
         config: None,
     };
-    storage.create_backfill(&record).await.unwrap();
+    let requested = vec![PartitionKey::Single {
+        keys: vec!["2024-01-15".to_string()],
+    }];
+    storage.create_backfill(&record, &requested).await.unwrap();
 
     let retrieved = storage.get_backfill("bf-001").await.unwrap();
     assert!(retrieved.is_some());
     let r = retrieved.unwrap();
     assert_eq!(r.backfill_id, "bf-001");
     assert_eq!(r.status, BackfillStatus::Requested);
-    assert_eq!(r.partition_keys.len(), 1);
+    assert_eq!(r.num_partitions, 1);
+    assert_eq!(
+        storage.get_backfill_keys("bf-001").await.unwrap(),
+        requested
+    );
     assert_eq!(r.launched_by, record.launched_by, "provenance roundtrips");
 
     // A row created without launched_by (a v2 writer) gets the V3 DDL
@@ -2029,7 +2035,7 @@ async fn test_backfill_crud() {
     // test `test_v3_backfill_launched_by_defaults_for_legacy_rows`.
     storage
             .db
-            .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
+            .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
             .await
             .unwrap()
             .check()
@@ -2058,7 +2064,7 @@ async fn test_get_all_backfills_page_pagination_and_filter() {
     ];
     for (id, status, ct) in specs {
         storage
-            .create_backfill(&make_backfill(id, status, ct))
+            .create_backfill(&make_backfill(id, status, ct), &[])
             .await
             .unwrap();
     }
@@ -2110,7 +2116,7 @@ async fn test_get_all_backfills_summary_counts() {
     ];
     for (id, status) in specs {
         storage
-            .create_backfill(&make_backfill(id, status, 0))
+            .create_backfill(&make_backfill(id, status, 0), &[])
             .await
             .unwrap();
     }

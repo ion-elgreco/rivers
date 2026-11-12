@@ -1964,11 +1964,12 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
             failure_policy: BackfillFailurePolicy::Continue,
             asset_selection: vec!["live_asset".into()],
             job_name: None,
-            partition_keys: vec![],
+            num_partitions: 0,
+            planned_runs: 0,
             run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
+            completed_partitions: 0,
+            failed_partitions: 0,
+            canceled_partitions: 0,
             max_concurrency: 1,
             tags: vec![],
             create_time: 1,
@@ -1978,7 +1979,7 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
             action: None,
             config: None,
         };
-        storage.create_backfill(&bf).await.unwrap();
+        storage.create_backfill(&bf, &[]).await.unwrap();
     })
     .await;
 
@@ -2226,7 +2227,7 @@ async fn test_backfill_config_round_trips() {
         config: Some(config.to_string()),
         ..make_backfill("bf_cfg", BackfillStatus::Requested, 1)
     };
-    storage.create_backfill(&bf).await.unwrap();
+    storage.create_backfill(&bf, &[]).await.unwrap();
     let got = storage.get_backfill("bf_cfg").await.unwrap().unwrap();
     assert_eq!(got.config.as_deref(), Some(config));
 }

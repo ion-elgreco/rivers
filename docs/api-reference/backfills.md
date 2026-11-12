@@ -7,7 +7,7 @@ Returned by `CodeRepository.backfill()`.
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `backfill_id` | `str` | Unique identifier for the backfill |
-| `num_partitions` | `int` | Total number of partitions in the backfill |
+| `num_partitions` | `int` | Number of partitions in the backfill. A key with several values counts once per partition that it names |
 | `num_runs` | `int` | Number of runs created |
 | `status` | `str` | Current status (`"in_progress"`, `"completed"`, `"failed"`, `"canceled"`) |
 | `completed` | `int` | Number of completed partitions |
@@ -15,7 +15,7 @@ Returned by `CodeRepository.backfill()`.
 | `canceled` | `int` | Number of canceled partitions |
 | `run_ids` | `list[str]` | IDs of runs created by the backfill |
 | `is_dry_run` | `bool` | Whether this was a dry-run preview |
-| `partition_keys` | `list[PartitionKey]` | Partition keys included in the backfill |
+| `partition_keys` | `list[PartitionKey]` | One key per partition of the backfill. The list is built on each read; use `num_partitions` for the count |
 
 ---
 
@@ -49,7 +49,7 @@ Controls how partition keys are grouped into runs during a backfill.
 BackfillStrategy.multi_run() -> BackfillStrategy.MultiRun
 ```
 
-One run per partition key (default).
+One run per partition (default). A key with several values makes one run for each partition that it names.
 
 ### `BackfillStrategy.single_run()`
 
@@ -57,7 +57,7 @@ One run per partition key (default).
 BackfillStrategy.single_run() -> BackfillStrategy.SingleRun
 ```
 
-All partition keys in a single run.
+All partitions in a single run.
 
 ### `BackfillStrategy.per_dimension()`
 
@@ -197,7 +197,7 @@ CodeRepository.rerun_backfill(
 ) -> BackfillResult
 ```
 
-Launch a previous backfill again as a new backfill, with the same selection, strategy, failure policy, concurrency, tags and verb. The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. For a backfill of a job, the rerun raises `ExecutionError` if the job now runs a different verb than the recorded one.
+Launch a previous backfill again as a new backfill, with the same selection, strategy, failure policy, concurrency, tags and verb. The rerun replays every partition of the original backfill, not only the failed or canceled ones. A partition that is no longer valid for the current definitions is left out; a key that names several partitions keeps the others. The rerun raises `ExecutionError` if no partition is left. For a backfill of a job, the rerun raises `ExecutionError` if the job now runs a different verb than the recorded one.
 
 !!! warning
     A rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. To retry only some partitions, call `backfill()` with those `partition_keys` and the original `action`.

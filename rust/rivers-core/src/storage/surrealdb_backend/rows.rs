@@ -364,65 +364,23 @@ impl DbStoredEvent {
     }
 }
 
-/// One `backfill_runs` row: a run linked to its backfill.
+/// One `backfill_runs` row: a run linked to its backfill, with its place in
+/// the plan and the number of partitions it holds.
 #[derive(Debug, Clone, SurrealValue)]
 pub(super) struct BackfillRunRow {
-    backfill_id: String,
-    run_id: String,
-    linked_at: i64,
+    pub(super) backfill_id: String,
+    pub(super) run_id: String,
+    pub(super) linked_at: i64,
+    pub(super) run_number: i64,
+    pub(super) member_count: i64,
 }
 
-impl BackfillRunRow {
-    /// Rows for `run_ids` in order, linked now.
-    pub(super) fn linked_now(backfill_id: &str, run_ids: &[String]) -> Vec<Self> {
-        let now = super::now_nanos();
-        run_ids
-            .iter()
-            .enumerate()
-            .map(|(i, run_id)| Self {
-                backfill_id: backfill_id.to_string(),
-                run_id: run_id.clone(),
-                linked_at: now + i as i64,
-            })
-            .collect()
-    }
-}
-
-/// One `backfill_outcomes` row: a settled key of a backfill.
+/// One `backfill_run_outcomes` row: how a planned run of a backfill ended.
 #[derive(Debug, Clone, SurrealValue)]
-pub(super) struct BackfillOutcomeRow {
-    backfill_id: String,
-    partition_key: PartitionKey,
-    outcome: String,
-}
-
-impl BackfillOutcomeRow {
-    /// Rows for the keys of each outcome. A key in more than one list keeps
-    /// the last: Failed over Canceled over Completed.
-    pub(super) fn settled(
-        backfill_id: &str,
-        completed: &[PartitionKey],
-        failed: &[PartitionKey],
-        canceled: &[PartitionKey],
-    ) -> Vec<Self> {
-        let mut by_key: std::collections::HashMap<&PartitionKey, &'static str> =
-            std::collections::HashMap::new();
-        for (keys, outcome) in [
-            (completed, "Completed"),
-            (canceled, "Canceled"),
-            (failed, "Failed"),
-        ] {
-            for key in keys {
-                by_key.insert(key, outcome);
-            }
-        }
-        by_key
-            .into_iter()
-            .map(|(key, outcome)| Self {
-                backfill_id: backfill_id.to_string(),
-                partition_key: key.clone(),
-                outcome: outcome.to_string(),
-            })
-            .collect()
-    }
+pub(super) struct BackfillRunOutcomeRow {
+    pub(super) backfill_id: String,
+    pub(super) run_number: i64,
+    pub(super) outcome: String,
+    pub(super) member_count: i64,
+    pub(super) failed_members: i64,
 }

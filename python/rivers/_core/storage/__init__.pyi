@@ -324,6 +324,7 @@ class Storage:
         password: str | None = None,
         namespace: str | None = None,
         database: str | None = None,
+        max_message_size: int | None = None,
     ) -> Storage:
         """Connect to a remote SurrealDB endpoint (e.g. ``ws://host:8000``).
 
@@ -336,6 +337,10 @@ class Storage:
         ``database`` — matching a ``DEFINE USER ... ON DATABASE`` definition.
         Omit both for an ``--unauthenticated`` SurrealDB. ``namespace``
         defaults to ``"rivers"`` and ``database`` to ``"main"``.
+
+        ``max_message_size`` is the largest message, in bytes, that the
+        connection sends or accepts. The default is 64 MiB. A SurrealDB
+        server accepts 128 MiB by default.
         """
         ...
 
