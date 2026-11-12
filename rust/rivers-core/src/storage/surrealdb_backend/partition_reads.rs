@@ -4,20 +4,34 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use surrealdb::types::SurrealValue;
 
 use crate::storage::{PartitionKey, retry};
 
 use super::*;
 
-/// Keys in one query. The text of the query grows with them: 500 statements
-/// are about 100 KB.
-const KEYS_PER_QUERY: usize = 500;
+/// Keys in one query.
+const KEYS_PER_QUERY: usize = 100;
+
+/// Queries of one read that run at the same time.
+const QUERIES_AT_ONCE: usize = 8;
+
+/// The statements that read `count` partitions with `select`: statement `i`
+/// names its partition as `$partition_i`.
+///
+/// Each statement has a parameter of its own. The engine handles one list
+/// of all keys again for every statement that reads a key from it.
+pub(super) fn keyed_statements(select: &str, count: usize) -> String {
+    (0..count)
+        .map(|i| select.replace("$partition", &format!("$partition_{i}")) + ";")
+        .collect()
+}
 
 impl SurrealStorage {
-    /// The rows that `select` returns for each of `partitions`. `select` is
-    /// one `SELECT` that names its partition as `$partition`; `binds` are its
-    /// other parameters.
+    /// The rows that `select` returns for each of `partitions`, in the order
+    /// of the partitions. `select` is one `SELECT` that names its partition
+    /// as `$partition`; `binds` are its other parameters.
     ///
     /// One statement per partition: the engine reaches a row by index only
     /// when it knows the value before the statement runs. A `partition_key IN
@@ -29,28 +43,43 @@ impl SurrealStorage {
         binds: &[(&'static str, &str)],
         partitions: &[PartitionKey],
     ) -> Result<Vec<R>> {
-        let mut rows: Vec<R> = Vec::new();
+        let queries: Vec<_> = partitions
+            .chunks(KEYS_PER_QUERY)
+            .map(|chunk| self.select_by_partitions_query(select, binds, chunk))
+            .collect();
 
-        for chunk in partitions.chunks(KEYS_PER_QUERY) {
-            let statements: String = (0..chunk.len())
-                .map(|i| select.replace("$partition", &format!("$partitions[{i}]")) + ";")
-                .collect();
-
-            let mut result = retry::with_retry(&self.retry_config, || async {
-                let mut query = self
-                    .db
-                    .query(statements.as_str())
-                    .bind(("partitions", chunk.to_vec()));
-                for (name, value) in binds {
-                    query = query.bind((*name, value.to_string()));
-                }
-                Ok(query.await?.check()?)
-            })
+        let rows: Vec<Vec<R>> = stream::iter(queries)
+            .buffered(QUERIES_AT_ONCE)
+            .try_collect()
             .await?;
 
-            for statement in 0..chunk.len() {
-                rows.extend(result.take::<Vec<R>>(statement)?);
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    /// One query of [`Self::select_by_partitions`].
+    async fn select_by_partitions_query<R: SurrealValue>(
+        &self,
+        select: &str,
+        binds: &[(&'static str, &str)],
+        partitions: &[PartitionKey],
+    ) -> Result<Vec<R>> {
+        let statements = keyed_statements(select, partitions.len());
+
+        let mut result = retry::with_retry(&self.retry_config, || async {
+            let mut query = self.db.query(statements.as_str());
+            for (name, value) in binds {
+                query = query.bind((*name, value.to_string()));
             }
+            for (i, partition) in partitions.iter().enumerate() {
+                query = query.bind((format!("partition_{i}"), partition.clone()));
+            }
+            Ok(query.await?.check()?)
+        })
+        .await?;
+
+        let mut rows: Vec<R> = Vec::new();
+        for statement in 0..partitions.len() {
+            rows.extend(result.take::<Vec<R>>(statement)?);
         }
 
         Ok(rows)
