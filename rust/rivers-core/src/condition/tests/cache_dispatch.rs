@@ -1094,28 +1094,32 @@ async fn test_recover_pending_dispatch_backfill_id_no_false_match() {
     // An UNRELATED backfill covering "a", created within the crash window; the
     // tick's own backfill ("bf-real") never dispatched.
     storage
-        .create_backfill(&BackfillRecord {
-            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
-            backfill_id: "bf-user".to_string(),
-            status: BackfillStatus::Requested,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["a".to_string()],
-            job_name: None,
-            partition_keys: vec![spk("k1")],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time: 1_500,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-            action: None,
-            config: None,
-        })
+        .create_backfill(
+            &BackfillRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                backfill_id: "bf-user".to_string(),
+                status: BackfillStatus::Requested,
+                strategy: BackfillStrategy::MultiRun,
+                failure_policy: BackfillFailurePolicy::Continue,
+                asset_selection: vec!["a".to_string()],
+                job_name: None,
+                num_partitions: 0,
+                planned_runs: 0,
+                run_ids: vec![],
+                completed_partitions: 0,
+                failed_partitions: 0,
+                canceled_partitions: 0,
+                max_concurrency: 1,
+                tags: vec![],
+                create_time: 1_500,
+                end_time: None,
+                error: None,
+                launched_by: LaunchedBy::default(),
+                action: None,
+                config: None,
+            },
+            &[spk("k1")],
+        )
         .await
         .unwrap();
 

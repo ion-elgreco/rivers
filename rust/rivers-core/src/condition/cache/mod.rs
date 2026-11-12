@@ -531,7 +531,7 @@ impl AssetConditionCache {
             }
         }
 
-        self.backfill = Self::load_active_backfills(storage, &self.ctx).await?;
+        self.backfill = Self::load_active_backfills(storage, &self.ctx, &HashMap::new()).await?;
 
         self.load_partition_status_inner(storage).await?;
 
@@ -540,9 +540,12 @@ impl AssetConditionCache {
     }
 
     /// Query active backfills (Requested + InProgress) and build a `BackfillState`.
+    /// The requested keys of a backfill are read once: `known_keys` are the
+    /// keys of the backfills in the state before this one.
     async fn load_active_backfills<S: StorageBackend>(
         storage: &S,
         ctx: &crate::storage::CodeLocationContext,
+        known_keys: &HashMap<String, Arc<[PartitionKey]>>,
     ) -> anyhow::Result<BackfillState> {
         let mut state = BackfillState::default();
         let scoped = storage.for_code_location(ctx);
@@ -558,9 +561,12 @@ impl AssetConditionCache {
                         .or_default()
                         .push(bf.backfill_id.clone());
                 }
-                state
-                    .partition_keys
-                    .insert(bf.backfill_id.clone(), bf.partition_keys.clone());
+
+                let keys = match known_keys.get(&bf.backfill_id) {
+                    Some(keys) => Arc::clone(keys),
+                    None => storage.get_backfill_keys(&bf.backfill_id).await?.into(),
+                };
+                state.partition_keys.insert(bf.backfill_id.clone(), keys);
             }
         }
         Ok(state)

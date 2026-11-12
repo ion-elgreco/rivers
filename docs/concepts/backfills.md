@@ -15,7 +15,7 @@ The `BackfillStrategy` controls how partition keys are grouped into runs.
 
 ### MultiRun (default)
 
-Creates one run per partition key. This gives maximum granularity -- if one partition fails, the others are unaffected.
+Creates one run per partition. This gives maximum granularity -- if one partition fails, the others are unaffected. A key with several values, such as `rs.PartitionKey.single(["2024-01-01", "2024-01-02"])`, makes one run for each partition that it names.
 
 ```python
 import rivers as rs
@@ -160,6 +160,8 @@ print(f"Completed: {result.completed}/{result.num_partitions}")
 | `block` | `bool` | `True` | Wait for completion. `False` only records the backfill for a daemon to run |
 | `dry_run` | `bool` | `False` | Preview without executing |
 
+The `rivers backfill` command launches a backfill from a terminal. Its `--detach` flag is the command-line form of `block=False`: see [Detached backfills](../api-reference/cli.md#detached-backfills).
+
 ## Dry-run preview
 
 Set `dry_run=True` to see what a backfill would do without actually executing:
@@ -244,7 +246,7 @@ The rivers web UI provides a dedicated **Backfills** page at `/backfills` that s
 
 ## Rerunning a backfill
 
-`repo.rerun_backfill()` launches a previous backfill again as a new backfill, with the same selection, strategy and [verb](actions.md). The rerun replays every partition of the original backfill, not only the failed or canceled ones. Keys that are no longer valid for the current definitions are dropped. A rerun from the backfill's page in the web UI also replays every partition with the same verb.
+`repo.rerun_backfill()` launches a previous backfill again as a new backfill, with the same selection, strategy and [verb](actions.md). The rerun replays every partition of the original backfill, not only the failed or canceled ones. A partition that is no longer valid for the current definitions is left out; a key that names several partitions keeps the others. A rerun from the backfill's page in the web UI follows the same rules.
 
 A backfill of a job keeps the verb that it recorded. If the job now runs a different verb, for example after a redeploy, the rerun is rejected with an error that names both verbs. To run the job's new verb, launch a new backfill of the job.
 

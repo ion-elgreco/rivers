@@ -91,6 +91,24 @@ test-dev: _runtime-bin
     RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial and not spark_test" python/
     RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "serial and not spark_test" python/
 
+# Run the tests that need a SurrealDB server: only a server has a message limit.
+# Starts a server in Docker on a free port and removes it at the end.
+test-server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name="rivers-test-surreal-$$"
+    docker run -d --name "$name" -p 127.0.0.1::8000 surrealdb/surrealdb:v4 \
+        start --unauthenticated --bind 0.0.0.0:8000 memory >/dev/null
+    trap 'docker rm -f "$name" >/dev/null' EXIT
+    port="$(docker port "$name" 8000/tcp | cut -d: -f2)"
+    for _ in $(seq 60); do
+        curl -sf "http://127.0.0.1:${port}/health" >/dev/null && break
+        sleep 0.5
+    done
+    export RIVERS_TEST_SURREAL_ENDPOINT="ws://127.0.0.1:${port}"
+    cargo test --profile {{ profile }} -p rivers-core --lib message_limit
+    uv run --no-sync pytest python/tests/backfill/test_backfill_message_limit.py
+
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
 #   can resolve when the crate is built with `ssr`.

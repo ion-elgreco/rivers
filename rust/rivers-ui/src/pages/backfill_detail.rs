@@ -14,9 +14,10 @@ use crate::components::ui_kit::{
 use crate::helpers::{code_location_label, format_duration, format_timestamp, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
-use crate::server_fns::backfills::{cancel_backfill, get_backfill, get_backfill_partitions};
+use crate::server_fns::backfills::{
+    cancel_backfill, get_backfill, get_backfill_partitions, get_backfill_runs,
+};
 use crate::server_fns::locations::list_code_locations;
-use crate::server_fns::runs::get_runs_by_ids;
 
 fn is_cancelable(status: &str) -> bool {
     matches!(status, "InProgress" | "Requested")
@@ -62,19 +63,20 @@ pub fn BackfillDetailPage() -> impl IntoView {
     );
     let locations = Resource::new(|| (), |_| list_code_locations());
 
+    // One page of the runs: a backfill can have one run per partition.
+    let (runs_page, set_runs_page) = signal(0u64);
+    let (runs_page_size, set_runs_page_size) = signal(50u64);
     let backfill_runs = Resource::new(
         move || {
-            let bf = backfill.get().and_then(|r| r.ok()).flatten();
-            let ids = bf.map(|b| b.run_ids.clone()).unwrap_or_default();
-            (ids, refresh_tick.get())
+            params.track();
+            (
+                backfill_id(),
+                runs_page.get(),
+                runs_page_size.get(),
+                refresh_tick.get(),
+            )
         },
-        |(ids, _)| async move {
-            if ids.is_empty() {
-                Ok(vec![])
-            } else {
-                get_runs_by_ids(ids).await
-            }
-        },
+        |(id, p, ps, _)| async move { get_backfill_runs(id, p * ps, ps).await },
     );
 
     let cancel = Action::new(move |id: &String| {
@@ -289,7 +291,7 @@ pub fn BackfillDetailPage() -> impl IntoView {
 
                             <SectionHeader
                                 label="PROGRESS"
-                                count=format!("{completed} of {}", crate::helpers::plural(total as u64, "partition", "partitions"))
+                                count=format!("{completed} of {}", crate::helpers::plural(total, "partition", "partitions"))
                             />
                             <ProgressBar
                                 value=Signal::derive(move || if total > 0 { completed as f64 / total as f64 } else { 0.0 })
@@ -298,14 +300,13 @@ pub fn BackfillDetailPage() -> impl IntoView {
                             />
 
                             {
-                                let done = completed as usize;
-                                let failed = record.failed_partitions as usize;
-                                let canceled = record.canceled_partitions as usize;
-                                let total_usize = total as usize;
-                                let pending_count = total_usize.saturating_sub(done + failed + canceled);
+                                let done = completed;
+                                let failed = record.failed_partitions;
+                                let canceled = record.canceled_partitions;
+                                let pending_count = total.saturating_sub(done + failed + canceled);
                                 let description = format!(
                                     "{} · one cell per partition",
-                                    crate::helpers::plural(total_usize as u64, "partition", "partitions"),
+                                    crate::helpers::plural(total, "partition", "partitions"),
                                 );
                                 view! {
                                     <div class="partition-panel">
@@ -375,27 +376,19 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 <pre class="error-msg error-msg--pre">{e}</pre>
                             })}
 
-                            <Transition fallback=move || view! { <GridRowSkeleton rows=3 cols=5/> }>
-                                {move || {
-                                    backfill_runs.get().map(|result| match result {
-                                        Ok(mut runs) => {
-                                            runs.sort_by_key(|r| std::cmp::Reverse(r.start_time));
-                                            let n_runs = runs.len();
-                                            view! {
-                                                <SectionHeader label="RUNS" count=n_runs.to_string()/>
-                                                {if runs.is_empty() {
-                                                    view! { <EmptyState message="No runs yet" compact=true/> }.into_any()
-                                                } else {
-                                                    view! { <RunsGrid rows=runs/> }.into_any()
-                                                }}
-                                            }.into_any()
-                                        }
-                                        Err(e) => view! {
-                                            <div class="error-msg">{format!("Couldn't load runs: {}", crate::helpers::err_text(&e))}</div>
-                                        }.into_any(),
-                                    })
+                            <SectionHeader label="RUNS" count=record.run_ids.len().to_string()/>
+                            <PaginatedView
+                                data=backfill_runs
+                                page=runs_page
+                                set_page=set_runs_page
+                                page_size=runs_page_size
+                                set_page_size=set_runs_page_size
+                                fallback=move || view! { <GridRowSkeleton rows=3 cols=5/> }
+                                empty=move || view! { <EmptyState message="No runs yet" compact=true/> }
+                                render={move |runs: Vec<crate::types::RunRecord>| {
+                                    view! { <RunsGrid rows=runs/> }.into_any()
                                 }}
-                            </Transition>
+                            />
                         }.into_any()
                     }
                     Ok(None) => view! { <div class="error-msg">"Backfill not found"</div> }.into_any(),

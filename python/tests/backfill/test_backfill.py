@@ -770,6 +770,94 @@ class TestBackfillRerun:
         assert rerun.num_partitions == 1
         assert rerun.completed == 1
 
+    def test_rerun_keeps_the_rest_of_a_key_that_names_many_partitions(self, storage):
+        """A range is one requested key. A value that left the definition is
+        left out of the rerun: the other partitions of the key run again."""
+
+        def build_repo(zones):
+            @rs.Asset(
+                partitions_def=rs.PartitionsDefinition.multi(
+                    {"day": _static_pd(["d1", "d2"]), "zone": _static_pd(zones)}
+                ),
+                io_handler=rs.InMemoryIOHandler(),
+            )
+            def asset(context: rs.AssetExecutionContext) -> int:
+                return 1
+
+            repo = rs.CodeRepository(
+                assets=[asset], default_executor=rs.Executor.in_process()
+            )
+            repo.resolve(storage=storage)
+            return repo
+
+        original = build_repo(["a", "b", "c"]).backfill(
+            selection=["asset"],
+            partition_range=rs.PartitionKeyRange.multi({"day": ("d1", "d2")}),
+        )
+        assert original.completed == 6
+
+        rerun = build_repo(["a", "c"]).rerun_backfill(original.backfill_id)
+
+        assert (rerun.num_partitions, rerun.completed) == (4, 4)
+        assert sorted(key.to_json() for key in rerun.partition_keys) == sorted(
+            rs.PartitionKey.multi({"day": day, "zone": zone}).to_json()
+            for day in ("d1", "d2")
+            for zone in ("a", "c")
+        )
+
+    @pytest.mark.parametrize(
+        ("partitions_def", "requested", "expected"),
+        [
+            (
+                rs.PartitionsDefinition.dynamic("tenants"),
+                rs.PartitionKey.single(["acme", "globex", "initech"]),
+                [rs.PartitionKey.single(t) for t in ("acme", "initech")],
+            ),
+            (
+                rs.PartitionsDefinition.multi(
+                    {
+                        "kind": _static_pd(["x", "y"]),
+                        "tenant": rs.PartitionsDefinition.dynamic("tenants"),
+                    }
+                ),
+                rs.PartitionKey.multi(
+                    {"kind": ["x", "y"], "tenant": ["acme", "globex", "initech"]}
+                ),
+                [
+                    rs.PartitionKey.multi({"kind": kind, "tenant": tenant})
+                    for kind in ("x", "y")
+                    for tenant in ("acme", "initech")
+                ],
+            ),
+        ],
+        ids=["dynamic", "dynamic-dimension"],
+    )
+    def test_rerun_removes_a_retired_dynamic_value_from_a_key(
+        self, storage, partitions_def, requested, expected
+    ):
+        """One requested key names every tenant. A tenant deleted since the
+        original backfill is removed from the key; the rest of the key stays."""
+
+        @rs.Asset(partitions_def=partitions_def, io_handler=rs.InMemoryIOHandler())
+        def asset(context: rs.AssetExecutionContext) -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[asset], default_executor=rs.Executor.in_process()
+        )
+        repo.resolve(storage=storage)
+        storage.add_dynamic_partitions("tenants", ["acme", "globex", "initech"])
+        original = repo.backfill(selection=["asset"], partition_keys=[requested])
+        assert original.completed == len(expected) // 2 * 3
+
+        storage.delete_dynamic_partition("tenants", "globex")
+        rerun = repo.rerun_backfill(original.backfill_id)
+
+        assert (rerun.num_partitions, rerun.completed) == (len(expected),) * 2
+        assert sorted(key.to_json() for key in rerun.partition_keys) == sorted(
+            key.to_json() for key in expected
+        )
+
     def test_rerun_with_no_surviving_keys_errors(self, storage):
         def build_repo(keys):
             @rs.Asset(

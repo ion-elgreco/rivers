@@ -735,6 +735,113 @@ impl PartitionsDefinition {
         }
     }
 
+    /// One member of `key` that this definition rejects, to name in an error
+    /// message. `None` when no single member is at fault: the key is valid, or
+    /// its shape does not fit the definition.
+    pub fn rejected_member(&self, key: &PyPartitionKey) -> PyResult<Option<PyPartitionKey>> {
+        match (self, key) {
+            (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                let mut member: HashMap<String, Vec<String>> = HashMap::new();
+                let mut any_rejected = false;
+
+                for (dim_name, dim_def) in dimensions {
+                    let Some(first) = keys.get(dim_name).and_then(|vals| vals.first()) else {
+                        return Ok(None);
+                    };
+                    let rejected = dim_def.rejected_value(&keys[dim_name])?;
+                    any_rejected |= rejected.is_some();
+                    member.insert(dim_name.clone(), vec![rejected.unwrap_or(first).clone()]);
+                }
+
+                Ok(any_rejected.then_some(PyPartitionKey::Multi { keys: member }))
+            }
+            (Self::Multi { .. }, PyPartitionKey::Single { .. }) => Ok(None),
+            (_, PyPartitionKey::Single { key }) => {
+                Ok(self
+                    .rejected_value(key)?
+                    .map(|value| PyPartitionKey::Single {
+                        key: vec![value.clone()],
+                    }))
+            }
+            (_, PyPartitionKey::Set { keys }) => {
+                for member in keys {
+                    if let Some(rejected) = self.rejected_member(member)? {
+                        return Ok(Some(rejected));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The part of `key` that this definition accepts: a value that is not a
+    /// key of its dimension is left out. `None` when no partition is left, or
+    /// when the shape of `key` does not fit the definition.
+    pub fn valid_part(&self, key: &PyPartitionKey) -> PyResult<Option<PyPartitionKey>> {
+        match (self, key) {
+            (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                if keys.len() != dimensions.len() {
+                    return Ok(None);
+                }
+                let mut kept: HashMap<String, Vec<String>> = HashMap::new();
+
+                for (dim_name, dim_def) in dimensions {
+                    let Some(values) = keys.get(dim_name) else {
+                        return Ok(None);
+                    };
+                    let valid = dim_def.valid_values(values)?;
+                    if valid.is_empty() {
+                        return Ok(None);
+                    }
+                    kept.insert(dim_name.clone(), valid);
+                }
+
+                Ok(Some(PyPartitionKey::Multi { keys: kept }))
+            }
+            (Self::Multi { .. }, PyPartitionKey::Single { .. }) => Ok(None),
+            (_, PyPartitionKey::Single { key }) => {
+                let valid = self.valid_values(key)?;
+                Ok((!valid.is_empty()).then_some(PyPartitionKey::Single { key: valid }))
+            }
+            (_, PyPartitionKey::Set { keys }) => {
+                let mut kept = Vec::new();
+                for member in keys {
+                    kept.extend(self.valid_part(member)?);
+                }
+                Ok((!kept.is_empty()).then_some(PyPartitionKey::Set { keys: kept }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Those of `values` that are keys of this definition.
+    fn valid_values(&self, values: &[String]) -> PyResult<Vec<String>> {
+        let mut valid = Vec::new();
+        for value in values {
+            let single = PyPartitionKey::Single {
+                key: vec![value.clone()],
+            };
+            if self.validate_partition_key(&single)? {
+                valid.push(value.clone());
+            }
+        }
+        Ok(valid)
+    }
+
+    /// The first of `values` that is not a key of this definition.
+    fn rejected_value<'a>(&self, values: &'a [String]) -> PyResult<Option<&'a String>> {
+        for value in values {
+            let single = PyPartitionKey::Single {
+                key: vec![value.clone()],
+            };
+            if !self.validate_partition_key(&single)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
     /// Compute the structural intersection of two partition definitions.
     pub fn intersect(&self, other: &Self) -> Result<Self, String> {
         match (self, other) {

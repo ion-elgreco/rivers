@@ -80,6 +80,43 @@ impl PartitionKey {
         }
     }
 
+    /// The member at `index` in `members()` order, without the members before it.
+    pub fn member_at(&self, index: usize) -> Option<PartitionKey> {
+        match self {
+            Self::Single { keys } => keys.get(index).map(|key| Self::Single {
+                keys: vec![key.clone()],
+            }),
+            Self::Multi { dims } => {
+                if index >= self.member_count() {
+                    return None;
+                }
+                let mut sorted: Vec<&(String, Vec<String>)> = dims.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+                // The last dimension changes with each member.
+                let mut rest = index;
+                let mut member: Vec<(String, Vec<String>)> = Vec::with_capacity(sorted.len());
+                for (name, values) in sorted.into_iter().rev() {
+                    member.push((name.clone(), vec![values[rest % values.len()].clone()]));
+                    rest /= values.len();
+                }
+                member.reverse();
+                Some(Self::Multi { dims: member })
+            }
+            Self::Set { keys } => {
+                let mut rest = index;
+                for key in keys {
+                    let count = key.member_count();
+                    if rest < count {
+                        return key.member_at(rest);
+                    }
+                    rest -= count;
+                }
+                None
+            }
+        }
+    }
+
     /// Canonical key-as-string encoding for display and string matching.
     pub fn to_display(&self) -> String {
         match self {
@@ -317,6 +354,53 @@ mod tests {
             ],
         };
         assert_eq!(pk.to_display(), "date=2024-01-01|region=us,eu");
+    }
+
+    #[test]
+    fn member_at_follows_the_order_of_members() {
+        let multi = PartitionKey::Multi {
+            dims: vec![
+                ("region".into(), vec!["us".into(), "eu".into()]),
+                ("date".into(), vec!["d1".into(), "d2".into(), "d3".into()]),
+                ("kind".into(), vec!["a".into()]),
+            ],
+        };
+        let keys = [
+            PartitionKey::Single {
+                keys: vec!["a".into(), "b".into(), "c".into()],
+            },
+            multi.clone(),
+            PartitionKey::Multi { dims: vec![] },
+            PartitionKey::Set {
+                keys: vec![
+                    PartitionKey::Single {
+                        keys: vec!["x".into(), "y".into()],
+                    },
+                    multi,
+                ],
+            },
+        ];
+
+        for key in keys {
+            let members = key.members();
+            for (index, member) in members.iter().enumerate() {
+                let at = key.member_at(index).expect("a member at each index");
+                assert_eq!(&at, member, "{} at {index}", key.to_display());
+                assert_eq!(at.to_json(), member.to_json(), "same dimension order");
+            }
+            assert_eq!(key.member_at(members.len()), None);
+        }
+    }
+
+    #[test]
+    fn member_at_of_a_dimension_with_no_values_is_none() {
+        let key = PartitionKey::Multi {
+            dims: vec![
+                ("date".into(), vec![]),
+                ("region".into(), vec!["us".into()]),
+            ],
+        };
+        assert_eq!(key.member_at(0), None);
     }
 
     #[test]

@@ -9,14 +9,76 @@ use crate::job::PyJob;
 use crate::partitions::{PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange};
 use crate::runtime::{io_rt, rt};
 use rivers_core::storage::{
-    BackfillFailurePolicy, BackfillRecord, BackfillStatus, LaunchedBy, PartitionKey,
-    StorageBackend, tag_keys,
+    BackfillFailurePolicy, BackfillRecord, BackfillRunOutcome, BackfillStatus, LaunchedBy,
+    PartitionKey, StorageBackend, UnstartedBackfillRun, tag_keys,
 };
 
 use super::*;
 
 /// Default run priority for backfill-spawned runs (-10 = lower than regular runs at 0).
 pub(crate) const DEFAULT_BACKFILL_PRIORITY: i32 = -10;
+
+/// Check the requested keys of a backfill against `selection`: each value of
+/// each dimension of a batched key one time, and dynamic values against storage.
+fn validate_backfill_keys(
+    state: &ResolvedState,
+    selection: &[String],
+    keys: &[PyPartitionKey],
+    verb: Option<&str>,
+) -> PyResult<()> {
+    let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
+    for key in keys {
+        validate_partition_for_verb(state, selection.iter().map(String::as_str), Some(key), verb)?;
+        dyn_checks.extend(dynamic_partition_checks(
+            state,
+            selection.iter().map(String::as_str),
+            Some(key),
+        ));
+    }
+
+    if !dyn_checks.is_empty() {
+        rt().block_on(verify_dynamic_partition_keys(
+            &state.storage,
+            &state.code_location_id,
+            &dyn_checks,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Plan the runs of a `Requested` backfill and move it to `InProgress`.
+/// Returns its requested keys and one key per run, in run order. A backfill
+/// whose keys name no partition is failed: no run can end it.
+fn start_backfill(
+    state: &ResolvedState,
+    record: &BackfillRecord,
+) -> PyResult<(Vec<PartitionKey>, Vec<PartitionKey>)> {
+    let backfill_id = &record.backfill_id;
+    let storage_err = |e: anyhow::Error| ExecutionError::new_err(format!("{e:#}"));
+
+    let requested = rt()
+        .block_on(state.storage.get_backfill_keys(backfill_id))
+        .map_err(storage_err)?;
+    let run_keys = rivers_core::execution::backfill::plan_runs(&record.strategy, &requested);
+
+    if run_keys.is_empty() {
+        let error = format!("Backfill '{backfill_id}' names no partition");
+        io_rt()
+            .block_on(state.storage.fail_backfill(backfill_id, &error))
+            .map_err(storage_err)?;
+        return Err(ExecutionError::new_err(error));
+    }
+
+    let started = io_rt()
+        .block_on(state.storage.start_backfill(backfill_id, run_keys.len()))
+        .map_err(storage_err)?;
+    if !started {
+        return Err(ExecutionError::new_err(format!(
+            "Backfill '{backfill_id}' is no longer Requested"
+        )));
+    }
+    Ok((requested, run_keys))
+}
 
 /// Kept out of `#[pymethods]` so they aren't exposed to Python. Daemon
 /// dispatchers, subdaemons, and other pymethod bodies that have already
@@ -120,18 +182,6 @@ impl PyCodeRepository {
             if keys.is_empty() {
                 return Err(ExecutionError::new_err("partition_keys must not be empty"));
             }
-            // repo.backfill() and gRPC LaunchBackfill are boundaries — reject
-            // invalid keys here like `materialize` does, instead of persisting
-            // a BackfillRecord that counts them and fails per-run later. The
-            // children run the verb, so the key must satisfy it.
-            for key in &keys {
-                validate_partition_for_verb(
-                    state,
-                    selection.iter().map(String::as_str),
-                    Some(key),
-                    child_verb.as_deref(),
-                )?;
-            }
             keys
         } else if let Some(range) = partition_range {
             let selected = selection.as_slice();
@@ -151,42 +201,23 @@ impl PyCodeRepository {
                         "partition_range specified but no partitioned assets found in selection",
                     )
                 })?;
-            let resolved = range.resolve(parts_def)?;
             // The range resolved against one def — the selection's other
-            // partitioned assets must accept each key too, same boundary
-            // contract as the explicit-keys branch.
-            for key in &resolved {
-                validate_partition_for_verb(
-                    state,
-                    selection.iter().map(String::as_str),
-                    Some(key),
-                    child_verb.as_deref(),
-                )?;
-            }
-            resolved
+            // partitioned assets must accept its keys too, checked below.
+            vec![range.resolve(parts_def)?]
         } else {
             return Err(ExecutionError::new_err(
                 "Either partition_keys or partition_range must be provided",
             ));
         };
 
-        let mut dyn_checks: Vec<DynamicKeyCheck> = Vec::new();
-        for key in &resolved_keys {
-            dyn_checks.extend(dynamic_partition_checks(
-                state,
-                selection.iter().map(String::as_str),
-                Some(key),
-            ));
-        }
-        if !dyn_checks.is_empty() {
-            rt().block_on(verify_dynamic_partition_keys(
-                &state.storage,
-                &state.code_location_id,
-                &dyn_checks,
-            ))?;
-        }
+        // repo.backfill() and gRPC LaunchBackfill are boundaries — reject
+        // invalid keys here like `materialize` does, instead of persisting a
+        // BackfillRecord that counts them and fails per-run later. The
+        // children run the verb, so the keys must satisfy it.
+        validate_backfill_keys(state, &selection, &resolved_keys, child_verb.as_deref())?;
 
-        let num_partitions = resolved_keys.len();
+        let core_keys: Vec<PartitionKey> = resolved_keys.iter().map(PartitionKey::from).collect();
+        let num_partitions: usize = core_keys.iter().map(PartitionKey::member_count).sum();
 
         // Resolution: explicit > asset default > MultiRun.
         let resolved_strategy = if let Some(s) = strategy {
@@ -208,14 +239,8 @@ impl PyCodeRepository {
         validate_backfill_strategy(&resolved_strategy, state, &selection)?;
 
         let core_strategy = resolved_strategy.to_core();
-        let run_groups = rivers_core::execution::backfill::group_into_runs(
-            &core_strategy,
-            &resolved_keys
-                .iter()
-                .map(PartitionKey::from)
-                .collect::<Vec<_>>(),
-        );
-        let num_runs = run_groups.len();
+        let num_runs =
+            rivers_core::execution::backfill::plan_runs(&core_strategy, &core_keys).len();
 
         if dry_run {
             return Ok(PyBackfillResult {
@@ -228,7 +253,7 @@ impl PyCodeRepository {
                 canceled: 0,
                 run_ids: Vec::new(),
                 is_dry_run: true,
-                partition_keys: resolved_keys,
+                requested_keys: resolved_keys,
             });
         }
 
@@ -237,7 +262,6 @@ impl PyCodeRepository {
             "stop_on_failure" => BackfillFailurePolicy::StopOnFailure,
             _ => BackfillFailurePolicy::Continue,
         };
-        let core_keys: Vec<PartitionKey> = resolved_keys.iter().map(PartitionKey::from).collect();
         let backfill_tags = tags.clone().unwrap_or_default();
 
         let record = BackfillRecord {
@@ -248,11 +272,12 @@ impl PyCodeRepository {
             failure_policy: fp.clone(),
             asset_selection: selection.clone(),
             job_name: job_name.clone(),
-            partition_keys: core_keys,
+            num_partitions: num_partitions as u64,
+            planned_runs: 0,
             run_ids: Vec::new(),
-            completed_partitions: Vec::new(),
-            failed_partitions: Vec::new(),
-            canceled_partitions: Vec::new(),
+            completed_partitions: 0,
+            failed_partitions: 0,
+            canceled_partitions: 0,
             max_concurrency: max_concurrency as i64,
             tags: backfill_tags.clone(),
             create_time: now_ts(),
@@ -265,8 +290,8 @@ impl PyCodeRepository {
         };
 
         io_rt()
-            .block_on(state.storage.create_backfill(&record))
-            .map_err(|e| ExecutionError::new_err(format!("Failed to create backfill: {e}")))?;
+            .block_on(state.storage.create_backfill(&record, &core_keys))
+            .map_err(|e| ExecutionError::new_err(format!("Failed to create backfill: {e:#}")))?;
 
         if block {
             self.execute_backfill_with(state, &backfill_id)?;
@@ -281,15 +306,15 @@ impl PyCodeRepository {
                 .unwrap_or_else(|| "Unknown".to_string());
             let completed = final_record
                 .as_ref()
-                .map(|r| r.completed_partitions.len())
+                .map(|r| r.completed_partitions as usize)
                 .unwrap_or(0);
             let failed = final_record
                 .as_ref()
-                .map(|r| r.failed_partitions.len())
+                .map(|r| r.failed_partitions as usize)
                 .unwrap_or(0);
             let canceled = final_record
                 .as_ref()
-                .map(|r| r.canceled_partitions.len())
+                .map(|r| r.canceled_partitions as usize)
                 .unwrap_or(0);
             let run_ids = final_record
                 .as_ref()
@@ -306,7 +331,7 @@ impl PyCodeRepository {
                 canceled,
                 run_ids,
                 is_dry_run: false,
-                partition_keys: resolved_keys,
+                requested_keys: resolved_keys,
             })
         } else {
             // Non-blocking: return immediately. A daemon picks up
@@ -321,7 +346,7 @@ impl PyCodeRepository {
                 canceled: 0,
                 run_ids: Vec::new(),
                 is_dry_run: false,
-                partition_keys: resolved_keys,
+                requested_keys: resolved_keys,
             })
         }
     }
@@ -378,6 +403,7 @@ impl PyCodeRepository {
             )));
         }
         fail_backfill_if_job_verb_changed(state, &record)?;
+        let (_, run_keys) = start_backfill(state, &record)?;
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -385,30 +411,31 @@ impl PyCodeRepository {
             flags.insert(backfill_id.to_string(), cancel.clone());
         }
 
-        let partition_keys: Vec<PyPartitionKey> = record
-            .partition_keys
-            .iter()
-            .map(PyPartitionKey::from)
-            .collect();
-
-        io_rt()
-            .block_on(state.storage.update_backfill_status(
-                backfill_id,
-                BackfillStatus::InProgress,
-                None,
-            ))
-            .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
-
-        let core_keys: Vec<PartitionKey> = partition_keys.iter().map(PartitionKey::from).collect();
-        let run_groups =
-            rivers_core::execution::backfill::group_into_runs(&record.strategy, &core_keys);
-
         let mut stop = false;
-        let mut canceled_keys: Vec<PartitionKey> = Vec::new();
+        // Planned runs that end here, before they start.
+        let mut unstarted: Vec<UnstartedBackfillRun> = Vec::new();
 
-        for group in &run_groups {
+        for (run_number, run_key) in run_keys.iter().enumerate() {
+            let member_count = run_key.member_count();
+            let unstarted_as = |outcome: BackfillRunOutcome| UnstartedBackfillRun {
+                run_number,
+                member_count,
+                outcome,
+            };
+            // A failed launch shows in the counts at once. The write at the
+            // end repeats it, so an error here is not final.
+            let launch_failed = || {
+                let failed = unstarted_as(BackfillRunOutcome::Failed);
+                let _ = io_rt().block_on(
+                    state
+                        .storage
+                        .settle_unstarted_backfill_runs(backfill_id, &[failed]),
+                );
+                failed
+            };
+
             if cancel.load(std::sync::atomic::Ordering::Relaxed) || stop {
-                canceled_keys.extend(group.iter().cloned());
+                unstarted.push(unstarted_as(BackfillRunOutcome::Canceled));
                 continue;
             }
 
@@ -416,11 +443,16 @@ impl PyCodeRepository {
             // always reach it; a rejected link means the backfill was
             // canceled under us — fold into the flag path.
             let run_id = uuid::Uuid::new_v4().to_string();
-            match io_rt().block_on(state.storage.link_backfill_run(backfill_id, &run_id)) {
+            match io_rt().block_on(state.storage.link_backfill_run(
+                backfill_id,
+                &run_id,
+                run_number,
+                member_count,
+            )) {
                 Ok(true) => {}
                 Ok(false) => {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    canceled_keys.extend(group.iter().cloned());
+                    unstarted.push(unstarted_as(BackfillRunOutcome::Canceled));
                     continue;
                 }
                 Err(e) => {
@@ -430,13 +462,7 @@ impl PyCodeRepository {
                         error = %e,
                         "backfill run link failed"
                     );
-                    let _ = io_rt().block_on(state.storage.update_backfill_progress(
-                        backfill_id,
-                        &[],
-                        &[],
-                        group,
-                        &[],
-                    ));
+                    unstarted.push(launch_failed());
                     continue;
                 }
             }
@@ -452,8 +478,7 @@ impl PyCodeRepository {
                 ));
             }
 
-            let batch_pk =
-                PyPartitionKey::from(&rivers_core::execution::backfill::bundle_keys(group));
+            let batch_pk = PyPartitionKey::from(run_key);
             let run_config = record.config.clone();
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
@@ -502,18 +527,12 @@ impl PyCodeRepository {
                 },
             };
 
-            // A run that finished recorded its own outcome; one that failed to
-            // launch has none.
+            // A run that ended recorded its own outcome, and keeps it. One
+            // that failed to launch has none.
             let succeeded = match result {
                 Ok(run_result) => run_result.success,
                 Err(_) => {
-                    let _ = io_rt().block_on(state.storage.update_backfill_progress(
-                        backfill_id,
-                        &[],
-                        &[],
-                        group,
-                        &[],
-                    ));
+                    unstarted.push(launch_failed());
                     false
                 }
             };
@@ -523,28 +542,31 @@ impl PyCodeRepository {
             }
         }
 
-        // Single finalizer: reconciles per-partition credit and records the
-        // never-launched (stop-on-failure / cancel) keys as canceled. Transient
-        // errors retry inside the storage layer; a remaining error is surfaced
-        // rather than swallowed (it would otherwise leave the backfill InProgress).
-        if let Err(e) = io_rt().block_on(
-            state
-                .storage
-                .try_complete_backfill(backfill_id, &canceled_keys),
-        ) {
-            tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill finalize failed");
+        // An external cancel that stopped a run from starting wins over the
+        // status that the ended runs give. It is written before those runs
+        // get their outcome: after that, the backfill is complete.
+        let canceled_a_run = unstarted
+            .iter()
+            .any(|run| run.outcome == BackfillRunOutcome::Canceled);
+        if cancel.load(std::sync::atomic::Ordering::Relaxed)
+            && canceled_a_run
+            && let Err(e) = io_rt().block_on(state.storage.cancel_backfill(backfill_id))
+        {
+            tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill cancel failed");
         }
 
-        // External cancel takes precedence over the failure-derived status —
-        // but only when it actually prevented work. A cancel that landed
-        // after the last group launched changes nothing, so the derived
-        // completion stands.
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) && !canceled_keys.is_empty() {
-            let _ = io_rt().block_on(state.storage.update_backfill_status(
-                backfill_id,
-                BackfillStatus::Canceled,
-                Some(now_ts()),
-            ));
+        // Transient errors retry inside the storage layer; a remaining error
+        // is surfaced rather than swallowed (it would otherwise leave the
+        // backfill InProgress).
+        let finalize = io_rt().block_on(async {
+            state
+                .storage
+                .settle_unstarted_backfill_runs(backfill_id, &unstarted)
+                .await?;
+            state.storage.try_complete_backfill(backfill_id).await
+        });
+        if let Err(e) = finalize {
+            tracing::error!(target: "rivers::repo", backfill_id = %backfill_id, error = %e, "backfill finalize failed");
         }
 
         {
@@ -573,19 +595,18 @@ impl PyCodeRepository {
             )));
         }
         fail_backfill_if_job_verb_changed(state, &record)?;
-
-        io_rt()
-            .block_on(state.storage.update_backfill_status(
-                backfill_id,
-                BackfillStatus::InProgress,
-                None,
-            ))
-            .map_err(|e| ExecutionError::new_err(format!("{e}")))?;
+        let (requested, run_keys) = start_backfill(state, &record)?;
 
         let submit = || -> PyResult<Vec<String>> {
-            let core_keys: Vec<PartitionKey> = record.partition_keys.clone();
-            let run_groups =
-                rivers_core::execution::backfill::group_into_runs(&record.strategy, &core_keys);
+            // The definitions can have changed since the backfill was created.
+            let requested: Vec<PyPartitionKey> =
+                requested.iter().map(PyPartitionKey::from).collect();
+            validate_backfill_keys(
+                state,
+                &record.asset_selection,
+                &requested,
+                record.action.as_deref(),
+            )?;
 
             let mut run_tags: Vec<(String, String)> = record.tags.clone();
             if !run_tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
@@ -595,13 +616,11 @@ impl PyCodeRepository {
                 ));
             }
 
-            let runs: Vec<RunSubmission> = run_groups
+            let runs: Vec<RunSubmission> = run_keys
                 .iter()
-                .map(|group| RunSubmission {
+                .map(|run_key| RunSubmission {
                     selection: Some(record.asset_selection.clone()),
-                    partition_key: Some(PyPartitionKey::from(
-                        &rivers_core::execution::backfill::bundle_keys(group),
-                    )),
+                    partition_key: Some(PyPartitionKey::from(run_key)),
                     tags: Some(run_tags.clone()),
                     job_name: record.job_name.clone(),
                     action: record.action.clone(),

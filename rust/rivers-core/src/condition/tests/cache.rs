@@ -1198,28 +1198,32 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
         .await
         .unwrap();
     storage
-        .create_backfill(&BackfillRecord {
-            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
-            backfill_id: "bf1".to_string(),
-            status: BackfillStatus::Requested,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["P".to_string()],
-            job_name: None,
-            partition_keys: vec![spk("k1"), spk("k2")],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time: 1000,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-            action: None,
-            config: None,
-        })
+        .create_backfill(
+            &BackfillRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                backfill_id: "bf1".to_string(),
+                status: BackfillStatus::Requested,
+                strategy: BackfillStrategy::MultiRun,
+                failure_policy: BackfillFailurePolicy::Continue,
+                asset_selection: vec!["P".to_string()],
+                job_name: None,
+                num_partitions: 0,
+                planned_runs: 0,
+                run_ids: vec![],
+                completed_partitions: 0,
+                failed_partitions: 0,
+                canceled_partitions: 0,
+                max_concurrency: 1,
+                tags: vec![],
+                create_time: 1000,
+                end_time: None,
+                error: None,
+                launched_by: LaunchedBy::default(),
+                action: None,
+                config: None,
+            },
+            &[spk("k1"), spk("k2")],
+        )
         .await
         .unwrap();
 
@@ -1231,10 +1235,10 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
     cache.in_progress_assets.entry("P".to_string()).or_default();
 
     // Canceled before any sub-run was ever observed.
-    storage
-        .update_backfill_status("bf1", BackfillStatus::Canceled, Some(2000))
-        .await
-        .unwrap();
+    assert_eq!(
+        storage.cancel_backfill("bf1").await.unwrap(),
+        BackfillStatus::Canceled
+    );
     cache.refresh(&storage, 0).await.unwrap();
 
     assert!(

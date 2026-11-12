@@ -62,8 +62,9 @@ pub(super) struct PartitionStatusPatch {
 pub struct BackfillState {
     /// Maps asset_key → backfill_ids for targeted completion detection.
     pub assets: HashMap<String, Vec<String>>,
-    /// Maps backfill_id → targeted partition keys.
-    pub partition_keys: HashMap<String, Vec<PartitionKey>>,
+    /// Maps backfill_id → the keys it was requested for. A key can name
+    /// many partitions.
+    pub partition_keys: HashMap<String, Arc<[PartitionKey]>>,
 }
 
 /// A run_id dispatch eagerly registered into `in_progress_assets` but storage hasn't yet confirmed.

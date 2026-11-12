@@ -576,92 +576,9 @@ impl PyCodeRepository {
         dry_run: bool,
     ) -> PyResult<PyBackfillResult> {
         py.detach(|| {
-            let state = self.ensure_resolved()?;
-            let record = io_rt()
-                .block_on(state.storage.get_backfill(&backfill_id))
-                .map_err(|e| ExecutionError::new_err(format!("Failed to load backfill: {e}")))?
-                .ok_or_else(|| {
-                    ExecutionError::new_err(format!("backfill '{backfill_id}' not found"))
-                })?;
-
-            let partition_keys: Vec<PyPartitionKey> = record
-                .partition_keys
-                .iter()
-                .map(PyPartitionKey::from)
-                .collect();
-
-            // Definitions may have evolved since the original backfill —
-            // replay the partitions that still exist instead of failing the
-            // whole rerun on the first retired key.
-            let total = partition_keys.len();
-            let (candidates, storage, code_location_id) = {
-                let selection_names: Vec<String> = match &record.job_name {
-                    Some(name) => state
-                        .jobs_info
-                        .get(name)
-                        .map(|j| j.asset_names.clone())
-                        .ok_or_else(|| {
-                            ExecutionError::new_err(format!("Job '{name}' not found"))
-                        })?,
-                    None => record.asset_selection.clone(),
-                };
-                let candidates: Vec<(PyPartitionKey, Vec<DynamicKeyCheck>)> = partition_keys
-                    .into_iter()
-                    .filter(|key| {
-                        validate_partition_for_verb(
-                            &state,
-                            selection_names.iter().map(String::as_str),
-                            Some(key),
-                            record.action.as_deref(),
-                        )
-                        .is_ok()
-                    })
-                    .map(|key| {
-                        let checks = dynamic_partition_checks(
-                            &state,
-                            selection_names.iter().map(String::as_str),
-                            Some(&key),
-                        );
-                        (key, checks)
-                    })
-                    .collect();
-                (
-                    candidates,
-                    state.storage.clone(),
-                    state.code_location_id.clone(),
-                )
-            };
-            let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(candidates.len());
-            for (key, checks) in candidates {
-                // Only a genuinely unregistered key is retired — a storage
-                // failure says nothing about the key and must abort the rerun.
-                let retired = !checks.is_empty()
-                    && !rt()
-                        .block_on(unregistered_dynamic_keys(
-                            &storage,
-                            &code_location_id,
-                            &checks,
-                        ))?
-                        .is_empty();
-                if !retired {
-                    partition_keys.push(key);
-                }
-            }
-            if partition_keys.len() < total {
-                tracing::warn!(
-                    target: "rivers::repo",
-                    backfill_id = %backfill_id,
-                    dropped = total - partition_keys.len(),
-                    kept = partition_keys.len(),
-                    "rerun skipping partitions no longer valid for the current definitions"
-                );
-            }
-            if partition_keys.is_empty() {
-                return Err(ExecutionError::new_err(format!(
-                    "Cannot rerun backfill '{backfill_id}': none of its {total} partitions \
-                     are valid for the current definitions"
-                )));
-            }
+            self.ensure_resolved()?;
+            let (record, partition_keys) =
+                io_rt().block_on(self.handle().rerun_source(&backfill_id))?;
 
             let strategy = PyBackfillStrategy::from_core(&record.strategy);
             let failure_policy = match record.failure_policy {

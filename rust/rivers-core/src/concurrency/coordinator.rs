@@ -98,6 +98,15 @@ impl RunQueueCoordinator {
             to_launch.push(run);
         }
 
+        for run in &mut to_launch {
+            run.partition_key = self
+                .storage
+                .backend()
+                .get_run(&run.run_id)
+                .await?
+                .and_then(|record| record.partition_key);
+        }
+
         for run in &to_launch {
             self.storage
                 .backend()
@@ -215,6 +224,40 @@ mod tests {
             let run = storage.get_run(id).await.unwrap().unwrap();
             assert_eq!(run.status, RunStatus::NotStarted);
         }
+    }
+
+    /// The poll runs several times a second over every queued run, and a
+    /// run key can name thousands of partitions.
+    #[tokio::test]
+    async fn tick_reads_the_partition_key_of_a_launched_run_only() {
+        let storage = make_storage().await;
+        let key = crate::storage::PartitionKey::Single {
+            keys: vec!["a".to_string(), "b".to_string()],
+        };
+        for (id, start_time) in [("first", 1), ("second", 2)] {
+            let mut run = queued_run(id, 0, start_time, vec![]);
+            run.partition_key = Some(key.clone());
+            storage.create_run(&run).await.unwrap();
+        }
+        let config = RunQueueConfig {
+            max_concurrent_runs: 1,
+            ..RunQueueConfig::default()
+        };
+        let coord = make_coordinator(config, storage.clone());
+
+        let (_, _, queued) = coord
+            .storage
+            .scoped()
+            .coordinator_tick_query()
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|run| run.partition_key.is_none()));
+
+        let launched = coord.tick().await.unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].run_id, "first");
+        assert_eq!(launched[0].partition_key, Some(key));
     }
 
     #[tokio::test]

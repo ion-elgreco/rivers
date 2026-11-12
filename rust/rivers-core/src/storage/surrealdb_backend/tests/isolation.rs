@@ -589,7 +589,7 @@ async fn backfills_page_isolated_per_code_location() {
         mk_isolation_backfill("a-2", "cl-a", BackfillStatus::Requested, 200),
         mk_isolation_backfill("b-1", "cl-b", BackfillStatus::Requested, 300),
     ] {
-        storage.create_backfill(&r).await.unwrap();
+        storage.create_backfill(&r, &[]).await.unwrap();
     }
 
     let page_a = storage
@@ -620,7 +620,7 @@ async fn backfills_summary_isolated_per_code_location() {
         mk_isolation_backfill("a-done", "cl-a", BackfillStatus::CompletedSuccess, 200),
         mk_isolation_backfill("b-fail", "cl-b", BackfillStatus::CompletedFailed, 300),
     ] {
-        storage.create_backfill(&r).await.unwrap();
+        storage.create_backfill(&r, &[]).await.unwrap();
     }
 
     let sum_a = storage.get_backfills_summary("cl-a").await.unwrap();

@@ -1505,6 +1505,77 @@ def test_rerun_backfill_not_found(backfill_grpc_channel):
     assert exc_info.value.code() == grpc.StatusCode.INTERNAL
 
 
+def test_rerun_backfill_leaves_out_a_retired_dynamic_value(grpc_stubs, storage):
+    """A rerun from the UI follows the rule of `repo.rerun_backfill`: a tenant
+    deleted since the original backfill leaves the key; the rest of the key
+    stays."""
+    pb2, pb2_grpc = grpc_stubs
+
+    @rs.Asset(
+        io_handler=DictIOHandler(),
+        partitions_def=rs.PartitionsDefinition.dynamic("tenants"),
+    )
+    def per_tenant(context: rs.AssetExecutionContext):
+        return context.partition_key
+
+    repo = rs.CodeRepository(
+        assets=[per_tenant],
+        default_executor=rs.Executor.in_process(),
+        run_queue=rs.RunQueueConfig(max_concurrent_runs=2, dequeue_interval="50ms"),
+    )
+    repo.resolve(storage=storage)
+    storage.add_dynamic_partitions("tenants", ["acme", "globex", "initech"])
+    port = repo._start_grpc_server("127.0.0.1", 0)
+    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+    grpc.channel_ready_future(channel).result(timeout=5)
+
+    def launch(stub, tenants):
+        key = pb2.ProtoPartitionKey(single=pb2.SinglePartitionKey(keys=tenants))
+        return stub.LaunchBackfill(
+            pb2.LaunchBackfillRequest(
+                selection=["per_tenant"],
+                partition_keys=[key],
+                failure_policy="continue",
+                max_concurrency=1,
+            )
+        )
+
+    try:
+        stub = pb2_grpc.CodeLocationServiceStub(channel)
+        every_tenant = launch(stub, ["acme", "globex", "initech"])
+        assert every_tenant.num_partitions == 3
+        one_tenant = launch(stub, ["globex"])
+
+        storage.delete_dynamic_partition("tenants", "globex")
+        rerun = stub.RerunBackfill(
+            pb2.RerunBackfillRequest(
+                backfill_id=every_tenant.backfill_id, dry_run=False
+            )
+        )
+        assert (rerun.num_partitions, rerun.num_runs) == (2, 2)
+
+        repo.execute_backfill_queued(rerun.backfill_id)
+        assert sorted(str(run.partition_key) for run in storage.get_queued_runs()) == [
+            "acme",
+            "initech",
+        ]
+
+        with pytest.raises(grpc.RpcError) as nothing_left:
+            stub.RerunBackfill(
+                pb2.RerunBackfillRequest(
+                    backfill_id=one_tenant.backfill_id, dry_run=False
+                )
+            )
+        assert nothing_left.value.code() == grpc.StatusCode.INTERNAL
+        assert (
+            "none of its 1 partitions are valid for the current definitions"
+            in nothing_left.value.details()
+        )
+    finally:
+        channel.close()
+        repo._stop_grpc_server()
+
+
 # ── rerun_run ──
 
 

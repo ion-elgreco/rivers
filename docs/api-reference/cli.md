@@ -214,8 +214,29 @@ Launches `repo.backfill()` against either:
 | `--concurrency`, `-c` | `4` | Max concurrent partition runs. |
 | `--on-failure` | `continue` | `continue` or `stop_on_failure`. |
 | `--dry-run` | `False` | Preview without executing. |
+| `--detach` | `False` | Record the backfill and return. See [Detached backfills](#detached-backfills). |
 | `--action` | none | Run this verb in every child run instead of materializing. |
 | `--surreal-endpoint` / `--code-location-id` / `--storage-path` / `--memory` | scratch store | Storage. See [Storage flags](#storage-flags). |
+
+### Detached backfills
+
+Without `--detach`, the command runs the backfill itself and returns when the backfill ends. A large backfill then needs a terminal that stays open.
+
+With `--detach`, the command records the backfill, prints its id and returns. The automation daemon of the code location plans the runs and puts them in the run queue.
+
+```bash
+rivers backfill my_pipeline \
+  --assets daily_events \
+  --from 2024-01-01 --to 2024-01-31 \
+  --detach \
+  --surreal-endpoint ws://surrealdb:8000 \
+  --code-location-id CODE_LOCATION_ID
+# Backfill BACKFILL_ID: Requested — 31 partitions, 31 runs
+```
+
+- `--detach` needs `--surreal-endpoint` or `--storage-path`: the store that the daemon reads. The command stops with an error on the scratch store or with `--memory`.
+- The run queue of the code location limits how many runs execute at the same time. `--concurrency` applies only to a backfill that the command runs itself.
+- Use `backfill-status` to follow the backfill and `backfill-cancel` to stop it.
 
 ---
 

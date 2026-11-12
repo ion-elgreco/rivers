@@ -414,7 +414,7 @@ pub(crate) fn spawn_backfill_monitor(
                 }
                 let backend = Arc::clone(handle.backend());
                 completions.spawn(async move {
-                    let result = backend.try_complete_backfill(&bf.backfill_id, &[]).await;
+                    let result = backend.try_complete_backfill(&bf.backfill_id).await;
                     (bf.backfill_id, result)
                 });
             }

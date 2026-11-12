@@ -77,7 +77,8 @@ class BackfillResult:
     backfill_id: str
     """Unique identifier assigned to the backfill."""
     num_partitions: int
-    """Total partition keys covered by the backfill."""
+    """Number of partitions in the backfill. A key with several values counts
+    once per partition that it names."""
     num_runs: int
     """Number of runs the backfill expanded into (depends on :class:`BackfillStrategy`)."""
     status: str
@@ -93,7 +94,8 @@ class BackfillResult:
     is_dry_run: bool
     """``True`` when produced by a planning-only invocation (no runs launched)."""
     partition_keys: list[PartitionKey]
-    """Concrete partition keys the backfill resolved to."""
+    """One key per partition of the backfill. The list is built on each read;
+    use :attr:`num_partitions` for the count."""
 
 class BackfillStatus:
     """Snapshot of backfill state returned by :meth:`CodeRepository.get_backfill`."""

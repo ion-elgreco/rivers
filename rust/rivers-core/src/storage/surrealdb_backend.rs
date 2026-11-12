@@ -7,7 +7,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::types::{RecordId, SurrealValue};
 
-use super::{BackfillRecord, EventRecord, PartitionKey, StorageBackend};
+use super::{EventRecord, PartitionKey, StorageBackend};
 
 mod migration;
 pub use migration::{
@@ -16,17 +16,22 @@ pub use migration::{
 };
 
 mod backend;
+mod backfill_runs;
+mod backfills;
 mod directory;
 mod pages;
 mod partition_keys;
+mod partition_reads;
 mod per_code_location;
 mod pools;
 mod queries;
 mod rows;
 mod run_queue;
 
+use backfills::load_backfill_progress;
 use queries::*;
 use rows::*;
+use run_queue::run_queued_event;
 
 /// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was constructed with.
 #[derive(Debug, Clone)]
@@ -74,6 +79,9 @@ pub struct SurrealConnectConfig {
     pub namespace: String,
     pub database: String,
     pub credentials: Option<SurrealCredentials>,
+    /// Largest message, in bytes, that the connection sends or accepts.
+    /// `None` keeps the SDK default (64 MiB).
+    pub max_message_size: Option<usize>,
 }
 
 impl SurrealConnectConfig {
@@ -84,12 +92,19 @@ impl SurrealConnectConfig {
             namespace: DEFAULT_NAMESPACE.to_string(),
             database: DEFAULT_DATABASE.to_string(),
             credentials: None,
+            max_message_size: None,
         }
     }
 
     /// Attach database-scoped credentials.
     pub fn with_credentials(mut self, username: String, password: String) -> Self {
         self.credentials = Some(SurrealCredentials::Database { username, password });
+        self
+    }
+
+    /// Set the largest message, in bytes, that the connection sends or accepts.
+    pub fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
         self
     }
 }
@@ -349,6 +364,7 @@ impl SurrealStorage {
             namespace,
             database,
             credentials,
+            max_message_size,
         } = config;
         let started = std::time::Instant::now();
         tracing::info!(
@@ -357,13 +373,21 @@ impl SurrealStorage {
             ns = %namespace,
             db = %database,
             authenticated = credentials.is_some(),
+            max_message_size,
             max_retries = retry_config.max_retries,
             max_backoff_ms = retry_config.max_backoff.as_millis() as u64,
             "opening surreal storage"
         );
         let db = super::retry::with_retry(&retry_config, || async {
             tracing::debug!(endpoint = %endpoint, "connecting remote surrealdb");
-            let db = any::connect(&endpoint)
+            let mut sdk_config = surrealdb::opt::Config::new();
+            if let Some(bytes) = max_message_size {
+                sdk_config = sdk_config
+                    .websocket(surrealdb::opt::WebsocketConfig::new().max_message_size(bytes))
+                    .context("invalid max_message_size")?;
+            }
+
+            let db = any::connect((endpoint.clone(), sdk_config))
                 .await
                 .context("failed to connect to remote SurrealDB")?;
             if let Some(creds) = credentials.clone() {
@@ -711,72 +735,6 @@ impl SurrealStorage {
     }
 }
 
-/// Fill in the requested keys, linked runs and settled keys of `backfills`,
-/// read from their own tables.
-async fn load_backfill_progress(
-    db: &Surreal<Any>,
-    mut backfills: Vec<BackfillRecord>,
-) -> Result<Vec<BackfillRecord>> {
-    #[derive(SurrealValue)]
-    struct KeysRow {
-        backfill_id: String,
-        partition_keys: Vec<PartitionKey>,
-    }
-    #[derive(SurrealValue)]
-    struct RunRow {
-        backfill_id: String,
-        run_id: String,
-    }
-    #[derive(SurrealValue)]
-    struct OutcomeRow {
-        backfill_id: String,
-        partition_key: PartitionKey,
-        outcome: String,
-    }
-
-    if backfills.is_empty() {
-        return Ok(backfills);
-    }
-    let ids: Vec<String> = backfills.iter().map(|b| b.backfill_id.clone()).collect();
-    let mut result = db
-        .query(LOAD_BACKFILL_PROGRESS)
-        .bind(("ids", ids))
-        .await?
-        .check()?;
-    let keys: Vec<KeysRow> = result.take(0)?;
-    let runs: Vec<RunRow> = result.take(1)?;
-    let outcomes: Vec<OutcomeRow> = result.take(2)?;
-
-    let index: HashMap<String, usize> = backfills
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.backfill_id.clone(), i))
-        .collect();
-    for row in keys {
-        if let Some(&i) = index.get(&row.backfill_id) {
-            backfills[i].partition_keys = row.partition_keys;
-        }
-    }
-    for row in runs {
-        if let Some(&i) = index.get(&row.backfill_id) {
-            backfills[i].run_ids.push(row.run_id);
-        }
-    }
-    for row in outcomes {
-        let Some(&i) = index.get(&row.backfill_id) else {
-            continue;
-        };
-        let backfill = &mut backfills[i];
-        match row.outcome.as_str() {
-            "Completed" => backfill.completed_partitions.push(row.partition_key),
-            "Failed" => backfill.failed_partitions.push(row.partition_key),
-            "Canceled" => backfill.canceled_partitions.push(row.partition_key),
-            other => anyhow::bail!("unknown backfill outcome '{other}'"),
-        }
-    }
-    Ok(backfills)
-}
-
 /// Convert a unique-index violation on a client-supplied-ID `CREATE` into `Ok(())`, logging a warning.
 fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Result<()> {
     match result {
@@ -847,33 +805,39 @@ impl SurrealStorage {
         } else {
             format!("BEGIN TRANSACTION; {update_sql}; COMMIT TRANSACTION;")
         };
-        let mut query = self
-            .db
-            .query(sql)
-            .bind(("cl", cl.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("event_id", event_id.to_string()))
-            .bind(("run_id", run_id.to_string()))
-            .bind(("timestamp", timestamp))
-            .bind(("data_version", data_version));
-        if !from_action {
-            query = query
-                .bind(("provenance_timestamp", provenance_timestamp))
-                .bind(("mcv", code_version));
-            if let Some(idv) = idv {
-                query = query.bind(("idv", idv));
+        let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
+        let oldest = parts.iter().map(|p| p.last_timestamp).min();
+
+        // Runs that write one asset at the same time all write its `assets`
+        // row, so all but one lose each commit.
+        super::retry::with_retry(&self.retry_config.contended_batch(), || async {
+            let mut query = self
+                .db
+                .query(sql.clone())
+                .bind(("cl", cl.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("event_id", event_id.to_string()))
+                .bind(("run_id", run_id.to_string()))
+                .bind(("timestamp", timestamp))
+                .bind(("data_version", data_version.clone()));
+            if !from_action {
+                query = query
+                    .bind(("provenance_timestamp", provenance_timestamp))
+                    .bind(("mcv", code_version.clone()));
+                if let Some(idv) = &idv {
+                    query = query.bind(("idv", idv.clone()));
+                }
             }
-        }
-        if has_parts {
-            let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
-            let oldest = parts.iter().map(|p| p.last_timestamp).min();
-            query = query
-                .bind(("keys", keys))
-                .bind(("oldest", oldest))
-                .bind(("rows", parts));
-        }
-        query.await?.check()?;
-        Ok(())
+            if has_parts {
+                query = query
+                    .bind(("keys", keys.clone()))
+                    .bind(("oldest", oldest))
+                    .bind(("rows", parts.clone()));
+            }
+            query.await?.check()?;
+            Ok(())
+        })
+        .await
     }
 }
 
