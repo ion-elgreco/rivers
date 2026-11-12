@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::storage::surrealdb_backend::partition_reads::keyed_statements;
 use crate::storage::surrealdb_backend::queries::PARTITION_TIMESTAMPS_OF_KEY;
 
 fn single(key: &str) -> PartitionKey {
@@ -116,8 +117,8 @@ async fn partition_timestamps_for_keys_reads_more_keys_than_one_query_holds() {
     }
 
     let mut wanted = keys.clone();
-    wanted.push(single("not-there"));
-    let rows: HashMap<PartitionKey, i64> = storage
+    wanted.insert(600, single("not-there"));
+    let rows: Vec<(PartitionKey, i64)> = storage
         .get_partition_timestamps_for_keys(DEFAULT_CODE_LOCATION_ID, "plain", &wanted)
         .await
         .unwrap()
@@ -125,12 +126,27 @@ async fn partition_timestamps_for_keys_reads_more_keys_than_one_query_holds() {
         .map(|(key, time, _)| (key, time))
         .collect();
 
-    let expected: HashMap<PartitionKey, i64> = keys
+    let expected: Vec<(PartitionKey, i64)> = keys
         .into_iter()
         .enumerate()
         .map(|(i, key)| (key, 1_000 + i as i64))
         .collect();
-    assert_eq!(rows, expected);
+    assert_eq!(
+        rows, expected,
+        "the rows of the keys, in the order of the keys"
+    );
+}
+
+/// The engine handles a list of keys again for every statement that takes
+/// its key from the list: a query of 500 keys cost 0.40 s on an asset with a
+/// million partitions, and 0.09 s with a parameter for each key.
+#[test]
+fn each_statement_of_a_keyed_read_has_a_parameter_of_its_own() {
+    assert_eq!(
+        keyed_statements("SELECT v FROM t WHERE k = $partition AND v > 0", 2),
+        "SELECT v FROM t WHERE k = $partition_0 AND v > 0;\
+         SELECT v FROM t WHERE k = $partition_1 AND v > 0;"
+    );
 }
 
 /// An asset with a million partitions has a million rows under the first two
@@ -145,13 +161,14 @@ async fn partition_timestamps_of_a_key_are_read_by_the_whole_index() {
         .await
         .unwrap();
 
-    let statement = PARTITION_TIMESTAMPS_OF_KEY.replace("$partition", "$partitions[0]");
+    let statement = keyed_statements(PARTITION_TIMESTAMPS_OF_KEY, 1);
+    let statement = statement.trim_end_matches(';');
     let plan: Vec<serde_json::Value> = storage
         .db
         .query(format!("{statement} EXPLAIN"))
         .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
         .bind(("asset_key", "trips".to_string()))
-        .bind(("partitions", vec![cell("00:00", "a")]))
+        .bind(("partition_0", cell("00:00", "a")))
         .await
         .unwrap()
         .take(0)
