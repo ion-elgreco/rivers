@@ -11,15 +11,10 @@ pub enum HeatCell {
 
 /// Partition / backfill heatmap — CSS-grid of status-colored cells.
 /// Default layout is 30 columns; pass `compact=true` for a 20-column variant.
-/// Pass `freshness_gradient=true` to apply an opacity gradient across `Done`
-/// cells so oldest cells look faded and newest look vivid (Rivers' partition
-/// freshness pattern for asset detail).
 #[component]
 pub fn PartitionHeatmap(
     #[prop(into)] cells: Vec<HeatCell>,
     #[prop(optional)] compact: bool,
-    #[prop(optional)] legend: bool,
-    #[prop(optional)] freshness_gradient: bool,
     /// Optional per-cell labels (e.g. partition keys). When present, hovering a
     /// cell reveals a Rivers-style inline info bar below the grid showing the
     /// key, index, and status.
@@ -53,12 +48,6 @@ pub fn PartitionHeatmap(
                 HeatCell::Pending => "pending",
                 HeatCell::Canceled => "canceled",
             };
-            let style = if freshness_gradient && matches!(c, HeatCell::Done) {
-                let op = 0.4 + (i as f64 / (total.max(1)) as f64) * 0.55;
-                Some(format!("opacity:{op:.2}"))
-            } else {
-                None
-            };
             let title = labels_arc
                 .get(i)
                 .map(|k| format!("{k} · {status_word}"))
@@ -66,7 +55,6 @@ pub fn PartitionHeatmap(
             view! {
                 <div
                     class=cls
-                    style=style
                     title=title
                     on:mouseenter=move |_| set_hover.set(Some(i))
                     on:mouseleave=move |_| set_hover.set(None)
@@ -131,14 +119,6 @@ pub fn PartitionHeatmap(
                     }
                 }
             </Show>
-            {legend.then(|| view! {
-                <div class="heatmap-legend">
-                    <span><span class="heatmap-legend-swatch" style="background:var(--success)"></span>"done"</span>
-                    <span><span class="heatmap-legend-swatch" style="background:var(--secondary)"></span>"running"</span>
-                    <span><span class="heatmap-legend-swatch" style="background:var(--error)"></span>"failed"</span>
-                    <span><span class="heatmap-legend-swatch" style="background:var(--bg-highest)"></span>"pending"</span>
-                </div>
-            })}
         </div>
     }
 }

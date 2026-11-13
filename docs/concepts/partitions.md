@@ -223,3 +223,17 @@ def all_regions(region_ab) -> int:
     # partition "a": region_ab=1, partition "c": region_ab=None
     return region_ab if region_ab is not None else 0
 ```
+
+## Partitions in the UI
+
+The **Partitions** tab of an asset shows the state of each partition. A partition is *materialized*, *failed* (it failed and was not materialized again), or *missing*.
+
+- **Tiles** show the number of partitions and the number in each state. The tile of the missing partitions has the **Materialize missing** button.
+- **The strip** has one bar for each run of keys of the first dimension, for example one bar per day. Each bar is stacked by state, and a state that has a partition is always visible. Point at a bar to read its numbers.
+- **The outline** has one row for each run of keys, with the partitions in each state. Open a row to see the rows below it: a month opens to its days, a day to its hours, and a key opens to the keys of the next dimension. The lowest level lists the partitions with their state, the time of the last materialization, and the run.
+
+**Show** limits the outline to the rows that hold failed or missing partitions. The find field lists the keys of the first dimension that hold the text.
+
+The dimensions of a multi-dimensional definition are in the order of their names: the first dimension by name leads the strip and the outline. The rows of time windows are in the order newest first, and the bars of the strip are in the order oldest first. Keys that do not sort by time (for example with the format `%d/%m/%Y`) are in the order of the definition, and so are the keys that the find field lists.
+
+The browser gets only the rows on the screen. The code location splits the keys into rows, and storage counts the partitions of each row from an index: the size of the page does not grow with the number of partitions. The find field reads every key of the first dimension in the code location, so a search of millions of keys can take some seconds. When the code location does not answer, the tab lists the materialized partitions only, with no filter and no find field.

@@ -22,7 +22,8 @@ use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_pa
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::{get_graph_topology, get_remote_downstream, get_remote_statuses};
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
-use crate::server_fns::overview::{get_assets_info, get_partition_status};
+use crate::server_fns::overview::get_assets_info;
+use crate::server_fns::partitions::get_partition_overview;
 use crate::server_fns::runs::{get_runs_for_asset, get_step_traceback};
 
 /// Status-class vocabulary for this page's event list and glyph timeline.
@@ -822,18 +823,7 @@ pub fn AssetDetailPage() -> impl IntoView {
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "partitions" { "" } else { "display:none" }>
-            <PartitionsTab
-                asset_key=key()
-                dynamic_name=Signal::derive(move || {
-                    assets_info
-                        .get()
-                        .and_then(|r| r.ok())
-                        .and_then(|infos| infos.into_iter().find(|a| a.asset_key == key()))
-                        .and_then(|a| a.partition_def)
-                        .and_then(|pd| pd.dynamic_namespace().map(str::to_string))
-                        .unwrap_or_default()
-                })
-            />
+            <PartitionsTab asset_key=key()/>
         </div>
 
         <div class="tab-content" style=move || if active_tab.get() == "automation" { "" } else { "display:none" }>
@@ -951,25 +941,15 @@ pub fn AssetDetailPage() -> impl IntoView {
 }
 
 #[component]
-fn PartitionsTab(
-    asset_key: String,
-    /// For a Dynamic asset, its namespace name (so `get_partition_status` sources
-    /// the storage-managed keys); empty for other kinds.
-    #[prop(into)]
-    dynamic_name: Signal<String>,
-) -> impl IntoView {
+fn PartitionsTab(asset_key: String) -> impl IntoView {
+    use crate::components::ui_kit::{OutlineSource, PartitionOutline};
+
     let key = asset_key.clone();
     let mat_key = asset_key.clone();
     let loc = use_current_location();
-    // Heatmap page start (one cell per key). Keep `PAGE` in sync with the
-    // server's `HEATMAP_PAGE`.
-    const PAGE: u64 = 1000;
-    let offset = RwSignal::new(0u64);
-    let partition_status = Resource::new(
-        move || (key.clone(), loc.get(), offset.get(), dynamic_name.get()),
-        |(key, (ns, name), offset, dyn_name)| async move {
-            get_partition_status(ns, name, key, offset, dyn_name).await
-        },
+    let overview = Resource::new(
+        move || (key.clone(), loc.get()),
+        |(key, (ns, name))| async move { get_partition_overview(ns, name, key).await },
     );
 
     // Launches a backfill over the asset's unmaterialized partitions; the server
@@ -996,80 +976,43 @@ fn PartitionsTab(
         }
     });
 
+    let missing_action = move || {
+        view! {
+            <button
+                class="btn btn-primary btn-small"
+                on:click=move |_| { materialize_missing.dispatch(()); }
+                disabled=move || mat_pending.get()
+            >
+                <IconPlay/>
+                {move || if mat_pending.get() { "Materializing…" } else { "Materialize missing" }}
+            </button>
+            {move || match materialize_missing.value().get() {
+                Some(Err(e)) => Some(view! {
+                    <span class="text-error">{crate::helpers::err_text(&e)}</span>
+                }),
+                _ => None,
+            }}
+        }
+    };
+
     view! {
         <Transition fallback=move || view! { <div class="loading">"Loading partitions…"</div> }>
             {move || {
-                partition_status.get().map(|result| match result {
-                    Ok(status) => {
-                        if status.partition_details.is_empty() {
-                            return view! { <EmptyState message="No partitions yet" compact=true/> }.into_any();
-                        }
-                        let has_missing = status.missing > 0;
-                        use crate::components::ui_kit::{HeatCell, PartitionHeatmap};
-                        let cells: Vec<HeatCell> = status.partition_details.iter().map(|p| {
-                            match p.status.as_str() {
-                                "Materialized" => HeatCell::Done,
-                                "Failed" => HeatCell::Failed,
-                                _ => HeatCell::Pending,
-                            }
-                        }).collect();
-                        let heatmap_labels: Vec<String> = status.partition_details.iter()
-                            .map(|p| p.key.clone())
-                            .collect();
-                        // The backend caps `partition_details` to a window, so the
-                        // heatmap stays bounded even for million-partition assets.
-                        let shown = status.partition_details.len();
-                        let total_n = status.total_partitions;
+                overview.get().map(|result| match result {
+                    Ok(overview) if overview.counts.total == 0 => {
+                        view! { <EmptyState message="No partitions yet" compact=true/> }.into_any()
+                    }
+                    Ok(overview) => {
+                        let (loc_ns, loc_name) = loc.get_untracked();
+                        let source = OutlineSource {
+                            loc_ns,
+                            loc_name,
+                            asset_key: asset_key.clone(),
+                        };
                         view! {
-                            <div class="partition-header">
-                                <div class="partition-summary">
-                                    <span class="stat-inline"><strong>{status.materialized}</strong>" materialized"</span>
-                                    <span class="stat-inline"><strong>{status.failed}</strong>" failed"</span>
-                                    <span class="stat-inline"><strong>{status.missing}</strong>" missing"</span>
-                                    <span class="stat-inline">"of "<strong>{status.total_partitions}</strong>" total"</span>
-                                    {(total_n > PAGE as usize).then(|| {
-                                        let off = offset.get() as usize;
-                                        view! {
-                                            <span class="stat-inline">
-                                                {format!("showing {}–{} of {}", off + 1, off + shown, total_n)}
-                                            </span>
-                                            <button
-                                                class="btn btn-small"
-                                                disabled={move || offset.get() == 0}
-                                                on:click=move |_| offset.update(|o| *o = o.saturating_sub(PAGE))
-                                            >
-                                                "Prev"
-                                            </button>
-                                            <button
-                                                class="btn btn-small"
-                                                // Braced: the `>=` would otherwise read as a tag close in `view!`.
-                                                disabled={move || offset.get() as usize + shown >= total_n}
-                                                on:click=move |_| offset.update(|o| *o += PAGE)
-                                            >
-                                                "Next"
-                                            </button>
-                                        }
-                                    })}
-                                </div>
-                                {has_missing.then(|| view! {
-                                    <button
-                                        class="btn btn-primary btn-small"
-                                        on:click=move |_| { materialize_missing.dispatch(()); }
-                                        disabled=move || mat_pending.get()
-                                    >
-                                        <IconPlay/>
-                                        {move || if mat_pending.get() { "Materializing…" } else { "Materialize missing" }}
-                                    </button>
-                                })}
-                                {move || match materialize_missing.value().get() {
-                                    Some(Err(e)) => Some(view! {
-                                        <span class="text-error">{crate::helpers::err_text(&e)}</span>
-                                    }),
-                                    _ => None,
-                                }}
-                            </div>
-                            <PartitionHeatmap cells=cells labels=heatmap_labels legend=true freshness_gradient=true/>
-                        }.into_any()
+                            <PartitionOutline source=source overview=overview missing_action=missing_action/>
+                        }
+                        .into_any()
                     }
                     Err(e) => view! { <div class="error-msg">{format!("Couldn't load partitions: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
                 })

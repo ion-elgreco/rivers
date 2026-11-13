@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, ResourceInfo};
+use crate::types::{AssetDefinitionInfo, ResourceInfo};
 
 /// The schema version of the database and the oldest rivers build, by schema
 /// version, that can read and write it.
@@ -235,109 +235,6 @@ pub async fn get_assets_info(
         }
     }
     Ok(assets)
-}
-
-/// Expand a stored `PartitionKey` into the individual partition-definition keys it represents.
-#[cfg(feature = "ssr")]
-fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
-    pk.members()
-        .into_iter()
-        .map(crate::types::partition_key_to_display)
-        .collect()
-}
-
-/// Tri-state per-partition status (Materialized / Failed / Missing) for the asset-detail partition heatmap.
-#[server]
-pub async fn get_partition_status(
-    loc_ns: String,
-    loc_name: String,
-    asset_key: String,
-    offset: u64,
-    dynamic_name: String,
-) -> Result<PartitionStatus, ServerFnError> {
-    use rivers_api::rivers::GetPartitionKeysRequest;
-    use rivers_core::execution::asset_partitions::{PartitionState, asset_partitions_page};
-    use rivers_core::storage::StorageBackend;
-
-    const HEATMAP_PAGE: u64 = 1000;
-
-    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
-    let state = expect_context::<crate::state::AppState>();
-    let scoped = state.storage.for_code_location(&ctx);
-
-    let mut window_keys: Vec<String> = Vec::new();
-    let mut total: usize = 0;
-    if !dynamic_name.is_empty() {
-        if let Ok(all) = scoped.get_dynamic_partitions(&dynamic_name).await {
-            total = all.len();
-            window_keys = all
-                .into_iter()
-                .skip(offset as usize)
-                .take(HEATMAP_PAGE as usize)
-                .collect();
-        }
-    } else if let Ok((_, mut client)) = state.connect_to(&loc_ns, &loc_name).await
-        && let Ok(resp) = client
-            .get_partition_keys(GetPartitionKeysRequest {
-                asset_key: asset_key.clone(),
-                offset,
-                limit: HEATMAP_PAGE,
-                query: String::new(),
-                dimension: String::new(),
-            })
-            .await
-    {
-        let resp = resp.into_inner();
-        total = resp.total as usize;
-        window_keys = resp.keys;
-    }
-
-    // The definition gave no keys, for example because the code location
-    // does not answer: the page shows the materialized partitions.
-    let from_definition = total > 0;
-    if !from_definition {
-        window_keys = scoped
-            .get_materialized_partitions_page(&asset_key, offset, HEATMAP_PAGE)
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?
-            .iter()
-            .flat_map(partition_key_members)
-            .collect();
-    }
-
-    let page = asset_partitions_page(&scoped, &asset_key, &window_keys)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    if !from_definition {
-        total = page.materialized as usize;
-    }
-
-    let partition_details: Vec<PartitionDetail> = window_keys
-        .into_iter()
-        .zip(page.states)
-        .map(|(key, state)| PartitionDetail {
-            key,
-            status: match state {
-                PartitionState::Materialized => "Materialized",
-                PartitionState::Failed => "Failed",
-                PartitionState::Missing => "Missing",
-            }
-            .to_string(),
-            last_timestamp: None,
-        })
-        .collect();
-
-    let materialized = (page.materialized as usize).min(total);
-    let failed = (page.failed as usize).min(total - materialized);
-    let missing = total - materialized - failed;
-    Ok(PartitionStatus {
-        asset_key,
-        total_partitions: total,
-        materialized,
-        failed,
-        missing,
-        partition_details,
-    })
 }
 
 /// A window `[offset, offset+limit)` of an asset's keys, each with its index in
@@ -578,9 +475,6 @@ pub async fn get_deployment_info(
 
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
-    use super::partition_key_members;
-    use rivers_core::storage::PartitionKey;
-
     #[test]
     fn code_location_versions_join_the_registry_with_the_directory() {
         use super::{CodeLocationVersion, SchemaInfo, code_location_versions};
@@ -651,44 +545,5 @@ mod tests {
             code_location_versions(&registry[..1], &directory, None);
         assert_eq!(no_schema[0].can_write, None);
         assert_eq!(no_schema[0].summary(), "0.13.0 · schema 13");
-    }
-
-    /// Heatmap classification compares these member strings against the gRPC window keys.
-    #[test]
-    fn multi_dim_member_matches_grpc_window_key_format() {
-        let pk = PartitionKey::Multi {
-            dims: vec![
-                ("region".into(), vec!["us".into()]),
-                ("date".into(), vec!["2024-01-01".into()]),
-            ],
-        };
-        assert_eq!(
-            partition_key_members(&pk),
-            vec!["date=2024-01-01|region=us"]
-        );
-    }
-
-    /// A batched Multi key counts each cartesian member independently.
-    #[test]
-    fn batched_multi_expands_to_one_member_per_combo() {
-        let pk = PartitionKey::Multi {
-            dims: vec![
-                ("date".into(), vec!["d1".into()]),
-                ("region".into(), vec!["us".into(), "eu".into()]),
-            ],
-        };
-        assert_eq!(
-            partition_key_members(&pk),
-            vec!["date=d1|region=us", "date=d1|region=eu"]
-        );
-    }
-
-    /// Single members stay bare values.
-    #[test]
-    fn single_members_stay_bare() {
-        let pk = PartitionKey::Single {
-            keys: vec!["a".into(), "b".into()],
-        };
-        assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
     }
 }

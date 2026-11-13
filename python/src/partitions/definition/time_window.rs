@@ -296,6 +296,69 @@ pub(crate) fn for_each_cron_tick(
     Ok(())
 }
 
+/// The first tick from `start` and the seconds between two ticks of a cron
+/// grid whose ticks are a fixed time apart: `0 * * * *` is one hour. `None`
+/// for a grid with ticks at other distances, or with more than one tick a
+/// minute.
+pub(super) fn cron_fixed_interval(
+    cron_expr: &str,
+    start: &civil::DateTime,
+) -> PyResult<Option<(civil::DateTime, f64)>> {
+    const DAY: SignedDuration = SignedDuration::from_hours(24);
+    const TICKS_MOST: usize = 24 * 60;
+
+    // A day, month or weekday field can leave days out. With none of them,
+    // every day has the same ticks.
+    let fields: Vec<&str> = cron_expr.split_whitespace().collect();
+    let days = match fields.len() {
+        5 => &fields[2..],
+        6 => &fields[3..],
+        _ => return Ok(None),
+    };
+    if days.iter().any(|field| *field != "*") {
+        return Ok(None);
+    }
+
+    let cron = parse_cron(cron_expr)?;
+    let day_start = start.date().at(0, 0, 0, 0);
+    let Ok(day_end) = day_start.checked_add(DAY) else {
+        return Ok(None);
+    };
+    let of_day: Vec<civil::DateTime> = cron
+        .iter_from(day_start, croner::Direction::Forward)
+        .take_while(|tick| *tick < day_end)
+        .take(TICKS_MOST + 1)
+        .collect();
+    let (Some(first_of_day), Some(last_of_day)) = (of_day.first(), of_day.last()) else {
+        return Ok(None);
+    };
+    if of_day.len() > TICKS_MOST {
+        return Ok(None);
+    }
+
+    // The ticks are a fixed time apart when each is one step after the tick
+    // before it, and the first tick of the next day is too.
+    let Ok(next_day) = first_of_day.checked_add(DAY) else {
+        return Ok(None);
+    };
+    let step = match of_day.get(1) {
+        Some(second) => second.duration_since(*first_of_day),
+        None => DAY,
+    };
+    let fixed = of_day
+        .windows(2)
+        .all(|pair| pair[1].duration_since(pair[0]) == step)
+        && next_day.duration_since(*last_of_day) == step;
+    if !fixed {
+        return Ok(None);
+    }
+
+    Ok(cron
+        .iter_from(*start, croner::Direction::Forward)
+        .next()
+        .map(|first| (first, step.as_secs_f64())))
+}
+
 /// Whether `t` falls exactly on the cron grid (cron is second-granular).
 pub(crate) fn cron_grid_contains(cron_expr: &str, t: civil::DateTime) -> PyResult<bool> {
     if t.subsec_nanosecond() != 0 {

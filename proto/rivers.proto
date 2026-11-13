@@ -15,6 +15,7 @@ service CodeLocationService {
   rpc GetAssetsInfo(GetAssetsInfoRequest) returns (GetAssetsInfoResponse);
   rpc GetPartitionKeys(GetPartitionKeysRequest) returns (GetPartitionKeysResponse);
   rpc GetPartitionKeyIndex(GetPartitionKeyIndexRequest) returns (GetPartitionKeyIndexResponse);
+  rpc GetPartitionGroups(GetPartitionGroupsRequest) returns (GetPartitionGroupsResponse);
   rpc GetSchedules(GetSchedulesRequest) returns (GetSchedulesResponse);
   rpc GetSensors(GetSensorsRequest) returns (GetSensorsResponse);
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
@@ -155,6 +156,54 @@ message GetPartitionKeyIndexRequest {
 }
 message GetPartitionKeyIndexResponse {
   int64 index = 1;
+}
+
+// The keys of one dimension of an asset as the rows of the partition
+// outline: groups of keys that follow each other, or the keys.
+message GetPartitionGroupsRequest {
+  string asset_key = 1;
+  // Multi dimension name. Empty = the first dimension of the asset by name.
+  string dimension = 2;
+  // The keys to split: from `first_key` to `last_key`. Both empty = every key.
+  string first_key = 3;
+  string last_key = 4;
+  // The most groups the reply holds: the finest split that fits. 0 = the
+  // next split of the keys.
+  uint32 max_groups = 5;
+}
+message GetPartitionGroupsResponse {
+  repeated PartitionKeyGroup groups = 1;
+  // The keys of the dimension ascend in definition order. False: the reply
+  // holds no group, and the keys are read in pages (GetPartitionKeys).
+  bool ascending = 2;
+  // Each group is one key.
+  bool of_keys = 3;
+  // The unit of time of one group ("month", "day"). Empty when not known.
+  string unit = 4;
+  // The unit of time of one key of the dimension. Empty when not known.
+  string key_unit = 5;
+  // The number of keys of the dimension.
+  uint64 total_keys = 6;
+  // The keys of the dimension are windows of time.
+  bool time = 7;
+  // The dimensions of the asset in the order of their names: the order of a
+  // stored partition key. An asset with one dimension has one entry with no name.
+  repeated PartitionDimension dimensions = 8;
+}
+message PartitionDimension {
+  string name = 1;
+  // The number of keys. 0 for a dynamic set: its keys are in storage.
+  uint64 keys = 2;
+  // The name of the dynamic set. Empty for the other kinds.
+  string dynamic_name = 3;
+}
+message PartitionKeyGroup {
+  // The start the keys share ("2024-06"), the key, or "first … last".
+  string label = 1;
+  string first_key = 2;
+  string last_key = 3;
+  // The number of keys.
+  uint64 keys = 4;
 }
 
 message ValidateConfigRequest {

@@ -6,8 +6,9 @@ use surrealdb::types::{RecordId, SurrealValue};
 use crate::storage::retry;
 use crate::storage::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, ConcurrencyClaimStatus,
-    CoordinatorRunInfo, PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord,
-    RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
+    CoordinatorRunInfo, PartitionBounds, PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit,
+    RunRecord, RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent,
+    StoredTick,
 };
 
 use super::partition_keys::KEY_ROWS_CHANGED;
@@ -599,6 +600,16 @@ impl PerCodeLocationStorage for SurrealStorage {
         .await
     }
 
+    async fn count_materialized_partitions_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<u64>> {
+        self.count_partitions_in_bounds(code_location_id, asset_key, bounds)
+            .await
+    }
+
     async fn count_dynamic_partitions(
         &self,
         code_location_id: &str,
@@ -680,6 +691,17 @@ impl PerCodeLocationStorage for SurrealStorage {
         keys: &[PartitionKey],
     ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
         self.partition_timestamps_for_keys(code_location_id, asset_key, keys)
+            .await
+    }
+
+    async fn get_partition_timestamps_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        self.partition_timestamps_in_bounds(code_location_id, asset_key, bounds, limit)
             .await
     }
 

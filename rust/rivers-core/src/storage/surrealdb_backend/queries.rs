@@ -154,6 +154,21 @@ pub(super) const PARTITION_TIMESTAMPS_OF_KEY: &str = "\
      WHERE code_location_id = $cl AND asset_key = $asset_key \
      AND partition_key = $partition AND last_timestamp IS NOT NONE";
 
+/// How many rows of an asset have a key from `$lower` to `$upper`. The
+/// engine counts them on `idx_asset_part` and reads no row.
+pub(super) const COUNT_PARTITIONS_IN_BOUNDS: &str = "\
+     SELECT count() AS total FROM asset_partitions \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key >= $lower AND partition_key <= $upper GROUP ALL";
+
+/// The materialization time and last run of the partitions of an asset with
+/// a key from `$lower` to `$upper`.
+pub(super) const PARTITION_TIMESTAMPS_IN_BOUNDS: &str = "\
+     SELECT partition_key, last_timestamp, last_run_id FROM asset_partitions \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key >= $lower AND partition_key <= $upper \
+     AND last_timestamp IS NOT NONE LIMIT $limit";
+
 /// The linked runs and the counts per outcome of the backfills `$ids`. `IN` on
 /// the leading index column is one index scan per id. The last statement
 /// counts the rows per partition of a backfill that ended before V14.

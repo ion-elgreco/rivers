@@ -464,6 +464,26 @@ impl CodeLocationService for CodeLocationImpl {
         Ok(Response::new(resp))
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.get_partition_groups")]
+    async fn get_partition_groups(
+        &self,
+        request: Request<GetPartitionGroupsRequest>,
+    ) -> Result<Response<GetPartitionGroupsResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .run_on_python(move |py, repo| {
+                let repo_ref = repo.get();
+                let state = repo_ref
+                    .state
+                    .get_attached(py)
+                    .ok_or("repository not resolved")?;
+                let asset_def = resolve_partition_target(&state, &req.asset_key, "")?;
+                py.detach(|| partition_groups(asset_def, &req))
+            })
+            .await?;
+        Ok(Response::new(resp))
+    }
+
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.validate_config")]
     async fn validate_config(
         &self,
