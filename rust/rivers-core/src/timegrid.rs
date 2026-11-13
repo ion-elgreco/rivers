@@ -1,5 +1,9 @@
 //! Wall-clock time-window grid for time-partition keys.
 
+mod day_grid;
+
+pub use day_grid::{DayGrid, Found};
+
 use anyhow::{Result, bail};
 use jiff::{SignedDuration, civil};
 use serde::{Deserialize, Serialize};

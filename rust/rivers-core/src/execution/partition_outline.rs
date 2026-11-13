@@ -18,6 +18,12 @@ pub trait Keys {
     /// The key at the place `index`, which is less than `len()`.
     fn key(&self, index: usize) -> String;
 
+    /// The places where `key` is cut into the starts that the keys of a
+    /// group share.
+    fn cuts(&self, key: &str) -> Vec<usize> {
+        cuts(key, &[])
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -89,7 +95,7 @@ pub fn split<K: Keys + ?Sized>(keys: &K, places: Range<usize>, most: usize) -> S
 
     let mut finest: Option<(usize, Vec<Range<usize>>)> = None;
     let mut above = 1;
-    for shared in cuts(&keys.key(places.start)) {
+    for shared in keys.cuts(&keys.key(places.start)) {
         // More groups than `most`: every later cut has as many or more.
         let Some(runs) = runs_at(keys, places.clone(), shared, most) else {
             break;
@@ -112,7 +118,7 @@ pub fn children<K: Keys + ?Sized>(keys: &K, places: Range<usize>) -> Split {
         return of_keys(keys, places);
     }
 
-    for shared in cuts(&keys.key(places.start)) {
+    for shared in keys.cuts(&keys.key(places.start)) {
         let Some(runs) = runs_at(keys, places.clone(), shared, ROWS_MOST) else {
             break;
         };
@@ -140,7 +146,7 @@ pub fn key_length<K: Keys + ?Sized>(keys: &K) -> Option<usize> {
     sample
         .windows(2)
         .map(|pair| {
-            cuts(&pair[0])
+            keys.cuts(&pair[0])
                 .into_iter()
                 .find(|shared| start(&pair[0], *shared) != start(&pair[1], *shared))
                 .unwrap_or(pair[0].len())
@@ -163,8 +169,18 @@ fn first_place(places: Range<usize>, after: impl Fn(usize) -> bool) -> usize {
     low
 }
 
-/// The places in `key` where a run of digits ends before the end of the key.
-fn cuts(key: &str) -> Vec<usize> {
+/// The places before the end of `key` where it is cut into the starts that
+/// the keys of a group share: `of_format`, the cuts of the format of the key,
+/// or with none of them each place where a run of digits ends.
+pub fn cuts(key: &str, of_format: &[usize]) -> Vec<usize> {
+    if !of_format.is_empty() {
+        return of_format
+            .iter()
+            .copied()
+            .filter(|cut| *cut < key.len())
+            .collect();
+    }
+
     let bytes = key.as_bytes();
     (1..bytes.len())
         .filter(|&at| bytes[at - 1].is_ascii_digit() && !bytes[at].is_ascii_digit())
@@ -274,14 +290,15 @@ fn group<K: Keys + ?Sized>(keys: &K, run: Range<usize>, first: String, label: St
 ///
 /// A mark is where the start that the groups share changes: `2024-02` along
 /// groups of days. Groups with no such start get marks at equal steps.
-pub fn marks(groups: &[KeyGroup], most: usize) -> Vec<(usize, String)> {
+/// `of_format` holds the cuts of the format of the keys, when it has some.
+pub fn marks(groups: &[KeyGroup], of_format: &[usize], most: usize) -> Vec<(usize, String)> {
     let Some(first) = groups.first() else {
         return Vec::new();
     };
 
     let mut finest = None;
     let mut above = 1;
-    for shared in cuts(&first.first) {
+    for shared in cuts(&first.first, of_format) {
         let mut level: Vec<(usize, String)> = Vec::new();
         for (at, group) in groups.iter().enumerate() {
             let text = start(&group.first, shared);
@@ -369,6 +386,15 @@ pub fn time_unit(fmt: &str, shared: usize) -> Option<&'static str> {
         .map(|(_, unit)| unit)
 }
 
+/// The cuts of the key format `fmt`: the place where each field of time ends.
+/// None when a part of the format has no fixed width.
+pub fn time_cuts(fmt: &str) -> Vec<usize> {
+    match fields(fmt) {
+        (units, true) => units.into_iter().map(|(at, _)| at).collect(),
+        (_, false) => Vec::new(),
+    }
+}
+
 /// Whether the keys of the format `fmt` sort in the order of time: fields of
 /// a fixed width, from the year down, each shorter than the one before.
 pub fn time_format_ascends(fmt: &str) -> bool {
@@ -421,7 +447,7 @@ mod tests {
         let keys = hours(91);
         let days = whole(&keys, 400);
 
-        let marks = marks(&days.groups, 12);
+        let marks = marks(&days.groups, &[], 12);
 
         assert_eq!(
             marks,
@@ -438,7 +464,7 @@ mod tests {
         let keys = hours(182);
         let months = whole(&keys, 62);
 
-        let marks = marks(&months.groups, 12);
+        let marks = marks(&months.groups, &[], 12);
 
         assert_eq!(marks.len(), 6);
         assert_eq!(marks[5], (5, "2024-06".to_string()));
@@ -451,7 +477,7 @@ mod tests {
         let parts = whole(&zones, 62);
 
         assert_eq!(
-            marks(&keys.groups, 12),
+            marks(&keys.groups, &[], 12),
             vec![
                 (0, "001".to_string()),
                 (44, "045".to_string()),
@@ -461,9 +487,12 @@ mod tests {
                 (220, "221".to_string()),
             ]
         );
-        assert_eq!(marks(&parts.groups, 12)[1], (8, "041".to_string()));
-        assert_eq!(marks(&keys.groups[..1], 12), vec![(0, "001".to_string())]);
-        assert!(marks(&[], 12).is_empty());
+        assert_eq!(marks(&parts.groups, &[], 12)[1], (8, "041".to_string()));
+        assert_eq!(
+            marks(&keys.groups[..1], &[], 12),
+            vec![(0, "001".to_string())]
+        );
+        assert!(marks(&[], &[], 12).is_empty());
     }
 
     #[test]
@@ -632,6 +661,102 @@ mod tests {
         assert_eq!(key_length(&from_eleven_at_night[..]), Some(13));
         assert_eq!(key_length(&zones[..]), Some(3));
         assert_eq!(key_length(&zones[..1]), None);
+    }
+
+    /// The keys of a time format, with the cuts of the format.
+    struct OfFormat {
+        keys: Vec<String>,
+        cuts: Vec<usize>,
+    }
+
+    impl OfFormat {
+        /// Every hour of the first `days` days of 2024, with no separator.
+        fn hours(days: u32) -> Self {
+            Self {
+                keys: hours(days)
+                    .into_iter()
+                    .map(|key| key.replace(['-', 'T', ':'], "")[..10].to_string())
+                    .collect(),
+                cuts: time_cuts("%Y%m%d%H"),
+            }
+        }
+    }
+
+    impl Keys for OfFormat {
+        fn len(&self) -> usize {
+            self.keys.len()
+        }
+
+        fn key(&self, index: usize) -> String {
+            self.keys[index].clone()
+        }
+
+        fn cuts(&self, key: &str) -> Vec<usize> {
+            cuts(key, &self.cuts)
+        }
+    }
+
+    #[test]
+    fn keys_with_no_separator_split_at_the_fields_of_their_format() {
+        let keys = OfFormat::hours(60);
+        assert_eq!(keys.key(0), "2024010100");
+
+        let months = split(&keys, 0..keys.len(), 31);
+        let days = children(&keys, between(&keys, "2024020100", "2024022923"));
+        let of_a_day = children(&keys, between(&keys, "2024022900", "2024022923"));
+
+        assert_eq!(labels(&months), ["202401", "202402"]);
+        assert_eq!(months.shared, Some(6));
+        assert_eq!(months.groups[1].keys, 29 * 24);
+        assert_eq!(days.groups.len(), 29);
+        assert_eq!(days.shared, Some(8));
+        assert_eq!(days.groups[28].label, "20240229");
+        assert!(of_a_day.of_keys);
+        assert_eq!(of_a_day.groups.len(), 24);
+        assert_eq!(key_length(&keys), Some(10));
+    }
+
+    #[test]
+    fn keys_with_no_separator_and_no_cuts_split_into_equal_parts() {
+        let keys = OfFormat::hours(60).keys;
+
+        let parts = whole(&keys, 31);
+
+        assert_eq!(parts.shared, None);
+        assert_eq!(parts.groups[0].label, "2024010100 … 2024010222");
+    }
+
+    #[test]
+    fn marks_of_keys_with_no_separator_follow_the_cuts_of_their_format() {
+        let keys = OfFormat::hours(91);
+        let days = split(&keys, 0..keys.len(), 400);
+
+        assert_eq!(days.groups.len(), 91);
+        assert_eq!(
+            marks(&days.groups, &keys.cuts, 12),
+            vec![
+                (0, "202401".to_string()),
+                (31, "202402".to_string()),
+                (60, "202403".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cuts_of_a_format_are_the_ends_of_its_fields() {
+        assert_eq!(time_cuts("%Y-%m-%dT%H:%M"), [4, 7, 10, 13, 16]);
+        assert_eq!(time_cuts("%Y%m%d%H"), [4, 6, 8, 10]);
+        assert_eq!(time_cuts("%FT%T"), [4, 7, 10, 13, 16, 19]);
+        assert_eq!(time_cuts("%Y-%b-%d"), [0usize; 0]);
+
+        assert_eq!(cuts("2024010100", &[4, 6, 8, 10]), [4, 6, 8]);
+        assert_eq!(
+            cuts("2024-01-01T00:00", &[4, 7, 10, 13, 16]),
+            [4, 7, 10, 13]
+        );
+        assert_eq!(cuts("2024-01-01T00:00", &[]), [4, 7, 10, 13]);
+        assert_eq!(cuts("v2-2024-01", &[7, 10]), [7]);
+        assert_eq!(cuts("customer", &[]), [0usize; 0]);
     }
 
     /// A dimension of a million keys that counts the keys it gives out.

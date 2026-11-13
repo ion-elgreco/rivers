@@ -189,6 +189,10 @@ message GetPartitionGroupsResponse {
   // The dimensions of the asset in the order of their names: the order of a
   // stored partition key. An asset with one dimension has one entry with no name.
   repeated PartitionDimension dimensions = 8;
+  // The places where a key is cut into the starts that the keys of a group
+  // share: the end of each field of a time format ("2024", "2024-06"). Empty:
+  // a key is cut where a run of digits ends.
+  repeated uint32 cuts = 9;
 }
 message PartitionDimension {
   string name = 1;

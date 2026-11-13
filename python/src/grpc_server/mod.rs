@@ -402,34 +402,7 @@ impl CodeLocationService for CodeLocationImpl {
                     .get_attached(py)
                     .ok_or("repository not resolved")?;
                 let target = resolve_partition_target(&state, &req.asset_key, &req.dimension)?;
-                // Empty query = browse (cheap total + window); non-empty = filter
-                // (page the matches; `total` is the match count).
-                let (keys, indices, total) = if req.query.is_empty() {
-                    let total = target.partition_count() as u64;
-                    let keys: Vec<String> = target
-                        .get_partition_keys_window(req.offset as usize, req.limit as usize)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(py_partition_key_display)
-                        .collect();
-                    let indices = (req.offset..).take(keys.len()).collect();
-                    (keys, indices, total)
-                } else {
-                    let (page, total) = target
-                        .get_partition_keys_filtered(
-                            &req.query,
-                            req.offset as usize,
-                            req.limit as usize,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let (indices, keys) = page.into_iter().map(|(i, k)| (i as u64, k)).unzip();
-                    (keys, indices, total as u64)
-                };
-                Ok(GetPartitionKeysResponse {
-                    keys,
-                    total,
-                    indices,
-                })
+                py.detach(|| partition_keys(target, &req))
             })
             .await?;
         Ok(Response::new(resp))
@@ -453,8 +426,8 @@ impl CodeLocationService for CodeLocationImpl {
                     .get_attached(py)
                     .ok_or("repository not resolved")?;
                 let target = resolve_partition_target(&state, &req.asset_key, &req.dimension)?;
-                let index = target
-                    .single_dim_key_index(&req.key)
+                let index = py
+                    .detach(|| target.single_dim_key_index(&req.key))
                     .map_err(|e| e.to_string())?
                     .map(|i| i as i64)
                     .unwrap_or(-1);
