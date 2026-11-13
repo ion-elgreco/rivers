@@ -88,6 +88,9 @@ mod read {
         pub key_unit: String,
         /// The keys are windows of time.
         pub time: bool,
+        /// The places where a key is cut into the starts that the keys of a
+        /// group share. Empty: a key is cut where a run of digits ends.
+        pub cuts: Vec<usize>,
     }
 
     impl Split {
@@ -123,6 +126,7 @@ mod read {
                 unit: reply.unit,
                 key_unit: reply.key_unit,
                 time: reply.time,
+                cuts: reply.cuts.into_iter().map(|cut| cut as usize).collect(),
             }
         }
     }
@@ -748,7 +752,7 @@ mod read {
             Ok(PartitionStrip {
                 heading: heading_of(place, split),
                 note: strip_note(place, split, &bars),
-                marks: keys::marks(&split.groups, MARKS_MOST)
+                marks: keys::marks(&split.groups, &split.cuts, MARKS_MOST)
                     .into_iter()
                     .map(|(at, text)| (at as u32, text))
                     .collect(),
@@ -907,6 +911,23 @@ mod read {
             key_unit: &'static str,
             /// The dynamic set that holds the keys. Empty: `keys` are these.
             dynamic: &'static str,
+            /// The ends of the fields of the key format. Empty: a key is cut
+            /// where a run of digits ends.
+            cuts: Vec<usize>,
+        }
+
+        impl keys::Keys for Dimension {
+            fn len(&self) -> usize {
+                self.keys.len()
+            }
+
+            fn key(&self, index: usize) -> String {
+                self.keys[index].clone()
+            }
+
+            fn cuts(&self, key: &str) -> Vec<usize> {
+                keys::cuts(key, &self.cuts)
+            }
         }
 
         fn named(name: &'static str, keys: &[&str]) -> Dimension {
@@ -915,6 +936,7 @@ mod read {
                 keys: keys.iter().map(|key| key.to_string()).collect(),
                 key_unit: "",
                 dynamic: "",
+                cuts: vec![],
             }
         }
 
@@ -932,6 +954,23 @@ mod read {
                     .collect(),
                 key_unit: "hour",
                 dynamic: "",
+                cuts: vec![],
+            }
+        }
+
+        /// The hours of January and February 2024 with the key format
+        /// `%Y%m%d%H`.
+        fn hours_with_no_separator() -> Dimension {
+            let hours = hours_of_two_months();
+            Dimension {
+                name: "",
+                keys: hours
+                    .keys
+                    .iter()
+                    .map(|key| key[..13].replace(['-', 'T'], ""))
+                    .collect(),
+                cuts: vec![4, 6, 8, 10],
+                ..hours
             }
         }
 
@@ -984,10 +1023,10 @@ mod read {
                     });
                 }
 
-                let places = keys::between(all, &request.first_key, &request.last_key);
+                let places = keys::between(dimension, &request.first_key, &request.last_key);
                 let split = match request.max_groups {
-                    0 => keys::children(all, places),
-                    most => keys::split(all, places, most as usize),
+                    0 => keys::children(dimension, places),
+                    most => keys::split(dimension, places, most as usize),
                 };
                 Ok(GetPartitionGroupsResponse {
                     groups: split
@@ -1005,6 +1044,7 @@ mod read {
                     key_unit: dimension.key_unit.to_string(),
                     total_keys: all.len() as u64,
                     time: !dimension.key_unit.is_empty(),
+                    cuts: dimension.cuts.iter().map(|cut| *cut as u32).collect(),
                     ..reply
                 })
             }
@@ -1209,6 +1249,37 @@ mod read {
         }
 
         #[tokio::test]
+        async fn keys_with_no_separator_have_rows_and_marks_at_the_fields_of_their_format() {
+            let storage = store_with(&[built(single("2024021005"), 100)]).await;
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let outline = outline(&scoped, Some(Definition(vec![hours_with_no_separator()])));
+
+            let overview = outline.overview().await.unwrap();
+
+            // One bar per day, with a mark where the month changes.
+            let strip = overview.strip.as_ref().unwrap();
+            assert_eq!(strip.bars.len(), 60);
+            assert_eq!(strip.bars[40].label, "20240210");
+            assert_eq!(
+                strip.marks,
+                vec![(0, "202401".to_string()), (31, "202402".to_string())]
+            );
+
+            let months = groups(&overview.top);
+            assert_eq!(
+                months
+                    .iter()
+                    .map(|row| (row.label.as_str(), row.counts))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("202402", PartitionCounts::of(696, 1, 0)),
+                    ("202401", PartitionCounts::of(744, 0, 0)),
+                ]
+            );
+        }
+
+        #[tokio::test]
         async fn the_find_field_lists_the_keys_that_hold_the_text() {
             let storage = store_with(&[built(cell("2024-02-10T05:00", "a"), 100)]).await;
             let ctx = CodeLocationContext::default_for_tests();
@@ -1278,6 +1349,7 @@ mod read {
                 keys,
                 key_unit: "",
                 dynamic: "",
+                cuts: vec![],
             }]);
             let outline = outline(&scoped, Some(definition));
 
@@ -1316,6 +1388,7 @@ mod read {
                 keys: vec![],
                 key_unit: "",
                 dynamic: "customers",
+                cuts: vec![],
             }]);
             let outline = outline(&scoped, Some(definition));
 

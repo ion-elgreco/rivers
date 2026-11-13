@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 use rivers_api::rivers::*;
 use rivers_core::execution::partition_outline::{
-    Keys, ascending, between, children, key_length, split, time_format_ascends, time_unit,
+    between, children, key_length, split, time_cuts, time_format_ascends, time_unit,
 };
 use tonic::Status;
 
 use crate::automation::schedule::TickRequest;
 use crate::config::run_config::{ConfigIssue, LocPart, config_schema_json, validate_run_config};
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
+use crate::partitions::definition::KeysByPlace;
 use crate::partitions::key_range::{
     DimensionSelection, PartitionKeyRangeInner, PyPartitionKeyRange,
 };
@@ -166,33 +167,40 @@ pub(super) fn resolve_partition_target<'a>(
     }
 }
 
-/// The keys of a definition with one dimension, each read by its place.
-struct KeysByPlace<'a> {
-    def: &'a PartitionsDefinition,
-    len: usize,
-}
+/// One page of the keys of `target`, in the order of the definition. With a
+/// query: of the keys that hold that text, and `total` counts those.
+pub(super) fn partition_keys(
+    target: &PartitionsDefinition,
+    req: &GetPartitionKeysRequest,
+) -> Result<GetPartitionKeysResponse, String> {
+    let (offset, limit) = (req.offset as usize, req.limit as usize);
 
-impl<'a> KeysByPlace<'a> {
-    fn of(def: &'a PartitionsDefinition) -> Self {
-        Self {
-            def,
-            len: def.partition_count(),
-        }
+    if req.query.is_empty() {
+        let keys: Vec<String> = target
+            .get_partition_keys_window(offset, limit)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(py_partition_key_display)
+            .collect();
+        return Ok(GetPartitionKeysResponse {
+            indices: (req.offset..).take(keys.len()).collect(),
+            keys,
+            total: target.partition_count() as u64,
+        });
     }
-}
 
-impl Keys for KeysByPlace<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn key(&self, index: usize) -> String {
-        self.def
-            .nth_single_dim_key(index)
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    }
+    let (page, total) = target
+        .get_partition_keys_filtered(&req.query, offset, limit)
+        .map_err(|e| e.to_string())?;
+    let (indices, keys) = page
+        .into_iter()
+        .map(|(place, key)| (place as u64, key))
+        .unzip();
+    Ok(GetPartitionKeysResponse {
+        keys,
+        total: total as u64,
+        indices,
+    })
 }
 
 /// The dimensions of `def` in the order of their names: the order of a stored
@@ -200,10 +208,7 @@ impl Keys for KeysByPlace<'_> {
 fn partition_dimensions(def: &PartitionsDefinition) -> Vec<PartitionDimension> {
     let dimension = |name: &str, def: &PartitionsDefinition| PartitionDimension {
         name: name.to_string(),
-        keys: match def.with_fixed_interval() {
-            Ok(Some(fixed)) => fixed.partition_count(),
-            _ => def.partition_count(),
-        } as u64,
+        keys: def.partition_count() as u64,
         dynamic_name: match def {
             PartitionsDefinition::Dynamic { name } => name.clone(),
             _ => String::new(),
@@ -251,40 +256,18 @@ pub(super) fn partition_groups(
         }
     };
 
-    // A cron grid with ticks a fixed time apart gives a key by its place, as
-    // a grid with an interval does. Another cron grid reaches a key by a walk
-    // from its start: its keys are listed once.
-    let fixed = def.with_fixed_interval().map_err(|e| e.to_string())?;
-    let def = fixed.as_ref().unwrap_or(def);
-
-    let by_place;
-    let listed: Vec<String>;
-    let (keys, fmt, ascends): (&dyn Keys, Option<&str>, bool) = match def {
-        PartitionsDefinition::Static { keys } => {
-            by_place = KeysByPlace::of(def);
-            let ascends = keys.iter().zip(keys.iter().skip(1)).all(|(a, b)| a < b);
-            (&by_place, None, ascends)
-        }
-        PartitionsDefinition::TimeWindow {
-            interval_seconds: Some(_),
-            fmt,
-            ..
-        } => {
-            by_place = KeysByPlace::of(def);
-            (&by_place, Some(fmt), time_format_ascends(fmt))
-        }
-        PartitionsDefinition::TimeWindow { fmt, .. } => {
-            listed = def.enumerate_single_dim_keys().map_err(|e| e.to_string())?;
-            let ascends = ascending(&listed);
-            (&listed, Some(fmt), ascends)
-        }
-        // The keys of a dynamic set are in storage.
-        PartitionsDefinition::Dynamic { .. } | PartitionsDefinition::Multi { .. } => {
-            return Ok(GetPartitionGroupsResponse {
-                dimensions,
-                ..Default::default()
-            });
-        }
+    // The keys of a dynamic set are in storage.
+    let by_place = def.keys_by_place().map_err(|e| e.to_string())?;
+    let Some(keys) = &by_place else {
+        return Ok(GetPartitionGroupsResponse {
+            dimensions,
+            ..Default::default()
+        });
+    };
+    let fmt = keys.fmt();
+    let ascends = match keys {
+        KeysByPlace::Static(listed) => listed.iter().zip(listed.iter().skip(1)).all(|(a, b)| a < b),
+        _ => fmt.is_some_and(time_format_ascends),
     };
     let total_keys = keys.len();
     let time = fmt.is_some();
@@ -329,6 +312,12 @@ pub(super) fn partition_groups(
         total_keys: total_keys as u64,
         time,
         dimensions,
+        cuts: fmt
+            .map(time_cuts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cut| cut as u32)
+            .collect(),
     })
 }
 

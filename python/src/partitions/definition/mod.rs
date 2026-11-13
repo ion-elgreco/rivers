@@ -1,6 +1,9 @@
 //! PartitionsDefinition — Static, TimeWindow, Multi, and Dynamic partition schemes.
+mod by_place;
 mod time_window;
 
+pub(crate) use by_place::KeysByPlace;
+use by_place::day_grid;
 pub(crate) use time_window::*;
 
 use std::collections::HashMap;
@@ -237,46 +240,10 @@ impl PartitionsDefinition {
         }
     }
 
-    /// The `idx`-th key (in definition order) of a single-dimension definition.
-    pub(crate) fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
-        match self {
-            Self::Static { keys } => Ok(keys.get_at(idx).cloned()),
-            Self::TimeWindow { .. } => Ok(self
-                .get_partition_keys_window(idx, 1)?
-                .into_iter()
-                .next()
-                .and_then(|pk| match pk {
-                    PyPartitionKey::Single { key } => key.into_iter().next(),
-                    _ => None,
-                })),
-            _ => Ok(None),
-        }
-    }
-
-    /// A cron grid whose ticks are a fixed time apart, as the same grid with
-    /// an interval: a key of it is found by its place, with no walk from the
-    /// start. `None` for every other definition.
-    pub(crate) fn with_fixed_interval(&self) -> PyResult<Option<Self>> {
-        let Self::TimeWindow {
-            cron_schedule: Some(expr),
-            start,
-            end,
-            fmt,
-            ..
-        } = self
-        else {
-            return Ok(None);
-        };
-
-        Ok(
-            cron_fixed_interval(expr, start)?.map(|(first, secs)| Self::TimeWindow {
-                cron_schedule: None,
-                interval_seconds: Some(secs),
-                start: first,
-                end: *end,
-                fmt: fmt.clone(),
-            }),
-        )
+    /// The keys of a definition with one dimension, each found by its place.
+    /// `None` for a definition with more dimensions, and for a dynamic set.
+    pub(crate) fn keys_by_place(&self) -> PyResult<Option<KeysByPlace<'_>>> {
+        KeysByPlace::of(self)
     }
 
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.
@@ -408,37 +375,22 @@ impl PartitionsDefinition {
                 .take(limit)
                 .map(|k| single(k.clone()))
                 .collect()),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                let keys = if let Some(secs) = interval_seconds {
-                    interval_window(*secs, start, end_dt, fmt, offset, limit)
-                } else if let Some(expr) = cron_schedule {
-                    let mut out = Vec::new();
-                    let mut idx = 0usize;
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        if idx >= offset && out.len() < limit {
-                            out.push(naive.strftime(fmt).to_string());
-                        }
-                        idx += 1;
-                        out.len() < limit
-                    })?;
-                    out
-                } else {
-                    Vec::new()
-                };
+            Self::TimeWindow { .. } => {
+                let keys = self
+                    .keys_by_place()?
+                    .map(|keys| keys.window(offset, limit))
+                    .unwrap_or_default();
                 Ok(keys.into_iter().map(single).collect())
             }
             Self::Multi { dimensions } => {
                 let n = dimensions.len();
-                let sizes: Vec<usize> = dimensions
+                let by_place = dimensions
                     .iter()
-                    .map(|(_, d)| d.partition_count())
+                    .map(|(_, def)| def.keys_by_place())
+                    .collect::<PyResult<Vec<_>>>()?;
+                let sizes: Vec<usize> = by_place
+                    .iter()
+                    .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
                     .collect();
                 let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
                 let end = offset.saturating_add(limit).min(total);
@@ -453,14 +405,17 @@ impl PartitionsDefinition {
                 for k in offset..end {
                     let mut rem = k;
                     let mut combo: HashMap<String, Vec<String>> = HashMap::new();
-                    for (i, (name, def)) in dimensions.iter().enumerate() {
+                    for (i, (name, _)) in dimensions.iter().enumerate() {
                         let idx_i = rem / strides[i];
                         rem %= strides[i];
-                        let key = def.nth_single_dim_key(idx_i)?.ok_or_else(|| {
-                            PartitionDefinitionError::new_err(format!(
-                                "dimension '{name}' has no key at index {idx_i}"
-                            ))
-                        })?;
+                        let key = by_place[i]
+                            .as_ref()
+                            .and_then(|keys| keys.get(idx_i))
+                            .ok_or_else(|| {
+                                PartitionDefinitionError::new_err(format!(
+                                    "dimension '{name}' has no key at index {idx_i}"
+                                ))
+                            })?;
                         combo.insert(name.clone(), vec![key]);
                     }
                     out.push(PyPartitionKey::Multi { keys: combo });
@@ -484,81 +439,15 @@ impl PartitionsDefinition {
         offset: usize,
         limit: usize,
     ) -> PyResult<(Vec<(usize, String)>, usize)> {
-        let mut total = 0usize;
-        let mut position = 0usize;
-        let mut page: Vec<(usize, String)> = Vec::new();
-        let mut consume = |k: String| {
-            if k.contains(query) {
-                if total >= offset && page.len() < limit {
-                    page.push((position, k));
-                }
-                total += 1;
-            }
-            position += 1;
-        };
-        match self {
-            Self::Static { keys } => {
-                for k in keys.iter() {
-                    consume(k.clone());
-                }
-            }
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                if let Some(secs) = interval_seconds {
-                    for_each_interval_tick(*secs, start, end_dt, |dt| {
-                        consume(dt.strftime(fmt).to_string());
-                        true
-                    });
-                } else if let Some(expr) = cron_schedule {
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        consume(naive.strftime(fmt).to_string());
-                        true
-                    })?;
-                }
-            }
-            _ => {}
+        match self.keys_by_place()? {
+            Some(keys) => keys.find(query, offset, limit),
+            None => Ok((Vec::new(), 0)),
         }
-        Ok((page, total))
     }
 
     /// Index of `key` in single-dim order — the "jump to key" target.
     pub fn single_dim_key_index(&self, key: &str) -> PyResult<Option<usize>> {
-        match self {
-            Self::Static { keys } => Ok(keys.get_index_of(key)),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                if let Some(secs) = interval_seconds {
-                    Ok(interval_index(*secs, start, end_dt, fmt, key))
-                } else if let Some(expr) = cron_schedule {
-                    let mut idx = 0usize;
-                    let mut found = None;
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        if naive.strftime(fmt).to_string() == key {
-                            found = Some(idx);
-                            return false;
-                        }
-                        idx += 1;
-                        true
-                    })?;
-                    Ok(found)
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
-        }
+        Ok(self.keys_by_place()?.and_then(|keys| keys.place(key)))
     }
 
     /// Total partitions, as cheaply as the kind allows.
@@ -580,6 +469,10 @@ impl PartitionsDefinition {
                 let end_dt = time_window_end(end);
                 if let Some(secs) = interval_seconds {
                     interval_window_count(*secs, start, end_dt)
+                } else if let Ok(Some(grid)) =
+                    day_grid(cron_schedule, interval_seconds, start, end_dt)
+                {
+                    grid.len()
                 } else if let Some(expr) = cron_schedule {
                     let mut n = 0usize;
                     let _ = for_each_cron_tick(expr, start, end_dt, |_| {
