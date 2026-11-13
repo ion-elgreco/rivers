@@ -298,6 +298,7 @@ machine. The run page in the UI shows it.
 | `status` | `str` |
 | `start_time` | `int` |
 | `end_time` | `int \| None` |
+| `execution_start_time` | `int \| None` |
 | `tags` | `list[tuple[str, str]]` |
 | `node_names` | `list[str]` |
 | `priority` | `int` |
@@ -306,6 +307,8 @@ machine. The run page in the UI shows it.
 | `launched_by` | `LaunchedBy` |
 | `action` | `str \| None` |
 | `config` | `dict[str, Any] \| None` |
+
+The times are nanoseconds since the Unix epoch. `start_time` is when the run was created; a queued run waits from this time. `execution_start_time` is when the run began to execute: it is `None` while the run waits, and for a run that ended before it began. The duration of a run is `end_time - execution_start_time`.
 
 `config` holds the [launch document](../concepts/configuration.md#the-launch-document) the run was launched with; `None` means the definitions as they are.
 

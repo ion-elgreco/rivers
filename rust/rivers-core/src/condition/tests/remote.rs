@@ -133,6 +133,7 @@ fn run(
         status,
         start_time,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: node_names.iter().map(|n| n.to_string()).collect(),
         priority: 0,

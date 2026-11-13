@@ -915,6 +915,7 @@ impl PyStorage {
             status: parse_run_status(status)?,
             start_time,
             end_time: None,
+            execution_start_time: None,
             tags,
             node_names,
             priority,

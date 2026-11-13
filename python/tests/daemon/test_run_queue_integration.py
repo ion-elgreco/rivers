@@ -718,6 +718,66 @@ class TestBackfillResume:
             daemon.stop()
 
 
+class TestRunQueueTimes:
+    def test_a_queued_run_begins_when_it_starts(self, storage):
+        """The wait in the queue is not a part of the time that a run executes."""
+        import time
+
+        @rs.Asset(name="waited", io_handler=rs.InMemoryIOHandler())
+        def waited() -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[waited],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=2, dequeue_interval="100ms"
+            ),
+        )
+        repo.resolve(storage=storage)
+        handle = repo._submit_run(selection=["waited"])
+        assert storage.get_run(handle.run_id).execution_start_time is None
+
+        # No daemon runs yet: the run waits.
+        wait_seconds = 1.0
+        time.sleep(wait_seconds)
+
+        daemon = AutomationDaemon(repo=repo, storage=storage)
+        daemon.start()
+        try:
+            run = _wait_for_run_terminal(storage, handle.run_id, timeout=20)
+        finally:
+            daemon.stop()
+
+        assert run is not None and run.status == "Success"
+        assert run.execution_start_time - run.start_time >= wait_seconds * 1e9
+        assert run.execution_start_time <= run.end_time
+
+    def test_a_run_canceled_in_the_queue_did_not_begin(self, storage):
+        """A run that ends before it starts has no start of execution."""
+
+        @rs.Asset(name="never_ran", io_handler=rs.InMemoryIOHandler())
+        def never_ran() -> int:
+            return 1
+
+        repo = rs.CodeRepository(
+            assets=[never_ran],
+            default_executor=rs.Executor.in_process(),
+            run_queue=rs.RunQueueConfig(
+                max_concurrent_runs=2, dequeue_interval="100ms"
+            ),
+        )
+        repo.resolve(storage=storage)
+        handle = repo._submit_run(selection=["never_ran"])
+
+        assert storage.cancel_queued_run(handle.run_id)
+
+        run = storage.get_run(handle.run_id)
+        assert run.status == "Canceled"
+        assert run.end_time is not None
+        assert run.execution_start_time is None
+
+
 class TestRunQueueConfig:
     def test_queued_run_applies_the_config_on_its_record(self, storage):
         """The queued record carries the config; the local run backend reads

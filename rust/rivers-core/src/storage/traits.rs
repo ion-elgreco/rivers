@@ -474,7 +474,8 @@ pub trait StorageBackend: PerCodeLocationStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> impl Future<Output = Result<()>> + Send;
-    /// Transition an existing run to `Started` unless it was canceled.
+    /// Transition an existing run to `Started` unless it was canceled, and
+    /// record when it began (the first start counts).
     /// Returns `false` (without touching the record) when the run is
     /// `Canceled` — the executor must skip the run instead of resurrecting it.
     fn try_start_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;

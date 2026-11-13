@@ -377,6 +377,9 @@ pub struct PyRunRecord {
     pub start_time: i64,
     #[pyo3(get)]
     pub end_time: Option<i64>,
+    /// See [`RunRecord::execution_start_time`].
+    #[pyo3(get)]
+    pub execution_start_time: Option<i64>,
     #[pyo3(get)]
     pub tags: Vec<(String, String)>,
     #[pyo3(get)]
@@ -417,6 +420,7 @@ impl From<RunRecord> for PyRunRecord {
             status: format_run_status(r.status).to_string(),
             start_time: r.start_time,
             end_time: r.end_time,
+            execution_start_time: r.execution_start_time,
             tags: r.tags,
             node_names: r.node_names,
             priority: r.priority,

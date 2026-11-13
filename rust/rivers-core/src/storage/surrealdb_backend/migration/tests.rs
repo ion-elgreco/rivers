@@ -1026,6 +1026,162 @@ async fn test_v14_moves_a_backfill_in_progress_to_one_outcome_per_run() {
     assert!(check_compatibility(stamps, Capability::ReadWrite, 14).is_ok());
 }
 
+/// V15 adds the time a run began to execute. An ended run from before it gets
+/// the best time that the store has, and only if the store shows that it
+/// began. It is additive: a V14 build can still read and write.
+#[tokio::test]
+async fn test_v15_gives_older_runs_the_time_they_began() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v14: Vec<Migration> = embedded_migrations().into_iter().take(14).collect();
+    apply_migrations(&db, &through_v14).await.unwrap();
+
+    // (run, status, end time, events, the time it began)
+    type Event = (&'static str, i64);
+    let cases: Vec<(&str, &str, Option<i64>, Vec<Event>, Option<i64>)> = vec![
+        (
+            "direct",
+            "Success",
+            Some(500),
+            vec![("StepStart", 110)],
+            Some(100),
+        ),
+        (
+            "direct-in-progress",
+            "Started",
+            None,
+            vec![("StepStart", 110)],
+            None,
+        ),
+        (
+            "direct-failed-in-a-step",
+            "Failure",
+            Some(500),
+            vec![("StepStart", 110), ("StepFailure", 500)],
+            Some(100),
+        ),
+        (
+            "direct-never-launched",
+            "Failure",
+            Some(500),
+            vec![("RunLaunchFailed", 500)],
+            None,
+        ),
+        (
+            "waited",
+            "Success",
+            Some(500),
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            Some(400),
+        ),
+        (
+            "waited-failed-in-a-step",
+            "Failure",
+            Some(500),
+            vec![("RunQueued", 100), ("RunDequeued", 400), ("StepStart", 420)],
+            Some(400),
+        ),
+        ("waiting", "Queued", None, vec![("RunQueued", 100)], None),
+        (
+            "left-the-queue",
+            "NotStarted",
+            None,
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            None,
+        ),
+        (
+            "canceled-in-the-queue",
+            "Canceled",
+            Some(300),
+            vec![("RunQueued", 100)],
+            None,
+        ),
+        (
+            "canceled-after-the-queue",
+            "Canceled",
+            Some(450),
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            None,
+        ),
+        (
+            "never-launched",
+            "Failure",
+            Some(700),
+            vec![
+                ("RunQueued", 100),
+                ("RunDequeued", 400),
+                ("RunLaunchFailed", 700),
+            ],
+            None,
+        ),
+        (
+            "dequeue-not-recorded",
+            "Success",
+            Some(500),
+            vec![("RunQueued", 100), ("StepStart", 420)],
+            None,
+        ),
+    ];
+
+    let runs: Vec<String> = cases
+        .iter()
+        .map(|(id, status, end_time, _, _)| {
+            let end_time = end_time.map_or("NONE".to_string(), |end| end.to_string());
+            format!(
+                "{{ run_id: '{id}', status: '{status}', start_time: 100, end_time: {end_time}, \
+                   tags: [], node_names: ['a'] }}"
+            )
+        })
+        .collect();
+    let events: Vec<String> = cases
+        .iter()
+        .flat_map(|(id, _, _, events, _)| {
+            events.iter().map(move |(event_type, timestamp)| {
+                format!(
+                    "{{ run_id: '{id}', event_type: '{event_type}', timestamp: {timestamp}, \
+                       metadata: [] }}"
+                )
+            })
+        })
+        .collect();
+    db.query(format!(
+        "INSERT INTO runs [{}] RETURN NONE; INSERT INTO events [{}] RETURN NONE",
+        runs.join(", "),
+        events.join(", ")
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let mut began: Vec<(String, Option<i64>)> = db
+        .query("SELECT VALUE [run_id, execution_start_time] FROM runs")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    began.sort();
+    let mut expected: Vec<(String, Option<i64>)> = cases
+        .iter()
+        .map(|(id, _, _, _, began)| (id.to_string(), *began))
+        .collect();
+    expected.sort();
+    assert_eq!(began, expected);
+
+    let stamps = stamps_at(&db, 15).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (15, 14, 14)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 14).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 14).is_ok());
+}
+
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
 /// fills at create time, so live pre-V5 slot rows must be backfilled: the
 /// conflict clause reads a missing `exclusive` as NONE (falsy), which would

@@ -267,6 +267,21 @@ def test_materialize_launch_failure_records_reason(no_handler_grpc_channel):
     assert "io_handler" in error
 
 
+def test_a_run_that_failed_to_launch_did_not_begin(no_handler_grpc_channel):
+    """A launch that fails before the run starts leaves no start of execution."""
+    channel, pb2, pb2_grpc, _repo, storage = no_handler_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+
+    run_id = stub.Materialize(pb2.MaterializeRequest(selection=["user_count"])).run_id
+
+    wait_until(
+        lambda: (r := storage.get_run(run_id)) is not None and r.status == "Failure"
+    )
+    run = storage.get_run(run_id)
+    assert run.end_time is not None
+    assert run.execution_start_time is None
+
+
 # ── Tests using full_grpc_channel (jobs, schedules, sensors, observe) ──
 
 

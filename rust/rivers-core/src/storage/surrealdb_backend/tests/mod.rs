@@ -109,6 +109,7 @@ fn minimal_run(run_id: &str, status: RunStatus) -> RunRecord {
         status,
         start_time: 1000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,

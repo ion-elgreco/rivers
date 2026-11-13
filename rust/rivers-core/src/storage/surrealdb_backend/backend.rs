@@ -501,15 +501,18 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn try_start_run(&self, run_id: &str) -> Result<bool> {
+        let now_ns = now_nanos();
         retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
                 .query(
-                    "UPDATE runs SET status = 'Started' \
+                    "UPDATE runs SET status = 'Started', \
+                             execution_start_time = execution_start_time ?? $now \
                          WHERE run_id = $run_id AND status != 'Canceled'; \
                      SELECT status FROM runs WHERE run_id = $run_id LIMIT 1",
                 )
                 .bind(("run_id", run_id.to_string()))
+                .bind(("now", now_ns))
                 .await?;
             let status: Option<String> = result.take((1, "status"))?;
             match status.as_deref() {

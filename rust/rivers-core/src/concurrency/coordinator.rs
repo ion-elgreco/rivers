@@ -177,6 +177,7 @@ mod tests {
             status: RunStatus::Queued,
             start_time,
             end_time: None,
+            execution_start_time: None,
             tags: tags
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

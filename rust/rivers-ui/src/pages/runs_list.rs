@@ -483,7 +483,7 @@ fn RunsTable(
                 <span>"STATUS"</span>
                 <span>"ASSETS"</span>
                 <span>"PARTITION"</span>
-                <span>"STARTED"</span>
+                <span>"CREATED"</span>
                 <span>"DURATION"</span>
                 <span>"CODE LOCATION"</span>
             </div>
@@ -520,7 +520,7 @@ fn RunRow(
     let st_kind = run_status_kind(&record.status);
     let start_ts = record.start_time;
     let created_abs = format_timestamp(Some(record.start_time));
-    let duration = format_duration(Some(record.start_time), record.end_time);
+    let duration = format_duration(record.execution_start_time, record.end_time);
     let asset_names = record.node_names.clone();
     let partition_val = record.partition_key.clone();
     let cl_title = record.code_location_id.clone();

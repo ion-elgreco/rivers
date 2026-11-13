@@ -256,6 +256,7 @@ mod tests {
                 status: RunStatus::Started,
                 start_time: 1,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec!["a".to_string()],
                 priority: 0,

@@ -115,13 +115,15 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
         match args.init {
             RunInit::Create { launched_by } => {
                 let priority = priority_from_tags(&args.tags);
+                let now = now_ts();
                 let record = RunRecord {
                     run_id: args.run_id.clone(),
                     code_location_id: args.storage.code_location_id().to_string(),
                     job_name: args.job_name,
                     status: RunStatus::Started,
-                    start_time: now_ts(),
+                    start_time: now,
                     end_time: None,
+                    execution_start_time: Some(now),
                     tags: args.tags,
                     node_names: node_names.clone(),
                     priority,

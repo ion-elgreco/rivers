@@ -360,6 +360,7 @@ async fn coordinator_tick_stress() {
                     status: RunStatus::Started,
                     start_time: now,
                     end_time: None,
+                    execution_start_time: None,
                     tags: vec![
                         ("env".into(), "prod".into()),
                         ("team".into(), format!("team-{}", i % 5)),
@@ -386,6 +387,7 @@ async fn coordinator_tick_stress() {
                     status: RunStatus::Queued,
                     start_time: now,
                     end_time: None,
+                    execution_start_time: None,
                     tags: vec![("env".into(), "staging".into())],
                     node_names: vec![format!("asset_{i}")],
                     priority: i as i32 % 10,

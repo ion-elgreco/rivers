@@ -462,6 +462,7 @@ pub async fn seed_run_record(storage: &SurrealStorage, run_id: &str) {
             status: RunStatus::Started,
             start_time: jiff::Timestamp::now().as_nanosecond() as i64,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,

@@ -322,6 +322,7 @@ impl QueuedRunDispatcher {
                 status: RunStatus::Queued,
                 start_time: rivers_core::util::now_ts(),
                 end_time: None,
+                execution_start_time: None,
                 tags: req.tags.clone(),
                 node_names: req.asset_selection.clone(),
                 priority,

@@ -202,8 +202,14 @@ pub struct RunRecord {
     #[serde(default)]
     pub job_name: Option<String>,
     pub status: RunStatus,
+    /// When the run was created. A queued run waits from this time, and the
+    /// queue and the run lists order by it.
     pub start_time: i64,
     pub end_time: Option<i64>,
+    /// When the run began to execute. `None` while it waits, and for a run
+    /// that ended before it began.
+    #[serde(default)]
+    pub execution_start_time: Option<i64>,
     pub tags: Vec<(String, String)>,
     pub node_names: Vec<String>,
     #[serde(default)]

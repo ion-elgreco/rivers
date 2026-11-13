@@ -571,6 +571,13 @@ that a daemon runs continues after the migration. A `rivers backfill`
 command that runs its backfill itself (without `--detach`) is not in the
 list of `rivers db status`: let it end, or stop it, before you migrate.
 
+### Upgrading to schema version 15
+
+Schema version 15 records when a run began to execute and raises no floor.
+The UI shows the duration of a run from that time, and shows the wait in the
+queue apart. A run that was in progress during the migration, or that an
+older `CodeLocation` image starts, shows no duration.
+
 ## Uninstall
 
 ```sh
