@@ -193,7 +193,12 @@ class RunRecord:
     runs (``repo.materialize()``, sensors that drive an asset selection)."""
     status: str
     start_time: int
+    """When the run was created, in nanoseconds. A queued run waits from this
+    time."""
     end_time: int | None
+    execution_start_time: int | None
+    """When the run began to execute, in nanoseconds. ``None`` while the run
+    waits in the queue, and for a run that ended before it began."""
     tags: list[tuple[str, str]]
     node_names: list[str]
     priority: int

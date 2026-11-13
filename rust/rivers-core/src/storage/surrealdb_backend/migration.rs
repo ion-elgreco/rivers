@@ -101,7 +101,7 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// The floors the [`SCHEMA_VERSION`] migration records; a test pins them to it.
 pub const MIN_READER: u32 = 14;
@@ -187,6 +187,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V14__backfill_run_outcomes.surql"),
         )
         .expect("V14__backfill_run_outcomes migration name is well-formed"),
+        Migration::unapplied(
+            "V15__run_execution_start",
+            include_str!("migrations/V15__run_execution_start.surql"),
+        )
+        .expect("V15__run_execution_start migration name is well-formed"),
     ]
 }
 

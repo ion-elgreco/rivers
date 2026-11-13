@@ -10,7 +10,7 @@ pub struct StripRun {
     pub id: String,
     /// Chip vocabulary from `run_status_kind`.
     pub kind: &'static str,
-    /// `None` until the run has an end time.
+    /// `None` until the run has begun and ended.
     pub duration_s: Option<f64>,
 }
 
@@ -23,7 +23,7 @@ impl StripRun {
             .map(|r| StripRun {
                 id: crate::helpers::short_id(&r.run_id, 8),
                 kind: crate::helpers::run_status_kind(&r.status),
-                duration_s: r.end_time.map(|e| (e - r.start_time).max(0) as f64 / 1e9),
+                duration_s: r.duration_secs(),
             })
             .collect()
     }
@@ -297,7 +297,7 @@ pub fn RunsGrid(
                 <span>"STATUS"</span>
                 {show_assets.then(|| view! { <span>"ASSETS"</span> })}
                 <span>"PARTITION"</span>
-                <span>"STARTED"</span>
+                <span>"CREATED"</span>
                 <span>"DURATION"</span>
             </div>
             {rows
@@ -312,7 +312,8 @@ pub fn RunsGrid(
                     let st_kind = crate::helpers::run_status_kind(&r.status);
                     let start_ts = r.start_time;
                     let created_abs = crate::helpers::format_timestamp(Some(r.start_time));
-                    let duration = crate::helpers::format_duration(Some(r.start_time), r.end_time);
+                    let duration =
+                        crate::helpers::format_duration(r.execution_start_time, r.end_time);
                     let assets = r.node_names.clone();
                     let partition = r.partition_key.clone().map(|p| {
                         let scheme = p

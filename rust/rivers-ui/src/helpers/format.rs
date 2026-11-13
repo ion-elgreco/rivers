@@ -47,10 +47,9 @@ pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
 /// [`format_duration`], which freezes at "Running…" once end is None.
 pub fn format_elapsed(start_ns: Option<i64>, end_ns: Option<i64>, now_secs: i64) -> String {
     match start_ns {
-        Some(s) => {
-            let start_secs = s / 1_000_000_000;
-            let end_secs = end_ns.map(|e| e / 1_000_000_000).unwrap_or(now_secs);
-            format_seconds((end_secs - start_secs).max(0))
+        Some(start) => {
+            let end = end_ns.unwrap_or(now_secs * 1_000_000_000);
+            format_seconds((end - start).max(0) / 1_000_000_000)
         }
         None => "—".to_string(),
     }
@@ -345,6 +344,34 @@ mod tests {
     #[test]
     fn test_format_duration_running() {
         assert_eq!(format_duration(Some(100), None), "Running…");
+    }
+
+    #[test]
+    fn test_format_elapsed_of_an_ended_span_is_its_duration() {
+        let s = 1_000_000_000i64;
+        // 10.9 s to 19.3 s is 8.4 s, though it touches nine seconds of the clock.
+        let (start, end) = (109 * s / 10, 193 * s / 10);
+
+        assert_eq!(format_elapsed(Some(start), Some(end), 0), "8s");
+        assert_eq!(format_duration(Some(start), Some(end)), "8s");
+    }
+
+    #[test]
+    fn test_format_elapsed_counts_to_now_while_open() {
+        let s = 1_000_000_000i64;
+
+        assert_eq!(format_elapsed(Some(100 * s), None, 130), "30s");
+        assert_eq!(format_elapsed(None, None, 130), "—");
+    }
+
+    #[test]
+    fn test_format_elapsed_does_not_step_back_at_the_end() {
+        let s = 1_000_000_000i64;
+        // 10.9 s to 19.3 s: the span is 8.1 s at second 19 of the clock.
+        let (start, end) = (109 * s / 10, 193 * s / 10);
+
+        assert_eq!(format_elapsed(Some(start), None, 19), "8s");
+        assert_eq!(format_elapsed(Some(start), Some(end), 19), "8s");
     }
 
     #[test]

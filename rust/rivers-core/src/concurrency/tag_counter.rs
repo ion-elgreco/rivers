@@ -198,6 +198,7 @@ mod tests {
             status: RunStatus::Started,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: tags
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -13,6 +13,7 @@ async fn test_queued_run_round_trip() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -49,6 +50,7 @@ async fn test_get_queued_runs_priority_ordering() {
             status: RunStatus::Queued,
             start_time: 3000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 10,
@@ -70,6 +72,7 @@ async fn test_get_queued_runs_priority_ordering() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -91,6 +94,7 @@ async fn test_get_queued_runs_priority_ordering() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 10,
@@ -130,6 +134,7 @@ async fn test_get_queued_runs_returns_all() {
                 status: RunStatus::Queued,
                 start_time: i * 100,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec![],
                 priority: 0,
@@ -159,6 +164,7 @@ async fn test_enqueue_runs_bulk_round_trip() {
             status: RunStatus::Queued,
             start_time: 1000 + i,
             end_time: None,
+            execution_start_time: None,
             tags: vec![("k".to_string(), format!("v{i}"))],
             node_names: vec![format!("asset{i}")],
             priority: i as i32,
@@ -212,6 +218,7 @@ async fn test_count_in_progress_runs() {
                 status: status.clone(),
                 start_time: 1000,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec![],
                 priority: 0,
@@ -241,6 +248,7 @@ async fn test_queued_to_not_started_transition() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 5,
@@ -282,6 +290,7 @@ async fn test_negative_priority_backfill() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: -10,
@@ -303,6 +312,7 @@ async fn test_negative_priority_backfill() {
             status: RunStatus::Queued,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -347,6 +357,7 @@ async fn test_cancel_queued_run_cleans_pending_steps() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -416,6 +427,7 @@ async fn test_cancel_queued_run_transitions_to_canceled() {
             status: RunStatus::Queued,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -447,6 +459,7 @@ async fn test_cancel_queued_run_noop_for_non_queued() {
             status: RunStatus::Started,
             start_time: 1000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -711,6 +724,42 @@ async fn test_try_start_run_starts_not_started() {
 
     let run = storage.get_run("r1").await.unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Started);
+}
+
+/// A run that waited in the queue began when it started, not when it was created.
+#[tokio::test]
+async fn test_try_start_run_records_when_the_run_began() {
+    let storage = make_storage().await;
+    storage
+        .create_run(&minimal_run("r1", RunStatus::NotStarted))
+        .await
+        .unwrap();
+
+    let before = crate::util::now_ts();
+    assert!(storage.try_start_run("r1").await.unwrap());
+
+    let run = storage.get_run("r1").await.unwrap().unwrap();
+    let began = run.execution_start_time.expect("a started run has begun");
+    assert!(began >= before, "began at {began}, started at {before}");
+    assert_eq!(run.start_time, 1000);
+}
+
+/// A later attempt of the same run starts it again: the run began at the first start.
+#[tokio::test]
+async fn test_try_start_run_keeps_the_first_start() {
+    let storage = make_storage().await;
+    storage
+        .create_run(&minimal_run("r1", RunStatus::NotStarted))
+        .await
+        .unwrap();
+
+    assert!(storage.try_start_run("r1").await.unwrap());
+    let first = storage.get_run("r1").await.unwrap().unwrap();
+    assert!(storage.try_start_run("r1").await.unwrap());
+    let second = storage.get_run("r1").await.unwrap().unwrap();
+
+    assert!(first.execution_start_time.is_some());
+    assert_eq!(second.execution_start_time, first.execution_start_time);
 }
 
 #[tokio::test]

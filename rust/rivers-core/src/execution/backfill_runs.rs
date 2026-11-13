@@ -55,6 +55,7 @@ mod tests {
             status: RunStatus::Queued,
             start_time: 7,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
