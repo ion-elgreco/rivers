@@ -27,18 +27,6 @@ use conditions::{render_conditions_tab, sort_conditions};
 use schedules::{render_schedules_table, sort_schedules};
 use sensors::{render_sensors_table, sort_sensors};
 
-fn format_with_commas(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
-}
-
 #[component]
 pub fn AutomationPage() -> impl IntoView {
     let (refresh_tick, set_refresh_tick) = signal(0u32);

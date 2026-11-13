@@ -238,7 +238,7 @@ impl PartitionsDefinition {
     }
 
     /// The `idx`-th key (in definition order) of a single-dimension definition.
-    fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
+    pub(crate) fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
         match self {
             Self::Static { keys } => Ok(keys.get_at(idx).cloned()),
             Self::TimeWindow { .. } => Ok(self
@@ -251,6 +251,32 @@ impl PartitionsDefinition {
                 })),
             _ => Ok(None),
         }
+    }
+
+    /// A cron grid whose ticks are a fixed time apart, as the same grid with
+    /// an interval: a key of it is found by its place, with no walk from the
+    /// start. `None` for every other definition.
+    pub(crate) fn with_fixed_interval(&self) -> PyResult<Option<Self>> {
+        let Self::TimeWindow {
+            cron_schedule: Some(expr),
+            start,
+            end,
+            fmt,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+
+        Ok(
+            cron_fixed_interval(expr, start)?.map(|(first, secs)| Self::TimeWindow {
+                cron_schedule: None,
+                interval_seconds: Some(secs),
+                start: first,
+                end: *end,
+                fmt: fmt.clone(),
+            }),
+        )
     }
 
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.

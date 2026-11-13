@@ -118,6 +118,19 @@ pub fn verb_label(verb: &str) -> String {
     }
 }
 
+/// A count with a comma between each three digits: "1,157,520".
+pub fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 /// "1 run", "3 runs".
 pub fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })

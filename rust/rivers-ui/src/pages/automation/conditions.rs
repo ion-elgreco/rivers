@@ -10,7 +10,7 @@ use crate::types::{
     AssetDefinitionInfo, ConditionEvalRecord, ConditionTickDetail, ConditionTickRecord,
 };
 
-use super::{SortIndicator, SortToggle, format_with_commas};
+use super::{SortIndicator, SortToggle};
 
 pub(super) fn sort_conditions(
     assets: &mut [AssetDefinitionInfo],
@@ -136,7 +136,7 @@ pub(super) fn render_conditions_tab(
                     None => (None, "—", "var(--text-muted)"),
                 };
 
-                let evals_formatted = format_with_commas(tick_count);
+                let evals_formatted = crate::helpers::format_with_commas(tick_count as u64);
 
                 view! {
                     <div class=row_cls style=GRID on:click=toggle_click>

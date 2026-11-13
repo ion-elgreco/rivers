@@ -8,9 +8,10 @@ use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
-    ConcurrencyClaimStatus, CoordinatorRunInfo, PartitionKey, PerCodeLocationStorage, PoolInfo,
-    PoolLimit, RunRecord, RunStatus, SlotHolder, SortOrder, StaleCause, StaleStatus,
-    StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
+    ConcurrencyClaimStatus, CoordinatorRunInfo, PartitionBounds, PartitionKey,
+    PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder, SortOrder,
+    StaleCause, StaleStatus, StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent,
+    StoredTick,
 };
 
 /// A backend reference pre-bound to a [`CodeLocationContext`].
@@ -257,6 +258,16 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn count_materialized_partitions_in(
+        &self,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<u64>> {
+        self.backend
+            .count_materialized_partitions_in(self.code_location_id, asset_key, bounds)
+            .await
+    }
+
     pub async fn count_dynamic_partitions(&self, partitions_def_name: &str) -> Result<u64> {
         self.backend
             .count_dynamic_partitions(self.code_location_id, partitions_def_name)
@@ -289,6 +300,17 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
         self.backend
             .get_partition_timestamps_for_keys(self.code_location_id, asset_key, keys)
+            .await
+    }
+
+    pub async fn get_partition_timestamps_in(
+        &self,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        self.backend
+            .get_partition_timestamps_in(self.code_location_id, asset_key, bounds, limit)
             .await
     }
 

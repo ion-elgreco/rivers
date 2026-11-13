@@ -85,6 +85,20 @@ pub async fn wait_until<F: Fn() -> bool>(pred: F) -> bool {
     false
 }
 
+/// The number of panics from this call on. A panic in a spawned task does
+/// not fail the test that caused it: the test must look at this number.
+pub fn count_panics() -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+    use std::sync::atomic::Ordering;
+
+    let panics = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let (seen, report) = (panics.clone(), std::panic::take_hook());
+    std::panic::set_hook(Box::new(move |info| {
+        seen.fetch_add(1, Ordering::Relaxed);
+        report(info);
+    }));
+    panics
+}
+
 /// Collect every element matching `selector` under `host` as `Element`s.
 /// Both inputs and outputs use `Element` (not `HtmlElement`) so callers
 /// can chain queries through SVG / mount-target boundaries —
@@ -204,6 +218,16 @@ pub enum Reply {
     Error,
     /// No answer: the server fn stays pending.
     Pending,
+    /// HTTP 200 with this JSON body, when the promise of a [`gate`] settles.
+    After(js_sys::Promise, String),
+}
+
+/// A promise and the function that settles it. The mock holds a
+/// [`Reply::After`] of the promise until the test calls the function.
+pub fn gate() -> (js_sys::Promise, js_sys::Function) {
+    let mut open = None;
+    let gate = js_sys::Promise::new(&mut |resolve, _reject| open = Some(resolve));
+    (gate, open.expect("the executor of a promise runs at once"))
 }
 
 /// The `Request`s a recording mock kept, in call order.
@@ -265,12 +289,26 @@ where
     let factory_jsv = js_sys::eval(factory_src).expect("compile response factory");
     let factory: js_sys::Function = factory_jsv.dyn_into().unwrap();
 
+    let held_src = "(function(gate, factory, body){\
+        return gate.then(function(){ return factory(body, 200); });\
+    })";
+    let held: js_sys::Function = js_sys::eval(held_src)
+        .expect("compile held response factory")
+        .dyn_into()
+        .unwrap();
+
     let closure: Closure<dyn FnMut(JsValue, JsValue) -> js_sys::Promise> =
         Closure::new(move |input: JsValue, _init: JsValue| {
             let (body_str, status) = match responder(input) {
                 Reply::Json(json) => (json, 200),
                 Reply::Error => (String::new(), 500),
                 Reply::Pending => return js_sys::Promise::new(&mut |_, _| {}),
+                Reply::After(gate, json) => {
+                    return held
+                        .call3(&JsValue::NULL, &gate, &factory, &JsValue::from_str(&json))
+                        .expect("held response factory call")
+                        .unchecked_into();
+                }
             };
             let response_jsv = factory
                 .call2(

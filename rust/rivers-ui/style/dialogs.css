@@ -30,14 +30,6 @@
     min-height: 0;
     overflow: hidden;
 }
-/* === Partition Grid === */
-.partition-summary {
-    display: flex;
-    gap: 1.5rem;
-    margin-bottom: 1rem;
-}
-.stat-inline { color: var(--text-muted); font-size: var(--fs-md); }
-.stat-inline strong { color: var(--text); }
 /* === Empty State — Rivers typography: centered sans, 14px, 48px/24px pad, 1.5 line === */
 .empty-state {
     padding: 20px 16px;
@@ -200,15 +192,6 @@ code {
 /* === Sortable columns === */
 
 .pagination-info { color: var(--text-muted); font-size: var(--fs-sm); }
-
-/* === Partition badge === */
-/* === Partition header === */
-.partition-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1rem;
-}
 
 /* === Live status chip === */
 /* Topbar indicator + Refresh button for pages driven by use_live_kick.

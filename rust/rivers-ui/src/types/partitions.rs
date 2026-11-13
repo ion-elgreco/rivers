@@ -92,19 +92,183 @@ pub fn submit_partition_count(keys: &[SubmitPartitionKey]) -> u64 {
         .sum()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionStatus {
-    pub asset_key: String,
-    pub total_partitions: usize,
-    pub materialized: usize,
-    pub failed: usize,
-    pub missing: usize,
-    pub partition_details: Vec<PartitionDetail>,
+/// The rows of the partition outline that are read, or shown, in one step.
+pub const OUTLINE_PAGE: u64 = 100;
+
+/// The partitions of an asset, or of one row of its partition outline, by
+/// state. A partition that is not materialized and not failed is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PartitionCounts {
+    pub total: u64,
+    pub materialized: u64,
+    pub failed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionDetail {
+impl PartitionCounts {
+    /// The counts of `total` partitions. The store can hold rows of keys
+    /// that the asset no longer has: no state counts more than `total`.
+    pub fn of(total: u64, materialized: u64, failed: u64) -> Self {
+        let materialized = materialized.min(total);
+        Self {
+            total,
+            materialized,
+            failed: failed.min(total - materialized),
+        }
+    }
+
+    pub fn missing(&self) -> u64 {
+        self.total - self.materialized - self.failed
+    }
+}
+
+/// One dimension of the partition keys of an asset.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutlineDimension {
+    /// Empty for an asset with one dimension.
+    pub name: String,
+    /// The number of keys.
+    pub keys: u64,
+    /// The dynamic set that holds the keys. Empty: the definition gives them.
+    #[serde(default)]
+    pub dynamic_name: String,
+}
+
+/// A run of keys of one dimension. The rows below a row of the partition
+/// outline are read with the place of that row.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutlinePlace {
+    /// The value of each dimension above.
+    #[serde(default)]
+    pub fixed: Vec<(String, String)>,
+    /// The dimension of the keys, then the dimensions below it. Empty when
+    /// the code location did not give the keys: the rows are then the
+    /// materialized partitions.
+    #[serde(default)]
+    pub dimensions: Vec<OutlineDimension>,
+    /// The keys from `first_key` to `last_key`. Both empty: every key.
+    #[serde(default)]
+    pub first_key: String,
+    #[serde(default)]
+    pub last_key: String,
+}
+
+/// A row of the partition outline that opens to more rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineRow {
+    pub label: String,
+    /// What the row holds: `720 hours`, `265 × zone`.
+    pub holds: String,
+    pub counts: PartitionCounts,
+    /// The rows below.
+    pub place: OutlinePlace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionRowState {
+    Materialized,
+    Failed,
+    Missing,
+}
+
+impl PartitionRowState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Materialized => "materialized",
+            Self::Failed => "failed",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// One partition as a row of the partition outline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionRow {
+    /// The key of the last dimension.
     pub key: String,
-    pub status: String,
-    pub last_timestamp: Option<i64>,
+    pub state: PartitionRowState,
+    /// The time of the last materialization. A failed partition can have one.
+    pub materialized_at: Option<i64>,
+    /// The run of the last materialization.
+    pub run_id: Option<String>,
+    /// The time of the failure of a failed partition.
+    pub failed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutlineRows {
+    Groups(Vec<OutlineRow>),
+    Partitions(Vec<PartitionRow>),
+}
+
+impl OutlineRows {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Groups(rows) => rows.len(),
+            Self::Partitions(rows) => rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The rows below one place of the partition outline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlineLevel {
+    /// The head of the first column: the dimension of the rows.
+    pub heading: String,
+    pub rows: OutlineRows,
+    /// The keys after the rows that the level did not read.
+    pub more: u64,
+}
+
+/// One bar of the strip above the partition outline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripBar {
+    pub label: String,
+    pub counts: PartitionCounts,
+}
+
+/// The partitions of an asset along the first dimension of its keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionStrip {
+    /// The dimension of the bars.
+    pub heading: String,
+    /// What one bar is: `one bar per day`.
+    pub note: String,
+    pub bars: Vec<StripBar>,
+    /// The marks of the axis: the place of a bar and the text.
+    pub marks: Vec<(u32, String)>,
+}
+
+/// What the partitions of an asset are: the line below their number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionShape {
+    /// The dimensions of the keys, each with the number of its keys.
+    Dimensions(Vec<(String, u64)>),
+    /// Windows of time, one dimension, from `first` to `last`.
+    Windows {
+        /// The unit of one window (`day`). Empty when not known.
+        unit: String,
+        first: String,
+        last: String,
+    },
+    /// Keys of one dimension.
+    Keys,
+}
+
+/// The Partitions tab of an asset: the counts, the strip and the first rows
+/// of the outline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionOverview {
+    pub counts: PartitionCounts,
+    pub shape: PartitionShape,
+    pub strip: Option<PartitionStrip>,
+    pub top: OutlineLevel,
+    /// The place of the top rows: a search reads its keys.
+    pub root: OutlinePlace,
+    /// The code location gave the keys. False: the rows are the materialized
+    /// partitions only.
+    pub from_definition: bool,
 }

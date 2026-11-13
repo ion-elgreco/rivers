@@ -9,10 +9,10 @@ use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillRunOutcome, BackfillStatus,
     CodeLocationDirectoryEntry, ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord,
     ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EndedBackfillRun,
-    EventRecord, LogRecord, PartitionKey, PoolInfo, PoolLimit, RunOutcome, RunProgress, RunRecord,
-    RunStatus, ScopedStorage, SlotHolder, SortOrder, StepAttempts, StepOutcome,
-    StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
-    UnstartedBackfillRun,
+    EventRecord, LogRecord, PartitionBounds, PartitionKey, PoolInfo, PoolLimit, RunOutcome,
+    RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder, StepAttempts,
+    StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick,
+    TickRecord, UnstartedBackfillRun,
 };
 
 /// A code-location identity bound for the lifetime of a logical operation.
@@ -223,6 +223,15 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<u64>> + Send;
 
+    /// How many partitions of an asset have a row in each of `bounds`, in
+    /// the order of the bounds. No read grows with the rows of the asset.
+    fn count_materialized_partitions_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> impl Future<Output = Result<Vec<u64>>> + Send;
+
     /// Number of registered keys for a dynamic partition namespace.
     fn count_dynamic_partitions(
         &self,
@@ -252,6 +261,16 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
         asset_key: &str,
         keys: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
+
+    /// Timestamp and last run of the partitions of an asset in `bounds`, at
+    /// most `limit` of them.
+    fn get_partition_timestamps_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
 
     fn get_in_progress_partitions(

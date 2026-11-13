@@ -7,7 +7,7 @@ use anyhow::Result;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use surrealdb::types::SurrealValue;
 
-use crate::storage::{PartitionKey, retry};
+use crate::storage::{PartitionBounds, PartitionKey, retry};
 
 use super::*;
 
@@ -25,6 +25,19 @@ const QUERIES_AT_ONCE: usize = 8;
 pub(super) fn keyed_statements(select: &str, count: usize) -> String {
     (0..count)
         .map(|i| select.replace("$partition", &format!("$partition_{i}")) + ";")
+        .collect()
+}
+
+/// The statements that run `select` for `count` bounds: statement `i` names
+/// its bounds as `$lower_i` and `$upper_i`.
+fn bounded_statements(select: &str, count: usize) -> String {
+    (0..count)
+        .map(|i| {
+            select
+                .replace("$lower", &format!("$lower_{i}"))
+                .replace("$upper", &format!("$upper_{i}"))
+                + ";"
+        })
         .collect()
 }
 
@@ -105,6 +118,92 @@ impl SurrealStorage {
                 keys,
             )
             .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.partition_key, r.last_timestamp, r.last_run_id))
+            .collect())
+    }
+
+    pub(super) async fn count_partitions_in_bounds(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<u64>> {
+        let queries: Vec<_> = bounds
+            .chunks(KEYS_PER_QUERY)
+            .map(|chunk| self.count_partitions_in_bounds_query(code_location_id, asset_key, chunk))
+            .collect();
+
+        let counts: Vec<Vec<u64>> = stream::iter(queries)
+            .buffered(QUERIES_AT_ONCE)
+            .try_collect()
+            .await?;
+
+        Ok(counts.into_iter().flatten().collect())
+    }
+
+    /// One query of [`Self::count_partitions_in_bounds`].
+    async fn count_partitions_in_bounds_query(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<u64>> {
+        let statements = bounded_statements(COUNT_PARTITIONS_IN_BOUNDS, bounds.len());
+
+        let mut result = retry::with_retry(&self.retry_config, || async {
+            let mut query = self
+                .db
+                .query(statements.as_str())
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()));
+            for (i, bounds) in bounds.iter().enumerate() {
+                query = query
+                    .bind((format!("lower_{i}"), bounds.lower.clone()))
+                    .bind((format!("upper_{i}"), bounds.upper.clone()));
+            }
+            Ok(query.await?.check()?)
+        })
+        .await?;
+
+        (0..bounds.len())
+            .map(|statement| {
+                let total: Option<u64> = result.take((statement, "total"))?;
+                Ok(total.unwrap_or(0))
+            })
+            .collect()
+    }
+
+    pub(super) async fn partition_timestamps_in_bounds(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        #[derive(Debug, SurrealValue)]
+        struct PartTsRow {
+            partition_key: PartitionKey,
+            last_timestamp: i64,
+            last_run_id: Option<String>,
+        }
+
+        let rows: Vec<PartTsRow> = retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(PARTITION_TIMESTAMPS_IN_BOUNDS)
+                .bind(("cl", code_location_id.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .bind(("lower", bounds.lower.clone()))
+                .bind(("upper", bounds.upper.clone()))
+                .bind(("limit", limit))
+                .await?
+                .check()?;
+            Ok(result.take(0)?)
+        })
+        .await?;
+
         Ok(rows
             .into_iter()
             .map(|r| (r.partition_key, r.last_timestamp, r.last_run_id))
