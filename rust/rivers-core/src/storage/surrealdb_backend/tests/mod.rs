@@ -18,6 +18,7 @@ mod coverage;
 mod crud;
 mod directory;
 mod executor_patterns;
+mod failure_rows;
 mod isolation;
 mod message_limit;
 mod observations;

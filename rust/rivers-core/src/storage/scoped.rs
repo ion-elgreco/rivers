@@ -8,10 +8,10 @@ use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
-    ConcurrencyClaimStatus, CoordinatorRunInfo, PartitionBounds, PartitionKey,
-    PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder, SortOrder,
-    StaleCause, StaleStatus, StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent,
-    StoredTick,
+    ConcurrencyClaimStatus, CoordinatorRunInfo, FailureCount, PartitionBounds, PartitionFailure,
+    PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder,
+    SortOrder, StaleCause, StaleStatus, StorageBackend, StoredConditionEval, StoredConditionTick,
+    StoredEvent, StoredTick,
 };
 
 /// A backend reference pre-bound to a [`CodeLocationContext`].
@@ -320,12 +320,40 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn count_partition_failures(&self, asset_key: &str) -> Result<FailureCount> {
+        self.backend
+            .count_partition_failures(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_partition_failures_in(
+        &self,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<FailureCount>> {
+        self.backend
+            .count_partition_failures_in(self.code_location_id, asset_key, bounds)
+            .await
+    }
+
     pub async fn get_partition_failures(
         &self,
         asset_key: &str,
-    ) -> Result<HashMap<PartitionKey, i64>> {
+        bounds: Option<&PartitionBounds>,
+        limit: u64,
+    ) -> Result<Vec<PartitionFailure>> {
         self.backend
-            .get_partition_failures(self.code_location_id, asset_key)
+            .get_partition_failures(self.code_location_id, asset_key, bounds, limit)
+            .await
+    }
+
+    pub async fn get_partition_failures_for_keys(
+        &self,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<PartitionFailure>> {
+        self.backend
+            .get_partition_failures_for_keys(self.code_location_id, asset_key, keys)
             .await
     }
 

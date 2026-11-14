@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
+use surrealdb::method::Query;
 use surrealdb::types::{RecordId, SurrealValue};
 
 use super::{EventRecord, PartitionKey, StorageBackend};
@@ -20,6 +21,7 @@ mod backfill_runs;
 mod backfills;
 mod directory;
 mod pages;
+mod partition_failures;
 mod partition_keys;
 mod partition_reads;
 mod per_code_location;
@@ -653,7 +655,7 @@ impl SurrealStorage {
 
     /// Apply partition-scoped deletions of one asset: rows no newer than
     /// their key's deletion gone, tombstones kept at each key's newest
-    /// deletion time.
+    /// deletion time. A failure no newer than the deletion goes too.
     async fn delete_partitions(
         &self,
         cl: &str,
@@ -671,39 +673,65 @@ impl SurrealStorage {
         for (pk, ts) in &newest {
             by_time.entry(*ts).or_default().push(pk.clone());
         }
+        let by_time: Vec<(i64, Vec<PartitionKey>)> = by_time.into_iter().collect();
+        let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
+        let Some(range) = partition_failures::key_range(&keys) else {
+            return Ok(());
+        };
         let rows: Vec<DbPartitionDeletion> = newest
-            .into_iter()
+            .iter()
             .map(|(partition_key, timestamp)| DbPartitionDeletion {
                 code_location_id: cl.to_string(),
                 asset_key: asset_key.to_string(),
-                partition_key,
-                timestamp,
+                partition_key: partition_key.clone(),
+                timestamp: *timestamp,
             })
             .collect();
         // One DELETE per deletion time, not a FOR loop, which costs more. The
         // members of one delete step share a time, so this is one statement.
-        let mut sql = String::from(BEGIN_PARTITION_DELETIONS);
+        let mut body = String::from(HOLD_FOR_PARTITION_DELETIONS);
         for i in 0..by_time.len() {
-            sql.push_str(&format!(
+            body.push_str(&format!(
                 "DELETE FROM asset_partitions WHERE code_location_id = $cl \
                  AND asset_key = $asset_key AND partition_key IN $keys_{i} \
                  AND last_timestamp <= $deleted_at_{i}; "
             ));
         }
-        sql.push_str(RECORD_PARTITION_TOMBSTONES);
-        let mut query = self
-            .db
-            .query(sql)
-            .bind(("cl", cl.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("rows", rows));
-        for (i, (deleted_at, keys)) in by_time.into_iter().enumerate() {
-            query = query
-                .bind((format!("keys_{i}"), keys))
-                .bind((format!("deleted_at_{i}"), deleted_at));
+        body.push_str(RECORD_PARTITION_TOMBSTONES);
+        let bind = DeletionParams {
+            cl,
+            asset_key,
+            rows: &rows,
+            range: &range,
+            by_time: &by_time,
+        };
+
+        let sql = format!(
+            "BEGIN TRANSACTION; {}{body} COMMIT TRANSACTION;",
+            partition_failures::failure_rows_guard()
+        );
+
+        // The writers of failures, materializations and deletions of one
+        // asset all write its `assets` row, so all but one lose each commit.
+        let retry_config = self.retry_config.contended_batch();
+        let applied = super::retry::with_retry(&retry_config, || {
+            partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str())))
+        })
+        .await?;
+        if applied {
+            return Ok(());
         }
-        query.await?.check()?;
-        Ok(())
+
+        // Failure rows are in the range of the keys: one transaction deletes
+        // and brings the failure rows in line.
+        super::retry::with_retry(&retry_config, || async {
+            let txn = self.db.clone().begin().await?;
+            bind.bind(txn.query(body.as_str())).await?.check()?;
+            partition_failures::fix_failures_after_deletion(&txn, cl, asset_key, &newest).await?;
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Which of `ids` belong to action runs. Events don't carry the verb, so
@@ -797,47 +825,129 @@ impl SurrealStorage {
         // the asset row first, so it runs before the row's update. The data
         // and provenance updates commit together too: no reader sees new data
         // with the provenance of the materialization it replaced.
-        let has_parts = !parts.is_empty();
-        let sql = if has_parts {
-            format!(
-                "BEGIN TRANSACTION; {UPSERT_ASSET_PARTITIONS}; {update_sql}; COMMIT TRANSACTION;"
-            )
-        } else {
-            format!("BEGIN TRANSACTION; {update_sql}; COMMIT TRANSACTION;")
-        };
         let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
-        let oldest = parts.iter().map(|p| p.last_timestamp).min();
+        let range = partition_failures::key_range(&keys);
+        let (guard, body) = match range {
+            Some(_) => (
+                partition_failures::failure_rows_guard(),
+                format!("{UPSERT_ASSET_PARTITIONS}; {update_sql};"),
+            ),
+            None => (String::new(), format!("{update_sql};")),
+        };
+        let sql = format!("BEGIN TRANSACTION; {guard}{body} COMMIT TRANSACTION;");
+        let bind = MaterializationParams {
+            cl,
+            asset_key,
+            event_id,
+            run_id,
+            timestamp,
+            data_version: &data_version,
+            provenance: (!from_action).then_some((provenance_timestamp, &code_version, &idv)),
+            parts: &parts,
+            keys: &keys,
+            range: range.as_ref(),
+        };
 
         // Runs that write one asset at the same time all write its `assets`
         // row, so all but one lose each commit.
-        super::retry::with_retry(&self.retry_config.contended_batch(), || async {
-            let mut query = self
-                .db
-                .query(sql.clone())
-                .bind(("cl", cl.to_string()))
-                .bind(("asset_key", asset_key.to_string()))
-                .bind(("event_id", event_id.to_string()))
-                .bind(("run_id", run_id.to_string()))
-                .bind(("timestamp", timestamp))
-                .bind(("data_version", data_version.clone()));
-            if !from_action {
-                query = query
-                    .bind(("provenance_timestamp", provenance_timestamp))
-                    .bind(("mcv", code_version.clone()));
-                if let Some(idv) = &idv {
-                    query = query.bind(("idv", idv.clone()));
-                }
-            }
-            if has_parts {
-                query = query
-                    .bind(("keys", keys.clone()))
-                    .bind(("oldest", oldest))
-                    .bind(("rows", parts.clone()));
-            }
-            query.await?.check()?;
-            Ok(())
+        let retry_config = self.retry_config.contended_batch();
+        let applied = super::retry::with_retry(&retry_config, || async {
+            partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str()))).await
         })
-        .await
+        .await?;
+        if applied {
+            return Ok(());
+        }
+
+        // Failure rows are in the range of the keys: one transaction
+        // materializes and brings the failure rows in line.
+        let late = super::retry::with_retry(&retry_config, || async {
+            let txn = self.db.clone().begin().await?;
+            bind.bind(txn.query(body.as_str())).await?.check()?;
+            let late =
+                partition_failures::fix_failures_after_materialization(&txn, cl, asset_key, &parts)
+                    .await?;
+            txn.commit().await?;
+            Ok(late)
+        })
+        .await?;
+        for (run_id, keys) in late {
+            self.rederive_failures_of_run(&run_id, false, Some((cl, asset_key, keys)))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The parameters of the statements of `apply_materialization`.
+struct MaterializationParams<'a> {
+    cl: &'a str,
+    asset_key: &'a str,
+    event_id: &'a str,
+    run_id: &'a str,
+    timestamp: i64,
+    data_version: &'a Option<String>,
+    /// The provenance's time, code version and inputs; none for an action.
+    provenance: Option<(i64, &'a Option<String>, &'a Option<Vec<(String, String)>>)>,
+    parts: &'a [DbAssetPartitionWrite],
+    keys: &'a [PartitionKey],
+    range: Option<&'a (PartitionKey, PartitionKey)>,
+}
+
+impl MaterializationParams<'_> {
+    fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
+        let mut query = query
+            .bind(("cl", self.cl.to_string()))
+            .bind(("asset_key", self.asset_key.to_string()))
+            .bind(("event_id", self.event_id.to_string()))
+            .bind(("run_id", self.run_id.to_string()))
+            .bind(("timestamp", self.timestamp))
+            .bind(("data_version", self.data_version.clone()));
+        if let Some((provenance_timestamp, code_version, idv)) = self.provenance {
+            query = query
+                .bind(("provenance_timestamp", provenance_timestamp))
+                .bind(("mcv", code_version.clone()));
+            if let Some(idv) = idv {
+                query = query.bind(("idv", idv.clone()));
+            }
+        }
+        if let Some((lowest, highest)) = self.range {
+            let oldest = self.parts.iter().map(|p| p.last_timestamp).min();
+            query = query
+                .bind(("keys", self.keys.to_vec()))
+                .bind(("oldest", oldest))
+                .bind(("rows", self.parts.to_vec()))
+                .bind(("lowest", lowest.clone()))
+                .bind(("highest", highest.clone()));
+        }
+        query
+    }
+}
+
+/// The parameters of the statements of `delete_partitions`.
+struct DeletionParams<'a> {
+    cl: &'a str,
+    asset_key: &'a str,
+    rows: &'a [DbPartitionDeletion],
+    range: &'a (PartitionKey, PartitionKey),
+    by_time: &'a [(i64, Vec<PartitionKey>)],
+}
+
+impl DeletionParams<'_> {
+    fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
+        let (lowest, highest) = self.range;
+        let mut query = query
+            .bind(("cl", self.cl.to_string()))
+            .bind(("asset_key", self.asset_key.to_string()))
+            .bind(("rows", self.rows.to_vec()))
+            .bind(("lowest", lowest.clone()))
+            .bind(("highest", highest.clone()));
+        for (i, (deleted_at, keys)) in self.by_time.iter().enumerate() {
+            query = query
+                .bind((format!("keys_{i}"), keys.clone()))
+                .bind((format!("deleted_at_{i}"), *deleted_at));
+        }
+        query
     }
 }
 

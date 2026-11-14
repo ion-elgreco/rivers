@@ -1182,6 +1182,88 @@ async fn test_v15_gives_older_runs_the_time_they_began() {
     assert!(check_compatibility(stamps, Capability::ReadWrite, 14).is_ok());
 }
 
+#[tokio::test]
+async fn test_v16_stores_the_failed_partitions_that_the_events_give() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v15: Vec<Migration> = embedded_migrations().into_iter().take(15).collect();
+    apply_migrations(&db, &through_v15).await.unwrap();
+
+    // `r_fail` ended in failure on p1..p3 and materialized p1. `f1` failed
+    // p2 earlier and p4, which a later materialization replaced. The action
+    // run `act` failed p5. p3 was deleted after the failure.
+    let key = |name: &str| format!("{{ variant: 'Single', keys: ['{name}'] }}");
+    db.query(format!(
+        "INSERT INTO assets [{{ asset_key: 'a', tags: [], kinds: [] }}] RETURN NONE; \
+         INSERT INTO runs [ \
+             {{ run_id: 'r_fail', status: 'Failure', start_time: 100, end_time: 500, tags: [], \
+                node_names: ['a'], partition_key: {{ variant: 'Single', keys: ['p1', 'p2', 'p3'] }} }}, \
+             {{ run_id: 'act', status: 'Success', start_time: 100, end_time: 400, tags: [], \
+                node_names: ['a'], action: 'optimize' }} \
+         ] RETURN NONE; \
+         INSERT INTO events [ \
+             {{ run_id: 'r_fail', asset_key: 'a', event_type: 'Materialization', \
+                partition_key: {p1}, timestamp: 200, metadata: [] }}, \
+             {{ run_id: 'f1', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p2}, timestamp: 150, metadata: [] }}, \
+             {{ run_id: 'f1', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p4}, timestamp: 300, metadata: [] }}, \
+             {{ run_id: 'act', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p5}, timestamp: 300, metadata: [] }} \
+         ] RETURN NONE; \
+         INSERT INTO asset_partitions [ \
+             {{ asset_key: 'a', partition_key: {p1}, last_timestamp: 200 }}, \
+             {{ asset_key: 'a', partition_key: {p2}, last_timestamp: 100 }}, \
+             {{ asset_key: 'a', partition_key: {p4}, last_timestamp: 350 }} \
+         ] RETURN NONE; \
+         INSERT INTO asset_partition_deletions [ \
+             {{ asset_key: 'a', partition_key: {p3}, timestamp: 600 }} \
+         ] RETURN NONE;",
+        p1 = key("p1"),
+        p2 = key("p2"),
+        p3 = key("p3"),
+        p4 = key("p4"),
+        p5 = key("p5"),
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let rows: Vec<(serde_json::Value, i64, String, Option<i64>, bool)> = db
+        .query(
+            "SELECT VALUE [partition_key, failed_at, run_id, built_at, has_row] \
+             FROM asset_partition_failures",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+            500,
+            "r_fail".to_string(),
+            Some(100),
+            true
+        )]
+    );
+
+    let stamps = stamps_at(&db, 16).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (16, 14, 16)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 15).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 15).is_err());
+}
+
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
 /// fills at create time, so live pre-V5 slot rows must be backfilled: the
 /// conflict clause reads a missing `exclusive` as NONE (falsy), which would

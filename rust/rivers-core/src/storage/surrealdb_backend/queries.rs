@@ -1,5 +1,6 @@
 /// A whole-asset deletion's clearing, one transaction in `consolidate_deletion`.
-/// The data and the provenance each clear by their own time.
+/// The data and the provenance each clear by their own time. A failure at or
+/// before the deletion goes with the partition rows.
 pub(super) const CLEAR_DELETED_ASSET: &str = "\
      UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
      last_timestamp = NONE, last_data_version = NONE \
@@ -13,7 +14,12 @@ pub(super) const CLEAR_DELETED_ASSET: &str = "\
      THEN last_deletion_timestamp ELSE $ts END \
      WHERE code_location_id = $cl AND asset_key = $asset_key; \
      DELETE FROM asset_partitions WHERE code_location_id = $cl \
-     AND asset_key = $asset_key AND last_timestamp <= $ts;";
+     AND asset_key = $asset_key AND last_timestamp <= $ts; \
+     DELETE FROM asset_partition_failures WHERE code_location_id = $cl \
+     AND asset_key = $asset_key AND failed_at <= $ts; \
+     UPDATE asset_partition_failures SET has_row = false, built_at = NONE \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND has_row = true AND built_at <= $ts;";
 
 /// Roll an `assets` row's data forward to a materialization event.
 pub(super) const MATERIALIZE_ASSET_DATA: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
@@ -44,14 +50,13 @@ pub(super) const MATERIALIZATION_IS_NEWER: &str =
 /// real materialization landing after it still records its provenance.
 pub(super) const PROVENANCE_IS_NEWER: &str = "AND last_provenance_timestamp <= $provenance_timestamp AND last_deletion_timestamp < $provenance_timestamp";
 
-/// Starts `delete_partitions`' transaction: write the `assets` row and put it
+/// Starts `delete_partitions`' changes: write the `assets` row and put it
 /// back. A materialization that adds partition rows writes that row too.
 /// Without it, the two write different rows (the tombstone, the partition
 /// row), so both commit from snapshots that miss each other, and the older
 /// partition row outlives the newer deletion. Now one fails and retries. An
 /// UPDATE that changes nothing writes nothing, hence the placeholder.
-pub(super) const BEGIN_PARTITION_DELETIONS: &str = "\
-     BEGIN TRANSACTION; \
+pub(super) const HOLD_FOR_PARTITION_DELETIONS: &str = "\
      LET $held = (SELECT VALUE last_event_id FROM assets \
          WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
      UPDATE assets SET last_event_id = 'partition deletion' \
@@ -59,14 +64,13 @@ pub(super) const BEGIN_PARTITION_DELETIONS: &str = "\
      UPDATE assets SET last_event_id = $held \
          WHERE code_location_id = $cl AND asset_key = $asset_key; ";
 
-/// Ends `delete_partitions`' transaction: record the tombstones at each
-/// key's newest deletion time. The tombstone outlives the Deletion event:
-/// failure supersession reads it, and deleting the run must not undo the
-/// deletion. A later materialization of the key reads it too.
+/// Ends `delete_partitions`' changes: record the tombstones at each key's
+/// newest deletion time. The tombstone outlives the Deletion event: failure
+/// supersession reads it, and deleting the run must not undo the deletion. A
+/// later materialization of the key reads it too.
 pub(super) const RECORD_PARTITION_TOMBSTONES: &str = "\
      INSERT INTO asset_partition_deletions $rows ON DUPLICATE KEY UPDATE timestamp = \
-     IF $input.timestamp > timestamp THEN $input.timestamp ELSE timestamp END; \
-     COMMIT TRANSACTION;";
+     IF $input.timestamp > timestamp THEN $input.timestamp ELSE timestamp END; ";
 
 /// Upsert `asset_partitions` rows on the UNIQUE index — one row per
 /// partition, newest event wins. A key deleted at or after its event, alone or
@@ -122,6 +126,76 @@ pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
              AND last_timestamp <= $deletion.timestamp; \
          }; \
      }";
+
+/// Starts a write of failure rows in a transaction: write the `assets` row
+/// and put it back, as a materialization and a deletion of the asset do. Of
+/// two that run at the same time, one then fails to commit and retries. The
+/// last statement returns the time of the latest deletion of the asset and
+/// whether the asset has partition tombstones.
+pub(super) const HOLD_ASSET_FOR_FAILURES: &str = "\
+     LET $asset = (SELECT last_event_id, last_deletion_timestamp FROM assets \
+         WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
+     UPDATE assets SET last_event_id = 'partition failure' \
+         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; \
+     UPDATE assets SET last_event_id = $asset.last_event_id \
+         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; \
+     RETURN { \
+         deleted_at: $asset.last_deletion_timestamp, \
+         tombstones: array::len(SELECT VALUE timestamp FROM asset_partition_deletions \
+             WHERE code_location_id = $cl AND asset_key = $asset_key LIMIT 1) > 0 \
+     };";
+
+/// Write the failure rows `$rows` (`DbPartitionFailure`s). A row that exists
+/// keeps the newer failure, and takes the time of the partition's row.
+pub(super) const RECORD_PARTITION_FAILURES: &str = "\
+     INSERT INTO asset_partition_failures $rows ON DUPLICATE KEY UPDATE \
+     run_id = IF $input.failed_at > failed_at THEN $input.run_id ELSE run_id END, \
+     failed_at = IF $input.failed_at > failed_at THEN $input.failed_at ELSE failed_at END, \
+     built_at = $input.built_at, has_row = $input.has_row RETURN NONE";
+
+/// Give the failure rows `$rows` (`DbPartitionFailure`s) the time of their
+/// partition's row.
+pub(super) const MOVE_FAILURE_ROWS: &str = "\
+     INSERT INTO asset_partition_failures $rows ON DUPLICATE KEY UPDATE \
+     built_at = $input.built_at, has_row = $input.has_row RETURN NONE";
+
+/// How many partitions of an asset failed, and how many of them have a row.
+/// Both are counted on an index.
+pub(super) const COUNT_FAILURES: &str = "\
+     SELECT count() AS total FROM asset_partition_failures \
+     WHERE code_location_id = $cl AND asset_key = $asset_key GROUP ALL; \
+     SELECT count() AS total FROM asset_partition_failures \
+     WHERE code_location_id = $cl AND asset_key = $asset_key AND has_row = true GROUP ALL";
+
+/// The same for the keys from `$lower` to `$upper`.
+pub(super) const COUNT_FAILURES_IN_BOUNDS: &str = "\
+     SELECT count() AS total FROM asset_partition_failures \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key >= $lower AND partition_key <= $upper GROUP ALL; \
+     SELECT count() AS total FROM asset_partition_failures \
+     WHERE code_location_id = $cl AND asset_key = $asset_key AND has_row = true \
+     AND partition_key >= $lower AND partition_key <= $upper GROUP ALL";
+
+/// One failure row of the keys from `$lowest` to `$highest`.
+pub(super) const ONE_FAILURE_IN_RANGE: &str = "\
+     SELECT VALUE failed_at FROM asset_partition_failures \
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key >= $lowest AND partition_key <= $highest LIMIT 1";
+
+/// The partitions whose failure row names the run `$run_id`.
+pub(super) const FAILURE_ROWS_OF_RUN: &str = "\
+     SELECT code_location_id, asset_key, partition_key \
+     FROM asset_partition_failures WHERE run_id = $run_id";
+
+/// After `SELECT <fields> FROM <table>`: the rows of the keys from `$lower`
+/// to `$upper`, at most `$limit`.
+pub(super) const ROWS_IN_RANGE: &str = "\
+     WHERE code_location_id = $cl AND asset_key = $asset_key \
+     AND partition_key >= $lower AND partition_key <= $upper LIMIT $limit";
+
+/// After `SELECT <fields> FROM <table>`: the row of the key `$partition`.
+pub(super) const ROW_OF_KEY: &str = "\
+     WHERE code_location_id = $cl AND asset_key = $asset_key AND partition_key = $partition";
 
 /// One page of an asset's events of the types `$types`, newest first. The
 /// events are read in time order off `idx_events_loc_asset_ts` until the page

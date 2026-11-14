@@ -9,10 +9,10 @@ use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillRunOutcome, BackfillStatus,
     CodeLocationDirectoryEntry, ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord,
     ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EndedBackfillRun,
-    EventRecord, LogRecord, PartitionBounds, PartitionKey, PoolInfo, PoolLimit, RunOutcome,
-    RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder, StepAttempts,
-    StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick,
-    TickRecord, UnstartedBackfillRun,
+    EventRecord, FailureCount, LogRecord, PartitionBounds, PartitionFailure, PartitionKey,
+    PoolInfo, PoolLimit, RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder,
+    SortOrder, StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent,
+    StoredLog, StoredTick, TickRecord, UnstartedBackfillRun,
 };
 
 /// A code-location identity bound for the lifetime of a logical operation.
@@ -279,14 +279,39 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
-    /// The time of the latest failure of each partition, unless a later
-    /// deletion replaced the failure. A later materialization is not checked:
-    /// compare with the time of the partition.
+    /// How many partitions of an asset failed and were not materialized or
+    /// deleted again, and how many of them have a row. Counted on an index.
+    fn count_partition_failures(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> impl Future<Output = Result<FailureCount>> + Send;
+
+    /// The same for each of `bounds`, in the order of the bounds.
+    fn count_partition_failures_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> impl Future<Output = Result<Vec<FailureCount>>> + Send;
+
+    /// The failed partitions of an asset, or of those in `bounds`, at most
+    /// `limit` of them.
     fn get_partition_failures(
         &self,
         code_location_id: &str,
         asset_key: &str,
-    ) -> impl Future<Output = Result<HashMap<PartitionKey, i64>>> + Send;
+        bounds: Option<&PartitionBounds>,
+        limit: u64,
+    ) -> impl Future<Output = Result<Vec<PartitionFailure>>> + Send;
+
+    /// The failed partitions of an asset among `keys`.
+    fn get_partition_failures_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<PartitionFailure>>> + Send;
 
     /// Partitions whose latest failure isn't superseded by a later materialization or deletion, with that failure's timestamp.
     fn get_failed_partitions(

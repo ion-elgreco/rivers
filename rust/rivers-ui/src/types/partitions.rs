@@ -188,7 +188,8 @@ pub struct PartitionRow {
     pub state: PartitionRowState,
     /// The time of the last materialization. A failed partition can have one.
     pub materialized_at: Option<i64>,
-    /// The run of the last materialization.
+    /// The run of the last materialization, or the run that failed a failed
+    /// partition.
     pub run_id: Option<String>,
     /// The time of the failure of a failed partition.
     pub failed_at: Option<i64>,

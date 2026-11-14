@@ -4,12 +4,15 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::storage::{PartitionBounds, PartitionKey, ScopedStorage, StorageBackend, stored_order};
+use crate::storage::{
+    FailureCount, PartitionBounds, PartitionFailure, PartitionKey, ScopedStorage, StorageBackend,
+    stored_order,
+};
 
-/// The failed partitions whose row is read to compare the time of the failure
-/// with the time of the materialization. A failed partition above this number
-/// counts as failed, and as materialized too when it has a row.
-const FAILURES_CHECKED: usize = 10_000;
+/// Up to this many failed partitions of an asset are read at once. With
+/// more, the failures in a run of keys are counted, and those of a list of
+/// partitions are read, when needed.
+const FAILURES_READ_AT_ONCE: u64 = 10_000;
 
 /// The state of one partition of an asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,94 +22,127 @@ pub enum PartitionState {
     Missing,
 }
 
-/// A partition that failed and was not materialized again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailedPartition {
-    pub key: PartitionKey,
-    pub failed_at: i64,
-    /// The partition has a row: a materialization older than the failure.
-    pub has_row: bool,
-}
-
-/// The partitions of an asset that failed and were not materialized again,
-/// in the order of the store.
+/// The partitions of an asset that failed and were not materialized or
+/// deleted again.
 #[derive(Debug, Clone, Default)]
 pub struct FailedPartitions {
-    partitions: Vec<FailedPartition>,
+    /// All the failed partitions of the asset.
+    count: FailureCount,
+    /// The failed partitions in the order of the store: all of them, or
+    /// those in the bounds of the read. `None` when the asset has more than
+    /// [`FAILURES_READ_AT_ONCE`].
+    partitions: Option<Vec<PartitionFailure>>,
 }
 
 impl FailedPartitions {
     /// The failed partitions of `asset_key`: all of them, or with `bounds`
-    /// those in one of the bounds. The rows of the partitions outside the
-    /// bounds are not read.
+    /// those in one of the bounds. With more than [`FAILURES_READ_AT_ONCE`],
+    /// only their number.
     pub async fn read<S: StorageBackend>(
         storage: &ScopedStorage<'_, S>,
         asset_key: &str,
         bounds: Option<&[PartitionBounds]>,
     ) -> Result<Self> {
-        let mut failures = storage.get_partition_failures(asset_key).await?;
-        if let Some(bounds) = bounds {
-            failures.retain(|key, _| bounds.iter().any(|bounds| bounds.contains(key)));
-        }
+        let count = storage.count_partition_failures(asset_key).await?;
+        let partitions = match count.failed {
+            0 => Some(Vec::new()),
+            failed if failed <= FAILURES_READ_AT_ONCE => {
+                let mut partitions = storage
+                    .get_partition_failures(asset_key, None, FAILURES_READ_AT_ONCE)
+                    .await?;
+                if let Some(bounds) = bounds {
+                    partitions
+                        .retain(|failed| bounds.iter().any(|bounds| bounds.contains(&failed.key)));
+                }
+                partitions.sort_by(|a, b| stored_order(&a.key, &b.key));
+                Some(partitions)
+            }
+            _ => None,
+        };
 
-        // A failed partition can have a row: the row is newer (the partition
-        // was materialized again) or older (it counts as failed).
-        let checked: Vec<PartitionKey> = failures.keys().take(FAILURES_CHECKED).cloned().collect();
-        let built_at: HashMap<PartitionKey, i64> = storage
-            .get_partition_timestamps_for_keys(asset_key, &checked)
-            .await?
-            .into_iter()
-            .map(|(key, time, _)| (key, time))
-            .collect();
+        Ok(Self { count, partitions })
+    }
 
-        let mut partitions: Vec<FailedPartition> = failures
-            .into_iter()
-            .filter_map(|(key, failed_at)| match built_at.get(&key) {
-                Some(built) if *built >= failed_at => None,
-                row => Some(FailedPartition {
-                    has_row: row.is_some(),
-                    key,
-                    failed_at,
-                }),
+    /// All the failed partitions of the asset.
+    pub fn count(&self) -> FailureCount {
+        self.count
+    }
+
+    /// The failed partitions in `bounds` of those read.
+    fn within<'a>(
+        read: &'a [PartitionFailure],
+        bounds: &PartitionBounds,
+    ) -> &'a [PartitionFailure] {
+        let start = read.partition_point(|failed| stored_order(&failed.key, &bounds.lower).is_lt());
+        let end = read.partition_point(|failed| stored_order(&failed.key, &bounds.upper).is_le());
+        &read[start..end.max(start)]
+    }
+
+    /// The failed partitions in each of `bounds`.
+    async fn counts_in<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorage<'_, S>,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<FailureCount>> {
+        let Some(read) = &self.partitions else {
+            return storage.count_partition_failures_in(asset_key, bounds).await;
+        };
+        Ok(bounds
+            .iter()
+            .map(|bounds| {
+                let within = Self::within(read, bounds);
+                FailureCount {
+                    failed: within.len() as u64,
+                    with_row: within.iter().filter(|failed| failed.has_row).count() as u64,
+                }
             })
-            .collect();
-        partitions.sort_by(|a, b| stored_order(&a.key, &b.key));
-
-        Ok(Self { partitions })
+            .collect())
     }
 
-    pub fn len(&self) -> usize {
-        self.partitions.len()
-    }
+    /// The failures of `partitions`, which are in `bounds` when given.
+    async fn of<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorage<'_, S>,
+        asset_key: &str,
+        bounds: Option<&PartitionBounds>,
+        partitions: &[PartitionKey],
+    ) -> Result<HashMap<PartitionKey, PartitionFailure>> {
+        let failures = match (&self.partitions, bounds) {
+            (Some(read), _) => partitions
+                .iter()
+                .filter_map(|key| {
+                    let at = read
+                        .binary_search_by(|failed| stored_order(&failed.key, key))
+                        .ok()?;
+                    Some(read[at].clone())
+                })
+                .collect(),
+            (None, Some(bounds)) => {
+                let limit = rows_limit(partitions.len());
+                let in_bounds = storage
+                    .get_partition_failures(asset_key, Some(bounds), limit)
+                    .await?;
+                match in_bounds.len() as u64 == limit {
+                    true => {
+                        storage
+                            .get_partition_failures_for_keys(asset_key, partitions)
+                            .await?
+                    }
+                    false => in_bounds,
+                }
+            }
+            (None, None) => {
+                storage
+                    .get_partition_failures_for_keys(asset_key, partitions)
+                    .await?
+            }
+        };
 
-    pub fn is_empty(&self) -> bool {
-        self.partitions.is_empty()
-    }
-
-    /// The failed partitions in `bounds`.
-    pub fn within(&self, bounds: &PartitionBounds) -> &[FailedPartition] {
-        let start = self
-            .partitions
-            .partition_point(|failed| stored_order(&failed.key, &bounds.lower).is_lt());
-        let end = self
-            .partitions
-            .partition_point(|failed| stored_order(&failed.key, &bounds.upper).is_le());
-        &self.partitions[start..end.max(start)]
-    }
-
-    pub fn get(&self, key: &PartitionKey) -> Option<&FailedPartition> {
-        self.partitions
-            .binary_search_by(|failed| stored_order(&failed.key, key))
-            .ok()
-            .map(|at| &self.partitions[at])
-    }
-
-    fn states(failed: &[FailedPartition], rows: u64) -> StateCounts {
-        let with_row = failed.iter().filter(|failed| failed.has_row).count() as u64;
-        StateCounts {
-            materialized: rows.saturating_sub(with_row),
-            failed: failed.len() as u64,
-        }
+        Ok(failures
+            .into_iter()
+            .map(|failed| (failed.key.clone(), failed))
+            .collect())
     }
 }
 
@@ -117,6 +153,17 @@ pub struct StateCounts {
     pub failed: u64,
 }
 
+impl StateCounts {
+    /// The states of partitions with `rows` rows, of which `failures` failed
+    /// later.
+    fn of(rows: u64, failures: FailureCount) -> Self {
+        StateCounts {
+            materialized: rows.saturating_sub(failures.with_row),
+            failed: failures.failed,
+        }
+    }
+}
+
 /// The partitions of `asset_key` by state.
 pub async fn count_states<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
@@ -124,25 +171,26 @@ pub async fn count_states<S: StorageBackend>(
     failed: &FailedPartitions,
 ) -> Result<StateCounts> {
     let rows = storage.count_materialized_partitions(asset_key).await?;
-    Ok(FailedPartitions::states(&failed.partitions, rows))
+    Ok(StateCounts::of(rows, failed.count))
 }
 
 /// The partitions in each of `bounds` by state, in the order of the bounds.
 ///
-/// No read grows with the number of materialized partitions.
+/// No read grows with the number of materialized or failed partitions.
 pub async fn count_states_in<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
     asset_key: &str,
     failed: &FailedPartitions,
     bounds: &[PartitionBounds],
 ) -> Result<Vec<StateCounts>> {
-    let rows = storage
-        .count_materialized_partitions_in(asset_key, bounds)
-        .await?;
-    Ok(bounds
-        .iter()
-        .zip(rows)
-        .map(|(bounds, rows)| FailedPartitions::states(failed.within(bounds), rows))
+    let (rows, failures) = tokio::try_join!(
+        storage.count_materialized_partitions_in(asset_key, bounds),
+        failed.counts_in(storage, asset_key, bounds),
+    )?;
+    Ok(rows
+        .into_iter()
+        .zip(failures)
+        .map(|(rows, failures)| StateCounts::of(rows, failures))
         .collect())
 }
 
@@ -152,7 +200,8 @@ pub struct PartitionRow {
     pub state: PartitionState,
     /// The time of the last materialization. A failed partition can have one.
     pub materialized_at: Option<i64>,
-    /// The run of the last materialization.
+    /// The run of the last materialization, or the run that failed a failed
+    /// partition.
     pub run_id: Option<String>,
     /// The time of the failure of a failed partition.
     pub failed_at: Option<i64>,
@@ -162,6 +211,14 @@ pub struct PartitionRow {
 /// of keys that the list does not hold.
 const ROWS_SPARE: u64 = 100;
 
+/// The rows that a read of the range of `partitions` returns before the
+/// partitions are read by key.
+fn rows_limit(partitions: usize) -> u64 {
+    (partitions as u64)
+        .saturating_mul(2)
+        .saturating_add(ROWS_SPARE)
+}
+
 /// A row for each of `partitions`, which are the partitions in `bounds`.
 pub async fn partition_rows_in<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
@@ -170,9 +227,7 @@ pub async fn partition_rows_in<S: StorageBackend>(
     bounds: &PartitionBounds,
     partitions: &[PartitionKey],
 ) -> Result<Vec<PartitionRow>> {
-    let limit = (partitions.len() as u64)
-        .saturating_mul(2)
-        .saturating_add(ROWS_SPARE);
+    let limit = rows_limit(partitions.len());
     let mut stored = storage
         .get_partition_timestamps_in(asset_key, bounds, limit)
         .await?;
@@ -184,7 +239,10 @@ pub async fn partition_rows_in<S: StorageBackend>(
             .await?;
     }
 
-    Ok(rows_of(failed, partitions, stored))
+    let failures = failed
+        .of(storage, asset_key, Some(bounds), partitions)
+        .await?;
+    Ok(rows_of(&failures, partitions, stored))
 }
 
 /// A row for each of `partitions`, each read by its key.
@@ -197,11 +255,12 @@ pub async fn partition_rows_of<S: StorageBackend>(
     let stored = storage
         .get_partition_timestamps_for_keys(asset_key, partitions)
         .await?;
-    Ok(rows_of(failed, partitions, stored))
+    let failures = failed.of(storage, asset_key, None, partitions).await?;
+    Ok(rows_of(&failures, partitions, stored))
 }
 
 fn rows_of(
-    failed: &FailedPartitions,
+    failures: &HashMap<PartitionKey, PartitionFailure>,
     partitions: &[PartitionKey],
     stored: Vec<(PartitionKey, i64, Option<String>)>,
 ) -> Vec<PartitionRow> {
@@ -215,7 +274,9 @@ fn rows_of(
         .map(|partition| {
             let built = stored.get(partition);
             let materialized_at = built.map(|(time, _)| *time);
-            let failure = failed
+            // The rows were read apart from the failures: a materialization
+            // between the two reads replaced the failure.
+            let failure = failures
                 .get(partition)
                 .filter(|failure| materialized_at.is_none_or(|built| built < failure.failed_at));
 
@@ -223,7 +284,7 @@ fn rows_of(
                 Some(failure) => PartitionRow {
                     state: PartitionState::Failed,
                     materialized_at,
-                    run_id: None,
+                    run_id: Some(failure.run_id.clone()),
                     failed_at: Some(failure.failed_at),
                 },
                 None => PartitionRow {
@@ -312,6 +373,13 @@ mod tests {
         for event in events {
             storage.store_event(event).await.unwrap();
         }
+        storage
+    }
+
+    /// The storage of `asset` after one drain of `events`.
+    async fn storage_with_drain(asset: &str, events: &[EventRecord]) -> SurrealStorage {
+        let storage = storage_with(asset, &[]).await;
+        storage.store_events(events).await.unwrap();
         storage
     }
 
@@ -418,8 +486,8 @@ mod tests {
             in_bounds,
             vec![
                 row(Materialized, Some(100), Some("run-100"), None),
-                row(Failed, Some(100), None, Some(200)),
-                row(Failed, None, None, Some(200)),
+                row(Failed, Some(100), Some("run-200"), Some(200)),
+                row(Failed, None, Some("run-200"), Some(200)),
                 row(Missing, None, None, None),
             ]
         );
@@ -455,7 +523,6 @@ mod tests {
         let ctx = CodeLocationContext::default_for_tests();
         let scoped = storage.for_code_location(&ctx);
         let hour = ("hour".to_string(), "00:00".to_string());
-
         let of_zone_c = FailedPartitions::read(
             &scoped,
             "trips",
@@ -463,35 +530,40 @@ mod tests {
         )
         .await
         .unwrap();
-        let of_the_next_hour = FailedPartitions::read(
+
+        let rows = partition_rows_of(
             &scoped,
             "trips",
-            Some(&[PartitionBounds::of_dimension(&[], "hour", "01:00", "01:00")]),
+            &of_zone_c,
+            &[cell("00:00", "b"), cell("00:00", "c")],
         )
         .await
         .unwrap();
 
-        assert_eq!(of_zone_c.len(), 1);
-        assert!(of_zone_c.get(&cell("00:00", "c")).is_some());
-        assert!(of_zone_c.get(&cell("00:00", "b")).is_none());
-        assert!(of_the_next_hour.is_empty());
+        // `00:00|b` failed too, outside the bounds of the read.
+        let states: Vec<PartitionState> = rows.iter().map(|row| row.state).collect();
+        assert_eq!(states, vec![Materialized, Failed]);
+        assert_eq!(of_zone_c.count().failed, 2);
     }
 
     #[test]
     fn a_partition_materialized_after_its_failure_is_not_failed() {
-        // A failure whose row was not read, as above `FAILURES_CHECKED`.
-        let failed = FailedPartitions {
-            partitions: vec![FailedPartition {
+        // The rows are read apart from the failures: a materialization
+        // between the two reads replaced the failure.
+        let failures = HashMap::from([(
+            single("p1"),
+            PartitionFailure {
                 key: single("p1"),
                 failed_at: 200,
+                run_id: "run-200".to_string(),
                 has_row: false,
-            }],
-        };
+            },
+        )]);
         let stored = |at: i64| vec![(single("p1"), at, Some(format!("run-{at}")))];
 
-        let built_later = rows_of(&failed, &[single("p1")], stored(300));
-        let built_before = rows_of(&failed, &[single("p1")], stored(100));
-        let not_built = rows_of(&failed, &[single("p1")], vec![]);
+        let built_later = rows_of(&failures, &[single("p1")], stored(300));
+        let built_before = rows_of(&failures, &[single("p1")], stored(100));
+        let not_built = rows_of(&failures, &[single("p1")], vec![]);
 
         assert_eq!(
             built_later,
@@ -504,7 +576,42 @@ mod tests {
         );
         assert_eq!(built_before[0].state, Failed);
         assert_eq!(built_before[0].failed_at, Some(200));
+        assert_eq!(built_before[0].run_id.as_deref(), Some("run-200"));
         assert_eq!(not_built[0].state, Failed);
+    }
+
+    #[tokio::test]
+    async fn states_of_more_failed_partitions_than_are_read_at_once() {
+        let names: Vec<String> = (0..10_050).map(|i| format!("p{i:05}")).collect();
+        let mut events: Vec<EventRecord> = names
+            .iter()
+            .map(|name| built("plain", single(name), 100))
+            .collect();
+        events.extend(names.iter().map(|name| failure("plain", single(name), 200)));
+        let storage = storage_with_drain("plain", &events).await;
+        let (failed, ctx) = failed_and_scoped(&storage, "plain").await;
+        let scoped = storage.for_code_location(&ctx);
+
+        let of_asset = count_states(&scoped, "plain", &failed).await.unwrap();
+        let of_runs = count_states_in(
+            &scoped,
+            "plain",
+            &failed,
+            &[
+                PartitionBounds::of_keys("p00000", "p00049"),
+                PartitionBounds::of_keys("p10000", "p10049"),
+            ],
+        )
+        .await
+        .unwrap();
+        let rows = partition_rows_of(&scoped, "plain", &failed, &[single("p10049")])
+            .await
+            .unwrap();
+
+        assert_eq!(of_asset, counts(0, 10_050));
+        assert_eq!(of_runs, vec![counts(0, 50), counts(0, 50)]);
+        assert_eq!(rows[0].state, Failed);
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-200"));
     }
 
     #[tokio::test]
@@ -536,11 +643,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(of_runs, vec![counts(1, 2), counts(1, 0)]);
-        assert_eq!(failed.len(), 2);
         assert_eq!(
-            failed.get(&single("2024-01-03")).map(|f| f.has_row),
-            Some(false)
+            failed.count(),
+            FailureCount {
+                failed: 2,
+                with_row: 1
+            }
         );
-        assert_eq!(failed.get(&single("2024-01-01")), None);
     }
 }

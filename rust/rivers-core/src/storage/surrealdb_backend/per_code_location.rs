@@ -6,9 +6,9 @@ use surrealdb::types::{RecordId, SurrealValue};
 use crate::storage::retry;
 use crate::storage::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, ConcurrencyClaimStatus,
-    CoordinatorRunInfo, PartitionBounds, PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit,
-    RunRecord, RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent,
-    StoredTick,
+    CoordinatorRunInfo, FailureCount, PartitionBounds, PartitionFailure, PartitionKey,
+    PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder,
+    StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
 };
 
 use super::partition_keys::KEY_ROWS_CHANGED;
@@ -746,12 +746,51 @@ impl PerCodeLocationStorage for SurrealStorage {
         Ok(rows.into_iter().map(|r| r.partition_key).collect())
     }
 
+    async fn count_partition_failures(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> Result<FailureCount> {
+        self.count_failures(code_location_id, asset_key).await
+    }
+
+    async fn count_partition_failures_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<FailureCount>> {
+        self.count_failures_in(code_location_id, asset_key, bounds)
+            .await
+    }
+
     async fn get_partition_failures(
         &self,
         code_location_id: &str,
         asset_key: &str,
-    ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
-        self.partition_failures(code_location_id, asset_key).await
+        bounds: Option<&PartitionBounds>,
+        limit: u64,
+    ) -> Result<Vec<PartitionFailure>> {
+        match bounds {
+            Some(bounds) => {
+                self.failures_in(code_location_id, asset_key, bounds, limit)
+                    .await
+            }
+            None => {
+                self.failures_of_asset(code_location_id, asset_key, Some(limit))
+                    .await
+            }
+        }
+    }
+
+    async fn get_partition_failures_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<PartitionFailure>> {
+        self.failures_of_keys(code_location_id, asset_key, keys)
+            .await
     }
 
     async fn get_failed_partitions(
@@ -760,14 +799,17 @@ impl PerCodeLocationStorage for SurrealStorage {
         asset_key: &str,
         materialized: &std::collections::HashMap<PartitionKey, i64>,
     ) -> Result<std::collections::HashMap<PartitionKey, i64>> {
-        let failures = self.partition_failures(code_location_id, asset_key).await?;
+        let failures = self
+            .failures_of_asset(code_location_id, asset_key, None)
+            .await?;
         Ok(failures
             .into_iter()
-            .filter(|(partition, failed)| {
+            .filter(|failure| {
                 materialized
-                    .get(partition)
-                    .is_none_or(|built| built < failed)
+                    .get(&failure.key)
+                    .is_none_or(|built| *built < failure.failed_at)
             })
+            .map(|failure| (failure.key, failure.failed_at))
             .collect())
     }
 

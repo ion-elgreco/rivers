@@ -12,6 +12,7 @@ use crate::storage::{
     StorageBackend, StoredEvent, StoredLog, TickRecord, UnstartedBackfillRun,
 };
 
+use super::partition_failures::keyed_failure;
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -97,6 +98,17 @@ impl StorageBackend for SurrealStorage {
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_deletion() {
                 self.consolidate_deletion(cl, asset_key, event, &event_id).await?;
+            }
+
+        if let Some((asset_key, partition_key)) = keyed_failure(event)
+            && self.action_run_ids(vec![event.run_id.clone()]).await?.is_empty() {
+                let failures = partition_key
+                    .members()
+                    .into_iter()
+                    .map(|member| (member, event.timestamp, event.run_id.clone()))
+                    .collect();
+                self.record_partition_failures(cl, asset_key, failures, None)
+                    .await?;
             }
 
         Ok(event_id)
@@ -277,6 +289,36 @@ impl StorageBackend for SurrealStorage {
             self.delete_partitions(cl, asset_key, deletions).await?;
         }
 
+        // The failures last: each is compared with the materializations and
+        // deletions above.
+        let failure_runs: Vec<String> = events
+            .iter()
+            .filter(|event| keyed_failure(event).is_some())
+            .map(|event| event.run_id.clone())
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_failure_runs = self.action_run_ids(failure_runs).await?;
+        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
+        for event in events {
+            let Some((asset_key, partition_key)) = keyed_failure(event) else {
+                continue;
+            };
+            if action_failure_runs.contains(&event.run_id) {
+                continue;
+            }
+            let of_asset = failures
+                .entry((event.code_location_id.as_str(), asset_key))
+                .or_default();
+            for member in partition_key.members() {
+                of_asset.push((member, event.timestamp, event.run_id.clone()));
+            }
+        }
+        for ((cl, asset_key), failures) in failures {
+            self.record_partition_failures(cl, asset_key, failures, None)
+                    .await?;
+        }
+
         Ok(event_ids.clone())
         })
         .await
@@ -424,7 +466,9 @@ impl StorageBackend for SurrealStorage {
             Ok(())
         })
         .await;
-        swallow_phantom_commit(result, "create_run", &run.run_id)
+        swallow_phantom_commit(result, "create_run", &run.run_id)?;
+        self.record_failures_of_created(std::slice::from_ref(run))
+            .await
     }
 
     async fn create_runs(&self, runs: &[RunRecord]) -> Result<()> {
@@ -444,7 +488,8 @@ impl StorageBackend for SurrealStorage {
             Ok(())
         })
         .await;
-        swallow_phantom_commit(result, "create_runs", &format!("batch[{}]", runs.len()))
+        swallow_phantom_commit(result, "create_runs", &format!("batch[{}]", runs.len()))?;
+        self.record_failures_of_created(runs).await
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(%run_id, ?status))]
@@ -454,6 +499,22 @@ impl StorageBackend for SurrealStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> Result<()> {
+        // The failures before the status: a run that reads as failed has them.
+        // A run whose end in failure moves earlier is derived again after the
+        // status.
+        let mut ends_earlier = false;
+        if status == RunStatus::Failure
+            && let Some(run) = self.run_of_failures(run_id).await?
+        {
+            let at = end_time.or(run.end_time).unwrap_or(run.start_time);
+            let ended = (run.status == "Failure").then(|| run.end_time.unwrap_or(run.start_time));
+            match ended {
+                Some(ended) if at < ended => ends_earlier = true,
+                Some(ended) if at == ended => {}
+                _ => self.record_failures_of_run(&run, at).await?,
+            }
+        }
+
         let set_end_time = if end_time.is_some() {
             ", end_time = $end_time"
         } else {
@@ -461,31 +522,44 @@ impl StorageBackend for SurrealStorage {
         };
         let update =
             format!("UPDATE runs SET status = $status{set_end_time} WHERE run_id = $run_id");
+        // The last statement returns the status before the update.
         let query = if matches!(
             status,
             RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
         ) {
             format!(
                 "BEGIN TRANSACTION;\n\
-                 LET $final = ({update} RETURN run_id, status, launched_by);\n\
+                 LET $final = ({update} RETURN run_id, status, launched_by, \
+                     $before.status AS status_before);\n\
                  {RECORD_BACKFILL_RUN_OUTCOME}\n\
-                 COMMIT TRANSACTION;"
+                 COMMIT TRANSACTION;\n\
+                 RETURN $final[0].status_before;"
             )
         } else {
-            format!("{update} RETURN NONE")
+            format!(
+                "LET $was = ({update} RETURN VALUE $before.status)[0];\n\
+                 RETURN $was;"
+            )
         };
 
-        retry::with_retry(&self.retry_config, || async {
-            self.db
+        let before: Option<String> = retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
                 .query(&query)
                 .bind(("run_id", run_id.to_string()))
                 .bind(("status", format!("{:?}", status)))
                 .bind(("end_time", end_time))
                 .await?
                 .check()?;
-            Ok(())
+            let last = result.num_statements() - 1;
+            Ok(result.take(last)?)
         })
-        .await
+        .await?;
+
+        if ends_earlier || (status != RunStatus::Failure && before.as_deref() == Some("Failure")) {
+            self.rederive_failures_of_run(run_id, false, None).await?;
+        }
+        Ok(())
     }
 
     async fn update_run_block_reason(&self, run_id: &str, reason: Option<&str>) -> Result<()> {
@@ -502,26 +576,35 @@ impl StorageBackend for SurrealStorage {
 
     async fn try_start_run(&self, run_id: &str) -> Result<bool> {
         let now_ns = now_nanos();
-        retry::with_retry(&self.retry_config, || async {
+        let (started, was_failed) = retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
                 .query(
                     "UPDATE runs SET status = 'Started', \
                              execution_start_time = execution_start_time ?? $now \
-                         WHERE run_id = $run_id AND status != 'Canceled'; \
+                         WHERE run_id = $run_id AND status != 'Canceled' \
+                         RETURN VALUE $before.status; \
                      SELECT status FROM runs WHERE run_id = $run_id LIMIT 1",
                 )
                 .bind(("run_id", run_id.to_string()))
                 .bind(("now", now_ns))
                 .await?;
+            let before: Vec<String> = result.take(0)?;
             let status: Option<String> = result.take((1, "status"))?;
+            let was_failed = before.iter().any(|status| status == "Failure");
             match status.as_deref() {
-                Some("Started") => Ok(true),
-                Some(_) => Ok(false),
+                Some("Started") => Ok((true, was_failed)),
+                Some(_) => Ok((false, was_failed)),
                 None => anyhow::bail!("run {run_id} not found"),
             }
         })
-        .await
+        .await?;
+
+        // A run that failed before it started: its end in failure is gone.
+        if was_failed {
+            self.rederive_failures_of_run(run_id, false, None).await?;
+        }
+        Ok(started)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {
@@ -1063,11 +1146,22 @@ impl StorageBackend for SurrealStorage {
                      DELETE FROM run_logs WHERE run_id = $run_id; \
                      DELETE FROM concurrency_slots WHERE run_id = $run_id; \
                      DELETE FROM pending_steps WHERE run_id = $run_id; \
-                     DELETE FROM kv WHERE key = $cancel_key; \
-                     DELETE FROM runs WHERE run_id = $run_id",
+                     DELETE FROM kv WHERE key = $cancel_key",
                 )
                 .bind(("run_id", run_id.to_string()))
                 .bind(("cancel_key", format!("cancel:{run_id}")))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await?;
+        // The failures of the run go with it; older failures of its
+        // partitions come back.
+        self.rederive_failures_of_run(run_id, true, None).await?;
+        retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query("DELETE FROM runs WHERE run_id = $run_id")
+                .bind(("run_id", run_id.to_string()))
                 .await?
                 .check()?;
             Ok(())

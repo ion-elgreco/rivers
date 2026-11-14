@@ -101,11 +101,11 @@ impl AsyncMigrate for SurrealMigrate {
 
 /// Highest embedded migration version. Bump by adding a `Vn__*.surql` + an
 /// [`embedded_migrations`] entry; a test pins this to that max.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// The floors the [`SCHEMA_VERSION`] migration records; a test pins them to it.
 pub const MIN_READER: u32 = 14;
-pub const MIN_WRITER: u32 = 14;
+pub const MIN_WRITER: u32 = 16;
 
 /// What a migration to this build stamps on the store.
 pub const BUILD_STAMPS: SchemaStamps = SchemaStamps {
@@ -192,7 +192,21 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V15__run_execution_start.surql"),
         )
         .expect("V15__run_execution_start migration name is well-formed"),
+        Migration::unapplied("V16__partition_failures", V16_PARTITION_FAILURES)
+            .expect("V16__partition_failures migration name is well-formed"),
     ]
+}
+
+const V16_PARTITION_FAILURES: &str = include_str!("migrations/V16__partition_failures.surql");
+
+/// The definitions of V16 without its stamp. The failure rows are filled in
+/// between the two: the table exists, and the store does not read as V16
+/// before it holds the rows.
+fn v16_definitions() -> &'static str {
+    let stamp = V16_PARTITION_FAILURES
+        .find("UPSERT migration_meta")
+        .expect("V16 ends with its stamp");
+    &V16_PARTITION_FAILURES[..stamp]
 }
 
 /// Apply all pending `migrations` via refinery (idempotent — applied ones are
@@ -233,6 +247,12 @@ async fn apply_migrations(db: &Surreal<Any>, migrations: &[Migration]) -> anyhow
     if before < 13 {
         apply(&mut backend, Target::Version(12), false).await?;
         rebuild_indexes(db).await?;
+    }
+    // V16 stores the failed partitions that the readers derived before.
+    if before < 16 {
+        apply(&mut backend, Target::Version(15), false).await?;
+        db.query(v16_definitions()).await?.check()?;
+        super::partition_failures::fill_partition_failures(db).await?;
     }
     apply(&mut backend, Target::Latest, false).await?;
     Ok(())

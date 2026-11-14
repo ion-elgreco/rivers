@@ -334,8 +334,8 @@ impl<'a> BatchContext<'a> {
 
     /// A failed partitioned step materialized none of its partitions, so record
     /// them all with one StepFailure carrying the whole key, in the form of
-    /// the run record when the record holds this key; `get_failed_partitions`
-    /// expands it. The None-keyed step-level failure (emitted separately)
+    /// the run record when the record holds this key; the store fails each
+    /// member of it. The None-keyed step-level failure (emitted separately)
     /// still drives run/step status.
     ///
     /// Action runs are skipped because the run record already says every member
@@ -343,8 +343,8 @@ impl<'a> BatchContext<'a> {
     /// consults events for it, so the keyed event would be pure noise. Contrast
     /// `surviving_members`, which *does* emit keyed failures on action runs: a
     /// per-key `mark_partition_failed` inside an otherwise-successful run has no
-    /// other record. Neither one floors a materialization — `get_failed_partitions`
-    /// filters action runs out on the read side.
+    /// other record. Neither one floors a materialization — the store records
+    /// no failed partition for an action run.
     pub(crate) fn emit_partition_failures(&self, step_name: &str, error: &str, ts: i64) {
         if self.scope.plan.is_action() {
             return;

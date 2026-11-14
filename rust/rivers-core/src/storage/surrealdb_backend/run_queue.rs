@@ -28,7 +28,16 @@ impl SurrealStorage {
     /// run already reached a terminal status and was left alone (a late
     /// launch-error must not stomp a concurrent Canceled/Success write).
     pub async fn fail_run_if_active(&self, run_id: &str, end_time: i64) -> Result<bool> {
-        retry::with_retry(&self.retry_config, || async {
+        // The failures before the status: a run that reads as failed has them.
+        let recorded = match self.run_of_failures(run_id).await? {
+            Some(run) if matches!(run.status.as_str(), "NotStarted" | "Queued" | "Started") => {
+                self.record_failures_of_run(&run, end_time).await?;
+                true
+            }
+            _ => false,
+        };
+
+        let failed = retry::with_retry(&self.retry_config, || async {
             let mut response = self
                 .db
                 .query(format!(
@@ -50,7 +59,13 @@ impl SurrealStorage {
             let failed: Option<bool> = response.take(last)?;
             Ok(failed.unwrap_or(false))
         })
-        .await
+        .await?;
+
+        // The run ended otherwise in the meantime.
+        if recorded && !failed {
+            self.rederive_failures_of_run(run_id, false, None).await?;
+        }
+        Ok(failed)
     }
 
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.

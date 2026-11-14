@@ -5,11 +5,12 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::storage::PartitionBounds;
 use crate::storage::surrealdb_backend::partition_reads::keyed_statements;
 use crate::storage::surrealdb_backend::queries::{
-    COUNT_PARTITIONS_IN_BOUNDS, PARTITION_TIMESTAMPS_OF_KEY,
+    COUNT_FAILURES, COUNT_FAILURES_IN_BOUNDS, COUNT_PARTITIONS_IN_BOUNDS, FAILURE_ROWS_OF_RUN,
+    ONE_FAILURE_IN_RANGE, PARTITION_TIMESTAMPS_OF_KEY, ROW_OF_KEY, ROWS_IN_RANGE,
 };
+use crate::storage::{PartitionBounds, PartitionFailure};
 
 fn single(key: &str) -> PartitionKey {
     PartitionKey::Single {
@@ -213,7 +214,7 @@ async fn materialized_partitions_page_reads_each_partition_once() {
 }
 
 #[tokio::test]
-async fn partition_failures_are_not_compared_with_materializations() {
+async fn a_later_materialization_or_deletion_replaces_a_failure() {
     let storage = make_storage().await;
     register(&storage, &["plain"]).await;
     storage
@@ -249,17 +250,21 @@ async fn partition_failures_are_not_compared_with_materializations() {
         .unwrap();
 
     let failures = storage
-        .get_partition_failures(DEFAULT_CODE_LOCATION_ID, "plain")
+        .get_partition_failures(DEFAULT_CODE_LOCATION_ID, "plain", None, 10)
         .await
         .unwrap();
     assert_eq!(
         failures,
-        HashMap::from([(single("rebuilt"), 100), (single("broken"), 100)])
+        vec![PartitionFailure {
+            key: single("broken"),
+            failed_at: 100,
+            run_id: "r1".to_string(),
+            has_row: false,
+        }]
     );
 
-    let times = HashMap::from([(single("rebuilt"), 200)]);
     let failed = storage
-        .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "plain", &times)
+        .get_failed_partitions(DEFAULT_CODE_LOCATION_ID, "plain", &HashMap::new())
         .await
         .unwrap();
     assert_eq!(failed, HashMap::from([(single("broken"), 100)]));
@@ -511,6 +516,127 @@ async fn rows_in_bounds_are_read_through_the_index() {
         format!("{plan:?}").contains("idx_asset_part"),
         "the bounds should be a range of the index of the keys: {plan:?}"
     );
+}
+
+/// `plain` has failure rows of `p00` to `p09`; the even ones have a row.
+async fn storage_with_failures() -> SurrealStorage {
+    let storage = make_storage().await;
+    register(&storage, &["plain"]).await;
+    let mut events = Vec::new();
+    for i in 0..10 {
+        let key = single(&format!("p{i:02}"));
+        if i % 2 == 0 {
+            events.push(materialization("plain", "r0", key.clone(), 100));
+        }
+        events.push(event("plain", "r1", EventType::StepFailure, key, 200));
+    }
+    storage.store_events(&events).await.unwrap();
+    storage
+}
+
+/// The plan of `statement`, with the keys from `p03` to `p07`, the key `p04`
+/// and the run `r1`.
+async fn plan_of(storage: &SurrealStorage, statement: &str) -> serde_json::Value {
+    let plan: Vec<serde_json::Value> = storage
+        .db
+        .query(format!("{statement} EXPLAIN"))
+        .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+        .bind(("asset_key", "plain".to_string()))
+        .bind(("lower", single("p03")))
+        .bind(("upper", single("p07")))
+        .bind(("lowest", single("p03")))
+        .bind(("highest", single("p07")))
+        .bind(("partition", single("p04")))
+        .bind(("limit", 100u64))
+        .bind(("run_id", "r1".to_string()))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    serde_json::Value::Array(plan)
+}
+
+/// An asset can have a million failed partitions. The counts of a page come
+/// from the indexes of the failure rows, and read no row.
+#[tokio::test]
+async fn failure_counts_are_counted_on_the_index() {
+    let storage = storage_with_failures().await;
+
+    for statement in COUNT_FAILURES
+        .split(';')
+        .chain(COUNT_FAILURES_IN_BOUNDS.split(';'))
+    {
+        let plan = plan_of(&storage, statement).await;
+        let mut found = Vec::new();
+        operators(&plan, &mut found);
+        assert!(
+            found.iter().any(|operator| operator == "IndexCountScan"),
+            "the count should come from the index alone: {statement}: {plan:?}"
+        );
+    }
+}
+
+/// Two indexes of the failure rows start with the asset. A read of a key, or
+/// of a range of keys, through the one that does not end with the key reads
+/// every failure row of the asset.
+#[tokio::test]
+async fn reads_of_keys_go_through_the_index_of_the_keys() {
+    let storage = storage_with_failures().await;
+    let range = ["'p03'", "'p07'"];
+    let key = ["'p04'"];
+
+    for (statement, index, reached) in [
+        (ONE_FAILURE_IN_RANGE.to_string(), "idx_apf", &range[..]),
+        (
+            format!("SELECT * FROM asset_partition_failures {ROWS_IN_RANGE}"),
+            "idx_apf",
+            &range[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partition_failures {ROW_OF_KEY}"),
+            "idx_apf",
+            &key[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partitions {ROWS_IN_RANGE}"),
+            "idx_asset_part",
+            &range[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partitions {ROW_OF_KEY}"),
+            "idx_asset_part",
+            &key[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partition_deletions {ROWS_IN_RANGE}"),
+            "idx_asset_part_del",
+            &range[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partition_deletions {ROW_OF_KEY}"),
+            "idx_asset_part_del",
+            &key[..],
+        ),
+        (
+            FAILURE_ROWS_OF_RUN.to_string(),
+            "idx_apf_run",
+            &["'r1'"][..],
+        ),
+    ] {
+        let plan = plan_of(&storage, &statement).await;
+        let mut accesses = Vec::new();
+        index_accesses(&plan, &mut accesses);
+
+        assert_eq!(accesses.len(), 1, "one index scan: {statement}: {plan:?}");
+        assert!(
+            format!("{plan:?}").contains(&format!("{index:?}")),
+            "the scan should use {index}: {statement}: {plan:?}"
+        );
+        assert!(
+            reached.iter().all(|value| accesses[0].contains(value)),
+            "the scan should reach {reached:?} on the index: {statement}: {plan:?}"
+        );
+    }
 }
 
 #[tokio::test]

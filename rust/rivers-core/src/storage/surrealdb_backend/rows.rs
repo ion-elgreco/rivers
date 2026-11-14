@@ -104,6 +104,18 @@ pub(super) struct DbPartitionDeletion {
     pub(super) timestamp: i64,
 }
 
+/// One `asset_partition_failures` row, written by [`RECORD_PARTITION_FAILURES`].
+#[derive(Debug, Clone, SurrealValue)]
+pub(super) struct DbPartitionFailure {
+    pub(super) code_location_id: String,
+    pub(super) asset_key: String,
+    pub(super) partition_key: PartitionKey,
+    pub(super) failed_at: i64,
+    pub(super) run_id: String,
+    pub(super) built_at: Option<i64>,
+    pub(super) has_row: bool,
+}
+
 /// One `asset_partitions` row, upserted via [`UPSERT_ASSET_PARTITIONS`] in
 /// the same transaction as its asset's row update.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]
