@@ -253,3 +253,4 @@ ds-bundle/
 .design-sync/node_modules
 .design-sync/pkg/dist/
 .design-sync/
+showcase/
