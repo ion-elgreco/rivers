@@ -46,7 +46,8 @@ class RunResult:
 
     Each failed output of a multi-asset is listed, and no output that
     materialized. A multi-asset that fails after all its outputs materialized
-    is listed under its own name.
+    is listed under its own name. When some events of the run could not be
+    stored, the list also holds ``("rivers/events", error_message)``.
     """
 
 class RunHandle:

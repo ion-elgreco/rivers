@@ -24,7 +24,7 @@ use rivers_core::storage::StorageBackend;
 
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
-use crate::errors::ConfigurationError;
+use crate::errors::{ConfigurationError, ExecutionError};
 
 use crate::partitions::PyPartitionKey;
 use crate::repository::resolved_node::ResolvedNode;
@@ -41,6 +41,9 @@ pub(crate) struct GraphNodeMap {
 }
 
 const DEFAULT_EXECUTOR_KEY: &str = "__default__";
+
+/// Name of the failure of a run whose events were not all stored.
+const EVENTS_NOT_STORED: &str = "rivers/events";
 
 /// Reserved metadata keys in the `rivers/` namespace.
 pub(crate) mod metadata_keys {
@@ -501,7 +504,12 @@ impl Executor {
                 }
             }
 
-            writer.flush();
+            if let Err(e) = writer.flush() {
+                failures.push((
+                    EVENTS_NOT_STORED.to_string(),
+                    ExecutionError::new_err(format!("{e:#}")),
+                ));
+            }
 
             failures
         })

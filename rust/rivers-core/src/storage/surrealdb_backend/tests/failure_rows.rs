@@ -8,6 +8,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 
 use super::*;
+use crate::storage::event_batch::{EventStore, EventWithId};
 use crate::storage::surrealdb_backend::partition_failures::{derived_rows, run_failure_rows};
 use crate::storage::{PartitionFailure, retry, stored_order};
 
@@ -679,6 +680,58 @@ async fn failures_of_more_partitions_than_one_transaction_holds() {
     assert_eq!(rows.len(), 2_500);
     assert_eq!(rows.iter().filter(|row| row.has_row).count(), 1_250);
     assert_derived(&storage, "a", "after the failure").await;
+}
+
+/// An attempt that stored the events of a batch and then stopped, and a send
+/// of the same batch again: each event is stored once, and the failures of
+/// the batch take their rows.
+#[tokio::test]
+async fn a_batch_sent_again_after_a_stopped_attempt_stores_each_event_once() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    let batch: Vec<EventWithId> = [
+        built("a", "r1", "p1", 100),
+        failed("a", "r2", single("p2"), 200),
+        failed("a", "r2", keys(&["p3", "p4"]), 300),
+    ]
+    .into_iter()
+    .map(EventWithId::new)
+    .collect();
+    let inserted: Vec<DbEventWrite> = batch
+        .iter()
+        .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+        .collect();
+    storage
+        .db
+        .query("INSERT IGNORE INTO events $rows RETURN NONE")
+        .bind(("rows", inserted))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    storage.store_events_with_ids(&batch).await.unwrap();
+
+    let mut stored = Vec::new();
+    for run_id in ["r1", "r2"] {
+        for event in storage.get_events_for_run(run_id).await.unwrap() {
+            stored.push((event.run_id, event.timestamp));
+        }
+    }
+    let once: Vec<(String, i64)> = batch
+        .iter()
+        .map(|e| (e.event.run_id.clone(), e.event.timestamp))
+        .collect();
+    assert_eq!(stored, once);
+    assert_eq!(
+        rows(&storage, "a").await,
+        vec![
+            failure("p2", 200, "r2", false),
+            failure("p3", 300, "r2", false),
+            failure("p4", 300, "r2", false)
+        ]
+    );
+    assert_derived(&storage, "a", "after the send again").await;
 }
 
 /// A small generator of numbers, the same on every run of the test.

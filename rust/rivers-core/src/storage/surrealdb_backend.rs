@@ -555,7 +555,7 @@ fn record_id_str(id: &RecordId) -> String {
 
 /// Client-generated `events` record id — retried inserts replay the same id
 /// so `INSERT IGNORE` deduplicates instead of appending.
-fn new_event_record_id() -> RecordId {
+pub(crate) fn new_event_record_id() -> RecordId {
     RecordId::new("events", uuid::Uuid::new_v4().simple().to_string())
 }
 

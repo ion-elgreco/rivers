@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use surrealdb::types::{Bytes, SurrealValue};
 
 use crate::assets::remote::LocationRef;
+use crate::storage::event_batch::{EventStore, EventWithId};
 use crate::storage::retry;
 use crate::storage::{
     BackfillRecord, BackfillRunOutcome, BackfillStatus, CodeLocationDirectoryEntry,
@@ -122,219 +123,10 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        if events.is_empty() {
-            return Ok(vec![]);
-        }
-        // Ids generated outside the retry closure: one consolidation conflict
-        // replays the whole drained batch, and INSERT IGNORE needs the same
-        // record ids to turn the re-insert into a no-op.
-        let rows: Vec<DbEventWrite> = events
-            .iter()
-            .map(|e| DbEventWrite::from_event(e, new_event_record_id()))
-            .collect();
-        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
-        retry::with_retry(&self.retry_config, || async {
-        self.db
-            .query("INSERT IGNORE INTO events $rows RETURN NONE")
-            .bind(("rows", rows.clone()))
-            .await
-            .context("failed to batch store events")?
-            .check()?;
-
-        // Group materializations by asset, then one bulk upsert. The newest
-        // event wins, by time, not by place in the drain: the `assets` row
-        // must hold a time no older than any of its partition rows.
-        let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-        // Latest event that actually consumed inputs, tracked apart from
-        // `latest_mat` so an action's provenance-free materialization landing
-        // in the same drain doesn't drop a real materialize's provenance.
-        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-        let mut part_rows: std::collections::HashMap<
-            (&str, &str, &PartitionKey),
-            DbAssetPartitionWrite,
-        > = std::collections::HashMap::new();
-        let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
-
-        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
-            let Some(asset_key) = &event.asset_key else {
-                continue;
-            };
-            if !event.event_type.is_materialization() {
-                continue;
-            }
-            let cl = event.code_location_id.as_str();
-            let key = (cl, asset_key.as_str());
-            let newest = |held: Option<&usize>| {
-                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
-            };
-            if newest(latest_mat.get(&key)) {
-                latest_mat.insert(key, idx);
-            }
-            if !event.input_data_versions.is_empty() && newest(latest_idv.get(&key)) {
-                latest_idv.insert(key, idx);
-            }
-            if let Some(partition_key) = &event.partition_key {
-                built_by
-                    .entry(key)
-                    .or_default()
-                    .push((partition_key, event.run_id.as_str()));
-                let part = (cl, asset_key.as_str(), partition_key);
-                if part_rows
-                    .get(&part)
-                    .is_none_or(|held| held.last_timestamp <= event.timestamp)
-                {
-                    part_rows.insert(
-                        part,
-                        DbAssetPartitionWrite {
-                            code_location_id: cl.to_string(),
-                            asset_key: asset_key.clone(),
-                            partition_key: partition_key.clone(),
-                            last_event_id: event_id.clone(),
-                            last_run_id: event.run_id.clone(),
-                            last_timestamp: event.timestamp,
-                        },
-                    );
-                }
-            }
-        }
-
-        // One `assets` row update per materialized asset (newest event wins).
-        let update_run_ids: Vec<String> = latest_mat
-            .values()
-            .map(|&idx| events[idx].run_id.clone())
-            .collect::<std::collections::HashSet<String>>()
-            .into_iter()
-            .collect();
-        let action_ids = self.action_run_ids(update_run_ids).await?;
-        // Each asset's partition rows commit in one transaction with its
-        // `assets` row update — a concurrent whole-asset deletion lands
-        // wholly before or wholly after, never between the two. Every
-        // partition row comes from a materialization event, so its asset is
-        // always in `latest_mat`.
-        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
-            std::collections::HashMap::new();
-        for ((cl, ak, _), row) in part_rows {
-            parts_by_asset.entry((cl, ak)).or_default().push(row);
-        }
-        for (&(cl, asset_key), &idx) in &latest_mat {
-            let event = &events[idx];
-            let event_id = &event_ids[idx];
-            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
-            let idv = idv_event.map(|e| e.input_data_versions.clone());
-            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
-            // A co-drained real materialize (the `idv` entry) legitimately
-            // owns provenance and the code-version stamp even when the
-            // action's event is the newer one.
-            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
-            let code_version = if action_only {
-                None
-            } else {
-                self.get_code_version(cl, asset_key).await?
-            };
-            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
-            let built_by = built_by.remove(&(cl, asset_key)).unwrap_or_default();
-            self.apply_materialization(
-                cl,
-                asset_key,
-                event_id,
-                &event.run_id,
-                event.timestamp,
-                event.event_type.data_version().map(|s| s.to_string()),
-                provenance_timestamp,
-                code_version,
-                idv,
-                action_only,
-                parts,
-                &built_by,
-            )
-            .await?;
-        }
-
-        // Partition-scoped deletions collapse to one DELETE per asset — a
-        // purge over a date range lands thousands of them in one drain.
-        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
-        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
-        for (event, event_id) in events.iter().zip(event_ids.iter()) {
-            let cl = event.code_location_id.as_str();
-            if let Some(asset_key) = &event.asset_key
-                && event.event_type.is_observation() {
-                    let data_version = event.event_type.data_version().map(|s| s.to_string());
-                    self.db
-                        .query("UPDATE assets SET last_event_id = $event_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("event_id", event_id.clone()))
-                        .bind(("timestamp", event.timestamp))
-                        .bind(("data_version", data_version))
-                        .await?
-                        .check()?;
-                }
-            if let Some(asset_key) = &event.asset_key
-                && event.event_type.is_deletion() {
-                    match &event.partition_key {
-                        Some(pk) => part_deletes
-                            .entry((cl, asset_key.as_str()))
-                            .or_default()
-                            .push((pk.clone(), event.timestamp)),
-                        // The newest deletion per asset wins — repeats in one
-                        // drain only re-clear the same row.
-                        None => {
-                            let key = (cl, asset_key.as_str());
-                            if whole_deletes
-                                .get(&key)
-                                .is_none_or(|(held, _)| held.timestamp <= event.timestamp)
-                            {
-                                whole_deletes.insert(key, (event, event_id));
-                            }
-                        }
-                    }
-                }
-        }
-        for ((cl, asset_key), (event, event_id)) in whole_deletes {
-            self.consolidate_deletion(cl, asset_key, event, event_id)
-                .await?;
-        }
-        for ((cl, asset_key), deletions) in part_deletes {
-            self.delete_partitions(cl, asset_key, deletions).await?;
-        }
-
-        // The failures last: each is compared with the materializations and
-        // deletions above.
-        let failure_runs: Vec<String> = events
-            .iter()
-            .filter(|event| keyed_failure(event).is_some())
-            .map(|event| event.run_id.clone())
-            .collect::<HashSet<String>>()
-            .into_iter()
-            .collect();
-        let action_failure_runs = self.action_run_ids(failure_runs).await?;
-        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
-        for event in events {
-            let Some((asset_key, partition_key)) = keyed_failure(event) else {
-                continue;
-            };
-            if action_failure_runs.contains(&event.run_id) {
-                continue;
-            }
-            let of_asset = failures
-                .entry((event.code_location_id.as_str(), asset_key))
-                .or_default();
-            for member in partition_key.members() {
-                of_asset.push((member, event.timestamp, event.run_id.clone()));
-            }
-        }
-        for ((cl, asset_key), failures) in failures {
-            self.record_partition_failures(cl, asset_key, failures, None)
-                    .await?;
-        }
-
-        Ok(event_ids.clone())
-        })
-        .await
+        let events: Vec<EventWithId> = events.iter().cloned().map(EventWithId::new).collect();
+        self.store_events_with_ids(&events).await?;
+        Ok(events.iter().map(|e| record_id_str(&e.id)).collect())
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = logs.len()))]
@@ -1408,6 +1200,224 @@ impl StorageBackend for SurrealStorage {
                 .into_iter()
                 .filter_map(|r| Some((r.asset_key?, r.data_version?)))
                 .collect())
+        })
+        .await
+    }
+}
+
+impl EventStore for SurrealStorage {
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
+    async fn store_events_with_ids(&self, events: &[EventWithId]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // The ids come with the events: one consolidation conflict replays
+        // the whole batch, and so does a send of the batch again; INSERT
+        // IGNORE needs the same record ids to turn the re-insert into a no-op.
+        let rows: Vec<DbEventWrite> = events
+            .iter()
+            .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+            .collect();
+        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
+        let events: Vec<&EventRecord> = events.iter().map(|e| &e.event).collect();
+        retry::with_retry(&self.retry_config, || async {
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", rows.clone()))
+            .await
+            .context("failed to batch store events")?
+            .check()?;
+
+        // Group materializations by asset, then one bulk upsert. The newest
+        // event wins, by time, not by place in the drain: the `assets` row
+        // must hold a time no older than any of its partition rows.
+        let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        // Latest event that actually consumed inputs, tracked apart from
+        // `latest_mat` so an action's provenance-free materialization landing
+        // in the same drain doesn't drop a real materialize's provenance.
+        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        let mut part_rows: std::collections::HashMap<
+            (&str, &str, &PartitionKey),
+            DbAssetPartitionWrite,
+        > = std::collections::HashMap::new();
+        let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
+
+        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
+            let Some(asset_key) = &event.asset_key else {
+                continue;
+            };
+            if !event.event_type.is_materialization() {
+                continue;
+            }
+            let cl = event.code_location_id.as_str();
+            let key = (cl, asset_key.as_str());
+            let newest = |held: Option<&usize>| {
+                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
+            };
+            if newest(latest_mat.get(&key)) {
+                latest_mat.insert(key, idx);
+            }
+            if !event.input_data_versions.is_empty() && newest(latest_idv.get(&key)) {
+                latest_idv.insert(key, idx);
+            }
+            if let Some(partition_key) = &event.partition_key {
+                built_by
+                    .entry(key)
+                    .or_default()
+                    .push((partition_key, event.run_id.as_str()));
+                let part = (cl, asset_key.as_str(), partition_key);
+                if part_rows
+                    .get(&part)
+                    .is_none_or(|held| held.last_timestamp <= event.timestamp)
+                {
+                    part_rows.insert(
+                        part,
+                        DbAssetPartitionWrite {
+                            code_location_id: cl.to_string(),
+                            asset_key: asset_key.clone(),
+                            partition_key: partition_key.clone(),
+                            last_event_id: event_id.clone(),
+                            last_run_id: event.run_id.clone(),
+                            last_timestamp: event.timestamp,
+                        },
+                    );
+                }
+            }
+        }
+
+        // One `assets` row update per materialized asset (newest event wins).
+        let update_run_ids: Vec<String> = latest_mat
+            .values()
+            .map(|&idx| events[idx].run_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_ids = self.action_run_ids(update_run_ids).await?;
+        // Each asset's partition rows commit in one transaction with its
+        // `assets` row update — a concurrent whole-asset deletion lands
+        // wholly before or wholly after, never between the two. Every
+        // partition row comes from a materialization event, so its asset is
+        // always in `latest_mat`.
+        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
+            std::collections::HashMap::new();
+        for ((cl, ak, _), row) in part_rows {
+            parts_by_asset.entry((cl, ak)).or_default().push(row);
+        }
+        for (&(cl, asset_key), &idx) in &latest_mat {
+            let event = &events[idx];
+            let event_id = &event_ids[idx];
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
+            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
+            // A co-drained real materialize (the `idv` entry) legitimately
+            // owns provenance and the code-version stamp even when the
+            // action's event is the newer one.
+            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
+            let code_version = if action_only {
+                None
+            } else {
+                self.get_code_version(cl, asset_key).await?
+            };
+            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
+            let built_by = built_by.remove(&(cl, asset_key)).unwrap_or_default();
+            self.apply_materialization(
+                cl,
+                asset_key,
+                event_id,
+                &event.run_id,
+                event.timestamp,
+                event.event_type.data_version().map(|s| s.to_string()),
+                provenance_timestamp,
+                code_version,
+                idv,
+                action_only,
+                parts,
+                &built_by,
+            )
+            .await?;
+        }
+
+        // Partition-scoped deletions collapse to one DELETE per asset — a
+        // purge over a date range lands thousands of them in one drain.
+        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
+        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
+        for (&event, event_id) in events.iter().zip(event_ids.iter()) {
+            let cl = event.code_location_id.as_str();
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_observation() {
+                    let data_version = event.event_type.data_version().map(|s| s.to_string());
+                    self.db
+                        .query("UPDATE assets SET last_event_id = $event_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key")
+                        .bind(("cl", cl.to_string()))
+                        .bind(("asset_key", asset_key.clone()))
+                        .bind(("event_id", event_id.clone()))
+                        .bind(("timestamp", event.timestamp))
+                        .bind(("data_version", data_version))
+                        .await?
+                        .check()?;
+                }
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_deletion() {
+                    match &event.partition_key {
+                        Some(pk) => part_deletes
+                            .entry((cl, asset_key.as_str()))
+                            .or_default()
+                            .push((pk.clone(), event.timestamp)),
+                        // The newest deletion per asset wins — repeats in one
+                        // drain only re-clear the same row.
+                        None => {
+                            let key = (cl, asset_key.as_str());
+                            if whole_deletes
+                                .get(&key)
+                                .is_none_or(|(held, _)| held.timestamp <= event.timestamp)
+                            {
+                                whole_deletes.insert(key, (event, event_id));
+                            }
+                        }
+                    }
+                }
+        }
+        for ((cl, asset_key), (event, event_id)) in whole_deletes {
+            self.consolidate_deletion(cl, asset_key, event, event_id)
+                .await?;
+        }
+        for ((cl, asset_key), deletions) in part_deletes {
+            self.delete_partitions(cl, asset_key, deletions).await?;
+        }
+
+        // The failures last: each is compared with the materializations and
+        // deletions above.
+        let failure_runs: Vec<String> = events
+            .iter()
+            .filter(|event| keyed_failure(event).is_some())
+            .map(|event| event.run_id.clone())
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_failure_runs = self.action_run_ids(failure_runs).await?;
+        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
+        for &event in &events {
+            let Some((asset_key, partition_key)) = keyed_failure(event) else {
+                continue;
+            };
+            if action_failure_runs.contains(&event.run_id) {
+                continue;
+            }
+            let of_asset = failures
+                .entry((event.code_location_id.as_str(), asset_key))
+                .or_default();
+            for member in partition_key.members() {
+                of_asset.push((member, event.timestamp, event.run_id.clone()));
+            }
+        }
+        for ((cl, asset_key), failures) in failures {
+            self.record_partition_failures(cl, asset_key, failures, None)
+                    .await?;
+        }
+
+        Ok(())
         })
         .await
     }
