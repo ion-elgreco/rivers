@@ -8,7 +8,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 
 use super::*;
-use crate::storage::surrealdb_backend::partition_failures::derived_rows;
+use crate::storage::surrealdb_backend::partition_failures::{derived_rows, run_failure_rows};
 use crate::storage::{PartitionFailure, retry, stored_order};
 
 const CL: &str = DEFAULT_CODE_LOCATION_ID;
@@ -97,11 +97,13 @@ async fn rows(storage: &SurrealStorage, asset: &str) -> Vec<PartitionFailure> {
     rows
 }
 
-/// The rows of `asset` are the failures that the events and the runs give.
-/// Returns how many there are.
+/// The rows of `asset` are the failures that the events and the runs give,
+/// and so are its failures by run. Returns how many rows there are.
 async fn assert_derived(storage: &SurrealStorage, asset: &str, step: &str) -> usize {
     let derived = derived_rows(&storage.db, CL, asset).await.unwrap();
     assert_eq!(rows(storage, asset).await, derived, "{step}");
+    let (kept, derived_by_run) = run_failure_rows(&storage.db, CL, asset).await.unwrap();
+    assert_eq!(kept, derived_by_run, "{step}: failures by run");
     derived.len()
 }
 
@@ -261,6 +263,74 @@ async fn a_materialization_after_its_failed_run_ended_replaces_the_failure() {
     assert_derived(&storage, "a", "after the late event").await;
 }
 
+/// The late event of a failed run comes in with a newer materialization of
+/// the same partition by another run: the failed run still does not fail
+/// the partition it materialized.
+#[tokio::test]
+async fn a_late_materialization_with_a_newer_one_replaces_the_failure() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    storage
+        .create_run(&run("x", RunStatus::Started, Some(single("p1")), &["a"]))
+        .await
+        .unwrap();
+    storage
+        .update_run_status("x", RunStatus::Failure, Some(500))
+        .await
+        .unwrap();
+
+    storage
+        .store_events(&[built("a", "x", "p1", 100), built("a", "y", "p1", 200)])
+        .await
+        .unwrap();
+
+    assert_eq!(assert_derived(&storage, "a", "after the drain").await, 0);
+}
+
+/// Two failures of a partition at the same time: each path that writes the
+/// row gives it the run that sorts first ("r10" before "r9").
+#[tokio::test]
+async fn of_two_failures_at_the_same_time_the_run_that_sorts_first_takes_the_row() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    storage
+        .create_run(&run("r8", RunStatus::Success, None, &["a"]))
+        .await
+        .unwrap();
+    let tied = vec![
+        failure("p1", 100, "r10", false),
+        failure("p2", 100, "r10", false),
+    ];
+
+    // One after the other, and in one drain.
+    storage
+        .store_event(&failed("a", "r9", single("p1"), 100))
+        .await
+        .unwrap();
+    storage
+        .store_event(&failed("a", "r10", single("p1"), 100))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            failed("a", "r9", single("p2"), 100),
+            failed("a", "r10", single("p2"), 100),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(rows(&storage, "a").await, tied);
+    assert_derived(&storage, "a", "after the failures").await;
+
+    // The row is computed again when a newer failure goes.
+    storage
+        .store_event(&failed("a", "r8", single("p1"), 300))
+        .await
+        .unwrap();
+    assert!(storage.delete_run("r8").await.unwrap());
+    assert_eq!(rows(&storage, "a").await, tied);
+    assert_derived(&storage, "a", "after the deletion").await;
+}
+
 #[tokio::test]
 async fn deleting_a_run_brings_back_an_older_failure() {
     let storage = make_storage().await;
@@ -288,6 +358,7 @@ async fn deleting_a_run_brings_back_an_older_failure() {
         rows(&storage, "a").await,
         vec![failure("p1", 100, "r1", false)]
     );
+    assert_derived(&storage, "a", "after the deletion").await;
 }
 
 #[tokio::test]
@@ -323,6 +394,7 @@ async fn a_run_that_no_longer_ends_in_failure_fails_no_partition() {
         rows(&storage, "a").await,
         vec![failure("p2", 300, "r1", false)]
     );
+    assert_derived(&storage, "a", "after the success").await;
 }
 
 #[tokio::test]
@@ -342,6 +414,7 @@ async fn a_run_failed_before_it_started_fails_no_partition_when_it_starts() {
     assert!(storage.try_start_run("r1").await.unwrap());
 
     assert!(rows(&storage, "a").await.is_empty());
+    assert_derived(&storage, "a", "after the start").await;
 }
 
 #[tokio::test]
@@ -356,6 +429,7 @@ async fn a_run_that_ended_otherwise_fails_no_partition() {
     assert!(!storage.fail_run_if_active("r1", 500).await.unwrap());
 
     assert!(rows(&storage, "a").await.is_empty());
+    assert_derived(&storage, "a", "after the late failure").await;
 }
 
 #[tokio::test]
@@ -775,6 +849,70 @@ async fn a_run_deleted_while_older_failures_come_in_leaves_the_derived_rows() {
             4
         );
     }
+}
+
+/// A run is deleted while another run keeps materializing other partitions
+/// of the same asset, which has many failed partitions: the deletion
+/// finishes. A deletion that derived the failures of the whole asset while
+/// it held the asset row started again on each materialization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_deleted_while_other_partitions_are_materialized_finishes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = store_on_disk(temp_dir.as_path_untracked()).await;
+    register(&storage, &["a"]).await;
+    let names: Vec<String> = (0..20_000).map(|i| format!("k{i:05}")).collect();
+    for (i, chunk) in names.chunks(1_000).enumerate() {
+        let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        storage
+            .store_event(&failed("a", &format!("old{i}"), keys(&chunk), 100))
+            .await
+            .unwrap();
+    }
+    storage
+        .create_run(&run("deleted", RunStatus::Success, None, &["a"]))
+        .await
+        .unwrap();
+    let of_run: Vec<&str> = names[..24].iter().map(String::as_str).collect();
+    storage
+        .store_event(&failed("a", "deleted", keys(&of_run), 200))
+        .await
+        .unwrap();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let (storage, started, stop) = (storage.clone(), started.clone(), stop.clone());
+        async move {
+            let mut written = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let event = built("a", "writer", &format!("z{written:06}"), 1_000 + written);
+                storage.store_event(&event).await.unwrap();
+                written += 1;
+                if written == 3 {
+                    started.notify_one();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+    });
+    started.notified().await;
+
+    let deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        storage.delete_run("deleted"),
+    )
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
+
+    let deleted = deleted.expect("the deletion should finish while the asset is materialized");
+    assert!(deleted.unwrap());
+    assert_eq!(
+        assert_derived(&storage, "a", "after the deletion").await,
+        20_000
+    );
 }
 
 /// Failures, materializations and deletions of one asset that race: the

@@ -12,7 +12,7 @@ use crate::storage::{
     StorageBackend, StoredEvent, StoredLog, TickRecord, UnstartedBackfillRun,
 };
 
-use super::partition_failures::keyed_failure;
+use super::partition_failures::{RunChange, keyed_failure};
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -65,6 +65,11 @@ impl StorageBackend for SurrealStorage {
                         }]
                     })
                     .unwrap_or_default();
+                let built_by: Vec<(&PartitionKey, &str)> = event
+                    .partition_key
+                    .iter()
+                    .map(|partition_key| (partition_key, event.run_id.as_str()))
+                    .collect();
                 self.apply_materialization(
                     cl,
                     asset_key,
@@ -77,6 +82,7 @@ impl StorageBackend for SurrealStorage {
                     idv,
                     is_action,
                     parts,
+                    &built_by,
                 )
                 .await?;
             }
@@ -151,6 +157,7 @@ impl StorageBackend for SurrealStorage {
             (&str, &str, &PartitionKey),
             DbAssetPartitionWrite,
         > = std::collections::HashMap::new();
+        let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
 
         for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
             let Some(asset_key) = &event.asset_key else {
@@ -171,6 +178,10 @@ impl StorageBackend for SurrealStorage {
                 latest_idv.insert(key, idx);
             }
             if let Some(partition_key) = &event.partition_key {
+                built_by
+                    .entry(key)
+                    .or_default()
+                    .push((partition_key, event.run_id.as_str()));
                 let part = (cl, asset_key.as_str(), partition_key);
                 if part_rows
                     .get(&part)
@@ -225,6 +236,7 @@ impl StorageBackend for SurrealStorage {
                 self.get_code_version(cl, asset_key).await?
             };
             let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
+            let built_by = built_by.remove(&(cl, asset_key)).unwrap_or_default();
             self.apply_materialization(
                 cl,
                 asset_key,
@@ -237,6 +249,7 @@ impl StorageBackend for SurrealStorage {
                 idv,
                 action_only,
                 parts,
+                &built_by,
             )
             .await?;
         }
@@ -500,16 +513,16 @@ impl StorageBackend for SurrealStorage {
         end_time: Option<i64>,
     ) -> Result<()> {
         // The failures before the status: a run that reads as failed has them.
-        // A run whose end in failure moves earlier is derived again after the
+        // A run whose end in failure moves earlier is repaired after the
         // status.
-        let mut ends_earlier = false;
+        let mut ends_earlier = None;
         if status == RunStatus::Failure
             && let Some(run) = self.run_of_failures(run_id).await?
         {
             let at = end_time.or(run.end_time).unwrap_or(run.start_time);
             let ended = (run.status == "Failure").then(|| run.end_time.unwrap_or(run.start_time));
             match ended {
-                Some(ended) if at < ended => ends_earlier = true,
+                Some(ended) if at < ended => ends_earlier = Some(at),
                 Some(ended) if at == ended => {}
                 _ => self.record_failures_of_run(&run, at).await?,
             }
@@ -556,8 +569,12 @@ impl StorageBackend for SurrealStorage {
         })
         .await?;
 
-        if ends_earlier || (status != RunStatus::Failure && before.as_deref() == Some("Failure")) {
-            self.rederive_failures_of_run(run_id, false, None).await?;
+        if let Some(at) = ends_earlier {
+            self.repair_failures_of_run(run_id, RunChange::FailedAt(Some(at)))
+                .await?;
+        } else if status != RunStatus::Failure && before.as_deref() == Some("Failure") {
+            self.repair_failures_of_run(run_id, RunChange::FailedAt(None))
+                .await?;
         }
         Ok(())
     }
@@ -602,7 +619,8 @@ impl StorageBackend for SurrealStorage {
 
         // A run that failed before it started: its end in failure is gone.
         if was_failed {
-            self.rederive_failures_of_run(run_id, false, None).await?;
+            self.repair_failures_of_run(run_id, RunChange::FailedAt(None))
+                .await?;
         }
         Ok(started)
     }
@@ -1157,7 +1175,8 @@ impl StorageBackend for SurrealStorage {
         .await?;
         // The failures of the run go with it; older failures of its
         // partitions come back.
-        self.rederive_failures_of_run(run_id, true, None).await?;
+        self.repair_failures_of_run(run_id, RunChange::Deleted)
+            .await?;
         retry::with_retry(&self.retry_config, || async {
             self.db
                 .query("DELETE FROM runs WHERE run_id = $run_id")

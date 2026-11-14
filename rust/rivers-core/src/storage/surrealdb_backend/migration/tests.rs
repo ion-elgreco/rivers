@@ -1254,6 +1254,33 @@ async fn test_v16_stores_the_failed_partitions_that_the_events_give() {
             true
         )]
     );
+    let mut by_run: Vec<(serde_json::Value, String, Option<i64>, Option<i64>)> = db
+        .query(
+            "SELECT VALUE [partition_key, run_id, step_failed_at, run_failed_at] \
+             FROM asset_partition_run_failures",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    by_run.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        by_run,
+        vec![
+            (
+                serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+                "f1".to_string(),
+                Some(150),
+                None
+            ),
+            (
+                serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+                "r_fail".to_string(),
+                None,
+                Some(500)
+            ),
+        ]
+    );
 
     let stamps = stamps_at(&db, 16).await;
     assert_eq!(

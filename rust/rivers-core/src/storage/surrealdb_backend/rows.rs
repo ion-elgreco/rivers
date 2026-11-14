@@ -116,6 +116,17 @@ pub(super) struct DbPartitionFailure {
     pub(super) has_row: bool,
 }
 
+/// One `asset_partition_run_failures` row, written by [`RECORD_RUN_FAILURES`].
+#[derive(Debug, Clone, SurrealValue)]
+pub(super) struct DbPartitionRunFailure {
+    pub(super) code_location_id: String,
+    pub(super) asset_key: String,
+    pub(super) partition_key: PartitionKey,
+    pub(super) run_id: String,
+    pub(super) step_failed_at: Option<i64>,
+    pub(super) run_failed_at: Option<i64>,
+}
+
 /// One `asset_partitions` row, upserted via [`UPSERT_ASSET_PARTITIONS`] in
 /// the same transaction as its asset's row update.
 #[derive(Debug, Clone, SurrealValue, serde::Serialize, serde::Deserialize)]

@@ -580,11 +580,12 @@ older `CodeLocation` image starts, shows no duration.
 
 ### Upgrading to schema version 16
 
-Schema version 16 stores the failed partitions of each asset in a table of
-their own, and raises the writer floor: every `CodeLocation` image must run
-the new rivers. An older UI still reads the database. The migration fills
-the table from the stored events and runs; on a store with many failed
-partitions it takes longer than the earlier migrations.
+Schema version 16 stores the failed partitions of each asset, and their
+failures by run, in tables of their own, and raises the writer floor: every
+`CodeLocation` image must run the new rivers. An older UI still reads the
+database. The migration fills the tables from the stored events and runs; on
+a store with many failed partitions it takes longer than the earlier
+migrations.
 
 ## Uninstall
 

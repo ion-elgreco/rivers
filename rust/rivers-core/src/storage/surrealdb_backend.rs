@@ -727,7 +727,7 @@ impl SurrealStorage {
         super::retry::with_retry(&retry_config, || async {
             let txn = self.db.clone().begin().await?;
             bind.bind(txn.query(body.as_str())).await?.check()?;
-            partition_failures::fix_failures_after_deletion(&txn, cl, asset_key, &newest).await?;
+            partition_failures::fix_failures_after_deletion(&txn, cl, asset_key, &keys).await?;
             txn.commit().await?;
             Ok(())
         })
@@ -792,7 +792,9 @@ impl SurrealStorage {
     /// can be older than the newest event. `from_action`: the event's run is
     /// an action run AND no co-drained event supplied real provenance
     /// (`idv`) — then no provenance is written, so a pending Stale(Code)
-    /// badge survives the verb.
+    /// badge survives the verb. `built_by`: each partition of the events and
+    /// the run of each event, also of those that a newer event of the
+    /// partition replaces in `parts`.
     #[allow(clippy::too_many_arguments)]
     async fn apply_materialization(
         &self,
@@ -807,6 +809,7 @@ impl SurrealStorage {
         idv: Option<Vec<(String, String)>>,
         from_action: bool,
         parts: Vec<DbAssetPartitionWrite>,
+        built_by: &[(&PartitionKey, &str)],
     ) -> Result<()> {
         let update_sql = format!("{MATERIALIZE_ASSET_DATA} {MATERIALIZATION_IS_NEWER}");
         let update_sql = if from_action {
@@ -861,21 +864,15 @@ impl SurrealStorage {
 
         // Failure rows are in the range of the keys: one transaction
         // materializes and brings the failure rows in line.
-        let late = super::retry::with_retry(&retry_config, || async {
+        super::retry::with_retry(&retry_config, || async {
             let txn = self.db.clone().begin().await?;
             bind.bind(txn.query(body.as_str())).await?.check()?;
-            let late =
-                partition_failures::fix_failures_after_materialization(&txn, cl, asset_key, &parts)
-                    .await?;
-            txn.commit().await?;
-            Ok(late)
-        })
-        .await?;
-        for (run_id, keys) in late {
-            self.rederive_failures_of_run(&run_id, false, Some((cl, asset_key, keys)))
+            partition_failures::fix_failures_after_materialization(&txn, cl, asset_key, built_by)
                 .await?;
-        }
-        Ok(())
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
     }
 }
 

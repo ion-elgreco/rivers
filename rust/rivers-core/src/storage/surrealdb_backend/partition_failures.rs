@@ -1,13 +1,16 @@
 //! The partitions whose latest result is a failure: one row each in
-//! `asset_partition_failures`.
+//! `asset_partition_failures`, and one row per partition and run in
+//! `asset_partition_run_failures`.
 //!
-//! A partition has a row while its latest failure is newer than its
+//! A partition has rows while its latest failure is newer than its
 //! materialization, its deletion and the deletion of its asset. The writers
-//! keep the rows: a failure adds one, a materialization or a deletion at or
-//! after the failure removes it. [`derive_failures`] gives the same failures
-//! from the events and the runs. It fills the table on the migration, and
-//! again for the partitions of a run that changed after it ended.
+//! keep the rows: a failure adds them, a materialization or a deletion at or
+//! after the failure removes them. When a run is deleted or its end changes,
+//! the rows of its partitions are computed again from the failures by run.
+//! [`derive_failures`] gives the same failures from the events and the runs:
+//! it fills the tables on the migration.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -28,8 +31,9 @@ use super::partition_reads::{
 use super::*;
 
 /// Partitions that one transaction writes. A short transaction holds the
-/// asset row for less time, and loses less work to a conflict.
-const FAILURES_PER_TRANSACTION: usize = 1_000;
+/// asset row for less time, and loses less work to a conflict: at about 50 µs
+/// per partition, 250 hold it for about 15 ms.
+const FAILURES_PER_TRANSACTION: usize = 250;
 
 /// Up to this many keys are read one by one. The rows of more keys are read
 /// as one range first.
@@ -104,8 +108,8 @@ impl Statements for Transaction<Any> {
     }
 }
 
-/// A row of a table with one row per partition of an asset, on a UNIQUE
-/// index of `code_location_id`, `asset_key` and `partition_key`.
+/// A row of a table of the partitions of an asset, on an index that starts
+/// with `code_location_id`, `asset_key` and `partition_key`.
 trait OfPartition: SurrealValue + Send {
     /// `SELECT <fields> FROM <table>`.
     const SELECT: &'static str;
@@ -153,6 +157,33 @@ struct FailedRow {
 impl OfPartition for FailedRow {
     const SELECT: &'static str =
         "SELECT id, partition_key, failed_at, run_id, built_at FROM asset_partition_failures";
+
+    fn partition_key(&self) -> &PartitionKey {
+        &self.partition_key
+    }
+}
+
+#[derive(Debug, SurrealValue)]
+struct RunFailedRow {
+    id: RecordId,
+    partition_key: PartitionKey,
+    run_id: String,
+    step_failed_at: Option<i64>,
+    run_failed_at: Option<i64>,
+}
+
+impl RunFailedRow {
+    fn failure(&self) -> RunFailure {
+        RunFailure {
+            step_failed_at: self.step_failed_at,
+            run_failed_at: self.run_failed_at,
+        }
+    }
+}
+
+impl OfPartition for RunFailedRow {
+    const SELECT: &'static str = "SELECT id, partition_key, run_id, step_failed_at, \
+         run_failed_at FROM asset_partition_run_failures";
 
     fn partition_key(&self) -> &PartitionKey {
         &self.partition_key
@@ -235,64 +266,105 @@ async fn built_at_of(
         .collect())
 }
 
-/// What a writer of failure rows reads while it holds the asset row.
-#[derive(Debug, SurrealValue)]
-struct Held {
+/// The deletions of an asset that its failures are compared with.
+#[derive(Debug, Clone, Copy, SurrealValue)]
+struct Deletions {
     /// The time of the latest deletion of the whole asset.
     deleted_at: Option<i64>,
     /// The asset has partition tombstones.
     tombstones: bool,
 }
 
-/// In `txn`: write the `assets` row and put it back (see
-/// [`HOLD_ASSET_FOR_FAILURES`]).
-async fn hold_asset(txn: &Transaction<Any>, cl: &str, asset_key: &str) -> Result<Held> {
+/// In `txn`: the deletions of the asset. `hold`: first write the `assets` row
+/// and put it back (see [`HOLD_ASSET_FOR_FAILURES`]).
+async fn deletions_of(
+    txn: &Transaction<Any>,
+    cl: &str,
+    asset_key: &str,
+    hold: bool,
+) -> Result<Deletions> {
+    let hold = if hold { HOLD_ASSET_FOR_FAILURES } else { "" };
     let mut result = txn
-        .query(HOLD_ASSET_FOR_FAILURES)
+        .query(format!("{hold}{DELETIONS_OF_ASSET}"))
         .bind(("cl", cl.to_string()))
         .bind(("asset_key", asset_key.to_string()))
         .await?
         .check()?;
     let last = result.num_statements() - 1;
-    let held: Option<Held> = result.take(last)?;
-    held.context("the hold of the asset row returns no row")
+    let deletions: Option<Deletions> = result.take(last)?;
+    deletions.context("the deletions of the asset return no row")
 }
 
-/// In `txn`, which holds the asset row: write a row for each of `failures`
-/// (in the order of the store) that is newer than the partition's
-/// materialization, its deletion and the deletion of the asset.
+/// In `txn`: hold the asset row, and read the deletions of the asset.
+async fn hold_asset(txn: &Transaction<Any>, cl: &str, asset_key: &str) -> Result<Deletions> {
+    deletions_of(txn, cl, asset_key, true).await
+}
+
+/// The time of the tombstone of each of `keys` that has one.
+async fn deleted_at_of(
+    txn: &Transaction<Any>,
+    cl: &str,
+    asset_key: &str,
+    deletions: &Deletions,
+    keys: &[PartitionKey],
+) -> Result<HashMap<PartitionKey, i64>> {
+    if !deletions.tombstones {
+        return Ok(HashMap::new());
+    }
+    Ok(rows_of_keys::<DeletedRow>(txn, cl, asset_key, keys)
+        .await?
+        .into_iter()
+        .map(|row| (row.partition_key, row.timestamp))
+        .collect())
+}
+
+/// In `txn`, which holds the asset row: write each of `failures` (in the
+/// order of the store) that is newer than the partition's materialization,
+/// its deletion and the deletion of the asset. `run_end`: the failures are
+/// the end of their run in failure, else keyed step failures.
 async fn write_failures(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
-    held: &Held,
+    deletions: &Deletions,
     failures: &[(PartitionKey, i64, String)],
+    run_end: bool,
 ) -> Result<()> {
     let failures: Vec<&(PartitionKey, i64, String)> = failures
         .iter()
-        .filter(|(_, at, _)| held.deleted_at.is_none_or(|deleted| deleted < *at))
+        .filter(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at))
         .collect();
     if failures.is_empty() {
         return Ok(());
     }
-    let keys: Vec<PartitionKey> = failures.iter().map(|(key, _, _)| key.clone()).collect();
+    let mut keys: Vec<PartitionKey> = failures.iter().map(|(key, _, _)| key.clone()).collect();
+    keys.dedup();
 
     let built = built_at_of(txn, cl, asset_key, &keys).await?;
-    let deleted: HashMap<PartitionKey, i64> = match held.tombstones {
-        true => rows_of_keys::<DeletedRow>(txn, cl, asset_key, &keys)
-            .await?
-            .into_iter()
-            .map(|row| (row.partition_key, row.timestamp))
-            .collect(),
-        false => HashMap::new(),
-    };
-
-    let rows: Vec<DbPartitionFailure> = failures
+    let deleted = deleted_at_of(txn, cl, asset_key, deletions, &keys).await?;
+    let failures: Vec<&(PartitionKey, i64, String)> = failures
         .into_iter()
         .filter(|(key, at, _)| {
             built.get(key).is_none_or(|built| built < at)
                 && deleted.get(key).is_none_or(|deleted| deleted < at)
         })
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let mut latest: HashMap<&PartitionKey, &(PartitionKey, i64, String)> = HashMap::new();
+    for &failure in &failures {
+        let (key, at, run_id) = failure;
+        if latest
+            .get(key)
+            .is_none_or(|held| rank(held.1, &held.2) < rank(*at, run_id))
+        {
+            latest.insert(key, failure);
+        }
+    }
+    let rows: Vec<DbPartitionFailure> = latest
+        .into_values()
         .map(|(key, at, run_id)| {
             let built_at = built.get(key).copied();
             DbPartitionFailure {
@@ -306,133 +378,195 @@ async fn write_failures(
             }
         })
         .collect();
+    let run_rows: Vec<DbPartitionRunFailure> = failures
+        .into_iter()
+        .map(|(key, at, run_id)| DbPartitionRunFailure {
+            code_location_id: cl.to_string(),
+            asset_key: asset_key.to_string(),
+            partition_key: key.clone(),
+            run_id: run_id.clone(),
+            step_failed_at: (!run_end).then_some(*at),
+            run_failed_at: run_end.then_some(*at),
+        })
+        .collect();
 
+    txn.query(format!(
+        "{RECORD_RUN_FAILURES}; {RECORD_PARTITION_FAILURES};"
+    ))
+    .bind(("run_rows", run_rows))
+    .bind(("rows", rows))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// In `txn`, which holds the asset row: give each failure by run of `keys`
+/// (in the order of the store) the failure that `change` gives for it, keep
+/// those that are newer than the partition's materialization and deletions,
+/// and give each partition the failure row of the latest of them, or none.
+/// `deletions`: of the asset, when the transaction read them. Returns whether
+/// a row changed.
+async fn refresh_partitions(
+    txn: &Transaction<Any>,
+    cl: &str,
+    asset_key: &str,
+    deletions: Option<Deletions>,
+    keys: &[PartitionKey],
+    change: impl Fn(&RunFailedRow) -> RunFailure,
+) -> Result<bool> {
+    let run_rows: Vec<RunFailedRow> = rows_of_keys(txn, cl, asset_key, keys).await?;
+    let failed: Vec<FailedRow> = rows_of_keys(txn, cl, asset_key, keys).await?;
+    if run_rows.is_empty() && failed.is_empty() {
+        return Ok(false);
+    }
+
+    let deletions = match deletions {
+        Some(deletions) => deletions,
+        None => deletions_of(txn, cl, asset_key, false).await?,
+    };
+    let mut keys: Vec<PartitionKey> = run_rows
+        .iter()
+        .map(|row| row.partition_key.clone())
+        .chain(failed.iter().map(|row| row.partition_key.clone()))
+        .collect();
+    keys.sort_by(stored_order);
+    keys.dedup();
+    let built = built_at_of(txn, cl, asset_key, &keys).await?;
+    let deleted = deleted_at_of(txn, cl, asset_key, &deletions, &keys).await?;
+    let replaced_at = |key: &PartitionKey| {
+        built
+            .get(key)
+            .copied()
+            .max(deleted.get(key).copied())
+            .max(deletions.deleted_at)
+    };
+
+    let mut gone: Vec<RecordId> = Vec::new();
+    let mut changed: Vec<DbPartitionRunFailure> = Vec::new();
+    let mut latest: HashMap<PartitionKey, (i64, String)> = HashMap::new();
+    for row in run_rows {
+        let failure = change(&row);
+        let newer = failure
+            .at()
+            .filter(|at| replaced_at(&row.partition_key).is_none_or(|replaced| replaced < *at));
+        let Some(at) = newer else {
+            gone.push(row.id);
+            continue;
+        };
+        if latest
+            .get(&row.partition_key)
+            .is_none_or(|(held, held_run)| rank(*held, held_run) < rank(at, &row.run_id))
+        {
+            latest.insert(row.partition_key.clone(), (at, row.run_id.clone()));
+        }
+        if failure != row.failure() {
+            changed.push(DbPartitionRunFailure {
+                code_location_id: cl.to_string(),
+                asset_key: asset_key.to_string(),
+                partition_key: row.partition_key,
+                run_id: row.run_id,
+                step_failed_at: failure.step_failed_at,
+                run_failed_at: failure.run_failed_at,
+            });
+        }
+    }
+
+    let mut failed: HashMap<PartitionKey, FailedRow> = failed
+        .into_iter()
+        .map(|row| (row.partition_key.clone(), row))
+        .collect();
+    let mut rows: Vec<DbPartitionFailure> = Vec::new();
+    for (key, (at, run_id)) in latest {
+        let built_at = built.get(&key).copied();
+        let held = failed.remove(&key);
+        if held.is_some_and(|row| {
+            row.failed_at == at && row.run_id == run_id && row.built_at == built_at
+        }) {
+            continue;
+        }
+        rows.push(DbPartitionFailure {
+            code_location_id: cl.to_string(),
+            asset_key: asset_key.to_string(),
+            partition_key: key,
+            failed_at: at,
+            run_id,
+            built_at,
+            has_row: built_at.is_some(),
+        });
+    }
+    gone.extend(failed.into_values().map(|row| row.id));
+
+    let mut sql = String::new();
+    if !gone.is_empty() {
+        sql.push_str("DELETE $gone RETURN NONE; ");
+    }
+    if !changed.is_empty() {
+        sql.push_str(&format!("{PUT_RUN_FAILURES}; "));
+    }
     if !rows.is_empty() {
-        txn.query(RECORD_PARTITION_FAILURES)
-            .bind(("rows", rows))
-            .await?
-            .check()?;
+        sql.push_str(&format!("{PUT_PARTITION_FAILURES}; "));
     }
-    Ok(())
+    if sql.is_empty() {
+        return Ok(false);
+    }
+    txn.query(sql)
+        .bind(("gone", gone))
+        .bind(("run_rows", changed))
+        .bind(("rows", rows))
+        .await?
+        .check()?;
+    Ok(true)
 }
 
-/// In `txn`: delete the failure rows `ids`.
-async fn delete_failure_rows(txn: &Transaction<Any>, ids: Vec<RecordId>) -> Result<()> {
-    if !ids.is_empty() {
-        txn.query("DELETE $ids RETURN NONE")
-            .bind(("ids", ids))
-            .await?
-            .check()?;
-    }
-    Ok(())
-}
-
-/// In `txn`: give the failure rows `rows` the time of their partition's row.
-async fn move_failure_rows(txn: &Transaction<Any>, rows: Vec<DbPartitionFailure>) -> Result<()> {
-    if !rows.is_empty() {
-        txn.query(MOVE_FAILURE_ROWS)
-            .bind(("rows", rows))
-            .await?
-            .check()?;
-    }
-    Ok(())
-}
-
-/// `row` with the time `built_at` of its partition's row.
-fn moved(cl: &str, asset_key: &str, row: FailedRow, built_at: Option<i64>) -> DbPartitionFailure {
-    DbPartitionFailure {
-        code_location_id: cl.to_string(),
-        asset_key: asset_key.to_string(),
-        partition_key: row.partition_key,
-        failed_at: row.failed_at,
-        run_id: row.run_id,
-        built_at,
-        has_row: built_at.is_some(),
-    }
-}
-
-/// In `txn`, after the materialization of `parts`: remove the failure rows
-/// that the materialization replaced, and give the others the time of the
-/// partition's row. Returns, by run, the partitions whose row names the run
-/// that materialized them: the failure can be the end of that run in failure,
-/// which the materialization replaces when its event comes in late.
+/// In `txn`, after the materializations `built_by` (each partition and the
+/// run that materialized it): the failures at or before the materialization
+/// go, and a run that materialized a partition does not fail it by its end.
+/// Its event can come in after the end of the run.
 pub(super) async fn fix_failures_after_materialization(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
-    parts: &[DbAssetPartitionWrite],
-) -> Result<HashMap<String, Vec<PartitionKey>>> {
-    let mut keys: Vec<PartitionKey> = parts
-        .iter()
-        .map(|part| part.partition_key.clone())
-        .collect();
+    built_by: &[(&PartitionKey, &str)],
+) -> Result<()> {
+    let mut runs_of: HashMap<PartitionKey, HashSet<&str>> = HashMap::new();
+    for &(partition_key, run_id) in built_by {
+        for member in partition_key.members() {
+            runs_of.entry(member).or_default().insert(run_id);
+        }
+    }
+    let mut keys: Vec<PartitionKey> = runs_of.keys().cloned().collect();
     keys.sort_by(stored_order);
-    keys.dedup();
-    let failed: Vec<FailedRow> = rows_of_keys(txn, cl, asset_key, &keys).await?;
-    if failed.is_empty() {
-        return Ok(HashMap::new());
-    }
 
-    let failed_keys: Vec<PartitionKey> =
-        failed.iter().map(|row| row.partition_key.clone()).collect();
-    let built = built_at_of(txn, cl, asset_key, &failed_keys).await?;
-    let run_of: HashMap<&PartitionKey, &str> = parts
-        .iter()
-        .map(|part| (&part.partition_key, part.last_run_id.as_str()))
-        .collect();
-
-    let mut replaced = Vec::new();
-    let mut moved_rows = Vec::new();
-    let mut late: HashMap<String, Vec<PartitionKey>> = HashMap::new();
-    for row in failed {
-        let built_at = built.get(&row.partition_key).copied();
-        if built_at.is_some_and(|built| built >= row.failed_at) {
-            replaced.push(row.id);
-            continue;
+    refresh_partitions(txn, cl, asset_key, None, &keys, |row| {
+        let failure = row.failure();
+        let built = runs_of
+            .get(&row.partition_key)
+            .is_some_and(|runs| runs.contains(row.run_id.as_str()));
+        match built {
+            true => RunFailure {
+                run_failed_at: None,
+                ..failure
+            },
+            false => failure,
         }
-        if run_of.get(&row.partition_key) == Some(&row.run_id.as_str()) {
-            late.entry(row.run_id.clone())
-                .or_default()
-                .push(row.partition_key.clone());
-        }
-        if built_at != row.built_at {
-            moved_rows.push(moved(cl, asset_key, row, built_at));
-        }
-    }
-
-    delete_failure_rows(txn, replaced).await?;
-    move_failure_rows(txn, moved_rows).await?;
-    Ok(late)
+    })
+    .await?;
+    Ok(())
 }
 
-/// In `txn`, after the deletion of partitions (`deleted`: the time of each):
-/// remove the failure rows that a deletion replaced, and clear the time of
-/// the partition's row of the others whose row the deletion removed.
+/// In `txn`, after the deletion of the partitions `keys`: the failures at or
+/// before their deletion go.
 pub(super) async fn fix_failures_after_deletion(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
-    deleted: &HashMap<PartitionKey, i64>,
+    keys: &[PartitionKey],
 ) -> Result<()> {
-    let mut keys: Vec<PartitionKey> = deleted.keys().cloned().collect();
+    let mut keys = keys.to_vec();
     keys.sort_by(stored_order);
-    let failed: Vec<FailedRow> = rows_of_keys(txn, cl, asset_key, &keys).await?;
-
-    let mut replaced = Vec::new();
-    let mut moved_rows = Vec::new();
-    for row in failed {
-        let Some(deleted_at) = deleted.get(&row.partition_key).copied() else {
-            continue;
-        };
-        if row.failed_at <= deleted_at {
-            replaced.push(row.id);
-        } else if row.built_at.is_some_and(|built| built <= deleted_at) {
-            moved_rows.push(moved(cl, asset_key, row, None));
-        }
-    }
-
-    delete_failure_rows(txn, replaced).await?;
-    move_failure_rows(txn, moved_rows).await
+    keys.dedup();
+    refresh_partitions(txn, cl, asset_key, None, &keys, RunFailedRow::failure).await?;
+    Ok(())
 }
 
 /// The columns of a run that its failures need.
@@ -463,13 +597,39 @@ impl From<&RunRecord> for RunOfFailures {
     }
 }
 
+/// A change of a run that the failure rows of its partitions follow.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RunChange {
+    /// The run is deleted.
+    Deleted,
+    /// The run ends in failure at this time, or not at all.
+    FailedAt(Option<i64>),
+}
+
+impl RunChange {
+    /// The failure by `row` after this change of the run `run_id`.
+    fn apply(self, run_id: &str, row: &RunFailedRow) -> RunFailure {
+        let failure = row.failure();
+        match self {
+            _ if row.run_id != run_id => failure,
+            RunChange::Deleted => RunFailure::default(),
+            RunChange::FailedAt(end) => RunFailure {
+                run_failed_at: failure.run_failed_at.and(end),
+                ..failure
+            },
+        }
+    }
+}
+
 impl SurrealStorage {
     /// Record the failures `(partition, time, run)` of partitions of one
     /// asset; each partition is one member. A partition takes a failure that
-    /// is newer than its materialization, its deletion, the deletion of the
-    /// asset and the failure its row holds. `failed_run`: the failures are
-    /// the end of this run in failure, which fails no partition it
-    /// materialized.
+    /// is newer than its materialization, its deletion and the deletion of
+    /// the asset: in the row of the partition and the run, and in the row of
+    /// the partition when it is newer than the failure that row holds, or as
+    /// new and of a run that sorts first.
+    /// `failed_run`: the failures are the end of this run in failure, which
+    /// fails no partition it materialized; else keyed step failures.
     pub(super) async fn record_partition_failures(
         &self,
         cl: &str,
@@ -477,22 +637,21 @@ impl SurrealStorage {
         failures: Vec<(PartitionKey, i64, String)>,
         failed_run: Option<&str>,
     ) -> Result<()> {
-        let mut latest: HashMap<PartitionKey, (i64, String)> = HashMap::new();
+        let mut latest: HashMap<(PartitionKey, String), i64> = HashMap::new();
         for (key, at, run_id) in failures {
-            if latest.get(&key).is_none_or(|(held, _)| *held < at) {
-                latest.insert(key, (at, run_id));
-            }
+            let held = latest.entry((key, run_id)).or_insert(at);
+            *held = (*held).max(at);
         }
         let mut failures: Vec<(PartitionKey, i64, String)> = latest
             .into_iter()
-            .map(|(key, (at, run_id))| (key, at, run_id))
+            .map(|((key, run_id), at)| (key, at, run_id))
             .collect();
         failures.sort_by(|a, b| stored_order(&a.0, &b.0));
 
         for chunk in failures.chunks(FAILURES_PER_TRANSACTION) {
             retry::with_retry(&self.retry_config.contended_batch(), || async {
                 let txn = self.db.clone().begin().await?;
-                let held = hold_asset(&txn, cl, asset_key).await?;
+                let deletions = hold_asset(&txn, cl, asset_key).await?;
 
                 // Read while the asset row is held: a materialization that
                 // commits after this makes the transaction retry.
@@ -500,7 +659,8 @@ impl SurrealStorage {
                     Some(run_id) => not_built_by(&self.db, asset_key, run_id, chunk).await?,
                     None => chunk.to_vec(),
                 };
-                write_failures(&txn, cl, asset_key, &held, &chunk).await?;
+                let run_end = failed_run.is_some();
+                write_failures(&txn, cl, asset_key, &deletions, &chunk, run_end).await?;
                 txn.commit().await?;
                 Ok(())
             })
@@ -570,103 +730,70 @@ impl SurrealStorage {
         Ok(())
     }
 
-    /// Derive again the failures of the partitions whose row names the run
-    /// `run_id`: the run is deleted (`excluded`), no longer ends in failure,
-    /// or materialized a partition after it ended. `only`: the asset and the
-    /// partitions to look at; without it, every row of the run.
-    pub(super) async fn rederive_failures_of_run(
+    /// Bring the failure rows of the partitions of the run `run_id` in line
+    /// with `change`. The failures by the run that change are read once;
+    /// their keys then go in the order of the store, at most
+    /// [`FAILURES_PER_TRANSACTION`] of one asset per transaction. A failure
+    /// by the run that comes in after the read comes from an event after the
+    /// change.
+    pub(super) async fn repair_failures_of_run(
         &self,
         run_id: &str,
-        excluded: bool,
-        only: Option<(&str, &str, Vec<PartitionKey>)>,
+        change: RunChange,
     ) -> Result<()> {
-        let assets: Vec<(String, String, Vec<PartitionKey>)> = match only {
-            Some((cl, asset_key, keys)) => vec![(cl.to_string(), asset_key.to_string(), keys)],
-            None => self.failure_rows_of_run(run_id).await?,
+        #[derive(SurrealValue)]
+        struct OfRun {
+            code_location_id: String,
+            asset_key: String,
+            partition_key: PartitionKey,
+        }
+
+        let (select, end) = match change {
+            RunChange::Deleted => (FAILURES_OF_RUN, None),
+            RunChange::FailedAt(end) => (FAILED_ENDS_OF_RUN, end),
         };
+        let rows: Vec<OfRun> = retry::with_retry(&self.retry_config, || async {
+            Ok(self
+                .db
+                .query(select)
+                .bind(("run_id", run_id.to_string()))
+                .bind(("end", end))
+                .await?
+                .check()?
+                .take(0)?)
+        })
+        .await?;
+        let mut keys_of: HashMap<(String, String), Vec<PartitionKey>> = HashMap::new();
+        for row in rows {
+            keys_of
+                .entry((row.code_location_id, row.asset_key))
+                .or_default()
+                .push(row.partition_key);
+        }
 
-        for (cl, asset_key, mut keys) in assets {
-            let scope = Scope::Asset {
-                cl: &cl,
-                asset_key: &asset_key,
-            };
+        let retry_config = self.retry_config.contended_batch();
+        for ((cl, asset_key), mut keys) in keys_of {
             keys.sort_by(stored_order);
-            keys.dedup();
-
             for chunk in keys.chunks(FAILURES_PER_TRANSACTION) {
-                retry::with_retry(&self.retry_config.contended_batch(), || async {
+                retry::with_retry(&retry_config, || async {
                     let txn = self.db.clone().begin().await?;
-                    let held = hold_asset(&txn, &cl, &asset_key).await?;
-
-                    // Derived while the asset row is held: a failure that
-                    // commits after this makes the transaction retry.
-                    let derived = derive_failures(&self.db, scope, excluded.then_some(run_id))
-                        .await?
-                        .remove(&(cl.clone(), asset_key.clone()))
-                        .unwrap_or_default();
-                    let rows: Vec<FailedRow> =
-                        rows_of_keys::<FailedRow>(&txn, &cl, &asset_key, chunk)
-                            .await?
-                            .into_iter()
-                            .filter(|row| row.run_id == run_id)
-                            .collect();
-                    let failures: Vec<(PartitionKey, i64, String)> = rows
-                        .iter()
-                        .filter_map(|row| {
-                            let failure = derived.get(&row.partition_key)?;
-                            Some((
-                                row.partition_key.clone(),
-                                failure.at,
-                                failure.run_id.clone(),
-                            ))
+                    let deletions = hold_asset(&txn, &cl, &asset_key).await?;
+                    let changed =
+                        refresh_partitions(&txn, &cl, &asset_key, Some(deletions), chunk, |row| {
+                            change.apply(run_id, row)
                         })
-                        .collect();
-
-                    delete_failure_rows(&txn, rows.into_iter().map(|row| row.id).collect()).await?;
-                    write_failures(&txn, &cl, &asset_key, &held, &failures).await?;
-                    txn.commit().await?;
+                        .await?;
+                    if changed {
+                        txn.commit().await?;
+                    } else {
+                        txn.cancel().await?;
+                    }
                     Ok(())
                 })
                 .await?;
             }
         }
         Ok(())
-    }
-
-    /// The partitions whose failure row names the run `run_id`, by asset.
-    async fn failure_rows_of_run(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<(String, String, Vec<PartitionKey>)>> {
-        #[derive(SurrealValue)]
-        struct Row {
-            code_location_id: String,
-            asset_key: String,
-            partition_key: PartitionKey,
-        }
-
-        let rows: Vec<Row> = retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query(FAILURE_ROWS_OF_RUN)
-                .bind(("run_id", run_id.to_string()))
-                .await?
-                .check()?;
-            Ok(result.take(0)?)
-        })
-        .await?;
-
-        let mut by_asset: HashMap<(String, String), Vec<PartitionKey>> = HashMap::new();
-        for row in rows {
-            by_asset
-                .entry((row.code_location_id, row.asset_key))
-                .or_default()
-                .push(row.partition_key);
-        }
-        Ok(by_asset
-            .into_iter()
-            .map(|((cl, asset_key), keys)| (cl, asset_key, keys))
-            .collect())
     }
 
     pub(super) async fn count_failures(&self, cl: &str, asset_key: &str) -> Result<FailureCount> {
@@ -834,60 +961,54 @@ impl From<FailureRow> for PartitionFailure {
     }
 }
 
-/// The assets whose failures to derive.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Scope<'a> {
-    All,
-    Asset { cl: &'a str, asset_key: &'a str },
+/// The failure of a partition by one run: the run's latest keyed step
+/// failure of the partition, and the end of the run in failure when it fails
+/// the partition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RunFailure {
+    pub(super) step_failed_at: Option<i64>,
+    pub(super) run_failed_at: Option<i64>,
 }
 
-impl Scope<'_> {
-    /// The filter of the rows of the scope in a table with
-    /// `code_location_id` and `asset_key`.
-    fn rows(&self) -> &'static str {
-        match self {
-            Scope::All => "asset_key IS NOT NONE",
-            Scope::Asset { .. } => "code_location_id = $cl AND asset_key = $asset_key",
-        }
+impl RunFailure {
+    /// The time of the failure: the later of the two.
+    pub(super) fn at(&self) -> Option<i64> {
+        self.step_failed_at.max(self.run_failed_at)
     }
-
-    fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
-        match self {
-            Scope::All => query,
-            Scope::Asset { cl, asset_key } => query
-                .bind(("cl", cl.to_string()))
-                .bind(("asset_key", asset_key.to_string())),
-        }
-    }
-}
-
-/// The latest failure of a partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LatestFailure {
-    pub(super) at: i64,
-    pub(super) run_id: String,
 }
 
 /// A code location and an asset key.
 type AssetOf = (String, String);
 
-/// The failures of each asset, by partition.
-pub(super) type DerivedFailures = HashMap<AssetOf, HashMap<PartitionKey, LatestFailure>>;
+/// The failures of one partition, by run.
+pub(super) type FailuresByRun = HashMap<String, RunFailure>;
 
-/// The latest failure of each partition (each member) of the assets of
-/// `scope`, unless a deletion at or after it replaced it. A later
-/// materialization is not compared here. `excluded`: a run to leave out, as
-/// if it was deleted.
+/// The failures of each asset, by partition and run.
+pub(super) type DerivedFailures = HashMap<AssetOf, HashMap<PartitionKey, FailuresByRun>>;
+
+/// The order of the failures of one partition: the later one is greater,
+/// and of two at the same time, the one of the run that sorts first.
+fn rank(at: i64, run_id: &str) -> (i64, Reverse<&str>) {
+    (at, Reverse(run_id))
+}
+
+/// The run and the time of the latest of `failures`.
+fn latest(failures: &FailuresByRun) -> Option<(&str, i64)> {
+    failures
+        .iter()
+        .filter_map(|(run_id, failure)| Some((run_id.as_str(), failure.at()?)))
+        .max_by_key(|&(run_id, at)| rank(at, run_id))
+}
+
+/// The failures of each partition (each member) of each asset, by run,
+/// unless a deletion at or after a failure replaced it. A later
+/// materialization is not compared here.
 ///
 /// A failure is a keyed `StepFailure` event of a run that is not an action
 /// run. The end in failure of a run with a partition that is not an action
 /// run is a failure too, at the end of the run: of each member of its
 /// partition, for each asset of the run, unless the run materialized it.
-pub(super) async fn derive_failures(
-    db: &Surreal<Any>,
-    scope: Scope<'_>,
-    excluded: Option<&str>,
-) -> Result<DerivedFailures> {
+pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures> {
     #[derive(Debug, SurrealValue)]
     struct RunRow {
         run_id: String,
@@ -924,25 +1045,15 @@ pub(super) async fn derive_failures(
         at: i64,
     }
 
-    // `$asset_key IN node_names` defeats every index: one scan of the runs
-    // serves both kinds of run. It keeps only action runs and failures.
-    let of_runs = match scope {
-        Scope::All => "",
-        Scope::Asset { .. } => "code_location_id = $cl AND $asset_key IN node_names AND ",
-    };
-    let runs: Vec<RunRow> = scope
-        .bind(db.query(format!(
+    // One scan of the runs serves both kinds of run.
+    let runs: Vec<RunRow> = db
+        .query(
             "SELECT run_id, code_location_id, status, action, partition_key, node_names, \
-             start_time, end_time FROM runs \
-             WHERE {of_runs}(action IS NOT NONE OR status = 'Failure')"
-        )))
+             start_time, end_time FROM runs WHERE action IS NOT NONE OR status = 'Failure'",
+        )
         .await?
         .check()?
         .take(0)?;
-    let runs: Vec<RunRow> = runs
-        .into_iter()
-        .filter(|run| Some(run.run_id.as_str()) != excluded)
-        .collect();
 
     // A failed action did not fail to materialize anything. Its keyed
     // StepFailure events stay in storage for the backfill accounting.
@@ -953,37 +1064,36 @@ pub(super) async fn derive_failures(
         .collect();
 
     let mut unknown = 0;
-    let mut latest: DerivedFailures = HashMap::new();
-    let mut fail = |asset: AssetOf, member: PartitionKey, at: i64, run_id: &str| {
-        let failures = latest.entry(asset).or_default();
-        if failures.get(&member).is_none_or(|held| held.at < at) {
-            let run_id = run_id.to_string();
-            failures.insert(member, LatestFailure { at, run_id });
-        }
-    };
+    let mut failures: DerivedFailures = HashMap::new();
 
-    let step_failures: Vec<StepFailureRow> = scope
-        .bind(db.query(format!(
+    let step_failures: Vec<StepFailureRow> = db
+        .query(
             "SELECT code_location_id, asset_key, partition_key, run_id, \
              math::max(timestamp) AS at FROM events \
-             WHERE {} AND event_type = 'StepFailure' AND partition_key IS NOT NONE \
+             WHERE asset_key IS NOT NONE AND event_type = 'StepFailure' \
+             AND partition_key IS NOT NONE \
              GROUP BY code_location_id, asset_key, partition_key, run_id",
-            scope.rows()
-        )))
+        )
         .await?
         .check()?
         .take(0)?;
     for row in step_failures {
-        let run_id = row.run_id.as_str();
-        if action_runs.contains(run_id) || Some(run_id) == excluded {
+        if action_runs.contains(row.run_id.as_str()) {
             continue;
         }
         let Some(partition_key) = stored_key(row.partition_key, &mut unknown) else {
             continue;
         };
+        let of_asset = failures
+            .entry((row.code_location_id, row.asset_key))
+            .or_default();
         for member in partition_key.members() {
-            let asset = (row.code_location_id.clone(), row.asset_key.clone());
-            fail(asset, member, row.at, run_id);
+            let failure = of_asset
+                .entry(member)
+                .or_default()
+                .entry(row.run_id.clone())
+                .or_default();
+            failure.step_failed_at = failure.step_failed_at.max(Some(row.at));
         }
     }
 
@@ -998,11 +1108,7 @@ pub(super) async fn derive_failures(
         .filter(|run| run.partition_key.is_some())
         .collect();
     let failed_run_ids: Vec<String> = failed_runs.iter().map(|run| run.run_id.clone()).collect();
-    let only_asset = match scope {
-        Scope::All => None,
-        Scope::Asset { asset_key, .. } => Some(asset_key),
-    };
-    let built = materialized_by_runs(db, only_asset, &failed_run_ids).await?;
+    let built = materialized_by_runs(db, None, &failed_run_ids).await?;
 
     for run in failed_runs {
         let Some(partition_key) = run
@@ -1014,18 +1120,21 @@ pub(super) async fn derive_failures(
         };
         let at = run.end_time.unwrap_or(run.start_time);
         let members = partition_key.members();
-        let assets: Vec<&str> = match only_asset {
-            Some(asset_key) => vec![asset_key],
-            None => run.node_names.iter().map(String::as_str).collect(),
-        };
-        for asset_key in assets {
-            let done = built.get(&(asset_key.to_string(), run.run_id.clone()));
+        for asset_key in &run.node_names {
+            let done = built.get(&(asset_key.clone(), run.run_id.clone()));
+            let of_asset = failures
+                .entry((run.code_location_id.clone(), asset_key.clone()))
+                .or_default();
             for member in &members {
                 if done.is_some_and(|done| done.contains(member)) {
                     continue;
                 }
-                let asset = (run.code_location_id.clone(), asset_key.to_string());
-                fail(asset, member.clone(), at, &run.run_id);
+                let failure = of_asset
+                    .entry(member.clone())
+                    .or_default()
+                    .entry(run.run_id.clone())
+                    .or_default();
+                failure.run_failed_at = Some(at);
             }
         }
     }
@@ -1033,14 +1142,13 @@ pub(super) async fn derive_failures(
     // A deletion replaces older failures the same way a newer
     // materialization does, the deletion of the whole asset for every key.
     // Read off the tombstones, which outlive the delete run's events.
-    let mut result = scope
-        .bind(db.query(format!(
+    let mut result = db
+        .query(
             "SELECT code_location_id, asset_key, partition_key, timestamp AS at \
-             FROM asset_partition_deletions WHERE {rows}; \
+             FROM asset_partition_deletions; \
              SELECT code_location_id, asset_key, last_deletion_timestamp AS at FROM assets \
-             WHERE {rows} AND last_deletion_timestamp IS NOT NONE;",
-            rows = scope.rows()
-        )))
+             WHERE last_deletion_timestamp IS NOT NONE;",
+        )
         .await?
         .check()?;
     let deletions: Vec<DeletionRow> = result.take(0)?;
@@ -1067,15 +1175,23 @@ pub(super) async fn derive_failures(
         *at = (*at).max(row.at);
     }
 
-    for (asset, failures) in latest.iter_mut() {
-        let of_asset = deleted.get(asset);
+    for (asset, of_asset) in failures.iter_mut() {
+        let deleted_of_asset = deleted.get(asset);
         let whole = asset_deleted.get(asset).copied();
-        failures.retain(|member, failure| {
-            let deleted_at = of_asset.and_then(|d| d.get(member)).copied().max(whole);
-            deleted_at.is_none_or(|deleted_at| deleted_at < failure.at)
+        of_asset.retain(|member, by_run| {
+            let deleted_at = deleted_of_asset
+                .and_then(|deleted| deleted.get(member))
+                .copied()
+                .max(whole);
+            by_run.retain(|_, failure| {
+                failure
+                    .at()
+                    .is_some_and(|at| deleted_at.is_none_or(|deleted_at| deleted_at < at))
+            });
+            !by_run.is_empty()
         });
     }
-    latest.retain(|_, failures| !failures.is_empty());
+    failures.retain(|_, of_asset| !of_asset.is_empty());
     if unknown > 0 {
         tracing::warn!(
             target: "rivers::storage",
@@ -1083,7 +1199,7 @@ pub(super) async fn derive_failures(
             "rows whose partition key has an unknown form are left out of the failed partitions"
         );
     }
-    Ok(latest)
+    Ok(failures)
 }
 
 /// A stored partition key, or `None` when the value is not one: it counts
@@ -1158,48 +1274,77 @@ async fn not_built_by(
         .collect())
 }
 
-/// The rows of the derived failures of one asset: those newer than the
-/// partition's materialization.
+/// The rows of the derived failures of one asset: the failures by run that
+/// are newer than the partition's materialization, and the failure row of
+/// the latest of them for each partition.
 async fn rows_of_derived(
     db: &Surreal<Any>,
     cl: &str,
     asset_key: &str,
-    failures: HashMap<PartitionKey, LatestFailure>,
-) -> Result<Vec<DbPartitionFailure>> {
-    let mut failures: Vec<(PartitionKey, LatestFailure)> = failures.into_iter().collect();
+    failures: HashMap<PartitionKey, FailuresByRun>,
+) -> Result<(Vec<DbPartitionFailure>, Vec<DbPartitionRunFailure>)> {
+    let mut failures: Vec<(PartitionKey, FailuresByRun)> = failures.into_iter().collect();
     failures.sort_by(|a, b| stored_order(&a.0, &b.0));
     let keys: Vec<PartitionKey> = failures.iter().map(|(key, _)| key.clone()).collect();
     let built = built_at_of(db, cl, asset_key, &keys).await?;
 
-    Ok(failures
-        .into_iter()
-        .filter(|(key, failure)| built.get(key).is_none_or(|built| *built < failure.at))
-        .map(|(key, failure)| {
-            let built_at = built.get(&key).copied();
-            DbPartitionFailure {
-                code_location_id: cl.to_string(),
-                asset_key: asset_key.to_string(),
-                partition_key: key,
-                failed_at: failure.at,
-                run_id: failure.run_id,
-                built_at,
-                has_row: built_at.is_some(),
-            }
-        })
-        .collect())
+    let (mut rows, mut run_rows) = (Vec::new(), Vec::new());
+    for (key, mut by_run) in failures {
+        let built_at = built.get(&key).copied();
+        by_run.retain(|_, failure| {
+            failure
+                .at()
+                .is_some_and(|at| built_at.is_none_or(|built| built < at))
+        });
+        let Some((run_id, at)) = latest(&by_run).map(|(run_id, at)| (run_id.to_string(), at))
+        else {
+            continue;
+        };
+        rows.push(DbPartitionFailure {
+            code_location_id: cl.to_string(),
+            asset_key: asset_key.to_string(),
+            partition_key: key.clone(),
+            failed_at: at,
+            run_id,
+            built_at,
+            has_row: built_at.is_some(),
+        });
+        run_rows.extend(
+            by_run
+                .into_iter()
+                .map(|(run_id, failure)| DbPartitionRunFailure {
+                    code_location_id: cl.to_string(),
+                    asset_key: asset_key.to_string(),
+                    partition_key: key.clone(),
+                    run_id,
+                    step_failed_at: failure.step_failed_at,
+                    run_failed_at: failure.run_failed_at,
+                }),
+        );
+    }
+    Ok((rows, run_rows))
 }
 
-/// Fill `asset_partition_failures` from the events and the runs, by the
-/// rules the readers derived the failures with before the table.
+/// Fill `asset_partition_failures` and `asset_partition_run_failures` from
+/// the events and the runs, by the rules the readers derived the failures
+/// with before the tables.
 pub(super) async fn fill_partition_failures(db: &Surreal<Any>) -> Result<()> {
-    db.query("DELETE asset_partition_failures").await?.check()?;
-    let derived = derive_failures(db, Scope::All, None).await?;
+    db.query("DELETE asset_partition_failures; DELETE asset_partition_run_failures;")
+        .await?
+        .check()?;
+    let derived = derive_failures(db).await?;
 
     for ((cl, asset_key), failures) in derived {
-        let rows = rows_of_derived(db, &cl, &asset_key, failures).await?;
+        let (rows, run_rows) = rows_of_derived(db, &cl, &asset_key, failures).await?;
         for chunk in rows.chunks(FAILURES_PER_TRANSACTION) {
-            db.query(RECORD_PARTITION_FAILURES)
+            db.query(PUT_PARTITION_FAILURES)
                 .bind(("rows", chunk.to_vec()))
+                .await?
+                .check()?;
+        }
+        for chunk in run_rows.chunks(FAILURES_PER_TRANSACTION) {
+            db.query(PUT_RUN_FAILURES)
+                .bind(("run_rows", chunk.to_vec()))
                 .await?
                 .check()?;
         }
@@ -1215,12 +1360,12 @@ pub(super) async fn derived_rows(
     cl: &str,
     asset_key: &str,
 ) -> Result<Vec<PartitionFailure>> {
-    let failures = derive_failures(db, Scope::Asset { cl, asset_key }, None)
+    let failures = derive_failures(db)
         .await?
         .remove(&(cl.to_string(), asset_key.to_string()))
         .unwrap_or_default();
-    let mut rows: Vec<PartitionFailure> = rows_of_derived(db, cl, asset_key, failures)
-        .await?
+    let (rows, _) = rows_of_derived(db, cl, asset_key, failures).await?;
+    let mut rows: Vec<PartitionFailure> = rows
         .into_iter()
         .map(|row| PartitionFailure {
             key: row.partition_key,
@@ -1231,4 +1376,113 @@ pub(super) async fn derived_rows(
         .collect();
     rows.sort_by(|a, b| stored_order(&a.key, &b.key));
     Ok(rows)
+}
+
+/// A failure by run as the tests compare it.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RunFailureRow {
+    pub(super) key: PartitionKey,
+    pub(super) run_id: String,
+    pub(super) step_failed_at: Option<i64>,
+    pub(super) run_failed_at: Option<i64>,
+}
+
+/// The failures by run of one asset that the writers keep, and those that
+/// the derivation gives that are newer than the partition's materialization
+/// and deletions, in the order of the store. A time at or before those reads
+/// as none in both: it fails nothing, now or later, as they only move later.
+#[cfg(test)]
+pub(super) async fn run_failure_rows(
+    db: &Surreal<Any>,
+    cl: &str,
+    asset_key: &str,
+) -> Result<(Vec<RunFailureRow>, Vec<RunFailureRow>)> {
+    #[derive(SurrealValue)]
+    struct Kept {
+        partition_key: PartitionKey,
+        run_id: String,
+        step_failed_at: Option<i64>,
+        run_failed_at: Option<i64>,
+    }
+
+    let of_asset = "WHERE code_location_id = $cl AND asset_key = $asset_key";
+    let mut result = db
+        .query(format!(
+            "{} {of_asset}; {} {of_asset}; \
+             SELECT VALUE last_deletion_timestamp FROM assets {of_asset}; \
+             SELECT partition_key, run_id, step_failed_at, run_failed_at \
+             FROM asset_partition_run_failures {of_asset};",
+            BuiltRow::SELECT,
+            DeletedRow::SELECT
+        ))
+        .bind(("cl", cl.to_string()))
+        .bind(("asset_key", asset_key.to_string()))
+        .await?
+        .check()?;
+    let built: Vec<BuiltRow> = result.take(0)?;
+    let tombstones: Vec<DeletedRow> = result.take(1)?;
+    let asset_deleted: Option<i64> = result
+        .take::<Vec<Option<i64>>>(2)?
+        .into_iter()
+        .flatten()
+        .max();
+    let kept: Vec<Kept> = result.take(3)?;
+
+    let mut replaced: HashMap<PartitionKey, i64> = HashMap::new();
+    let deleted = tombstones.into_iter().flat_map(|row| {
+        row.partition_key
+            .members()
+            .into_iter()
+            .map(move |member| (member, row.timestamp))
+    });
+    let built = built
+        .into_iter()
+        .filter_map(|row| Some((row.partition_key, row.last_timestamp?)));
+    for (key, at) in deleted.chain(built) {
+        let held = replaced.entry(key).or_insert(at);
+        *held = (*held).max(at);
+    }
+    let newer = |key: &PartitionKey, at: Option<i64>| {
+        let replaced_at = replaced.get(key).copied().max(asset_deleted);
+        at.filter(|at| replaced_at.is_none_or(|replaced_at| replaced_at < *at))
+    };
+    let row = |key: PartitionKey, run_id: String, failure: RunFailure| RunFailureRow {
+        step_failed_at: newer(&key, failure.step_failed_at),
+        run_failed_at: newer(&key, failure.run_failed_at),
+        key,
+        run_id,
+    };
+    let order = |a: &RunFailureRow, b: &RunFailureRow| {
+        stored_order(&a.key, &b.key).then_with(|| a.run_id.cmp(&b.run_id))
+    };
+
+    let mut kept: Vec<RunFailureRow> = kept
+        .into_iter()
+        .map(|kept| {
+            let failure = RunFailure {
+                step_failed_at: kept.step_failed_at,
+                run_failed_at: kept.run_failed_at,
+            };
+            row(kept.partition_key, kept.run_id, failure)
+        })
+        .collect();
+    kept.sort_by(order);
+
+    let derived = derive_failures(db)
+        .await?
+        .remove(&(cl.to_string(), asset_key.to_string()))
+        .unwrap_or_default();
+    let mut derived: Vec<RunFailureRow> = derived
+        .into_iter()
+        .flat_map(|(key, by_run)| {
+            by_run
+                .into_iter()
+                .map(move |(run_id, failure)| (key.clone(), run_id, failure))
+        })
+        .map(|(key, run_id, failure)| row(key, run_id, failure))
+        .filter(|row| row.step_failed_at.is_some() || row.run_failed_at.is_some())
+        .collect();
+    derived.sort_by(order);
+    Ok((kept, derived))
 }

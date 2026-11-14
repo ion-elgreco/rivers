@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use super::*;
 use crate::storage::surrealdb_backend::partition_reads::keyed_statements;
 use crate::storage::surrealdb_backend::queries::{
-    COUNT_FAILURES, COUNT_FAILURES_IN_BOUNDS, COUNT_PARTITIONS_IN_BOUNDS, FAILURE_ROWS_OF_RUN,
-    ONE_FAILURE_IN_RANGE, PARTITION_TIMESTAMPS_OF_KEY, ROW_OF_KEY, ROWS_IN_RANGE,
+    COUNT_FAILURES, COUNT_FAILURES_IN_BOUNDS, COUNT_PARTITIONS_IN_BOUNDS, FAILED_ENDS_OF_RUN,
+    FAILURES_OF_RUN, ONE_FAILURE_IN_RANGE, PARTITION_TIMESTAMPS_OF_KEY, ROW_OF_KEY, ROWS_IN_RANGE,
 };
 use crate::storage::{PartitionBounds, PartitionFailure};
 
@@ -618,8 +618,19 @@ async fn reads_of_keys_go_through_the_index_of_the_keys() {
             &key[..],
         ),
         (
-            FAILURE_ROWS_OF_RUN.to_string(),
-            "idx_apf_run",
+            format!("SELECT * FROM asset_partition_run_failures {ROWS_IN_RANGE}"),
+            "idx_aprf",
+            &range[..],
+        ),
+        (
+            format!("SELECT * FROM asset_partition_run_failures {ROW_OF_KEY}"),
+            "idx_aprf",
+            &key[..],
+        ),
+        (FAILURES_OF_RUN.to_string(), "idx_aprf_run", &["'r1'"][..]),
+        (
+            FAILED_ENDS_OF_RUN.to_string(),
+            "idx_aprf_run",
             &["'r1'"][..],
         ),
     ] {

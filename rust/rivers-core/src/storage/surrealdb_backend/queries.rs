@@ -1,6 +1,7 @@
 /// A whole-asset deletion's clearing, one transaction in `consolidate_deletion`.
 /// The data and the provenance each clear by their own time. A failure at or
-/// before the deletion goes with the partition rows.
+/// before the deletion goes with the partition rows; an unset time of a
+/// failure by run is NONE, which sorts below every number.
 pub(super) const CLEAR_DELETED_ASSET: &str = "\
      UPDATE assets SET last_event_id = $event_id, last_run_id = NONE, \
      last_timestamp = NONE, last_data_version = NONE \
@@ -17,6 +18,8 @@ pub(super) const CLEAR_DELETED_ASSET: &str = "\
      AND asset_key = $asset_key AND last_timestamp <= $ts; \
      DELETE FROM asset_partition_failures WHERE code_location_id = $cl \
      AND asset_key = $asset_key AND failed_at <= $ts; \
+     DELETE FROM asset_partition_run_failures WHERE code_location_id = $cl \
+     AND asset_key = $asset_key AND step_failed_at <= $ts AND run_failed_at <= $ts; \
      UPDATE asset_partition_failures SET has_row = false, built_at = NONE \
      WHERE code_location_id = $cl AND asset_key = $asset_key \
      AND has_row = true AND built_at <= $ts;";
@@ -129,35 +132,60 @@ pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
 
 /// Starts a write of failure rows in a transaction: write the `assets` row
 /// and put it back, as a materialization and a deletion of the asset do. Of
-/// two that run at the same time, one then fails to commit and retries. The
-/// last statement returns the time of the latest deletion of the asset and
-/// whether the asset has partition tombstones.
+/// two that run at the same time, one then fails to commit and retries.
 pub(super) const HOLD_ASSET_FOR_FAILURES: &str = "\
-     LET $asset = (SELECT last_event_id, last_deletion_timestamp FROM assets \
+     LET $asset = (SELECT last_event_id FROM assets \
          WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
      UPDATE assets SET last_event_id = 'partition failure' \
          WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; \
      UPDATE assets SET last_event_id = $asset.last_event_id \
-         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; \
+         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; ";
+
+/// The time of the latest deletion of an asset, and whether the asset has
+/// partition tombstones.
+pub(super) const DELETIONS_OF_ASSET: &str = "\
      RETURN { \
-         deleted_at: $asset.last_deletion_timestamp, \
+         deleted_at: (SELECT VALUE last_deletion_timestamp FROM assets \
+             WHERE code_location_id = $cl AND asset_key = $asset_key)[0], \
          tombstones: array::len(SELECT VALUE timestamp FROM asset_partition_deletions \
              WHERE code_location_id = $cl AND asset_key = $asset_key LIMIT 1) > 0 \
      };";
 
 /// Write the failure rows `$rows` (`DbPartitionFailure`s). A row that exists
-/// keeps the newer failure, and takes the time of the partition's row.
+/// keeps the newer failure, of two at the same time the one of the run that
+/// sorts first, and takes the time of the partition's row. The run goes
+/// first: it compares with the time the row had.
 pub(super) const RECORD_PARTITION_FAILURES: &str = "\
      INSERT INTO asset_partition_failures $rows ON DUPLICATE KEY UPDATE \
-     run_id = IF $input.failed_at > failed_at THEN $input.run_id ELSE run_id END, \
+     run_id = IF $input.failed_at > failed_at \
+         OR ($input.failed_at == failed_at AND $input.run_id < run_id) \
+         THEN $input.run_id ELSE run_id END, \
      failed_at = IF $input.failed_at > failed_at THEN $input.failed_at ELSE failed_at END, \
      built_at = $input.built_at, has_row = $input.has_row RETURN NONE";
 
-/// Give the failure rows `$rows` (`DbPartitionFailure`s) the time of their
-/// partition's row.
-pub(super) const MOVE_FAILURE_ROWS: &str = "\
+/// Write the failures by run `$run_rows` (`DbPartitionRunFailure`s). A row
+/// that exists keeps the later step failure, and takes the end of the run in
+/// failure when the input has one.
+pub(super) const RECORD_RUN_FAILURES: &str = "\
+     INSERT INTO asset_partition_run_failures $run_rows ON DUPLICATE KEY UPDATE \
+     step_failed_at = IF $input.step_failed_at > step_failed_at \
+         THEN $input.step_failed_at ELSE step_failed_at END, \
+     run_failed_at = IF $input.run_failed_at IS NONE \
+         THEN run_failed_at ELSE $input.run_failed_at END \
+     RETURN NONE";
+
+/// Write the failure rows `$rows` (`DbPartitionFailure`s) as they are.
+pub(super) const PUT_PARTITION_FAILURES: &str = "\
      INSERT INTO asset_partition_failures $rows ON DUPLICATE KEY UPDATE \
+     failed_at = $input.failed_at, run_id = $input.run_id, \
      built_at = $input.built_at, has_row = $input.has_row RETURN NONE";
+
+/// Write the failures by run `$run_rows` (`DbPartitionRunFailure`s) as they
+/// are.
+pub(super) const PUT_RUN_FAILURES: &str = "\
+     INSERT INTO asset_partition_run_failures $run_rows ON DUPLICATE KEY UPDATE \
+     step_failed_at = $input.step_failed_at, run_failed_at = $input.run_failed_at \
+     RETURN NONE";
 
 /// How many partitions of an asset failed, and how many of them have a row.
 /// Both are counted on an index.
@@ -182,10 +210,17 @@ pub(super) const ONE_FAILURE_IN_RANGE: &str = "\
      WHERE code_location_id = $cl AND asset_key = $asset_key \
      AND partition_key >= $lowest AND partition_key <= $highest LIMIT 1";
 
-/// The partitions whose failure row names the run `$run_id`.
-pub(super) const FAILURE_ROWS_OF_RUN: &str = "\
+/// The partitions of the failures by the run `$run_id`.
+pub(super) const FAILURES_OF_RUN: &str = "\
      SELECT code_location_id, asset_key, partition_key \
-     FROM asset_partition_failures WHERE run_id = $run_id";
+     FROM asset_partition_run_failures WHERE run_id = $run_id";
+
+/// The same, of the failures by the end of the run in failure at another
+/// time than `$end`.
+pub(super) const FAILED_ENDS_OF_RUN: &str = "\
+     SELECT code_location_id, asset_key, partition_key \
+     FROM asset_partition_run_failures WHERE run_id = $run_id \
+     AND run_failed_at IS NOT NONE AND run_failed_at != $end";
 
 /// After `SELECT <fields> FROM <table>`: the rows of the keys from `$lower`
 /// to `$upper`, at most `$limit`.

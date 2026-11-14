@@ -15,8 +15,23 @@ DEFINE FIELD IF NOT EXISTS has_row ON asset_partition_failures TYPE bool;
 DEFINE INDEX IF NOT EXISTS idx_apf ON asset_partition_failures FIELDS code_location_id, asset_key, partition_key UNIQUE;
 -- Counts of the failed partitions with a row in a range of keys.
 DEFINE INDEX IF NOT EXISTS idx_apf_row ON asset_partition_failures FIELDS code_location_id, asset_key, has_row, partition_key;
--- The rows of a run, when the run is deleted or does not end in failure.
-DEFINE INDEX IF NOT EXISTS idx_apf_run ON asset_partition_failures FIELDS run_id;
+
+-- The failures of the partitions above, one row per partition and run: the
+-- run's latest keyed step failure of the partition, and the end of the run in
+-- failure when it fails the partition. The failure of a row is the later of
+-- the two, and is newer than the partition's materialization and deletion.
+-- The row above is the one with the latest failure. When a run is deleted or
+-- its end changes, the rows of its partitions are computed again from these.
+DEFINE TABLE IF NOT EXISTS asset_partition_run_failures SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS code_location_id ON asset_partition_run_failures TYPE string;
+DEFINE FIELD IF NOT EXISTS asset_key ON asset_partition_run_failures TYPE string;
+DEFINE FIELD IF NOT EXISTS partition_key ON asset_partition_run_failures TYPE object FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS run_id ON asset_partition_run_failures TYPE string;
+DEFINE FIELD IF NOT EXISTS step_failed_at ON asset_partition_run_failures TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS run_failed_at ON asset_partition_run_failures TYPE option<int>;
+DEFINE INDEX IF NOT EXISTS idx_aprf ON asset_partition_run_failures FIELDS code_location_id, asset_key, partition_key, run_id UNIQUE;
+-- The rows of a run, when the run is deleted or its end changes.
+DEFINE INDEX IF NOT EXISTS idx_aprf_run ON asset_partition_run_failures FIELDS run_id;
 
 -- Breaking for writers: an older writer does not keep the rows. An older
 -- reader derives the failures from the events and still works.

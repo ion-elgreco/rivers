@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use crate::storage::retry;
 use crate::storage::{EventRecord, EventType, RunRecord};
 
+use super::partition_failures::RunChange;
 use super::*;
 
 /// Build the `RunQueued` event row that pairs with a freshly-written queued `RunRecord`.
@@ -63,7 +64,13 @@ impl SurrealStorage {
 
         // The run ended otherwise in the meantime.
         if recorded && !failed {
-            self.rederive_failures_of_run(run_id, false, None).await?;
+            let end = self
+                .run_of_failures(run_id)
+                .await?
+                .filter(|run| run.status == "Failure")
+                .map(|run| run.end_time.unwrap_or(run.start_time));
+            self.repair_failures_of_run(run_id, RunChange::FailedAt(end))
+                .await?;
         }
         Ok(failed)
     }
