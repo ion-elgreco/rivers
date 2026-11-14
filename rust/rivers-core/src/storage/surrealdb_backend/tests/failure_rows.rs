@@ -432,6 +432,149 @@ async fn a_run_that_ended_otherwise_fails_no_partition() {
     assert_derived(&storage, "a", "after the late failure").await;
 }
 
+/// Write `set` on the run `run_id` as a write of its status does, and stop
+/// there: as if the process stopped before the repair after the status.
+async fn write_status_only(storage: &SurrealStorage, run_id: &str, set: &str) {
+    storage
+        .db
+        .query(format!("UPDATE runs SET {set} WHERE run_id = $run_id"))
+        .bind(("run_id", run_id.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
+/// A final status and one that is not final: each writes the status in a
+/// query of its own.
+#[tokio::test]
+async fn a_status_written_again_after_a_stop_clears_the_end_in_failure() {
+    for status in [
+        RunStatus::Success,
+        RunStatus::Canceled,
+        RunStatus::NotStarted,
+    ] {
+        let storage = make_storage().await;
+        register(&storage, &["a"]).await;
+        storage
+            .create_run(&run(
+                "r1",
+                RunStatus::Started,
+                Some(keys(&["p1", "p2", "p3"])),
+                &["a"],
+            ))
+            .await
+            .unwrap();
+        storage
+            .store_events(&[
+                built("a", "r1", "p1", 100),
+                failed("a", "r1", single("p2"), 300),
+            ])
+            .await
+            .unwrap();
+        storage
+            .update_run_status("r1", RunStatus::Failure, Some(500))
+            .await
+            .unwrap();
+        assert_eq!(rows(&storage, "a").await.len(), 2);
+
+        write_status_only(&storage, "r1", &format!("status = '{status:?}'")).await;
+        storage
+            .update_run_status("r1", status.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(&storage, "a").await,
+            vec![failure("p2", 300, "r1", false)],
+            "{status:?}"
+        );
+        assert_derived(&storage, "a", &format!("after {status:?} again")).await;
+    }
+}
+
+#[tokio::test]
+async fn a_start_again_after_a_stop_clears_the_end_in_failure() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    storage
+        .create_run(&run("r1", RunStatus::Queued, Some(single("p1")), &["a"]))
+        .await
+        .unwrap();
+    assert!(storage.fail_run_if_active("r1", 500).await.unwrap());
+    assert_eq!(rows(&storage, "a").await.len(), 1);
+
+    write_status_only(&storage, "r1", "status = 'Started'").await;
+    assert!(storage.try_start_run("r1").await.unwrap());
+
+    assert!(rows(&storage, "a").await.is_empty());
+    assert_derived(&storage, "a", "after the start again").await;
+}
+
+#[tokio::test]
+async fn an_earlier_end_written_again_after_a_stop_moves_the_failures() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    storage
+        .create_run(&run(
+            "r1",
+            RunStatus::Started,
+            Some(keys(&["p1", "p2", "p3"])),
+            &["a"],
+        ))
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Failure, Some(700))
+        .await
+        .unwrap();
+    storage
+        .store_events(&[
+            built("a", "r2", "p1", 600),
+            failed("a", "r3", single("p3"), 550),
+        ])
+        .await
+        .unwrap();
+
+    write_status_only(&storage, "r1", "end_time = 400").await;
+    storage
+        .update_run_status("r1", RunStatus::Failure, Some(400))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows(&storage, "a").await,
+        vec![
+            failure("p2", 400, "r1", false),
+            failure("p3", 550, "r3", false)
+        ]
+    );
+    assert_derived(&storage, "a", "after the earlier end again").await;
+}
+
+/// A failure that comes after the run ended otherwise writes no status, and
+/// still brings the rows in line with the stored status.
+#[tokio::test]
+async fn a_failure_of_a_run_that_ended_otherwise_after_a_stop_clears_the_end_in_failure() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    storage
+        .create_run(&run("r1", RunStatus::Started, Some(single("p1")), &["a"]))
+        .await
+        .unwrap();
+    storage
+        .update_run_status("r1", RunStatus::Failure, Some(500))
+        .await
+        .unwrap();
+    assert_eq!(rows(&storage, "a").await.len(), 1);
+
+    write_status_only(&storage, "r1", "status = 'Success', end_time = 600").await;
+    assert!(!storage.fail_run_if_active("r1", 700).await.unwrap());
+
+    assert!(rows(&storage, "a").await.is_empty());
+    assert_derived(&storage, "a", "after the late failure").await;
+}
+
 #[tokio::test]
 async fn a_run_created_as_failed_fails_its_partitions() {
     let storage = make_storage().await;

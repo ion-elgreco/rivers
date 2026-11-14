@@ -621,6 +621,14 @@ impl RunChange {
     }
 }
 
+/// The status and the times of a run, as the store holds them.
+#[derive(Debug, SurrealValue)]
+pub(super) struct StoredStatus {
+    pub(super) status: String,
+    pub(super) start_time: i64,
+    pub(super) end_time: Option<i64>,
+}
+
 impl SurrealStorage {
     /// Record the failures `(partition, time, run)` of partitions of one
     /// asset; each partition is one member. A partition takes a failure that
@@ -794,6 +802,26 @@ impl SurrealStorage {
             }
         }
         Ok(())
+    }
+
+    /// After a write of the status of the run `run_id`: bring the failure
+    /// rows of its partitions in line with `stored`, the status that the
+    /// store then holds, when the run is stored. A failed run fails them at
+    /// its end time, else its start time; any other run not by its end. It
+    /// follows the stored status, not the one before the write, so a write
+    /// done again after a stop repairs too. With nothing to change, it is one
+    /// read of the run's failures: each write of a status pays it.
+    pub(super) async fn repair_failures_after_status(
+        &self,
+        run_id: &str,
+        stored: Option<&StoredStatus>,
+    ) -> Result<()> {
+        let Some(run) = stored else {
+            return Ok(());
+        };
+        let end = (run.status == "Failure").then(|| run.end_time.unwrap_or(run.start_time));
+        self.repair_failures_of_run(run_id, RunChange::FailedAt(end))
+            .await
     }
 
     pub(super) async fn count_failures(&self, cl: &str, asset_key: &str) -> Result<FailureCount> {

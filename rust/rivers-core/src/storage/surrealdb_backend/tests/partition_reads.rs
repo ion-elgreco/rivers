@@ -9,6 +9,7 @@ use crate::storage::surrealdb_backend::partition_reads::keyed_statements;
 use crate::storage::surrealdb_backend::queries::{
     COUNT_FAILURES, COUNT_FAILURES_IN_BOUNDS, COUNT_PARTITIONS_IN_BOUNDS, FAILED_ENDS_OF_RUN,
     FAILURES_OF_RUN, ONE_FAILURE_IN_RANGE, PARTITION_TIMESTAMPS_OF_KEY, ROW_OF_KEY, ROWS_IN_RANGE,
+    STATUS_OF_RUN,
 };
 use crate::storage::{PartitionBounds, PartitionFailure};
 
@@ -633,6 +634,7 @@ async fn reads_of_keys_go_through_the_index_of_the_keys() {
             "idx_aprf_run",
             &["'r1'"][..],
         ),
+        (STATUS_OF_RUN.to_string(), "idx_runs_id", &["'r1'"][..]),
     ] {
         let plan = plan_of(&storage, &statement).await;
         let mut accesses = Vec::new();

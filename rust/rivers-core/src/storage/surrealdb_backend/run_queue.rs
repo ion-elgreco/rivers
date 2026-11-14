@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::storage::retry;
 use crate::storage::{EventRecord, EventType, RunRecord};
 
-use super::partition_failures::RunChange;
+use super::partition_failures::StoredStatus;
 use super::*;
 
 /// Build the `RunQueued` event row that pairs with a freshly-written queued `RunRecord`.
@@ -30,15 +30,13 @@ impl SurrealStorage {
     /// launch-error must not stomp a concurrent Canceled/Success write).
     pub async fn fail_run_if_active(&self, run_id: &str, end_time: i64) -> Result<bool> {
         // The failures before the status: a run that reads as failed has them.
-        let recorded = match self.run_of_failures(run_id).await? {
-            Some(run) if matches!(run.status.as_str(), "NotStarted" | "Queued" | "Started") => {
-                self.record_failures_of_run(&run, end_time).await?;
-                true
-            }
-            _ => false,
-        };
+        if let Some(run) = self.run_of_failures(run_id).await?
+            && matches!(run.status.as_str(), "NotStarted" | "Queued" | "Started")
+        {
+            self.record_failures_of_run(&run, end_time).await?;
+        }
 
-        let failed = retry::with_retry(&self.retry_config, || async {
+        let (failed, stored) = retry::with_retry(&self.retry_config, || async {
             let mut response = self
                 .db
                 .query(format!(
@@ -49,7 +47,8 @@ impl SurrealStorage {
                          RETURN run_id, status, launched_by);\n\
                      {RECORD_BACKFILL_RUN_OUTCOME}\n\
                      COMMIT TRANSACTION;\n\
-                     RETURN array::len($final ?? []) > 0;"
+                     RETURN array::len($final ?? []) > 0;\n\
+                     {STATUS_OF_RUN};"
                 ))
                 .bind(("run_id", run_id.to_string()))
                 .bind(("end_time", end_time))
@@ -57,21 +56,15 @@ impl SurrealStorage {
                 .context("failed to fail-out run")?
                 .check()?;
             let last = response.num_statements() - 1;
-            let failed: Option<bool> = response.take(last)?;
-            Ok(failed.unwrap_or(false))
+            let failed: Option<bool> = response.take(last - 1)?;
+            let stored: Option<StoredStatus> = response.take(last)?;
+            Ok((failed.unwrap_or(false), stored))
         })
         .await?;
 
-        // The run ended otherwise in the meantime.
-        if recorded && !failed {
-            let end = self
-                .run_of_failures(run_id)
-                .await?
-                .filter(|run| run.status == "Failure")
-                .map(|run| run.end_time.unwrap_or(run.start_time));
-            self.repair_failures_of_run(run_id, RunChange::FailedAt(end))
-                .await?;
-        }
+        // The run may have ended otherwise in the meantime.
+        self.repair_failures_after_status(run_id, stored.as_ref())
+            .await?;
         Ok(failed)
     }
 

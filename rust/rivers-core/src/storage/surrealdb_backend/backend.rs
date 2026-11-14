@@ -12,7 +12,7 @@ use crate::storage::{
     StorageBackend, StoredEvent, StoredLog, TickRecord, UnstartedBackfillRun,
 };
 
-use super::partition_failures::{RunChange, keyed_failure};
+use super::partition_failures::{RunChange, StoredStatus, keyed_failure};
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -513,18 +513,14 @@ impl StorageBackend for SurrealStorage {
         end_time: Option<i64>,
     ) -> Result<()> {
         // The failures before the status: a run that reads as failed has them.
-        // A run whose end in failure moves earlier is repaired after the
-        // status.
-        let mut ends_earlier = None;
+        // An earlier end is repaired after the status.
         if status == RunStatus::Failure
             && let Some(run) = self.run_of_failures(run_id).await?
         {
             let at = end_time.or(run.end_time).unwrap_or(run.start_time);
             let ended = (run.status == "Failure").then(|| run.end_time.unwrap_or(run.start_time));
-            match ended {
-                Some(ended) if at < ended => ends_earlier = Some(at),
-                Some(ended) if at == ended => {}
-                _ => self.record_failures_of_run(&run, at).await?,
+            if ended.is_none_or(|ended| ended < at) {
+                self.record_failures_of_run(&run, at).await?;
             }
         }
 
@@ -535,7 +531,7 @@ impl StorageBackend for SurrealStorage {
         };
         let update =
             format!("UPDATE runs SET status = $status{set_end_time} WHERE run_id = $run_id");
-        // The last statement returns the status before the update.
+        // The last statement returns the run as the update leaves it.
         let query = if matches!(
             status,
             RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
@@ -543,19 +539,16 @@ impl StorageBackend for SurrealStorage {
             format!(
                 "BEGIN TRANSACTION;\n\
                  LET $final = ({update} RETURN run_id, status, launched_by, \
-                     $before.status AS status_before);\n\
+                     start_time, end_time);\n\
                  {RECORD_BACKFILL_RUN_OUTCOME}\n\
                  COMMIT TRANSACTION;\n\
-                 RETURN $final[0].status_before;"
+                 RETURN $final;"
             )
         } else {
-            format!(
-                "LET $was = ({update} RETURN VALUE $before.status)[0];\n\
-                 RETURN $was;"
-            )
+            format!("{update} RETURN status, start_time, end_time;")
         };
 
-        let before: Option<String> = retry::with_retry(&self.retry_config, || async {
+        let stored: Vec<StoredStatus> = retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
                 .query(&query)
@@ -569,14 +562,8 @@ impl StorageBackend for SurrealStorage {
         })
         .await?;
 
-        if let Some(at) = ends_earlier {
-            self.repair_failures_of_run(run_id, RunChange::FailedAt(Some(at)))
-                .await?;
-        } else if status != RunStatus::Failure && before.as_deref() == Some("Failure") {
-            self.repair_failures_of_run(run_id, RunChange::FailedAt(None))
-                .await?;
-        }
-        Ok(())
+        self.repair_failures_after_status(run_id, stored.first())
+            .await
     }
 
     async fn update_run_block_reason(&self, run_id: &str, reason: Option<&str>) -> Result<()> {
@@ -593,36 +580,27 @@ impl StorageBackend for SurrealStorage {
 
     async fn try_start_run(&self, run_id: &str) -> Result<bool> {
         let now_ns = now_nanos();
-        let (started, was_failed) = retry::with_retry(&self.retry_config, || async {
+        let stored = retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
-                .query(
+                .query(format!(
                     "UPDATE runs SET status = 'Started', \
                              execution_start_time = execution_start_time ?? $now \
-                         WHERE run_id = $run_id AND status != 'Canceled' \
-                         RETURN VALUE $before.status; \
-                     SELECT status FROM runs WHERE run_id = $run_id LIMIT 1",
-                )
+                         WHERE run_id = $run_id AND status != 'Canceled' RETURN NONE; \
+                     {STATUS_OF_RUN}"
+                ))
                 .bind(("run_id", run_id.to_string()))
                 .bind(("now", now_ns))
-                .await?;
-            let before: Vec<String> = result.take(0)?;
-            let status: Option<String> = result.take((1, "status"))?;
-            let was_failed = before.iter().any(|status| status == "Failure");
-            match status.as_deref() {
-                Some("Started") => Ok((true, was_failed)),
-                Some(_) => Ok((false, was_failed)),
-                None => anyhow::bail!("run {run_id} not found"),
-            }
+                .await?
+                .check()?;
+            let stored: Option<StoredStatus> = result.take(1)?;
+            stored.with_context(|| format!("run {run_id} not found"))
         })
         .await?;
 
-        // A run that failed before it started: its end in failure is gone.
-        if was_failed {
-            self.repair_failures_of_run(run_id, RunChange::FailedAt(None))
-                .await?;
-        }
-        Ok(started)
+        self.repair_failures_after_status(run_id, Some(&stored))
+            .await?;
+        Ok(stored.status == "Started")
     }
 
     async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {

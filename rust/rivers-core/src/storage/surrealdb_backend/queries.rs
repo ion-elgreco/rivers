@@ -222,6 +222,10 @@ pub(super) const FAILED_ENDS_OF_RUN: &str = "\
      FROM asset_partition_run_failures WHERE run_id = $run_id \
      AND run_failed_at IS NOT NONE AND run_failed_at != $end";
 
+/// The status and the times of the run `$run_id` (a `StoredStatus`).
+pub(super) const STATUS_OF_RUN: &str =
+    "SELECT status, start_time, end_time FROM runs WHERE run_id = $run_id LIMIT 1";
+
 /// After `SELECT <fields> FROM <table>`: the rows of the keys from `$lower`
 /// to `$upper`, at most `$limit`.
 pub(super) const ROWS_IN_RANGE: &str = "\
