@@ -77,17 +77,3 @@ pub async fn get_backfills_summary() -> Result<BackfillsSummary, ServerFnError> 
         .map(Into::into)
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
-
-/// Cancel a backfill. One whose runs all ended keeps its own final status.
-/// Runs in flight go on to their end; the cancel stops the runs not started.
-#[server]
-pub async fn cancel_backfill(backfill_id: String) -> Result<bool, ServerFnError> {
-    use rivers_core::storage::StorageBackend;
-    let state = expect_context::<crate::state::AppState>();
-    state
-        .storage
-        .cancel_backfill(&backfill_id)
-        .await
-        .map(|_| true)
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}

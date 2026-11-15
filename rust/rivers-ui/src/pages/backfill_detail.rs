@@ -14,8 +14,9 @@ use crate::components::ui_kit::{
 use crate::helpers::{code_location_label, format_duration, format_timestamp, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
-use crate::server_fns::backfills::{cancel_backfill, get_backfill, get_backfill_runs};
+use crate::server_fns::backfills::{get_backfill, get_backfill_runs};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::mutations::cancel_backfill;
 use crate::server_fns::partitions::get_backfill_partition_overview;
 use crate::types::PartitionOverview;
 
