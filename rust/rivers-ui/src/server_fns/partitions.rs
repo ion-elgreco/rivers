@@ -1,8 +1,9 @@
-//! Server functions for the Partitions tab of an asset.
+//! Server functions for the partition outline of an asset or a backfill.
 //!
-//! The code location splits the keys of a dimension into rows; the store
-//! counts the partitions of each row. No read grows with the number of
-//! partitions of the asset.
+//! The code location splits the keys of a dimension into rows. For an asset,
+//! the store counts the partitions of each row; no read grows with the
+//! number of partitions of the asset. For a backfill, the counts come from
+//! its requested keys and the outcome of each of its runs.
 
 use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
@@ -39,6 +40,30 @@ pub async fn get_partition_rows(
     .await
 }
 
+/// The counts, the strip and the top rows of the partition outline of a
+/// backfill.
+#[server]
+pub async fn get_backfill_partition_overview(
+    backfill_id: String,
+) -> Result<PartitionOverview, ServerFnError> {
+    read::of_backfill(&backfill_id, async |outline| outline.overview().await).await
+}
+
+/// The rows below `place` in the partition outline of a backfill, as
+/// [`get_partition_rows`] gives them for an asset.
+#[server(input = Json)]
+pub async fn get_backfill_partition_rows(
+    backfill_id: String,
+    place: OutlinePlace,
+    query: String,
+    offset: u64,
+) -> Result<OutlineLevel, ServerFnError> {
+    read::of_backfill(&backfill_id, async |outline| {
+        outline.rows(&place, &query, offset).await
+    })
+    .await
+}
+
 #[cfg(feature = "ssr")]
 mod read {
     use anyhow::{Context, Result, anyhow};
@@ -52,9 +77,16 @@ mod read {
         FailedPartitions, PartitionRow as StoredRow, PartitionState, count_states, count_states_in,
         partition_rows_in, partition_rows_of,
     };
+    use rivers_core::execution::backfill_partitions::{
+        BackfillCounts, BackfillPartitionState, BackfillStates, KeyRange, PartitionOutcome,
+    };
     use rivers_core::execution::partition_outline::{self as keys, KeyGroup};
     use rivers_core::storage::surrealdb_backend::SurrealStorage;
-    use rivers_core::storage::{PartitionBounds, PartitionKey, ScopedStorage, StorageBackend};
+    use rivers_core::storage::{
+        CodeLocationContext, PartitionBounds, PartitionKey, ScopedStorage, StorageBackend,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::OnceCell;
     use tonic::transport::Channel;
 
@@ -286,6 +318,100 @@ mod read {
         }
     }
 
+    fn backfill_row(key: String, outcome: PartitionOutcome) -> PartitionRow {
+        PartitionRow {
+            key,
+            state: match outcome.state {
+                BackfillPartitionState::Completed => PartitionRowState::Done,
+                BackfillPartitionState::Failed => PartitionRowState::Failed,
+                BackfillPartitionState::Canceled => PartitionRowState::Canceled,
+                BackfillPartitionState::Pending => PartitionRowState::Pending,
+            },
+            materialized_at: None,
+            run_id: outcome.run_id,
+            failed_at: None,
+        }
+    }
+
+    fn counts_of(counts: BackfillCounts) -> PartitionCounts {
+        PartitionCounts::of_backfill(
+            counts.total,
+            counts.completed,
+            counts.failed,
+            counts.canceled,
+        )
+    }
+
+    /// The counts of one partition in `state`.
+    fn counts_of_state(state: PartitionRowState) -> PartitionCounts {
+        use PartitionRowState::*;
+        PartitionCounts {
+            total: 1,
+            done: matches!(state, Materialized | Done) as u64,
+            failed: (state == Failed) as u64,
+            canceled: (state == Canceled) as u64,
+        }
+    }
+
+    /// Where the rows read the state of each partition.
+    pub(super) enum States<'a> {
+        /// The stored state of an asset, with its failed partitions in the
+        /// place of the read.
+        Asset(&'a FailedPartitions),
+        /// What happened to each partition in a backfill.
+        Backfill(&'a BackfillStates),
+    }
+
+    /// The keys of one dimension of a backfill.
+    struct BackfillKeys {
+        in_order: Vec<String>,
+        sorted: Vec<String>,
+    }
+
+    /// The backfill of an outline: what happened to its partitions, and the
+    /// keys of its dimensions, which take the place of the keys of the asset.
+    pub(super) struct Backfill {
+        states: BackfillStates,
+        keys: Mutex<HashMap<String, Arc<BackfillKeys>>>,
+    }
+
+    impl Backfill {
+        pub(super) fn new(states: BackfillStates) -> Self {
+            Self {
+                states,
+                keys: Mutex::default(),
+            }
+        }
+
+        fn keys(&self, dimension: &str) -> Arc<BackfillKeys> {
+            let mut keys = self.keys.lock().expect("no read panics with the lock held");
+            keys.entry(dimension.to_string())
+                .or_insert_with(|| {
+                    let in_order = self.states.keys_of(dimension);
+                    let mut sorted = in_order.clone();
+                    sorted.sort();
+                    Arc::new(BackfillKeys { in_order, sorted })
+                })
+                .clone()
+        }
+
+        /// One page of the partitions in the order they were asked for, for a
+        /// backfill whose code location gives no keys.
+        fn page(&self, offset: u64) -> OutlineLevel {
+            let page = self.states.page(offset, PAGE);
+            let read = offset.saturating_add(page.len() as u64);
+            OutlineLevel {
+                heading: "partition".to_string(),
+                more: self.states.total().saturating_sub(read),
+                rows: OutlineRows::Partitions(
+                    page.into_iter()
+                        .map(|(partition, outcome)| backfill_row(partition.to_display(), outcome))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
     /// The code location as the outline asks it for keys.
     pub(super) trait KeySource {
         async fn groups(
@@ -315,14 +441,18 @@ mod read {
         }
     }
 
-    /// The reads of the partition outline of one asset, for one request.
+    /// The reads of the partition outline of one asset or backfill, for one
+    /// request.
     pub(super) struct Outline<'a, S, K> {
         storage: &'a ScopedStorage<'a, S>,
         /// `None`: the code location does not answer.
         source: Option<K>,
+        /// The asset whose partition definition the code location splits.
         asset_key: &'a str,
         /// The name and the sorted keys of the dynamic set of the request.
         dynamic: OnceCell<(String, Vec<String>)>,
+        /// `Some`: the outline of a backfill of the asset.
+        backfill: Option<Backfill>,
     }
 
     /// The result of `read` on the outline of `asset_key`.
@@ -347,6 +477,61 @@ mod read {
                 .map(|(_, client)| client),
             asset_key,
             dynamic: OnceCell::new(),
+            backfill: None,
+        };
+        read(&outline)
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))
+    }
+
+    /// The result of `read` on the outline of backfill `backfill_id`. The
+    /// code location of the backfill splits the keys of its first asset.
+    pub(super) async fn of_backfill<T>(
+        backfill_id: &str,
+        read: impl AsyncFnOnce(
+            &Outline<'_, SurrealStorage, CodeLocationServiceClient<Channel>>,
+        ) -> Result<T>,
+    ) -> Result<T, ServerFnError> {
+        let state = expect_context::<crate::state::AppState>();
+        let found = async {
+            let record = state
+                .storage
+                .get_backfill(backfill_id)
+                .await?
+                .context("backfill not found")?;
+            let states = BackfillStates::read(&*state.storage, &record).await?;
+            anyhow::Ok((record, states))
+        };
+        let (record, states) = found.await.map_err(|e| ServerFnError::new(e.to_string()))?;
+
+        let ctx = CodeLocationContext::new(record.code_location_id.clone());
+        let storage = state.storage.for_code_location(&ctx);
+        let entry = state
+            .registry
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|entry| entry.identity == record.code_location_id);
+        let source = match entry {
+            Some(entry) => state
+                .connect_to(&entry.namespace, &entry.name)
+                .await
+                .ok()
+                .map(|(_, client)| client),
+            None => None,
+        };
+
+        let outline = Outline {
+            storage: &storage,
+            source,
+            asset_key: record
+                .asset_selection
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+            dynamic: OnceCell::new(),
+            backfill: Some(Backfill::new(states)),
         };
         read(&outline)
             .await
@@ -355,6 +540,13 @@ mod read {
 
     impl<S: StorageBackend, K: KeySource> Outline<'_, S, K> {
         pub async fn overview(&self) -> Result<PartitionOverview> {
+            match &self.backfill {
+                Some(backfill) => self.backfill_overview(backfill).await,
+                None => self.asset_overview().await,
+            }
+        }
+
+        async fn asset_overview(&self) -> Result<PartitionOverview> {
             let failed = FailedPartitions::read(self.storage, self.asset_key, None).await?;
             let states = count_states(self.storage, self.asset_key, &failed).await?;
 
@@ -392,6 +584,76 @@ mod read {
             } else {
                 self.split(&root, BARS_MOST).await?
             };
+            self.overview_of(root, counts, bars, &States::Asset(&failed))
+                .await
+        }
+
+        /// The overview of a backfill: the dimensions of the asset with the
+        /// keys that the backfill holds, from its first key to its last.
+        async fn backfill_overview(&self, backfill: &Backfill) -> Result<PartitionOverview> {
+            let counts = backfill
+                .states
+                .counts_in(&[KeyRange::default()])
+                .pop()
+                .map(counts_of)
+                .unwrap_or_default();
+
+            let Some(reply) = self.first_split().await else {
+                return Ok(PartitionOverview {
+                    counts,
+                    shape: PartitionShape::Keys,
+                    strip: None,
+                    top: backfill.page(0),
+                    root: OutlinePlace::default(),
+                    from_definition: false,
+                });
+            };
+
+            let mut root = OutlinePlace {
+                dimensions: reply
+                    .dimensions
+                    .iter()
+                    .map(|dimension| OutlineDimension {
+                        name: dimension.name.clone(),
+                        keys: backfill.keys(&dimension.name).in_order.len() as u64,
+                        dynamic_name: dimension.dynamic_name.clone(),
+                    })
+                    .collect(),
+                ..OutlinePlace::default()
+            };
+            let leading = root
+                .dimensions
+                .first()
+                .context("the asset has no partition dimension")?;
+            let keys = backfill.keys(&leading.name);
+            if let (true, true, Some(first), Some(last)) = (
+                leading.dynamic_name.is_empty(),
+                reply.ascending,
+                keys.sorted.first(),
+                keys.sorted.last(),
+            ) {
+                root.first_key = first.clone();
+                root.last_key = last.clone();
+            }
+
+            let bars = self.split(&root, BARS_MOST).await?;
+            self.overview_of(root, counts, bars, &States::Backfill(&backfill.states))
+                .await
+        }
+
+        /// The overview of the partitions of `root` with `counts`, and
+        /// `bars` the split of the strip. `None`: the keys do not ascend.
+        async fn overview_of(
+            &self,
+            root: OutlinePlace,
+            counts: PartitionCounts,
+            bars: Option<Split>,
+            states: &States<'_>,
+        ) -> Result<PartitionOverview> {
+            let leading = root
+                .dimensions
+                .first()
+                .context("the asset has no partition dimension")?;
 
             let (strip, top, shape_of) = match bars {
                 Some(bars) => {
@@ -411,8 +673,8 @@ mod read {
                     };
 
                     let (strip, level) = futures_util::try_join!(
-                        self.strip(&root, &bars, true, &failed),
-                        self.level(&root, top, true, 0, &failed),
+                        self.strip(&root, &bars, true, states),
+                        self.level(&root, top, true, 0, states),
                     )?;
                     (Some(strip), level, bars)
                 }
@@ -423,9 +685,9 @@ mod read {
                     let top = Split::of_keys(page[..shown].to_vec());
                     let bars = Split::of_keys(page);
 
-                    let level = self.level(&root, top, false, more, &failed).await?;
+                    let level = self.level(&root, top, false, more, states).await?;
                     let strip = match keys_total <= BARS_MOST as u64 {
-                        true => Some(self.strip(&root, &bars, false, &failed).await?),
+                        true => Some(self.strip(&root, &bars, false, states).await?),
                         false => None,
                     };
                     (strip, level, Split::default())
@@ -464,7 +726,10 @@ mod read {
             offset: u64,
         ) -> Result<OutlineLevel> {
             if place.dimensions.is_empty() {
-                return self.stored_level(offset, None).await;
+                return match &self.backfill {
+                    Some(backfill) => Ok(backfill.page(offset)),
+                    None => self.stored_level(offset, None).await,
+                };
             }
 
             let next = match (query.is_empty(), offset) {
@@ -480,6 +745,11 @@ mod read {
                 }
             };
 
+            if let Some(backfill) = &self.backfill {
+                let states = States::Backfill(&backfill.states);
+                return self.level(place, split, in_order, more, &states).await;
+            }
+
             // The failed partitions that the rows can show, and no others.
             let bounds: Vec<PartitionBounds> = match (in_order, split.groups.as_slice()) {
                 (true, [first, .., last]) => vec![bounds_of(place, &first.first, &last.last)],
@@ -491,7 +761,8 @@ mod read {
             let failed =
                 FailedPartitions::read(self.storage, self.asset_key, Some(&bounds)).await?;
 
-            self.level(place, split, in_order, more, &failed).await
+            self.level(place, split, in_order, more, &States::Asset(&failed))
+                .await
         }
 
         /// The split of the strip for the first dimension of the asset, with
@@ -558,8 +829,12 @@ mod read {
                 .first()
                 .context("the place has no dimension")?;
 
+            let backfill_keys = self.backfill.as_ref().map(|b| b.keys(&dimension.name));
             if !dimension.dynamic_name.is_empty() {
-                let all = self.dynamic_keys(&dimension.dynamic_name).await?;
+                let all = match &backfill_keys {
+                    Some(keys) => keys.sorted.as_slice(),
+                    None => self.dynamic_keys(&dimension.dynamic_name).await?,
+                };
                 let places = keys::between(all, &place.first_key, &place.last_key);
                 let split = match most {
                     0 => keys::children(all, places),
@@ -580,12 +855,25 @@ mod read {
                 max_groups: most,
             };
             let reply = self.source()?.groups(request).await?;
-            Ok(reply.ascending.then(|| Split::of_reply(reply)))
+            if !reply.ascending {
+                return Ok(None);
+            }
+
+            // A group of a backfill holds the keys of the backfill only.
+            let mut split = Split::of_reply(reply);
+            if let Some(keys) = backfill_keys {
+                split.groups.retain_mut(|group| {
+                    group.keys = keys::between(&keys.sorted, &group.first, &group.last).len();
+                    group.keys > 0
+                });
+            }
+            Ok(Some(split))
         }
 
         /// `limit` keys of the first dimension of `place` from `offset`, in
         /// the order of the definition, and the number of all of them. With
-        /// `query`: the keys that hold that text.
+        /// `query`: the keys that hold that text. The keys of a backfill are
+        /// in the order they were asked for.
         async fn keys_page(
             &self,
             place: &OutlinePlace,
@@ -598,8 +886,14 @@ mod read {
                 .first()
                 .context("the place has no dimension")?;
 
-            if !dimension.dynamic_name.is_empty() {
-                let all = self.dynamic_keys(&dimension.dynamic_name).await?;
+            let backfill_keys = self.backfill.as_ref().map(|b| b.keys(&dimension.name));
+            let all = match (&backfill_keys, dimension.dynamic_name.is_empty()) {
+                (Some(keys), true) => Some(keys.in_order.as_slice()),
+                (Some(keys), false) => Some(keys.sorted.as_slice()),
+                (None, false) => Some(self.dynamic_keys(&dimension.dynamic_name).await?),
+                (None, true) => None,
+            };
+            if let Some(all) = all {
                 let matches = || all.iter().filter(|key| key.contains(query));
                 let page = matches()
                     .skip(usize::try_from(offset).unwrap_or(usize::MAX))
@@ -625,8 +919,34 @@ mod read {
             &self,
             place: &OutlinePlace,
             split: &Split,
-            failed: &FailedPartitions,
+            states: &States<'_>,
         ) -> Result<Vec<PartitionCounts>> {
+            let failed = match states {
+                States::Asset(failed) => failed,
+                States::Backfill(backfill) => {
+                    let dimension = place
+                        .dimensions
+                        .first()
+                        .map(|dimension| dimension.name.clone())
+                        .unwrap_or_default();
+                    let ranges: Vec<KeyRange> = split
+                        .groups
+                        .iter()
+                        .map(|group| KeyRange {
+                            fixed: place.fixed.clone(),
+                            dimension: dimension.clone(),
+                            first: group.first.clone(),
+                            last: group.last.clone(),
+                        })
+                        .collect();
+                    return Ok(backfill
+                        .counts_in(&ranges)
+                        .into_iter()
+                        .map(counts_of)
+                        .collect());
+                }
+            };
+
             let per_key = partitions_per_key(place);
             let bounds: Vec<PartitionBounds> = split
                 .groups
@@ -651,18 +971,31 @@ mod read {
 
         /// The partitions of `split`, the keys of the last dimension. With
         /// `in_order`, the keys follow each other: one read gives their rows.
+        /// `None` for a partition that a backfill does not hold.
         async fn partitions(
             &self,
             place: &OutlinePlace,
             split: &Split,
             in_order: bool,
-            failed: &FailedPartitions,
-        ) -> Result<Vec<PartitionRow>> {
+            states: &States<'_>,
+        ) -> Result<Vec<Option<PartitionRow>>> {
             let partitions: Vec<PartitionKey> = split
                 .groups
                 .iter()
                 .map(|group| partition_of(place, &group.first))
                 .collect();
+
+            let failed = match states {
+                States::Asset(failed) => failed,
+                States::Backfill(backfill) => {
+                    return Ok(split
+                        .groups
+                        .iter()
+                        .zip(backfill.outcomes_of(&partitions))
+                        .map(|(group, outcome)| Some(backfill_row(group.first.clone(), outcome?)))
+                        .collect());
+                }
+            };
 
             let stored = match (in_order, split.groups.as_slice()) {
                 (true, [first, .., last]) => {
@@ -677,32 +1010,41 @@ mod read {
                 .groups
                 .iter()
                 .zip(stored)
-                .map(|(group, stored)| row_of(group.first.clone(), stored))
+                .map(|(group, stored)| Some(row_of(group.first.clone(), stored)))
                 .collect())
         }
 
         /// The rows of `split`, a split of the keys of `place`. With
-        /// `in_order`, the groups follow each other in ascending order.
+        /// `in_order`, the groups follow each other in ascending order. A
+        /// backfill shows no row without a partition of its own.
         async fn level(
             &self,
             place: &OutlinePlace,
             split: Split,
             in_order: bool,
             more: u64,
-            failed: &FailedPartitions,
+            states: &States<'_>,
         ) -> Result<OutlineLevel> {
             let heading = heading_of(place, &split);
             let newest_first = in_order && split.time;
 
             let rows = if split.of_keys && place.dimensions.len() == 1 {
-                let mut rows = self.partitions(place, &split, in_order, failed).await?;
+                let mut rows: Vec<PartitionRow> = self
+                    .partitions(place, &split, in_order, states)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect();
                 if newest_first {
                     rows.reverse();
                 }
                 OutlineRows::Partitions(rows)
             } else {
-                let counts = self.counts(place, &split, failed).await?;
+                let counts = self.counts(place, &split, states).await?;
                 let mut rows = group_rows(place, &split, counts);
+                if matches!(states, States::Backfill(_)) {
+                    rows.retain(|row| row.counts.total > 0);
+                }
                 if newest_first {
                     rows.reverse();
                 }
@@ -723,20 +1065,18 @@ mod read {
             place: &OutlinePlace,
             split: &Split,
             in_order: bool,
-            failed: &FailedPartitions,
+            states: &States<'_>,
         ) -> Result<PartitionStrip> {
             let counts = if split.of_keys && place.dimensions.len() == 1 {
-                self.partitions(place, split, in_order, failed)
+                self.partitions(place, split, in_order, states)
                     .await?
                     .into_iter()
-                    .map(|row| PartitionCounts {
-                        total: 1,
-                        materialized: (row.state == PartitionRowState::Materialized) as u64,
-                        failed: (row.state == PartitionRowState::Failed) as u64,
+                    .map(|row| {
+                        row.map_or_else(PartitionCounts::default, |row| counts_of_state(row.state))
                     })
                     .collect()
             } else {
-                self.counts(place, split, failed).await?
+                self.counts(place, split, states).await?
             };
 
             let bars: Vec<StripBar> = split
@@ -817,8 +1157,11 @@ mod read {
     #[cfg(test)]
     mod tests {
         use rivers_api::rivers::PartitionKeyGroup;
+        use rivers_core::execution::backfill::plan_runs;
         use rivers_core::storage::{
-            AssetRecord, CodeLocationContext, DEFAULT_CODE_LOCATION_ID, EventRecord, EventType,
+            AssetRecord, BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy,
+            CodeLocationContext, DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, LaunchedBy,
+            RunRecord, RunStatus,
         };
 
         use super::*;
@@ -1133,6 +1476,7 @@ mod read {
                 source,
                 asset_key: "asset",
                 dynamic: OnceCell::new(),
+                backfill: None,
             }
         }
 
@@ -1154,7 +1498,7 @@ mod read {
             }
         }
 
-        /// The label of each bar with its partitions: all, materialized, failed.
+        /// The label of each bar with its partitions: all, done, failed.
         fn bars_of(overview: &PartitionOverview) -> Vec<(&str, u64, u64, u64)> {
             overview
                 .strip
@@ -1163,10 +1507,11 @@ mod read {
                 .map(|bar| {
                     let PartitionCounts {
                         total,
-                        materialized,
+                        done,
                         failed,
+                        ..
                     } = bar.counts;
-                    (bar.label.as_str(), total, materialized, failed)
+                    (bar.label.as_str(), total, done, failed)
                 })
                 .collect()
         }
@@ -1578,6 +1923,289 @@ mod read {
                 strip_note(&days(), &split(false, "", ""), &bars(&[5, 4])),
                 "one bar per group of keys"
             );
+        }
+
+        /// Store backfill `bf` of `asset` for `requested` and start it.
+        /// Returns the key of each run of its plan.
+        async fn started_backfill(
+            storage: &SurrealStorage,
+            strategy: BackfillStrategy,
+            requested: &[PartitionKey],
+        ) -> Vec<PartitionKey> {
+            let record = BackfillRecord {
+                backfill_id: "bf".to_string(),
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                status: BackfillStatus::Requested,
+                strategy: strategy.clone(),
+                failure_policy: BackfillFailurePolicy::Continue,
+                asset_selection: vec!["asset".to_string()],
+                job_name: None,
+                num_partitions: 0,
+                planned_runs: 0,
+                run_ids: vec![],
+                completed_partitions: 0,
+                failed_partitions: 0,
+                canceled_partitions: 0,
+                max_concurrency: 1,
+                tags: vec![],
+                create_time: 1,
+                end_time: None,
+                error: None,
+                launched_by: LaunchedBy::default(),
+                action: None,
+                config: None,
+            };
+            storage.create_backfill(&record, requested).await.unwrap();
+
+            let plan = plan_runs(&strategy, requested);
+            assert!(storage.start_backfill("bf", plan.len()).await.unwrap());
+            plan
+        }
+
+        /// Run `run-<n>` of the plan ends with `status`, with a step failure
+        /// for each of `failed`.
+        async fn ended_run(
+            storage: &SurrealStorage,
+            plan: &[PartitionKey],
+            run_number: usize,
+            status: RunStatus,
+            failed: &[PartitionKey],
+        ) {
+            let run_id = format!("run-{run_number}");
+            let run_key = &plan[run_number];
+            assert!(
+                storage
+                    .link_backfill_run("bf", &run_id, run_number, run_key.member_count())
+                    .await
+                    .unwrap()
+            );
+            storage
+                .create_run(&RunRecord {
+                    run_id: run_id.clone(),
+                    code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                    job_name: None,
+                    status: RunStatus::Started,
+                    start_time: 1,
+                    end_time: None,
+                    execution_start_time: None,
+                    tags: vec![],
+                    node_names: vec!["asset".to_string()],
+                    priority: 0,
+                    partition_key: Some(run_key.clone()),
+                    block_reason: None,
+                    launched_by: LaunchedBy::Backfill {
+                        backfill_id: "bf".to_string(),
+                    },
+                    action: None,
+                    config: None,
+                })
+                .await
+                .unwrap();
+            for partition in failed {
+                let mut failure = failure(partition.clone(), 2);
+                failure.run_id = run_id.clone();
+                storage.store_event(&failure).await.unwrap();
+            }
+            storage
+                .update_run_status(&run_id, status, Some(3))
+                .await
+                .unwrap();
+        }
+
+        async fn backfill_outline<'a>(
+            storage: &'a ScopedStorage<'a, SurrealStorage>,
+            base: &SurrealStorage,
+            source: Option<Definition>,
+        ) -> Outline<'a, SurrealStorage, Definition> {
+            let record = base.get_backfill("bf").await.unwrap().unwrap();
+            let states = BackfillStates::read(base, &record).await.unwrap();
+            Outline {
+                backfill: Some(Backfill::new(states)),
+                ..outline(storage, source)
+            }
+        }
+
+        /// The key, the state and the run of each partition of `level`.
+        fn runs(level: &OutlineLevel) -> Vec<(&str, PartitionRowState, Option<&str>)> {
+            match &level.rows {
+                OutlineRows::Partitions(rows) => rows
+                    .iter()
+                    .map(|row| (row.key.as_str(), row.state, row.run_id.as_deref()))
+                    .collect(),
+                OutlineRows::Groups(_) => panic!("the level lists groups: {level:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_backfill_opens_from_months_down_to_the_partitions_it_holds() {
+            let storage = store_with(&[]).await;
+            let hours: Vec<String> = hours_of_two_months()
+                .keys
+                .into_iter()
+                .filter(|hour| hour.as_str() >= "2024-01-20")
+                .collect();
+            let requested = [PartitionKey::Multi {
+                dims: vec![
+                    ("hour".to_string(), hours),
+                    ("zone".to_string(), vec!["a".to_string(), "b".to_string()]),
+                ],
+            }];
+            let strategy = BackfillStrategy::PerDimension {
+                multi_run: vec!["zone".to_string()],
+                single_run: vec!["hour".to_string()],
+            };
+            let plan = started_backfill(&storage, strategy, &requested).await;
+            // Zone a succeeds with one hour failed alone; zone b fails.
+            let hour = "2024-02-10T05:00";
+            ended_run(&storage, &plan, 0, RunStatus::Success, &[cell(hour, "a")]).await;
+            ended_run(&storage, &plan, 1, RunStatus::Failure, &[]).await;
+
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let definition =
+                Definition(vec![named("zone", &["a", "b", "c"]), hours_of_two_months()]);
+            let outline = backfill_outline(&scoped, &storage, Some(definition)).await;
+
+            let overview = outline.overview().await.unwrap();
+
+            assert_eq!(
+                overview.counts,
+                PartitionCounts::of_backfill(1968, 983, 985, 0)
+            );
+            assert_eq!(
+                overview.shape,
+                PartitionShape::Dimensions(vec![
+                    ("hour".to_string(), 984),
+                    ("zone".to_string(), 2)
+                ])
+            );
+            assert_eq!(
+                (
+                    overview.root.first_key.as_str(),
+                    overview.root.last_key.as_str()
+                ),
+                ("2024-01-20T00:00", "2024-02-29T23:00"),
+                "the outline starts and ends with the keys of the backfill"
+            );
+
+            // One bar per day of the backfill.
+            let bars = bars_of(&overview);
+            assert_eq!(bars.len(), 41);
+            assert_eq!(bars[0], ("2024-01-20", 48, 24, 24));
+            assert_eq!(bars[21], ("2024-02-10", 48, 23, 25));
+
+            let months = groups(&overview.top);
+            assert_eq!(
+                months
+                    .iter()
+                    .map(|row| (row.label.as_str(), row.holds.as_str(), row.counts))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        "2024-02",
+                        "696 hours",
+                        PartitionCounts::of_backfill(1392, 695, 697, 0)
+                    ),
+                    (
+                        "2024-01",
+                        "288 hours",
+                        PartitionCounts::of_backfill(576, 288, 288, 0)
+                    ),
+                ]
+            );
+
+            let days = outline.rows(&months[0].place, "", 0).await.unwrap();
+            let days = groups(&days);
+            assert_eq!(days.len(), 29);
+            assert_eq!(days[19].label, "2024-02-10");
+            assert_eq!(days[19].counts, PartitionCounts::of_backfill(48, 23, 25, 0));
+
+            let hours = outline.rows(&days[19].place, "", 0).await.unwrap();
+            let hours = groups(&hours);
+            assert_eq!(hours.len(), 24);
+            assert_eq!(hours[18].label, hour);
+            assert_eq!(hours[18].holds, "2 × zone");
+            assert_eq!(hours[18].counts, PartitionCounts::of_backfill(2, 0, 2, 0));
+
+            // Zone c is not in the backfill.
+            let zones = outline.rows(&hours[18].place, "", 0).await.unwrap();
+            assert_eq!(
+                runs(&zones),
+                vec![
+                    ("a", PartitionRowState::Failed, Some("run-0")),
+                    ("b", PartitionRowState::Failed, Some("run-1")),
+                ]
+            );
+
+            let found = outline.rows(&overview.root, "02-10T0", 0).await.unwrap();
+            let found = groups(&found);
+            assert_eq!(found.len(), 10);
+            assert_eq!(found[5].label, hour);
+            assert_eq!(found[5].counts, PartitionCounts::of_backfill(2, 0, 2, 0));
+            assert_eq!(found[4].counts, PartitionCounts::of_backfill(2, 1, 1, 0));
+        }
+
+        #[tokio::test]
+        async fn a_backfill_of_keys_in_free_order_lists_them_in_the_order_asked() {
+            let storage = store_with(&[]).await;
+            let requested = [single("large"), single("small")];
+            let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+            ended_run(&storage, &plan, 0, RunStatus::Success, &[]).await;
+            ended_run(&storage, &plan, 1, RunStatus::Failure, &[]).await;
+
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let definition = Definition(vec![named("", &["small", "medium", "large", "xl"])]);
+            let outline = backfill_outline(&scoped, &storage, Some(definition)).await;
+
+            let overview = outline.overview().await.unwrap();
+
+            assert_eq!(overview.counts, PartitionCounts::of_backfill(2, 1, 1, 0));
+            assert_eq!(overview.shape, PartitionShape::Keys);
+            assert_eq!(
+                runs(&overview.top),
+                vec![
+                    ("large", PartitionRowState::Done, Some("run-0")),
+                    ("small", PartitionRowState::Failed, Some("run-1")),
+                ]
+            );
+            assert_eq!(
+                bars_of(&overview),
+                vec![("large", 1, 1, 0), ("small", 1, 0, 1)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_backfill_whose_code_location_does_not_answer_lists_its_partitions() {
+            let storage = store_with(&[]).await;
+            let requested = [PartitionKey::Single {
+                keys: vec!["b".to_string(), "a".to_string(), "c".to_string()],
+            }];
+            let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+            ended_run(&storage, &plan, 0, RunStatus::Success, &[]).await;
+            ended_run(&storage, &plan, 2, RunStatus::Canceled, &[]).await;
+
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let outline = backfill_outline(&scoped, &storage, None).await;
+
+            let overview = outline.overview().await.unwrap();
+
+            assert!(!overview.from_definition);
+            assert_eq!(overview.counts, PartitionCounts::of_backfill(3, 1, 0, 1));
+            assert_eq!(overview.top.heading, "partition");
+            assert_eq!(
+                runs(&overview.top),
+                vec![
+                    ("b", PartitionRowState::Done, Some("run-0")),
+                    ("a", PartitionRowState::Pending, None),
+                    ("c", PartitionRowState::Canceled, Some("run-2")),
+                ]
+            );
+
+            let rest = outline.rows(&overview.root, "", 1).await.unwrap();
+            assert_eq!(runs(&rest).len(), 2);
+            assert_eq!(rest.more, 0);
         }
 
         #[test]

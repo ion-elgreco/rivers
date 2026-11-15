@@ -4,8 +4,7 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::Json;
 
 use crate::types::{
-    BackfillFilter, BackfillInfo, BackfillPartitionsPage, BackfillsPage, BackfillsSummary, Page,
-    RunRecord,
+    BackfillFilter, BackfillInfo, BackfillsPage, BackfillsSummary, Page, RunRecord,
 };
 
 #[server]
@@ -18,49 +17,6 @@ pub async fn get_backfill(backfill_id: String) -> Result<Option<BackfillInfo>, S
         .await
         .map(|opt| opt.map(Into::into))
         .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
-/// One page of the partitions of a backfill, each with what happened to it,
-/// for the heatmap.
-#[server]
-pub async fn get_backfill_partitions(
-    backfill_id: String,
-    offset: u64,
-    limit: u64,
-) -> Result<BackfillPartitionsPage, ServerFnError> {
-    use rivers_core::execution::backfill_partitions::{
-        BackfillPartitionState, backfill_partitions_page,
-    };
-    use rivers_core::storage::StorageBackend;
-    let state = expect_context::<crate::state::AppState>();
-    let record = state
-        .storage
-        .get_backfill(&backfill_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .ok_or_else(|| ServerFnError::new("backfill not found"))?;
-
-    let rows = backfill_partitions_page(&*state.storage, &record, offset, limit)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .into_iter()
-        .map(|(partition, state)| {
-            let status = match state {
-                BackfillPartitionState::Completed => "done",
-                BackfillPartitionState::Failed => "failed",
-                BackfillPartitionState::Canceled => "canceled",
-                BackfillPartitionState::Pending => "pending",
-            };
-            crate::types::BackfillPartitionCell {
-                key: crate::types::partition_key_to_display(partition),
-                status: status.to_string(),
-            }
-        })
-        .collect();
-    Ok(BackfillPartitionsPage {
-        rows,
-        total: record.num_partitions,
-    })
 }
 
 /// One page of the runs of a backfill, the run linked last first.

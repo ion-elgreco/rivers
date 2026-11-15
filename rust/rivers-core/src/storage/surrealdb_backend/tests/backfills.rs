@@ -936,7 +936,9 @@ async fn test_ended_backfill_runs_are_read_by_run_number() {
 
 #[tokio::test]
 async fn test_partition_page_of_an_older_backfill_reads_its_rows_per_partition() {
-    use crate::execution::backfill_partitions::{BackfillPartitionState, backfill_partitions_page};
+    use crate::execution::backfill_partitions::{
+        BackfillCounts, BackfillPartitionState, BackfillStates, KeyRange,
+    };
 
     let storage = make_storage().await;
     let requested = [key("a"), key("b"), key("c"), key("d")];
@@ -987,19 +989,40 @@ async fn test_partition_page_of_an_older_backfill_reads_its_rows_per_partition()
     );
 
     let old = storage.get_backfill("old").await.unwrap().unwrap();
-    let page: Vec<(String, BackfillPartitionState)> =
-        backfill_partitions_page(&storage, &old, 1, 3)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(partition, state)| (partition.to_display(), state))
-            .collect();
+    let states = BackfillStates::read(&storage, &old).await.unwrap();
+    let page: Vec<(String, BackfillPartitionState)> = states
+        .page(1, 3)
+        .into_iter()
+        .map(|(partition, outcome)| (partition.to_display(), outcome.state))
+        .collect();
     assert_eq!(
         page,
         vec![
             ("b".to_string(), BackfillPartitionState::Failed),
             ("c".to_string(), BackfillPartitionState::Canceled),
             ("d".to_string(), BackfillPartitionState::Pending),
+        ]
+    );
+
+    let up_to_b = KeyRange {
+        last: "b".to_string(),
+        ..KeyRange::default()
+    };
+    assert_eq!(
+        states.counts_in(&[KeyRange::default(), up_to_b]),
+        vec![
+            BackfillCounts {
+                total: 4,
+                completed: 1,
+                failed: 1,
+                canceled: 1,
+            },
+            BackfillCounts {
+                total: 2,
+                completed: 1,
+                failed: 1,
+                canceled: 0,
+            },
         ]
     );
 }

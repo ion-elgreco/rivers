@@ -8,16 +8,16 @@ use crate::components::live::{LiveStatusChip, use_live_kick};
 use crate::components::loading_skeleton::GridRowSkeleton;
 use crate::components::pagination::PaginatedView;
 use crate::components::ui_kit::{
-    AssetSummaryRow, Crumb, EmptyState, HeatCell, PartitionHeatmap, ProgressBar, RunsGrid,
-    SectionHeader, StatusChip, Topbar, meta_tile_fill,
+    AssetSummaryRow, Crumb, EmptyState, OutlineOf, OutlineSource, PartitionOutline, ProgressBar,
+    RunsGrid, SectionHeader, StatusChip, Topbar, meta_tile_fill,
 };
 use crate::helpers::{code_location_label, format_duration, format_timestamp, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::server_fns::assets::get_assets;
-use crate::server_fns::backfills::{
-    cancel_backfill, get_backfill, get_backfill_partitions, get_backfill_runs,
-};
+use crate::server_fns::backfills::{cancel_backfill, get_backfill, get_backfill_runs};
 use crate::server_fns::locations::list_code_locations;
+use crate::server_fns::partitions::get_backfill_partition_overview;
+use crate::types::PartitionOverview;
 
 fn is_cancelable(status: &str) -> bool {
     matches!(status, "InProgress" | "Requested")
@@ -40,23 +40,6 @@ pub fn BackfillDetailPage() -> impl IntoView {
         |(id, _)| get_backfill(id),
     );
 
-    // Windowed real keys + per-partition status for the heatmap, paged so a
-    // large backfill ships a bounded slice.
-    let (part_page, set_part_page) = signal(0u64);
-    let (part_page_size, set_part_page_size) = signal(1000u64);
-    let partitions = Resource::new(
-        move || {
-            params.track();
-            (
-                backfill_id(),
-                part_page.get(),
-                part_page_size.get(),
-                refresh_tick.get(),
-            )
-        },
-        |(id, p, ps, _)| async move { get_backfill_partitions(id, p * ps, ps).await },
-    );
-
     let all_assets = Resource::new(
         move || loc.get(),
         |(ns, name)| get_assets(ns, name, None, None, None),
@@ -77,6 +60,32 @@ pub fn BackfillDetailPage() -> impl IntoView {
             )
         },
         |(id, p, ps, _)| async move { get_backfill_runs(id, p * ps, ps).await },
+    );
+
+    // Made here, not in the view that waits for the record: the server and
+    // the browser must make the resources in the same order. Once the reader
+    // opens, filters or searches the outline, newer numbers wait: a new
+    // outline would close the rows.
+    let explored = RwSignal::new(false);
+    let held_tick = StoredValue::new(0u32);
+    let partitions = Resource::new(
+        move || {
+            params.track();
+            let tick = if explored.get() {
+                held_tick.get_value()
+            } else {
+                let tick = refresh_tick.get();
+                held_tick.set_value(tick);
+                tick
+            };
+            (backfill_id(), tick)
+        },
+        |(id, _)| get_backfill_partition_overview(id),
+    );
+    Effect::watch(
+        move || params.track(),
+        move |_, _, _| explored.set(false),
+        false,
     );
 
     let cancel = Action::new(move |id: &String| {
@@ -299,56 +308,37 @@ pub fn BackfillDetailPage() -> impl IntoView {
                                 height_px=8
                             />
 
-                            {
-                                let done = completed;
-                                let failed = record.failed_partitions;
-                                let canceled = record.canceled_partitions;
-                                let pending_count = total.saturating_sub(done + failed + canceled);
-                                let description = format!(
-                                    "{} · one cell per partition",
-                                    crate::helpers::plural(total, "partition", "partitions"),
-                                );
-                                view! {
-                                    <div class="partition-panel">
-                                        <div class="partition-panel-header">
-                                            <div>
-                                                <div class="section-header-label">"PARTITIONS"</div>
-                                                <div class="partition-panel-desc">{description}</div>
-                                            </div>
-                                            <div class="partition-panel-legend">
-                                                <span><span class="partition-legend-swatch partition-legend-swatch--done"></span>{format!("done · {}", done)}</span>
-                                                {(failed > 0).then(|| view! {
-                                                    <span><span class="partition-legend-swatch partition-legend-swatch--failed"></span>{format!("failed · {}", failed)}</span>
-                                                })}
-                                                {(canceled > 0).then(|| view! {
-                                                    <span><span class="partition-legend-swatch partition-legend-swatch--canceled"></span>{format!("canceled · {}", canceled)}</span>
-                                                })}
-                                                <span><span class="partition-legend-swatch partition-legend-swatch--pending"></span>{format!("pending · {}", pending_count)}</span>
-                                            </div>
-                                        </div>
-                                        <PaginatedView
-                                            data=partitions
-                                            page=part_page
-                                            set_page=set_part_page
-                                            page_size=part_page_size
-                                            set_page_size=set_part_page_size
-                                            fallback=move || view! { <div class="loading">"Loading partitions…"</div> }
-                                            render={move |rows: Vec<crate::types::BackfillPartitionCell>| {
-                                                let cells: Vec<HeatCell> = rows.iter().map(|r| match r.status.as_str() {
-                                                    "done" => HeatCell::Done,
-                                                    "failed" => HeatCell::Failed,
-                                                    "running" => HeatCell::Running,
-                                                    "canceled" => HeatCell::Canceled,
-                                                    _ => HeatCell::Pending,
-                                                }).collect();
-                                                let labels: Vec<String> = rows.into_iter().map(|r| r.key).collect();
-                                                view! { <PartitionHeatmap cells=cells labels=labels/> }.into_any()
-                                            }}
-                                        />
-                                    </div>
-                                }
-                            }
+                        }.into_any()
+                    }
+                    Ok(None) => view! { <div class="error-msg">"Backfill not found"</div> }.into_any(),
+                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load backfill: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                })
+            }}
+        </Transition>
 
+        // Outside the view of the record, which is drawn again on each live
+        // update: the open rows of the outline stay open.
+        <Transition>
+            <Show when=move || matches!(backfill.get(), Some(Ok(Some(_))))>
+                <SectionHeader label="PARTITIONS"/>
+                {move || {
+                    params.track();
+                    view! {
+                        <BackfillPartitions
+                            backfill_id=backfill_id()
+                            overview=partitions
+                            explored=explored
+                        />
+                    }
+                }}
+            </Show>
+        </Transition>
+
+        <Transition>
+            {move || {
+                backfill.get().map(|result| match result {
+                    Ok(Some(record)) => {
+                        view! {
                             <SectionHeader label="ASSETS" count=record.asset_selection.len().to_string()/>
                             <div class="asset-summary-list">
                                 {
@@ -391,8 +381,48 @@ pub fn BackfillDetailPage() -> impl IntoView {
                             />
                         }.into_any()
                     }
-                    Ok(None) => view! { <div class="error-msg">"Backfill not found"</div> }.into_any(),
-                    Err(e) => view! { <div class="error-msg">{format!("Couldn't load backfill: {}", crate::helpers::err_text(&e))}</div> }.into_any(),
+                    Ok(None) | Err(_) => ().into_any(),
+                })
+            }}
+        </Transition>
+    }
+}
+
+/// The partitions of a backfill: tiles, a strip and an outline of the keys,
+/// as on the Partitions tab of an asset.
+#[component]
+fn BackfillPartitions(
+    backfill_id: String,
+    overview: Resource<Result<PartitionOverview, ServerFnError>>,
+    explored: RwSignal<bool>,
+) -> impl IntoView {
+    let loc = use_current_location();
+
+    view! {
+        <Transition fallback=move || view! { <div class="loading">"Loading partitions…"</div> }>
+            {move || {
+                overview.get().map(|result| match result {
+                    Ok(overview) if overview.counts.total == 0 => {
+                        view! { <EmptyState message="No partitions" compact=true/> }.into_any()
+                    }
+                    Ok(overview) => {
+                        let (loc_ns, loc_name) = loc.get_untracked();
+                        let source = OutlineSource {
+                            loc_ns,
+                            loc_name,
+                            of: OutlineOf::Backfill(backfill_id.clone()),
+                        };
+                        view! {
+                            <PartitionOutline source=source overview=overview explored=explored/>
+                        }
+                        .into_any()
+                    }
+                    Err(e) => view! {
+                        <div class="error-msg">
+                            {format!("Couldn't load partitions: {}", crate::helpers::err_text(&e))}
+                        </div>
+                    }
+                    .into_any(),
                 })
             }}
         </Transition>

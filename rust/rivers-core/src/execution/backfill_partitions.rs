@@ -1,13 +1,22 @@
-//! The partitions of a backfill with what happened to each, one page at a time.
+//! The partitions of a backfill with what happened to each: counted by the
+//! rows of an outline, or one by one.
+//!
+//! The requested keys and the outcome of each run that ended are read once.
+//! A count works on the requested keys, which hold whole dimensions, and
+//! does not write out each partition.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use futures_util::{StreamExt, TryStreamExt};
 
 use crate::execution::backfill::RunNumbers;
 use crate::storage::{
     BackfillRecord, BackfillRunOutcome, EndedBackfillRun, PartitionKey, StorageBackend,
 };
+
+/// The reads of the failed partitions of runs that are in flight at once.
+const READS_AT_ONCE: usize = 8;
 
 /// What happened to one partition of a backfill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,31 +37,567 @@ impl From<BackfillRunOutcome> for BackfillPartitionState {
     }
 }
 
-/// The partitions of `backfill` from `offset`, at most `limit`, in the order
-/// of its requested keys, each with what happened to it.
-pub async fn backfill_partitions_page<S: StorageBackend>(
-    storage: &S,
-    backfill: &BackfillRecord,
-    offset: u64,
-    limit: u64,
-) -> Result<Vec<(PartitionKey, BackfillPartitionState)>> {
-    let requested = storage.get_backfill_keys(&backfill.backfill_id).await?;
-    let partitions = partitions_at(&requested, offset, limit);
-    if partitions.is_empty() {
-        return Ok(Vec::new());
+/// What happened to one partition, and the run that held it when that run
+/// ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionOutcome {
+    pub state: BackfillPartitionState,
+    pub run_id: Option<String>,
+}
+
+impl PartitionOutcome {
+    fn pending() -> Self {
+        Self {
+            state: BackfillPartitionState::Pending,
+            run_id: None,
+        }
+    }
+}
+
+/// The partitions of a backfill, or of one part of it, by what happened to
+/// them. The partitions in no other state are pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackfillCounts {
+    pub total: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub canceled: u64,
+}
+
+impl BackfillCounts {
+    pub fn pending(&self) -> u64 {
+        self.total
+            .saturating_sub(self.completed + self.failed + self.canceled)
     }
 
-    // A backfill that ended before outcomes were kept per run has no plan.
-    let states = if backfill.planned_runs > 0 {
-        states_from_runs(storage, backfill, &requested, &partitions).await?
-    } else {
-        states_from_partition_rows(storage, backfill, &partitions).await?
+    fn add(&mut self, state: BackfillPartitionState, partitions: u64) {
+        match state {
+            BackfillPartitionState::Completed => self.completed += partitions,
+            BackfillPartitionState::Failed => self.failed += partitions,
+            BackfillPartitionState::Canceled => self.canceled += partitions,
+            BackfillPartitionState::Pending => {}
+        }
+    }
+}
+
+/// The partitions of one row of an outline: the value of each dimension
+/// above the row, and the keys of `dimension` from `first` to `last`, by
+/// the order of their text. `first` and `last` both empty: every key.
+/// `dimension` is empty for keys of one dimension. The default is every
+/// partition.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyRange {
+    pub fixed: Vec<(String, String)>,
+    pub dimension: String,
+    pub first: String,
+    pub last: String,
+}
+
+impl KeyRange {
+    fn bounded(&self) -> bool {
+        !(self.first.is_empty() && self.last.is_empty())
+    }
+
+    fn holds_key(&self, key: &str) -> bool {
+        key >= self.first.as_str() && (self.last.is_empty() || key <= self.last.as_str())
+    }
+
+    fn fixed_value(&self, name: &str) -> Option<&str> {
+        self.fixed
+            .iter()
+            .find(|(fixed, _)| fixed == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Whether the range holds the partition with `values`, one value per
+    /// dimension.
+    fn holds(&self, values: &[(&str, &str)]) -> bool {
+        let has = |name: &str| values.iter().any(|(of, _)| *of == name);
+        if self.fixed.iter().any(|(name, _)| !has(name))
+            || (self.bounded() && !has(&self.dimension))
+        {
+            return false;
+        }
+
+        values
+            .iter()
+            .all(|(name, value)| match self.fixed_value(name) {
+                Some(fixed) => fixed == *value,
+                None if self.bounded() && *name == self.dimension => self.holds_key(value),
+                None => true,
+            })
+    }
+}
+
+/// One requested key: the values of each of its dimensions. Its partitions
+/// are every combination of them, in the order of `PartitionKey::member_at`.
+struct Block {
+    /// Each dimension by name, the empty name for keys of one dimension,
+    /// with its values in the requested order.
+    dims: Vec<(String, Vec<String>)>,
+    /// The values of each dimension, sorted.
+    sorted: Vec<Vec<String>>,
+    /// The place of the first partition of the block among the requested
+    /// partitions.
+    first: usize,
+    count: usize,
+}
+
+impl Block {
+    fn new(dims: Vec<(String, Vec<String>)>, first: usize) -> Self {
+        let sorted = dims
+            .iter()
+            .map(|(_, values)| {
+                let mut sorted = values.clone();
+                sorted.sort();
+                sorted
+            })
+            .collect();
+        let count = dims.iter().fold(1usize, |count, (_, values)| {
+            count.saturating_mul(values.len())
+        });
+        Self {
+            dims,
+            sorted,
+            first,
+            count,
+        }
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.dims.iter().any(|(of, _)| of == name)
+    }
+
+    /// The partitions of the block in `range` whose values on the
+    /// dimensions of `pinned` are those values.
+    fn count_in(&self, range: &KeyRange, pinned: &[(String, String)]) -> u64 {
+        if range.fixed.iter().any(|(name, _)| !self.has(name))
+            || (range.bounded() && !self.has(&range.dimension))
+            || pinned.iter().any(|(name, _)| !self.has(name))
+        {
+            return 0;
+        }
+
+        let mut count = 1u64;
+        for ((name, _), sorted) in self.dims.iter().zip(&self.sorted) {
+            let pin = pinned
+                .iter()
+                .find(|(of, _)| of == name)
+                .map(|(_, value)| value.as_str());
+            let in_dimension = range.bounded() && *name == range.dimension;
+            let values = match (pin, range.fixed_value(name)) {
+                (Some(pin), Some(fixed)) if pin != fixed => 0,
+                (Some(value), _) | (None, Some(value)) => {
+                    if in_dimension && !range.holds_key(value) {
+                        0
+                    } else {
+                        equal_range(sorted, value).len()
+                    }
+                }
+                (None, None) if in_dimension => key_range(sorted, &range.first, &range.last).len(),
+                (None, None) => sorted.len(),
+            };
+            count = count.saturating_mul(values as u64);
+            if count == 0 {
+                break;
+            }
+        }
+        count
+    }
+
+    /// The values of the partition at `offset` in the block.
+    fn member_at(&self, offset: usize) -> Vec<(&str, &str)> {
+        let mut rest = offset;
+        let mut member: Vec<(&str, &str)> = Vec::with_capacity(self.dims.len());
+        for (name, values) in self.dims.iter().rev() {
+            member.push((name.as_str(), values[rest % values.len()].as_str()));
+            rest /= values.len();
+        }
+        member.reverse();
+        member
+    }
+
+    /// Whether the block holds the partition with `values`.
+    fn holds(&self, values: &[(&str, &str)]) -> bool {
+        values.len() == self.dims.len()
+            && self.dims.iter().zip(&self.sorted).zip(values).all(
+                |(((name, _), sorted), (of, value))| {
+                    name == of && !equal_range(sorted, value).is_empty()
+                },
+            )
+    }
+
+    /// The place of the partition with `values` in the block.
+    fn offset_of(&self, values: &[(&str, &str)]) -> Option<usize> {
+        if values.len() != self.dims.len() {
+            return None;
+        }
+        let mut offset = 0usize;
+        for ((name, block_values), (of, value)) in self.dims.iter().zip(values) {
+            if name != of {
+                return None;
+            }
+            let at = block_values.iter().position(|v| v == value)?;
+            offset = offset * block_values.len() + at;
+        }
+        Some(offset)
+    }
+}
+
+/// The places of the values equal to `value` in `sorted`.
+fn equal_range(sorted: &[String], value: &str) -> std::ops::Range<usize> {
+    let start = sorted.partition_point(|v| v.as_str() < value);
+    let end = sorted.partition_point(|v| v.as_str() <= value);
+    start..end
+}
+
+/// The places of the values from `first` to `last` in `sorted`. An empty
+/// `last` has no end.
+fn key_range(sorted: &[String], first: &str, last: &str) -> std::ops::Range<usize> {
+    let start = sorted.partition_point(|v| v.as_str() < first);
+    let end = match last {
+        "" => sorted.len(),
+        last => sorted.partition_point(|v| v.as_str() <= last),
     };
-    Ok(partitions
-        .into_iter()
-        .map(|(_, partition)| partition)
-        .zip(states)
-        .collect())
+    start..end.max(start)
+}
+
+/// The value of each dimension of a partition that holds one value per
+/// dimension, by the name of the dimension. `None` for a batched key.
+fn values_of(partition: &PartitionKey) -> Option<Vec<(&str, &str)>> {
+    match partition {
+        PartitionKey::Single { keys } if keys.len() == 1 => Some(vec![("", keys[0].as_str())]),
+        PartitionKey::Multi { dims } => {
+            let mut values: Vec<(&str, &str)> = dims
+                .iter()
+                .map(|(name, values)| match values.as_slice() {
+                    [value] => Some((name.as_str(), value.as_str())),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            values.sort_by(|a, b| a.0.cmp(b.0));
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
+/// The requested keys as blocks, in the requested order.
+fn blocks_of(requested: &[PartitionKey]) -> Vec<Block> {
+    fn push(key: &PartitionKey, blocks: &mut Vec<Block>, first: &mut usize) {
+        let dims = match key.expanded().into_owned() {
+            PartitionKey::Single { keys } => vec![(String::new(), keys)],
+            PartitionKey::Multi { mut dims } => {
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
+                dims
+            }
+            PartitionKey::Set { keys } => {
+                for key in &keys {
+                    push(key, blocks, first);
+                }
+                return;
+            }
+            PartitionKey::SingleItems { .. } | PartitionKey::MultiItems { .. } => {
+                unreachable!("an expanded key has no items")
+            }
+        };
+        let block = Block::new(dims, *first);
+        *first += block.count;
+        blocks.push(block);
+    }
+
+    let mut blocks = Vec::new();
+    let mut first = 0;
+    for key in requested {
+        push(key, &mut blocks, &mut first);
+    }
+    blocks
+}
+
+/// The state of every partition of a run that ended, before the partitions
+/// that failed alone in it.
+fn state_of_run(run: &EndedBackfillRun) -> BackfillPartitionState {
+    if run.outcome == BackfillRunOutcome::Completed && run.failed_members >= run.member_count {
+        BackfillPartitionState::Failed
+    } else {
+        run.outcome.into()
+    }
+}
+
+/// What happened to each partition of a backfill, read once for the reads of
+/// one request.
+pub struct BackfillStates {
+    requested: Vec<PartitionKey>,
+    blocks: Vec<Block>,
+    numbers: RunNumbers,
+    ended: HashMap<usize, EndedBackfillRun>,
+    /// The partitions that failed alone in each run that succeeded.
+    failed_alone: HashMap<usize, HashSet<PartitionKey>>,
+    /// A backfill that ended before outcomes were kept per run: the outcome
+    /// of each partition that has one.
+    outcomes: Option<HashMap<PartitionKey, BackfillRunOutcome>>,
+}
+
+impl BackfillStates {
+    pub async fn read<S: StorageBackend>(storage: &S, backfill: &BackfillRecord) -> Result<Self> {
+        let id = backfill.backfill_id.as_str();
+        let requested = storage.get_backfill_keys(id).await?;
+        let blocks = blocks_of(&requested);
+        let numbers = RunNumbers::new(&backfill.strategy, &requested);
+
+        if backfill.planned_runs == 0 {
+            let members: Vec<PartitionKey> =
+                requested.iter().flat_map(PartitionKey::members).collect();
+            let outcomes = storage
+                .get_backfill_partition_outcomes(id, &members)
+                .await?
+                .into_iter()
+                .collect();
+            return Ok(Self {
+                requested,
+                blocks,
+                numbers,
+                ended: HashMap::new(),
+                failed_alone: HashMap::new(),
+                outcomes: Some(outcomes),
+            });
+        }
+
+        let last = usize::try_from(backfill.planned_runs - 1).unwrap_or(usize::MAX);
+        let ended: HashMap<usize, EndedBackfillRun> = storage
+            .get_ended_backfill_runs(id, 0, last)
+            .await?
+            .into_iter()
+            .map(|run| (run.run_number, run))
+            .collect();
+
+        let partly_failed: Vec<(usize, String)> = ended
+            .values()
+            .filter(|run| {
+                run.outcome == BackfillRunOutcome::Completed
+                    && run.failed_members > 0
+                    && run.failed_members < run.member_count
+            })
+            .filter_map(|run| Some((run.run_number, run.run_id.clone()?)))
+            .collect();
+        let failed_alone: HashMap<usize, HashSet<PartitionKey>> =
+            futures_util::stream::iter(partly_failed)
+                .map(|(number, run_id)| async move {
+                    let failed = storage.get_run_failed_partitions(&run_id).await?;
+                    anyhow::Ok((number, failed.into_iter().collect()))
+                })
+                .buffer_unordered(READS_AT_ONCE)
+                .try_collect()
+                .await?;
+
+        Ok(Self {
+            requested,
+            blocks,
+            numbers,
+            ended,
+            failed_alone,
+            outcomes: None,
+        })
+    }
+
+    /// The distinct values of `dimension` among the requested keys, in the
+    /// requested order. The empty name gives the keys of one dimension.
+    pub fn keys_of(&self, dimension: &str) -> Vec<String> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut keys = Vec::new();
+        for block in &self.blocks {
+            let Some((_, values)) = block.dims.iter().find(|(name, _)| name == dimension) else {
+                continue;
+            };
+            for value in values {
+                if seen.insert(value) {
+                    keys.push(value.clone());
+                }
+            }
+        }
+        keys
+    }
+
+    /// The partitions of each of `ranges` by what happened to them.
+    pub fn counts_in(&self, ranges: &[KeyRange]) -> Vec<BackfillCounts> {
+        let mut counts: Vec<BackfillCounts> = ranges
+            .iter()
+            .map(|range| BackfillCounts {
+                total: self
+                    .blocks
+                    .iter()
+                    .map(|block| block.count_in(range, &[]))
+                    .sum(),
+                ..BackfillCounts::default()
+            })
+            .collect();
+        let add_to_each = |counts: &mut [BackfillCounts], values: &[(&str, &str)], state| {
+            for (range, counts) in ranges.iter().zip(counts.iter_mut()) {
+                if range.holds(values) {
+                    counts.add(state, 1);
+                }
+            }
+        };
+
+        if let Some(outcomes) = &self.outcomes {
+            for (partition, outcome) in outcomes {
+                if let Some(values) = values_of(partition) {
+                    add_to_each(&mut counts, &values, (*outcome).into());
+                }
+            }
+            return counts;
+        }
+
+        match &self.numbers {
+            RunNumbers::OneRun => {
+                if let Some(run) = self.ended.get(&0) {
+                    for counts in &mut counts {
+                        counts.add(state_of_run(run), counts.total);
+                    }
+                }
+            }
+            RunNumbers::RunPerPartition => {
+                for run in self.ended.values() {
+                    if let Some(values) = self.member_at(run.run_number) {
+                        add_to_each(&mut counts, &values, state_of_run(run));
+                    }
+                }
+            }
+            RunNumbers::RunPerGroup { multi_run, numbers } => {
+                let mut groups: Vec<Option<&[(String, String)]>> = vec![None; numbers.len()];
+                for (group, number) in numbers {
+                    groups[*number] = Some(group.as_slice());
+                }
+                for run in self.ended.values() {
+                    let Some(Some(group)) = groups.get(run.run_number) else {
+                        continue;
+                    };
+                    for (range, counts) in ranges.iter().zip(&mut counts) {
+                        let partitions = self
+                            .blocks
+                            .iter()
+                            .filter(|block| holds_group(block, multi_run, group))
+                            .map(|block| block.count_in(range, group))
+                            .sum();
+                        counts.add(state_of_run(run), partitions);
+                    }
+                }
+            }
+        }
+
+        for failed in self.failed_alone.values() {
+            for partition in failed {
+                let Some(values) = values_of(partition) else {
+                    continue;
+                };
+                if !self.holds(&values) {
+                    continue;
+                }
+                for (range, counts) in ranges.iter().zip(&mut counts) {
+                    if range.holds(&values) {
+                        counts.completed = counts.completed.saturating_sub(1);
+                        counts.failed += 1;
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    /// What happened to each of `partitions`. `None` for a partition that
+    /// the backfill does not hold.
+    pub fn outcomes_of(&self, partitions: &[PartitionKey]) -> Vec<Option<PartitionOutcome>> {
+        partitions
+            .iter()
+            .map(|partition| {
+                let values = values_of(partition)?;
+                // Only a run per partition takes its number from the place.
+                let place = match self.numbers {
+                    RunNumbers::RunPerPartition => self.place_of(&values)?,
+                    _ => self.holds(&values).then_some(0)?,
+                };
+                Some(self.outcome_at(place, partition))
+            })
+            .collect()
+    }
+
+    /// The partitions from `offset`, at most `limit`, in the order of the
+    /// requested keys, each with what happened to it.
+    pub fn page(&self, offset: u64, limit: u64) -> Vec<(PartitionKey, PartitionOutcome)> {
+        partitions_at(&self.requested, offset, limit)
+            .into_iter()
+            .map(|(place, partition)| {
+                let outcome = self.outcome_at(place, &partition);
+                (partition, outcome)
+            })
+            .collect()
+    }
+
+    /// The number of the requested partitions.
+    pub fn total(&self) -> u64 {
+        self.blocks.iter().map(|block| block.count as u64).sum()
+    }
+
+    fn outcome_at(&self, place: usize, partition: &PartitionKey) -> PartitionOutcome {
+        if let Some(outcomes) = &self.outcomes {
+            return PartitionOutcome {
+                state: outcomes
+                    .get(partition)
+                    .map_or(BackfillPartitionState::Pending, |outcome| (*outcome).into()),
+                run_id: None,
+            };
+        }
+
+        let Some(run) = self
+            .numbers
+            .of(place, partition)
+            .and_then(|number| self.ended.get(&number))
+        else {
+            return PartitionOutcome::pending();
+        };
+        let failed_alone = run.outcome == BackfillRunOutcome::Completed
+            && self
+                .failed_alone
+                .get(&run.run_number)
+                .is_some_and(|failed| failed.contains(partition));
+        PartitionOutcome {
+            state: match failed_alone {
+                true => BackfillPartitionState::Failed,
+                false => state_of_run(run),
+            },
+            run_id: run.run_id.clone(),
+        }
+    }
+
+    fn holds(&self, values: &[(&str, &str)]) -> bool {
+        self.blocks.iter().any(|block| block.holds(values))
+    }
+
+    /// The place among the requested partitions of the partition with
+    /// `values`.
+    fn place_of(&self, values: &[(&str, &str)]) -> Option<usize> {
+        self.blocks
+            .iter()
+            .find_map(|block| Some(block.first + block.offset_of(values)?))
+    }
+
+    /// The values of the requested partition at `place`.
+    fn member_at(&self, place: usize) -> Option<Vec<(&str, &str)>> {
+        let at = self.blocks.partition_point(|block| block.first <= place);
+        let block = self.blocks.get(at.checked_sub(1)?)?;
+        (place < block.first + block.count).then(|| block.member_at(place - block.first))
+    }
+}
+
+/// Whether the run of `group` holds partitions of `block`: the block has the
+/// dimensions of `multi_run` that the group names, and no other.
+fn holds_group(block: &Block, multi_run: &[String], group: &[(String, String)]) -> bool {
+    let grouped = block
+        .dims
+        .iter()
+        .filter(|(name, _)| multi_run.contains(name))
+        .count();
+    grouped == group.len()
 }
 
 /// The partitions that `requested` names from `offset`, at most `limit`, each
@@ -80,89 +625,6 @@ fn partitions_at(
         first_of_key = end_of_key;
     }
     page
-}
-
-async fn states_from_runs<S: StorageBackend>(
-    storage: &S,
-    backfill: &BackfillRecord,
-    requested: &[PartitionKey],
-    partitions: &[(usize, PartitionKey)],
-) -> Result<Vec<BackfillPartitionState>> {
-    let numbers = RunNumbers::new(&backfill.strategy, requested);
-    let run_numbers: Vec<Option<usize>> = partitions
-        .iter()
-        .map(|(place, partition)| numbers.of(*place, partition))
-        .collect();
-    let on_page: BTreeSet<usize> = run_numbers.iter().flatten().copied().collect();
-    let (Some(first), Some(last)) = (on_page.first(), on_page.last()) else {
-        return Ok(vec![BackfillPartitionState::Pending; partitions.len()]);
-    };
-
-    let ended: HashMap<usize, EndedBackfillRun> = storage
-        .get_ended_backfill_runs(&backfill.backfill_id, *first, *last)
-        .await?
-        .into_iter()
-        .filter(|run| on_page.contains(&run.run_number))
-        .map(|run| (run.run_number, run))
-        .collect();
-
-    // A run that succeeded can hold partitions that failed alone.
-    let mut failed_alone: HashMap<usize, HashSet<PartitionKey>> = HashMap::new();
-    for run in ended.values() {
-        let some_failed = run.failed_members > 0 && run.failed_members < run.member_count;
-        if run.outcome == BackfillRunOutcome::Completed
-            && some_failed
-            && let Some(run_id) = &run.run_id
-        {
-            let failed = storage.get_run_failed_partitions(run_id).await?;
-            failed_alone.insert(run.run_number, failed.into_iter().collect());
-        }
-    }
-
-    Ok(partitions
-        .iter()
-        .zip(&run_numbers)
-        .map(|((_, partition), run_number)| {
-            let Some(run) = run_number.and_then(|number| ended.get(&number)) else {
-                return BackfillPartitionState::Pending;
-            };
-            let failed_in_a_good_run = run.outcome == BackfillRunOutcome::Completed
-                && (run.failed_members >= run.member_count
-                    || failed_alone
-                        .get(&run.run_number)
-                        .is_some_and(|failed| failed.contains(partition)));
-            if failed_in_a_good_run {
-                BackfillPartitionState::Failed
-            } else {
-                run.outcome.into()
-            }
-        })
-        .collect())
-}
-
-async fn states_from_partition_rows<S: StorageBackend>(
-    storage: &S,
-    backfill: &BackfillRecord,
-    partitions: &[(usize, PartitionKey)],
-) -> Result<Vec<BackfillPartitionState>> {
-    let keys: Vec<PartitionKey> = partitions
-        .iter()
-        .map(|(_, partition)| partition.clone())
-        .collect();
-    let outcomes: HashMap<PartitionKey, BackfillRunOutcome> = storage
-        .get_backfill_partition_outcomes(&backfill.backfill_id, &keys)
-        .await?
-        .into_iter()
-        .collect();
-
-    Ok(keys
-        .iter()
-        .map(|partition| {
-            outcomes
-                .get(partition)
-                .map_or(BackfillPartitionState::Pending, |outcome| (*outcome).into())
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -291,18 +753,44 @@ mod tests {
             .unwrap();
     }
 
+    async fn read_states(storage: &SurrealStorage) -> BackfillStates {
+        let backfill = storage.get_backfill("bf").await.unwrap().unwrap();
+        BackfillStates::read(storage, &backfill).await.unwrap()
+    }
+
     async fn page(
         storage: &SurrealStorage,
         offset: u64,
         limit: u64,
     ) -> Vec<(String, BackfillPartitionState)> {
-        let backfill = storage.get_backfill("bf").await.unwrap().unwrap();
-        backfill_partitions_page(storage, &backfill, offset, limit)
+        read_states(storage)
             .await
-            .unwrap()
+            .page(offset, limit)
             .into_iter()
-            .map(|(partition, state)| (partition.to_display(), state))
+            .map(|(partition, outcome)| (partition.to_display(), outcome.state))
             .collect()
+    }
+
+    fn range(fixed: &[(&str, &str)], dimension: &str, first: &str, last: &str) -> KeyRange {
+        KeyRange {
+            fixed: fixed
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            dimension: dimension.to_string(),
+            first: first.to_string(),
+            last: last.to_string(),
+        }
+    }
+
+    /// Counts of `total` partitions: completed, failed, canceled.
+    fn counted(total: u64, completed: u64, failed: u64, canceled: u64) -> BackfillCounts {
+        BackfillCounts {
+            total,
+            completed,
+            failed,
+            canceled,
+        }
     }
 
     #[tokio::test]
@@ -405,6 +893,156 @@ mod tests {
                 cell("a", Completed),
                 cell("b", Failed),
                 cell("c", Completed)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_per_zone_counts_the_rows_of_an_outline() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let requested = [multi(&[
+            ("hour", &["h1", "h2", "h3", "h4"]),
+            ("zone", &["z1", "z2", "z3"]),
+        ])];
+        let strategy = BackfillStrategy::PerDimension {
+            multi_run: vec!["zone".to_string()],
+            single_run: vec!["hour".to_string()],
+        };
+        let plan = started_backfill(&storage, strategy, &requested).await;
+
+        // z1 succeeded with h2 failed alone, z2 failed, z3 is open.
+        let failed = multi(&[("zone", &["z1"]), ("hour", &["h2"])]);
+        ended_run(&storage, &plan, 0, RunStatus::Success, &[failed]).await;
+        ended_run(&storage, &plan, 1, RunStatus::Failure, &[]).await;
+
+        let states = read_states(&storage).await;
+        assert_eq!(states.total(), 12);
+        assert_eq!(
+            states.counts_in(&[
+                KeyRange::default(),
+                range(&[], "hour", "h1", "h2"),
+                range(&[], "hour", "h3", "h3"),
+                range(&[("hour", "h2")], "zone", "", ""),
+                range(&[("hour", "h2")], "zone", "z2", "z3"),
+                range(&[("zone", "z1")], "hour", "h2", "h9"),
+                range(&[], "hour", "h5", "h9"),
+                range(&[("tier", "pro")], "", "", ""),
+            ]),
+            vec![
+                counted(12, 3, 5, 0),
+                counted(6, 1, 3, 0),
+                counted(3, 1, 1, 0),
+                counted(3, 0, 2, 0),
+                counted(2, 0, 1, 0),
+                counted(3, 2, 1, 0),
+                counted(0, 0, 0, 0),
+                counted(0, 0, 0, 0),
+            ]
+        );
+
+        // The run of z3 is canceled before it starts.
+        storage
+            .settle_unstarted_backfill_runs(
+                "bf",
+                &[UnstartedBackfillRun {
+                    run_number: 2,
+                    member_count: 4,
+                    outcome: BackfillRunOutcome::Canceled,
+                }],
+            )
+            .await
+            .unwrap();
+        let states = read_states(&storage).await;
+        assert_eq!(
+            states.counts_in(&[KeyRange::default(), range(&[], "zone", "z3", "z3")]),
+            vec![counted(12, 3, 5, 4), counted(4, 0, 0, 4)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_per_partition_counts_each_run_that_ended() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        // Keys out of the order of their text, in two requested keys.
+        let requested = [single(&["d", "b"]), single(&["a", "c"])];
+        let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+
+        ended_run(&storage, &plan, 0, RunStatus::Success, &[]).await;
+        ended_run(&storage, &plan, 1, RunStatus::Failure, &[]).await;
+        ended_run(&storage, &plan, 3, RunStatus::Canceled, &[]).await;
+
+        let states = read_states(&storage).await;
+        assert_eq!(states.keys_of(""), ["d", "b", "a", "c"]);
+        assert_eq!(
+            states.counts_in(&[
+                KeyRange::default(),
+                range(&[], "", "a", "b"),
+                range(&[], "", "c", "d"),
+                range(&[], "", "d", "d"),
+            ]),
+            vec![
+                counted(4, 1, 1, 1),
+                counted(2, 0, 1, 0),
+                counted(2, 1, 0, 1),
+                counted(1, 1, 0, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_run_counts_every_partition_with_the_ones_that_failed_alone() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let requested = [single(&["a", "b", "c"])];
+        let plan = started_backfill(&storage, BackfillStrategy::SingleRun, &requested).await;
+
+        let states = read_states(&storage).await;
+        assert_eq!(
+            states.counts_in(&[KeyRange::default()]),
+            vec![counted(3, 0, 0, 0)],
+            "nothing ended: every partition is pending"
+        );
+
+        ended_run(&storage, &plan, 0, RunStatus::Success, &[single(&["b"])]).await;
+
+        let states = read_states(&storage).await;
+        assert_eq!(
+            states.counts_in(&[KeyRange::default(), range(&[], "", "b", "c")]),
+            vec![counted(3, 2, 1, 0), counted(2, 1, 1, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_partition_names_its_run_and_a_key_outside_the_backfill_has_none() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let requested = [multi(&[("hour", &["h1", "h2"]), ("zone", &["z1", "z2"])])];
+        let strategy = BackfillStrategy::PerDimension {
+            multi_run: vec!["zone".to_string()],
+            single_run: vec!["hour".to_string()],
+        };
+        let plan = started_backfill(&storage, strategy, &requested).await;
+        let failed = multi(&[("zone", &["z1"]), ("hour", &["h2"])]);
+        ended_run(&storage, &plan, 0, RunStatus::Success, &[failed]).await;
+
+        let cell = |hour: &str, zone: &str| multi(&[("zone", &[zone]), ("hour", &[hour])]);
+        let outcome = |state, run: Option<&str>| {
+            Some(PartitionOutcome {
+                state,
+                run_id: run.map(String::from),
+            })
+        };
+        assert_eq!(
+            read_states(&storage).await.outcomes_of(&[
+                cell("h1", "z1"),
+                cell("h2", "z1"),
+                cell("h2", "z2"),
+                cell("h3", "z1"),
+                multi(&[("hour", &["h1", "h2"]), ("zone", &["z1"])]),
+            ]),
+            vec![
+                outcome(Completed, Some("run-0")),
+                outcome(Failed, Some("run-0")),
+                outcome(Pending, None),
+                None,
+                None,
             ]
         );
     }

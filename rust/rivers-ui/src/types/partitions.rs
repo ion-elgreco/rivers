@@ -95,29 +95,41 @@ pub fn submit_partition_count(keys: &[SubmitPartitionKey]) -> u64 {
 /// The rows of the partition outline that are read, or shown, in one step.
 pub const OUTLINE_PAGE: u64 = 100;
 
-/// The partitions of an asset, or of one row of its partition outline, by
-/// state. A partition that is not materialized and not failed is missing.
+/// The partitions of an asset or a backfill, or of one row of its partition
+/// outline, by state. `done` counts the materialized partitions of an asset
+/// and the completed partitions of a backfill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PartitionCounts {
     pub total: u64,
-    pub materialized: u64,
+    pub done: u64,
     pub failed: u64,
+    /// Only a backfill has canceled partitions.
+    pub canceled: u64,
 }
 
 impl PartitionCounts {
-    /// The counts of `total` partitions. The store can hold rows of keys
-    /// that the asset no longer has: no state counts more than `total`.
-    pub fn of(total: u64, materialized: u64, failed: u64) -> Self {
-        let materialized = materialized.min(total);
+    /// The counts of `total` partitions of an asset. The store can hold rows
+    /// of keys that the asset no longer has: no state counts more than
+    /// `total`.
+    pub fn of(total: u64, done: u64, failed: u64) -> Self {
+        Self::of_backfill(total, done, failed, 0)
+    }
+
+    pub fn of_backfill(total: u64, done: u64, failed: u64, canceled: u64) -> Self {
+        let done = done.min(total);
+        let failed = failed.min(total - done);
         Self {
             total,
-            materialized,
-            failed: failed.min(total - materialized),
+            done,
+            failed,
+            canceled: canceled.min(total - done - failed),
         }
     }
 
-    pub fn missing(&self) -> u64 {
-        self.total - self.materialized - self.failed
+    /// The partitions in no other state: missing for an asset, pending for a
+    /// backfill.
+    pub fn rest(&self) -> u64 {
+        self.total - self.done - self.failed - self.canceled
     }
 }
 
@@ -163,11 +175,16 @@ pub struct OutlineRow {
     pub place: OutlinePlace,
 }
 
+/// The state of a partition of an asset (materialized, failed, missing) or of
+/// a backfill (done, failed, canceled, pending).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartitionRowState {
     Materialized,
     Failed,
     Missing,
+    Done,
+    Canceled,
+    Pending,
 }
 
 impl PartitionRowState {
@@ -176,6 +193,9 @@ impl PartitionRowState {
             Self::Materialized => "materialized",
             Self::Failed => "failed",
             Self::Missing => "missing",
+            Self::Done => "done",
+            Self::Canceled => "canceled",
+            Self::Pending => "pending",
         }
     }
 }
@@ -189,7 +209,7 @@ pub struct PartitionRow {
     /// The time of the last materialization. A failed partition can have one.
     pub materialized_at: Option<i64>,
     /// The run of the last materialization, or the run that failed a failed
-    /// partition.
+    /// partition. For a backfill: the run that held the partition.
     pub run_id: Option<String>,
     /// The time of the failure of a failed partition.
     pub failed_at: Option<i64>,
@@ -259,8 +279,8 @@ pub enum PartitionShape {
     Keys,
 }
 
-/// The Partitions tab of an asset: the counts, the strip and the first rows
-/// of the outline.
+/// The partitions of an asset or a backfill: the counts, the strip and the
+/// first rows of the outline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionOverview {
     pub counts: PartitionCounts,
@@ -270,6 +290,7 @@ pub struct PartitionOverview {
     /// The place of the top rows: a search reads its keys.
     pub root: OutlinePlace,
     /// The code location gave the keys. False: the rows are the materialized
-    /// partitions only.
+    /// partitions of an asset, or the partitions of a backfill in the order
+    /// they were asked for.
     pub from_definition: bool,
 }

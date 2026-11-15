@@ -942,7 +942,7 @@ pub fn AssetDetailPage() -> impl IntoView {
 
 #[component]
 fn PartitionsTab(asset_key: String) -> impl IntoView {
-    use crate::components::ui_kit::{OutlineSource, PartitionOutline};
+    use crate::components::ui_kit::{OutlineOf, OutlineSource, PartitionOutline};
 
     let key = asset_key.clone();
     let mat_key = asset_key.clone();
@@ -1007,7 +1007,7 @@ fn PartitionsTab(asset_key: String) -> impl IntoView {
                         let source = OutlineSource {
                             loc_ns,
                             loc_name,
-                            asset_key: asset_key.clone(),
+                            of: OutlineOf::Asset(asset_key.clone()),
                         };
                         view! {
                             <PartitionOutline source=source overview=overview missing_action=missing_action/>

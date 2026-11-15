@@ -261,72 +261,6 @@
     animation: pulse-op 1.4s ease-in-out infinite;
 }
 
-/* ── Rivers: Partition heatmap ── */
-.heatmap {
-    display: grid;
-    grid-template-columns: repeat(30, 1fr);
-    gap: 3px;
-}
-.heatmap--sm { grid-template-columns: repeat(20, 1fr); gap: 2px; }
-.heatmap-cell {
-    aspect-ratio: 1 / 1;
-    border-radius: var(--round-xs);
-    transition: opacity 400ms ease, background 400ms ease, outline 120ms ease;
-    min-width: 4px;
-    cursor: help;
-}
-.heatmap-cell:hover {
-    outline: 1px solid var(--text);
-    outline-offset: 1px;
-    z-index: 2;
-    position: relative;
-}
-.heatmap-cell--done { background: var(--success); opacity: 0.9; }
-.heatmap-cell--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); animation: pulse-op 1.4s ease-in-out infinite; }
-.heatmap-cell--failed { background: var(--error); opacity: 1; }
-.heatmap-cell--pending { background: var(--bg-highest); opacity: 0.6; }
-.heatmap-cell--canceled { background: var(--text-muted); opacity: 0.35; }
-
-/* Rivers hover-info bar: reveals when hovering a cell with labels */
-.heatmap-info {
-    /* Sticky to the viewport bottom so the hover info stays in view even when
-       the cell grid is taller than the screen (long backfills / 1k windows). */
-    position: sticky;
-    bottom: 8px;
-    z-index: 5;
-    margin-top: 12px;
-    padding: 8px 12px;
-    background: var(--bg-highest);
-    border: 1px solid var(--border);
-    border-radius: var(--round-sm);
-    box-shadow: var(--shadow-overlay);
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    font-family: var(--font-mono);
-    font-size: var(--fs-sm);
-}
-.heatmap-info-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: var(--round-xs);
-    flex-shrink: 0;
-}
-.heatmap-info-dot--done { background: var(--success); opacity: 0.9; }
-.heatmap-info-dot--running { background: var(--secondary); box-shadow: 0 0 6px var(--secondary); }
-.heatmap-info-dot--failed { background: var(--error); }
-.heatmap-info-dot--pending { background: var(--bg-highest); border: 1px solid var(--border); opacity: 0.6; }
-.heatmap-info-dot--canceled { background: var(--text-muted); opacity: 0.4; }
-.heatmap-info-label { color: var(--text-muted); }
-.heatmap-info-key { color: var(--text); }
-.heatmap-info-sep { color: var(--text-comment); opacity: 0.6; }
-.heatmap-info-pos { color: var(--text-muted); }
-.heatmap-info-state--done { color: var(--success); }
-.heatmap-info-state--running { color: var(--secondary); }
-.heatmap-info-state--failed { color: var(--error); }
-.heatmap-info-state--pending { color: var(--text-muted); }
-.heatmap-info-state--canceled { color: var(--text-muted); }
-
 /* ── Rivers: Recent runs strip (duration bars) ── */
 .runs-strip {
     background: var(--bg-surface);
@@ -1643,6 +1577,7 @@ code[title],
 
 /* ── Partition outline: tiles, strip along the first dimension, rows ── */
 .part-tiles { grid-template-columns: 1.5fr 1fr 1fr 1fr; margin-bottom: 14px; }
+.part-tiles--five { grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; }
 .part-tile-value { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xl); }
 .part-tile-value .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .part-tile-value.part-zero { color: var(--text-muted); }
@@ -1701,6 +1636,7 @@ code[title],
 .part-seg-done { background: var(--success); opacity: 0.9; }
 .part-seg-failed { background: var(--error); }
 .part-seg-missing { background: color-mix(in srgb, var(--text-muted) 62%, var(--bg-surface)); }
+.part-seg-canceled { background: var(--text-comment); }
 .part-axis { position: relative; height: 18px; margin-top: 6px; overflow: hidden; }
 .part-axis span {
     position: absolute;
@@ -1761,6 +1697,7 @@ code[title],
 .part-rail--done { background: var(--success); }
 .part-rail--failed { background: var(--error); }
 .part-rail--missing { background: color-mix(in srgb, var(--text-muted) 62%, var(--bg-surface)); }
+.part-rail--canceled { background: var(--text-comment); }
 .part-name { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 .part-caret { width: 12px; color: var(--text-muted); font-size: var(--fs-sm); flex-shrink: 0; }
 .part-key { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1790,6 +1727,14 @@ code[title],
     font-variant-numeric: tabular-nums;
 }
 .part-leaf-run, .part-head--partitions span:last-child { grid-column: 4 / 6; }
+/* A backfill: one more column of numbers, and no time of materialization. */
+.part-outline--backfill .part-head,
+.part-outline--backfill .part-row,
+.part-outline--backfill .part-leaf {
+    grid-template-columns: minmax(260px, 1.6fr) 120px minmax(220px, 1.3fr) 90px 90px 90px;
+}
+.part-outline--backfill .part-leaf-run,
+.part-outline--backfill .part-head--partitions span:last-child { grid-column: 3 / -1; }
 .part-leaf .part-time { color: var(--text); }
 .part-leaf .part-ago { color: var(--text-muted); }
 .part-run { color: var(--secondary); text-decoration: none; }

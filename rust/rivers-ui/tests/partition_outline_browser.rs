@@ -1,6 +1,6 @@
-//! Browser tests for the Partitions tab of an asset: the tiles, the strip
-//! with the numbers of the bar under the pointer, and the outline whose rows
-//! open, filter, show more and search.
+//! Browser tests for the partition outline of an asset and of a backfill:
+//! the tiles, the strip with the numbers of the bar under the pointer, and
+//! the outline whose rows open, filter, show more and search.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -16,7 +16,7 @@ use common::{
 use leptos::mount::mount_to;
 use leptos::prelude::*;
 use rivers_ui::components::ui_kit::{
-    OutlineSource, PartitionOutline, PartitionStripView, PartitionTiles,
+    OutlineOf, OutlineSource, PartitionOutline, PartitionStripView, PartitionTiles,
 };
 use rivers_ui::types::{
     OutlineDimension, OutlineLevel, OutlinePlace, OutlineRow, OutlineRows, PartitionCounts,
@@ -29,11 +29,7 @@ use web_sys::{Element, HtmlElement, HtmlInputElement, KeyboardEvent, KeyboardEve
 wasm_bindgen_test_configure!(run_in_browser);
 
 fn counts(total: u64, materialized: u64, failed: u64) -> PartitionCounts {
-    PartitionCounts {
-        total,
-        materialized,
-        failed,
-    }
+    PartitionCounts::of(total, materialized, failed)
 }
 
 fn text(el: &Element) -> String {
@@ -106,7 +102,7 @@ fn source() -> OutlineSource {
     OutlineSource {
         loc_ns: "default".into(),
         loc_name: "demo".into(),
-        asset_key: "trips".into(),
+        of: OutlineOf::Asset("trips".into()),
     }
 }
 
@@ -634,4 +630,106 @@ fn an_asset_with_no_definition_has_no_filter_and_no_find_field() {
     assert!(query_all(&target, ".filter-pill").is_empty());
     assert!(query_all(&target, ".rv-search").is_empty());
     assert_eq!(query_all(&target, ".part-leaf").len(), 1);
+}
+
+#[wasm_bindgen_test]
+async fn a_backfill_shows_its_own_states_and_reads_its_own_rows() {
+    let (_mock, requests) = install_routing_fetch_mock(|url| {
+        if url.contains("get_backfill_partition_rows") {
+            let run = |key: &str, state, run: Option<&str>| PartitionRow {
+                key: key.into(),
+                state,
+                materialized_at: None,
+                run_id: run.map(String::from),
+                failed_at: None,
+            };
+            let level = OutlineLevel {
+                heading: "zone".into(),
+                rows: OutlineRows::Partitions(vec![
+                    run("001", PartitionRowState::Done, Some("5c2e0000-0001")),
+                    run("002", PartitionRowState::Canceled, Some("5c2e0000-0002")),
+                    run("003", PartitionRowState::Pending, None),
+                ]),
+                more: 0,
+            };
+            Reply::Json(serde_json::to_string(&level).unwrap())
+        } else {
+            Reply::Error
+        }
+    });
+    let mut overview = overview(OutlineRows::Groups(vec![OutlineRow {
+        counts: PartitionCounts::of_backfill(72, 50, 2, 10),
+        ..day("2024-06-30", 0, 0)
+    }]));
+    overview.counts = PartitionCounts::of_backfill(144, 100, 4, 20);
+    let explored = RwSignal::new(false);
+    let target = fresh_mount_target();
+    mount_to(target.clone(), move || {
+        let source = OutlineSource {
+            of: OutlineOf::Backfill("bf-1".into()),
+            ..source()
+        };
+        view! { <PartitionOutline source=source overview=overview explored=explored/> }
+    })
+    .forget();
+
+    assert_eq!(
+        texts(&target, ".meta-tile"),
+        [
+            "Partitions144hour 48 × zone 3",
+            "Done10069.4%",
+            "Failed42.7%",
+            "Canceled2013.8%",
+            "Pending2013.8%",
+        ]
+    );
+    assert_eq!(
+        texts(&target, ".filter-pill"),
+        ["All144", "Failed4", "Canceled20", "Pending20"]
+    );
+    assert_eq!(
+        texts(&target, ".part-head span"),
+        [
+            "hour",
+            "Partitions",
+            "Done",
+            "Failed",
+            "Canceled",
+            "Pending"
+        ]
+    );
+    let row = query_one(&target, ".part-row");
+    assert_eq!(text(&row), "▸2024-06-3024 hours725069.4%21010");
+    assert!(!explored.get_untracked());
+
+    click(&row, false);
+    assert!(wait_until(|| query_all(&target, ".part-leaf").len() == 3).await);
+    assert!(explored.get_untracked(), "an open row holds the outline");
+
+    assert_eq!(
+        texts(&target, ".part-head--partitions span"),
+        ["zone", "State", "Run"]
+    );
+    assert_eq!(
+        texts(&target, ".part-leaf .chip"),
+        ["done", "canceled", "pending"]
+    );
+    let run = query_one(&target, ".part-leaf a");
+    assert_eq!(
+        run.get_attribute("href").as_deref(),
+        Some("/locations/default/demo/runs/5c2e0000-0001")
+    );
+    let sent = requests.borrow().clone();
+    let bodies = request_bodies(&sent).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains(r#""backfill_id":"bf-1""#),
+        "{}",
+        bodies[0]
+    );
+
+    let pending = query_all(&target, ".filter-pill")[3].clone();
+    click(&pending, false);
+    flush_effects().await;
+    assert_eq!(texts(&target, ".part-leaf .part-key"), ["003"]);
 }

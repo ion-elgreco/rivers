@@ -1,5 +1,6 @@
-//! The partitions of an asset: tiles with the counts, a strip along the first
-//! dimension of the keys, and an outline of the keys down to the partitions.
+//! The partitions of an asset or a backfill: tiles with the counts, a strip
+//! along the first dimension of the keys, and an outline of the keys down to
+//! the partitions.
 
 use core::time::Duration;
 
@@ -9,7 +10,7 @@ use super::RiversSearch;
 use crate::helpers::{err_text, format_timestamp, format_with_commas, short_id};
 use crate::loc::loc_path;
 use crate::now::RelTime;
-use crate::server_fns::partitions::get_partition_rows;
+use crate::server_fns::partitions::{get_backfill_partition_rows, get_partition_rows};
 use crate::types::{
     OUTLINE_PAGE, OutlineLevel, OutlinePlace, OutlineRow, OutlineRows, PartitionCounts,
     PartitionOverview, PartitionRow, PartitionRowState, PartitionShape, PartitionStrip, StripBar,
@@ -44,9 +45,10 @@ pub fn percent(part: u64, whole: u64) -> String {
 /// visible.
 pub fn bar_parts(counts: &PartitionCounts, least: f64) -> Vec<(&'static str, f64)> {
     let shares: Vec<(&'static str, f64)> = [
-        ("done", counts.materialized),
+        ("done", counts.done),
         ("failed", counts.failed),
-        ("missing", counts.missing()),
+        ("canceled", counts.canceled),
+        ("missing", counts.rest()),
     ]
     .into_iter()
     .filter(|(_, partitions)| *partitions > 0)
@@ -93,13 +95,54 @@ fn next_step(hidden: u64, unread: u64) -> u64 {
     }
 }
 
+/// Whose partitions an outline shows. The words of the states follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutlineKind {
+    #[default]
+    Asset,
+    Backfill,
+}
+
+impl OutlineKind {
+    /// The word for a partition that is done.
+    fn done(self) -> &'static str {
+        match self {
+            Self::Asset => "materialized",
+            Self::Backfill => "done",
+        }
+    }
+
+    /// The word for a partition in no other state.
+    fn rest(self) -> &'static str {
+        match self {
+            Self::Asset => "missing",
+            Self::Backfill => "pending",
+        }
+    }
+
+    fn has_canceled(self) -> bool {
+        self == Self::Backfill
+    }
+}
+
+/// `word` with a capital first letter.
+fn capital(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// The rows of the outline that the reader asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StateFilter {
     #[default]
     All,
     Failed,
-    Missing,
+    Canceled,
+    /// The missing partitions of an asset, the pending ones of a backfill.
+    Rest,
 }
 
 impl StateFilter {
@@ -107,60 +150,92 @@ impl StateFilter {
         match self {
             Self::All => true,
             Self::Failed => counts.failed > 0,
-            Self::Missing => counts.missing() > 0,
+            Self::Canceled => counts.canceled > 0,
+            Self::Rest => counts.rest() > 0,
         }
     }
 
     fn shows_state(self, state: PartitionRowState) -> bool {
+        use PartitionRowState::*;
         match self {
             Self::All => true,
-            Self::Failed => state == PartitionRowState::Failed,
-            Self::Missing => state == PartitionRowState::Missing,
+            Self::Failed => state == Failed,
+            Self::Canceled => state == Canceled,
+            Self::Rest => matches!(state, Missing | Pending),
         }
     }
 
-    fn nothing(self) -> &'static str {
+    fn nothing(self, kind: OutlineKind) -> String {
         match self {
-            Self::All => "No partitions.",
-            Self::Failed => "No failed partitions here.",
-            Self::Missing => "No missing partitions here.",
+            Self::All => "No partitions.".to_string(),
+            Self::Failed => "No failed partitions here.".to_string(),
+            Self::Canceled => "No canceled partitions here.".to_string(),
+            Self::Rest => format!("No {} partitions here.", kind.rest()),
         }
     }
 }
 
-/// Where the rows of the outline are read: the code location and the asset.
+/// Whose partitions an outline reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutlineOf {
+    Asset(String),
+    Backfill(String),
+}
+
+/// Where the rows of the outline are read: the code location of the links,
+/// and the asset or the backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineSource {
     pub loc_ns: String,
     pub loc_name: String,
-    pub asset_key: String,
+    pub of: OutlineOf,
 }
 
 impl OutlineSource {
+    pub fn kind(&self) -> OutlineKind {
+        match self.of {
+            OutlineOf::Asset(_) => OutlineKind::Asset,
+            OutlineOf::Backfill(_) => OutlineKind::Backfill,
+        }
+    }
+
     async fn rows(
         self,
         place: OutlinePlace,
         query: String,
         offset: u64,
     ) -> Result<OutlineLevel, String> {
-        get_partition_rows(
-            self.loc_ns,
-            self.loc_name,
-            self.asset_key,
-            place,
-            query,
-            offset,
-        )
-        .await
+        match self.of {
+            OutlineOf::Asset(asset_key) => {
+                get_partition_rows(self.loc_ns, self.loc_name, asset_key, place, query, offset)
+                    .await
+            }
+            OutlineOf::Backfill(backfill_id) => {
+                get_backfill_partition_rows(backfill_id, place, query, offset).await
+            }
+        }
         .map_err(|e| err_text(&e))
+    }
+}
+
+/// Marks that the reader opened, filtered or searched the outline: a newer
+/// overview waits, as a new outline would close the rows.
+#[derive(Debug, Clone, Copy)]
+struct Explored(RwSignal<bool>);
+
+fn explore() {
+    if let Some(Explored(explored)) = use_context::<Explored>() {
+        explored.set(true);
     }
 }
 
 fn rail_of(counts: &PartitionCounts) -> &'static str {
     if counts.failed > 0 {
         "part-rail part-rail--failed"
-    } else if counts.missing() > 0 {
+    } else if counts.rest() > 0 {
         "part-rail part-rail--missing"
+    } else if counts.canceled > 0 {
+        "part-rail part-rail--canceled"
     } else {
         "part-rail part-rail--done"
     }
@@ -181,13 +256,14 @@ fn dash() -> impl IntoView {
     view! { <span class="part-dash">"–"</span> }
 }
 
-/// The four tiles above the outline: the partitions, and each state.
+/// The tiles above the outline: the partitions, and each state.
 #[component]
 pub fn PartitionTiles(
     counts: PartitionCounts,
     shape: PartitionShape,
     /// Shown in the tile of the missing partitions when there are some.
     missing_action: Option<ViewFn>,
+    #[prop(optional)] kind: OutlineKind,
 ) -> impl IntoView {
     let shape = match shape {
         PartitionShape::Dimensions(dimensions) => dimensions
@@ -225,27 +301,34 @@ pub fn PartitionTiles(
         0 => "\u{a0}".to_string(),
         count => percent(count, counts.total),
     };
-    let missing = counts.missing();
+    let missing = counts.rest();
 
     view! {
-        <div class="meta-tile-grid part-tiles">
+        <div class="meta-tile-grid part-tiles" class:part-tiles--five=kind.has_canceled()>
             <div class="meta-tile">
                 <div class="meta-tile-label">"Partitions"</div>
                 <div class="meta-tile-value part-tile-value">{format_with_commas(counts.total)}</div>
                 <div class="part-tile-sub">{shape}</div>
             </div>
             <div class="meta-tile">
-                <div class="meta-tile-label">"Materialized"</div>
-                {value(counts.materialized, "dot-success")}
-                <div class="part-tile-sub">{percent(counts.materialized, counts.total)}</div>
+                <div class="meta-tile-label">{capital(kind.done())}</div>
+                {value(counts.done, "dot-success")}
+                <div class="part-tile-sub">{percent(counts.done, counts.total)}</div>
             </div>
             <div class="meta-tile">
                 <div class="meta-tile-label">"Failed"</div>
                 {value(counts.failed, "dot-failed")}
                 <div class="part-tile-sub">{share(counts.failed)}</div>
             </div>
+            {kind.has_canceled().then(|| view! {
+                <div class="meta-tile">
+                    <div class="meta-tile-label">"Canceled"</div>
+                    {value(counts.canceled, "dot-canceled")}
+                    <div class="part-tile-sub">{share(counts.canceled)}</div>
+                </div>
+            })}
             <div class="meta-tile">
-                <div class="meta-tile-label">"Missing"</div>
+                <div class="meta-tile-label">{capital(kind.rest())}</div>
                 {value(missing, "dot-missing")}
                 {match missing_action.filter(|_| missing > 0) {
                     Some(action) => view! { <div class="part-tile-action">{action.run()}</div> }.into_any(),
@@ -259,7 +342,10 @@ pub fn PartitionTiles(
 /// One bar for each run of keys of the first dimension, stacked by state.
 /// The line beside the head shows the numbers of the bar under the pointer.
 #[component]
-pub fn PartitionStripView(strip: PartitionStrip) -> impl IntoView {
+pub fn PartitionStripView(
+    strip: PartitionStrip,
+    #[prop(optional)] kind: OutlineKind,
+) -> impl IntoView {
     let PartitionStrip {
         heading,
         note,
@@ -275,9 +361,10 @@ pub fn PartitionStripView(strip: PartitionStrip) -> impl IntoView {
         Some(at) => bars.with_value(|bars| {
             let StripBar { label, counts } = &bars[at];
             let states = [
-                (counts.materialized, "materialized"),
+                (counts.done, kind.done()),
                 (counts.failed, "failed"),
-                (counts.missing(), "missing"),
+                (counts.canceled, "canceled"),
+                (counts.rest(), kind.rest()),
             ]
             .into_iter()
             .filter(|(partitions, _)| *partitions > 0)
@@ -312,9 +399,12 @@ pub fn PartitionStripView(strip: PartitionStrip) -> impl IntoView {
                 <span class="section-header-label">{heading}</span>
                 <span class="part-strip-note">{readout}</span>
                 <span class="part-legend">
-                    <span><i class="part-seg-done"></i>"materialized"</span>
+                    <span><i class="part-seg-done"></i>{kind.done()}</span>
                     <span><i class="part-seg-failed"></i>"failed"</span>
-                    <span><i class="part-seg-missing"></i>"missing"</span>
+                    {kind.has_canceled().then(|| view! {
+                        <span><i class="part-seg-canceled"></i>"canceled"</span>
+                    })}
+                    <span><i class="part-seg-missing"></i>{kind.rest()}</span>
                 </span>
             </div>
             <div class="part-bars" on:mouseleave=move |_| pointed.set(None)>{columns}</div>
@@ -351,35 +441,39 @@ impl Row {
     }
 }
 
-fn group_head(heading: String) -> impl IntoView {
+fn group_head(heading: String, kind: OutlineKind) -> impl IntoView {
     view! {
         <div class="part-head">
             <span>{heading}</span>
             <span class="part-num">"Partitions"</span>
-            <span>"Materialized"</span>
+            <span>{capital(kind.done())}</span>
             <span class="part-num">"Failed"</span>
-            <span class="part-num">"Missing"</span>
+            {kind.has_canceled().then(|| view! { <span class="part-num">"Canceled"</span> })}
+            <span class="part-num">{capital(kind.rest())}</span>
         </div>
     }
 }
 
-fn partition_head(heading: String, depth: usize) -> impl IntoView {
+fn partition_head(heading: String, depth: usize, kind: OutlineKind) -> impl IntoView {
     view! {
         <div class="part-head part-head--partitions">
             <span style=format!("padding-left:{}px", depth * INDENT + INDENT)>{heading}</span>
             <span>"State"</span>
-            <span>"Materialized"</span>
+            {(kind == OutlineKind::Asset).then(|| view! { <span>"Materialized"</span> })}
             <span>"Run"</span>
         </div>
     }
 }
 
 fn partition_row(source: &OutlineSource, row: PartitionRow, depth: usize) -> impl IntoView + use<> {
+    use PartitionRowState::*;
     let (rail, dot) = match row.state {
-        PartitionRowState::Materialized => ("part-rail part-rail--done", "dot dot-success"),
-        PartitionRowState::Failed => ("part-rail part-rail--failed", "dot dot-failed"),
-        PartitionRowState::Missing => ("part-rail part-rail--missing", "dot dot-missing"),
+        Materialized | Done => ("part-rail part-rail--done", "dot dot-success"),
+        Failed => ("part-rail part-rail--failed", "dot dot-failed"),
+        Canceled => ("part-rail part-rail--canceled", "dot dot-canceled"),
+        Missing | Pending => ("part-rail part-rail--missing", "dot dot-missing"),
     };
+    let of_asset = source.kind() == OutlineKind::Asset;
     let failed = row
         .failed_at
         .map(|at| format!("failed {}", format_timestamp(Some(at))));
@@ -400,17 +494,19 @@ fn partition_row(source: &OutlineSource, row: PartitionRow, depth: usize) -> imp
                     {row.state.label()}
                 </span>
             </span>
-            <span>
-                {match row.materialized_at {
-                    Some(at) => view! {
-                        <span class="part-time">{format_timestamp(Some(at))}</span>
-                        " "
-                        <span class="part-ago"><RelTime ts=at/></span>
-                    }
-                    .into_any(),
-                    None => dash().into_any(),
-                }}
-            </span>
+            {of_asset.then(|| view! {
+                <span>
+                    {match row.materialized_at {
+                        Some(at) => view! {
+                            <span class="part-time">{format_timestamp(Some(at))}</span>
+                            " "
+                            <span class="part-ago"><RelTime ts=at/></span>
+                        }
+                        .into_any(),
+                        None => dash().into_any(),
+                    }}
+                </span>
+            })}
             <span class="part-leaf-run">
                 {match run {
                     Some(run) => run.into_any(),
@@ -439,10 +535,12 @@ fn OutlineGroupRow(
     let below = RwSignal::new(None::<Result<OutlineLevel, String>>);
     let asked = StoredValue::new(false);
 
+    let kind = source.kind();
     let toggle = {
         let source = source.clone();
         let place = place.clone();
         move || {
+            explore();
             open.update(|open| *open = !*open);
             if asked.get_value() {
                 return;
@@ -465,7 +563,11 @@ fn OutlineGroupRow(
         }
     };
 
-    let missing = counts.missing();
+    let missing = counts.rest();
+    let number = |count: u64, class: &'static str| match count {
+        0 => view! { <span class="part-num part-dash">"–"</span> }.into_any(),
+        count => view! { <span class=class>{format_with_commas(count)}</span> }.into_any(),
+    };
     view! {
         <div
             class="part-row"
@@ -485,20 +587,12 @@ fn OutlineGroupRow(
             <span class="part-num">{format_with_commas(counts.total)}</span>
             <span class="part-share">
                 <span class="part-bar">{segments(&counts, 3.0, "width")}</span>
-                <span class="part-share-n">{format_with_commas(counts.materialized)}</span>
-                <span class="part-share-pct">{percent(counts.materialized, counts.total)}</span>
+                <span class="part-share-n">{format_with_commas(counts.done)}</span>
+                <span class="part-share-pct">{percent(counts.done, counts.total)}</span>
             </span>
-            {match counts.failed {
-                0 => view! { <span class="part-num part-dash">"–"</span> }.into_any(),
-                failed => view! {
-                    <span class="part-num part-num--failed">{format_with_commas(failed)}</span>
-                }
-                .into_any(),
-            }}
-            {match missing {
-                0 => view! { <span class="part-num part-dash">"–"</span> }.into_any(),
-                missing => view! { <span class="part-num">{format_with_commas(missing)}</span> }.into_any(),
-            }}
+            {number(counts.failed, "part-num part-num--failed")}
+            {kind.has_canceled().then(|| number(counts.canceled, "part-num"))}
+            {number(missing, "part-num")}
         </div>
         <div class="part-below" style:display=move || if open.get() { "" } else { "none" }>
             {move || {
@@ -546,9 +640,10 @@ fn OutlineLevelView(
         rows,
         more,
     } = level;
+    let kind = source.kind();
     let head = match &rows {
-        OutlineRows::Partitions(_) => Some(partition_head(heading, depth).into_any()),
-        OutlineRows::Groups(_) if depth == 0 => Some(group_head(heading).into_any()),
+        OutlineRows::Partitions(_) => Some(partition_head(heading, depth, kind).into_any()),
+        OutlineRows::Groups(_) if depth == 0 => Some(group_head(heading, kind).into_any()),
         OutlineRows::Groups(_) => None,
     };
 
@@ -573,6 +668,7 @@ fn OutlineLevelView(
     let show_more = {
         let source = source.clone();
         move |_| {
+            explore();
             if hidden() > 0 {
                 shown.update(|shown| *shown += OUTLINE_PAGE as usize);
                 return;
@@ -624,7 +720,7 @@ fn OutlineLevelView(
                 let pad = pad.clone();
                 move || {
                     (matching.with(Vec::is_empty) && unread.get() == 0)
-                        .then(|| view! { <div class="part-line" style=pad.clone()>{filter.get().nothing()}</div> })
+                        .then(|| view! { <div class="part-line" style=pad.clone()>{filter.get().nothing(kind)}</div> })
                 }
             }
             {
@@ -661,7 +757,7 @@ fn OutlineLevelView(
     .into_any()
 }
 
-/// The Partitions tab of an asset.
+/// The partitions of an asset or a backfill.
 #[component]
 pub fn PartitionOutline(
     source: OutlineSource,
@@ -669,7 +765,14 @@ pub fn PartitionOutline(
     /// Shown in the tile of the missing partitions when there are some.
     #[prop(optional, into)]
     missing_action: Option<ViewFn>,
+    /// Set when the reader opens, filters or searches the outline.
+    #[prop(optional)]
+    explored: Option<RwSignal<bool>>,
 ) -> impl IntoView {
+    if let Some(explored) = explored {
+        provide_context(Explored(explored));
+    }
+    let kind = source.kind();
     let PartitionOverview {
         counts,
         shape,
@@ -695,6 +798,7 @@ pub fn PartitionOutline(
         let source = source.clone();
         let root = root.clone();
         move |query: String| {
+            explore();
             text.set(query.clone());
             found.set(None);
             if let Some(timer) = timer.get_value() {
@@ -719,7 +823,7 @@ pub fn PartitionOutline(
         }
     };
 
-    let pill = move |shows: StateFilter, label: &'static str, count: u64| {
+    let pill = move |shows: StateFilter, label: String, count: u64| {
         let count_class = match (shows, count) {
             (StateFilter::Failed, 1..) => "count count--error",
             _ => "count",
@@ -729,7 +833,10 @@ pub fn PartitionOutline(
                 class="filter-pill"
                 class:filter-pill--active=move || filter.get() == shows
                 aria-pressed=move || (filter.get() == shows).to_string()
-                on:click=move |_| filter.set(shows)
+                on:click=move |_| {
+                    explore();
+                    filter.set(shows);
+                }
             >
                 {label}
                 <span class=count_class>{format_with_commas(count)}</span>
@@ -739,28 +846,34 @@ pub fn PartitionOutline(
 
     let found_source = source.clone();
     let found_root = root.clone();
+    let rest_label = capital(kind.rest());
+    let notice = match kind {
+        OutlineKind::Asset => {
+            "The code location does not answer: these are the materialized partitions only."
+        }
+        OutlineKind::Backfill => {
+            "The code location does not answer: these are the partitions of the backfill, in the order they were asked for."
+        }
+    };
     view! {
-        <PartitionTiles counts=counts shape=shape missing_action=missing_action/>
-        {strip.map(|strip| view! { <PartitionStripView strip=strip/> })}
-        {(!from_definition).then(|| view! {
-            <div class="part-notice">
-                "The code location does not answer: these are the materialized partitions only."
-            </div>
-        })}
+        <PartitionTiles counts=counts shape=shape missing_action=missing_action kind=kind/>
+        {strip.map(|strip| view! { <PartitionStripView strip=strip kind=kind/> })}
+        {(!from_definition).then(|| view! { <div class="part-notice">{notice}</div> })}
 
         {from_definition.then(|| view! {
             <div class="part-toolbar">
                 <div class="filter-pill-group">
                     <span class="filter-pill-group-label">"Show"</span>
-                    {pill(StateFilter::All, "All", counts.total)}
-                    {pill(StateFilter::Failed, "Failed", counts.failed)}
-                    {pill(StateFilter::Missing, "Missing", counts.missing())}
+                    {pill(StateFilter::All, "All".to_string(), counts.total)}
+                    {pill(StateFilter::Failed, "Failed".to_string(), counts.failed)}
+                    {kind.has_canceled().then(|| pill(StateFilter::Canceled, "Canceled".to_string(), counts.canceled))}
+                    {pill(StateFilter::Rest, rest_label.clone(), counts.rest())}
                 </div>
                 <RiversSearch value=text on_input=Callback::new(search) placeholder="find a partition…"/>
             </div>
         })}
 
-        <div class="part-outline">
+        <div class="part-outline" class:part-outline--backfill=kind == OutlineKind::Backfill>
             <div style:display=move || if text.with(String::is_empty) { "" } else { "none" }>
                 <OutlineLevelView source=source place=root level=top depth=0 filter=filter/>
             </div>
@@ -799,11 +912,12 @@ pub fn PartitionOutline(
 mod tests {
     use super::*;
 
-    fn counts(total: u64, materialized: u64, failed: u64) -> PartitionCounts {
+    fn counts(total: u64, done: u64, failed: u64) -> PartitionCounts {
         PartitionCounts {
             total,
-            materialized,
+            done,
             failed,
+            canceled: 0,
         }
     }
 
@@ -820,11 +934,11 @@ mod tests {
 
     #[test]
     fn each_state_with_partitions_has_a_visible_part() {
-        let parts = bar_parts(&counts(1_000_000, 999_998, 1), 3.0);
+        let parts = bar_parts(&PartitionCounts::of_backfill(1_000_000, 999_997, 1, 1), 3.0);
 
         let states: Vec<&str> = parts.iter().map(|(state, _)| *state).collect();
-        assert_eq!(states, ["done", "failed", "missing"]);
-        assert!(parts[1].1 > 2.5 && parts[2].1 > 2.5);
+        assert_eq!(states, ["done", "failed", "canceled", "missing"]);
+        assert!(parts[1].1 > 2.5 && parts[2].1 > 2.5 && parts[3].1 > 2.5);
         let sum: f64 = parts.iter().map(|(_, share)| share).sum();
         assert!((sum - 100.0).abs() < 1e-9);
     }
@@ -868,10 +982,16 @@ mod tests {
 
         assert!(StateFilter::All.shows_counts(&complete));
         assert!(!StateFilter::Failed.shows_counts(&complete));
-        assert!(!StateFilter::Missing.shows_counts(&complete));
+        assert!(!StateFilter::Rest.shows_counts(&complete));
         assert!(StateFilter::Failed.shows_counts(&with_gap));
-        assert!(StateFilter::Missing.shows_counts(&with_gap));
-        assert!(StateFilter::Missing.shows_state(PartitionRowState::Missing));
-        assert!(!StateFilter::Missing.shows_state(PartitionRowState::Failed));
+        assert!(StateFilter::Rest.shows_counts(&with_gap));
+        assert!(StateFilter::Rest.shows_state(PartitionRowState::Missing));
+        assert!(StateFilter::Rest.shows_state(PartitionRowState::Pending));
+        assert!(!StateFilter::Rest.shows_state(PartitionRowState::Failed));
+
+        let stopped = PartitionCounts::of_backfill(24, 20, 0, 4);
+        assert!(StateFilter::Canceled.shows_counts(&stopped));
+        assert!(!StateFilter::Rest.shows_counts(&stopped));
+        assert!(StateFilter::Canceled.shows_state(PartitionRowState::Canceled));
     }
 }
