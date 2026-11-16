@@ -48,7 +48,7 @@ axum-server.workspace = true
 # transitively by `kube/admission`; declared explicitly so the version is
 # pinned alongside that feature. `jsonptr` provides the `PointerBuf` paths
 # json-patch operations are built from.
-json-patch = "4"
+json-patch = "5"
 jsonptr = "0.7"
 mimalloc = "0.1"
 # git ref→commit resolution: pkt-line framing for the v0 ref
