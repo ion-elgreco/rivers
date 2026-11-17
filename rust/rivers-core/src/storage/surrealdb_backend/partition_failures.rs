@@ -553,18 +553,15 @@ pub(super) async fn fix_failures_after_materialization(
     Ok(())
 }
 
-/// In `txn`, after the deletion of the partitions `keys`: the failures at or
-/// before their deletion go.
+/// In `txn`, after the deletion of the partitions `keys`, each once and in
+/// the order of the store: the failures at or before their deletion go.
 pub(super) async fn fix_failures_after_deletion(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
     keys: &[PartitionKey],
 ) -> Result<()> {
-    let mut keys = keys.to_vec();
-    keys.sort_by(stored_order);
-    keys.dedup();
-    refresh_partitions(txn, cl, asset_key, None, &keys, RunFailedRow::failure).await?;
+    refresh_partitions(txn, cl, asset_key, None, keys, RunFailedRow::failure).await?;
     Ok(())
 }
 

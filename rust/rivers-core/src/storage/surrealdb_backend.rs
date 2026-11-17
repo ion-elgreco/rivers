@@ -8,7 +8,7 @@ use surrealdb::engine::any::{self, Any};
 use surrealdb::method::Query;
 use surrealdb::types::{Bytes, RecordId, SurrealValue};
 
-use super::{EventRecord, PartitionKey, StorageBackend};
+use super::{EventRecord, PartitionKey, StorageBackend, stored_order};
 
 mod migration;
 pub use migration::{
@@ -669,24 +669,14 @@ impl SurrealStorage {
                 .and_modify(|t| *t = (*t).max(ts))
                 .or_insert(ts);
         }
-        let mut by_time: HashMap<i64, Vec<PartitionKey>> = HashMap::new();
+        let mut by_time: HashMap<i64, Vec<&PartitionKey>> = HashMap::new();
         for (pk, ts) in &newest {
-            by_time.entry(*ts).or_default().push(pk.clone());
+            by_time.entry(*ts).or_default().push(pk);
         }
-        let by_time: Vec<(i64, Vec<PartitionKey>)> = by_time.into_iter().collect();
-        let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
-        let Some(range) = partition_failures::key_range(keys.iter()) else {
+        let by_time: Vec<(i64, Vec<&PartitionKey>)> = by_time.into_iter().collect();
+        let Some(range) = partition_failures::key_range(newest.keys()) else {
             return Ok(());
         };
-        let rows: Vec<DbPartitionDeletion> = newest
-            .iter()
-            .map(|(partition_key, timestamp)| DbPartitionDeletion {
-                code_location_id: cl.to_string(),
-                asset_key: asset_key.to_string(),
-                partition_key: partition_key.clone(),
-                timestamp: *timestamp,
-            })
-            .collect();
         // One DELETE per deletion time, not a FOR loop, which costs more. The
         // members of one delete step share a time, so this is one statement.
         let mut body = String::from(HOLD_FOR_PARTITION_DELETIONS);
@@ -701,7 +691,7 @@ impl SurrealStorage {
         let bind = DeletionParams {
             cl,
             asset_key,
-            rows: &rows,
+            newest: &newest,
             range,
             by_time: &by_time,
         };
@@ -724,6 +714,8 @@ impl SurrealStorage {
 
         // Failure rows are in the range of the keys: one transaction deletes
         // and brings the failure rows in line.
+        let mut keys: Vec<PartitionKey> = newest.keys().cloned().collect();
+        keys.sort_by(stored_order);
         super::retry::with_retry(&retry_config, || async {
             let txn = self.db.clone().begin().await?;
             bind.bind(txn.query(body.as_str())).await?.check()?;
@@ -957,23 +949,35 @@ impl MaterializationParams<'_> {
 struct DeletionParams<'a> {
     cl: &'a str,
     asset_key: &'a str,
-    rows: &'a [DbPartitionDeletion],
+    /// Each key's newest deletion time.
+    newest: &'a HashMap<PartitionKey, i64>,
     range: (&'a PartitionKey, &'a PartitionKey),
-    by_time: &'a [(i64, Vec<PartitionKey>)],
+    by_time: &'a [(i64, Vec<&'a PartitionKey>)],
 }
 
 impl DeletionParams<'_> {
     fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
         let (lowest, highest) = self.range;
+        let rows: Vec<DbPartitionDeletion> = self
+            .newest
+            .iter()
+            .map(|(partition_key, timestamp)| DbPartitionDeletion {
+                code_location_id: self.cl.to_string(),
+                asset_key: self.asset_key.to_string(),
+                partition_key: partition_key.clone(),
+                timestamp: *timestamp,
+            })
+            .collect();
         let mut query = query
             .bind(("cl", self.cl.to_string()))
             .bind(("asset_key", self.asset_key.to_string()))
-            .bind(("rows", self.rows.to_vec()))
+            .bind(("rows", rows))
             .bind(("lowest", lowest.clone()))
             .bind(("highest", highest.clone()));
         for (i, (deleted_at, keys)) in self.by_time.iter().enumerate() {
+            let keys: Vec<PartitionKey> = keys.iter().map(|&key| key.clone()).collect();
             query = query
-                .bind((format!("keys_{i}"), keys.clone()))
+                .bind((format!("keys_{i}"), keys))
                 .bind((format!("deleted_at_{i}"), *deleted_at));
         }
         query
