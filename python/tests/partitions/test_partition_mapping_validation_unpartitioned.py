@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 import pytest
@@ -5,7 +6,12 @@ import pytest
 import rivers as rs
 from rivers.exceptions import PartitionValidationError
 
-from .mapping_validation_helpers import STATIC_KEYS, make_repo
+from .mapping_validation_helpers import (
+    KEY_LOOKUP_GRIDS,
+    STATIC_KEYS,
+    make_repo,
+    validate_mapped_edge,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +176,57 @@ def test_unpartitioned_downstream_partitioned_upstream_specific_partitions():
 
     repo = make_repo([upstream, downstream])
     assert repo is not None
+
+
+@pytest.mark.parametrize(("make_parts", "has", "lacks"), KEY_LOOKUP_GRIDS)
+def test_specific_partitions_keys_must_be_upstream_keys(make_parts, has, lacks):
+    """SpecificPartitions takes the upstream's keys in their exact text only."""
+    parts = make_parts()
+    validate_mapped_edge(None, parts, rs.PartitionMapping.specific_partitions(has))
+
+    for key in lacks:
+        mapping = rs.PartitionMapping.specific_partitions([*has, key])
+        with pytest.raises(
+            PartitionValidationError,
+            match=f"SpecificPartitions key '{re.escape(key)}' is not a valid partition key for upstream",
+        ):
+            validate_mapped_edge(None, parts, mapping)
+
+
+@pytest.mark.parametrize(
+    ("make_parts", "match"),
+    [
+        pytest.param(
+            lambda: rs.PartitionsDefinition.dynamic("colors"),
+            "NotImplementedError: Cannot enumerate dynamic partition keys",
+            id="dynamic",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.multi(
+                {
+                    "letter": rs.PartitionsDefinition.static_(STATIC_KEYS),
+                    "color": rs.PartitionsDefinition.dynamic("colors"),
+                }
+            ),
+            "NotImplementedError: Cannot enumerate dynamic partition keys",
+            id="multi-dynamic",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.multi(
+                {"letter": rs.PartitionsDefinition.static_(STATIC_KEYS)}
+            ),
+            "SpecificPartitions key 'a' is not a valid partition key for upstream",
+            id="multi",
+        ),
+    ],
+)
+def test_specific_partitions_upstream_without_single_dim_keys_rejected(
+    make_parts, match
+):
+    """SpecificPartitions needs an upstream whose single-dimension keys are known."""
+    mapping = rs.PartitionMapping.specific_partitions(["a"])
+    with pytest.raises(PartitionValidationError, match=re.escape(match)):
+        validate_mapped_edge(None, make_parts(), mapping)
 
 
 def test_unpartitioned_downstream_partitioned_upstream_identity():

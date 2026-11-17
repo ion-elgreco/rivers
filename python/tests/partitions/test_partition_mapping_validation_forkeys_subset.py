@@ -448,7 +448,7 @@ def test_subset_accepted_same_type_subset_keys():
 def test_subset_rejected_upstream_extra_keys():
     """Subset is rejected when upstream has keys not in downstream (Static)."""
     down_parts = rs.PartitionsDefinition.static_(["a", "b"])
-    up_parts = rs.PartitionsDefinition.static_(["a", "b", "c"])
+    up_parts = rs.PartitionsDefinition.static_(["a", "z", "b", "c"])
 
     @rs.Asset(partitions_def=up_parts)
     def upstream() -> Any:
@@ -465,7 +465,10 @@ def test_subset_rejected_upstream_extra_keys():
     def downstream(upstream: Any) -> Any:
         return upstream
 
-    with pytest.raises(PartitionValidationError, match="upstream has extra keys"):
+    with pytest.raises(
+        PartitionValidationError,
+        match=re.escape('upstream has extra keys: ["c", "z"]'),
+    ):
         make_repo([upstream, downstream])
 
 

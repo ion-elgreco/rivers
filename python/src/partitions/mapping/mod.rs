@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use jiff::{SignedDuration, civil};
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyNotImplementedError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -17,7 +17,8 @@ use crate::errors::PartitionValidationError;
 
 use super::PyPartitionKey;
 use super::definition::{
-    PartitionsDefinition, cron_grid_contains, for_each_cron_tick, for_each_interval_tick,
+    KeysByPlace, PartitionsDefinition, cron_grid_contains, for_each_cron_tick,
+    for_each_interval_tick,
 };
 
 /// Resolution of an upstream load decision at materialize time.
@@ -29,20 +30,25 @@ pub enum UpstreamKeyResolution {
     Skip,
 }
 
-/// Single-dim partition keys as a string set, for set-based validation.
-fn single_dim_key_set(
+/// The keys of a definition with one dimension, to look keys up in. `None`
+/// for a Multi definition, which has none of these keys.
+fn single_dim_keys(
     def: &PartitionsDefinition,
-) -> Result<HashSet<String>, MappingValidationError> {
-    def.get_partition_keys()
-        .map(|keys| {
-            keys.into_iter()
-                .filter_map(|pk| match pk {
-                    PyPartitionKey::Single { key } => key.into_iter().next(),
-                    _ => None,
-                })
-                .collect()
-        })
-        .map_err(|e| MappingValidationError::DefinitionError(e.to_string()))
+) -> Result<Option<KeysByPlace<'_>>, MappingValidationError> {
+    let definition_error = |e: PyErr| MappingValidationError::DefinitionError(e.to_string());
+    if def.has_dynamic_dimension() {
+        return Err(definition_error(PyNotImplementedError::new_err(
+            "Cannot enumerate dynamic partition keys",
+        )));
+    }
+    def.keys_by_place().map_err(definition_error)
+}
+
+/// Whether `keys` has `key` as its exact text. A time grid finds the place
+/// of any text that parses to one of its ticks.
+fn has_key(keys: Option<&KeysByPlace<'_>>, key: &str) -> bool {
+    keys.and_then(|keys| keys.get(keys.place(key)?))
+        .is_some_and(|listed| listed == key)
 }
 
 #[pyclass(
@@ -625,9 +631,9 @@ impl PartitionMapping {
                 validate_time_window_grid_compat("time_window", down, up)
             }
             Self::Static { mapping: key_map } => {
-                let down_keys = single_dim_key_set(down)?;
+                let down_keys = single_dim_keys(down)?;
                 for src in key_map.keys() {
-                    if !down_keys.contains(src) {
+                    if !has_key(down_keys.as_ref(), src) {
                         return Err(MappingValidationError::KeyNotInDefinition {
                             key: src.clone(),
                             side: Side::Downstream,
@@ -635,9 +641,9 @@ impl PartitionMapping {
                         });
                     }
                 }
-                let up_keys = single_dim_key_set(up)?;
+                let up_keys = single_dim_keys(up)?;
                 for tgt in key_map.values() {
-                    if !up_keys.contains(tgt) {
+                    if !has_key(up_keys.as_ref(), tgt) {
                         return Err(MappingValidationError::KeyNotInDefinition {
                             key: tgt.clone(),
                             side: Side::Upstream,
@@ -668,14 +674,17 @@ impl PartitionMapping {
                         upstream: up.variant_name().to_string(),
                     });
                 }
-                if let (PartitionsDefinition::Static { .. }, PartitionsDefinition::Static { .. }) =
-                    (down, up)
+                if let (
+                    PartitionsDefinition::Static { keys: down_keys },
+                    PartitionsDefinition::Static { keys: up_keys },
+                ) = (down, up)
                 {
-                    let down_keys = single_dim_key_set(down)?;
-                    let up_keys = single_dim_key_set(up)?;
-                    if !up_keys.is_subset(&down_keys) {
-                        let mut extras: Vec<String> =
-                            up_keys.difference(&down_keys).cloned().collect();
+                    let mut extras: Vec<String> = up_keys
+                        .iter()
+                        .filter(|k| !down_keys.contains(k))
+                        .cloned()
+                        .collect();
+                    if !extras.is_empty() {
                         extras.sort();
                         return Err(MappingValidationError::UpstreamKeysNotSubset { extras });
                     }
@@ -865,9 +874,9 @@ impl PartitionMapping {
         match self {
             Self::AllPartitions {} => Ok(()),
             Self::SpecificPartitions { partition_keys } => {
-                let up_keys = single_dim_key_set(up)?;
+                let up_keys = single_dim_keys(up)?;
                 for pk in partition_keys {
-                    if !up_keys.contains(pk) {
+                    if !has_key(up_keys.as_ref(), pk) {
                         return Err(MappingValidationError::KeyNotInDefinition {
                             key: pk.clone(),
                             side: Side::Upstream,
