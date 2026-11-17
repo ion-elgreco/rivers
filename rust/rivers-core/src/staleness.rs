@@ -40,11 +40,19 @@ pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, G
 /// not the consumer.
 pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
     AssetRecord {
+        code_location_id: owner.code_location_id.clone(),
         asset_key: local.to_string(),
+        tags: owner.tags.clone(),
+        kinds: owner.kinds.clone(),
+        asset_group: owner.asset_group.clone(),
         code_version: None,
+        last_event_id: owner.last_event_id.clone(),
+        last_run_id: owner.last_run_id.clone(),
+        last_timestamp: owner.last_timestamp,
+        last_data_version: owner.last_data_version.clone(),
         last_materialization_code_version: None,
         last_input_data_versions: Vec::new(),
-        ..owner.clone()
+        pool: owner.pool.clone(),
     }
 }
 
