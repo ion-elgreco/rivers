@@ -120,21 +120,20 @@ pub(crate) fn select_in_universe(
 
 /// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
 /// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
-pub(crate) fn prev_partition_latch(
-    dep_selections: &DepScope<PartitionSelection>,
-    ctx: &EvalContext,
+pub(crate) fn prev_partition_latch<'a>(
+    dep_selections: &DepScope<'a, PartitionSelection>,
+    ctx: &'a EvalContext,
     my_idx: u32,
-) -> PartitionSelection {
+) -> &'a PartitionSelection {
     match dep_selections.cur_prev {
-        Some(map) => map.get(&my_idx).cloned(),
+        Some(map) => map.get(&my_idx),
         None => ctx
             .prev_state
             .partition_state
             .as_ref()
-            .and_then(|ps| ps.previous_selections.get(&my_idx))
-            .cloned(),
+            .and_then(|ps| ps.previous_selections.get(&my_idx)),
     }
-    .unwrap_or(PartitionSelection::Empty)
+    .unwrap_or(&PartitionSelection::Empty)
 }
 
 /// Build a skipped tree for a subtree that was not evaluated due to short-circuiting.

@@ -82,7 +82,11 @@ pub(crate) trait EvalDomain {
     fn will_be_requested(ctx: &EvalContext) -> Self::Sel;
 
     // stateful
-    fn prev_latch(dep_scope: &DepScope<Self::Sel>, ctx: &EvalContext, idx: u32) -> Self::Sel;
+    fn prev_latch<'a>(
+        dep_scope: &DepScope<'a, Self::Sel>,
+        ctx: &'a EvalContext,
+        idx: u32,
+    ) -> &'a Self::Sel;
     fn since_last_handled(current: Self::Sel, ctx: &EvalContext) -> Self::Sel;
 
     // Evaluate `condition` as if `dep_key` were the target. The partition impl
@@ -223,13 +227,12 @@ impl EvalDomain for BoolDomain {
         ctx.requested_this_tick.contains_key(ctx.target_key)
     }
 
-    fn prev_latch(dep_scope: &DepScope<bool>, ctx: &EvalContext, idx: u32) -> bool {
+    fn prev_latch<'a>(dep_scope: &DepScope<'a, bool>, ctx: &'a EvalContext, idx: u32) -> &'a bool {
         dep_scope
             .cur_prev
             .unwrap_or(&ctx.prev_state.previous_results)
             .get(&idx)
-            .copied()
-            .unwrap_or(false)
+            .unwrap_or(&false)
     }
     fn since_last_handled(current: bool, ctx: &EvalContext) -> bool {
         if !current {
@@ -415,11 +418,11 @@ impl EvalDomain for PartitionDomain {
             .unwrap_or(PartitionSelection::Empty)
     }
 
-    fn prev_latch(
-        dep_scope: &DepScope<PartitionSelection>,
-        ctx: &EvalContext,
+    fn prev_latch<'a>(
+        dep_scope: &DepScope<'a, PartitionSelection>,
+        ctx: &'a EvalContext,
         idx: u32,
-    ) -> PartitionSelection {
+    ) -> &'a PartitionSelection {
         prev_partition_latch(dep_scope, ctx, idx)
     }
     fn since_last_handled(current: PartitionSelection, ctx: &EvalContext) -> PartitionSelection {
