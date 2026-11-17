@@ -9,7 +9,7 @@ pub(crate) use deps::*;
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::types::{IntoPyDict, PyDict, PyTuple, PyType};
 
 use super::dep_def::DepDef;
 use super::external_asset::{ExternalAsset, PyExternalAsset};
@@ -1008,11 +1008,10 @@ impl PyAsset {
 
     /// The asset name. Raises AssetDefinitionError if the name has not been set.
     #[getter]
-    fn name(&self) -> PyResult<String> {
+    fn name(&self) -> PyResult<&str> {
         self.inner
             .name()
-            .as_ref()
-            .cloned()
+            .as_deref()
             .ok_or_else(|| AssetDefinitionError::new_err("Asset has no name"))
     }
 
@@ -1028,24 +1027,24 @@ impl PyAsset {
     }
 
     #[getter]
-    fn tags(&self) -> Option<Vec<String>> {
-        self.inner.tags().cloned()
+    fn tags(&self) -> Option<&Vec<String>> {
+        self.inner.tags()
     }
 
     /// Kind labels (e.g. "table", "view").
     #[getter]
-    fn kinds(&self) -> Kinds {
-        self.inner.kinds().clone()
+    fn kinds(&self) -> &Kinds {
+        self.inner.kinds()
     }
 
     #[getter]
-    fn group(&self) -> Option<String> {
-        self.inner.group().cloned()
+    fn group(&self) -> Option<&String> {
+        self.inner.group()
     }
 
     #[getter]
-    fn metadata(&self) -> Option<HashMap<String, String>> {
-        self.inner.metadata().cloned()
+    fn metadata(&self) -> Option<&HashMap<String, String>> {
+        self.inner.metadata()
     }
 
     /// True if the compute/observe function is an async def.
@@ -1085,21 +1084,15 @@ impl PyAsset {
     }
 
     #[getter]
-    fn hooks(&self, py: Python) -> Option<Vec<Py<PyHook>>> {
-        self.inner
-            .hooks()
-            .map(|h| h.iter().map(|hook| hook.clone_ref(py)).collect())
+    fn hooks(&self) -> Option<&Vec<Py<PyHook>>> {
+        self.inner.hooks()
     }
 
     /// Actions declared on this asset; `None` when it declares none.
     #[getter]
-    fn actions(&self, py: Python) -> Option<Vec<Py<super::action::PyAssetAction>>> {
+    fn actions(&self) -> Option<&[Py<super::action::PyAssetAction>]> {
         let actions = self.inner.actions();
-        if actions.is_empty() {
-            None
-        } else {
-            Some(actions.iter().map(|a| a.clone_ref(py)).collect())
-        }
+        (!actions.is_empty()).then_some(actions)
     }
 
     #[getter]
@@ -1114,16 +1107,16 @@ impl PyAsset {
 
     /// List of (pool_key, slots_consumed) pairs.
     #[getter]
-    fn pool(&self) -> Vec<(String, u32)> {
-        self.inner.pool().clone()
+    fn pool(&self) -> &[(String, u32)] {
+        self.inner.pool()
     }
 
     /// Slots claimed per pool, the normalized form of the `pool_slots=`
     /// declaration. Declared as an `int` or a per-pool dict; reads back as the
     /// dict so the stub's attribute is not a promise that raises.
     #[getter]
-    fn pool_slots(&self) -> HashMap<String, u32> {
-        self.inner.pool().iter().cloned().collect()
+    fn pool_slots<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.inner.pool().into_py_dict(py)
     }
 
     /// Lineage-only dependencies declared via `deps=`. Input deps become
@@ -1162,11 +1155,7 @@ impl PyAsset {
             RetryRef::Inline(p) => Py::new(py, crate::retry::PyRetryPolicy { inner: p.clone() })
                 .ok()
                 .map(|v| v.into_any()),
-            RetryRef::Named(key) => key
-                .clone()
-                .into_pyobject(py)
-                .ok()
-                .map(|v| v.unbind().into_any()),
+            RetryRef::Named(key) => key.into_pyobject(py).ok().map(|v| v.unbind().into_any()),
         }
     }
 
@@ -1185,8 +1174,8 @@ impl PyAsset {
     }
 
     #[getter]
-    fn code_version(&self) -> Option<String> {
-        self.inner.code_version().cloned()
+    fn code_version(&self) -> Option<&String> {
+        self.inner.code_version()
     }
 
     /// The definition object, or the `partition_defs` registry name string.
