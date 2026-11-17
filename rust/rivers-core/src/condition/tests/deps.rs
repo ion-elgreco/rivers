@@ -917,7 +917,7 @@ fn test_any_deps_in_progress() {
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a), ("b".to_string(), b.clone())]);
     let deps = HashMap::from([("b".to_string(), vec!["a".to_string()])]);
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "b",
         root_key: "b",

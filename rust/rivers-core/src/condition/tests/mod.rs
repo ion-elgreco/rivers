@@ -72,7 +72,7 @@ fn make_materialized_record(key: &str, ts: i64) -> AssetRecord {
     r
 }
 
-static EMPTY_SET: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+static EMPTY_SET: std::sync::LazyLock<HashSet<&str>> = std::sync::LazyLock::new(HashSet::new);
 
 static EMPTY_BACKFILL: std::sync::LazyLock<crate::condition::cache::BackfillState> =
     std::sync::LazyLock::new(crate::condition::cache::BackfillState::default);

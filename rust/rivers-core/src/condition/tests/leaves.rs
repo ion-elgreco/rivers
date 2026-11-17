@@ -39,7 +39,7 @@ fn test_in_progress() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
@@ -69,7 +69,7 @@ fn test_execution_failed() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let failed = HashSet::from(["a".to_string()]);
+    let failed = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",

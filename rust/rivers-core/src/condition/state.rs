@@ -140,9 +140,9 @@ pub struct CacheSnapshot<'a> {
     /// Upstream dependencies per asset (precomputed from graph edges).
     pub upstream_deps: &'a HashMap<String, Vec<String>>,
     /// Assets currently part of in-progress (Started) runs.
-    pub in_progress_assets: &'a HashSet<String>,
+    pub in_progress_assets: &'a HashSet<&'a str>,
     /// Assets whose latest run failed.
-    pub failed_assets: &'a HashSet<String>,
+    pub failed_assets: &'a HashSet<&'a str>,
     /// Latest failure timestamp per currently-failed asset.
     pub failed_asset_timestamps: &'a HashMap<String, i64>,
     /// Active backfill state: asset→backfill_ids + backfill_id→partition_keys.

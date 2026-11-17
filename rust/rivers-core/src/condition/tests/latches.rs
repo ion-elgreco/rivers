@@ -297,9 +297,9 @@ fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
     );
     let deps = HashMap::from([("r".to_string(), vec!["a".to_string(), "b".to_string()])]);
 
-    let both = HashSet::from(["a".to_string(), "b".to_string()]);
-    let none: HashSet<String> = HashSet::new();
-    let only_a = HashSet::from(["a".to_string()]);
+    let both = HashSet::from(["a", "b"]);
+    let none: HashSet<&str> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
 
     let r = make_record("r");
     let a = make_materialized_record("a", 100);
@@ -377,8 +377,8 @@ fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
     let tree = ConditionNode::And(vec![agg(), agg()]);
     let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
 
-    let only_a = HashSet::from(["a".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
+    let none: HashSet<&str> = HashSet::new();
     let r = make_record("r");
     let a = make_materialized_record("a", 100);
     let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
@@ -451,8 +451,8 @@ fn assert_unpartitioned_dep_latch_persists(tree: &ConditionNode, latched: &str) 
         ("b".to_string(), vec!["c".to_string()]),
     ]);
 
-    let only_latched = HashSet::from([latched.to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_latched = HashSet::from([latched]);
+    let none: HashSet<&str> = HashSet::new();
 
     let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
     let r_status = crate::condition::cache::PartitionStatusEntry {
@@ -523,8 +523,8 @@ fn test_and_short_circuit_preserves_stateful_child_latch() {
     let deps = HashMap::new();
     let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
     let records = HashMap::from([("r".to_string(), r.clone())]);
-    let only_r = HashSet::from(["r".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_r = HashSet::from(["r"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // Tick 1: gate (InProgress) and trigger (ExecutionFailed) true → Since latches, And fires.
     let mut ctx1 = make_ctx("r", &r, &records, &deps);
@@ -594,8 +594,8 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
     let a = make_materialized_record("a", 100);
     let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
 
-    let only_a = HashSet::from(["a".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // Tue 2023-11-14: 16:00 (tick 1) → 16:31 (tick 2); cron tick at 16:30.
     let t1: i64 = 1_699_977_600_000_000_000;
@@ -686,8 +686,8 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
     let deps = HashMap::new();
     let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
     let records = HashMap::from([("r".to_string(), r.clone())]);
-    let only_r = HashSet::from(["r".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_r = HashSet::from(["r"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // ── Tick 1: gate false, trigger true → Or evaluates the Since (latches true) ──
     let mut ctx1 = make_ctx("r", &r, &records, &deps);

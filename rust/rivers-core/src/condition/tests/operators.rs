@@ -411,7 +411,7 @@ fn test_counter_stability_and_short_circuit() {
     assert_eq!(r1.sub_results.len(), 1);
 
     // Tick 2: InProgress=true (no short-circuit) → NewlyTrue(Missing) fires (inner=true, previous=false).
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
     let mut prev2 = AssetConditionState::default();
     // No previous results → NewlyTrue fires
     let ctx2 = EvalContext {

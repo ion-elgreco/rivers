@@ -509,26 +509,26 @@ impl ConditionPass {
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         let now_local = crate::util::local_datetime(now);
         let time_windows = TimeWindowResolver::new(&self.time_window_sources, now_local);
-        let in_progress_keys: HashSet<String> = self
+        let in_progress_keys: HashSet<&str> = self
             .cache
             .in_progress_assets
             .keys()
             .chain(self.cache.remote_in_progress_keys())
-            .cloned()
+            .map(String::as_str)
             .collect();
 
-        let failed_keys: HashSet<String> = self
+        let failed_keys: HashSet<&str> = self
             .cache
             .failed_assets
             .iter()
             .chain(self.cache.remote_failed_keys())
-            .cloned()
+            .map(String::as_str)
             .chain(
                 self.cache
                     .partition_status
                     .iter()
                     .filter(|(_, status)| !status.failed.is_empty())
-                    .map(|(key, _)| key.clone()),
+                    .map(|(key, _)| key.as_str()),
             )
             .collect();
 

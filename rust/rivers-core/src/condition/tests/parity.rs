@@ -39,13 +39,13 @@ fn parity_eval_pair(
     let records = HashMap::from([(key.to_string(), record.clone())]);
     let deps = HashMap::new();
 
-    let in_progress_assets: HashSet<String> = if scn.in_progress {
-        HashSet::from([key.to_string()])
+    let in_progress_assets: HashSet<&str> = if scn.in_progress {
+        HashSet::from([key])
     } else {
         HashSet::new()
     };
-    let failed_assets: HashSet<String> = if scn.failed {
-        HashSet::from([key.to_string()])
+    let failed_assets: HashSet<&str> = if scn.failed {
+        HashSet::from([key])
     } else {
         HashSet::new()
     };
