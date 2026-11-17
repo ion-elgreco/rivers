@@ -501,8 +501,7 @@ pub fn AssetsListPage() -> impl IntoView {
                     let key_for_check = key.clone();
                     let key_for_toggle = key.clone();
                     let href = loc_path(loc_ns, loc_name, &format!("assets/{}", key));
-                    let info: Option<crate::types::AssetDefinitionInfo> = info_map.get(&key).cloned();
-                    let asset_type = info.as_ref().map(|i| i.asset_type.clone()).unwrap_or_default();
+                    let asset_type = info_map.get(&key).map(|i| i.asset_type.clone()).unwrap_or_default();
                     let kinds_str = record.kinds.join(", ");
                     let kinds_for_badge = record.kinds.first().cloned().unwrap_or_else(|| "—".into());
                     let group = record.asset_group.clone().unwrap_or_default();
