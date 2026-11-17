@@ -327,13 +327,10 @@ async fn write_failures(
     cl: &str,
     asset_key: &str,
     deletions: &Deletions,
-    failures: &[(PartitionKey, i64, String)],
+    mut failures: Vec<&(PartitionKey, i64, String)>,
     run_end: bool,
 ) -> Result<()> {
-    let failures: Vec<&(PartitionKey, i64, String)> = failures
-        .iter()
-        .filter(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at))
-        .collect();
+    failures.retain(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at));
     if failures.is_empty() {
         return Ok(());
     }
@@ -665,10 +662,10 @@ impl SurrealStorage {
                 // commits after this makes the transaction retry.
                 let chunk = match failed_run {
                     Some(run_id) => not_built_by(&self.db, asset_key, run_id, chunk).await?,
-                    None => chunk.to_vec(),
+                    None => chunk.iter().collect(),
                 };
                 let run_end = failed_run.is_some();
-                write_failures(&txn, cl, asset_key, &deletions, &chunk, run_end).await?;
+                write_failures(&txn, cl, asset_key, &deletions, chunk, run_end).await?;
                 txn.commit().await?;
                 Ok(())
             })
@@ -1287,18 +1284,17 @@ async fn materialized_by_runs(
 
 /// The failures of `failures` whose partition the run `run_id` did not
 /// materialize.
-async fn not_built_by(
+async fn not_built_by<'a>(
     db: &Surreal<Any>,
     asset_key: &str,
     run_id: &str,
-    failures: &[(PartitionKey, i64, String)],
-) -> Result<Vec<(PartitionKey, i64, String)>> {
+    failures: &'a [(PartitionKey, i64, String)],
+) -> Result<Vec<&'a (PartitionKey, i64, String)>> {
     let built = materialized_by_runs(db, Some(asset_key), &[run_id.to_string()]).await?;
     let done = built.get(&(asset_key.to_string(), run_id.to_string()));
     Ok(failures
         .iter()
         .filter(|(key, _, _)| done.is_none_or(|done| !done.contains(key)))
-        .cloned()
         .collect())
 }
 
