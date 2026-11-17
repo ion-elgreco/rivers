@@ -182,8 +182,8 @@ impl RegistryClient {
     pub async fn resolve(&self, req: &ResolveRequest) -> Result<Resolution, RegistryError> {
         let (registry, repository) = parse_image_ref(&req.image)?;
         let key = CacheKey {
-            registry: registry.clone(),
-            repository: repository.clone(),
+            registry,
+            repository,
             tag: req.tag.clone(),
         };
 
@@ -191,23 +191,23 @@ impl RegistryClient {
             return Ok(hit);
         }
 
-        if let Some(pause) = self.registry_pause(&registry).await {
-            metrics::registry_request(&registry, "rate_limited_cached");
+        if let Some(pause) = self.registry_pause(&key.registry).await {
+            metrics::registry_request(&key.registry, "rate_limited_cached");
             return Err(RegistryError::RateLimited { retry_after: pause });
         }
 
         let previous_etag = self.previous_etag(&key).await;
         let outcome = self
             .head_manifest(
-                &registry,
-                &repository,
+                &key.registry,
+                &key.repository,
                 &req.tag,
                 &req.auth,
                 previous_etag.as_deref(),
             )
             .await;
 
-        self.record_outcome(&key, req, outcome).await
+        self.record_outcome(key, req, outcome).await
     }
 
     async fn cache_lookup(&self, key: &CacheKey, req: &ResolveRequest) -> Option<Resolution> {
@@ -259,7 +259,7 @@ impl RegistryClient {
 
     async fn record_outcome(
         &self,
-        key: &CacheKey,
+        key: CacheKey,
         req: &ResolveRequest,
         outcome: Result<HeadOutcome, RegistryError>,
     ) -> Result<Resolution, RegistryError> {
@@ -267,8 +267,9 @@ impl RegistryClient {
         match outcome {
             Ok(HeadOutcome::Fresh { digest, etag }) => {
                 let immutable = req.immutable_hint || looks_immutable(&req.tag);
+                metrics::registry_request(&key.registry, "resolved");
                 state.entries.insert(
-                    key.clone(),
+                    key,
                     CacheEntry {
                         digest: digest.clone(),
                         etag,
@@ -278,11 +279,10 @@ impl RegistryClient {
                         consecutive_errors: 0,
                     },
                 );
-                metrics::registry_request(&key.registry, "resolved");
                 Ok(Resolution::Resolved { digest })
             }
             Ok(HeadOutcome::NotModified) => {
-                let Some(entry) = state.entries.get_mut(key) else {
+                let Some(entry) = state.entries.get_mut(&key) else {
                     // NotModified without a prior entry shouldn't happen (we
                     // only send If-None-Match when we have one), but treat as
                     // transient.
@@ -301,26 +301,26 @@ impl RegistryClient {
             }
             Err(RegistryError::RateLimited { retry_after }) => {
                 let deadline = Instant::now() + retry_after;
-                state.rate_limited.insert(key.registry.clone(), deadline);
-                if let Some(entry) = state.entries.get_mut(key) {
+                if let Some(entry) = state.entries.get_mut(&key) {
                     entry.next_attempt_after = Some(deadline);
                 }
                 metrics::registry_request(&key.registry, "rate_limited");
+                state.rate_limited.insert(key.registry, deadline);
                 Err(RegistryError::RateLimited { retry_after })
             }
             Err(e @ RegistryError::NotFound) => {
                 // Terminal for this tag — drop any cached entry.
-                state.entries.remove(key);
+                state.entries.remove(&key);
                 metrics::registry_request(&key.registry, "not_found");
                 Err(e)
             }
             Err(e @ RegistryError::AuthFailed) => {
-                state.entries.remove(key);
+                state.entries.remove(&key);
                 metrics::registry_request(&key.registry, "auth_failed");
                 Err(e)
             }
             Err(e @ (RegistryError::Transient(_) | RegistryError::Malformed(_))) => {
-                if let Some(entry) = state.entries.get_mut(key) {
+                if let Some(entry) = state.entries.get_mut(&key) {
                     entry.consecutive_errors = entry.consecutive_errors.saturating_add(1);
                     let backoff = exponential_backoff(entry.consecutive_errors, self.max_backoff);
                     entry.next_attempt_after = Some(Instant::now() + backoff);
@@ -369,7 +369,7 @@ impl RegistryClient {
             };
 
             let token = self.fetch_bearer_token(&challenge, auth).await?;
-            let mut retry_headers = headers.clone();
+            let mut retry_headers = headers;
             retry_headers.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {token}"))
