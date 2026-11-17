@@ -61,22 +61,21 @@ pub fn definitions_by_key(
 /// Without definitions (still loading, or the code location is down), the
 /// records are all there is.
 pub fn defined_assets(
-    records: Vec<crate::types::AssetRecord>,
+    records: &[crate::types::AssetRecord],
     definitions: Option<&[crate::types::AssetDefinitionInfo]>,
 ) -> Vec<crate::types::AssetRecord> {
     let Some(definitions) = definitions else {
-        return records;
+        return records.to_vec();
     };
-    let mut by_key: std::collections::HashMap<String, crate::types::AssetRecord> = records
-        .into_iter()
-        .map(|r| (r.asset_key.clone(), r))
-        .collect();
+    let mut by_key: std::collections::HashMap<&str, &crate::types::AssetRecord> =
+        records.iter().map(|r| (r.asset_key.as_str(), r)).collect();
 
     definitions
         .iter()
         .map(|d| {
             by_key
-                .remove(&d.asset_key)
+                .remove(d.asset_key.as_str())
+                .cloned()
                 .unwrap_or_else(|| crate::types::AssetRecord {
                     asset_key: d.asset_key.clone(),
                     tags: d.tags.clone(),
@@ -130,7 +129,7 @@ mod tests {
         weekly.group = Some("sales".to_string());
         let definitions = vec![make_info("orders", None), weekly];
 
-        let listed = defined_assets(records, Some(&definitions));
+        let listed = defined_assets(&records, Some(&definitions));
 
         assert_eq!(keys(&listed), ["orders", "weekly_revenue"]);
         assert_eq!(listed[0].stale_status, StaleStatus::UpToDate);
@@ -144,6 +143,6 @@ mod tests {
     fn defined_assets_without_definitions_keeps_the_records() {
         let records = vec![record("orders", StaleStatus::UpToDate)];
 
-        assert_eq!(keys(&defined_assets(records, None)), ["orders"]);
+        assert_eq!(keys(&defined_assets(&records, None)), ["orders"]);
     }
 }

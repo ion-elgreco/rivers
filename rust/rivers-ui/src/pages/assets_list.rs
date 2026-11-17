@@ -58,9 +58,19 @@ pub fn AssetsListPage() -> impl IntoView {
     );
 
     let all_records = move || -> Vec<AssetRecord> {
-        let records = all_assets.get().and_then(|r| r.ok()).unwrap_or_default();
-        let definitions = assets_info.get().and_then(|r| r.ok());
-        crate::helpers::defined_assets(records, definitions.as_deref())
+        let records = all_assets.read();
+        let definitions = assets_info.read();
+        crate::helpers::defined_assets(
+            records
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            definitions
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(Vec::as_slice),
+        )
     };
 
     let unique_tags = move || {
@@ -231,10 +241,13 @@ pub fn AssetsListPage() -> impl IntoView {
 
         let sort_field = sort_by.get();
         let asc = sort_asc.get();
-        let infos_for_sort = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-        let type_map: std::collections::HashMap<String, String> = infos_for_sort
+        let infos_for_sort = assets_info.read();
+        let type_map: std::collections::HashMap<&str, &str> = infos_for_sort
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .into_iter()
-            .map(|i| (i.asset_key.clone(), i.asset_type.clone()))
+            .flatten()
+            .map(|i| (i.asset_key.as_str(), i.asset_type.as_str()))
             .collect();
 
         records.sort_by(|a, b| {
@@ -247,9 +260,15 @@ pub fn AssetsListPage() -> impl IntoView {
                     .cmp(&b.kinds.first().cloned().unwrap_or_default()),
                 "group" => a.asset_group.cmp(&b.asset_group),
                 "type" => {
-                    let at = type_map.get(&a.asset_key).cloned().unwrap_or_default();
-                    let bt = type_map.get(&b.asset_key).cloned().unwrap_or_default();
-                    at.cmp(&bt)
+                    let at = type_map
+                        .get(a.asset_key.as_str())
+                        .copied()
+                        .unwrap_or_default();
+                    let bt = type_map
+                        .get(b.asset_key.as_str())
+                        .copied()
+                        .unwrap_or_default();
+                    at.cmp(bt)
                 }
                 "tags" => {
                     let at = a.tags.first().cloned().unwrap_or_default();
@@ -465,15 +484,22 @@ pub fn AssetsListPage() -> impl IntoView {
 
         <Transition fallback=move || view! { <TableSkeleton rows=8 cols=7/> }>
             {move || {
-                if let Some(Err(e)) = all_assets.get() {
+                if let Some(Err(e)) = &*all_assets.read() {
                     return view! {
-                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div>
+                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(e))}</div>
                     }.into_any();
                 }
                 let records = sorted_filtered();
-                let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-                let info_map: std::collections::HashMap<String, _> = infos.into_iter().map(|i| (i.asset_key.clone(), i)).collect();
-                let topo = graph.get().and_then(|r| r.ok());
+                let infos = assets_info.read();
+                let types: std::collections::HashMap<&str, &str> = infos
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .into_iter()
+                    .flatten()
+                    .map(|i| (i.asset_key.as_str(), i.asset_type.as_str()))
+                    .collect();
+                let topology = graph.read();
+                let topo = topology.as_ref().and_then(|r| r.as_ref().ok());
 
                 if records.is_empty() {
                     return view! { <EmptyState message="No assets match the filters" hint="Clear a filter to see more"/> }.into_any();
@@ -490,10 +516,10 @@ pub fn AssetsListPage() -> impl IntoView {
 
                 fn render_row(
                     record: crate::types::AssetRecord,
-                    info_map: &std::collections::HashMap<String, crate::types::AssetDefinitionInfo>,
+                    types: &std::collections::HashMap<&str, &str>,
                     selected: ReadSignal<Vec<String>>,
                     set_selected: WriteSignal<Vec<String>>,
-                    topo: &Option<crate::types::GraphTopology>,
+                    topo: Option<&crate::types::GraphTopology>,
                     loc_ns: &str,
                     loc_name: &str,
                 ) -> impl IntoView + use<> {
@@ -501,7 +527,7 @@ pub fn AssetsListPage() -> impl IntoView {
                     let key_for_check = key.clone();
                     let key_for_toggle = key.clone();
                     let href = loc_path(loc_ns, loc_name, &format!("assets/{}", key));
-                    let asset_type = info_map.get(&key).map(|i| i.asset_type.clone()).unwrap_or_default();
+                    let asset_type = types.get(key.as_str()).map(|t| t.to_string()).unwrap_or_default();
                     let kinds_str = record.kinds.join(", ");
                     let kinds_for_badge = record.kinds.first().cloned().unwrap_or_else(|| "—".into());
                     let group = record.asset_group.clone().unwrap_or_default();
@@ -621,7 +647,7 @@ pub fn AssetsListPage() -> impl IntoView {
                         </div>
                         {{
                             let (lns, lnm) = loc.get();
-                            attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            attention.into_iter().map(|r| render_row(r, &types, selected, set_selected, topo, &lns, &lnm)).collect::<Vec<_>>()
                         }}
                         {(n_attention > 0 && !healthy.is_empty()).then(|| view! {
                             <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:var(--fs-2xs); font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
@@ -631,7 +657,7 @@ pub fn AssetsListPage() -> impl IntoView {
                         })}
                         {{
                             let (lns, lnm) = loc.get();
-                            healthy.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            healthy.into_iter().map(|r| render_row(r, &types, selected, set_selected, topo, &lns, &lnm)).collect::<Vec<_>>()
                         }}
                     </div>
                 }.into_any()
