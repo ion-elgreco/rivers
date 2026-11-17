@@ -1156,6 +1156,8 @@ mod read {
 
     #[cfg(test)]
     mod tests {
+        use std::borrow::Cow;
+
         use rivers_api::rivers::PartitionKeyGroup;
         use rivers_core::execution::backfill::plan_runs;
         use rivers_core::storage::{
@@ -1264,8 +1266,8 @@ mod read {
                 self.keys.len()
             }
 
-            fn key(&self, index: usize) -> String {
-                self.keys[index].clone()
+            fn key(&self, index: usize) -> Cow<'_, str> {
+                Cow::Borrowed(&self.keys[index])
             }
 
             fn cuts(&self, key: &str) -> Vec<usize> {
