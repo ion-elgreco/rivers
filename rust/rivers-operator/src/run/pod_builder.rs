@@ -6,24 +6,26 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference}
 use kube_client::ResourceExt;
 use rivers_k8s::crd::code_location::CodeLocationSpec;
 use rivers_k8s::crd::run::Run;
-use rivers_k8s::workspace::{self, PodGraft, WorkspaceSpec};
+use rivers_k8s::workspace::{self, PodGraft, WorkspacePodPieces, WorkspaceSpec};
 
 use crate::codelocation::WorkspaceConfig;
 
-/// Consumer-side workspace for a git-mode run, or `None` for image mode.
-/// Derived from the Run's stamped `spec.source`, its CodeLocation's spec and
-/// the chart config; the same spec shape the step-Job builder rebuilds
+/// Consumer-side workspace pieces for a git-mode run, or `None` for image
+/// mode. Derived from the Run's stamped `spec.source`, its CodeLocation's spec
+/// and the chart config; the same spec shape the step-Job builder rebuilds
 /// in-pod from `RIVERS_RUN_SOURCE`. `spec.image` runs on that tree.
-fn run_workspace_spec(
+fn run_workspace_pieces(
     run: &Run,
     workspace_cfg: &WorkspaceConfig,
     cl_spec: &CodeLocationSpec,
-) -> Option<WorkspaceSpec> {
-    run.spec.source.as_ref().map(|source| WorkspaceSpec {
-        source: source.clone(),
-        volume: workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec),
-        extra_env: cl_spec.env.clone(),
-    })
+) -> Option<WorkspacePodPieces> {
+    let source = run.spec.source.as_ref()?;
+    let volume = workspace_cfg.volume(&run.spec.code_location_ref.name, cl_spec);
+    Some(workspace::consumer_pod_pieces(&WorkspaceSpec {
+        source,
+        volume: &volume,
+        extra_env: &cl_spec.env,
+    }))
 }
 
 /// `resume = true` flips the `rivers execute` invocation to resume mode
@@ -50,11 +52,7 @@ pub fn build_executor_pod(
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
-    let graft = PodGraft::from(
-        run_workspace_spec(run, workspace_cfg, cl_spec)
-            .as_ref()
-            .map(workspace::consumer_pod_pieces),
-    );
+    let graft = PodGraft::from(run_workspace_pieces(run, workspace_cfg, cl_spec));
 
     Pod {
         metadata: ObjectMeta {
@@ -369,9 +367,7 @@ mod tests {
             &Default::default(),
             &shared,
         );
-        let pieces = workspace::consumer_pod_pieces(
-            &run_workspace_spec(&run, &shared, &CodeLocationSpec::default()).unwrap(),
-        );
+        let pieces = run_workspace_pieces(&run, &shared, &CodeLocationSpec::default()).unwrap();
         let pod_spec = pod.spec.unwrap();
         assert!(pod_spec.init_containers.is_none(), "shared consumer");
         let c = &pod_spec.containers[0];
@@ -550,9 +546,9 @@ mod tests {
             cl.spec.env = user_env.clone();
             let volume = workspace_cfg.volume(&cl.name_any(), &cl.spec);
             let tree = || WorkspaceSpec {
-                source: source.clone(),
-                volume: volume.clone(),
-                extra_env: cl.spec.env.clone(),
+                source: &source,
+                volume: &volume,
+                extra_env: &cl.spec.env,
             };
 
             // The code-location pod that built the tree the run is stamped with.
@@ -602,7 +598,7 @@ mod tests {
                     run_cr_uid: String::new(),
                     code_location_id: run.spec.code_location_ref.identity.clone(),
                     extra_env: cl.spec.env.clone(),
-                    workspace: Some(tree()),
+                    workspace: Some((source.clone(), volume.clone())),
                 },
                 "train",
             )

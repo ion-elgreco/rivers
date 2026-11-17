@@ -35,10 +35,14 @@ pub struct K8sStepExecutorConfig {
     /// verbatim onto every step pod's container so `valueFrom.secretKeyRef` /
     /// `configMapKeyRef` / `fieldRef` semantics are preserved end-to-end.
     pub extra_env: Vec<EnvVar>,
-    /// Git-mode workspace: when set, each step Job mounts the
-    /// materialized tree (read-only in shared mode; built per pod in
-    /// fallback mode) and runs the venv's `rivers` from the checkout.
-    pub workspace: Option<crate::workspace::WorkspaceSpec>,
+    /// Git-mode workspace, the tree and the volume it lives on: when set,
+    /// each step Job mounts the materialized tree (read-only in shared mode;
+    /// built per pod in fallback mode) and runs the venv's `rivers` from the
+    /// checkout.
+    pub workspace: Option<(
+        crate::crd::run::RunSource,
+        crate::workspace::WorkspaceVolume,
+    )>,
 }
 
 impl K8sStepExecutorConfig {
@@ -47,14 +51,18 @@ impl K8sStepExecutorConfig {
     /// it; `worker_image` runs on that tree. Image mode leaves `workspace`
     /// unset.
     pub fn with_detected_workspace(mut self) -> Self {
-        self.workspace = crate::env::detect_git_workspace().map(|(source, volume)| {
-            crate::workspace::WorkspaceSpec {
+        self.workspace = crate::env::detect_git_workspace();
+        self
+    }
+
+    fn workspace_spec(&self) -> Option<crate::workspace::WorkspaceSpec<'_>> {
+        self.workspace
+            .as_ref()
+            .map(|(source, volume)| crate::workspace::WorkspaceSpec {
                 source,
                 volume,
-                extra_env: self.extra_env.clone(),
-            }
-        });
-        self
+                extra_env: &self.extra_env,
+            })
     }
 }
 
@@ -212,7 +220,7 @@ fn build_job_inner(
 
     let graft = crate::workspace::PodGraft::from(
         config
-            .workspace
+            .workspace_spec()
             .as_ref()
             .map(crate::workspace::consumer_pod_pieces),
     );
@@ -372,7 +380,12 @@ mod tests {
         }
     }
 
-    fn git_workspace(volume: crate::workspace::WorkspaceVolume) -> crate::workspace::WorkspaceSpec {
+    fn git_workspace(
+        volume: crate::workspace::WorkspaceVolume,
+    ) -> (
+        crate::crd::run::RunSource,
+        crate::workspace::WorkspaceVolume,
+    ) {
         let source: crate::crd::run::RunSource = serde_json::from_value(serde_json::json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
@@ -385,11 +398,7 @@ mod tests {
             "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dffff",
         }))
         .unwrap();
-        crate::workspace::WorkspaceSpec {
-            source,
-            volume,
-            extra_env: vec![],
-        }
+        (source, volume)
     }
 
     #[test]
@@ -400,7 +409,7 @@ mod tests {
                 claim_name: "analytics-workspace".to_string(),
             },
         ));
-        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let pieces = crate::workspace::consumer_pod_pieces(&config.workspace_spec().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 
@@ -433,7 +442,7 @@ mod tests {
         config.workspace = Some(git_workspace(crate::workspace::WorkspaceVolume::EmptyDir {
             size_limit: None,
         }));
-        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let pieces = crate::workspace::consumer_pod_pieces(&config.workspace_spec().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 

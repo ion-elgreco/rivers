@@ -61,19 +61,19 @@ pub enum WorkspaceVolume {
     EmptyDir { size_limit: Option<Quantity> },
 }
 
-/// A tree and the volume it lives on.
-#[derive(Clone, Debug)]
-pub struct WorkspaceSpec {
+/// A tree and the volume it lives on, borrowed for one build.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceSpec<'a> {
     /// The tree: [`RunSource::workspace_key`] is its subpath on the volume,
     /// and the pods that run it carry it in `RIVERS_RUN_SOURCE`.
-    pub source: RunSource,
-    pub volume: WorkspaceVolume,
+    pub source: &'a RunSource,
+    pub volume: &'a WorkspaceVolume,
     /// The CL's `spec.env`, applied to the init container too (RFC-036
     /// extended: `UV_INDEX_URL` & co. are needed at install time).
-    pub extra_env: Vec<EnvVar>,
+    pub extra_env: &'a [EnvVar],
 }
 
-impl WorkspaceSpec {
+impl WorkspaceSpec<'_> {
     /// The project directory: the checkout plus `path`.
     fn working_dir(&self) -> String {
         match self
@@ -203,7 +203,7 @@ fn pod_pieces(spec: &WorkspaceSpec, shape: Shape) -> WorkspacePodPieces {
     let read_only = matches!(shape, Shape::Mounts);
     let mut pieces = WorkspacePodPieces {
         init_containers: Vec::new(),
-        volumes: vec![workspace_volume(&spec.volume, read_only)],
+        volumes: vec![workspace_volume(spec.volume, read_only)],
         main_command: vec![VENV_RIVERS_BIN.to_string()],
         main_working_dir: spec.working_dir(),
         main_mounts: vec![workspace_mount(&key, read_only)],
@@ -222,7 +222,7 @@ fn pod_pieces(spec: &WorkspaceSpec, shape: Shape) -> WorkspacePodPieces {
 fn sync_init_container(spec: &WorkspaceSpec, key: &str, build: Build) -> Container {
     let git = &spec.source.git;
     let mut env = vec![
-        run_source_env(&spec.source),
+        run_source_env(spec.source),
         env_var("UV_PROJECT_ENVIRONMENT", VENV_PATH),
     ];
     // A fallback pod's cache is never reused, and it would hold a second copy
@@ -390,9 +390,9 @@ fn main_env(spec: &WorkspaceSpec) -> Vec<EnvVar> {
         env_var("VIRTUAL_ENV", VENV_PATH),
         // In the pod template ⇒ a new commit rolls the Deployment.
         env_var("RIVERS_GIT_COMMIT", &spec.source.git.commit),
-        run_source_env(&spec.source),
+        run_source_env(spec.source),
     ];
-    match &spec.volume {
+    match spec.volume {
         WorkspaceVolume::SharedPvc { claim_name } => {
             env.push(env_var(crate::env::ENV_WORKSPACE_PVC, claim_name));
         }
@@ -423,8 +423,25 @@ mod tests {
         }
     }
 
-    fn spec(volume: WorkspaceVolume) -> WorkspaceSpec {
-        WorkspaceSpec {
+    /// The tree of the tests on a volume, with the CL's env.
+    struct Tree {
+        source: RunSource,
+        volume: WorkspaceVolume,
+        extra_env: Vec<EnvVar>,
+    }
+
+    impl Tree {
+        fn spec(&self) -> WorkspaceSpec<'_> {
+            WorkspaceSpec {
+                source: &self.source,
+                volume: &self.volume,
+                extra_env: &self.extra_env,
+            }
+        }
+    }
+
+    fn tree(volume: WorkspaceVolume) -> Tree {
+        Tree {
             source: RunSource {
                 git: GitCoordinates {
                     url: "https://forge.example/acme/pipelines.git".to_string(),
@@ -445,7 +462,7 @@ mod tests {
         }
     }
 
-    /// `spec()`'s tree, as `RIVERS_RUN_SOURCE` carries it.
+    /// `tree()`'s source, as `RIVERS_RUN_SOURCE` carries it.
     const SOURCE_JSON: &str = concat!(
         r#"{"git":{"url":"https://forge.example/acme/pipelines.git","#,
         r#""commit":"9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8","#,
@@ -477,7 +494,7 @@ mod tests {
 
     #[test]
     fn builder_shared_golden() {
-        let pieces = builder_pod_pieces(&spec(shared()), &prune());
+        let pieces = builder_pod_pieces(&tree(shared()).spec(), &prune());
         assert_eq!(
             serde_json::to_value(&pieces.init_containers).unwrap(),
             json!([{
@@ -544,8 +561,8 @@ mod tests {
 
     #[test]
     fn fallback_pods_differ_from_the_shared_builder_only_where_documented() {
-        let shared_pieces = builder_pod_pieces(&spec(shared()), &prune());
-        let fb = consumer_pod_pieces(&spec(fallback()));
+        let shared_pieces = builder_pod_pieces(&tree(shared()).spec(), &prune());
+        let fb = consumer_pod_pieces(&tree(fallback()).spec());
 
         // emptyDir volumes stanza.
         assert_eq!(
@@ -609,7 +626,7 @@ mod tests {
 
     #[test]
     fn the_fallback_code_location_pod_is_built_like_its_run_pods() {
-        let cl_pod = builder_pod_pieces(&spec(fallback()), &prune());
+        let cl_pod = builder_pod_pieces(&tree(fallback()).spec(), &prune());
         let prune_env: Vec<_> = cl_pod.init_containers[0]
             .env
             .iter()
@@ -621,13 +638,13 @@ mod tests {
         assert_eq!(prune_env, Vec::<&str>::new());
         assert_eq!(
             serde_json::to_value(&cl_pod).unwrap(),
-            serde_json::to_value(consumer_pod_pieces(&spec(fallback()))).unwrap()
+            serde_json::to_value(consumer_pod_pieces(&tree(fallback()).spec())).unwrap()
         );
     }
 
     #[test]
     fn the_builder_tells_its_prune_which_tree_it_mounts() {
-        let pieces = builder_pod_pieces(&spec(shared()), &prune());
+        let pieces = builder_pod_pieces(&tree(shared()).spec(), &prune());
         let init = &pieces.init_containers[0];
         let key = init
             .env
@@ -650,7 +667,7 @@ mod tests {
 
     #[test]
     fn consumer_shared_has_no_init_no_creds_and_readonly_mount() {
-        let pieces = consumer_pod_pieces(&spec(shared()));
+        let pieces = consumer_pod_pieces(&tree(shared()).spec());
 
         // The negative assertions ARE the design (RFC: "consumers need no
         // init container") — pin them as tightly as the positives.
@@ -672,13 +689,13 @@ mod tests {
         );
         assert_eq!(
             pieces.main_env,
-            builder_pod_pieces(&spec(shared()), &prune()).main_env
+            builder_pod_pieces(&tree(shared()).spec(), &prune()).main_env
         );
     }
 
     #[test]
     fn consumer_fallback_builds_its_own_tree() {
-        let pieces = consumer_pod_pieces(&spec(fallback()));
+        let pieces = consumer_pod_pieces(&tree(fallback()).spec());
         assert_eq!(pieces.init_containers.len(), 1, "fallback consumers sync");
         // …but never prune: no /workspaces mount, no keep-set env.
         let init = &pieces.init_containers[0];
@@ -717,19 +734,19 @@ mod tests {
         for (shape, pieces, cache_env, cache_mounts) in [
             (
                 "builder shared",
-                builder_pod_pieces(&spec(shared()), &prune()),
+                builder_pod_pieces(&tree(shared()).spec(), &prune()),
                 json!([{ "name": "UV_CACHE_DIR", "value": "/uv-cache" }]),
                 json!([{ "name": "workspace", "mountPath": "/uv-cache", "subPath": "cache" }]),
             ),
             (
                 "builder fallback",
-                builder_pod_pieces(&spec(fallback()), &prune()),
+                builder_pod_pieces(&tree(fallback()).spec(), &prune()),
                 json!([{ "name": "UV_NO_CACHE", "value": "1" }]),
                 json!([]),
             ),
             (
                 "consumer fallback",
-                consumer_pod_pieces(&spec(fallback())),
+                consumer_pod_pieces(&tree(fallback()).spec()),
                 json!([{ "name": "UV_NO_CACHE", "value": "1" }]),
                 json!([]),
             ),
@@ -764,14 +781,20 @@ mod tests {
         for (shape, pieces) in [
             (
                 "builder shared",
-                builder_pod_pieces(&spec(shared()), &prune()),
+                builder_pod_pieces(&tree(shared()).spec(), &prune()),
             ),
             (
                 "builder fallback",
-                builder_pod_pieces(&spec(fallback()), &prune()),
+                builder_pod_pieces(&tree(fallback()).spec(), &prune()),
             ),
-            ("consumer shared", consumer_pod_pieces(&spec(shared()))),
-            ("consumer fallback", consumer_pod_pieces(&spec(fallback()))),
+            (
+                "consumer shared",
+                consumer_pod_pieces(&tree(shared()).spec()),
+            ),
+            (
+                "consumer fallback",
+                consumer_pod_pieces(&tree(fallback()).spec()),
+            ),
         ] {
             let pythonpath: Vec<_> = pieces
                 .main_env
@@ -805,9 +828,9 @@ mod tests {
             ),
             (Some("/deep/dir/"), "/workspace/src/deep/dir"),
         ] {
-            let mut s = spec(shared());
+            let mut s = tree(shared());
             s.source.git.path = path.map(str::to_string);
-            assert_eq!(s.working_dir(), dir, "{path:?}");
+            assert_eq!(s.spec().working_dir(), dir, "{path:?}");
         }
     }
 
@@ -816,14 +839,20 @@ mod tests {
         for (shape, pieces) in [
             (
                 "builder shared",
-                builder_pod_pieces(&spec(shared()), &prune()),
+                builder_pod_pieces(&tree(shared()).spec(), &prune()),
             ),
             (
                 "builder fallback",
-                builder_pod_pieces(&spec(fallback()), &prune()),
+                builder_pod_pieces(&tree(fallback()).spec(), &prune()),
             ),
-            ("consumer shared", consumer_pod_pieces(&spec(shared()))),
-            ("consumer fallback", consumer_pod_pieces(&spec(fallback()))),
+            (
+                "consumer shared",
+                consumer_pod_pieces(&tree(shared()).spec()),
+            ),
+            (
+                "consumer fallback",
+                consumer_pod_pieces(&tree(fallback()).spec()),
+            ),
         ] {
             assert_eq!(
                 serde_json::to_value(&pieces.pod_security_context).unwrap(),
@@ -835,18 +864,19 @@ mod tests {
 
     #[test]
     fn user_env_replaces_same_named_sync_env() {
-        let mut s = spec(shared());
+        let mut s = tree(shared());
         s.extra_env.push(EnvVar {
             name: "UV_COMPILE_BYTECODE".to_string(),
             value: Some("0".to_string()),
             ..Default::default()
         });
+        let empty_dir = fallback();
         let fb = WorkspaceSpec {
-            volume: fallback(),
-            ..s.clone()
+            volume: &empty_dir,
+            ..s.spec()
         };
         for (shape, pieces) in [
-            ("builder shared", builder_pod_pieces(&s, &prune())),
+            ("builder shared", builder_pod_pieces(&s.spec(), &prune())),
             ("builder fallback", builder_pod_pieces(&fb, &prune())),
             ("consumer fallback", consumer_pod_pieces(&fb)),
         ] {
@@ -863,9 +893,9 @@ mod tests {
 
     #[test]
     fn anonymous_spec_omits_credentials_everywhere() {
-        let mut s = spec(shared());
+        let mut s = tree(shared());
         s.source.git.secret_name = None;
-        let pieces = builder_pod_pieces(&s, &prune());
+        let pieces = builder_pod_pieces(&s.spec(), &prune());
         let all = serde_json::to_value(&pieces).unwrap().to_string();
         assert!(!all.contains("git-credentials"), "{all}");
     }

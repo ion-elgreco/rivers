@@ -836,7 +836,7 @@ mod tests {
         let git = cl.spec.git.as_ref().unwrap();
         rivers_k8s::workspace::builder_pod_pieces(
             &rivers_k8s::workspace::WorkspaceSpec {
-                source: rivers_k8s::crd::run::RunSource {
+                source: &rivers_k8s::crd::run::RunSource {
                     git: rivers_k8s::crd::run::GitCoordinates {
                         url: git.url.clone(),
                         commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
@@ -847,8 +847,8 @@ mod tests {
                     dependencies: git.dependencies.clone(),
                     runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
                 },
-                volume,
-                extra_env: cl.spec.env.clone(),
+                volume: &volume,
+                extra_env: &cl.spec.env,
             },
             &crate::codelocation::WorkspaceConfig::default().prune("analytics"),
         )

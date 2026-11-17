@@ -988,9 +988,9 @@ mod tests {
         ] {
             let pod_env = builder_pod_pieces(
                 &WorkspaceSpec {
-                    source: source.clone(),
-                    volume: volume.clone(),
-                    extra_env: vec![],
+                    source: &source,
+                    volume: &volume,
+                    extra_env: &[],
                 },
                 &prune(),
             )
@@ -1045,9 +1045,9 @@ mod tests {
         ] {
             // The run executor pod's workspace env, as the operator builds it.
             let run_pod = consumer_pod_pieces(&WorkspaceSpec {
-                source: source.clone(),
-                volume,
-                extra_env: vec![],
+                source: &source,
+                volume: &volume,
+                extra_env: &[],
             });
 
             // What the in-pod Kubernetes step executor does with that env.
@@ -1151,9 +1151,9 @@ mod tests {
         ] {
             let cl_pod = builder_pod_pieces(
                 &WorkspaceSpec {
-                    source: source.clone(),
-                    volume: volume.clone(),
-                    extra_env: vec![],
+                    source: &source,
+                    volume: &volume,
+                    extra_env: &[],
                 },
                 &prune(),
             );
@@ -1161,9 +1161,9 @@ mod tests {
             let run_source = with_vars(&workspace_vars(&cl_pod.main_env), detect_run_source)
                 .expect("the code-location pod hands on its source");
             let run_pod = consumer_pod_pieces(&WorkspaceSpec {
-                source: run_source,
-                volume,
-                extra_env: vec![],
+                source: &run_source,
+                volume: &volume,
+                extra_env: &[],
             });
             let config = with_vars(&workspace_vars(&run_pod.main_env), || {
                 step_config("ghcr.io/acme/rivers-runtime:0.5.0").with_detected_workspace()
@@ -1216,7 +1216,7 @@ mod tests {
         ] {
             let cl_pod = builder_pod_pieces(
                 &WorkspaceSpec {
-                    source: RunSource {
+                    source: &RunSource {
                         git: GitCoordinates {
                             url: "https://forge.example/acme/pipelines.git".to_string(),
                             commit: commit.to_string(),
@@ -1227,8 +1227,8 @@ mod tests {
                         dependencies: Default::default(),
                         runtime_image: runtime.clone(),
                     },
-                    volume,
-                    extra_env: vec![],
+                    volume: &volume,
+                    extra_env: &[],
                 },
                 &prune(),
             );
