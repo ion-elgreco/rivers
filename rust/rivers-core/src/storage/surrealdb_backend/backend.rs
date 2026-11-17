@@ -1256,9 +1256,10 @@ impl EventStore for SurrealStorage {
         // One `assets` row update per materialized asset (newest event wins).
         let update_run_ids: Vec<String> = latest_mat
             .values()
-            .map(|&idx| events[idx].run_id.clone())
-            .collect::<std::collections::HashSet<String>>()
+            .map(|&idx| events[idx].run_id.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
+            .map(str::to_owned)
             .collect();
         let action_ids = self.action_run_ids(update_run_ids).await?;
         // Each asset's partition rows commit in one transaction with its
@@ -1358,9 +1359,10 @@ impl EventStore for SurrealStorage {
         let failure_runs: Vec<String> = events
             .iter()
             .filter(|event| keyed_failure(event).is_some())
-            .map(|event| event.run_id.clone())
-            .collect::<HashSet<String>>()
+            .map(|event| event.run_id.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
+            .map(str::to_owned)
             .collect();
         let action_failure_runs = self.action_run_ids(failure_runs).await?;
         let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, &str)>> = HashMap::new();
