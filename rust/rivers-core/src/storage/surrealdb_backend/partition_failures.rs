@@ -327,7 +327,7 @@ async fn write_failures(
     cl: &str,
     asset_key: &str,
     deletions: &Deletions,
-    mut failures: Vec<&(PartitionKey, i64, String)>,
+    mut failures: Vec<&(PartitionKey, i64, &str)>,
     run_end: bool,
 ) -> Result<()> {
     failures.retain(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at));
@@ -339,7 +339,7 @@ async fn write_failures(
 
     let built = built_at_of(txn, cl, asset_key, &keys).await?;
     let deleted = deleted_at_of(txn, cl, asset_key, deletions, &keys).await?;
-    let failures: Vec<&(PartitionKey, i64, String)> = failures
+    let failures: Vec<&(PartitionKey, i64, &str)> = failures
         .into_iter()
         .filter(|(key, at, _)| {
             built.get(key).is_none_or(|built| built < at)
@@ -350,12 +350,12 @@ async fn write_failures(
         return Ok(());
     }
 
-    let mut latest: HashMap<&PartitionKey, &(PartitionKey, i64, String)> = HashMap::new();
+    let mut latest: HashMap<&PartitionKey, &(PartitionKey, i64, &str)> = HashMap::new();
     for &failure in &failures {
         let (key, at, run_id) = failure;
         if latest
             .get(key)
-            .is_none_or(|held| rank(held.1, &held.2) < rank(*at, run_id))
+            .is_none_or(|held| rank(held.1, held.2) < rank(*at, run_id))
         {
             latest.insert(key, failure);
         }
@@ -369,7 +369,7 @@ async fn write_failures(
                 asset_key: asset_key.to_string(),
                 partition_key: key.clone(),
                 failed_at: *at,
-                run_id: run_id.clone(),
+                run_id: run_id.to_string(),
                 built_at,
                 has_row: built_at.is_some(),
             }
@@ -381,7 +381,7 @@ async fn write_failures(
             code_location_id: cl.to_string(),
             asset_key: asset_key.to_string(),
             partition_key: key.clone(),
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             step_failed_at: (!run_end).then_some(*at),
             run_failed_at: run_end.then_some(*at),
         })
@@ -639,15 +639,15 @@ impl SurrealStorage {
         &self,
         cl: &str,
         asset_key: &str,
-        failures: Vec<(PartitionKey, i64, String)>,
+        failures: Vec<(PartitionKey, i64, &str)>,
         failed_run: Option<&str>,
     ) -> Result<()> {
-        let mut latest: HashMap<(PartitionKey, String), i64> = HashMap::new();
+        let mut latest: HashMap<(PartitionKey, &str), i64> = HashMap::new();
         for (key, at, run_id) in failures {
             let held = latest.entry((key, run_id)).or_insert(at);
             *held = (*held).max(at);
         }
-        let mut failures: Vec<(PartitionKey, i64, String)> = latest
+        let mut failures: Vec<(PartitionKey, i64, &str)> = latest
             .into_iter()
             .map(|((key, run_id), at)| (key, at, run_id))
             .collect();
@@ -706,10 +706,10 @@ impl SurrealStorage {
 
         for asset_key in &run.node_names {
             let done = built.get(&(asset_key.clone(), run.run_id.clone()));
-            let failures: Vec<(PartitionKey, i64, String)> = members
+            let failures: Vec<(PartitionKey, i64, &str)> = members
                 .iter()
                 .filter(|member| done.is_none_or(|done| !done.contains(*member)))
-                .map(|member| (member.clone(), at, run.run_id.clone()))
+                .map(|member| (member.clone(), at, run.run_id.as_str()))
                 .collect();
             if !failures.is_empty() {
                 let failed_run = Some(run.run_id.as_str());
@@ -1288,8 +1288,8 @@ async fn not_built_by<'a>(
     db: &Surreal<Any>,
     asset_key: &str,
     run_id: &str,
-    failures: &'a [(PartitionKey, i64, String)],
-) -> Result<Vec<&'a (PartitionKey, i64, String)>> {
+    failures: &'a [(PartitionKey, i64, &'a str)],
+) -> Result<Vec<&'a (PartitionKey, i64, &'a str)>> {
     let built = materialized_by_runs(db, Some(asset_key), &[run_id.to_string()]).await?;
     let done = built.get(&(asset_key.to_string(), run_id.to_string()));
     Ok(failures

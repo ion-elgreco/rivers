@@ -112,7 +112,7 @@ impl StorageBackend for SurrealStorage {
                 let failures = partition_key
                     .members()
                     .into_iter()
-                    .map(|member| (member, event.timestamp, event.run_id.clone()))
+                    .map(|member| (member, event.timestamp, event.run_id.as_str()))
                     .collect();
                 self.record_partition_failures(cl, asset_key, failures, None)
                     .await?;
@@ -1397,7 +1397,7 @@ impl EventStore for SurrealStorage {
             .into_iter()
             .collect();
         let action_failure_runs = self.action_run_ids(failure_runs).await?;
-        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
+        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, &str)>> = HashMap::new();
         for &event in &events {
             let Some((asset_key, partition_key)) = keyed_failure(event) else {
                 continue;
@@ -1409,7 +1409,7 @@ impl EventStore for SurrealStorage {
                 .entry((event.code_location_id.as_str(), asset_key))
                 .or_default();
             for member in partition_key.members() {
-                of_asset.push((member, event.timestamp, event.run_id.clone()));
+                of_asset.push((member, event.timestamp, event.run_id.as_str()));
             }
         }
         for ((cl, asset_key), failures) in failures {
