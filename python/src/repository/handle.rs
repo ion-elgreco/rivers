@@ -417,7 +417,7 @@ impl RepoHandle {
     /// no `job_name`). Caller-minted `run_id`. No validation — the
     /// caller is responsible (gRPC validates at the boundary;
     /// internal callers like sensors/schedules/conditions trust their
-    /// upstream).
+    /// upstream). Returns the written record.
     ///
     /// Used by:
     ///   * `DirectRunDispatcher::dispatch_materialization` (async fn,
@@ -435,7 +435,7 @@ impl RepoHandle {
         run_id: String,
         action: Option<String>,
         config: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<RunRecord> {
         let state = self.resolved()?;
         create_materialization_run(
             &state,
@@ -1117,7 +1117,7 @@ pub(super) async fn create_materialization_run(
     run_id: String,
     action: Option<String>,
     config: Option<String>,
-) -> PyResult<()> {
+) -> PyResult<RunRecord> {
     let priority = priority_from_tags(&tags);
     let record = RunRecord {
         run_id,
@@ -1149,7 +1149,7 @@ pub(super) async fn create_materialization_run(
         "materialization run created"
     );
 
-    Ok(())
+    Ok(record)
 }
 
 /// Serializes the first resolve, so concurrent first callers resolve once.
