@@ -459,7 +459,7 @@ async fn run_step_with_retries(
         None => {
             for (_, reason) in &recorded {
                 if let Some(esc) = spec.policy.as_ref().and_then(|p| p.escalate.as_ref()) {
-                    compute = rivers_k8s::compute::escalate_compute(&compute, esc, *reason);
+                    compute = rivers_k8s::compute::escalate_compute(compute, esc, *reason);
                 }
             }
         }
@@ -547,7 +547,7 @@ async fn run_step_with_retries(
             return (spec.instance_name, false);
         }
         if let Some(esc) = &policy.escalate {
-            compute = rivers_k8s::compute::escalate_compute(&compute, esc, reason);
+            compute = rivers_k8s::compute::escalate_compute(compute, esc, reason);
         }
         let delay = compute_delay(policy, attempt, rng01());
         for name in &spec.event_names {
