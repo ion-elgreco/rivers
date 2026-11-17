@@ -803,10 +803,10 @@ impl SurrealStorage {
         event_id: &str,
         run_id: &str,
         timestamp: i64,
-        data_version: Option<String>,
+        data_version: Option<&str>,
         provenance_timestamp: i64,
-        code_version: Option<String>,
-        idv: Option<Vec<(String, String)>>,
+        code_version: Option<&str>,
+        idv: Option<&[(String, String)]>,
         from_action: bool,
         parts: Vec<DbAssetPartitionWrite>,
         built_by: &[(&PartitionKey, &str)],
@@ -844,8 +844,8 @@ impl SurrealStorage {
             event_id,
             run_id,
             timestamp,
-            data_version: &data_version,
-            provenance: (!from_action).then_some((provenance_timestamp, &code_version, &idv)),
+            data_version,
+            provenance: (!from_action).then_some((provenance_timestamp, code_version, idv)),
             parts: &parts,
             keys: &keys,
             range: range.as_ref(),
@@ -883,9 +883,9 @@ struct MaterializationParams<'a> {
     event_id: &'a str,
     run_id: &'a str,
     timestamp: i64,
-    data_version: &'a Option<String>,
+    data_version: Option<&'a str>,
     /// The provenance's time, code version and inputs; none for an action.
-    provenance: Option<(i64, &'a Option<String>, &'a Option<Vec<(String, String)>>)>,
+    provenance: Option<(i64, Option<&'a str>, Option<&'a [(String, String)]>)>,
     parts: &'a [DbAssetPartitionWrite],
     keys: &'a [PartitionKey],
     range: Option<&'a (PartitionKey, PartitionKey)>,
@@ -899,13 +899,13 @@ impl MaterializationParams<'_> {
             .bind(("event_id", self.event_id.to_string()))
             .bind(("run_id", self.run_id.to_string()))
             .bind(("timestamp", self.timestamp))
-            .bind(("data_version", self.data_version.clone()));
+            .bind(("data_version", self.data_version.map(str::to_owned)));
         if let Some((provenance_timestamp, code_version, idv)) = self.provenance {
             query = query
                 .bind(("provenance_timestamp", provenance_timestamp))
-                .bind(("mcv", code_version.clone()));
+                .bind(("mcv", code_version.map(str::to_owned)));
             if let Some(idv) = idv {
-                query = query.bind(("idv", idv.clone()));
+                query = query.bind(("idv", idv.to_vec()));
             }
         }
         if let Some((lowest, highest)) = self.range {

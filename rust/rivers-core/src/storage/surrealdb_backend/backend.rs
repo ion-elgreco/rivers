@@ -46,12 +46,12 @@ impl StorageBackend for SurrealStorage {
 
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_materialization() {
-                let input_data_versions = event.input_data_versions.clone();
                 let is_action = !self
                     .action_run_ids(vec![event.run_id.clone()])
                     .await?
                     .is_empty();
-                let idv = (!input_data_versions.is_empty()).then_some(input_data_versions);
+                let idv = (!event.input_data_versions.is_empty())
+                    .then_some(event.input_data_versions.as_slice());
                 let parts = event
                     .partition_key
                     .as_ref()
@@ -77,9 +77,9 @@ impl StorageBackend for SurrealStorage {
                     &event_id,
                     &event.run_id,
                     event.timestamp,
-                    event.event_type.data_version().map(|s| s.to_string()),
+                    event.event_type.data_version(),
                     event.timestamp,
-                    materialization_code_version,
+                    materialization_code_version.as_deref(),
                     idv,
                     is_action,
                     parts,
@@ -1309,7 +1309,7 @@ impl EventStore for SurrealStorage {
             let event = &events[idx];
             let event_id = &event_ids[idx];
             let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
-            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let idv = idv_event.map(|e| e.input_data_versions.as_slice());
             let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
             // A co-drained real materialize (the `idv` entry) legitimately
             // owns provenance and the code-version stamp even when the
@@ -1328,9 +1328,9 @@ impl EventStore for SurrealStorage {
                 event_id,
                 &event.run_id,
                 event.timestamp,
-                event.event_type.data_version().map(|s| s.to_string()),
+                event.event_type.data_version(),
                 provenance_timestamp,
-                code_version,
+                code_version.as_deref(),
                 idv,
                 action_only,
                 parts,
