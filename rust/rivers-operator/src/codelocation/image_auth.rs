@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{LocalObjectReference, Secret};
 use kube_client::api::Api;
 
 use super::registry::RegistryAuth;
@@ -18,7 +18,7 @@ use super::registry::RegistryAuth;
 const DOCKERCONFIGJSON_KEY: &str = ".dockerconfigjson";
 const DOCKERCFG_KEY: &str = ".dockercfg";
 
-/// Pick creds for `registry` from a list of imagePullSecret names.
+/// Pick creds for `registry` from a list of imagePullSecrets.
 ///
 /// The first secret that yields a matching entry wins; on no match, returns
 /// [`RegistryAuth::Anonymous`]. Soft-fails on read errors (logs + continues)
@@ -26,10 +26,10 @@ const DOCKERCFG_KEY: &str = ".dockercfg";
 /// images still work.
 pub async fn resolve_auth(
     secrets_api: &Api<Secret>,
-    secret_names: &[String],
+    pull_secrets: &[LocalObjectReference],
     registry: &str,
 ) -> RegistryAuth {
-    for name in secret_names {
+    for LocalObjectReference { name } in pull_secrets {
         let secret = match secrets_api.get(name).await {
             Ok(s) => s,
             Err(e) => {
