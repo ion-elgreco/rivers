@@ -135,8 +135,9 @@ struct Block {
     /// Each dimension by name, the empty name for keys of one dimension,
     /// with its values in the requested order.
     dims: Vec<(String, Vec<String>)>,
-    /// The values of each dimension, sorted.
-    sorted: Vec<Vec<String>>,
+    /// The places of the values of each dimension, in the order of the
+    /// values.
+    sorted: Vec<Vec<u32>>,
     /// The place of the first partition of the block among the requested
     /// partitions.
     first: usize,
@@ -148,9 +149,9 @@ impl Block {
         let sorted = dims
             .iter()
             .map(|(_, values)| {
-                let mut sorted = values.clone();
-                sorted.sort();
-                sorted
+                let mut places: Vec<u32> = (0..values.len() as u32).collect();
+                places.sort_unstable_by_key(|&at| &values[at as usize]);
+                places
             })
             .collect();
         let count = dims.iter().fold(1usize, |count, (_, values)| {
@@ -179,7 +180,7 @@ impl Block {
         }
 
         let mut count = 1u64;
-        for ((name, _), sorted) in self.dims.iter().zip(&self.sorted) {
+        for ((name, block_values), sorted) in self.dims.iter().zip(&self.sorted) {
             let pin = pinned
                 .iter()
                 .find(|(of, _)| of == name)
@@ -191,10 +192,12 @@ impl Block {
                     if in_dimension && !range.holds_key(value) {
                         0
                     } else {
-                        equal_range(sorted, value).len()
+                        equal_range(block_values, sorted, value).len()
                     }
                 }
-                (None, None) if in_dimension => key_range(sorted, &range.first, &range.last).len(),
+                (None, None) if in_dimension => {
+                    key_range(block_values, sorted, &range.first, &range.last).len()
+                }
                 (None, None) => sorted.len(),
             };
             count = count.saturating_mul(values as u64);
@@ -221,8 +224,8 @@ impl Block {
     fn holds(&self, values: &[(&str, &str)]) -> bool {
         values.len() == self.dims.len()
             && self.dims.iter().zip(&self.sorted).zip(values).all(
-                |(((name, _), sorted), (of, value))| {
-                    name == of && !equal_range(sorted, value).is_empty()
+                |(((name, block_values), sorted), (of, value))| {
+                    name == of && !equal_range(block_values, sorted, value).is_empty()
                 },
             )
     }
@@ -244,20 +247,23 @@ impl Block {
     }
 }
 
-/// The places of the values equal to `value` in `sorted`.
-fn equal_range(sorted: &[String], value: &str) -> std::ops::Range<usize> {
-    let start = sorted.partition_point(|v| v.as_str() < value);
-    let end = sorted.partition_point(|v| v.as_str() <= value);
+/// The places in `sorted` of the values equal to `value`. `sorted` holds
+/// the places of `values` in the order of the values.
+fn equal_range(values: &[String], sorted: &[u32], value: &str) -> std::ops::Range<usize> {
+    let at = |place: &u32| values[*place as usize].as_str();
+    let start = sorted.partition_point(|place| at(place) < value);
+    let end = sorted.partition_point(|place| at(place) <= value);
     start..end
 }
 
-/// The places of the values from `first` to `last` in `sorted`. An empty
+/// The places in `sorted` of the values from `first` to `last`. An empty
 /// `last` has no end.
-fn key_range(sorted: &[String], first: &str, last: &str) -> std::ops::Range<usize> {
-    let start = sorted.partition_point(|v| v.as_str() < first);
+fn key_range(values: &[String], sorted: &[u32], first: &str, last: &str) -> std::ops::Range<usize> {
+    let at = |place: &u32| values[*place as usize].as_str();
+    let start = sorted.partition_point(|place| at(place) < first);
     let end = match last {
         "" => sorted.len(),
-        last => sorted.partition_point(|v| v.as_str() <= last),
+        last => sorted.partition_point(|place| at(place) <= last),
     };
     start..end.max(start)
 }
@@ -285,20 +291,24 @@ fn values_of(partition: &PartitionKey) -> Option<Vec<(&str, &str)>> {
 /// The requested keys as blocks, in the requested order.
 fn blocks_of(requested: &[PartitionKey]) -> Vec<Block> {
     fn push(key: &PartitionKey, blocks: &mut Vec<Block>, first: &mut usize) {
-        let dims = match key.expanded().into_owned() {
+        let expanded = key.expanded();
+        if let PartitionKey::Set { keys } = &*expanded {
+            for key in keys {
+                push(key, blocks, first);
+            }
+            return;
+        }
+
+        let dims = match expanded.into_owned() {
             PartitionKey::Single { keys } => vec![(String::new(), keys)],
             PartitionKey::Multi { mut dims } => {
                 dims.sort_by(|a, b| a.0.cmp(&b.0));
                 dims
             }
-            PartitionKey::Set { keys } => {
-                for key in &keys {
-                    push(key, blocks, first);
-                }
-                return;
-            }
-            PartitionKey::SingleItems { .. } | PartitionKey::MultiItems { .. } => {
-                unreachable!("an expanded key has no items")
+            PartitionKey::Set { .. }
+            | PartitionKey::SingleItems { .. }
+            | PartitionKey::MultiItems { .. } => {
+                unreachable!("a set is pushed above, and an expanded key has no items")
             }
         };
         let block = Block::new(dims, *first);
