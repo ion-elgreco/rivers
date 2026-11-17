@@ -349,21 +349,17 @@ fn reach<'a>(adj: &HashMap<&'a str, Vec<&'a str>>, start: Vec<&'a str>) -> HashS
 
 impl CodeRepository {
     pub fn resolve_asset_graph(&mut self) -> Result<(), String> {
-        let mut graph: AssetGraph = Graph::new();
-        let mut name_to_index: HashMap<String, NodeIndex> = HashMap::new();
+        let edges = self.assets.values().map(Vec::len).sum();
+        let mut graph: AssetGraph = Graph::with_capacity(self.assets.len(), edges);
+        let name_to_index: HashMap<&str, NodeIndex> = self
+            .assets
+            .keys()
+            .map(|name| (name.as_str(), graph.add_node(DagNode::new(name))))
+            .collect();
 
-        for (name, asset_inputs) in self.assets() {
-            let mut node = DagNode::new(name);
-            node.inputs = asset_inputs.clone();
-            let idx = graph.add_node(node);
-            name_to_index.insert(name.to_string(), idx);
-        }
-
-        // Resolve ByName → Resolved and add edges.
-        let node_indices: Vec<NodeIndex> = graph.node_indices().collect();
-        for idx in node_indices {
-            let inputs = std::mem::take(&mut graph[idx].inputs);
-            let mut resolved_inputs = Vec::<NodeRef>::with_capacity(inputs.len());
+        // Nodes were added in `self.assets` order, so the indices line up.
+        for ((name, inputs), idx) in self.assets.iter().zip(graph.node_indices()) {
+            let mut resolved_inputs = Vec::with_capacity(inputs.len());
 
             for input in inputs {
                 let NodeRef::ByName(dep_name) = input else {
@@ -372,17 +368,13 @@ impl CodeRepository {
                         "resolve_asset_graph expected NodeRef::ByName, got a resolved ref"
                     );
                 };
-                let Some(&dep_idx) = name_to_index.get(&dep_name) else {
-                    return Err(format!(
-                        "Asset '{}': unresolved input '{}'",
-                        &graph[idx].name, dep_name
-                    ));
+                let Some(&dep_idx) = name_to_index.get(dep_name.as_str()) else {
+                    return Err(format!("Asset '{name}': unresolved input '{dep_name}'"));
                 };
                 if dep_idx == idx {
                     return Err(format!(
-                        "Asset '{}': depends on itself; use SelfDependency[T] \
-                         to reference an asset's own previous output",
-                        &graph[idx].name
+                        "Asset '{name}': depends on itself; use SelfDependency[T] \
+                         to reference an asset's own previous output"
                     ));
                 }
                 resolved_inputs.push(NodeRef::Resolved(dep_idx));
@@ -491,6 +483,33 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(err.contains("SelfDependency"), "missing hint: {err}");
+    }
+
+    #[test]
+    fn test_resolved_nodes_follow_asset_order() {
+        let graph = make_graph(vec![("c", vec!["b", "a"]), ("a", vec![]), ("b", vec!["a"])]);
+
+        let resolved: Vec<(&str, Vec<&str>)> = graph
+            .node_indices()
+            .map(|idx| {
+                let inputs = graph[idx]
+                    .inputs
+                    .iter()
+                    .map(|input| match input {
+                        NodeRef::Resolved(dep) => graph[*dep].name.as_str(),
+                        NodeRef::ByName(dep) => panic!("unresolved input '{dep}'"),
+                    })
+                    .collect();
+                (graph[idx].name.as_str(), inputs)
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            [("a", vec![]), ("b", vec!["a"]), ("c", vec!["b", "a"])]
+        );
+
+        let edges = [("b", "a"), ("c", "a"), ("c", "b")].map(|(f, t)| (f.into(), t.into()));
+        assert_eq!(to_topology(&graph).edges, edges);
     }
 
     #[test]
