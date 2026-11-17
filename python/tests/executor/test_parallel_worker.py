@@ -1914,6 +1914,32 @@ def test_mp_six_parallel_assets(tmp_path):
     assert sum(load(f"p_{i}") for i in range(1, 7)) == 21
 
 
+def test_worker_result_pickles_every_field():
+    """A worker result reaches the parent with every field it carried."""
+    from rivers._core import WorkerResult
+
+    outputs = [("step", 0, [], "dv")]
+    result = WorkerResult(
+        outputs,
+        captured_logs=("out", "err", "rust"),
+        dynamic_keys=["a", "b"],
+        failed_partitions=[('{"single":"x"}', "boom")],
+        graph_written=True,
+        graph_error=ValueError("graph write failed"),
+    )
+
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored.outputs == outputs
+    assert restored.captured_logs == ("out", "err", "rust")
+    assert restored.dynamic_keys == ["a", "b"]
+    assert restored.failed_partitions == [('{"single":"x"}', "boom")]
+    assert restored.graph_written is True
+    assert type(restored.graph_error) is ValueError
+    assert restored.graph_error.args == ("graph write failed",)
+    assert restored.error is None
+
+
 # ---------------------------------------------------------------------------
 # 14. InMemoryIOHandler validation
 # ---------------------------------------------------------------------------

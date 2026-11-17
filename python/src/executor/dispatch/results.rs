@@ -22,7 +22,7 @@ use crate::result_types::ResultKind;
 
 use super::super::in_step_pod;
 use super::super::ops::{self, OutOfProcess, now_ts};
-use super::super::parallel::worker::unwrap_worker_error;
+use super::super::parallel::worker::{PyWorkerResult, unwrap_worker_error};
 use super::super::traceback;
 use super::context::BatchContext;
 use super::types::{CapturedLogs, StepCapture, WorkOutcome, YieldedOutput};
@@ -793,25 +793,22 @@ pub(crate) fn process_worker_result(
     step_config: Option<Py<PyAny>>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
-    // Emit captured stdout/stderr/rust_logs from the worker subprocess as a
-    // `run_logs` row before output processing, mirroring the in-process path
-    // (`execute_step_with_capture` → `emit_captured_logs`).
-    if let Ok(logs_obj) = worker_result.getattr(py, "captured_logs")
-        && !logs_obj.is_none(py)
-        && let Ok((stdout, stderr, rust_logs)) = logs_obj.extract::<(String, String, String)>(py)
-    {
-        ctx.emit_log_output(step_name, &stdout, &stderr, &rust_logs, now_ts());
-    }
-
-    let outputs_obj = match worker_result.getattr(py, "outputs") {
-        Ok(o) => o,
+    let worker_result = match worker_result.bind(py).cast::<PyWorkerResult>() {
+        Ok(r) => r.get(),
         Err(e) => {
-            ctx.record_failure_no_hooks(step_name, e, failures);
+            ctx.record_failure_no_hooks(step_name, e.into(), failures);
             return;
         }
     };
-    let outputs_bound = outputs_obj.bind(py);
-    let outputs_list: &Bound<PyList> = match outputs_bound.cast() {
+
+    // Emit captured stdout/stderr/rust_logs from the worker subprocess as a
+    // `run_logs` row before output processing, mirroring the in-process path
+    // (`execute_step_with_capture` → `emit_captured_logs`).
+    if let Some((stdout, stderr, rust_logs)) = &worker_result.captured_logs {
+        ctx.emit_log_output(step_name, stdout, stderr, rust_logs, now_ts());
+    }
+
+    let outputs_list: &Bound<PyList> = match worker_result.outputs.bind(py).cast() {
         Ok(l) => l,
         Err(e) => {
             ctx.record_failure_no_hooks(step_name, e.into(), failures);
@@ -825,12 +822,8 @@ pub(crate) fn process_worker_result(
     // Single-output dynamic_keys come back at top-level on WorkerResult; the
     // orchestrator persists them to KV (loky workers don't write KV — embedded
     // SurrealKV is single-process and the orchestrator owns the lock).
-    let dynamic_keys: Option<Vec<String>> = if is_single {
-        worker_result
-            .getattr(py, "dynamic_keys")
-            .ok()
-            .and_then(|o| o.extract::<Option<Vec<String>>>(py).ok())
-            .flatten()
+    let dynamic_keys = if is_single {
+        worker_result.dynamic_keys.as_deref()
     } else {
         None
     };
@@ -838,17 +831,13 @@ pub(crate) fn process_worker_result(
     // Worker-drained mark_partition_failed marks cross IPC as (key_json, error);
     // stash them like process_step_result so emit_materialization emits a
     // per-partition StepFailure instead of a Materialization.
-    let worker_marks: Vec<(String, String)> = worker_result
-        .getattr(py, "failed_partitions")
-        .ok()
-        .and_then(|o| o.extract::<Vec<(String, String)>>(py).ok())
-        .unwrap_or_default();
-    let marks: Vec<(crate::partitions::PyPartitionKey, String)> = worker_marks
-        .into_iter()
+    let marks: Vec<(crate::partitions::PyPartitionKey, String)> = worker_result
+        .failed_partitions
+        .iter()
         .filter_map(|(json, err)| {
-            rivers_core::storage::PartitionKey::from_json(&json)
+            rivers_core::storage::PartitionKey::from_json(json)
                 .ok()
-                .map(|core| ((&core).into(), err))
+                .map(|core| ((&core).into(), err.clone()))
         })
         .collect();
     stash_failed_partitions(ctx, step, marks);
@@ -860,7 +849,7 @@ pub(crate) fn process_worker_result(
         .flatten();
     let mut graph_written = false;
     if let Some(graph_name) = &graph_name {
-        match write_graph_after_worker(py, ctx, step, graph_name, &worker_result, outputs_list) {
+        match write_graph_after_worker(py, ctx, step, graph_name, worker_result, outputs_list) {
             Ok(written) => graph_written = written,
             Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
         }
@@ -876,7 +865,7 @@ pub(crate) fn process_worker_result(
             end_ts,
             &item_any,
             step_config.as_ref(),
-            dynamic_keys.as_deref(),
+            dynamic_keys,
         ) {
             ctx.record_failure_no_hooks(step_name, e, failures);
         }
@@ -890,9 +879,9 @@ pub(crate) fn process_worker_result(
             .iter()
             .filter_map(|item| item.get_item(0).ok()?.extract().ok())
             .collect();
-        match worker_result.getattr(py, "error") {
-            Ok(error) if !error.is_none(py) => {
-                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.into_bound(py)));
+        match &worker_result.error {
+            Some(error) => {
+                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.bind(py).clone()));
                 handle_failure(
                     py,
                     ctx,
@@ -904,7 +893,7 @@ pub(crate) fn process_worker_result(
                     failures,
                 );
             }
-            _ => fail_unyielded_outputs(ctx, step, &yielded, failures),
+            None => fail_unyielded_outputs(ctx, step, &yielded, failures),
         }
     }
 
@@ -924,17 +913,13 @@ fn write_graph_after_worker(
     ctx: &BatchContext,
     step: &ExecutionStep,
     graph_name: &str,
-    worker_result: &Py<PyAny>,
+    worker_result: &PyWorkerResult,
     outputs: &Bound<PyList>,
 ) -> PyResult<bool> {
-    let err = worker_result.getattr(py, "graph_error")?;
-    if !err.is_none(py) {
-        return Err(PyErr::from_value(err.into_bound(py)));
+    if let Some(err) = &worker_result.graph_error {
+        return Err(PyErr::from_value(err.bind(py).clone()));
     }
-    if worker_result
-        .getattr(py, "graph_written")?
-        .extract::<bool>(py)?
-    {
+    if worker_result.graph_written {
         return Ok(true);
     }
     let task_output = match outputs.iter().next() {
