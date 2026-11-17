@@ -147,8 +147,7 @@ pub(crate) struct RepoHandle {
 
 /// One run to enqueue via [`submit_runs`].
 pub(crate) struct RunSubmission {
-    /// `None` = all assets.
-    pub(crate) selection: Option<Vec<String>>,
+    pub(crate) selection: Vec<String>,
     /// The key as the run record holds it.
     pub(crate) partition_key: Option<rivers_core::storage::PartitionKey>,
     pub(crate) tags: Option<Vec<(String, String)>>,
@@ -962,18 +961,7 @@ pub(super) async fn submit_runs(
     launched_by: LaunchedBy,
 ) -> PyResult<Vec<String>> {
     let (records, storage) = {
-        let graph = state
-            .inner_repo
-            .graph
-            .as_ref()
-            .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
-
         let now = now_ts();
-        let all_names: Vec<String> = graph
-            .node_indices()
-            .map(|idx| graph[idx].name.clone())
-            .collect();
-
         let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
 
         for RunSubmission {
@@ -997,7 +985,7 @@ pub(super) async fn submit_runs(
                 end_time: None,
                 execution_start_time: None,
                 tags: run_tags,
-                node_names: selection.unwrap_or_else(|| all_names.clone()),
+                node_names: selection,
                 priority,
                 partition_key,
                 block_reason: None,

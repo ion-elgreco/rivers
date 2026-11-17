@@ -630,7 +630,7 @@ impl PyCodeRepository {
             let runs: Vec<RunSubmission> = run_keys
                 .into_iter()
                 .map(|run_key| RunSubmission {
-                    selection: Some(record.asset_selection.clone()),
+                    selection: record.asset_selection.clone(),
                     partition_key: Some(run_key),
                     tags: Some(run_tags.clone()),
                     job_name: record.job_name.clone(),
