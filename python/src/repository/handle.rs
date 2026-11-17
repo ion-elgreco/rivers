@@ -610,7 +610,7 @@ impl RepoHandle {
             let Some(key) = valid_part_for_verb(
                 &state,
                 &asset_names,
-                &PyPartitionKey::from(key),
+                PyPartitionKey::from(key),
                 record.action.as_deref(),
             ) else {
                 continue;
@@ -629,11 +629,14 @@ impl RepoHandle {
                 .iter()
                 .map(|(_, namespace, value)| (namespace.as_str(), value.as_str()))
                 .collect();
-            let Some(key) = without_dynamic_values(&state, &asset_names, &key, &retired) else {
+            let Some(mut key) = without_dynamic_values(&state, &asset_names, key, &retired) else {
                 continue;
             };
 
-            kept += PartitionKey::from(&key).member_count();
+            // The filtered value lists keep their growth capacity, and the
+            // keys live on in the request.
+            key.shrink_to_fit();
+            kept += key.member_count();
             partition_keys.push(key);
         }
 
