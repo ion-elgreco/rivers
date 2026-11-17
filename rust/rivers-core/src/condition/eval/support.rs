@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::condition::cache::RunTags;
-use crate::storage::PartitionKey;
+use crate::storage::{NamedPartitions, PartitionKey};
 
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
@@ -176,9 +176,14 @@ pub(crate) fn eval_backfill_in_progress_partitioned(
     let mut targeted: HashSet<PartitionKey> = HashSet::new();
     for bf_id in backfill_ids {
         match ctx.cache.backfill.partition_keys.get(bf_id) {
-            Some(bf_partitions) if !bf_partitions.is_empty() => {
-                let bf_set: HashSet<PartitionKey> = bf_partitions.iter().cloned().collect();
-                targeted.extend(pctx.all_keys.intersection(&bf_set).cloned());
+            Some(requested) if !requested.is_empty() => {
+                let named = NamedPartitions::new(requested);
+                targeted.extend(
+                    pctx.all_keys
+                        .iter()
+                        .filter(|key| named.contains(key))
+                        .cloned(),
+                );
             }
             _ => {
                 return PartitionSelection::All;

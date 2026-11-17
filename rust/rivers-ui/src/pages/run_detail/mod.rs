@@ -323,13 +323,18 @@ pub fn RunDetailPage() -> impl IntoView {
                         let sid = short_id(&record.run_id, 8);
                         let status_kind = run_status_kind(&record.status);
                         let (_, _, trigger_label, trigger_sub) = launched_by_display(&record.launched_by);
-                        // Reactive elapsed: ticks once per second while end_time
-                        // is None (run still in flight), freezes when end_time
-                        // is set.
-                        let run_start_ns = record.start_time;
+                        // Reactive labels: each ticks once per second until its
+                        // end is known, then freezes.
+                        let created_ns = record.start_time;
+                        let began_ns = record.execution_start_time;
                         let run_end_ns = record.end_time;
+                        let wait_end_ns = record.wait_end();
+                        let shows_wait = record.shows_wait();
+                        let waited_label = move || {
+                            format_elapsed(Some(created_ns), wait_end_ns, use_now().get())
+                        };
                         let elapsed_label = move || {
-                            format_elapsed(Some(run_start_ns), run_end_ns, use_now().get())
+                            format_elapsed(began_ns, run_end_ns, use_now().get())
                         };
                         let cl_id = record.code_location_id.clone();
                         let cl_label = {
@@ -353,8 +358,14 @@ pub fn RunDetailPage() -> impl IntoView {
                                         </span>
                                     })}
                                     <span class="run-trigger-meta-item" title=format_relative_time(record.start_time, jiff::Timestamp::now().as_second())>{format_timestamp(Some(record.start_time))}</span>
-                                    <span class="run-trigger-meta-sep">"·"</span>
-                                    <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
+                                    {shows_wait.then(|| view! {
+                                        <span class="run-trigger-meta-sep">"·"</span>
+                                        <span class="run-trigger-meta-item">"waited "<span class="run-trigger-meta-value">{waited_label}</span></span>
+                                    })}
+                                    {began_ns.is_some().then(|| view! {
+                                        <span class="run-trigger-meta-sep">"·"</span>
+                                        <span class="run-trigger-meta-item">"elapsed "<span class="run-trigger-meta-value">{elapsed_label}</span></span>
+                                    })}
                                     <span class="run-trigger-meta-sep">"·"</span>
                                     <span class="run-trigger-meta-item run-trigger-meta-trigger">{trigger_label}</span>
                                     {trigger_sub.map(|s| view! {

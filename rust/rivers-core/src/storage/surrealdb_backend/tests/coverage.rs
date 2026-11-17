@@ -196,6 +196,7 @@ async fn test_get_runs_by_ids() {
         status: RunStatus::Success,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["a".to_string()],
         priority: 0,
@@ -212,6 +213,7 @@ async fn test_get_runs_by_ids() {
         status: RunStatus::Started,
         start_time: 2000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -228,6 +230,7 @@ async fn test_get_runs_by_ids() {
         status: RunStatus::Failure,
         start_time: 3000,
         end_time: Some(3500),
+        execution_start_time: None,
         tags: vec![("env".to_string(), "prod".to_string())],
         node_names: vec!["b".to_string()],
         priority: 0,
@@ -277,6 +280,7 @@ async fn test_get_runs_by_ids_orders_by_start_time() {
         status: RunStatus::Success,
         start_time: start,
         end_time: Some(start + 100),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["a".to_string()],
         priority: 0,
@@ -316,6 +320,7 @@ async fn test_get_runs_since() {
         status: RunStatus::Success,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -332,6 +337,7 @@ async fn test_get_runs_since() {
         status: RunStatus::Started,
         start_time: 2000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -348,6 +354,7 @@ async fn test_get_runs_since() {
         status: RunStatus::Success,
         start_time: 3000,
         end_time: Some(3500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -967,6 +974,7 @@ async fn test_get_in_progress_partitions() {
         status: RunStatus::Started,
         start_time: 1000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1043,6 +1051,7 @@ async fn test_get_in_progress_partitions_ignores_action_runs() {
         status: RunStatus::Started,
         start_time: 1000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1106,6 +1115,7 @@ async fn test_get_failed_partitions() {
         status: RunStatus::Failure,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1181,6 +1191,7 @@ async fn fail_run_if_active_leaves_terminal_runs_alone() {
         status: RunStatus::Canceled,
         start_time: 100,
         end_time: Some(150),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["a".to_string()],
         priority: 0,
@@ -1227,6 +1238,7 @@ async fn deletion_during_a_run_does_not_outrank_its_failure() {
         status: RunStatus::Failure,
         start_time: 90,
         end_time: Some(110),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["orders".to_string()],
         priority: 0,
@@ -1278,6 +1290,7 @@ async fn a_failed_run_does_not_fail_the_partitions_it_materialized() {
         status: RunStatus::Failure,
         start_time: 90,
         end_time: Some(110),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["raw".to_string(), "clean".to_string()],
         priority: 0,
@@ -1334,6 +1347,7 @@ async fn a_failed_run_does_not_fail_the_partitions_it_materialized_after_they_mo
             status,
             start_time: start,
             end_time: Some(end),
+            execution_start_time: None,
             tags: vec![],
             node_names: nodes.iter().map(|n| n.to_string()).collect(),
             priority: 0,
@@ -1442,6 +1456,7 @@ async fn test_get_failed_partitions_includes_marked_in_success_run() {
         status: RunStatus::Success,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1496,6 +1511,7 @@ async fn test_get_failed_partitions_uses_latest_event_per_partition() {
         status: RunStatus::Success,
         start_time: 1000,
         end_time: Some(2000),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1566,6 +1582,7 @@ async fn test_get_failed_partitions_ignores_step_level_failures() {
         status: RunStatus::Failure,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1639,6 +1656,7 @@ async fn test_get_failed_partitions_expands_set_failure() {
         status: RunStatus::Failure,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1711,6 +1729,7 @@ async fn test_get_failed_partitions_ignores_action_runs() {
         status,
         start_time: 1000,
         end_time: Some(1500),
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["asset".to_string()],
         priority: 0,
@@ -1991,13 +2010,12 @@ async fn test_backfill_crud() {
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["my_asset".to_string()],
         job_name: None,
-        partition_keys: vec![PartitionKey::Single {
-            keys: vec!["2024-01-15".to_string()],
-        }],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 4,
         tags: vec![("team".to_string(), "data".to_string())],
         create_time: 1000,
@@ -2013,14 +2031,21 @@ async fn test_backfill_crud() {
         action: None,
         config: None,
     };
-    storage.create_backfill(&record).await.unwrap();
+    let requested = vec![PartitionKey::Single {
+        keys: vec!["2024-01-15".to_string()],
+    }];
+    storage.create_backfill(&record, &requested).await.unwrap();
 
     let retrieved = storage.get_backfill("bf-001").await.unwrap();
     assert!(retrieved.is_some());
     let r = retrieved.unwrap();
     assert_eq!(r.backfill_id, "bf-001");
     assert_eq!(r.status, BackfillStatus::Requested);
-    assert_eq!(r.partition_keys.len(), 1);
+    assert_eq!(r.num_partitions, 1);
+    assert_eq!(
+        storage.get_backfill_keys("bf-001").await.unwrap(),
+        requested
+    );
     assert_eq!(r.launched_by, record.launched_by, "provenance roundtrips");
 
     // A row created without launched_by (a v2 writer) gets the V3 DDL
@@ -2029,7 +2054,7 @@ async fn test_backfill_crud() {
     // test `test_v3_backfill_launched_by_defaults_for_legacy_rows`.
     storage
             .db
-            .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], partition_keys: [], run_ids: [], completed_partitions: [], failed_partitions: [], canceled_partitions: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
+            .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")
             .await
             .unwrap()
             .check()
@@ -2058,7 +2083,7 @@ async fn test_get_all_backfills_page_pagination_and_filter() {
     ];
     for (id, status, ct) in specs {
         storage
-            .create_backfill(&make_backfill(id, status, ct))
+            .create_backfill(&make_backfill(id, status, ct), &[])
             .await
             .unwrap();
     }
@@ -2110,7 +2135,7 @@ async fn test_get_all_backfills_summary_counts() {
     ];
     for (id, status) in specs {
         storage
-            .create_backfill(&make_backfill(id, status, 0))
+            .create_backfill(&make_backfill(id, status, 0), &[])
             .await
             .unwrap();
     }

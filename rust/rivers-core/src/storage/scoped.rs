@@ -8,9 +8,10 @@ use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
     AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
-    ConcurrencyClaimStatus, CoordinatorRunInfo, PartitionKey, PerCodeLocationStorage, PoolInfo,
-    PoolLimit, RunRecord, RunStatus, SlotHolder, SortOrder, StaleCause, StaleStatus,
-    StorageBackend, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
+    ConcurrencyClaimStatus, CoordinatorRunInfo, FailureCount, PartitionBounds, PartitionFailure,
+    PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder,
+    SortOrder, StaleCause, StaleStatus, StorageBackend, StoredConditionEval, StoredConditionTick,
+    StoredEvent, StoredTick,
 };
 
 /// A backend reference pre-bound to a [`CodeLocationContext`].
@@ -240,9 +241,30 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn get_materialized_partitions_page(
+        &self,
+        asset_key: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<PartitionKey>> {
+        self.backend
+            .get_materialized_partitions_page(self.code_location_id, asset_key, offset, limit)
+            .await
+    }
+
     pub async fn count_materialized_partitions(&self, asset_key: &str) -> Result<u64> {
         self.backend
             .count_materialized_partitions(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_materialized_partitions_in(
+        &self,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<u64>> {
+        self.backend
+            .count_materialized_partitions_in(self.code_location_id, asset_key, bounds)
             .await
     }
 
@@ -281,9 +303,57 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
+    pub async fn get_partition_timestamps_in(
+        &self,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
+    ) -> Result<Vec<(PartitionKey, i64, Option<String>)>> {
+        self.backend
+            .get_partition_timestamps_in(self.code_location_id, asset_key, bounds, limit)
+            .await
+    }
+
     pub async fn get_in_progress_partitions(&self, asset_key: &str) -> Result<Vec<PartitionKey>> {
         self.backend
             .get_in_progress_partitions(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_partition_failures(&self, asset_key: &str) -> Result<FailureCount> {
+        self.backend
+            .count_partition_failures(self.code_location_id, asset_key)
+            .await
+    }
+
+    pub async fn count_partition_failures_in(
+        &self,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<FailureCount>> {
+        self.backend
+            .count_partition_failures_in(self.code_location_id, asset_key, bounds)
+            .await
+    }
+
+    pub async fn get_partition_failures(
+        &self,
+        asset_key: &str,
+        bounds: Option<&PartitionBounds>,
+        limit: u64,
+    ) -> Result<Vec<PartitionFailure>> {
+        self.backend
+            .get_partition_failures(self.code_location_id, asset_key, bounds, limit)
+            .await
+    }
+
+    pub async fn get_partition_failures_for_keys(
+        &self,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> Result<Vec<PartitionFailure>> {
+        self.backend
+            .get_partition_failures_for_keys(self.code_location_id, asset_key, keys)
             .await
     }
 

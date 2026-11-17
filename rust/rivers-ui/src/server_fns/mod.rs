@@ -8,6 +8,7 @@ pub mod graph;
 pub mod locations;
 pub mod mutations;
 pub mod overview;
+pub mod partitions;
 pub mod pools;
 pub mod runs;
 pub mod user;

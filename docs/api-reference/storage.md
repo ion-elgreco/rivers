@@ -20,7 +20,7 @@ Create an embedded storage backed by SurrealKV at the given path.
 storage = rs.Storage.embedded(".rivers/storage")
 ```
 
-### `Storage.connect(endpoint, *, username=None, password=None, namespace=None, database=None)`
+### `Storage.connect(endpoint, *, username=None, password=None, namespace=None, database=None, max_message_size=None)`
 
 Connect to a remote SurrealDB endpoint (e.g. `ws://host:8000`). Used by the K8s `serve` / `execute` CLI commands.
 
@@ -37,6 +37,7 @@ Each parameter resolves via: explicit kwarg → `RIVERS_SURREAL_*` env var → d
 | `password` | `str \| None` | `None` | Password for the DB-scoped user. |
 | `namespace` | `str \| None` | `"rivers"` | SurrealDB namespace. |
 | `database` | `str \| None` | `"main"` | SurrealDB database name. |
+| `max_message_size` | `int \| None` | `None` | Largest message, in bytes, that the connection sends or accepts. `None` keeps the default of 64 MiB. A SurrealDB server accepts 128 MiB by default. Not read from an env var. |
 
 When `username` and `password` both resolve to non-empty values, they authenticate as a database-scoped user against `namespace` / `database` — matching a `DEFINE USER ... ON DATABASE` definition.
 
@@ -66,6 +67,9 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 | 11 | Runs are indexed by code location, status and end time | 2, 10 |
 | 12 | A backfill's requested keys, runs and settled keys move into tables of their own | 12, 12 |
 | 13 | Storage moves to SurrealDB 4 (embedded stores are SurrealKV); indexes are rebuilt | 13, 13 |
+| 14 | A backfill keeps its requested keys in pages and its progress in one row per run | 14, 14 |
+| 15 | A run records when it began to execute | 14, 14 |
+| 16 | The failed partitions of each asset, and their failures by run, are stored in tables of their own; the migration fills them from the events | 14, 16 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
@@ -296,6 +300,7 @@ machine. The run page in the UI shows it.
 | `status` | `str` |
 | `start_time` | `int` |
 | `end_time` | `int \| None` |
+| `execution_start_time` | `int \| None` |
 | `tags` | `list[tuple[str, str]]` |
 | `node_names` | `list[str]` |
 | `priority` | `int` |
@@ -304,6 +309,8 @@ machine. The run page in the UI shows it.
 | `launched_by` | `LaunchedBy` |
 | `action` | `str \| None` |
 | `config` | `dict[str, Any] \| None` |
+
+The times are nanoseconds since the Unix epoch. `start_time` is when the run was created; a queued run waits from this time. `execution_start_time` is when the run began to execute: it is `None` while the run waits, and for a run that ended before it began. The duration of a run is `end_time - execution_start_time`.
 
 `config` holds the [launch document](../concepts/configuration.md#the-launch-document) the run was launched with; `None` means the definitions as they are.
 

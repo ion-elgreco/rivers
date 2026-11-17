@@ -17,19 +17,14 @@ async fn current_user_ref() -> Option<rivers_api::rivers::UserRef> {
     })
 }
 
-/// Connect to the code location that owns `run_id` (from its stored
-/// `code_location_id`), regardless of which location the UI is currently
-/// showing — a run-scoped action routed to the page's location would replay
-/// foreign runs against the wrong definitions.
 #[cfg(feature = "ssr")]
-async fn connect_to_run_owner(
-    run_id: &str,
-) -> Result<
-    rivers_api::rivers::code_location_service_client::CodeLocationServiceClient<
-        tonic::transport::Channel,
-    >,
-    ServerFnError,
-> {
+type LocationClient = rivers_api::rivers::code_location_service_client::CodeLocationServiceClient<
+    tonic::transport::Channel,
+>;
+
+/// Connect to the code location that owns `run_id`.
+#[cfg(feature = "ssr")]
+async fn connect_to_run_owner(run_id: &str) -> Result<LocationClient, ServerFnError> {
     use rivers_core::storage::StorageBackend;
     let state = expect_context::<crate::state::AppState>();
     let record = state
@@ -38,7 +33,19 @@ async fn connect_to_run_owner(
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .ok_or_else(|| ServerFnError::new(format!("run '{run_id}' not found")))?;
-    let cl = record.code_location_id;
+    connect_to_owner(&state, &record.code_location_id, &format!("run '{run_id}'")).await
+}
+
+/// Connect to the code location `cl` (a stored `code_location_id`) that owns
+/// `what`, regardless of which location the UI is currently showing — an
+/// action routed to the page's location would replay foreign runs against
+/// the wrong definitions.
+#[cfg(feature = "ssr")]
+async fn connect_to_owner(
+    state: &crate::state::AppState,
+    cl: &str,
+    what: &str,
+) -> Result<LocationClient, ServerFnError> {
     let entries = state
         .registry
         .list()
@@ -54,7 +61,7 @@ async fn connect_to_run_owner(
         })
         .ok_or_else(|| {
             ServerFnError::new(format!(
-                "code location '{cl}' owning run '{run_id}' is not registered"
+                "code location '{cl}' owning {what} is not registered"
             ))
         })?;
     if !entry.is_ready() {
@@ -532,6 +539,40 @@ pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
     Ok(resp.into_inner().success)
 }
 
+/// Cancel a backfill through the code location that owns it, which also
+/// cancels the runs of the backfill that have not ended. One whose runs all
+/// ended keeps its own final status. Returns `true` once the code location
+/// took the request.
+#[server]
+pub async fn cancel_backfill(backfill_id: String) -> Result<bool, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    cancel_backfill_of(&state, backfill_id).await
+}
+
+#[cfg(feature = "ssr")]
+async fn cancel_backfill_of(
+    state: &crate::state::AppState,
+    backfill_id: String,
+) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::CancelBackfillRequest;
+    use rivers_core::storage::StorageBackend;
+
+    let record = state
+        .storage
+        .get_backfill(&backfill_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new(format!("backfill '{backfill_id}' not found")))?;
+    let what = format!("backfill '{backfill_id}'");
+    let mut client = connect_to_owner(state, &record.code_location_id, &what).await?;
+
+    client
+        .cancel_backfill(CancelBackfillRequest { backfill_id })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(true)
+}
+
 /// Outcome of a bulk run action (cancel / delete). `requested` counts runs
 /// whose request was accepted; `failed` carries `(run_id, error)` for the
 /// rest.
@@ -666,4 +707,153 @@ pub async fn validate_config(
             kind: e.kind,
         })
         .collect())
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use std::convert::Infallible;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use rivers_api::rivers::{CancelBackfillRequest, CancelBackfillResponse};
+    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::{
+        BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
+        StorageBackend,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    use crate::code_location_registry::Registry;
+    use crate::state::AppState;
+    use crate::types::CodeLocationEntry;
+
+    /// A code location that answers only `CancelBackfill`, and keeps the
+    /// backfills it was asked to cancel.
+    #[derive(Clone, Default)]
+    struct FakeLocation {
+        canceled: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tonic::server::NamedService for FakeLocation {
+        const NAME: &'static str = "rivers.v1.CodeLocationService";
+    }
+
+    impl tonic::server::UnaryService<CancelBackfillRequest> for FakeLocation {
+        type Response = CancelBackfillResponse;
+        type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+        fn call(&mut self, request: tonic::Request<CancelBackfillRequest>) -> Self::Future {
+            let backfill_id = request.into_inner().backfill_id;
+            self.canceled.lock().unwrap().push(backfill_id);
+            std::future::ready(Ok(tonic::Response::new(CancelBackfillResponse {
+                success: false,
+            })))
+        }
+    }
+
+    impl tower::Service<http::Request<tonic::body::Body>> for FakeLocation {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            let fake = self.clone();
+            Box::pin(async move {
+                assert_eq!(
+                    request.uri().path(),
+                    "/rivers.v1.CodeLocationService/CancelBackfill"
+                );
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                Ok(grpc.unary(fake, request).await)
+            })
+        }
+    }
+
+    async fn spawn_fake() -> (String, FakeLocation) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fake = FakeLocation::default();
+        let service = fake.clone();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), fake)
+    }
+
+    fn entry(name: &str, identity: &str, grpc_endpoint: &str) -> CodeLocationEntry {
+        CodeLocationEntry {
+            namespace: "dev".into(),
+            name: name.into(),
+            grpc_endpoint: grpc_endpoint.into(),
+            image: String::new(),
+            module: String::new(),
+            phase: "Ready".into(),
+            observed_generation: 1,
+            identity: identity.into(),
+        }
+    }
+
+    fn backfill(code_location_id: &str) -> BackfillRecord {
+        BackfillRecord {
+            backfill_id: "bf".to_string(),
+            code_location_id: code_location_id.to_string(),
+            status: BackfillStatus::InProgress,
+            strategy: BackfillStrategy::MultiRun,
+            failure_policy: BackfillFailurePolicy::Continue,
+            asset_selection: vec!["asset".to_string()],
+            job_name: None,
+            num_partitions: 0,
+            planned_runs: 0,
+            run_ids: vec![],
+            completed_partitions: 0,
+            failed_partitions: 0,
+            canceled_partitions: 0,
+            max_concurrency: 1,
+            tags: vec![],
+            create_time: 1,
+            end_time: None,
+            error: None,
+            launched_by: LaunchedBy::default(),
+            action: None,
+            config: None,
+        }
+    }
+
+    /// The code location cancels the runs of the backfill: a cancel in the
+    /// store alone lets the queued runs go on.
+    #[tokio::test]
+    async fn a_backfill_is_canceled_by_the_code_location_that_owns_it() {
+        let (endpoint, fake) = spawn_fake().await;
+        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        storage
+            .create_backfill(&backfill("owner-id"), &[])
+            .await
+            .unwrap();
+        let state = AppState {
+            storage,
+            graph: None,
+            registry: Registry::Static(Arc::new(vec![
+                entry("other", "other-id", ""),
+                entry("owner", "owner-id", &endpoint),
+            ])),
+            key_comparisons: Default::default(),
+        };
+
+        super::cancel_backfill_of(&state, "bf".into())
+            .await
+            .unwrap();
+
+        assert_eq!(*fake.canceled.lock().unwrap(), ["bf"]);
+    }
 }

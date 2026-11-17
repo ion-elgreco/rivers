@@ -1,5 +1,9 @@
 use super::super::*;
 use super::*;
+use crate::storage::{
+    BackfillRecord, BackfillRunOutcome, BackfillStatus, PartitionKey, RunStatus,
+    UnstartedBackfillRun,
+};
 
 async fn count_rows(db: &Surreal<Any>, table: &str) -> u64 {
     let mut r = db
@@ -725,39 +729,48 @@ async fn test_v12_moves_backfill_progress_out_of_the_row() {
     .check()
     .unwrap();
 
-    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+    let through_v12: Vec<Migration> = embedded_migrations().into_iter().take(12).collect();
+    apply_migrations(&db, &through_v12).await.unwrap();
 
-    let read = async |id: &str| -> crate::storage::BackfillRecord {
-        let rows: Vec<crate::storage::BackfillRecord> = db
-            .query("SELECT * FROM backfills WHERE backfill_id = $id")
-            .bind(("id", id.to_string()))
-            .await
-            .unwrap()
-            .take(0)
-            .unwrap();
-        load_backfill_progress(&db, rows)
-            .await
-            .unwrap()
-            .pop()
-            .expect("backfill row")
+    let rows = async |query: &str| -> Vec<serde_json::Value> {
+        db.query(query.to_string()).await.unwrap().take(0).unwrap()
     };
-    let single = |k: &str| PartitionKey::Single {
-        keys: vec![k.to_string()],
-    };
-    let b1 = read("b1").await;
     assert_eq!(
-        b1.partition_keys,
-        vec![single("p1"), single("p2"), single("p3"), single("p4")]
+        rows("SELECT VALUE partition_keys.keys FROM backfill_keys WHERE backfill_id = 'b1'").await,
+        vec![serde_json::json!([["p1"], ["p2"], ["p3"], ["p4"]])]
     );
-    assert_eq!(b1.run_ids, vec!["r2", "r1", "r3"]);
-    assert_eq!(b1.completed_partitions, vec![single("p1")]);
-    let mut failed = b1.failed_partitions.clone();
-    failed.sort_by_key(|k| k.to_display());
-    assert_eq!(failed, vec![single("p2"), single("p3")]);
-    assert_eq!(b1.canceled_partitions, vec![single("p4")]);
-    let b2 = read("b2").await;
-    assert!(b2.partition_keys.is_empty() && b2.run_ids.is_empty());
-    assert!(b2.completed_partitions.is_empty() && b2.failed_partitions.is_empty());
+    assert_eq!(
+        rows(
+            "SELECT VALUE run_id FROM \
+             (SELECT run_id, linked_at FROM backfill_runs WHERE backfill_id = 'b1' ORDER BY linked_at)"
+        )
+        .await,
+        vec!["r2", "r1", "r3"]
+    );
+    assert_eq!(
+        rows(
+            "SELECT VALUE [partition_key.keys[0], outcome] FROM backfill_outcomes \
+             WHERE backfill_id = 'b1' ORDER BY partition_key.keys[0]"
+        )
+        .await,
+        vec![
+            serde_json::json!(["p1", "Completed"]),
+            serde_json::json!(["p2", "Failed"]),
+            serde_json::json!(["p3", "Failed"]),
+            serde_json::json!(["p4", "Canceled"]),
+        ]
+    );
+    assert_eq!(
+        rows("SELECT VALUE partition_keys FROM backfill_keys WHERE backfill_id = 'b2'").await,
+        vec![serde_json::json!([])]
+    );
+    for table in ["backfill_runs", "backfill_outcomes"] {
+        assert!(
+            rows(&format!("SELECT * FROM {table} WHERE backfill_id = 'b2'"))
+                .await
+                .is_empty()
+        );
+    }
 
     let left_on_row: Vec<serde_json::Value> = db
         .query(
@@ -803,6 +816,479 @@ async fn test_v13_raises_both_floors() {
     assert!(check_compatibility(stamps, Capability::Read, 12).is_err());
     assert!(check_compatibility(stamps, Capability::ReadWrite, 12).is_err());
     assert!(check_compatibility(stamps, Capability::ReadWrite, 13).is_ok());
+}
+
+/// V14 counts a backfill per planned run. An older backfill that ended keeps
+/// its rows per partition; one in progress goes on under the new rows.
+#[tokio::test]
+async fn test_v14_moves_a_backfill_in_progress_to_one_outcome_per_run() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v13: Vec<Migration> = embedded_migrations().into_iter().take(13).collect();
+    apply_migrations(&db, &through_v13).await.unwrap();
+
+    let backfill = |id: &str, status: &str| {
+        format!(
+            "{{ backfill_id: '{id}', code_location_id: 'default', status: '{status}', \
+               strategy: {{ variant: 'PerDimension', multi_run: ['zone'], single_run: ['hour'] }}, \
+               failure_policy: 'Continue', asset_selection: ['a'], max_concurrency: 1, tags: [], \
+               create_time: 1, end_time: NONE, error: NONE, launched_by: {{ kind: 'manual' }} }}"
+        )
+    };
+    let cell = |hours: &str, zones: &str| {
+        format!("{{ variant: 'Multi', dims: [['hour', [{hours}]], ['zone', [{zones}]]] }}")
+    };
+    let run = |id: &str, status: &str, zone: &str| {
+        format!(
+            "{{ run_id: '{id}', status: '{status}', start_time: 1, tags: [], node_names: ['a'], \
+               partition_key: {}, launched_by: {{ kind: 'backfill', backfill_id: 'active' }} }}",
+            cell("'h1', 'h2'", zone)
+        )
+    };
+    let failure = |step: &str| {
+        format!(
+            "{{ run_id: 'run-z1', event_type: 'StepFailure', asset_key: '{step}', timestamp: 2, \
+               metadata: [], partition_key: {} }}",
+            cell("'h2'", "'z1'")
+        )
+    };
+    db.query(format!(
+        "INSERT INTO backfills [{}, {}, {}] RETURN NONE; \
+         INSERT INTO backfill_keys [\
+            {{ backfill_id: 'old', partition_keys: [\
+                {{ variant: 'Single', keys: ['p1'] }}, {{ variant: 'Single', keys: ['p2', 'p3'] }}, \
+                {}, \
+                {{ variant: 'Set', keys: [{{ variant: 'Single', keys: ['s1'] }}, {{ variant: 'Single', keys: ['s2'] }}] }}] }}, \
+            {{ backfill_id: 'active', partition_keys: [{}] }}, \
+            {{ backfill_id: 'requested', partition_keys: [{{ variant: 'Single', keys: ['p1', 'p2'] }}] }} \
+         ] RETURN NONE; \
+         INSERT INTO backfill_runs [\
+            {{ backfill_id: 'old', run_id: 'old-r1', linked_at: 1 }}, \
+            {{ backfill_id: 'active', run_id: 'run-z2', linked_at: 20 }}, \
+            {{ backfill_id: 'active', run_id: 'run-z1', linked_at: 10 }}, \
+            {{ backfill_id: 'active', run_id: 'run-z3', linked_at: 30 }}, \
+            {{ backfill_id: 'active', run_id: 'run-z4', linked_at: 40 }} \
+         ] RETURN NONE; \
+         INSERT INTO backfill_outcomes [\
+            {{ backfill_id: 'old', partition_key: {{ variant: 'Single', keys: ['p1'] }}, outcome: 'Completed' }}, \
+            {{ backfill_id: 'old', partition_key: {{ variant: 'Single', keys: ['p2'] }}, outcome: 'Failed' }}, \
+            {{ backfill_id: 'old', partition_key: {{ variant: 'Single', keys: ['p3'] }}, outcome: 'Canceled' }}, \
+            {{ backfill_id: 'active', partition_key: {}, outcome: 'Completed' }}, \
+            {{ backfill_id: 'active', partition_key: {}, outcome: 'Failed' }} \
+         ] RETURN NONE; \
+         INSERT INTO runs [{}, {}, {}] RETURN NONE; \
+         INSERT INTO events [{}, {}] RETURN NONE;",
+        backfill("old", "CompletedFailed"),
+        backfill("active", "InProgress"),
+        backfill("requested", "Requested"),
+        cell("'h1', 'h2', 'h3'", "'z1', 'z2'"),
+        cell("'h1', 'h2'", "'z1', 'z2', 'z3', 'z4'"),
+        cell("'h1'", "'z1'"),
+        cell("'h2'", "'z1'"),
+        run("run-z1", "Success", "'z1'"),
+        run("run-z2", "Failure", "'z2'"),
+        run("run-z3", "Started", "'z3'"),
+        failure("first"),
+        failure("second"),
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    db.query(format!(
+        "INSERT INTO backfills [{}] RETURN NONE; \
+         CREATE backfill_keys CONTENT {{ backfill_id: 'wide', partition_keys: \
+            array::map(array::range(0, 5000), |$i: int| {{ variant: 'Single', keys: [<string> $i] }}) }} \
+            RETURN NONE;",
+        backfill("wide", "CompletedSuccess"),
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let storage = SurrealStorage {
+        db: db.clone(),
+        retry_config: Default::default(),
+        backend_kind: SurrealBackendKind::Memory,
+        runtime: None,
+    };
+    let read = async |id: &str| storage.get_backfill(id).await.unwrap().expect("backfill");
+    let counts = |b: &BackfillRecord| {
+        (
+            b.completed_partitions,
+            b.failed_partitions,
+            b.canceled_partitions,
+        )
+    };
+
+    // An older backfill keeps its rows: each counts one partition.
+    let old = read("old").await;
+    assert_eq!(old.num_partitions, 11, "1 + 2 + 3 x 2 + 2");
+    assert_eq!((old.planned_runs, counts(&old)), (0, (1, 1, 1)));
+    assert_eq!(old.run_ids, vec!["old-r1"]);
+    assert_eq!(storage.get_backfill_keys("old").await.unwrap().len(), 4);
+
+    // Its keys are in pages, in order, and the one row per backfill is gone.
+    let wide = storage.get_backfill_keys("wide").await.unwrap();
+    assert_eq!(read("wide").await.num_partitions, 5000);
+    assert_eq!(wide.len(), 5000);
+    assert!(wide.iter().enumerate().all(|(i, key)| *key
+        == PartitionKey::Single {
+            keys: vec![i.to_string()]
+        }));
+    let pages: Vec<i64> = db
+        .query("SELECT VALUE page FROM backfill_key_pages WHERE backfill_id = 'wide' ORDER BY page")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(pages, vec![0, 1]);
+    assert_eq!(count_rows(&db, "backfill_keys").await, 0);
+
+    // The backfill in progress: run numbers in link order, a row per run that
+    // ended, no rows per partition.
+    let active = read("active").await;
+    assert_eq!((active.num_partitions, active.planned_runs), (8, 4));
+    assert_eq!(active.run_ids, vec!["run-z1", "run-z2", "run-z3", "run-z4"]);
+    assert_eq!(
+        counts(&active),
+        (1, 3, 0),
+        "run-z1 succeeded with one partition failed alone; run-z2 failed"
+    );
+    let links: Vec<serde_json::Value> = db
+        .query(
+            "SELECT VALUE [run_id, run_number, member_count] FROM backfill_runs \
+             WHERE backfill_id = 'active' ORDER BY run_number",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(
+        links,
+        vec![
+            serde_json::json!(["run-z1", 0, 2]),
+            serde_json::json!(["run-z2", 1, 2]),
+            serde_json::json!(["run-z3", 2, 2]),
+            serde_json::json!(["run-z4", 3, 0]),
+        ],
+        "run-z4 is linked but has no run yet"
+    );
+    let per_partition: Vec<String> = db
+        .query("SELECT VALUE backfill_id FROM backfill_outcomes")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(per_partition, vec!["old"; 3]);
+
+    // It completes under the new rows.
+    assert_eq!(storage.try_complete_backfill("active").await.unwrap(), None);
+    storage
+        .update_run_status("run-z3", RunStatus::Success, Some(5))
+        .await
+        .unwrap();
+    storage
+        .settle_unstarted_backfill_runs(
+            "active",
+            &[UnstartedBackfillRun {
+                run_number: 3,
+                member_count: 2,
+                outcome: BackfillRunOutcome::Canceled,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.try_complete_backfill("active").await.unwrap(),
+        Some(BackfillStatus::CompletedFailed)
+    );
+    assert_eq!(counts(&read("active").await), (3, 3, 2));
+
+    // A requested backfill starts as a new one does.
+    let requested = read("requested").await;
+    assert_eq!((requested.num_partitions, requested.planned_runs), (2, 0));
+    assert!(storage.start_backfill("requested", 2).await.unwrap());
+
+    let stamps = stamps_at(&db, 14).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (14, 14, 14)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 13).is_err());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 13).is_err());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 14).is_ok());
+}
+
+/// V15 adds the time a run began to execute. An ended run from before it gets
+/// the best time that the store has, and only if the store shows that it
+/// began. It is additive: a V14 build can still read and write.
+#[tokio::test]
+async fn test_v15_gives_older_runs_the_time_they_began() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v14: Vec<Migration> = embedded_migrations().into_iter().take(14).collect();
+    apply_migrations(&db, &through_v14).await.unwrap();
+
+    // (run, status, end time, events, the time it began)
+    type Event = (&'static str, i64);
+    let cases: Vec<(&str, &str, Option<i64>, Vec<Event>, Option<i64>)> = vec![
+        (
+            "direct",
+            "Success",
+            Some(500),
+            vec![("StepStart", 110)],
+            Some(100),
+        ),
+        (
+            "direct-in-progress",
+            "Started",
+            None,
+            vec![("StepStart", 110)],
+            None,
+        ),
+        (
+            "direct-failed-in-a-step",
+            "Failure",
+            Some(500),
+            vec![("StepStart", 110), ("StepFailure", 500)],
+            Some(100),
+        ),
+        (
+            "direct-never-launched",
+            "Failure",
+            Some(500),
+            vec![("RunLaunchFailed", 500)],
+            None,
+        ),
+        (
+            "waited",
+            "Success",
+            Some(500),
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            Some(400),
+        ),
+        (
+            "waited-failed-in-a-step",
+            "Failure",
+            Some(500),
+            vec![("RunQueued", 100), ("RunDequeued", 400), ("StepStart", 420)],
+            Some(400),
+        ),
+        ("waiting", "Queued", None, vec![("RunQueued", 100)], None),
+        (
+            "left-the-queue",
+            "NotStarted",
+            None,
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            None,
+        ),
+        (
+            "canceled-in-the-queue",
+            "Canceled",
+            Some(300),
+            vec![("RunQueued", 100)],
+            None,
+        ),
+        (
+            "canceled-after-the-queue",
+            "Canceled",
+            Some(450),
+            vec![("RunQueued", 100), ("RunDequeued", 400)],
+            None,
+        ),
+        (
+            "never-launched",
+            "Failure",
+            Some(700),
+            vec![
+                ("RunQueued", 100),
+                ("RunDequeued", 400),
+                ("RunLaunchFailed", 700),
+            ],
+            None,
+        ),
+        (
+            "dequeue-not-recorded",
+            "Success",
+            Some(500),
+            vec![("RunQueued", 100), ("StepStart", 420)],
+            None,
+        ),
+    ];
+
+    let runs: Vec<String> = cases
+        .iter()
+        .map(|(id, status, end_time, _, _)| {
+            let end_time = end_time.map_or("NONE".to_string(), |end| end.to_string());
+            format!(
+                "{{ run_id: '{id}', status: '{status}', start_time: 100, end_time: {end_time}, \
+                   tags: [], node_names: ['a'] }}"
+            )
+        })
+        .collect();
+    let events: Vec<String> = cases
+        .iter()
+        .flat_map(|(id, _, _, events, _)| {
+            events.iter().map(move |(event_type, timestamp)| {
+                format!(
+                    "{{ run_id: '{id}', event_type: '{event_type}', timestamp: {timestamp}, \
+                       metadata: [] }}"
+                )
+            })
+        })
+        .collect();
+    db.query(format!(
+        "INSERT INTO runs [{}] RETURN NONE; INSERT INTO events [{}] RETURN NONE",
+        runs.join(", "),
+        events.join(", ")
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let mut began: Vec<(String, Option<i64>)> = db
+        .query("SELECT VALUE [run_id, execution_start_time] FROM runs")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    began.sort();
+    let mut expected: Vec<(String, Option<i64>)> = cases
+        .iter()
+        .map(|(id, _, _, _, began)| (id.to_string(), *began))
+        .collect();
+    expected.sort();
+    assert_eq!(began, expected);
+
+    let stamps = stamps_at(&db, 15).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (15, 14, 14)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 14).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 14).is_ok());
+}
+
+#[tokio::test]
+async fn test_v16_stores_the_failed_partitions_that_the_events_give() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v15: Vec<Migration> = embedded_migrations().into_iter().take(15).collect();
+    apply_migrations(&db, &through_v15).await.unwrap();
+
+    // `r_fail` ended in failure on p1..p3 and materialized p1. `f1` failed
+    // p2 earlier and p4, which a later materialization replaced. The action
+    // run `act` failed p5. p3 was deleted after the failure.
+    let key = |name: &str| format!("{{ variant: 'Single', keys: ['{name}'] }}");
+    db.query(format!(
+        "INSERT INTO assets [{{ asset_key: 'a', tags: [], kinds: [] }}] RETURN NONE; \
+         INSERT INTO runs [ \
+             {{ run_id: 'r_fail', status: 'Failure', start_time: 100, end_time: 500, tags: [], \
+                node_names: ['a'], partition_key: {{ variant: 'Single', keys: ['p1', 'p2', 'p3'] }} }}, \
+             {{ run_id: 'act', status: 'Success', start_time: 100, end_time: 400, tags: [], \
+                node_names: ['a'], action: 'optimize' }} \
+         ] RETURN NONE; \
+         INSERT INTO events [ \
+             {{ run_id: 'r_fail', asset_key: 'a', event_type: 'Materialization', \
+                partition_key: {p1}, timestamp: 200, metadata: [] }}, \
+             {{ run_id: 'f1', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p2}, timestamp: 150, metadata: [] }}, \
+             {{ run_id: 'f1', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p4}, timestamp: 300, metadata: [] }}, \
+             {{ run_id: 'act', asset_key: 'a', event_type: 'StepFailure', \
+                partition_key: {p5}, timestamp: 300, metadata: [] }} \
+         ] RETURN NONE; \
+         INSERT INTO asset_partitions [ \
+             {{ asset_key: 'a', partition_key: {p1}, last_timestamp: 200 }}, \
+             {{ asset_key: 'a', partition_key: {p2}, last_timestamp: 100 }}, \
+             {{ asset_key: 'a', partition_key: {p4}, last_timestamp: 350 }} \
+         ] RETURN NONE; \
+         INSERT INTO asset_partition_deletions [ \
+             {{ asset_key: 'a', partition_key: {p3}, timestamp: 600 }} \
+         ] RETURN NONE;",
+        p1 = key("p1"),
+        p2 = key("p2"),
+        p3 = key("p3"),
+        p4 = key("p4"),
+        p5 = key("p5"),
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let rows: Vec<(serde_json::Value, i64, String, Option<i64>, bool)> = db
+        .query(
+            "SELECT VALUE [partition_key, failed_at, run_id, built_at, has_row] \
+             FROM asset_partition_failures",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+            500,
+            "r_fail".to_string(),
+            Some(100),
+            true
+        )]
+    );
+    let mut by_run: Vec<(serde_json::Value, String, Option<i64>, Option<i64>)> = db
+        .query(
+            "SELECT VALUE [partition_key, run_id, step_failed_at, run_failed_at] \
+             FROM asset_partition_run_failures",
+        )
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    by_run.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        by_run,
+        vec![
+            (
+                serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+                "f1".to_string(),
+                Some(150),
+                None
+            ),
+            (
+                serde_json::json!({ "variant": "Single", "keys": ["p2"] }),
+                "r_fail".to_string(),
+                None,
+                Some(500)
+            ),
+        ]
+    );
+
+    let stamps = stamps_at(&db, 16).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (16, 14, 16)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 15).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 15).is_err());
 }
 
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only

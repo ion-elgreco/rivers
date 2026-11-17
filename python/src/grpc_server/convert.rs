@@ -2,11 +2,15 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use rivers_api::rivers::*;
+use rivers_core::execution::partition_outline::{
+    between, children, key_length, split, time_cuts, time_format_ascends, time_unit,
+};
 use tonic::Status;
 
 use crate::automation::schedule::TickRequest;
 use crate::config::run_config::{ConfigIssue, LocPart, config_schema_json, validate_run_config};
 use crate::partitions::backfill_strategy::PyBackfillStrategy;
+use crate::partitions::definition::KeysByPlace;
 use crate::partitions::key_range::{
     DimensionSelection, PartitionKeyRangeInner, PyPartitionKeyRange,
 };
@@ -161,6 +165,160 @@ pub(super) fn resolve_partition_target<'a>(
         pd.dimension_def(dimension)
             .ok_or_else(|| format!("asset '{asset_key}' has no partition dimension '{dimension}'"))
     }
+}
+
+/// One page of the keys of `target`, in the order of the definition. With a
+/// query: of the keys that hold that text, and `total` counts those.
+pub(super) fn partition_keys(
+    target: &PartitionsDefinition,
+    req: &GetPartitionKeysRequest,
+) -> Result<GetPartitionKeysResponse, String> {
+    let (offset, limit) = (req.offset as usize, req.limit as usize);
+
+    if req.query.is_empty() {
+        let keys: Vec<String> = target
+            .get_partition_keys_window(offset, limit)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(py_partition_key_display)
+            .collect();
+        return Ok(GetPartitionKeysResponse {
+            indices: (req.offset..).take(keys.len()).collect(),
+            keys,
+            total: target.partition_count() as u64,
+        });
+    }
+
+    let (page, total) = target
+        .get_partition_keys_filtered(&req.query, offset, limit)
+        .map_err(|e| e.to_string())?;
+    let (indices, keys) = page
+        .into_iter()
+        .map(|(place, key)| (place as u64, key))
+        .unzip();
+    Ok(GetPartitionKeysResponse {
+        keys,
+        total: total as u64,
+        indices,
+    })
+}
+
+/// The dimensions of `def` in the order of their names: the order of a stored
+/// partition key. A definition with one dimension has one entry with no name.
+fn partition_dimensions(def: &PartitionsDefinition) -> Vec<PartitionDimension> {
+    let dimension = |name: &str, def: &PartitionsDefinition| PartitionDimension {
+        name: name.to_string(),
+        keys: def.partition_count() as u64,
+        dynamic_name: match def {
+            PartitionsDefinition::Dynamic { name } => name.clone(),
+            _ => String::new(),
+        },
+    };
+
+    match def {
+        PartitionsDefinition::Multi { dimensions } => {
+            let mut dimensions: Vec<PartitionDimension> = dimensions
+                .iter()
+                .map(|(name, def)| dimension(name, def))
+                .collect();
+            dimensions.sort_by(|a, b| a.name.cmp(&b.name));
+            dimensions
+        }
+        single => vec![dimension("", single)],
+    }
+}
+
+/// The groups of the partition outline for one dimension of `asset_def`.
+pub(super) fn partition_groups(
+    asset_def: &PartitionsDefinition,
+    req: &GetPartitionGroupsRequest,
+) -> Result<GetPartitionGroupsResponse, String> {
+    let dimensions = partition_dimensions(asset_def);
+    let def = match asset_def {
+        PartitionsDefinition::Multi { .. } => {
+            let name = match req.dimension.as_str() {
+                "" => dimensions[0].name.as_str(),
+                name => name,
+            };
+            asset_def.dimension_def(name).ok_or_else(|| {
+                format!(
+                    "asset '{}' has no partition dimension '{name}'",
+                    req.asset_key
+                )
+            })?
+        }
+        single if req.dimension.is_empty() => single,
+        _ => {
+            return Err(format!(
+                "asset '{}' has no partition dimension '{}'",
+                req.asset_key, req.dimension
+            ));
+        }
+    };
+
+    // The keys of a dynamic set are in storage.
+    let by_place = def.keys_by_place().map_err(|e| e.to_string())?;
+    let Some(keys) = &by_place else {
+        return Ok(GetPartitionGroupsResponse {
+            dimensions,
+            ..Default::default()
+        });
+    };
+    let fmt = keys.fmt();
+    let ascends = match keys {
+        KeysByPlace::Static(listed) => listed.iter().zip(listed.iter().skip(1)).all(|(a, b)| a < b),
+        _ => fmt.is_some_and(time_format_ascends),
+    };
+    let total_keys = keys.len();
+    let time = fmt.is_some();
+
+    if !ascends {
+        return Ok(GetPartitionGroupsResponse {
+            total_keys: total_keys as u64,
+            time,
+            dimensions,
+            ..Default::default()
+        });
+    }
+
+    let places = between(keys, &req.first_key, &req.last_key);
+    let split = match req.max_groups {
+        0 => children(keys, places),
+        most => split(keys, places, most as usize),
+    };
+    let unit = |shared: Option<usize>| {
+        shared
+            .zip(fmt)
+            .and_then(|(shared, fmt)| time_unit(fmt, shared))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    Ok(GetPartitionGroupsResponse {
+        unit: unit(split.shared),
+        key_unit: unit(key_length(keys)),
+        of_keys: split.of_keys,
+        groups: split
+            .groups
+            .into_iter()
+            .map(|group| PartitionKeyGroup {
+                label: group.label,
+                first_key: group.first,
+                last_key: group.last,
+                keys: group.keys as u64,
+            })
+            .collect(),
+        ascending: true,
+        total_keys: total_keys as u64,
+        time,
+        dimensions,
+        cuts: fmt
+            .map(time_cuts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cut| cut as u32)
+            .collect(),
+    })
 }
 
 /// For Multi, surface per-dimension keys so the UI can render one selector per

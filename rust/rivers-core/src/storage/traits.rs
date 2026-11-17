@@ -6,12 +6,13 @@ use anyhow::Result;
 use crate::assets::remote::LocationRef;
 
 use super::{
-    AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry,
-    ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord,
-    CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EventRecord, LogRecord, PartitionKey, PoolInfo,
-    PoolLimit, RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder,
-    StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog,
-    StoredTick, TickRecord,
+    AssetRecord, AssetScope, BackfillRecord, BackfillRunOutcome, BackfillStatus,
+    CodeLocationDirectoryEntry, ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord,
+    ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EndedBackfillRun,
+    EventRecord, FailureCount, LogRecord, PartitionBounds, PartitionFailure, PartitionKey,
+    PoolInfo, PoolLimit, RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder,
+    SortOrder, StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent,
+    StoredLog, StoredTick, TickRecord, UnstartedBackfillRun,
 };
 
 /// A code-location identity bound for the lifetime of a logical operation.
@@ -206,11 +207,30 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
 
+    /// The materialized partitions of an asset from `offset`, at most
+    /// `limit`, in the order of the index.
+    fn get_materialized_partitions_page(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        offset: u64,
+        limit: u64,
+    ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
+
     fn count_materialized_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
     ) -> impl Future<Output = Result<u64>> + Send;
+
+    /// How many partitions of an asset have a row in each of `bounds`, in
+    /// the order of the bounds. No read grows with the rows of the asset.
+    fn count_materialized_partitions_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> impl Future<Output = Result<Vec<u64>>> + Send;
 
     /// Number of registered keys for a dynamic partition namespace.
     fn count_dynamic_partitions(
@@ -243,11 +263,55 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         keys: &[PartitionKey],
     ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
 
+    /// Timestamp and last run of the partitions of an asset in `bounds`, at
+    /// most `limit` of them.
+    fn get_partition_timestamps_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &PartitionBounds,
+        limit: u64,
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, i64, Option<String>)>>> + Send;
+
     fn get_in_progress_partitions(
         &self,
         code_location_id: &str,
         asset_key: &str,
     ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
+
+    /// How many partitions of an asset failed and were not materialized or
+    /// deleted again, and how many of them have a row. Counted on an index.
+    fn count_partition_failures(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> impl Future<Output = Result<FailureCount>> + Send;
+
+    /// The same for each of `bounds`, in the order of the bounds.
+    fn count_partition_failures_in(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> impl Future<Output = Result<Vec<FailureCount>>> + Send;
+
+    /// The failed partitions of an asset, or of those in `bounds`, at most
+    /// `limit` of them.
+    fn get_partition_failures(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        bounds: Option<&PartitionBounds>,
+        limit: u64,
+    ) -> impl Future<Output = Result<Vec<PartitionFailure>>> + Send;
+
+    /// The failed partitions of an asset among `keys`.
+    fn get_partition_failures_for_keys(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<PartitionFailure>>> + Send;
 
     /// Partitions whose latest failure isn't superseded by a later materialization or deletion, with that failure's timestamp.
     fn get_failed_partitions(
@@ -454,7 +518,8 @@ pub trait StorageBackend: PerCodeLocationStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> impl Future<Output = Result<()>> + Send;
-    /// Transition an existing run to `Started` unless it was canceled.
+    /// Transition an existing run to `Started` unless it was canceled, and
+    /// record when it began (the first start counts).
     /// Returns `false` (without touching the record) when the run is
     /// `Canceled` — the executor must skip the run instead of resurrecting it.
     fn try_start_run(&self, run_id: &str) -> impl Future<Output = Result<bool>> + Send;
@@ -593,31 +658,68 @@ pub trait StorageBackend: PerCodeLocationStorage {
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
     // Backfills
-    fn create_backfill(&self, backfill: &BackfillRecord)
-    -> impl Future<Output = Result<()>> + Send;
-    fn update_backfill_status(
+    /// Store a backfill and the keys it was requested for. A key can name
+    /// many partitions.
+    fn create_backfill(
         &self,
-        backfill_id: &str,
-        status: BackfillStatus,
-        end_time: Option<i64>,
+        backfill: &BackfillRecord,
+        partition_keys: &[PartitionKey],
     ) -> impl Future<Output = Result<()>> + Send;
-    fn update_backfill_progress(
+    /// The requested keys of a backfill, in the order given at creation.
+    fn get_backfill_keys(
         &self,
         backfill_id: &str,
-        run_ids: &[String],
-        completed: &[PartitionKey],
-        failed: &[PartitionKey],
-        canceled: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
+    /// Move a `Requested` backfill to `InProgress` and record the number of
+    /// runs in its plan. `false` when the backfill is not `Requested`.
+    fn start_backfill(
+        &self,
+        backfill_id: &str,
+        planned_runs: usize,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Record planned runs that ended before they started. A planned run that
+    /// has an outcome keeps it.
+    fn settle_unstarted_backfill_runs(
+        &self,
+        backfill_id: &str,
+        runs: &[UnstartedBackfillRun],
     ) -> impl Future<Output = Result<()>> + Send;
     fn get_backfill(
         &self,
         backfill_id: &str,
     ) -> impl Future<Output = Result<Option<BackfillRecord>>> + Send;
-    /// Check if all runs for a backfill are terminal and finalize it if so.
+    /// The planned runs of a backfill that ended, with a run number from
+    /// `first` to `last`, in plan order.
+    fn get_ended_backfill_runs(
+        &self,
+        backfill_id: &str,
+        first: usize,
+        last: usize,
+    ) -> impl Future<Output = Result<Vec<EndedBackfillRun>>> + Send;
+    /// What happened to each of `partitions` in a backfill that ended before
+    /// outcomes were kept per run. A partition with no outcome is left out.
+    fn get_backfill_partition_outcomes(
+        &self,
+        backfill_id: &str,
+        partitions: &[PartitionKey],
+    ) -> impl Future<Output = Result<Vec<(PartitionKey, BackfillRunOutcome)>>> + Send;
+    /// The partitions that a run recorded a step failure for.
+    fn get_run_failed_partitions(
+        &self,
+        run_id: &str,
+    ) -> impl Future<Output = Result<Vec<PartitionKey>>> + Send;
+    /// The linked runs of a backfill that have no outcome, in plan order. A
+    /// run that is linked and does not exist yet is one of them.
+    fn get_open_backfill_runs(
+        &self,
+        backfill_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>>> + Send;
+    /// Set the final status of an `InProgress` backfill when every planned
+    /// run has an outcome. `None` when the backfill is not `InProgress` or
+    /// planned runs are still open.
     fn try_complete_backfill(
         &self,
         backfill_id: &str,
-        extra_canceled: &[PartitionKey],
     ) -> impl Future<Output = Result<Option<BackfillStatus>>> + Send;
 
     /// Cancel a backfill. If every run is already terminal the cancel came

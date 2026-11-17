@@ -157,7 +157,7 @@ def rerun_backfill(
 ) -> BackfillResult
 ```
 
-Launch a previous backfill again. The rerun replays every partition of the original backfill, not only the failed or canceled ones; keys that are no longer valid are dropped. It keeps the original verb, so a rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. For a backfill of a job, it raises `ExecutionError` if the job now runs a different verb. To retry only some partitions, call `backfill()` with those keys and the original `action`. See [Backfills](backfills.md) for the full reference.
+Launch a previous backfill again. The rerun replays every partition of the original backfill, not only the failed or canceled ones; partitions that are no longer valid are left out. It keeps the original verb, so a rerun of a `delete` backfill deletes every partition again, including partitions materialized again after the first run. For a backfill of a job, it raises `ExecutionError` if the job now runs a different verb. To retry only some partitions, call `backfill()` with those keys and the original `action`. See [Backfills](backfills.md) for the full reference.
 
 ### `observe()`
 
@@ -331,7 +331,7 @@ Outcome of a synchronous `materialize()` call.
 | `success` | `bool` | `True` when every requested asset materialized. |
 | `run_id` | `str` | ID of the underlying run record. |
 | `materialized_assets` | `list[str]` | Asset keys attempted in this run. |
-| `failed_assets` | `list[tuple[str, str]]` | `(asset_key, error_message)` pairs for the assets that failed: each failed output of a multi-asset, and no output that materialized. A multi-asset that fails after all its outputs materialized is listed under its own name. |
+| `failed_assets` | `list[tuple[str, str]]` | `(asset_key, error_message)` pairs for the assets that failed: each failed output of a multi-asset, and no output that materialized. A multi-asset that fails after all its outputs materialized is listed under its own name. When some events of the run could not be stored, the list also holds `("rivers/events", error_message)`. |
 
 To read output values, use `repo.load_node(name)`.
 

@@ -455,6 +455,7 @@ async fn every_channel_delivers_sse_events_over_http() {
                     status: RunStatus::Queued,
                     start_time: 1,
                     end_time: None,
+                    execution_start_time: None,
                     tags: vec![],
                     node_names: vec![],
                     priority: 0,
@@ -548,11 +549,12 @@ async fn every_channel_delivers_sse_events_over_http() {
                     failure_policy: BackfillFailurePolicy::Continue,
                     asset_selection: vec!["sse_asset".into()],
                     job_name: None,
-                    partition_keys: vec![],
+                    num_partitions: 0,
+                    planned_runs: 0,
                     run_ids: vec![],
-                    completed_partitions: vec![],
-                    failed_partitions: vec![],
-                    canceled_partitions: vec![],
+                    completed_partitions: 0,
+                    failed_partitions: 0,
+                    canceled_partitions: 0,
                     max_concurrency: 1,
                     tags: vec![],
                     create_time: 1,
@@ -562,7 +564,10 @@ async fn every_channel_delivers_sse_events_over_http() {
                     action: None,
                     config: None,
                 };
-                storage.create_backfill(&bf).await.expect("create_backfill");
+                storage
+                    .create_backfill(&bf, &[])
+                    .await
+                    .expect("create_backfill");
             },
             &["event: backfills-changed"],
         )
@@ -665,6 +670,7 @@ async fn metrics_advance_after_write() {
         status: RunStatus::Queued,
         start_time: 1,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -782,6 +788,7 @@ async fn multiple_sse_clients_receive_same_event() {
         status: RunStatus::Queued,
         start_time: 1,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -897,6 +904,7 @@ async fn sse_client_isolation_across_channels() {
         status: RunStatus::Queued,
         start_time: 1,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,

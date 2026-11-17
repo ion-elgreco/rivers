@@ -93,6 +93,7 @@ impl From<rivers_core::storage::RunRecord> for RunRecord {
             status: r.status.into(),
             start_time: r.start_time,
             end_time: r.end_time,
+            execution_start_time: r.execution_start_time,
             tags: r.tags,
             node_names: r.node_names,
             priority: r.priority,
@@ -402,14 +403,10 @@ impl From<rivers_core::storage::BackfillRecord> for BackfillInfo {
             strategy_code,
             job_name: b.job_name,
             asset_selection: b.asset_selection,
-            total_partitions: b
-                .partition_keys
-                .iter()
-                .map(|pk| pk.member_count())
-                .sum::<usize>() as u32,
-            completed_partitions: b.completed_partitions.len() as u32,
-            failed_partitions: b.failed_partitions.len() as u32,
-            canceled_partitions: b.canceled_partitions.len() as u32,
+            total_partitions: b.num_partitions,
+            completed_partitions: b.completed_partitions,
+            failed_partitions: b.failed_partitions,
+            canceled_partitions: b.canceled_partitions,
             max_concurrency: b.max_concurrency as u32,
             run_ids: b.run_ids,
             tags: b.tags,
@@ -584,13 +581,12 @@ mod tests {
             failure_policy: rivers_core::storage::BackfillFailurePolicy::Continue,
             asset_selection: vec!["orders".into()],
             job_name: None,
-            partition_keys: vec![rivers_core::storage::PartitionKey::Single {
-                keys: vec!["p1".into()],
-            }],
+            num_partitions: 5,
+            planned_runs: 5,
             run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
+            completed_partitions: 3,
+            failed_partitions: 1,
+            canceled_partitions: 0,
             max_concurrency: 4,
             tags: vec![],
             create_time: 0,
@@ -602,6 +598,15 @@ mod tests {
         };
         let ui: BackfillInfo = core.into();
         assert_eq!(ui.action.as_deref(), Some("purge"));
+        assert_eq!(
+            (
+                ui.total_partitions,
+                ui.completed_partitions,
+                ui.failed_partitions,
+                ui.canceled_partitions
+            ),
+            (5, 3, 1, 0)
+        );
     }
 
     /// Run-list partition labels must use the same canonical `dim=v|dim=v`
@@ -616,6 +621,7 @@ mod tests {
             status: rivers_core::storage::RunStatus::Success,
             start_time: 0,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -664,6 +670,84 @@ mod tests {
         assert_eq!(
             ui.partition_key.as_deref(),
             Some("date=2024-01-01|region=us")
+        );
+    }
+
+    /// Half a year of hours for one zone, as the planner of a backfill writes it.
+    fn span_key() -> rivers_core::storage::PartitionKey {
+        use rivers_core::storage::{KeyItem, KeySpan, PartitionKey, SpanStep};
+
+        let hours = KeySpan::new(
+            "2024-01-01T00:00",
+            "2024-06-30T23:00",
+            SpanStep::Cron("0 * * * *".into()),
+            "%Y-%m-%dT%H:00",
+        )
+        .unwrap();
+        PartitionKey::MultiItems {
+            dims: vec![
+                ("hour".into(), vec![KeyItem::Span(hours)]),
+                ("zone".into(), vec![KeyItem::Value("132".into())]),
+            ],
+        }
+    }
+
+    /// A run of a span of time windows shows its first partitions and the
+    /// total, as a run of the same windows written out does.
+    #[test]
+    fn run_record_with_a_span_key_shows_a_preview_and_the_total() {
+        let core = rivers_core::storage::RunRecord {
+            run_id: "r1".into(),
+            code_location_id: rivers_core::storage::default_code_location_id(),
+            job_name: None,
+            status: rivers_core::storage::RunStatus::Success,
+            start_time: 0,
+            end_time: None,
+            execution_start_time: None,
+            tags: vec![],
+            node_names: vec![],
+            priority: 0,
+            partition_key: Some(span_key()),
+            block_reason: None,
+            launched_by: rivers_core::storage::LaunchedBy::Manual { user: None },
+            action: None,
+            config: None,
+        };
+
+        let ui: RunRecord = core.into();
+
+        let preview = ui.partition_key.expect("a partitioned run");
+        assert_eq!(
+            preview.preview,
+            vec![
+                "hour=2024-01-01T00:00|zone=132",
+                "hour=2024-01-01T01:00|zone=132",
+                "hour=2024-01-01T02:00|zone=132",
+            ]
+        );
+        assert_eq!(preview.total, 4368);
+    }
+
+    /// An event of a whole run names the span, not each window.
+    #[test]
+    fn stored_event_with_a_span_key_shows_the_span() {
+        let core = rivers_core::storage::StoredEvent {
+            id: rivers_core::surrealdb::types::RecordId::new("events", "e1"),
+            event_type: rivers_core::storage::EventType::RunQueued,
+            asset_key: None,
+            run_id: "r1".into(),
+            partition_key: Some(span_key()),
+            timestamp: 0,
+            metadata: vec![],
+            code_version: None,
+            input_data_versions: vec![],
+        };
+
+        let ui: StoredEvent = core.into();
+
+        assert_eq!(
+            ui.partition_key.as_deref(),
+            Some("hour=2024-01-01T00:00..2024-06-30T23:00|zone=132")
         );
     }
 

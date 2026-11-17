@@ -214,8 +214,29 @@ Launches `repo.backfill()` against either:
 | `--concurrency`, `-c` | `4` | Max concurrent partition runs. |
 | `--on-failure` | `continue` | `continue` or `stop_on_failure`. |
 | `--dry-run` | `False` | Preview without executing. |
+| `--detach` | `False` | Record the backfill and return. See [Detached backfills](#detached-backfills). |
 | `--action` | none | Run this verb in every child run instead of materializing. |
 | `--surreal-endpoint` / `--code-location-id` / `--storage-path` / `--memory` | scratch store | Storage. See [Storage flags](#storage-flags). |
+
+### Detached backfills
+
+Without `--detach`, the command runs the backfill itself and returns when the backfill ends. A large backfill then needs a terminal that stays open.
+
+With `--detach`, the command records the backfill, prints its id and returns. The automation daemon of the code location plans the runs and puts them in the run queue.
+
+```bash
+rivers backfill my_pipeline \
+  --assets daily_events \
+  --from 2024-01-01 --to 2024-01-31 \
+  --detach \
+  --surreal-endpoint ws://surrealdb:8000 \
+  --code-location-id CODE_LOCATION_ID
+# Backfill BACKFILL_ID: Requested — 31 partitions, 31 runs
+```
+
+- `--detach` needs `--surreal-endpoint` or `--storage-path`: the store that the daemon reads. The command stops with an error on the scratch store or with `--memory`.
+- The run queue of the code location limits how many runs execute at the same time. `--concurrency` applies only to a backfill that the command runs itself.
+- Use `backfill-status` to follow the backfill and `backfill-cancel` to stop it.
 
 ---
 
@@ -239,7 +260,7 @@ rivers execute my_pipeline --run-id RID --surreal-endpoint ws://surreal:8000
 rivers execute-step my_pipeline --run-id RID --step-key my_asset
 ```
 
-Designed for K8s execution pods. `execute` runs an entire run with a pre-assigned `run-id`; `execute-step` runs one step (used by step worker pods). Both read the run record for the verb and the per-asset config overrides the run was launched with, and exit 1 without one. With `--job`, `execute` fails the run, without starting it, when the job's verb in the pod's code differs from the verb on the run record.
+Designed for K8s execution pods. `execute` runs an entire run with a pre-assigned `run-id`; `execute-step` runs one step (used by step worker pods). Both read the run record for the verb, the partition key and the per-asset config overrides the run was launched with, and exit 1 without one. With `--partition-key`, the pod runs that key in place of the key of the run record; the record keeps its key. With `--job`, `execute` fails the run, without starting it, when the job's verb in the pod's code differs from the verb on the run record.
 
 ---
 

@@ -145,6 +145,9 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
 # `ServiceExt::oneshot` for router-level auth tests.
 tower = { version = "0.5", features = ["util"] }
+# A fake code location that answers one gRPC method.
+http = "1"
+tonic-prost.workspace = true
 
 # Wasm-only dev-deps for browser-based component tests. The extra
 # `web-sys` features here are needed by `tests/partition_picker_browser.rs`

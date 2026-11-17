@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
-use crate::types::{AssetDefinitionInfo, PartitionDetail, PartitionStatus, ResourceInfo};
+use crate::types::{AssetDefinitionInfo, ResourceInfo};
 
 /// The schema version of the database and the oldest rivers build, by schema
 /// version, that can read and write it.
@@ -235,140 +235,6 @@ pub async fn get_assets_info(
         }
     }
     Ok(assets)
-}
-
-/// Expand a stored `PartitionKey` into the individual partition-definition keys it represents.
-#[cfg(feature = "ssr")]
-fn partition_key_members(pk: &rivers_core::storage::PartitionKey) -> Vec<String> {
-    pk.members()
-        .into_iter()
-        .map(crate::types::partition_key_to_display)
-        .collect()
-}
-
-/// Tri-state heatmap label for one partition.
-#[cfg(feature = "ssr")]
-fn partition_status_label(
-    key: &str,
-    materialized: &std::collections::HashSet<String>,
-    failed: &std::collections::HashSet<String>,
-) -> &'static str {
-    if failed.contains(key) {
-        "Failed"
-    } else if materialized.contains(key) {
-        "Materialized"
-    } else {
-        "Missing"
-    }
-}
-
-/// Tri-state per-partition status (Materialized / Failed / Missing) for the asset-detail partition heatmap.
-#[server]
-pub async fn get_partition_status(
-    loc_ns: String,
-    loc_name: String,
-    asset_key: String,
-    offset: u64,
-    dynamic_name: String,
-) -> Result<PartitionStatus, ServerFnError> {
-    use rivers_api::rivers::GetPartitionKeysRequest;
-    use rivers_core::storage::StorageBackend;
-    use std::collections::HashSet;
-
-    const HEATMAP_PAGE: u64 = 1000;
-
-    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
-    let state = expect_context::<crate::state::AppState>();
-    let scoped = state.storage.for_code_location(&ctx);
-
-    let materialized_count = scoped
-        .count_materialized_partitions(&asset_key)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))? as usize;
-
-    let mut window_keys: Vec<String> = Vec::new();
-    let mut total: usize = 0;
-    if !dynamic_name.is_empty() {
-        if let Ok(all) = scoped.get_dynamic_partitions(&dynamic_name).await {
-            total = all.len();
-            window_keys = all
-                .into_iter()
-                .skip(offset as usize)
-                .take(HEATMAP_PAGE as usize)
-                .collect();
-        }
-    } else if let Ok((_, mut client)) = state.connect_to(&loc_ns, &loc_name).await
-        && let Ok(resp) = client
-            .get_partition_keys(GetPartitionKeysRequest {
-                asset_key: asset_key.clone(),
-                offset,
-                limit: HEATMAP_PAGE,
-                query: String::new(),
-                dimension: String::new(),
-            })
-            .await
-    {
-        let resp = resp.into_inner();
-        total = resp.total as usize;
-        window_keys = resp.keys;
-    }
-
-    let materialized_spks = scoped
-        .get_materialized_partitions(&asset_key)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let materialized_keys: HashSet<String> = materialized_spks
-        .iter()
-        .flat_map(partition_key_members)
-        .collect();
-
-    let partition_timestamps: std::collections::HashMap<rivers_core::storage::PartitionKey, i64> =
-        scoped
-            .get_partition_timestamps(&asset_key)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-    let failed_keys: HashSet<String> = scoped
-        .get_failed_partitions(&asset_key, &partition_timestamps)
-        .await
-        .unwrap_or_default()
-        .keys()
-        .flat_map(partition_key_members)
-        .collect();
-    let failed_count = failed_keys.len();
-
-    let detail_keys: Vec<String> = if total == 0 {
-        total = materialized_keys.len();
-        materialized_keys
-            .iter()
-            .take(HEATMAP_PAGE as usize)
-            .cloned()
-            .collect()
-    } else {
-        window_keys
-    };
-
-    let partition_details: Vec<PartitionDetail> = detail_keys
-        .iter()
-        .map(|key| PartitionDetail {
-            key: key.clone(),
-            status: partition_status_label(key, &materialized_keys, &failed_keys).to_string(),
-            last_timestamp: None,
-        })
-        .collect();
-
-    let materialized = materialized_count.min(total);
-    let failed = failed_count.min(total - materialized);
-    let missing = total - materialized - failed;
-    Ok(PartitionStatus {
-        asset_key,
-        total_partitions: total,
-        materialized,
-        failed,
-        missing,
-        partition_details,
-    })
 }
 
 /// A window `[offset, offset+limit)` of an asset's keys, each with its index in
@@ -609,9 +475,6 @@ pub async fn get_deployment_info(
 
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
-    use super::partition_key_members;
-    use rivers_core::storage::PartitionKey;
-
     #[test]
     fn code_location_versions_join_the_registry_with_the_directory() {
         use super::{CodeLocationVersion, SchemaInfo, code_location_versions};
@@ -682,66 +545,5 @@ mod tests {
             code_location_versions(&registry[..1], &directory, None);
         assert_eq!(no_schema[0].can_write, None);
         assert_eq!(no_schema[0].summary(), "0.13.0 · schema 13");
-    }
-
-    /// Heatmap classification compares these member strings against the gRPC window keys.
-    #[test]
-    fn multi_dim_member_matches_grpc_window_key_format() {
-        let pk = PartitionKey::Multi {
-            dims: vec![
-                ("region".into(), vec!["us".into()]),
-                ("date".into(), vec!["2024-01-01".into()]),
-            ],
-        };
-        assert_eq!(
-            partition_key_members(&pk),
-            vec!["date=2024-01-01|region=us"]
-        );
-    }
-
-    /// A batched Multi key counts each cartesian member independently.
-    #[test]
-    fn batched_multi_expands_to_one_member_per_combo() {
-        let pk = PartitionKey::Multi {
-            dims: vec![
-                ("date".into(), vec!["d1".into()]),
-                ("region".into(), vec!["us".into(), "eu".into()]),
-            ],
-        };
-        assert_eq!(
-            partition_key_members(&pk),
-            vec!["date=d1|region=us", "date=d1|region=eu"]
-        );
-    }
-
-    /// Single members stay bare values.
-    #[test]
-    fn single_members_stay_bare() {
-        let pk = PartitionKey::Single {
-            keys: vec!["a".into(), "b".into()],
-        };
-        assert_eq!(partition_key_members(&pk), vec!["a", "b"]);
-    }
-
-    /// Failed wins over Materialized.
-    #[test]
-    fn failed_status_wins_over_materialized() {
-        use super::partition_status_label;
-        use std::collections::HashSet;
-        let materialized: HashSet<String> =
-            ["p".to_string(), "q".to_string()].into_iter().collect();
-        let failed: HashSet<String> = ["p".to_string()].into_iter().collect();
-        assert_eq!(
-            partition_status_label("p", &materialized, &failed),
-            "Failed"
-        );
-        assert_eq!(
-            partition_status_label("q", &materialized, &failed),
-            "Materialized"
-        );
-        assert_eq!(
-            partition_status_label("z", &materialized, &failed),
-            "Missing"
-        );
     }
 }

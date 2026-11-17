@@ -56,6 +56,7 @@ async fn test_cache_detects_in_progress_completion_as_change() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -163,6 +164,7 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
         status: RunStatus::Started,
         start_time: 2000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["dst".to_string()],
         priority: 0,
@@ -387,6 +389,7 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
         status: RunStatus::Started,
         start_time: start,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec!["dst".to_string()],
         priority: 0,
@@ -520,6 +523,7 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
         status: RunStatus::Started,
         start_time: 2000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![("batch".to_string(), k.to_string())],
         node_names: vec!["dst".to_string()],
         priority: 0,
@@ -630,6 +634,7 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -716,6 +721,7 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["x".to_string(), "y".to_string()],
             priority: 0,
@@ -816,6 +822,7 @@ async fn test_failed_joint_run_step_success_records_tick_tags() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![("team".to_string(), "x".to_string())],
             node_names: vec!["x".to_string(), "y".to_string()],
             priority: 0,
@@ -912,6 +919,7 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -980,6 +988,7 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
             status: RunStatus::Queued,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![("team".to_string(), "x".to_string())],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -1066,6 +1075,7 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
         status,
         start_time: start,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![asset.to_string()],
         priority: 0,
@@ -1136,6 +1146,7 @@ async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["x".to_string()],
             priority: 0,
@@ -1198,28 +1209,32 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
         .await
         .unwrap();
     storage
-        .create_backfill(&BackfillRecord {
-            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
-            backfill_id: "bf1".to_string(),
-            status: BackfillStatus::Requested,
-            strategy: BackfillStrategy::MultiRun,
-            failure_policy: BackfillFailurePolicy::Continue,
-            asset_selection: vec!["P".to_string()],
-            job_name: None,
-            partition_keys: vec![spk("k1"), spk("k2")],
-            run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
-            max_concurrency: 1,
-            tags: vec![],
-            create_time: 1000,
-            end_time: None,
-            error: None,
-            launched_by: LaunchedBy::default(),
-            action: None,
-            config: None,
-        })
+        .create_backfill(
+            &BackfillRecord {
+                code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+                backfill_id: "bf1".to_string(),
+                status: BackfillStatus::Requested,
+                strategy: BackfillStrategy::MultiRun,
+                failure_policy: BackfillFailurePolicy::Continue,
+                asset_selection: vec!["P".to_string()],
+                job_name: None,
+                num_partitions: 0,
+                planned_runs: 0,
+                run_ids: vec![],
+                completed_partitions: 0,
+                failed_partitions: 0,
+                canceled_partitions: 0,
+                max_concurrency: 1,
+                tags: vec![],
+                create_time: 1000,
+                end_time: None,
+                error: None,
+                launched_by: LaunchedBy::default(),
+                action: None,
+                config: None,
+            },
+            &[spk("k1"), spk("k2")],
+        )
         .await
         .unwrap();
 
@@ -1231,10 +1246,10 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
     cache.in_progress_assets.entry("P".to_string()).or_default();
 
     // Canceled before any sub-run was ever observed.
-    storage
-        .update_backfill_status("bf1", BackfillStatus::Canceled, Some(2000))
-        .await
-        .unwrap();
+    assert_eq!(
+        storage.cancel_backfill("bf1").await.unwrap(),
+        BackfillStatus::Canceled
+    );
     cache.refresh(&storage, 0).await.unwrap();
 
     assert!(
@@ -1281,6 +1296,7 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![("team".to_string(), "x".to_string())],
             node_names: vec!["P".to_string(), "D".to_string()],
             priority: 0,
@@ -1349,6 +1365,7 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
         status: RunStatus::Started,
         start_time: start,
         end_time: None,
+        execution_start_time: None,
         tags: vec![("who".to_string(), who.to_string())],
         node_names: vec!["P".to_string()],
         priority: 0,
@@ -1430,6 +1447,7 @@ async fn test_in_progress_partition_keys_expands_batched_members() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["a".to_string()],
             priority: 0,
@@ -1479,6 +1497,7 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         status: RunStatus::Started,
         start_time: start,
         end_time: None,
+        execution_start_time: None,
         tags,
         node_names: vec!["A".to_string()],
         priority: 0,
@@ -1560,6 +1579,7 @@ async fn test_later_finishing_run_keeps_latest_tags() {
         status: RunStatus::Started,
         start_time: start,
         end_time: None,
+        execution_start_time: None,
         tags,
         node_names: vec!["X".to_string()],
         priority: 0,
@@ -1658,6 +1678,7 @@ fn run_record(
         status,
         start_time,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: node_names.into_iter().map(String::from).collect(),
         priority: 0,
@@ -1907,6 +1928,7 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
             status: RunStatus::Started,
             start_time: 2000,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec!["x".to_string(), "y".to_string()],
             priority: 0,

@@ -46,6 +46,17 @@ const CONTENDED_MAX_ELAPSED: Duration = Duration::from_secs(5);
 const CONTENDED_MAX_RETRIES: u32 =
     (2 * CONTENDED_MAX_ELAPSED.as_millis() / CONTENDED_MAX_BACKOFF.as_millis()) as u32 + 16;
 
+/// First wait of a batch write that lost a race: about the time one batch
+/// takes to commit.
+const CONTENDED_BATCH_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+/// Ceiling for the wait of a batch write that lost a race. Measured with 8 to
+/// 32 writers of one asset: a 10 s ceiling stores about as much, and single
+/// batches wait two to three times as long.
+const CONTENDED_BATCH_MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// How long a batch write that lost a race keeps trying. With 32 writers of one
+/// asset the slowest batch took 16 s.
+const CONTENDED_BATCH_MAX_ELAPSED: Duration = Duration::from_secs(60);
+
 impl StorageRetryConfig {
     /// The schedule for an operation that lost a race, not one that hit a sick
     /// backend.
@@ -68,6 +79,26 @@ impl StorageRetryConfig {
             max_backoff: CONTENDED_MAX_BACKOFF.min(self.max_backoff),
             backoff_multiplier: self.backoff_multiplier,
             max_elapsed: Some(CONTENDED_MAX_ELAPSED),
+        }
+    }
+
+    /// The schedule for a batch write that lost a race.
+    ///
+    /// The winner's commit takes as long as a batch, and every new attempt
+    /// costs the store a whole batch. On the waits of [`Self::contended`] all
+    /// losers stay in the store at once: 16 writers of one asset then store a
+    /// third of what they store on this schedule. Here the waits start near
+    /// the time of one batch and double up to one second, so the losers back
+    /// off as the number of writers grows.
+    ///
+    /// The budget is wall-clock for the same reason as in [`Self::contended`].
+    pub fn contended_batch(&self) -> Self {
+        Self {
+            max_retries: self.max_retries.max(CONTENDED_MAX_RETRIES),
+            initial_backoff: CONTENDED_BATCH_INITIAL_BACKOFF.min(self.max_backoff),
+            max_backoff: CONTENDED_BATCH_MAX_BACKOFF.min(self.max_backoff),
+            backoff_multiplier: self.backoff_multiplier,
+            max_elapsed: Some(CONTENDED_BATCH_MAX_ELAPSED),
         }
     }
 }
@@ -352,6 +383,35 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), 30);
+    }
+
+    /// Every attempt of a batch write costs the store a whole batch, so a
+    /// batch that keeps losing must back off.
+    #[tokio::test]
+    async fn contended_batch_schedule_backs_off() {
+        let backend = StorageRetryConfig::default();
+        let schedule = backend.contended_batch();
+        assert!(schedule.initial_backoff < backend.initial_backoff);
+        assert!(schedule.max_backoff > backend.contended().max_backoff);
+
+        let config = StorageRetryConfig {
+            max_elapsed: Some(Duration::from_secs(1)),
+            ..schedule
+        };
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = with_retry_if(
+            &config,
+            |_| true,
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async { Err::<i32, _>(anyhow::anyhow!("lost the race")) }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(attempts <= 12, "{attempts} attempts in one second");
     }
 
     #[tokio::test]

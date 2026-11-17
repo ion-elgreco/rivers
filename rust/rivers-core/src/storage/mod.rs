@@ -1,5 +1,6 @@
 //! Storage trait and types for persisting orchestration state.
 
+pub mod event_batch;
 pub mod retry;
 pub mod surrealdb_backend;
 
@@ -7,7 +8,11 @@ mod asset;
 mod backfill;
 mod directory;
 mod event;
+mod key_item;
+mod partition_bounds;
+mod partition_failure;
 mod partition_key;
+mod partition_members;
 mod pool;
 mod run;
 mod scoped;
@@ -18,7 +23,11 @@ pub use asset::*;
 pub use backfill::*;
 pub use directory::*;
 pub use event::*;
+pub use key_item::{KeyItem, KeySpan, SpanStep, items_with_spans};
+pub use partition_bounds::{PartitionBounds, stored_order};
+pub use partition_failure::{FailureCount, PartitionFailure};
 pub use partition_key::*;
+pub use partition_members::*;
 pub use pool::*;
 pub use run::*;
 pub use scoped::*;

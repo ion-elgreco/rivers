@@ -345,6 +345,7 @@ async fn scoped_run_queries_isolated_per_code_location() {
                 status,
                 start_time: ts,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec![],
                 priority: 0,
@@ -366,6 +367,7 @@ async fn scoped_run_queries_isolated_per_code_location() {
             status: RunStatus::Queued,
             start_time: now,
             end_time: None,
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,
@@ -451,6 +453,7 @@ async fn runs_page_isolated_per_code_location() {
                 status: RunStatus::Success,
                 start_time: ts,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec![],
                 priority: 0,
@@ -496,6 +499,7 @@ async fn runs_summary_isolated_per_code_location() {
         status,
         start_time: now,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -553,6 +557,7 @@ async fn last_run_per_job_isolated_per_code_location() {
                 status: RunStatus::Success,
                 start_time: ts,
                 end_time: None,
+                execution_start_time: None,
                 tags: vec![],
                 node_names: vec![],
                 priority: 0,
@@ -589,7 +594,7 @@ async fn backfills_page_isolated_per_code_location() {
         mk_isolation_backfill("a-2", "cl-a", BackfillStatus::Requested, 200),
         mk_isolation_backfill("b-1", "cl-b", BackfillStatus::Requested, 300),
     ] {
-        storage.create_backfill(&r).await.unwrap();
+        storage.create_backfill(&r, &[]).await.unwrap();
     }
 
     let page_a = storage
@@ -620,7 +625,7 @@ async fn backfills_summary_isolated_per_code_location() {
         mk_isolation_backfill("a-done", "cl-a", BackfillStatus::CompletedSuccess, 200),
         mk_isolation_backfill("b-fail", "cl-b", BackfillStatus::CompletedFailed, 300),
     ] {
-        storage.create_backfill(&r).await.unwrap();
+        storage.create_backfill(&r, &[]).await.unwrap();
     }
 
     let sum_a = storage.get_backfills_summary("cl-a").await.unwrap();

@@ -4,15 +4,16 @@ use anyhow::{Context, Result};
 use surrealdb::types::{Bytes, SurrealValue};
 
 use crate::assets::remote::LocationRef;
+use crate::storage::event_batch::{EventStore, EventWithId};
 use crate::storage::retry;
 use crate::storage::{
-    BackfillRecord, BackfillStatus, CodeLocationDirectoryEntry, ComponentRecord,
-    ConditionEvalRecord, ConditionTickRecord, EventRecord, EventType, LogRecord, PartitionKey,
-    RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome, StorageBackend, StoredEvent,
-    StoredLog, TickRecord,
+    BackfillRecord, BackfillRunOutcome, BackfillStatus, CodeLocationDirectoryEntry,
+    ComponentRecord, ConditionEvalRecord, ConditionTickRecord, EndedBackfillRun, EventRecord,
+    EventType, LogRecord, PartitionKey, RunOutcome, RunProgress, RunRecord, RunStatus, StepOutcome,
+    StorageBackend, StoredEvent, StoredLog, TickRecord, UnstartedBackfillRun,
 };
 
-use super::run_queue::SettledRunKeys;
+use super::partition_failures::{RunChange, StoredStatus, keyed_failure};
 use super::*;
 
 impl StorageBackend for SurrealStorage {
@@ -65,6 +66,11 @@ impl StorageBackend for SurrealStorage {
                         }]
                     })
                     .unwrap_or_default();
+                let built_by: Vec<(&PartitionKey, &str)> = event
+                    .partition_key
+                    .iter()
+                    .map(|partition_key| (partition_key, event.run_id.as_str()))
+                    .collect();
                 self.apply_materialization(
                     cl,
                     asset_key,
@@ -77,6 +83,7 @@ impl StorageBackend for SurrealStorage {
                     idv,
                     is_action,
                     parts,
+                    &built_by,
                 )
                 .await?;
             }
@@ -100,187 +107,26 @@ impl StorageBackend for SurrealStorage {
                 self.consolidate_deletion(cl, asset_key, event, &event_id).await?;
             }
 
+        if let Some((asset_key, partition_key)) = keyed_failure(event)
+            && self.action_run_ids(vec![event.run_id.clone()]).await?.is_empty() {
+                let failures = partition_key
+                    .members()
+                    .into_iter()
+                    .map(|member| (member, event.timestamp, event.run_id.clone()))
+                    .collect();
+                self.record_partition_failures(cl, asset_key, failures, None)
+                    .await?;
+            }
+
         Ok(event_id)
         })
         .await
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        if events.is_empty() {
-            return Ok(vec![]);
-        }
-        // Ids generated outside the retry closure: one consolidation conflict
-        // replays the whole drained batch, and INSERT IGNORE needs the same
-        // record ids to turn the re-insert into a no-op.
-        let rows: Vec<DbEventWrite> = events
-            .iter()
-            .map(|e| DbEventWrite::from_event(e, new_event_record_id()))
-            .collect();
-        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
-        retry::with_retry(&self.retry_config, || async {
-        self.db
-            .query("INSERT IGNORE INTO events $rows RETURN NONE")
-            .bind(("rows", rows.clone()))
-            .await
-            .context("failed to batch store events")?
-            .check()?;
-
-        // Group materializations by asset, then one bulk upsert. The newest
-        // event wins, by time, not by place in the drain: the `assets` row
-        // must hold a time no older than any of its partition rows.
-        let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-        // Latest event that actually consumed inputs, tracked apart from
-        // `latest_mat` so an action's provenance-free materialization landing
-        // in the same drain doesn't drop a real materialize's provenance.
-        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-        let mut part_rows: std::collections::HashMap<
-            (&str, &str, &PartitionKey),
-            DbAssetPartitionWrite,
-        > = std::collections::HashMap::new();
-
-        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
-            let Some(asset_key) = &event.asset_key else {
-                continue;
-            };
-            if !event.event_type.is_materialization() {
-                continue;
-            }
-            let cl = event.code_location_id.as_str();
-            let key = (cl, asset_key.as_str());
-            let newest = |held: Option<&usize>| {
-                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
-            };
-            if newest(latest_mat.get(&key)) {
-                latest_mat.insert(key, idx);
-            }
-            if !event.input_data_versions.is_empty() && newest(latest_idv.get(&key)) {
-                latest_idv.insert(key, idx);
-            }
-            if let Some(partition_key) = &event.partition_key {
-                let part = (cl, asset_key.as_str(), partition_key);
-                if part_rows
-                    .get(&part)
-                    .is_none_or(|held| held.last_timestamp <= event.timestamp)
-                {
-                    part_rows.insert(
-                        part,
-                        DbAssetPartitionWrite {
-                            code_location_id: cl.to_string(),
-                            asset_key: asset_key.clone(),
-                            partition_key: partition_key.clone(),
-                            last_event_id: event_id.clone(),
-                            last_run_id: event.run_id.clone(),
-                            last_timestamp: event.timestamp,
-                        },
-                    );
-                }
-            }
-        }
-
-        // One `assets` row update per materialized asset (newest event wins).
-        let update_run_ids: Vec<String> = latest_mat
-            .values()
-            .map(|&idx| events[idx].run_id.clone())
-            .collect::<std::collections::HashSet<String>>()
-            .into_iter()
-            .collect();
-        let action_ids = self.action_run_ids(update_run_ids).await?;
-        // Each asset's partition rows commit in one transaction with its
-        // `assets` row update — a concurrent whole-asset deletion lands
-        // wholly before or wholly after, never between the two. Every
-        // partition row comes from a materialization event, so its asset is
-        // always in `latest_mat`.
-        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
-            std::collections::HashMap::new();
-        for ((cl, ak, _), row) in part_rows {
-            parts_by_asset.entry((cl, ak)).or_default().push(row);
-        }
-        for (&(cl, asset_key), &idx) in &latest_mat {
-            let event = &events[idx];
-            let event_id = &event_ids[idx];
-            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
-            let idv = idv_event.map(|e| e.input_data_versions.clone());
-            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
-            // A co-drained real materialize (the `idv` entry) legitimately
-            // owns provenance and the code-version stamp even when the
-            // action's event is the newer one.
-            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
-            let code_version = if action_only {
-                None
-            } else {
-                self.get_code_version(cl, asset_key).await?
-            };
-            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
-            self.apply_materialization(
-                cl,
-                asset_key,
-                event_id,
-                &event.run_id,
-                event.timestamp,
-                event.event_type.data_version().map(|s| s.to_string()),
-                provenance_timestamp,
-                code_version,
-                idv,
-                action_only,
-                parts,
-            )
-            .await?;
-        }
-
-        // Partition-scoped deletions collapse to one DELETE per asset — a
-        // purge over a date range lands thousands of them in one drain.
-        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
-        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
-        for (event, event_id) in events.iter().zip(event_ids.iter()) {
-            let cl = event.code_location_id.as_str();
-            if let Some(asset_key) = &event.asset_key
-                && event.event_type.is_observation() {
-                    let data_version = event.event_type.data_version().map(|s| s.to_string());
-                    self.db
-                        .query("UPDATE assets SET last_event_id = $event_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key")
-                        .bind(("cl", cl.to_string()))
-                        .bind(("asset_key", asset_key.clone()))
-                        .bind(("event_id", event_id.clone()))
-                        .bind(("timestamp", event.timestamp))
-                        .bind(("data_version", data_version))
-                        .await?
-                        .check()?;
-                }
-            if let Some(asset_key) = &event.asset_key
-                && event.event_type.is_deletion() {
-                    match &event.partition_key {
-                        Some(pk) => part_deletes
-                            .entry((cl, asset_key.as_str()))
-                            .or_default()
-                            .push((pk.clone(), event.timestamp)),
-                        // The newest deletion per asset wins — repeats in one
-                        // drain only re-clear the same row.
-                        None => {
-                            let key = (cl, asset_key.as_str());
-                            if whole_deletes
-                                .get(&key)
-                                .is_none_or(|(held, _)| held.timestamp <= event.timestamp)
-                            {
-                                whole_deletes.insert(key, (event, event_id));
-                            }
-                        }
-                    }
-                }
-        }
-        for ((cl, asset_key), (event, event_id)) in whole_deletes {
-            self.consolidate_deletion(cl, asset_key, event, event_id)
-                .await?;
-        }
-        for ((cl, asset_key), deletions) in part_deletes {
-            self.delete_partitions(cl, asset_key, deletions).await?;
-        }
-
-        Ok(event_ids.clone())
-        })
-        .await
+        let events: Vec<EventWithId> = events.iter().cloned().map(EventWithId::new).collect();
+        self.store_events_with_ids(&events).await?;
+        Ok(events.iter().map(|e| record_id_str(&e.id)).collect())
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = logs.len()))]
@@ -425,7 +271,9 @@ impl StorageBackend for SurrealStorage {
             Ok(())
         })
         .await;
-        swallow_phantom_commit(result, "create_run", &run.run_id)
+        swallow_phantom_commit(result, "create_run", &run.run_id)?;
+        self.record_failures_of_created(std::slice::from_ref(run))
+            .await
     }
 
     async fn create_runs(&self, runs: &[RunRecord]) -> Result<()> {
@@ -445,7 +293,8 @@ impl StorageBackend for SurrealStorage {
             Ok(())
         })
         .await;
-        swallow_phantom_commit(result, "create_runs", &format!("batch[{}]", runs.len()))
+        swallow_phantom_commit(result, "create_runs", &format!("batch[{}]", runs.len()))?;
+        self.record_failures_of_created(runs).await
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(%run_id, ?status))]
@@ -455,33 +304,58 @@ impl StorageBackend for SurrealStorage {
         status: RunStatus,
         end_time: Option<i64>,
     ) -> Result<()> {
-        let runs: Vec<RunRecord> = retry::with_retry(&self.retry_config, || async {
-            let status_str = format!("{:?}", status);
-            let mut response = if let Some(end) = end_time {
-                self.db
-                    .query(
-                        "UPDATE runs SET status = $status, end_time = $end_time \
-                         WHERE run_id = $run_id RETURN AFTER",
-                    )
-                    .bind(("run_id", run_id.to_string()))
-                    .bind(("status", status_str))
-                    .bind(("end_time", end))
-                    .await?
-            } else {
-                self.db
-                    .query("UPDATE runs SET status = $status WHERE run_id = $run_id RETURN AFTER")
-                    .bind(("run_id", run_id.to_string()))
-                    .bind(("status", status_str))
-                    .await?
-            };
-            Ok(response.take(0)?)
+        // The failures before the status: a run that reads as failed has them.
+        // An earlier end is repaired after the status.
+        if status == RunStatus::Failure
+            && let Some(run) = self.run_of_failures(run_id).await?
+        {
+            let at = end_time.or(run.end_time).unwrap_or(run.start_time);
+            let ended = (run.status == "Failure").then(|| run.end_time.unwrap_or(run.start_time));
+            if ended.is_none_or(|ended| ended < at) {
+                self.record_failures_of_run(&run, at).await?;
+            }
+        }
+
+        let set_end_time = if end_time.is_some() {
+            ", end_time = $end_time"
+        } else {
+            ""
+        };
+        let update =
+            format!("UPDATE runs SET status = $status{set_end_time} WHERE run_id = $run_id");
+        // The last statement returns the run as the update leaves it.
+        let query = if matches!(
+            status,
+            RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
+        ) {
+            format!(
+                "BEGIN TRANSACTION;\n\
+                 LET $final = ({update} RETURN run_id, status, launched_by, \
+                     start_time, end_time);\n\
+                 {RECORD_BACKFILL_RUN_OUTCOME}\n\
+                 COMMIT TRANSACTION;\n\
+                 RETURN $final;"
+            )
+        } else {
+            format!("{update} RETURN status, start_time, end_time;")
+        };
+
+        let stored: Vec<StoredStatus> = retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(&query)
+                .bind(("run_id", run_id.to_string()))
+                .bind(("status", format!("{:?}", status)))
+                .bind(("end_time", end_time))
+                .await?
+                .check()?;
+            let last = result.num_statements() - 1;
+            Ok(result.take(last)?)
         })
         .await?;
 
-        for run in &runs {
-            self.record_backfill_run_outcome(run).await;
-        }
-        Ok(())
+        self.repair_failures_after_status(run_id, stored.first())
+            .await
     }
 
     async fn update_run_block_reason(&self, run_id: &str, reason: Option<&str>) -> Result<()> {
@@ -497,24 +371,28 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn try_start_run(&self, run_id: &str) -> Result<bool> {
-        retry::with_retry(&self.retry_config, || async {
+        let now_ns = now_nanos();
+        let stored = retry::with_retry(&self.retry_config, || async {
             let mut result = self
                 .db
-                .query(
-                    "UPDATE runs SET status = 'Started' \
-                         WHERE run_id = $run_id AND status != 'Canceled'; \
-                     SELECT status FROM runs WHERE run_id = $run_id LIMIT 1",
-                )
+                .query(format!(
+                    "UPDATE runs SET status = 'Started', \
+                             execution_start_time = execution_start_time ?? $now \
+                         WHERE run_id = $run_id AND status != 'Canceled' RETURN NONE; \
+                     {STATUS_OF_RUN}"
+                ))
                 .bind(("run_id", run_id.to_string()))
-                .await?;
-            let status: Option<String> = result.take((1, "status"))?;
-            match status.as_deref() {
-                Some("Started") => Ok(true),
-                Some(_) => Ok(false),
-                None => anyhow::bail!("run {run_id} not found"),
-            }
+                .bind(("now", now_ns))
+                .await?
+                .check()?;
+            let stored: Option<StoredStatus> = result.take(1)?;
+            stored.with_context(|| format!("run {run_id} not found"))
         })
-        .await
+        .await?;
+
+        self.repair_failures_after_status(run_id, Some(&stored))
+            .await?;
+        Ok(stored.status == "Started")
     }
 
     async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {
@@ -860,270 +738,66 @@ impl StorageBackend for SurrealStorage {
 
     // ── Backfills ──
 
-    async fn create_backfill(&self, backfill: &BackfillRecord) -> Result<()> {
-        let links = BackfillRunRow::linked_now(&backfill.backfill_id, &backfill.run_ids);
-        let outcomes = BackfillOutcomeRow::settled(
-            &backfill.backfill_id,
-            &backfill.completed_partitions,
-            &backfill.failed_partitions,
-            &backfill.canceled_partitions,
-        );
-        let result = retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     CREATE backfills CONTENT object::remove($backfill, {BACKFILL_PROGRESS_COLUMNS});\n\
-                     CREATE backfill_keys CONTENT {{ backfill_id: $id, partition_keys: $keys }};\n\
-                     {LINK_BACKFILL_RUNS};\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("backfill", backfill.clone()))
-                .bind(("id", backfill.backfill_id.clone()))
-                .bind(("keys", backfill.partition_keys.clone()))
-                .bind(("links", links.clone()))
-                .bind(("outcomes", outcomes.clone()))
-                .await
-                .context("failed to create backfill")?
-                .check()?;
-            Ok(())
-        })
-        .await;
-        swallow_phantom_commit(result, "create_backfill", &backfill.backfill_id)
+    async fn create_backfill(
+        &self,
+        backfill: &BackfillRecord,
+        partition_keys: &[PartitionKey],
+    ) -> Result<()> {
+        self.create_backfill_rows(backfill, partition_keys).await
     }
 
-    async fn update_backfill_status(
-        &self,
-        backfill_id: &str,
-        status: BackfillStatus,
-        end_time: Option<i64>,
-    ) -> Result<()> {
-        retry::with_retry(&self.retry_config, || async {
-            let status_str = format!("{:?}", status);
-            if let Some(end) = end_time {
-                self.db
-                    .query("UPDATE backfills SET status = $status, end_time = $end_time WHERE backfill_id = $id")
-                    .bind(("id", backfill_id.to_string()))
-                    .bind(("status", status_str))
-                    .bind(("end_time", end))
-                    .await?;
-            } else {
-                self.db
-                    .query("UPDATE backfills SET status = $status WHERE backfill_id = $id")
-                    .bind(("id", backfill_id.to_string()))
-                    .bind(("status", status_str))
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
+    async fn get_backfill_keys(&self, backfill_id: &str) -> Result<Vec<PartitionKey>> {
+        self.read_backfill_keys(backfill_id).await
     }
 
-    async fn update_backfill_progress(
+    async fn start_backfill(&self, backfill_id: &str, planned_runs: usize) -> Result<bool> {
+        self.start_backfill_row(backfill_id, planned_runs).await
+    }
+
+    async fn settle_unstarted_backfill_runs(
         &self,
         backfill_id: &str,
-        run_ids: &[String],
-        completed: &[PartitionKey],
-        failed: &[PartitionKey],
-        canceled: &[PartitionKey],
+        runs: &[UnstartedBackfillRun],
     ) -> Result<()> {
-        let links = BackfillRunRow::linked_now(backfill_id, run_ids);
-        let outcomes = BackfillOutcomeRow::settled(backfill_id, completed, failed, canceled);
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     {LINK_BACKFILL_RUNS};\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("links", links.clone()))
-                .bind(("outcomes", outcomes.clone()))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await
+        self.record_unstarted_backfill_runs(backfill_id, runs).await
     }
 
     async fn get_backfill(&self, backfill_id: &str) -> Result<Option<BackfillRecord>> {
-        retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query("SELECT * FROM backfills WHERE backfill_id = $id LIMIT 1")
-                .bind(("id", backfill_id.to_string()))
-                .await?;
-            let rows: Vec<BackfillRecord> = result.take(0)?;
-            Ok(load_backfill_progress(&self.db, rows).await?.pop())
-        })
-        .await
+        self.read_backfill(backfill_id).await
     }
 
-    async fn try_complete_backfill(
+    async fn get_ended_backfill_runs(
         &self,
         backfill_id: &str,
-        extra_canceled: &[PartitionKey],
-    ) -> Result<Option<BackfillStatus>> {
-        let backfill = self
-            .get_backfill(backfill_id)
-            .await?
-            .context("backfill not found")?;
+        first: usize,
+        last: usize,
+    ) -> Result<Vec<EndedBackfillRun>> {
+        self.ended_backfill_runs(backfill_id, first, last).await
+    }
 
-        if backfill.status != BackfillStatus::InProgress {
-            return Ok(None);
-        }
+    async fn get_backfill_partition_outcomes(
+        &self,
+        backfill_id: &str,
+        partitions: &[PartitionKey],
+    ) -> Result<Vec<(PartitionKey, BackfillRunOutcome)>> {
+        self.backfill_partition_outcomes(backfill_id, partitions)
+            .await
+    }
 
-        let runs = if backfill.run_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.get_runs_by_ids(&backfill.run_ids, None).await?
-        };
-        let all_terminal = runs.iter().all(|r| {
-            matches!(
-                r.status,
-                RunStatus::Success | RunStatus::Failure | RunStatus::Canceled
-            )
-        });
-        if !all_terminal {
-            return Ok(None);
-        }
-        // Nothing to finalize: no terminal runs and no externally-canceled keys.
-        if runs.is_empty() && extra_canceled.is_empty() {
-            return Ok(None);
-        }
+    async fn get_run_failed_partitions(&self, run_id: &str) -> Result<Vec<PartitionKey>> {
+        self.run_failed_partitions(run_id).await
+    }
 
-        // Every requested partition must be accounted for: run by a linked run
-        // that exists, passed in as canceled, or settled without a run (a group
-        // whose link failed). Otherwise groups are still to be launched.
-        let ran: HashSet<PartitionKey> = runs
-            .iter()
-            .filter_map(|r| r.partition_key.as_ref())
-            .flat_map(PartitionKey::members)
-            .collect();
-        let extra: HashSet<PartitionKey> = extra_canceled
-            .iter()
-            .flat_map(PartitionKey::members)
-            .collect();
-        let settled_without_run = |keys: &[PartitionKey]| -> Vec<PartitionKey> {
-            keys.iter()
-                .flat_map(PartitionKey::members)
-                .filter(|k| !ran.contains(k) && !extra.contains(k))
-                .collect()
-        };
-        let failed_without_run = settled_without_run(&backfill.failed_partitions);
-        let canceled_without_run = settled_without_run(&backfill.canceled_partitions);
-        let accounted = |k: &PartitionKey| {
-            ran.contains(k)
-                || extra.contains(k)
-                || failed_without_run.contains(k)
-                || canceled_without_run.contains(k)
-        };
-        if !backfill
-            .partition_keys
-            .iter()
-            .flat_map(PartitionKey::members)
-            .all(|k| accounted(&k))
-        {
-            return Ok(None);
-        }
+    async fn get_open_backfill_runs(&self, backfill_id: &str) -> Result<Vec<String>> {
+        self.open_backfill_runs(backfill_id).await
+    }
 
-        let mut completed_pks: Vec<PartitionKey> = Vec::new();
-        let mut failed_pks: Vec<PartitionKey> = Vec::new();
-        let mut canceled_pks: Vec<PartitionKey> = Vec::new();
-        let mut any_failed = false;
-        let mut any_canceled = false;
-
-        let success_run_ids: Vec<String> = runs
-            .iter()
-            .filter(|r| matches!(r.status, RunStatus::Success))
-            .map(|r| r.run_id.clone())
-            .collect();
-        let failed_by_run = self.step_failed_members(success_run_ids).await?;
-
-        for run in &runs {
-            if run.partition_key.is_none() {
-                match run.status {
-                    RunStatus::Failure => any_failed = true,
-                    RunStatus::Canceled => any_canceled = true,
-                    _ => {}
-                }
-                continue;
-            }
-            let settled = SettledRunKeys::of(run, failed_by_run.get(&run.run_id));
-            any_failed |= !settled.failed.is_empty();
-            any_canceled |= !settled.canceled.is_empty();
-            completed_pks.extend(settled.completed);
-            failed_pks.extend(settled.failed);
-            canceled_pks.extend(settled.canceled);
-        }
-
-        if !extra_canceled.is_empty() {
-            canceled_pks.extend(extra_canceled.iter().cloned());
-            any_canceled = true;
-        }
-        any_failed |= !failed_without_run.is_empty();
-        any_canceled |= !canceled_without_run.is_empty();
-        failed_pks.extend(failed_without_run);
-        canceled_pks.extend(canceled_without_run);
-
-        let new_status = if any_failed {
-            BackfillStatus::CompletedFailed
-        } else if any_canceled {
-            BackfillStatus::Canceled
-        } else {
-            BackfillStatus::CompletedSuccess
-        };
-
-        let outcomes =
-            BackfillOutcomeRow::settled(backfill_id, &completed_pks, &failed_pks, &canceled_pks);
-        let now = now_nanos();
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(format!(
-                    "BEGIN TRANSACTION;\n\
-                     DELETE backfill_outcomes WHERE backfill_id = $id;\n\
-                     {RECORD_BACKFILL_OUTCOMES};\n\
-                     UPDATE backfills SET status = $status, end_time = $end_time \
-                         WHERE backfill_id = $id;\n\
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("id", backfill_id.to_string()))
-                .bind(("outcomes", outcomes.clone()))
-                .bind(("status", format!("{new_status:?}")))
-                .bind(("end_time", now))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await?;
-        Ok(Some(new_status))
+    async fn try_complete_backfill(&self, backfill_id: &str) -> Result<Option<BackfillStatus>> {
+        self.complete_backfill(backfill_id).await
     }
 
     async fn cancel_backfill(&self, backfill_id: &str) -> Result<BackfillStatus> {
-        // Settle first: if every run already finished, the cancel prevented
-        // nothing and the derived outcome wins.
-        if let Some(settled) = self.try_complete_backfill(backfill_id, &[]).await? {
-            return Ok(settled);
-        }
-        let now = now_nanos();
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "UPDATE backfills SET status = 'Canceled', end_time = $now \
-                     WHERE backfill_id = $id AND status IN ['Requested', 'InProgress']",
-                )
-                .bind(("id", backfill_id.to_string()))
-                .bind(("now", now))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await?;
-        Ok(self
-            .get_backfill(backfill_id)
-            .await?
-            .with_context(|| format!("backfill '{backfill_id}' not found"))?
-            .status)
+        self.cancel_backfill_row(backfill_id).await
     }
 
     // Concurrency pools
@@ -1208,30 +882,31 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn cancel_queued_run(&self, run_id: &str) -> Result<bool> {
-        let canceled = retry::with_retry(&self.retry_config, || async {
+        retry::with_retry(&self.retry_config, || async {
             let now_ns = now_nanos();
             let mut result = self
                 .db
-                .query(
-                    "UPDATE runs SET status = $new_status, end_time = $now \
-                         WHERE run_id = $run_id AND status IN ['Queued', 'NotStarted']; \
-                     DELETE FROM pending_steps WHERE run_id = $run_id; \
+                .query(format!(
+                    "BEGIN TRANSACTION;\n\
+                     LET $final = (UPDATE runs SET status = $new_status, end_time = $now \
+                         WHERE run_id = $run_id AND status IN ['Queued', 'NotStarted'] \
+                         RETURN run_id, status, launched_by);\n\
+                     DELETE FROM pending_steps WHERE run_id = $run_id;\n\
+                     {RECORD_BACKFILL_RUN_OUTCOME}\n\
+                     COMMIT TRANSACTION;\n\
                      SELECT count() AS total FROM runs \
-                         WHERE run_id = $run_id AND status = $new_status GROUP ALL",
-                )
+                         WHERE run_id = $run_id AND status = $new_status GROUP ALL;"
+                ))
                 .bind(("run_id", run_id.to_string()))
                 .bind(("new_status", RunStatus::Canceled))
                 .bind(("now", now_ns))
-                .await?;
-            let count: Option<u32> = result.take((2, "total"))?;
+                .await?
+                .check()?;
+            let last = result.num_statements() - 1;
+            let count: Option<u32> = result.take((last, "total"))?;
             Ok(count.unwrap_or(0) > 0)
         })
-        .await?;
-
-        if canceled && let Some(run) = self.get_run(run_id).await? {
-            self.record_backfill_run_outcome(&run).await;
-        }
-        Ok(canceled)
+        .await
     }
 
     async fn delete_run(&self, run_id: &str) -> Result<bool> {
@@ -1259,11 +934,23 @@ impl StorageBackend for SurrealStorage {
                      DELETE FROM run_logs WHERE run_id = $run_id; \
                      DELETE FROM concurrency_slots WHERE run_id = $run_id; \
                      DELETE FROM pending_steps WHERE run_id = $run_id; \
-                     DELETE FROM kv WHERE key = $cancel_key; \
-                     DELETE FROM runs WHERE run_id = $run_id",
+                     DELETE FROM kv WHERE key = $cancel_key",
                 )
                 .bind(("run_id", run_id.to_string()))
                 .bind(("cancel_key", format!("cancel:{run_id}")))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await?;
+        // The failures of the run go with it; older failures of its
+        // partitions come back.
+        self.repair_failures_of_run(run_id, RunChange::Deleted)
+            .await?;
+        retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query("DELETE FROM runs WHERE run_id = $run_id")
+                .bind(("run_id", run_id.to_string()))
                 .await?
                 .check()?;
             Ok(())
@@ -1513,6 +1200,224 @@ impl StorageBackend for SurrealStorage {
                 .into_iter()
                 .filter_map(|r| Some((r.asset_key?, r.data_version?)))
                 .collect())
+        })
+        .await
+    }
+}
+
+impl EventStore for SurrealStorage {
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
+    async fn store_events_with_ids(&self, events: &[EventWithId]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // The ids come with the events: one consolidation conflict replays
+        // the whole batch, and so does a send of the batch again; INSERT
+        // IGNORE needs the same record ids to turn the re-insert into a no-op.
+        let rows: Vec<DbEventWrite> = events
+            .iter()
+            .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+            .collect();
+        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
+        let events: Vec<&EventRecord> = events.iter().map(|e| &e.event).collect();
+        retry::with_retry(&self.retry_config, || async {
+        self.db
+            .query("INSERT IGNORE INTO events $rows RETURN NONE")
+            .bind(("rows", rows.clone()))
+            .await
+            .context("failed to batch store events")?
+            .check()?;
+
+        // Group materializations by asset, then one bulk upsert. The newest
+        // event wins, by time, not by place in the drain: the `assets` row
+        // must hold a time no older than any of its partition rows.
+        let mut latest_mat: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        // Latest event that actually consumed inputs, tracked apart from
+        // `latest_mat` so an action's provenance-free materialization landing
+        // in the same drain doesn't drop a real materialize's provenance.
+        let mut latest_idv: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        let mut part_rows: std::collections::HashMap<
+            (&str, &str, &PartitionKey),
+            DbAssetPartitionWrite,
+        > = std::collections::HashMap::new();
+        let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
+
+        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
+            let Some(asset_key) = &event.asset_key else {
+                continue;
+            };
+            if !event.event_type.is_materialization() {
+                continue;
+            }
+            let cl = event.code_location_id.as_str();
+            let key = (cl, asset_key.as_str());
+            let newest = |held: Option<&usize>| {
+                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
+            };
+            if newest(latest_mat.get(&key)) {
+                latest_mat.insert(key, idx);
+            }
+            if !event.input_data_versions.is_empty() && newest(latest_idv.get(&key)) {
+                latest_idv.insert(key, idx);
+            }
+            if let Some(partition_key) = &event.partition_key {
+                built_by
+                    .entry(key)
+                    .or_default()
+                    .push((partition_key, event.run_id.as_str()));
+                let part = (cl, asset_key.as_str(), partition_key);
+                if part_rows
+                    .get(&part)
+                    .is_none_or(|held| held.last_timestamp <= event.timestamp)
+                {
+                    part_rows.insert(
+                        part,
+                        DbAssetPartitionWrite {
+                            code_location_id: cl.to_string(),
+                            asset_key: asset_key.clone(),
+                            partition_key: partition_key.clone(),
+                            last_event_id: event_id.clone(),
+                            last_run_id: event.run_id.clone(),
+                            last_timestamp: event.timestamp,
+                        },
+                    );
+                }
+            }
+        }
+
+        // One `assets` row update per materialized asset (newest event wins).
+        let update_run_ids: Vec<String> = latest_mat
+            .values()
+            .map(|&idx| events[idx].run_id.clone())
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_ids = self.action_run_ids(update_run_ids).await?;
+        // Each asset's partition rows commit in one transaction with its
+        // `assets` row update — a concurrent whole-asset deletion lands
+        // wholly before or wholly after, never between the two. Every
+        // partition row comes from a materialization event, so its asset is
+        // always in `latest_mat`.
+        let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
+            std::collections::HashMap::new();
+        for ((cl, ak, _), row) in part_rows {
+            parts_by_asset.entry((cl, ak)).or_default().push(row);
+        }
+        for (&(cl, asset_key), &idx) in &latest_mat {
+            let event = &events[idx];
+            let event_id = &event_ids[idx];
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
+            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
+            // A co-drained real materialize (the `idv` entry) legitimately
+            // owns provenance and the code-version stamp even when the
+            // action's event is the newer one.
+            let action_only = action_ids.contains(&event.run_id) && idv.is_none();
+            let code_version = if action_only {
+                None
+            } else {
+                self.get_code_version(cl, asset_key).await?
+            };
+            let parts = parts_by_asset.remove(&(cl, asset_key)).unwrap_or_default();
+            let built_by = built_by.remove(&(cl, asset_key)).unwrap_or_default();
+            self.apply_materialization(
+                cl,
+                asset_key,
+                event_id,
+                &event.run_id,
+                event.timestamp,
+                event.event_type.data_version().map(|s| s.to_string()),
+                provenance_timestamp,
+                code_version,
+                idv,
+                action_only,
+                parts,
+                &built_by,
+            )
+            .await?;
+        }
+
+        // Partition-scoped deletions collapse to one DELETE per asset — a
+        // purge over a date range lands thousands of them in one drain.
+        let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
+        let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
+        for (&event, event_id) in events.iter().zip(event_ids.iter()) {
+            let cl = event.code_location_id.as_str();
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_observation() {
+                    let data_version = event.event_type.data_version().map(|s| s.to_string());
+                    self.db
+                        .query("UPDATE assets SET last_event_id = $event_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key")
+                        .bind(("cl", cl.to_string()))
+                        .bind(("asset_key", asset_key.clone()))
+                        .bind(("event_id", event_id.clone()))
+                        .bind(("timestamp", event.timestamp))
+                        .bind(("data_version", data_version))
+                        .await?
+                        .check()?;
+                }
+            if let Some(asset_key) = &event.asset_key
+                && event.event_type.is_deletion() {
+                    match &event.partition_key {
+                        Some(pk) => part_deletes
+                            .entry((cl, asset_key.as_str()))
+                            .or_default()
+                            .push((pk.clone(), event.timestamp)),
+                        // The newest deletion per asset wins — repeats in one
+                        // drain only re-clear the same row.
+                        None => {
+                            let key = (cl, asset_key.as_str());
+                            if whole_deletes
+                                .get(&key)
+                                .is_none_or(|(held, _)| held.timestamp <= event.timestamp)
+                            {
+                                whole_deletes.insert(key, (event, event_id));
+                            }
+                        }
+                    }
+                }
+        }
+        for ((cl, asset_key), (event, event_id)) in whole_deletes {
+            self.consolidate_deletion(cl, asset_key, event, event_id)
+                .await?;
+        }
+        for ((cl, asset_key), deletions) in part_deletes {
+            self.delete_partitions(cl, asset_key, deletions).await?;
+        }
+
+        // The failures last: each is compared with the materializations and
+        // deletions above.
+        let failure_runs: Vec<String> = events
+            .iter()
+            .filter(|event| keyed_failure(event).is_some())
+            .map(|event| event.run_id.clone())
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        let action_failure_runs = self.action_run_ids(failure_runs).await?;
+        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
+        for &event in &events {
+            let Some((asset_key, partition_key)) = keyed_failure(event) else {
+                continue;
+            };
+            if action_failure_runs.contains(&event.run_id) {
+                continue;
+            }
+            let of_asset = failures
+                .entry((event.code_location_id.as_str(), asset_key))
+                .or_default();
+            for member in partition_key.members() {
+                of_asset.push((member, event.timestamp, event.run_id.clone()));
+            }
+        }
+        for ((cl, asset_key), failures) in failures {
+            self.record_partition_failures(cl, asset_key, failures, None)
+                    .await?;
+        }
+
+        Ok(())
         })
         .await
     }

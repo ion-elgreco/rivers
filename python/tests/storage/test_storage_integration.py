@@ -61,6 +61,30 @@ def test_execute_creates_run():
     assert runs[0].end_time is not None
 
 
+@pytest.mark.parametrize("launch", ["materialize", "job"])
+def test_a_direct_run_records_when_it_began(launch):
+    """A run that does not wait in the queue also records when it began."""
+    storage = rs.Storage.memory()
+
+    @rs.Asset(name="a")
+    def a() -> int:
+        return 42
+
+    repo = rs.CodeRepository(
+        assets=[a],
+        jobs=[rs.Job(name="j", assets=[a], executor=rs.Executor.in_process())],
+    )
+    repo.resolve(storage=storage)
+    if launch == "materialize":
+        repo.materialize()
+    else:
+        repo.get_job("j").execute()
+
+    (run,) = storage.get_runs()
+    assert run.status == "Success"
+    assert run.start_time <= run.execution_start_time <= run.end_time
+
+
 def test_materialization_events():
     """Materialization emits events for assets with io_handlers."""
     storage = rs.Storage.memory()

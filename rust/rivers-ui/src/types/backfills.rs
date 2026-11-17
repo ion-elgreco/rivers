@@ -1,17 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{LaunchedBy, Page};
-
-/// One windowed partition of a backfill: its display key and status
-/// ("done" | "failed" | "canceled" | "pending").
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackfillPartitionCell {
-    pub key: String,
-    pub status: String,
-}
-
-/// A window of a backfill's partitions plus the total partition count.
-pub type BackfillPartitionsPage = Page<BackfillPartitionCell>;
+use super::LaunchedBy;
 
 /// Filter passed to the paginated backfills server fn. Empty/`None` means no
 /// restriction. Mirrors `rivers_core::storage::BackfillFilter`.
@@ -52,10 +41,10 @@ pub struct BackfillInfo {
     #[serde(default)]
     pub job_name: Option<String>,
     pub asset_selection: Vec<String>,
-    pub total_partitions: u32,
-    pub completed_partitions: u32,
-    pub failed_partitions: u32,
-    pub canceled_partitions: u32,
+    pub total_partitions: u64,
+    pub completed_partitions: u64,
+    pub failed_partitions: u64,
+    pub canceled_partitions: u64,
     pub max_concurrency: u32,
     pub run_ids: Vec<String>,
     pub tags: Vec<(String, String)>,

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
+use surrealdb::method::Query;
 use surrealdb::types::{RecordId, SurrealValue};
 
-use super::{BackfillRecord, EventRecord, PartitionKey, StorageBackend};
+use super::{EventRecord, PartitionKey, StorageBackend};
 
 mod migration;
 pub use migration::{
@@ -16,17 +17,23 @@ pub use migration::{
 };
 
 mod backend;
+mod backfill_runs;
+mod backfills;
 mod directory;
 mod pages;
+mod partition_failures;
 mod partition_keys;
+mod partition_reads;
 mod per_code_location;
 mod pools;
 mod queries;
 mod rows;
 mod run_queue;
 
+use backfills::load_backfill_progress;
 use queries::*;
 use rows::*;
+use run_queue::run_queued_event;
 
 /// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was constructed with.
 #[derive(Debug, Clone)]
@@ -74,6 +81,9 @@ pub struct SurrealConnectConfig {
     pub namespace: String,
     pub database: String,
     pub credentials: Option<SurrealCredentials>,
+    /// Largest message, in bytes, that the connection sends or accepts.
+    /// `None` keeps the SDK default (64 MiB).
+    pub max_message_size: Option<usize>,
 }
 
 impl SurrealConnectConfig {
@@ -84,12 +94,19 @@ impl SurrealConnectConfig {
             namespace: DEFAULT_NAMESPACE.to_string(),
             database: DEFAULT_DATABASE.to_string(),
             credentials: None,
+            max_message_size: None,
         }
     }
 
     /// Attach database-scoped credentials.
     pub fn with_credentials(mut self, username: String, password: String) -> Self {
         self.credentials = Some(SurrealCredentials::Database { username, password });
+        self
+    }
+
+    /// Set the largest message, in bytes, that the connection sends or accepts.
+    pub fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
         self
     }
 }
@@ -349,6 +366,7 @@ impl SurrealStorage {
             namespace,
             database,
             credentials,
+            max_message_size,
         } = config;
         let started = std::time::Instant::now();
         tracing::info!(
@@ -357,13 +375,21 @@ impl SurrealStorage {
             ns = %namespace,
             db = %database,
             authenticated = credentials.is_some(),
+            max_message_size,
             max_retries = retry_config.max_retries,
             max_backoff_ms = retry_config.max_backoff.as_millis() as u64,
             "opening surreal storage"
         );
         let db = super::retry::with_retry(&retry_config, || async {
             tracing::debug!(endpoint = %endpoint, "connecting remote surrealdb");
-            let db = any::connect(&endpoint)
+            let mut sdk_config = surrealdb::opt::Config::new();
+            if let Some(bytes) = max_message_size {
+                sdk_config = sdk_config
+                    .websocket(surrealdb::opt::WebsocketConfig::new().max_message_size(bytes))
+                    .context("invalid max_message_size")?;
+            }
+
+            let db = any::connect((endpoint.clone(), sdk_config))
                 .await
                 .context("failed to connect to remote SurrealDB")?;
             if let Some(creds) = credentials.clone() {
@@ -529,7 +555,7 @@ fn record_id_str(id: &RecordId) -> String {
 
 /// Client-generated `events` record id — retried inserts replay the same id
 /// so `INSERT IGNORE` deduplicates instead of appending.
-fn new_event_record_id() -> RecordId {
+pub(crate) fn new_event_record_id() -> RecordId {
     RecordId::new("events", uuid::Uuid::new_v4().simple().to_string())
 }
 
@@ -629,7 +655,7 @@ impl SurrealStorage {
 
     /// Apply partition-scoped deletions of one asset: rows no newer than
     /// their key's deletion gone, tombstones kept at each key's newest
-    /// deletion time.
+    /// deletion time. A failure no newer than the deletion goes too.
     async fn delete_partitions(
         &self,
         cl: &str,
@@ -647,39 +673,65 @@ impl SurrealStorage {
         for (pk, ts) in &newest {
             by_time.entry(*ts).or_default().push(pk.clone());
         }
+        let by_time: Vec<(i64, Vec<PartitionKey>)> = by_time.into_iter().collect();
+        let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
+        let Some(range) = partition_failures::key_range(&keys) else {
+            return Ok(());
+        };
         let rows: Vec<DbPartitionDeletion> = newest
-            .into_iter()
+            .iter()
             .map(|(partition_key, timestamp)| DbPartitionDeletion {
                 code_location_id: cl.to_string(),
                 asset_key: asset_key.to_string(),
-                partition_key,
-                timestamp,
+                partition_key: partition_key.clone(),
+                timestamp: *timestamp,
             })
             .collect();
         // One DELETE per deletion time, not a FOR loop, which costs more. The
         // members of one delete step share a time, so this is one statement.
-        let mut sql = String::from(BEGIN_PARTITION_DELETIONS);
+        let mut body = String::from(HOLD_FOR_PARTITION_DELETIONS);
         for i in 0..by_time.len() {
-            sql.push_str(&format!(
+            body.push_str(&format!(
                 "DELETE FROM asset_partitions WHERE code_location_id = $cl \
                  AND asset_key = $asset_key AND partition_key IN $keys_{i} \
                  AND last_timestamp <= $deleted_at_{i}; "
             ));
         }
-        sql.push_str(RECORD_PARTITION_TOMBSTONES);
-        let mut query = self
-            .db
-            .query(sql)
-            .bind(("cl", cl.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("rows", rows));
-        for (i, (deleted_at, keys)) in by_time.into_iter().enumerate() {
-            query = query
-                .bind((format!("keys_{i}"), keys))
-                .bind((format!("deleted_at_{i}"), deleted_at));
+        body.push_str(RECORD_PARTITION_TOMBSTONES);
+        let bind = DeletionParams {
+            cl,
+            asset_key,
+            rows: &rows,
+            range: &range,
+            by_time: &by_time,
+        };
+
+        let sql = format!(
+            "BEGIN TRANSACTION; {}{body} COMMIT TRANSACTION;",
+            partition_failures::failure_rows_guard()
+        );
+
+        // The writers of failures, materializations and deletions of one
+        // asset all write its `assets` row, so all but one lose each commit.
+        let retry_config = self.retry_config.contended_batch();
+        let applied = super::retry::with_retry(&retry_config, || {
+            partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str())))
+        })
+        .await?;
+        if applied {
+            return Ok(());
         }
-        query.await?.check()?;
-        Ok(())
+
+        // Failure rows are in the range of the keys: one transaction deletes
+        // and brings the failure rows in line.
+        super::retry::with_retry(&retry_config, || async {
+            let txn = self.db.clone().begin().await?;
+            bind.bind(txn.query(body.as_str())).await?.check()?;
+            partition_failures::fix_failures_after_deletion(&txn, cl, asset_key, &keys).await?;
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Which of `ids` belong to action runs. Events don't carry the verb, so
@@ -711,72 +763,6 @@ impl SurrealStorage {
     }
 }
 
-/// Fill in the requested keys, linked runs and settled keys of `backfills`,
-/// read from their own tables.
-async fn load_backfill_progress(
-    db: &Surreal<Any>,
-    mut backfills: Vec<BackfillRecord>,
-) -> Result<Vec<BackfillRecord>> {
-    #[derive(SurrealValue)]
-    struct KeysRow {
-        backfill_id: String,
-        partition_keys: Vec<PartitionKey>,
-    }
-    #[derive(SurrealValue)]
-    struct RunRow {
-        backfill_id: String,
-        run_id: String,
-    }
-    #[derive(SurrealValue)]
-    struct OutcomeRow {
-        backfill_id: String,
-        partition_key: PartitionKey,
-        outcome: String,
-    }
-
-    if backfills.is_empty() {
-        return Ok(backfills);
-    }
-    let ids: Vec<String> = backfills.iter().map(|b| b.backfill_id.clone()).collect();
-    let mut result = db
-        .query(LOAD_BACKFILL_PROGRESS)
-        .bind(("ids", ids))
-        .await?
-        .check()?;
-    let keys: Vec<KeysRow> = result.take(0)?;
-    let runs: Vec<RunRow> = result.take(1)?;
-    let outcomes: Vec<OutcomeRow> = result.take(2)?;
-
-    let index: HashMap<String, usize> = backfills
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.backfill_id.clone(), i))
-        .collect();
-    for row in keys {
-        if let Some(&i) = index.get(&row.backfill_id) {
-            backfills[i].partition_keys = row.partition_keys;
-        }
-    }
-    for row in runs {
-        if let Some(&i) = index.get(&row.backfill_id) {
-            backfills[i].run_ids.push(row.run_id);
-        }
-    }
-    for row in outcomes {
-        let Some(&i) = index.get(&row.backfill_id) else {
-            continue;
-        };
-        let backfill = &mut backfills[i];
-        match row.outcome.as_str() {
-            "Completed" => backfill.completed_partitions.push(row.partition_key),
-            "Failed" => backfill.failed_partitions.push(row.partition_key),
-            "Canceled" => backfill.canceled_partitions.push(row.partition_key),
-            other => anyhow::bail!("unknown backfill outcome '{other}'"),
-        }
-    }
-    Ok(backfills)
-}
-
 /// Convert a unique-index violation on a client-supplied-ID `CREATE` into `Ok(())`, logging a warning.
 fn swallow_phantom_commit(result: Result<()>, op: &'static str, id: &str) -> Result<()> {
     match result {
@@ -806,7 +792,9 @@ impl SurrealStorage {
     /// can be older than the newest event. `from_action`: the event's run is
     /// an action run AND no co-drained event supplied real provenance
     /// (`idv`) — then no provenance is written, so a pending Stale(Code)
-    /// badge survives the verb.
+    /// badge survives the verb. `built_by`: each partition of the events and
+    /// the run of each event, also of those that a newer event of the
+    /// partition replaces in `parts`.
     #[allow(clippy::too_many_arguments)]
     async fn apply_materialization(
         &self,
@@ -821,6 +809,7 @@ impl SurrealStorage {
         idv: Option<Vec<(String, String)>>,
         from_action: bool,
         parts: Vec<DbAssetPartitionWrite>,
+        built_by: &[(&PartitionKey, &str)],
     ) -> Result<()> {
         let update_sql = format!("{MATERIALIZE_ASSET_DATA} {MATERIALIZATION_IS_NEWER}");
         let update_sql = if from_action {
@@ -839,41 +828,123 @@ impl SurrealStorage {
         // the asset row first, so it runs before the row's update. The data
         // and provenance updates commit together too: no reader sees new data
         // with the provenance of the materialization it replaced.
-        let has_parts = !parts.is_empty();
-        let sql = if has_parts {
-            format!(
-                "BEGIN TRANSACTION; {UPSERT_ASSET_PARTITIONS}; {update_sql}; COMMIT TRANSACTION;"
-            )
-        } else {
-            format!("BEGIN TRANSACTION; {update_sql}; COMMIT TRANSACTION;")
+        let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
+        let range = partition_failures::key_range(&keys);
+        let (guard, body) = match range {
+            Some(_) => (
+                partition_failures::failure_rows_guard(),
+                format!("{UPSERT_ASSET_PARTITIONS}; {update_sql};"),
+            ),
+            None => (String::new(), format!("{update_sql};")),
         };
-        let mut query = self
-            .db
-            .query(sql)
-            .bind(("cl", cl.to_string()))
-            .bind(("asset_key", asset_key.to_string()))
-            .bind(("event_id", event_id.to_string()))
-            .bind(("run_id", run_id.to_string()))
-            .bind(("timestamp", timestamp))
-            .bind(("data_version", data_version));
-        if !from_action {
+        let sql = format!("BEGIN TRANSACTION; {guard}{body} COMMIT TRANSACTION;");
+        let bind = MaterializationParams {
+            cl,
+            asset_key,
+            event_id,
+            run_id,
+            timestamp,
+            data_version: &data_version,
+            provenance: (!from_action).then_some((provenance_timestamp, &code_version, &idv)),
+            parts: &parts,
+            keys: &keys,
+            range: range.as_ref(),
+        };
+
+        // Runs that write one asset at the same time all write its `assets`
+        // row, so all but one lose each commit.
+        let retry_config = self.retry_config.contended_batch();
+        let applied = super::retry::with_retry(&retry_config, || async {
+            partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str()))).await
+        })
+        .await?;
+        if applied {
+            return Ok(());
+        }
+
+        // Failure rows are in the range of the keys: one transaction
+        // materializes and brings the failure rows in line.
+        super::retry::with_retry(&retry_config, || async {
+            let txn = self.db.clone().begin().await?;
+            bind.bind(txn.query(body.as_str())).await?.check()?;
+            partition_failures::fix_failures_after_materialization(&txn, cl, asset_key, built_by)
+                .await?;
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+/// The parameters of the statements of `apply_materialization`.
+struct MaterializationParams<'a> {
+    cl: &'a str,
+    asset_key: &'a str,
+    event_id: &'a str,
+    run_id: &'a str,
+    timestamp: i64,
+    data_version: &'a Option<String>,
+    /// The provenance's time, code version and inputs; none for an action.
+    provenance: Option<(i64, &'a Option<String>, &'a Option<Vec<(String, String)>>)>,
+    parts: &'a [DbAssetPartitionWrite],
+    keys: &'a [PartitionKey],
+    range: Option<&'a (PartitionKey, PartitionKey)>,
+}
+
+impl MaterializationParams<'_> {
+    fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
+        let mut query = query
+            .bind(("cl", self.cl.to_string()))
+            .bind(("asset_key", self.asset_key.to_string()))
+            .bind(("event_id", self.event_id.to_string()))
+            .bind(("run_id", self.run_id.to_string()))
+            .bind(("timestamp", self.timestamp))
+            .bind(("data_version", self.data_version.clone()));
+        if let Some((provenance_timestamp, code_version, idv)) = self.provenance {
             query = query
                 .bind(("provenance_timestamp", provenance_timestamp))
-                .bind(("mcv", code_version));
+                .bind(("mcv", code_version.clone()));
             if let Some(idv) = idv {
-                query = query.bind(("idv", idv));
+                query = query.bind(("idv", idv.clone()));
             }
         }
-        if has_parts {
-            let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
-            let oldest = parts.iter().map(|p| p.last_timestamp).min();
+        if let Some((lowest, highest)) = self.range {
+            let oldest = self.parts.iter().map(|p| p.last_timestamp).min();
             query = query
-                .bind(("keys", keys))
+                .bind(("keys", self.keys.to_vec()))
                 .bind(("oldest", oldest))
-                .bind(("rows", parts));
+                .bind(("rows", self.parts.to_vec()))
+                .bind(("lowest", lowest.clone()))
+                .bind(("highest", highest.clone()));
         }
-        query.await?.check()?;
-        Ok(())
+        query
+    }
+}
+
+/// The parameters of the statements of `delete_partitions`.
+struct DeletionParams<'a> {
+    cl: &'a str,
+    asset_key: &'a str,
+    rows: &'a [DbPartitionDeletion],
+    range: &'a (PartitionKey, PartitionKey),
+    by_time: &'a [(i64, Vec<PartitionKey>)],
+}
+
+impl DeletionParams<'_> {
+    fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
+        let (lowest, highest) = self.range;
+        let mut query = query
+            .bind(("cl", self.cl.to_string()))
+            .bind(("asset_key", self.asset_key.to_string()))
+            .bind(("rows", self.rows.to_vec()))
+            .bind(("lowest", lowest.clone()))
+            .bind(("highest", highest.clone()));
+        for (i, (deleted_at, keys)) in self.by_time.iter().enumerate() {
+            query = query
+                .bind((format!("keys_{i}"), keys.clone()))
+                .bind((format!("deleted_at_{i}"), *deleted_at));
+        }
+        query
     }
 }
 

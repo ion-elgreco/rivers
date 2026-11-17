@@ -97,6 +97,7 @@ mod tests {
             status: RunStatus::Failure,
             start_time: 0,
             end_time: Some(end_time),
+            execution_start_time: None,
             tags: vec![],
             node_names: vec![],
             priority: 0,

@@ -1,6 +1,9 @@
 //! PartitionsDefinition — Static, TimeWindow, Multi, and Dynamic partition schemes.
+mod by_place;
 mod time_window;
 
+pub(crate) use by_place::KeysByPlace;
+use by_place::day_grid;
 pub(crate) use time_window::*;
 
 use std::collections::HashMap;
@@ -237,20 +240,10 @@ impl PartitionsDefinition {
         }
     }
 
-    /// The `idx`-th key (in definition order) of a single-dimension definition.
-    fn nth_single_dim_key(&self, idx: usize) -> PyResult<Option<String>> {
-        match self {
-            Self::Static { keys } => Ok(keys.get_at(idx).cloned()),
-            Self::TimeWindow { .. } => Ok(self
-                .get_partition_keys_window(idx, 1)?
-                .into_iter()
-                .next()
-                .and_then(|pk| match pk {
-                    PyPartitionKey::Single { key } => key.into_iter().next(),
-                    _ => None,
-                })),
-            _ => Ok(None),
-        }
+    /// The keys of a definition with one dimension, each found by its place.
+    /// `None` for a definition with more dimensions, and for a dynamic set.
+    pub(crate) fn keys_by_place(&self) -> PyResult<Option<KeysByPlace<'_>>> {
+        KeysByPlace::of(self)
     }
 
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.
@@ -382,37 +375,22 @@ impl PartitionsDefinition {
                 .take(limit)
                 .map(|k| single(k.clone()))
                 .collect()),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                let keys = if let Some(secs) = interval_seconds {
-                    interval_window(*secs, start, end_dt, fmt, offset, limit)
-                } else if let Some(expr) = cron_schedule {
-                    let mut out = Vec::new();
-                    let mut idx = 0usize;
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        if idx >= offset && out.len() < limit {
-                            out.push(naive.strftime(fmt).to_string());
-                        }
-                        idx += 1;
-                        out.len() < limit
-                    })?;
-                    out
-                } else {
-                    Vec::new()
-                };
+            Self::TimeWindow { .. } => {
+                let keys = self
+                    .keys_by_place()?
+                    .map(|keys| keys.window(offset, limit))
+                    .unwrap_or_default();
                 Ok(keys.into_iter().map(single).collect())
             }
             Self::Multi { dimensions } => {
                 let n = dimensions.len();
-                let sizes: Vec<usize> = dimensions
+                let by_place = dimensions
                     .iter()
-                    .map(|(_, d)| d.partition_count())
+                    .map(|(_, def)| def.keys_by_place())
+                    .collect::<PyResult<Vec<_>>>()?;
+                let sizes: Vec<usize> = by_place
+                    .iter()
+                    .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
                     .collect();
                 let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
                 let end = offset.saturating_add(limit).min(total);
@@ -427,14 +405,17 @@ impl PartitionsDefinition {
                 for k in offset..end {
                     let mut rem = k;
                     let mut combo: HashMap<String, Vec<String>> = HashMap::new();
-                    for (i, (name, def)) in dimensions.iter().enumerate() {
+                    for (i, (name, _)) in dimensions.iter().enumerate() {
                         let idx_i = rem / strides[i];
                         rem %= strides[i];
-                        let key = def.nth_single_dim_key(idx_i)?.ok_or_else(|| {
-                            PartitionDefinitionError::new_err(format!(
-                                "dimension '{name}' has no key at index {idx_i}"
-                            ))
-                        })?;
+                        let key = by_place[i]
+                            .as_ref()
+                            .and_then(|keys| keys.get(idx_i))
+                            .ok_or_else(|| {
+                                PartitionDefinitionError::new_err(format!(
+                                    "dimension '{name}' has no key at index {idx_i}"
+                                ))
+                            })?;
                         combo.insert(name.clone(), vec![key]);
                     }
                     out.push(PyPartitionKey::Multi { keys: combo });
@@ -458,81 +439,15 @@ impl PartitionsDefinition {
         offset: usize,
         limit: usize,
     ) -> PyResult<(Vec<(usize, String)>, usize)> {
-        let mut total = 0usize;
-        let mut position = 0usize;
-        let mut page: Vec<(usize, String)> = Vec::new();
-        let mut consume = |k: String| {
-            if k.contains(query) {
-                if total >= offset && page.len() < limit {
-                    page.push((position, k));
-                }
-                total += 1;
-            }
-            position += 1;
-        };
-        match self {
-            Self::Static { keys } => {
-                for k in keys.iter() {
-                    consume(k.clone());
-                }
-            }
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                if let Some(secs) = interval_seconds {
-                    for_each_interval_tick(*secs, start, end_dt, |dt| {
-                        consume(dt.strftime(fmt).to_string());
-                        true
-                    });
-                } else if let Some(expr) = cron_schedule {
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        consume(naive.strftime(fmt).to_string());
-                        true
-                    })?;
-                }
-            }
-            _ => {}
+        match self.keys_by_place()? {
+            Some(keys) => keys.find(query, offset, limit),
+            None => Ok((Vec::new(), 0)),
         }
-        Ok((page, total))
     }
 
     /// Index of `key` in single-dim order — the "jump to key" target.
     pub fn single_dim_key_index(&self, key: &str) -> PyResult<Option<usize>> {
-        match self {
-            Self::Static { keys } => Ok(keys.get_index_of(key)),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let end_dt = time_window_end(end);
-                if let Some(secs) = interval_seconds {
-                    Ok(interval_index(*secs, start, end_dt, fmt, key))
-                } else if let Some(expr) = cron_schedule {
-                    let mut idx = 0usize;
-                    let mut found = None;
-                    for_each_cron_tick(expr, start, end_dt, |naive| {
-                        if naive.strftime(fmt).to_string() == key {
-                            found = Some(idx);
-                            return false;
-                        }
-                        idx += 1;
-                        true
-                    })?;
-                    Ok(found)
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
-        }
+        Ok(self.keys_by_place()?.and_then(|keys| keys.place(key)))
     }
 
     /// Total partitions, as cheaply as the kind allows.
@@ -554,6 +469,10 @@ impl PartitionsDefinition {
                 let end_dt = time_window_end(end);
                 if let Some(secs) = interval_seconds {
                     interval_window_count(*secs, start, end_dt)
+                } else if let Ok(Some(grid)) =
+                    day_grid(cron_schedule, interval_seconds, start, end_dt)
+                {
+                    grid.len()
                 } else if let Some(expr) = cron_schedule {
                     let mut n = 0usize;
                     let _ = for_each_cron_tick(expr, start, end_dt, |_| {
@@ -623,6 +542,21 @@ impl PartitionsDefinition {
                 fmt: fmt.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// The grid of each time dimension of the definition, by dimension name.
+    pub fn time_grids(&self) -> Vec<rivers_core::execution::backfill_spans::DimensionGrid> {
+        match self {
+            Self::Multi { dimensions } => dimensions
+                .iter()
+                .filter_map(|(name, def)| Some((Some(name.clone()), def.time_grid()?)))
+                .collect(),
+            _ => self
+                .time_grid()
+                .map(|grid| (None, grid))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -733,6 +667,113 @@ impl PartitionsDefinition {
             }
             _ => Ok(false),
         }
+    }
+
+    /// One member of `key` that this definition rejects, to name in an error
+    /// message. `None` when no single member is at fault: the key is valid, or
+    /// its shape does not fit the definition.
+    pub fn rejected_member(&self, key: &PyPartitionKey) -> PyResult<Option<PyPartitionKey>> {
+        match (self, key) {
+            (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                let mut member: HashMap<String, Vec<String>> = HashMap::new();
+                let mut any_rejected = false;
+
+                for (dim_name, dim_def) in dimensions {
+                    let Some(first) = keys.get(dim_name).and_then(|vals| vals.first()) else {
+                        return Ok(None);
+                    };
+                    let rejected = dim_def.rejected_value(&keys[dim_name])?;
+                    any_rejected |= rejected.is_some();
+                    member.insert(dim_name.clone(), vec![rejected.unwrap_or(first).clone()]);
+                }
+
+                Ok(any_rejected.then_some(PyPartitionKey::Multi { keys: member }))
+            }
+            (Self::Multi { .. }, PyPartitionKey::Single { .. }) => Ok(None),
+            (_, PyPartitionKey::Single { key }) => {
+                Ok(self
+                    .rejected_value(key)?
+                    .map(|value| PyPartitionKey::Single {
+                        key: vec![value.clone()],
+                    }))
+            }
+            (_, PyPartitionKey::Set { keys }) => {
+                for member in keys {
+                    if let Some(rejected) = self.rejected_member(member)? {
+                        return Ok(Some(rejected));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The part of `key` that this definition accepts: a value that is not a
+    /// key of its dimension is left out. `None` when no partition is left, or
+    /// when the shape of `key` does not fit the definition.
+    pub fn valid_part(&self, key: &PyPartitionKey) -> PyResult<Option<PyPartitionKey>> {
+        match (self, key) {
+            (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
+                if keys.len() != dimensions.len() {
+                    return Ok(None);
+                }
+                let mut kept: HashMap<String, Vec<String>> = HashMap::new();
+
+                for (dim_name, dim_def) in dimensions {
+                    let Some(values) = keys.get(dim_name) else {
+                        return Ok(None);
+                    };
+                    let valid = dim_def.valid_values(values)?;
+                    if valid.is_empty() {
+                        return Ok(None);
+                    }
+                    kept.insert(dim_name.clone(), valid);
+                }
+
+                Ok(Some(PyPartitionKey::Multi { keys: kept }))
+            }
+            (Self::Multi { .. }, PyPartitionKey::Single { .. }) => Ok(None),
+            (_, PyPartitionKey::Single { key }) => {
+                let valid = self.valid_values(key)?;
+                Ok((!valid.is_empty()).then_some(PyPartitionKey::Single { key: valid }))
+            }
+            (_, PyPartitionKey::Set { keys }) => {
+                let mut kept = Vec::new();
+                for member in keys {
+                    kept.extend(self.valid_part(member)?);
+                }
+                Ok((!kept.is_empty()).then_some(PyPartitionKey::Set { keys: kept }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Those of `values` that are keys of this definition.
+    fn valid_values(&self, values: &[String]) -> PyResult<Vec<String>> {
+        let mut valid = Vec::new();
+        for value in values {
+            let single = PyPartitionKey::Single {
+                key: vec![value.clone()],
+            };
+            if self.validate_partition_key(&single)? {
+                valid.push(value.clone());
+            }
+        }
+        Ok(valid)
+    }
+
+    /// The first of `values` that is not a key of this definition.
+    fn rejected_value<'a>(&self, values: &'a [String]) -> PyResult<Option<&'a String>> {
+        for value in values {
+            let single = PyPartitionKey::Single {
+                key: vec![value.clone()],
+            };
+            if !self.validate_partition_key(&single)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     /// Compute the structural intersection of two partition definitions.

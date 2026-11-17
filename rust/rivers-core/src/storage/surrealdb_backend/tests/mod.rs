@@ -10,6 +10,7 @@ use super::super::{
 use super::*;
 use crate::assets::graph::GraphTopology;
 
+mod asset_events;
 mod backfills;
 mod claims;
 mod consolidation;
@@ -17,12 +18,16 @@ mod coverage;
 mod crud;
 mod directory;
 mod executor_patterns;
+mod failure_rows;
 mod isolation;
+mod message_limit;
 mod observations;
+mod partition_reads;
 mod pools;
 mod run_progress;
 mod run_queue;
 mod run_status;
+mod span_keys;
 mod ui_queries;
 
 async fn make_storage() -> SurrealStorage {
@@ -80,11 +85,12 @@ fn make_backfill(id: &str, status: BackfillStatus, create_time: i64) -> Backfill
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["a".to_string()],
         job_name: None,
-        partition_keys: vec![],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 1,
         tags: vec![],
         create_time,
@@ -104,6 +110,7 @@ fn minimal_run(run_id: &str, status: RunStatus) -> RunRecord {
         status,
         start_time: 1000,
         end_time: None,
+        execution_start_time: None,
         tags: vec![],
         node_names: vec![],
         priority: 0,
@@ -129,11 +136,12 @@ fn mk_isolation_backfill(
         failure_policy: BackfillFailurePolicy::Continue,
         asset_selection: vec!["a".to_string()],
         job_name: None,
-        partition_keys: vec![],
+        num_partitions: 0,
+        planned_runs: 0,
         run_ids: vec![],
-        completed_partitions: vec![],
-        failed_partitions: vec![],
-        canceled_partitions: vec![],
+        completed_partitions: 0,
+        failed_partitions: 0,
+        canceled_partitions: 0,
         max_concurrency: 1,
         tags: vec![],
         create_time,

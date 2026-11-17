@@ -1008,3 +1008,74 @@ async fn concurrent_observations_stay_consistent() {
         );
     }
 }
+
+/// Runs that write partitions of one asset at the same time all write its
+/// `assets` row, so all but one lose each commit. A lost race is not a sick
+/// store: it must not use up the attempts kept for one, or a batch of events
+/// stays without its partition rows. This store keeps no such attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_batches_of_one_asset_all_get_their_partition_rows() {
+    const RUNS: usize = 4;
+    const BATCHES: usize = 12;
+    const BATCH: usize = 64;
+
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = std::sync::Arc::new(
+        SurrealStorage::new_embedded_with_retry(
+            temp_dir.as_path_untracked().to_str().unwrap(),
+            retry::StorageRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+            Capability::ReadWrite,
+        )
+        .await
+        .expect("failed to create embedded storage"),
+    );
+    register(&storage, &["trips"]).await;
+
+    // The partitions of one run share its zone and one event time.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RUNS));
+    let runs: Vec<_> = (0..RUNS)
+        .map(|run| {
+            let (storage, barrier) = (storage.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let mut lost = Vec::new();
+                for batch in 0..BATCHES {
+                    let events: Vec<EventRecord> = (0..BATCH)
+                        .map(|i| EventRecord {
+                            partition_key: Some(PartitionKey::Multi {
+                                dims: vec![
+                                    (
+                                        "hour".to_string(),
+                                        vec![format!("h{:04}", batch * BATCH + i)],
+                                    ),
+                                    ("zone".to_string(), vec![format!("z{run}")]),
+                                ],
+                            }),
+                            ..make_event("trips", &format!("run{run}"), 1_000 + run as i64)
+                        })
+                        .collect();
+                    if let Err(e) = storage.store_events(&events).await {
+                        lost.push(format!("run{run} batch {batch}: {e:#}"));
+                    }
+                }
+                lost
+            })
+        })
+        .collect();
+    let mut lost = Vec::new();
+    for run in runs {
+        lost.extend(run.await.unwrap());
+    }
+
+    assert_eq!(lost, Vec::<String>::new(), "batches that were not stored");
+    assert_eq!(
+        storage
+            .count_materialized_partitions(DEFAULT_CODE_LOCATION_ID, "trips")
+            .await
+            .unwrap(),
+        (RUNS * BATCHES * BATCH) as u64
+    );
+}

@@ -563,6 +563,30 @@ volume for a second copy, and keeps the original files in `_rocksdb_backup/`.
 The next `helm upgrade` removes the opt-in again. Upgrade an external
 SurrealDB server to v4 the same way before you migrate.
 
+### Upgrading to schema version 14
+
+Schema version 14 stores a backfill in a new form and raises both floors:
+every `CodeLocation` image and the UI must run the new rivers. A backfill
+that a daemon runs continues after the migration. A `rivers backfill`
+command that runs its backfill itself (without `--detach`) is not in the
+list of `rivers db status`: let it end, or stop it, before you migrate.
+
+### Upgrading to schema version 15
+
+Schema version 15 records when a run began to execute and raises no floor.
+The UI shows the duration of a run from that time, and shows the wait in the
+queue apart. A run that was in progress during the migration, or that an
+older `CodeLocation` image starts, shows no duration.
+
+### Upgrading to schema version 16
+
+Schema version 16 stores the failed partitions of each asset, and their
+failures by run, in tables of their own, and raises the writer floor: every
+`CodeLocation` image must run the new rivers. An older UI still reads the
+database. The migration fills the tables from the stored events and runs; on
+a store with many failed partitions it takes longer than the earlier
+migrations.
+
 ## Uninstall
 
 ```sh

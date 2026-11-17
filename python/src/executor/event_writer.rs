@@ -5,10 +5,13 @@
 //! to SurrealDB in batches (by count or timer), decoupling storage write
 //! latency from step execution throughput. The channel is unbounded so events
 //! arent lossed and we dont block the thread; if storage falls behind, depth grows and a warning is logged once it crosses the
-//! high-water mark.
+//! high-water mark. Events that the store refuses stay in the batch and are
+//! sent again (see [`EventBatch`]).
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use rivers_core::storage::event_batch::{BATCH_SIZE, EventBatch};
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{EventRecord, LogRecord, ScopedStorageHandle, StorageBackend};
 use tokio::sync::{mpsc, oneshot};
@@ -17,7 +20,6 @@ use tracing::warn;
 
 use crate::runtime::io_rt;
 
-const BATCH_SIZE: usize = 64;
 const FLUSH_INTERVAL_MS: u64 = 200;
 /// Queue depth at which we warn that storage is falling behind. Hysteresis is
 /// applied at half this value to avoid log spam around the boundary.
@@ -54,7 +56,7 @@ impl From<LogRecord> for WriterMsg {
 /// can see when storage is the bottleneck.
 pub(crate) struct EventWriter {
     sender: mpsc::UnboundedSender<WriterMsg>,
-    handle: JoinHandle<()>,
+    handle: JoinHandle<anyhow::Result<()>>,
     /// Owning code-location identity; stamped onto every event passed through
     /// `emit()`/`emit_log()`. Senders obtained via `sender()` bypass this and
     /// must stamp the field themselves.
@@ -66,9 +68,7 @@ impl EventWriter {
         let (tx, rx) = mpsc::unbounded_channel();
         let code_location_id = storage.code_location_id().to_string();
         let backend = Arc::clone(storage.backend());
-        let handle = io_rt().spawn(async move {
-            batch_writer_loop(rx, &backend).await;
-        });
+        let handle = io_rt().spawn(async move { batch_writer_loop(rx, &backend).await });
         Self {
             sender: tx,
             handle,
@@ -108,17 +108,20 @@ impl EventWriter {
         self.sender.clone()
     }
 
-    pub(crate) fn flush(self) {
+    /// Stores the events that are left and stops the writer. An error means
+    /// that some events of the run are not stored.
+    pub(crate) fn flush(self) -> anyhow::Result<()> {
         drop(self.sender);
-        if let Err(e) = io_rt().block_on(self.handle) {
-            warn!("event writer task panicked: {e:?}");
-        }
+        io_rt()
+            .block_on(self.handle)
+            .context("the event writer stopped")?
     }
 }
 
 /// Queues `events` behind every event already on `tx` and waits until they
 /// are stored with them. Unlike `emit`, a failed store comes back as the
-/// error. The caller stamps `code_location_id`, as with `sender()`.
+/// error; the events stay and are sent again. The caller stamps
+/// `code_location_id`, as with `sender()`.
 pub(crate) async fn store_now(
     tx: &mpsc::UnboundedSender<WriterMsg>,
     events: Vec<EventRecord>,
@@ -131,18 +134,6 @@ pub(crate) async fn store_now(
         .map_err(|_| anyhow::anyhow!("the event writer has stopped"))?
 }
 
-async fn flush_batch(storage: &SurrealStorage, batch: &mut Vec<EventRecord>) -> anyhow::Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let stored = storage.store_events(batch).await.map(drop);
-    if let Err(e) = &stored {
-        warn!("failed to flush event batch: {e:?}");
-    }
-    batch.clear();
-    stored
-}
-
 async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
     if batch.is_empty() {
         return;
@@ -153,8 +144,13 @@ async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
     batch.clear();
 }
 
-async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: &SurrealStorage) {
-    let mut events = Vec::with_capacity(BATCH_SIZE);
+/// Returns the error of the last send when events are left that the store
+/// did not take.
+async fn batch_writer_loop(
+    mut rx: mpsc::UnboundedReceiver<WriterMsg>,
+    storage: &SurrealStorage,
+) -> anyhow::Result<()> {
+    let mut events = EventBatch::default();
     let mut logs: Vec<LogRecord> = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -169,7 +165,7 @@ async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: 
                     Some(WriterMsg::Event(event)) => {
                         events.push(event);
                         if events.len() >= BATCH_SIZE {
-                            let _ = flush_batch(storage, &mut events).await;
+                            events.send_unless_paused(storage).await;
                         }
                     }
                     Some(WriterMsg::Log(log)) => {
@@ -180,17 +176,17 @@ async fn batch_writer_loop(mut rx: mpsc::UnboundedReceiver<WriterMsg>, storage: 
                     }
                     Some(WriterMsg::StoreNow(now, done)) => {
                         events.extend(now);
-                        let _ = done.send(flush_batch(storage, &mut events).await);
+                        let _ = done.send(events.send(storage).await);
                     }
                     None => {
-                        let _ = flush_batch(storage, &mut events).await;
+                        let stored = events.send_until_stored(storage).await;
                         flush_logs(storage, &mut logs).await;
-                        return;
+                        return stored;
                     }
                 }
             }
             _ = interval.tick() => {
-                let _ = flush_batch(storage, &mut events).await;
+                events.send_unless_paused(storage).await;
                 flush_logs(storage, &mut logs).await;
                 let depth = rx.len();
                 if depth >= HIGH_WATER_MARK && !above_high_water {

@@ -80,6 +80,7 @@ fn resolve_remote_config(
         namespace,
         database,
         credentials: None,
+        max_message_size: None,
     };
     if let (Some(u), Some(p)) = (username, password) {
         config = config.with_credentials(u, p);
@@ -308,9 +309,10 @@ impl PyStorage {
     /// credentials (matching `DEFINE USER ... ON DATABASE`); when either
     /// is missing on both kwarg AND env, the connection is unauthenticated
     /// (`--unauthenticated` SurrealDB). `namespace` / `database` default to
-    /// `"rivers"` / `"main"`.
+    /// `"rivers"` / `"main"`. `max_message_size` is the largest message, in
+    /// bytes, that the connection sends or accepts (default 64 MiB).
     #[staticmethod]
-    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None))]
+    #[pyo3(signature = (endpoint, *, username=None, password=None, namespace=None, database=None, max_message_size=None))]
     fn connect(
         py: Python<'_>,
         endpoint: &str,
@@ -318,14 +320,16 @@ impl PyStorage {
         password: Option<String>,
         namespace: Option<String>,
         database: Option<String>,
+        max_message_size: Option<usize>,
     ) -> PyResult<Self> {
         // Whole body runs detached: env-var resolution + config building touch
         // nothing Python, and the GIL must stay released across `block_on` to
         // avoid the daemon-task deadlock (see `Self::embedded`).
         let endpoint_owned = endpoint.to_string();
         let (storage, authenticated) = py.detach(|| -> PyResult<_> {
-            let (config, authenticated) =
+            let (mut config, authenticated) =
                 resolve_remote_config(endpoint_owned, username, password, namespace, database);
+            config.max_message_size = max_message_size;
             let storage = io_rt()
                 .block_on(SurrealStorage::connect(config))
                 .map_err(to_py_err)?;
@@ -881,7 +885,7 @@ impl PyStorage {
     }
 
     /// Create a run record (test helper). Not part of the public API.
-    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None))]
+    #[pyo3(name = "_create_run", signature = (run_id, job_name, status, start_time, priority=0, tags=vec![], block_reason=None, node_names=vec![], action=None, config=None, partition_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn create_run(
         &self,
@@ -896,6 +900,7 @@ impl PyStorage {
         node_names: Vec<String>,
         action: Option<String>,
         config: Option<Py<PyAny>>,
+        partition_key: Option<PyPartitionKey>,
     ) -> PyResult<()> {
         use rivers_core::storage::RunRecord;
         let config = crate::config::run_config::run_config_to_json(py, config.as_ref())?;
@@ -910,10 +915,11 @@ impl PyStorage {
             status: parse_run_status(status)?,
             start_time,
             end_time: None,
+            execution_start_time: None,
             tags,
             node_names,
             priority,
-            partition_key: None,
+            partition_key: partition_key.as_ref().map(Into::into),
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
             action,
@@ -922,6 +928,39 @@ impl PyStorage {
         py.detach(|| {
             io_rt()
                 .block_on(self.backend().create_run(&record))
+                .map_err(to_py_err)
+        })
+    }
+
+    /// The partition key of a run, and of each of its events that has one
+    /// (with the event type), as text in the form that storage holds: a span
+    /// of time windows shows as `first..last` (test helper). Not part of the
+    /// public API.
+    #[pyo3(name = "_stored_keys")]
+    #[allow(clippy::type_complexity)]
+    fn stored_keys(
+        &self,
+        py: Python<'_>,
+        run_id: &str,
+    ) -> PyResult<(Option<String>, Vec<(String, String)>)> {
+        py.detach(|| {
+            io_rt()
+                .block_on(async {
+                    let run = self.backend().get_run(run_id).await?;
+                    let events = self.backend().get_events_for_run(run_id).await?;
+
+                    let run_key = run
+                        .and_then(|run| run.partition_key)
+                        .map(|key| key.to_display());
+                    let event_keys = events
+                        .into_iter()
+                        .filter_map(|event| {
+                            let key = event.partition_key?.to_display();
+                            Some((event.event_type.type_name().to_string(), key))
+                        })
+                        .collect();
+                    anyhow::Ok((run_key, event_keys))
+                })
                 .map_err(to_py_err)
         })
     }
@@ -957,14 +996,12 @@ impl PyStorage {
             failure_policy: BackfillFailurePolicy::Continue,
             asset_selection,
             job_name: None,
-            partition_keys: partition_keys
-                .into_iter()
-                .map(|k| PartitionKey::Single { keys: vec![k] })
-                .collect(),
+            num_partitions: 0,
+            planned_runs: 0,
             run_ids: vec![],
-            completed_partitions: vec![],
-            failed_partitions: vec![],
-            canceled_partitions: vec![],
+            completed_partitions: 0,
+            failed_partitions: 0,
+            canceled_partitions: 0,
             max_concurrency: 4,
             tags: vec![],
             create_time,
@@ -974,9 +1011,13 @@ impl PyStorage {
             action: None,
             config: None,
         };
+        let partition_keys: Vec<PartitionKey> = partition_keys
+            .into_iter()
+            .map(|k| PartitionKey::Single { keys: vec![k] })
+            .collect();
         py.detach(|| {
             io_rt()
-                .block_on(self.backend().create_backfill(&record))
+                .block_on(self.backend().create_backfill(&record, &partition_keys))
                 .map_err(to_py_err)
         })
     }

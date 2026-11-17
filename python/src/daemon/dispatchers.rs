@@ -203,6 +203,7 @@ impl DirectRunDispatcher {
                             Some(assets),
                             py_pk,
                             None,
+                            None,
                             false,
                             config,
                             Some(run_id.clone()),
@@ -215,6 +216,7 @@ impl DirectRunDispatcher {
                         .materialize_with_launcher(
                             Some(assets),
                             py_pk,
+                            None,
                             None,
                             false,
                             config,
@@ -320,6 +322,7 @@ impl QueuedRunDispatcher {
                 status: RunStatus::Queued,
                 start_time: rivers_core::util::now_ts(),
                 end_time: None,
+                execution_start_time: None,
                 tags: req.tags.clone(),
                 node_names: req.asset_selection.clone(),
                 priority,

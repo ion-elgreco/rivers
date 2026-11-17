@@ -1,5 +1,9 @@
 //! Wall-clock time-window grid for time-partition keys.
 
+mod day_grid;
+
+pub use day_grid::{DayGrid, Found};
+
 use anyhow::{Result, bail};
 use jiff::{SignedDuration, civil};
 use serde::{Deserialize, Serialize};
@@ -281,6 +285,27 @@ impl TimeGrid {
 /// Normalize a cron tick to whole seconds (croner yields sub-second fractions).
 fn cron_tick_civil(tick: civil::DateTime) -> civil::DateTime {
     tick.with().subsec_nanosecond(0).build().unwrap_or(tick)
+}
+
+/// The ticks of `cron` from `from` on, starting with `from` when it is a tick.
+pub(crate) fn cron_ticks(
+    cron: &croner::Cron,
+    from: civil::DateTime,
+) -> impl Iterator<Item = civil::DateTime> + use<> {
+    let anchor = from
+        .checked_sub(SignedDuration::from_secs(1))
+        .unwrap_or(from);
+    cron.iter_from(anchor, croner::Direction::Forward)
+        .map(cron_tick_civil)
+        .skip_while(move |tick| *tick < from)
+}
+
+/// [`cron_ticks`] of a cron expression.
+pub(crate) fn cron_ticks_from(
+    expr: &str,
+    from: civil::DateTime,
+) -> Result<impl Iterator<Item = civil::DateTime> + use<>> {
+    Ok(cron_ticks(&parse_cron(expr)?, from))
 }
 
 /// Parse a cron expression in the ONE dialect rivers accepts (5 or 6 fields,

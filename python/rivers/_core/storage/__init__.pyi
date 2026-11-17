@@ -193,7 +193,12 @@ class RunRecord:
     runs (``repo.materialize()``, sensors that drive an asset selection)."""
     status: str
     start_time: int
+    """When the run was created, in nanoseconds. A queued run waits from this
+    time."""
     end_time: int | None
+    execution_start_time: int | None
+    """When the run began to execute, in nanoseconds. ``None`` while the run
+    waits in the queue, and for a run that ended before it began."""
     tags: list[tuple[str, str]]
     node_names: list[str]
     priority: int
@@ -324,6 +329,7 @@ class Storage:
         password: str | None = None,
         namespace: str | None = None,
         database: str | None = None,
+        max_message_size: int | None = None,
     ) -> Storage:
         """Connect to a remote SurrealDB endpoint (e.g. ``ws://host:8000``).
 
@@ -336,6 +342,10 @@ class Storage:
         ``database`` — matching a ``DEFINE USER ... ON DATABASE`` definition.
         Omit both for an ``--unauthenticated`` SurrealDB. ``namespace``
         defaults to ``"rivers"`` and ``database`` to ``"main"``.
+
+        ``max_message_size`` is the largest message, in bytes, that the
+        connection sends or accepts. The default is 64 MiB. A SurrealDB
+        server accepts 128 MiB by default.
         """
         ...
 
@@ -568,8 +578,19 @@ class Storage:
         node_names: list[str] = ...,
         action: str | None = None,
         config: dict[str, Any] | None = None,
+        partition_key: PartitionKey | None = None,
     ) -> None:
         """(Internal) create a run record directly — test helper."""
+        ...
+
+    def _stored_keys(self, run_id: str) -> tuple[str | None, list[tuple[str, str]]]:
+        """(Internal) the partition key of a run and of its keyed events, as storage holds them — test helper.
+
+        Returns:
+            The key of the run as text, and one ``(event_type, key)`` pair for
+            each event of the run that has a key. A span of time windows shows
+            as ``first..last``.
+        """
         ...
 
     def get_queued_runs(self) -> list[RunRecord]:

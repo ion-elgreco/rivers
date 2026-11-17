@@ -221,6 +221,7 @@ pub fn detect_surreal_connect_config() -> SurrealConnectConfig {
         database: env_nonempty(ENV_SURREAL_DATABASE)
             .unwrap_or_else(|| DEFAULT_DATABASE.to_string()),
         credentials: None,
+        max_message_size: None,
     };
     if let (Some(u), Some(p)) = (
         env_nonempty(ENV_SURREAL_USERNAME),
@@ -1112,7 +1113,6 @@ mod tests {
             run_cr_uid: "uid-1".to_string(),
             code_location_id: "cl-1".to_string(),
             extra_env: vec![],
-            partition_key: None,
             workspace: None,
         }
     }
