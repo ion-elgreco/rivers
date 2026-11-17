@@ -1,17 +1,20 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use leptos::prelude::*;
+
+use crate::components::dag::layout::{LayoutNode, LayoutResult};
 
 use super::timeline::StepStatus;
 
 #[component]
 pub(super) fn RunDagView(
-    layout: crate::components::dag::layout::LayoutResult,
-    status_by_asset: std::collections::HashMap<String, StepStatus>,
-    duration_by_asset: std::collections::HashMap<String, String>,
+    layout: Arc<LayoutResult>,
+    status_by_asset: Arc<HashMap<String, StepStatus>>,
+    mut duration_by_asset: HashMap<String, String>,
     selected_step: ReadSignal<Option<String>>,
     on_select: WriteSignal<Option<String>>,
 ) -> impl IntoView {
-    use crate::components::dag::layout::LayoutNode;
-
     // Nodes render ~72px tall (fits 2-line names + header + duration), but our layout
     // was computed with 48-tall node boxes + 16 gap. Scale y positions so we preserve
     // the same visual gap between rendered nodes and avoid overlap.
@@ -22,18 +25,15 @@ pub(super) fn RunDagView(
 
     let width = layout.width.max(400.0);
     let height = (layout.height * y_scale).max(200.0) + 32.0;
-    let node_by_id: std::collections::HashMap<String, LayoutNode> = layout
-        .nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.clone()))
-        .collect();
+    let node_by_id: HashMap<&str, &LayoutNode> =
+        layout.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     let edge_views: Vec<_> = layout
         .edges
         .iter()
         .filter_map(|e| {
-            let src = node_by_id.get(&e.source)?;
-            let tgt = node_by_id.get(&e.target)?;
+            let src = node_by_id.get(e.source.as_str())?;
+            let tgt = node_by_id.get(e.target.as_str())?;
             let x1 = src.x + src.width;
             let y1 = src.y * y_scale + RENDER_H / 2.0;
             let x2 = tgt.x;
@@ -82,7 +82,7 @@ pub(super) fn RunDagView(
                         Some(n.kind.clone())
                     }
                 });
-            let dur = duration_by_asset.get(&n.id).cloned().unwrap_or_default();
+            let dur = duration_by_asset.remove(&n.id).unwrap_or_default();
             let full_key = n.id.clone();
             let is_running = matches!(status, Some(StepStatus::Running));
             let key_for_click = full_key.clone();
