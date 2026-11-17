@@ -685,12 +685,15 @@ mod read {
                     } else {
                         ROWS_MOST
                     };
+                    let finer;
                     let top = if bars.groups.len() <= most as usize {
-                        bars.clone()
+                        &bars
                     } else {
-                        self.split(&root, most)
+                        finer = self
+                            .split(&root, most)
                             .await?
-                            .context("the keys of the dimension do not ascend")?
+                            .context("the keys of the dimension do not ascend")?;
+                        &finer
                     };
 
                     let (strip, level) = futures_util::try_join!(
@@ -704,11 +707,13 @@ mod read {
                     let shown = page.len().min(PAGE as usize);
                     let more = keys_total.saturating_sub(shown as u64);
                     let top = Split::of_keys(page[..shown].to_vec());
-                    let bars = Split::of_keys(page);
 
-                    let level = self.level(&root, top, false, more, states).await?;
+                    let level = self.level(&root, &top, false, more, states).await?;
                     let strip = match keys_total <= BARS_MOST as u64 {
-                        true => Some(self.strip(&root, &bars, false, states).await?),
+                        true => {
+                            let bars = Split::of_keys(page);
+                            Some(self.strip(&root, &bars, false, states).await?)
+                        }
                         false => None,
                     };
                     (strip, level, Split::default())
@@ -768,7 +773,7 @@ mod read {
 
             if let Some(backfill) = &self.backfill {
                 let states = States::Backfill(&backfill.states);
-                return self.level(place, split, in_order, more, &states).await;
+                return self.level(place, &split, in_order, more, &states).await;
             }
 
             // The failed partitions that the rows can show, and no others.
@@ -782,7 +787,7 @@ mod read {
             let failed =
                 FailedPartitions::read(self.storage, self.asset_key, Some(&bounds)).await?;
 
-            self.level(place, split, in_order, more, &States::Asset(&failed))
+            self.level(place, &split, in_order, more, &States::Asset(&failed))
                 .await
         }
 
@@ -1048,17 +1053,17 @@ mod read {
         async fn level(
             &self,
             place: &OutlinePlace,
-            split: Split,
+            split: &Split,
             in_order: bool,
             more: u64,
             states: &States<'_>,
         ) -> Result<OutlineLevel> {
-            let heading = heading_of(place, &split);
+            let heading = heading_of(place, split);
             let newest_first = in_order && split.time;
 
             let rows = if split.of_keys && place.dimensions.len() == 1 {
                 let mut rows: Vec<PartitionRow> = self
-                    .partitions(place, &split, in_order, states)
+                    .partitions(place, split, in_order, states)
                     .await?
                     .into_iter()
                     .flatten()
@@ -1068,8 +1073,8 @@ mod read {
                 }
                 OutlineRows::Partitions(rows)
             } else {
-                let counts = self.counts(place, &split, states).await?;
-                let mut rows = group_rows(place, &split, counts);
+                let counts = self.counts(place, split, states).await?;
+                let mut rows = group_rows(place, split, counts);
                 if matches!(states, States::Backfill(_)) {
                     rows.retain(|row| row.counts.total > 0);
                 }
