@@ -7,7 +7,7 @@ use kube_client::{Api, ResourceExt};
 use kube_runtime::controller::Action;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{RunOutcome, RunStatus, StorageBackend};
-use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
+use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::{CONDITION_EXECUTOR_READY, Run, RunCondition, RunCrdStatus, RunPhase};
 
 use super::cancel;
@@ -31,7 +31,7 @@ pub struct Context {
     /// Shared CodeLocation cache fed by `codelocation::run_watcher`. The
     /// run reconciler reads the owning CL's spec from here whenever it
     /// creates an executor pod; on cache miss (startup window before the
-    /// watcher syncs) `fetch_cl_spec` falls back to a live API GET.
+    /// watcher syncs) `fetch_code_location` falls back to a live API GET.
     pub directory: Arc<DirectoryState>,
     /// Chart-level workspace settings, needed to mount git-mode runs'
     /// trees onto their executor pods.
@@ -85,26 +85,28 @@ pub async fn reconcile(run: Arc<Run>, ctx: Arc<Context>) -> Result<Action, Error
     }
 }
 
-/// Look up a Run's owning CodeLocation and return its spec. Reads from the
-/// operator's shared cache (populated by `codelocation::run_watcher`) and
-/// falls back to a live API GET on miss — covers the brief startup window
-/// before the watcher's initial sync. Errors (CR missing, no RBAC, transient
-/// API failure) bubble up so the reconciler requeues; we never want to
-/// launch a run pod with a partial env list (silently losing user-declared
-/// `secretKeyRef`s) or a workspace sized without the CL's
-/// `spec.git.workspaceSize`.
-pub(crate) async fn fetch_cl_spec(
+/// Look up a Run's owning CodeLocation. Reads from the operator's shared
+/// cache (populated by `codelocation::run_watcher`) and falls back to a live
+/// API GET on miss — covers the brief startup window before the watcher's
+/// initial sync. Errors (CR missing, no RBAC, transient API failure) bubble
+/// up so the reconciler requeues; we never want to launch a run pod with a
+/// partial env list (silently losing user-declared `secretKeyRef`s) or a
+/// workspace sized without the CL's `spec.git.workspaceSize`.
+pub(crate) async fn fetch_code_location(
     ctx: &Context,
     run: &Run,
-) -> Result<Arc<CodeLocationSpec>, Error> {
+) -> Result<Arc<CodeLocation>, Error> {
     let namespace = run.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let cl_name = &run.spec.code_location_ref.name;
-    if let Some(spec) = ctx.directory.lookup_spec(&namespace, cl_name).await {
-        return Ok(spec);
+    if let Some(cl) = ctx
+        .directory
+        .lookup_code_location(&namespace, cl_name)
+        .await
+    {
+        return Ok(cl);
     }
     let cls_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), &namespace);
-    let cl = cls_api.get(cl_name).await?;
-    Ok(Arc::new(cl.spec))
+    Ok(Arc::new(cls_api.get(cl_name).await?))
 }
 
 /// Phase-specific retry tuning lives inside `reconcile()`; this is the
@@ -144,13 +146,13 @@ async fn reconcile_pending(
     let run_id = status.run_id.as_deref().unwrap();
     let pod_name = executor_pod_name(name);
 
-    let cl_spec = fetch_cl_spec(ctx, run).await?;
+    let cl = fetch_code_location(ctx, run).await?;
     let pod = build_executor_pod(
         run,
         &pod_name,
         run_id,
         false,
-        &cl_spec,
+        &cl.spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,

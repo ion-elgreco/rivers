@@ -9,8 +9,8 @@ use rivers_k8s::crd::run::{CONDITION_EXECUTOR_RESTARTED, Run, RunPhase};
 
 use super::pod_builder::build_executor_pod;
 use super::reconcile::{
-    Context, Error, apply_outcome_to_status, delete_pod_if_exists, fetch_cl_spec, make_condition,
-    patch_status, push_condition, sync_run_status_to_storage,
+    Context, Error, apply_outcome_to_status, delete_pod_if_exists, fetch_code_location,
+    make_condition, patch_status, push_condition, sync_run_status_to_storage,
 };
 
 /// Bumps `restartsWithoutProgress` (resetting to 0 if storage shows new
@@ -118,13 +118,13 @@ pub async fn handle_executor_failure(
         let _ = delete_pod_if_exists(pods_api, old_pod).await;
     }
 
-    let cl_spec = fetch_cl_spec(ctx, run).await?;
+    let cl = fetch_code_location(ctx, run).await?;
     let pod = build_executor_pod(
         run,
         &pod_name,
         run_id,
         true,
-        &cl_spec,
+        &cl.spec,
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,

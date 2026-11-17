@@ -20,7 +20,7 @@ use rivers_api::{
     CodeLocationEntry, CodeLocationEvent, ListCodeLocationsRequest, ListCodeLocationsResponse,
     WatchCodeLocationsRequest,
 };
-use rivers_k8s::crd::code_location::{CodeLocation, CodeLocationSpec};
+use rivers_k8s::crd::code_location::CodeLocation;
 use tokio::sync::{RwLock, broadcast};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
@@ -105,9 +105,10 @@ impl DirectoryState {
     }
 
     /// The CR as the watcher last saw it. Used by the admission webhook to
-    /// resolve a Run's `codeLocationRef`. Returns `None` if the CR isn't in
-    /// the cache; callers may then fall back to a live API server `GET` to
-    /// cover the window where a replica's reflector hasn't seen the CR yet.
+    /// resolve a Run's `codeLocationRef`, and by the run reconciler to read
+    /// the CR's spec. Returns `None` if the CR isn't in the cache; callers
+    /// may then fall back to a live API server `GET` to cover the window
+    /// where a replica's reflector hasn't seen the CR yet.
     pub async fn lookup_code_location(
         &self,
         namespace: &str,
@@ -115,15 +116,6 @@ impl DirectoryState {
     ) -> Option<Arc<CodeLocation>> {
         let key = EntryKey::new(namespace, name);
         self.code_locations.read().await.get(&key).cloned()
-    }
-
-    /// The cached CR's spec — the path the run reconciler uses when
-    /// resolving `spec.env`. Returns `None` only during the brief startup
-    /// window before the watcher syncs.
-    pub async fn lookup_spec(&self, namespace: &str, name: &str) -> Option<Arc<CodeLocationSpec>> {
-        self.lookup_code_location(namespace, name)
-            .await
-            .map(|cl| Arc::new(cl.spec.clone()))
     }
 
     /// Insert or update an entry. Emits `ADDED` on first sight, `MODIFIED` on
@@ -468,8 +460,8 @@ mod tests {
 
         state.upsert_code_location(cl.clone()).await;
         assert_eq!(state.snapshot("").await, vec![]);
-        let spec = state.lookup_spec("ns", "a").await.unwrap();
-        assert_eq!(spec.image.as_deref(), Some("repo"));
+        let cached = state.lookup_code_location("ns", "a").await.unwrap();
+        assert_eq!(cached.spec.image.as_deref(), Some("repo"));
 
         let status = serde_json::json!({ "phase": "Ready", "resolvedImage": "repo@sha256:a" });
         cl.status = Some(serde_json::from_value(status).unwrap());
