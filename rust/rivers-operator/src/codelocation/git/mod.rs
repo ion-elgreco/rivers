@@ -833,10 +833,9 @@ impl GitResolver {
             Transport::Http => {
                 let auth = match &req.credentials {
                     GitCredentials::Anonymous => http::GitAuth::Anonymous,
-                    GitCredentials::Basic { username, password } => http::GitAuth::Basic {
-                        username: username.clone(),
-                        password: password.clone(),
-                    },
+                    GitCredentials::Basic { username, password } => {
+                        http::GitAuth::Basic { username, password }
+                    }
                     GitCredentials::Ssh { .. } => {
                         return Err(GitError::AuthFailed(
                             "SSH credentials cannot fetch an http(s) url".to_string(),

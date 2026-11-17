@@ -33,14 +33,24 @@ const ADVERTISEMENT_CONTENT_TYPE: &str = "application/x-git-upload-pack-advertis
 
 /// Credentials resolved from the CR's Secret (`username`/`password` keys —
 /// a forge token is just a password with any username).
-#[derive(Clone, Debug, Default)]
-pub enum GitAuth {
+#[derive(Clone, Default)]
+pub enum GitAuth<'a> {
     #[default]
     Anonymous,
     Basic {
-        username: String,
-        password: String,
+        username: &'a str,
+        password: &'a str,
     },
+}
+
+/// The kind only: the credentials stay out of logs and panics.
+impl std::fmt::Debug for GitAuth<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitAuth::Anonymous => f.write_str("Anonymous"),
+            GitAuth::Basic { .. } => f.debug_struct("Basic").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// GET the smart-HTTP ref advertisement and keep the refs that answer
@@ -48,7 +58,7 @@ pub enum GitAuth {
 pub async fn fetch_advertisement(
     client: &reqwest::Client,
     repo_url: &str,
-    auth: &GitAuth,
+    auth: &GitAuth<'_>,
     wanted: &GitRef,
     timeout: Duration,
 ) -> Result<Advertisement, GitError> {
@@ -66,7 +76,7 @@ pub async fn fetch_advertisement(
 pub(crate) async fn fetch_advertisement_with_cap(
     client: &reqwest::Client,
     repo_url: &str,
-    auth: &GitAuth,
+    auth: &GitAuth<'_>,
     wanted: &GitRef,
     timeout: Duration,
     cap: usize,
@@ -224,8 +234,8 @@ mod tests {
 
         let repo = format!("{}/repo.git/", server.uri());
         let auth = GitAuth::Basic {
-            username: "bot".to_string(),
-            password: "s3cret".to_string(),
+            username: "bot",
+            password: "s3cret",
         };
         let main = fixtures::branch("main");
         let adv = fetch_advertisement(&client(), &repo, &auth, &main, TIMEOUT)
@@ -324,8 +334,8 @@ mod tests {
             .await;
         let repo = format!("http://bot@{}/r.git", server.address());
         let secret = GitAuth::Basic {
-            username: "ci-bot".to_string(),
-            password: "ghp_S3cr3t".to_string(),
+            username: "ci-bot",
+            password: "ghp_S3cr3t",
         };
         let from_secret = format!(
             "Basic {}",
@@ -351,6 +361,18 @@ mod tests {
                 .collect();
             assert_eq!(authorization, sent, "{case}");
         }
+    }
+
+    #[test]
+    fn debug_shows_the_kind_only() {
+        let auth = GitAuth::Basic {
+            username: "ci-bot",
+            password: "ghp_S3cr3t",
+        };
+        let shown = format!("{auth:?}");
+        assert!(!shown.contains("ghp_S3cr3t"), "{shown}");
+        assert_eq!(shown, "Basic { .. }");
+        assert_eq!(format!("{:?}", GitAuth::Anonymous), "Anonymous");
     }
 
     #[tokio::test]
