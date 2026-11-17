@@ -1257,6 +1257,72 @@ def test_predefined_keys_honor_changed_dynamic_keys_between_runs(tmp_path):
     )
 
 
+@pytest.mark.parametrize("executor", ["in_process", "parallel"])
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_predefined_keys_read_from_kv_in_a_later_run(
+    tmp_path, storage, executor, is_async
+):
+    """The source's DynamicOutput keys are written to KV when the source runs
+    on the orchestrator. A later run that maps over the source without
+    running it reads the keys from KV, so mapped instances keep the source's
+    keys instead of synthetic indices."""
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+
+    @rs.Task
+    def kv_inc(x: int) -> int:
+        return x + 1
+
+    @rs.Task
+    def kv_sum(values: list) -> int:
+        return sum(values)
+
+    def outputs() -> list:
+        return [
+            rs.DynamicOutput(key="alpha", value=10),
+            rs.DynamicOutput(key="beta", value=20),
+        ]
+
+    if is_async:
+
+        @rs.Asset(io_handler=handler)
+        async def kv_source() -> list:
+            return outputs()
+
+    else:
+
+        @rs.Asset(io_handler=handler)
+        def kv_source() -> list:
+            return outputs()
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def kv_pipeline():
+        mapped = kv_source().map(kv_inc)
+        return kv_sum(mapped.collect())
+
+    repo = rs.CodeRepository(
+        assets=[kv_source, kv_pipeline],
+        tasks=[kv_inc, kv_sum],
+        default_executor=rs.Executor.in_process()
+        if executor == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize(selection=["kv_source"]).success
+    assert repo.materialize(selection=["kv_pipeline"]).success
+
+    assert (
+        handler.load_input(
+            rs.InputContext(asset_name="kv_pipeline", downstream_asset="t")
+        )
+        == 32
+    )
+    store_root = handler.store.prefix
+    assert os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__alpha.pkl"))
+    assert os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__beta.pkl"))
+    assert not os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__0.pkl"))
+
+
 # ---------------------------------------------------------------------------
 # Mapped instance failure skips downstream under Parallel
 # ---------------------------------------------------------------------------

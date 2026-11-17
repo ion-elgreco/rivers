@@ -104,8 +104,9 @@ pub(crate) struct OutputRecorder {
     is_single: bool,
     return_hint: Option<Py<PyAny>>,
     config_instance: Option<Py<PyAny>>,
-    /// dynamic_keys writes the `__keys` index alongside the step's value.
-    /// Only meaningful on the single-output path (multi-assets write per-output).
+    /// dynamic_keys writes the `__keys` index alongside the step's value; the
+    /// run state takes them after the outputs. Only meaningful on the
+    /// single-output path (multi-assets write per-output).
     dynamic_keys: Option<Vec<String>>,
     input_versions: Vec<(String, String)>,
     /// A generator's context, until its first output: the partitions that the
@@ -143,13 +144,13 @@ impl OutputRecorder {
         }
     }
 
-    /// For the outputs of `step_result`.
+    /// For the outputs of `step_result`. Takes its dynamic keys.
     fn of(
         py: Python,
         ctx: &BatchContext,
         step: &ExecutionStep,
         step_name: &str,
-        step_result: &ops::StepResult,
+        step_result: &mut ops::StepResult,
     ) -> Self {
         let context = match &step_result.generator {
             Some(
@@ -167,7 +168,7 @@ impl OutputRecorder {
         }
         Self {
             return_hint: step_result.return_hint.as_ref().map(|h| h.clone_ref(py)),
-            dynamic_keys: step_result.dynamic_keys.clone(),
+            dynamic_keys: step_result.dynamic_keys.take(),
             ..recorder
         }
     }
@@ -363,36 +364,28 @@ pub(crate) fn process_step_result(
     let is_single = step.outputs.is_empty();
     let is_non_mapped = step_name == step.name;
 
-    // Step-level pre-iter (single non-mapped only):
-    //   1. record dynamic_keys so a downstream fan-out can skip a potentially
-    //      stale on-disk `__keys`. Empty Vec = ran with plain values.
-    //   2. dual IO write for final graph asset node — only non-mapped (a
-    //      mapped instance is a per-key write, not the step's "final" output).
+    // Dual IO write for final graph asset node — only non-mapped (a mapped
+    // instance is a per-key write, not the step's "final" output).
     let mut wrote_graph: Option<String> = None;
-    if is_single && is_non_mapped {
-        ctx.state.record_dynamic_keys(
-            step.name.clone(),
-            step_result.dynamic_keys.clone().unwrap_or_default(),
-        );
-
-        if let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
-            && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-        {
-            match ops::handle_step_output(
-                py,
-                graph_name,
-                graph_node,
-                &step_result.result,
-                ctx.scope.partition_key,
-                step_result.return_hint.as_ref(),
-                Vec::new(),
-                ctx.repo.io_handler_registry,
-            ) {
-                Ok(_) => wrote_graph = Some(graph_name.clone()),
-                Err(e) => {
-                    let gn = graph_name.clone();
-                    ctx.record_failure_no_hooks(&gn, e, failures);
-                }
+    if is_single
+        && is_non_mapped
+        && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
+        && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
+    {
+        match ops::handle_step_output(
+            py,
+            graph_name,
+            graph_node,
+            &step_result.result,
+            ctx.scope.partition_key,
+            step_result.return_hint.as_ref(),
+            Vec::new(),
+            ctx.repo.io_handler_registry,
+        ) {
+            Ok(_) => wrote_graph = Some(graph_name.clone()),
+            Err(e) => {
+                let gn = graph_name.clone();
+                ctx.record_failure_no_hooks(&gn, e, failures);
             }
         }
     }
@@ -407,7 +400,7 @@ pub(crate) fn process_step_result(
         })
         .collect();
     let mut recorder =
-        recorder.unwrap_or_else(|| OutputRecorder::of(py, ctx, step, step_name, &step_result));
+        recorder.unwrap_or_else(|| OutputRecorder::of(py, ctx, step, step_name, &mut step_result));
 
     let body_capture = step_result
         .generator
@@ -423,6 +416,13 @@ pub(crate) fn process_step_result(
     if let Some(capture) = body_capture {
         let logs = join_logs(call_logs, recorder.logs.take());
         emit_captured_logs(ctx, step_name, join_logs(logs, capture.finish()));
+    }
+
+    // A downstream fan-out in this run reads these keys instead of KV; an
+    // empty Vec means the step returned plain values.
+    if is_single && is_non_mapped {
+        let keys = recorder.dynamic_keys.take().unwrap_or_default();
+        ctx.state.record_dynamic_keys(step.name.clone(), keys);
     }
 
     if let Err(e) = result {
