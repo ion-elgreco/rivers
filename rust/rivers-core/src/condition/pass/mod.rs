@@ -1,5 +1,6 @@
 //! Per-tick orchestration for the condition evaluation engine.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -114,7 +115,7 @@ pub struct ConditionPass {
     pub upstream_universes: HashMap<String, PartitionUniverse>,
     /// Time-window resolution source per time-window-partitioned asset
     /// (conditioned assets and upstream deps), for `InLatestTimeWindow`.
-    pub time_window_sources: HashMap<String, TimeWindowSource>,
+    pub time_window_sources: HashMap<Arc<str>, TimeWindowSource>,
     /// Set when the last committed tick had to skip fired assets (failed or
     /// fully-dropped dispatch); forces the next tick to re-evaluate so their
     /// un-consumed triggers can re-fire.
@@ -176,7 +177,7 @@ impl ConditionPass {
                 .entry(asset.clone())
                 .or_insert(*ts);
         }
-        let mut time_window_sources: HashMap<String, TimeWindowSource> = HashMap::new();
+        let mut time_window_sources: HashMap<Arc<str>, TimeWindowSource> = HashMap::new();
         for info in &conditions {
             if let Some(pi) = &info.partition_info
                 && let Some(fmt) = &pi.time_window_fmt
@@ -186,7 +187,7 @@ impl ConditionPass {
                     _ => None,
                 };
                 time_window_sources.insert(
-                    info.asset_key.clone(),
+                    info.asset_key.as_str().into(),
                     TimeWindowSource {
                         fmt: fmt.clone(),
                         grid,
@@ -197,7 +198,7 @@ impl ConditionPass {
         for (asset, universe) in &universes_map {
             if let PartitionUniverse::TimeWindow { grid, .. } = universe {
                 time_window_sources
-                    .entry(asset.clone())
+                    .entry(asset.as_str().into())
                     .or_insert_with(|| TimeWindowSource {
                         fmt: grid.fmt.clone(),
                         grid: Some(grid.clone()),

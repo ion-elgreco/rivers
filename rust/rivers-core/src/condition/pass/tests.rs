@@ -149,7 +149,7 @@ fn grid_derivation_matches_the_scan() {
     for lookback in [None, Some(86_400.0), Some(2.5 * 86_400.0)] {
         let scanned = compute_latest_time_window_keys(&keys, "%Y-%m-%d", now, lookback);
         let sources = HashMap::from([(
-            "a".to_string(),
+            "a".into(),
             TimeWindowSource {
                 fmt: "%Y-%m-%d".to_string(),
                 grid: Some(grid.clone()),

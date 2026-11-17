@@ -301,7 +301,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
         &[("2020-01-01", 100), ("2020-01-02", 100)],
     );
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,
@@ -340,7 +340,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["2020-02-01", "2020-02-02", "2020-02-03"], &[], &[]);
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,
@@ -375,7 +375,7 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["us", "eu", "ap"], &["us"], &[("us", 100)]);
-    let fmts: HashMap<String, TimeWindowSource> = HashMap::new(); // "a" is not time-partitioned
+    let fmts = HashMap::new(); // "a" is not time-partitioned
     let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let empty_partition_statuses = HashMap::new();
@@ -418,7 +418,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
         &[("2020-01-01", 100)],
     );
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,
