@@ -287,7 +287,7 @@ fn sync_init_container(spec: &WorkspaceSpec, key: &str, build: Build) -> Contain
         name: SYNC_CONTAINER.to_string(),
         image: Some(spec.source.runtime_image.clone()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        command: Some(SYNC_COMMAND.map(String::from).to_vec()),
+        command: Some(SYNC_COMMAND.map(String::from).into()),
         // Default policy reads only /dev/termination-log; the fallback puts
         // uv's/git's stderr tail where the reconciler can lift it into
         // status.message.
