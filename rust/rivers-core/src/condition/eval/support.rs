@@ -8,7 +8,7 @@ use crate::storage::{NamedPartitions, PartitionKey};
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
 use super::super::state::{EvalContext, EvalNodeResult, NodeStatus};
-use super::DepScope;
+use super::{DepScope, count_nodes};
 
 /// The (data version, materialized ts) baseline `DataVersionChanged` compares
 /// against: in a dep pivot, the ROOT's per-dep baseline (so one asset's fire
@@ -161,7 +161,7 @@ pub(crate) fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> 
     );
     let children = if is_dep_aggregate {
         for child in node.children() {
-            let _ = build_skipped_subtree(child, counter);
+            count_nodes(child, counter);
         }
         Vec::new()
     } else {

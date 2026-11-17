@@ -631,27 +631,27 @@ fn test_evaluate_with_tree_full_result() {
 
     let expected_tree = EvalNodeResult {
         node_idx: 0,
-        label: "All of".to_string(),
-        node_type: "And".to_string(),
+        label: "All of".into(),
+        node_type: "And".into(),
         status: NodeStatus::True,
         children: vec![
             EvalNodeResult {
                 node_idx: 1,
-                label: "missing".to_string(),
-                node_type: "Leaf".to_string(),
+                label: "missing".into(),
+                node_type: "Leaf".into(),
                 status: NodeStatus::True,
                 children: vec![],
                 num_partitions: None,
             },
             EvalNodeResult {
                 node_idx: 2,
-                label: "Not".to_string(),
-                node_type: "Not".to_string(),
+                label: "Not".into(),
+                node_type: "Not".into(),
                 status: NodeStatus::True,
                 children: vec![EvalNodeResult {
                     node_idx: 3,
-                    label: "in_progress".to_string(),
-                    node_type: "Leaf".to_string(),
+                    label: "in_progress".into(),
+                    node_type: "Leaf".into(),
                     status: NodeStatus::False,
                     children: vec![],
                     num_partitions: None,

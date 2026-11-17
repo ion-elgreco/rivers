@@ -1,5 +1,6 @@
 //! Condition evaluation state and context types.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -271,9 +272,9 @@ pub struct EvalNodeResult {
     /// Index of this node in the pre-order traversal (matches the u32 counter system).
     pub node_idx: u32,
     /// Human-readable label (e.g. "missing", "All of", "newly_true").
-    pub label: String,
+    pub label: Cow<'static, str>,
     /// Type tag for UI rendering (e.g. "And", "Or", "Not", "Leaf").
-    pub node_type: String,
+    pub node_type: Cow<'static, str>,
     /// Whether this node evaluated to true, false, or was skipped.
     pub status: NodeStatus,
     /// Child evaluation results (empty for leaf nodes).
@@ -294,7 +295,7 @@ impl EvalNodeResult {
         Self {
             node_idx: idx,
             label: node.display_label(),
-            node_type: node.node_type_str().to_string(),
+            node_type: node.node_type_str().into(),
             status,
             children,
             num_partitions,

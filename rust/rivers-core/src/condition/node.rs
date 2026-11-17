@@ -1,5 +1,7 @@
 //! The condition tree type system.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 pub fn format_tag_label(
@@ -374,7 +376,7 @@ impl ConditionNode {
     }
 
     /// Short display label for a single node (non-recursive).
-    pub fn node_label(&self) -> String {
+    pub fn node_label(&self) -> Cow<'static, str> {
         match self {
             ConditionNode::Missing => "missing".into(),
             ConditionNode::InProgress => "in_progress".into(),
@@ -386,11 +388,11 @@ impl ConditionNode {
                 cron_schedule,
                 timezone,
             } => match timezone {
-                Some(tz) => format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz),
-                None => format!("cron_tick_passed('{}')", cron_schedule),
+                Some(tz) => format!("cron_tick_passed('{}', tz='{}')", cron_schedule, tz).into(),
+                None => format!("cron_tick_passed('{}')", cron_schedule).into(),
             },
             ConditionNode::InLatestTimeWindow { lookback_delta } => match lookback_delta {
-                Some(d) => format!("in_latest_time_window(lookback={})", d),
+                Some(d) => format!("in_latest_time_window(lookback={})", d).into(),
                 None => "in_latest_time_window".into(),
             },
             ConditionNode::InitialEvaluation => "initial_evaluation".into(),
@@ -399,32 +401,31 @@ impl ConditionNode {
             ConditionNode::LastExecutedWithTags {
                 tag_keys,
                 tag_values,
-            } => format_tag_label("last_executed_with_tags", tag_keys, tag_values),
+            } => format_tag_label("last_executed_with_tags", tag_keys, tag_values).into(),
             ConditionNode::LastRunIncludesTarget => "last_run_includes_target".into(),
             ConditionNode::WillBeRequested => "will_be_requested".into(),
             ConditionNode::HasRunWithTags {
                 tag_keys,
                 tag_values,
-            } => format_tag_label("has_run_with_tags", tag_keys, tag_values),
+            } => format_tag_label("has_run_with_tags", tag_keys, tag_values).into(),
             ConditionNode::AllRunsHaveTags {
                 tag_keys,
                 tag_values,
-            } => format_tag_label("all_runs_have_tags", tag_keys, tag_values),
+            } => format_tag_label("all_runs_have_tags", tag_keys, tag_values).into(),
             ConditionNode::AnyDepsMatch { condition, label } => match label {
-                Some(l) => l.clone(),
-                None => format!("any_deps_match({})", condition.fingerprint_hex()),
+                Some(l) => l.clone().into(),
+                None => format!("any_deps_match({})", condition.fingerprint_hex()).into(),
             },
             ConditionNode::AllDepsMatch { condition, label } => match label {
-                Some(l) => l.clone(),
-                None => format!("all_deps_match({})", condition.fingerprint_hex()),
+                Some(l) => l.clone().into(),
+                None => format!("all_deps_match({})", condition.fingerprint_hex()).into(),
             },
-            ConditionNode::AssetMatches { keys, condition } => {
-                format!(
-                    "asset_matches({}, {})",
-                    keys_label(keys),
-                    condition.fingerprint_hex()
-                )
-            }
+            ConditionNode::AssetMatches { keys, condition } => format!(
+                "asset_matches({}, {})",
+                keys_label(keys),
+                condition.fingerprint_hex()
+            )
+            .into(),
             ConditionNode::And(_) => "All of".into(),
             ConditionNode::Or(_) => "Any of".into(),
             ConditionNode::Not(_) => "Not".into(),
@@ -435,11 +436,11 @@ impl ConditionNode {
     }
 
     /// Readable label for UI display (the eval tree).
-    pub fn display_label(&self) -> String {
+    pub fn display_label(&self) -> Cow<'static, str> {
         match self {
             ConditionNode::AnyDepsMatch { .. }
             | ConditionNode::AllDepsMatch { .. }
-            | ConditionNode::AssetMatches { .. } => self.describe(),
+            | ConditionNode::AssetMatches { .. } => self.describe().into(),
             _ => self.node_label(),
         }
     }
@@ -478,7 +479,7 @@ impl ConditionNode {
                     condition.describe()
                 )
             }
-            _ => self.node_label(),
+            _ => self.node_label().into_owned(),
         }
     }
 
