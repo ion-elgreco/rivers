@@ -220,72 +220,72 @@ impl ExecutionPlan {
         let order =
             petgraph::algo::toposort(graph, None).expect("Graph has cycles (invalid dependencies)");
 
-        let mut group_step_idx: HashMap<&str, usize> = HashMap::new();
+        // Group key -> (index, name) of the group's step.
+        let mut group_step_idx: HashMap<&str, (usize, &str)> = HashMap::new();
         // Rewrite map: grouped output_name -> the group's step name.
-        let mut output_to_step: HashMap<String, String> = HashMap::new();
+        let mut output_to_step: HashMap<&str, &str> = HashMap::new();
         let mut steps: Vec<ExecutionStep> = Vec::new();
 
         for idx in order.into_iter().rev() {
-            let node_name = &graph[idx].name;
+            let node_name = graph[idx].name.as_str();
             if !asset_names.contains(node_name) {
                 continue;
             }
 
-            let neighbors: Vec<String> = graph
-                .neighbors_directed(idx, petgraph::Direction::Outgoing)
-                .map(|dep_idx| graph[dep_idx].name.clone())
-                .collect();
+            let neighbors = move || {
+                graph
+                    .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                    .map(move |dep_idx| graph[dep_idx].name.as_str())
+            };
 
-            let plan_dependencies: Vec<String> = neighbors
-                .iter()
-                .filter(|n| asset_names.contains(n.as_str()))
-                .map(|n| output_to_step.get(n).cloned().unwrap_or_else(|| n.clone()))
-                .collect::<HashSet<_>>()
-                .into_iter()
+            let plan_dependencies: HashSet<&str> = neighbors()
+                .filter(|n| asset_names.contains(*n))
+                .map(|n| output_to_step.get(n).copied().unwrap_or(n))
                 .collect();
 
             if let Some(group_key) = groups.get(node_name) {
-                if let Some(&existing_idx) = group_step_idx.get(group_key.as_str()) {
+                if let Some(&(existing_idx, step_name)) = group_step_idx.get(group_key.as_str()) {
                     let step = &mut steps[existing_idx];
-                    step.outputs.push(node_name.clone());
+                    step.outputs.push(node_name.to_owned());
                     // Union deps, dropping intra-group references.
-                    for dep in &plan_dependencies {
-                        if dep != &step.name
-                            && !step.outputs.contains(dep)
-                            && !step.plan_dependencies.contains(dep)
+                    for &dep in &plan_dependencies {
+                        if step.name != dep
+                            && !step.outputs.iter().any(|o| o == dep)
+                            && !step.plan_dependencies.iter().any(|d| d == dep)
                         {
-                            step.plan_dependencies.push(dep.clone());
+                            step.plan_dependencies.push(dep.to_owned());
                         }
                     }
-                    for dep in &neighbors {
-                        if !step.outputs.contains(dep)
-                            && dep != &step.name
-                            && !step.graph_dependencies.contains(dep)
+                    for dep in neighbors() {
+                        if !step.outputs.iter().any(|o| o == dep)
+                            && step.name != dep
+                            && !step.graph_dependencies.iter().any(|d| d == dep)
                         {
-                            step.graph_dependencies.push(dep.clone());
+                            step.graph_dependencies.push(dep.to_owned());
                         }
                     }
-                    output_to_step.insert(node_name.clone(), step.name.clone());
+                    output_to_step.insert(node_name, step_name);
                 } else {
-                    let step_name = node_name.clone();
-                    let step_idx = steps.len();
-                    output_to_step.insert(node_name.clone(), step_name.clone());
-                    group_step_idx.insert(group_key.as_str(), step_idx);
+                    output_to_step.insert(node_name, node_name);
+                    group_step_idx.insert(group_key.as_str(), (steps.len(), node_name));
                     steps.push(ExecutionStep {
-                        name: step_name,
+                        name: node_name.to_owned(),
                         kind: StepKind::Normal,
-                        outputs: vec![node_name.clone()],
-                        plan_dependencies,
-                        graph_dependencies: neighbors,
+                        outputs: vec![node_name.to_owned()],
+                        plan_dependencies: plan_dependencies
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        graph_dependencies: neighbors().map(str::to_owned).collect(),
                     });
                 }
             } else {
                 steps.push(ExecutionStep {
-                    name: node_name.clone(),
+                    name: node_name.to_owned(),
                     kind: StepKind::Normal,
                     outputs: Vec::new(),
-                    plan_dependencies,
-                    graph_dependencies: neighbors,
+                    plan_dependencies: plan_dependencies.into_iter().map(str::to_owned).collect(),
+                    graph_dependencies: neighbors().map(str::to_owned).collect(),
                 });
             }
         }
@@ -293,26 +293,27 @@ impl ExecutionPlan {
         // Preserve the order tasks were written in graph asset bodies within each
         // dependency level. Steps without a composition hint sort to the end.
         if !composition_order.is_empty() {
-            let mut step_levels: HashMap<String, usize> = HashMap::new();
+            // Keyed by step name only: a grouped output is rewritten to its step
+            // before any dependent is reached, so plan deps are always step names.
+            let mut step_levels: HashMap<&str, usize> = HashMap::with_capacity(steps.len());
             for step in &steps {
                 let level = if step.plan_dependencies.is_empty() {
                     0
                 } else {
                     step.plan_dependencies
                         .iter()
-                        .map(|dep| step_levels.get(dep).copied().unwrap_or(0) + 1)
+                        .map(|dep| step_levels.get(dep.as_str()).copied().unwrap_or(0) + 1)
                         .max()
                         .unwrap_or(0)
                 };
-                step_levels.insert(step.name.clone(), level);
-                for output in &step.outputs {
-                    step_levels.insert(output.clone(), level);
+                if let Some(name) = asset_names.get(&step.name) {
+                    step_levels.insert(name.as_str(), level);
                 }
             }
 
             steps.sort_by(|a, b| {
-                let level_a = step_levels.get(&a.name).copied().unwrap_or(0);
-                let level_b = step_levels.get(&b.name).copied().unwrap_or(0);
+                let level_a = step_levels.get(a.name.as_str()).copied().unwrap_or(0);
+                let level_b = step_levels.get(b.name.as_str()).copied().unwrap_or(0);
                 level_a.cmp(&level_b).then_with(|| {
                     // Only apply composition order between steps in the same graph
                     // (matching prefix before '/').
