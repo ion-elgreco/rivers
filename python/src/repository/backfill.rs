@@ -248,17 +248,12 @@ impl PyCodeRepository {
         let resolved_strategy = if let Some(s) = strategy {
             s
         } else {
-            let selected_names = selection.as_slice();
-            let asset_strategies: Vec<PyBackfillStrategy> = selected_names
+            let mut asset_strategies = selection
                 .iter()
-                .filter_map(|name| state.node_map.get(name)?.backfill_strategy())
-                .collect();
-            if !asset_strategies.is_empty()
-                && asset_strategies.iter().all(|s| s == &asset_strategies[0])
-            {
-                asset_strategies.into_iter().next().unwrap()
-            } else {
-                PyBackfillStrategy::MultiRun {}
+                .filter_map(|name| state.node_map.get(name)?.backfill_strategy());
+            match asset_strategies.next() {
+                Some(first) if asset_strategies.all(|s| s == first) => first.clone(),
+                _ => PyBackfillStrategy::MultiRun {},
             }
         };
         validate_backfill_strategy(&resolved_strategy, state, &selection)?;
@@ -287,16 +282,15 @@ impl PyCodeRepository {
             "stop_on_failure" => BackfillFailurePolicy::StopOnFailure,
             _ => BackfillFailurePolicy::Continue,
         };
-        let backfill_tags = tags.clone().unwrap_or_default();
 
         let record = BackfillRecord {
             backfill_id: backfill_id.clone(),
             code_location_id: state.code_location_id.clone(),
             status: BackfillStatus::Requested,
             strategy: core_strategy,
-            failure_policy: fp.clone(),
-            asset_selection: selection.clone(),
-            job_name: job_name.clone(),
+            failure_policy: fp,
+            asset_selection: selection,
+            job_name,
             num_partitions: num_partitions as u64,
             planned_runs: 0,
             run_ids: Vec::new(),
@@ -304,14 +298,14 @@ impl PyCodeRepository {
             failed_partitions: 0,
             canceled_partitions: 0,
             max_concurrency: max_concurrency as i64,
-            tags: backfill_tags.clone(),
+            tags: tags.unwrap_or_default(),
             create_time: now_ts(),
             end_time: None,
             error: None,
             launched_by,
             // The verb the children run — a Job target's own, not `None`.
             action: child_verb,
-            config: config.clone(),
+            config,
         };
 
         io_rt()

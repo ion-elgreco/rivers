@@ -311,14 +311,12 @@ impl RepoHandle {
                 .as_ref()
                 .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
 
-            let asset_names: Vec<String> = if let Some(ref sel) = selection {
-                sel.clone()
-            } else {
+            let asset_names: Vec<String> = selection.unwrap_or_else(|| {
                 graph
                     .node_indices()
                     .map(|idx| graph[idx].name.clone())
                     .collect()
-            };
+            });
 
             // The record carries the job's verb, so the key must satisfy it.
             let action = job_action(&state.jobs_info, job_name.as_deref());
@@ -594,13 +592,13 @@ impl RepoHandle {
             .map_err(load_failed)?;
         let total: usize = requested.iter().map(PartitionKey::member_count).sum();
 
-        let asset_names: Vec<String> = match &record.job_name {
+        let asset_names: &[String] = match &record.job_name {
             Some(name) => state
                 .jobs_info
                 .get(name)
-                .map(|job| job.asset_names.clone())
+                .map(|job| job.asset_names.as_slice())
                 .ok_or_else(|| ExecutionError::new_err(format!("Job '{name}' not found")))?,
-            None => record.asset_selection.clone(),
+            None => &record.asset_selection,
         };
 
         let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(requested.len());
@@ -608,7 +606,7 @@ impl RepoHandle {
         for key in requested {
             let Some(key) = valid_part_for_verb(
                 &state,
-                &asset_names,
+                asset_names,
                 PyPartitionKey::from(key),
                 record.action.as_deref(),
             ) else {
@@ -628,7 +626,7 @@ impl RepoHandle {
                 .iter()
                 .map(|(_, namespace, value)| (namespace.as_str(), value.as_str()))
                 .collect();
-            let Some(mut key) = without_dynamic_values(&state, &asset_names, key, &retired) else {
+            let Some(mut key) = without_dynamic_values(&state, asset_names, key, &retired) else {
                 continue;
             };
 

@@ -1031,9 +1031,9 @@ impl ResolvedNode {
         }
     }
 
-    pub fn backfill_strategy(&self) -> Option<PyBackfillStrategy> {
+    pub fn backfill_strategy(&self) -> Option<&PyBackfillStrategy> {
         match self {
-            ResolvedNode::Asset(node) => node.backfill_strategy.clone(),
+            ResolvedNode::Asset(node) => node.backfill_strategy.as_ref(),
             _ => None,
         }
     }

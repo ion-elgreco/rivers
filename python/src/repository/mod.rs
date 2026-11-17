@@ -589,12 +589,12 @@ impl PyCodeRepository {
             };
             let max_concurrency = record.max_concurrency.clamp(0, u32::MAX as i64) as u32;
 
-            let mut tags = record.tags.clone();
+            let mut tags = record.tags;
             tags.push((tag_keys::RERUN_OF.to_string(), backfill_id));
 
-            let target = match &record.job_name {
-                Some(name) => crate::daemon::RunType::Job(name.clone()),
-                None => crate::daemon::RunType::Materialization(record.asset_selection.clone()),
+            let target = match record.job_name {
+                Some(name) => crate::daemon::RunType::Job(name),
+                None => crate::daemon::RunType::Materialization(record.asset_selection),
             };
 
             self.backfill_inner(
@@ -610,7 +610,7 @@ impl PyCodeRepository {
                 dry_run,
                 None,
                 rivers_core::storage::LaunchedBy::default(),
-                record.action.clone(),
+                record.action,
             )
         })
     }
