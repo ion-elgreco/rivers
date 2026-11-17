@@ -212,9 +212,10 @@ impl PyCodeRepository {
                 .filter(|name| {
                     state
                         .node_map
-                        .get(name)
+                        .get(*name)
                         .is_some_and(|n| n.is_materializable())
                 })
+                .map(str::to_owned)
                 .collect();
         };
 

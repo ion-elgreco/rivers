@@ -227,7 +227,7 @@ pub fn descendants<'g>(graph: &'g AssetGraph, name: &str) -> HashSet<&'g str> {
 }
 
 /// Upstream closure: `targets` plus every transitive dependency they require.
-pub fn upstream_closure(graph: &AssetGraph, targets: &HashSet<String>) -> HashSet<String> {
+pub fn upstream_closure<'g>(graph: &'g AssetGraph, targets: &HashSet<String>) -> HashSet<&'g str> {
     let lookup = name_to_index(graph);
     let mut result = HashSet::new();
     let mut stack: Vec<NodeIndex> = targets
@@ -236,8 +236,7 @@ pub fn upstream_closure(graph: &AssetGraph, targets: &HashSet<String>) -> HashSe
         .collect();
 
     while let Some(idx) = stack.pop() {
-        let name = graph[idx].name.clone();
-        if result.insert(name) {
+        if result.insert(graph[idx].name.as_str()) {
             for dep_idx in graph.neighbors_directed(idx, petgraph::Direction::Outgoing) {
                 stack.push(dep_idx);
             }
@@ -608,10 +607,7 @@ mod tests {
     fn test_upstream_closure_single_root() {
         let graph = make_graph(vec![("a", vec![])]);
         let targets = HashSet::from(["a".into()]);
-        assert_eq!(
-            upstream_closure(&graph, &targets),
-            HashSet::from(["a".into()])
-        );
+        assert_eq!(upstream_closure(&graph, &targets), HashSet::from(["a"]));
     }
 
     #[test]
@@ -620,7 +616,7 @@ mod tests {
         let targets = HashSet::from(["c".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
+            HashSet::from(["a", "b", "c"])
         );
     }
 
@@ -630,7 +626,7 @@ mod tests {
         let targets = HashSet::from(["b".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into()])
+            HashSet::from(["a", "b"])
         );
     }
 
@@ -882,7 +878,7 @@ mod tests {
         let targets = HashSet::from(["b".into(), "c".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
+            HashSet::from(["a", "b", "c"])
         );
     }
 
@@ -890,10 +886,7 @@ mod tests {
     fn test_upstream_closure_ignores_unknown_targets() {
         let graph = make_graph(vec![("a", vec![])]);
         let targets = HashSet::from(["a".into(), "missing".into()]);
-        assert_eq!(
-            upstream_closure(&graph, &targets),
-            HashSet::from(["a".into()])
-        );
+        assert_eq!(upstream_closure(&graph, &targets), HashSet::from(["a"]));
     }
 
     #[test]
