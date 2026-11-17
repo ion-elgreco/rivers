@@ -5,9 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::{AssetRecord, PartitionKey};
 
 use super::node::ConditionNode;
-use super::partition::{
-    PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
-};
+use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then node index.
@@ -570,7 +568,7 @@ fn eval_partitioned_on_dep(
     let mapping = pctx
         .resolver
         .mapping_kind(dep_key, ctx.target_key)
-        .filter(|m| !matches!(m, PartitionMappingKind::Identity));
+        .filter(|m| !m.is_identity());
     let needs_floor = contains_newly_updated(condition);
     let dep_root_floor = pctx
         .all_partition_statuses

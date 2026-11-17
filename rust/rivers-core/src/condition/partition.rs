@@ -245,10 +245,30 @@ fn shift_selection(
 }
 
 impl PartitionMappingKind {
+    /// True if the mapping sends every key to itself.
+    pub(crate) fn is_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::Identity
+                | Self::Subset
+                | Self::TimeWindow { offset: 0, .. }
+                | Self::TimeWindow { grid: None, .. }
+        )
+    }
+
     /// Map upstream partition keys to downstream partition keys, without a
     /// downstream universe: dimension fan-outs over-approximate to `All`.
     pub fn map_to_downstream(&self, upstream_keys: &PartitionSelection) -> PartitionSelection {
         self.map_to_downstream_in(upstream_keys, None)
+    }
+
+    /// [`Self::map_to_downstream`] that returns `upstream_keys` itself when the
+    /// mapping is an identity.
+    fn map_to_downstream_owned(&self, upstream_keys: PartitionSelection) -> PartitionSelection {
+        if self.is_identity() {
+            return upstream_keys;
+        }
+        self.map_to_downstream_in(&upstream_keys, None)
     }
 
     /// Map upstream partition keys to downstream partition keys. With a
@@ -318,8 +338,8 @@ impl PartitionMappingKind {
                         {
                             let val = upstream_dims.get(upstream_dim.as_str())?;
                             let single_key = PartitionKey::Single { keys: val.to_vec() };
-                            let mapped = per_dim_mapping.map_to_downstream(
-                                &PartitionSelection::Keys(std::iter::once(single_key).collect()),
+                            let mapped = per_dim_mapping.map_to_downstream_owned(
+                                PartitionSelection::Keys(std::iter::once(single_key).collect()),
                             );
                             match mapped {
                                 PartitionSelection::Keys(ks) => {
@@ -425,7 +445,7 @@ impl PartitionMappingKind {
                     });
                     for dim_val in dim_vals {
                         let sel = PartitionSelection::Keys(std::iter::once(dim_val).collect());
-                        match inner.map_to_downstream(&sel) {
+                        match inner.map_to_downstream_owned(sel) {
                             PartitionSelection::Keys(ks) => mapped.extend(ks),
                             PartitionSelection::All => return PartitionSelection::All,
                             PartitionSelection::Empty => {}
@@ -441,7 +461,7 @@ impl PartitionMappingKind {
                             continue;
                         }
                         let sel = PartitionSelection::Keys(std::iter::once(uk.clone()).collect());
-                        match inner.map_to_downstream(&sel) {
+                        match inner.map_to_downstream_owned(sel) {
                             PartitionSelection::Keys(ks) => {
                                 for k in ks {
                                     if let PartitionKey::Single { keys: vals } = k {
