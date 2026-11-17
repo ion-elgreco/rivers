@@ -743,6 +743,7 @@ pub(crate) fn handle_failure(
     // Asset hooks carry materialize semantics; action runs don't fire them.
     if ctx.scope.plan.is_materialize()
         && let Some(node) = ctx.repo.node_map.get(&step.name)
+        && node.has_failure_hooks()
     {
         ops::run_failure_hooks(
             py,

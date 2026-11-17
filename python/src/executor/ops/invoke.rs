@@ -52,7 +52,7 @@ pub(crate) fn build_step_args(
     run_id: &str,
     config_out: &mut Option<Py<PyAny>>,
 ) -> PyResult<BuiltStepArgs> {
-    let partition = build_partition_context(node, partition_key)?;
+    let mut partition = build_partition_context(node, partition_key)?;
     let func = node.callable(py)?;
     let return_hint = extract_return_hint(py, &func)?;
 
@@ -93,7 +93,7 @@ pub(crate) fn build_step_args(
                     .is_some_and(|a| is_task_context_annotation(py, a));
                 let ctx_obj = if is_task_ctx {
                     let ctx =
-                        PyTaskExecutionContext::new(step.name.clone(), tags, partition.clone())
+                        PyTaskExecutionContext::new(step.name.clone(), tags, partition.take())
                             .with_config(config_instance.as_ref().map(|c| c.clone_ref(py)));
                     Py::new(py, ctx)?.into_any()
                 } else {
@@ -111,7 +111,7 @@ pub(crate) fn build_step_args(
                         node.group(),
                         node.code_version(),
                         node.metadata().cloned(),
-                        partition.clone(),
+                        partition.take(),
                         is_multi,
                         if is_multi {
                             step.outputs.clone()
