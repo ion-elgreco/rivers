@@ -167,12 +167,12 @@ struct RolloutStatus<T> {
 fn rollout_status<T: Template>(
     cl: &CodeLocation,
     rollout: &Rollout<T>,
-    prior_serving: Option<T>,
+    prior_serving: Option<&T>,
     apply_failure: Option<&str>,
 ) -> RolloutStatus<T> {
     let serving = match &rollout.template {
         Some(template) if rollout.complete => Some(template.clone()),
-        _ => prior_serving,
+        _ => prior_serving.cloned(),
     };
     let desired = cl.spec.replicas;
     let ready =
@@ -249,19 +249,24 @@ pub(super) fn git_status(
     let rollout = rollout_status(
         cl,
         &update.rollout,
-        prior.and_then(|s| s.run_source.clone()),
+        prior.and_then(|s| s.run_source.as_ref()),
         update.apply_failure.as_deref(),
     );
     let serving = rollout.serving;
     let mut status = CodeLocationStatus {
+        phase: Some(rollout.phase),
+        observed_generation: cl.metadata.generation,
         resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
         grpc_endpoint: (!rollout.failed).then_some(update.endpoint),
+        last_reconciled: Some(now.clone()),
         ready_replicas: update.rollout.ready_replicas.filter(|_| !rollout.failed),
+        message: None,
+        conditions: Vec::new(),
         source: serving.as_ref().map(source_display),
         resolved_commit: serving.as_ref().map(|t| t.git.commit.clone()),
         resolved_ref: serving.as_ref().and_then(|t| t.git.r#ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
         run_source: serving,
-        ..next_status(cl, rollout.phase, now)
     };
     match update.resolution {
         Some(GitResolution::ImageResolved {
@@ -401,7 +406,7 @@ pub(super) fn image_status(
     let prior = cl.status.as_ref();
     let prior_serving = prior
         .filter(|s| !is_git_status(s))
-        .and_then(|s| s.resolved_image.clone());
+        .and_then(|s| s.resolved_image.as_ref());
     let rollout = rollout_status(cl, &update.rollout, prior_serving, None);
     let mut status = CodeLocationStatus {
         phase: Some(rollout.phase),
@@ -576,22 +581,6 @@ fn same_but_last_reconciled(status: &CodeLocationStatus, prior: &CodeLocationSta
         && *run_source == prior.run_source
 }
 
-/// `cl`'s status for a pass at `at` in `phase`. It keeps what the prior
-/// status says the pods run (`resolvedImage`, `source` and the git fields)
-/// until the pass sets these; the pass sets the other fields anew.
-fn next_status(cl: &CodeLocation, phase: CodeLocationPhase, at: &str) -> CodeLocationStatus {
-    CodeLocationStatus {
-        phase: Some(phase),
-        observed_generation: cl.metadata.generation,
-        last_reconciled: Some(at.to_string()),
-        grpc_endpoint: None,
-        ready_replicas: None,
-        message: None,
-        conditions: Vec::new(),
-        ..cl.status.clone().unwrap_or_default()
-    }
-}
-
 /// Why a pass resolved nothing for the pods to run.
 pub(super) enum Unresolved<'a> {
     /// A follower, before the leader has resolved the image.
@@ -644,8 +633,19 @@ fn unresolved_status(
     let now = at.to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
+        phase: Some(phase),
+        observed_generation: cl.metadata.generation,
+        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
+        grpc_endpoint: None,
+        last_reconciled: Some(now.clone()),
+        ready_replicas: None,
         message: Some(message),
-        ..next_status(cl, phase, &now)
+        conditions: Vec::new(),
+        source: prior.and_then(|s| s.source.clone()),
+        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+        run_source: prior.and_then(|s| s.run_source.clone()),
     };
     push_condition(
         &mut status,
