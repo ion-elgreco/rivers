@@ -473,13 +473,9 @@ impl BackfillStates {
                     }
                 }
             }
-            RunNumbers::RunPerGroup { multi_run, numbers } => {
-                let mut groups: Vec<Option<&[(String, String)]>> = vec![None; numbers.len()];
-                for (group, number) in numbers {
-                    groups[*number] = Some(group.as_slice());
-                }
+            RunNumbers::RunPerGroup { multi_run, groups } => {
                 for run in self.ended.values() {
-                    let Some(Some(group)) = groups.get(run.run_number) else {
+                    let Some(group) = groups.get(run.run_number) else {
                         continue;
                     };
                     for (range, counts) in ranges.iter().zip(&mut counts) {

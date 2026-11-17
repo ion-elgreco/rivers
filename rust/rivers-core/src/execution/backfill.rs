@@ -1,7 +1,7 @@
 //! Backfill planning — split the requested partition keys into runs per strategy.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::storage::{BackfillStrategy, PartitionKey};
 
@@ -42,10 +42,11 @@ pub enum RunNumbers {
     OneRun,
     /// One run per partition, in the order of the requested partitions.
     RunPerPartition,
-    /// One run per combination of values on the `multi_run` dimensions.
+    /// One run per combination of values on the `multi_run` dimensions. The
+    /// combinations are sorted: the place of one is its run number.
     RunPerGroup {
         multi_run: Vec<String>,
-        numbers: HashMap<Vec<(String, String)>, usize>,
+        groups: Vec<Vec<(String, String)>>,
     },
 }
 
@@ -61,11 +62,7 @@ impl RunNumbers {
                     .collect();
                 Self::RunPerGroup {
                     multi_run: multi_run.clone(),
-                    numbers: groups
-                        .into_iter()
-                        .enumerate()
-                        .map(|(number, group)| (group, number))
-                        .collect(),
+                    groups: groups.into_iter().collect(),
                 }
             }
         }
@@ -77,9 +74,16 @@ impl RunNumbers {
         match self {
             Self::OneRun => Some(0),
             Self::RunPerPartition => Some(index),
-            Self::RunPerGroup { multi_run, numbers } => {
-                let group = groups_along(partition, multi_run).pop()?;
-                numbers.get(&group).copied()
+            Self::RunPerGroup { multi_run, groups } => {
+                let group = last_group_along(partition, multi_run)?;
+                groups
+                    .binary_search_by(|other| {
+                        let other = other
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()));
+                        other.cmp(group.iter().copied())
+                    })
+                    .ok()
             }
         }
     }
@@ -147,6 +151,24 @@ fn groups_along(key: &PartitionKey, multi_run: &[String]) -> Vec<Vec<(String, St
             .collect();
     }
     groups
+}
+
+/// The last of [`groups_along`] for `key`, borrowed: the one combination of
+/// a partition.
+fn last_group_along<'a>(
+    key: &'a PartitionKey,
+    multi_run: &[String],
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let PartitionKey::Multi { dims } = key else {
+        return Some(Vec::new());
+    };
+    let mut group = dims
+        .iter()
+        .filter(|(name, _)| multi_run.contains(name))
+        .map(|(name, values)| Some((name.as_str(), values.iter().max()?.as_str())))
+        .collect::<Option<Vec<_>>>()?;
+    group.sort_by_key(|(name, _)| *name);
+    Some(group)
 }
 
 /// The parts of `key` that go into different runs: one per combination of
