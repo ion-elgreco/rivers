@@ -41,16 +41,14 @@ pub(crate) async fn resolve_identity(
     loc_name: &str,
 ) -> Result<rivers_core::storage::CodeLocationContext, leptos::prelude::ServerFnError> {
     let state = leptos::prelude::expect_context::<crate::state::AppState>();
-    let entry = state
+    let identity = state
         .registry
-        .lookup(loc_ns, loc_name)
+        .identity_of(loc_ns, loc_name)
         .await
         .ok_or_else(|| {
             leptos::prelude::ServerFnError::new(format!(
                 "code location {loc_ns}/{loc_name} not found in registry"
             ))
         })?;
-    Ok(rivers_core::storage::CodeLocationContext::new(
-        entry.identity,
-    ))
+    Ok(rivers_core::storage::CodeLocationContext::new(identity))
 }

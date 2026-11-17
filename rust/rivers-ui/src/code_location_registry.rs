@@ -8,11 +8,11 @@
 //! fixed list (`Static`, for tests).
 //!
 //! The `Grpc` backend holds an in-memory cache of all known entries fed by a
-//! background `Watch` stream — every `list()` / `lookup()` is an O(1) read
-//! against the cache, not an RPC. On any stream failure (connection refused,
-//! transport drop, or the server's `DataLoss` status — emitted when the
-//! broadcast subscriber lags) the watcher clears the cache and reconnects
-//! with exponential backoff, so the next snapshot is always coherent.
+//! background `Watch` stream — every `list()` / `lookup()` reads the cache,
+//! not an RPC. On any stream failure (connection refused, transport drop, or
+//! the server's `DataLoss` status — emitted when the broadcast subscriber
+//! lags) the watcher clears the cache and reconnects with exponential
+//! backoff, so the next snapshot is always coherent.
 
 use anyhow::{Context, Result};
 use rivers_api::rivers::code_location_event::Type as EventType;
@@ -23,7 +23,6 @@ use rivers_core::assets::remote::LocationRef;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{CodeLocationDirectoryEntry, StorageBackend};
 use rivers_core::util::now_ts;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -34,8 +33,6 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 use crate::types::CodeLocationEntry;
-
-type EntryMap = HashMap<(String, String), CodeLocationEntry>;
 
 /// Attaches `authorization: Bearer <token>` to every outbound RPC.
 #[derive(Clone)]
@@ -64,7 +61,7 @@ impl Interceptor for BearerAuth {
 #[derive(Clone)]
 pub enum Registry {
     /// In-process fixed list, for tests.
-    Static(Arc<Vec<CodeLocationEntry>>),
+    Static(Arc<[CodeLocationEntry]>),
     /// Live gRPC connection to the operator. Backed by an in-memory cache fed
     /// by a background `Watch` stream — see [`GrpcRegistry::run_watcher`].
     Grpc(Arc<GrpcRegistry>),
@@ -87,7 +84,7 @@ impl Registry {
     /// Empty registry — no code locations. Used by tests and as a temporary
     /// placeholder before the gRPC connection is set up.
     pub fn empty() -> Self {
-        Self::Static(Arc::new(Vec::new()))
+        Self::Static(Arc::new([]))
     }
 
     /// Build a registry against a remote operator and start its background
@@ -109,11 +106,11 @@ impl Registry {
         }
     }
 
-    /// Snapshot of currently-known entries. `Grpc` reads the map its watcher
-    /// maintains; `Storage` reads storage at most every 2 s.
-    pub async fn list(&self) -> Result<Vec<CodeLocationEntry>> {
+    /// Snapshot of currently-known entries. `Grpc` reads the entries its
+    /// watcher maintains; `Storage` reads storage at most every 2 s.
+    pub async fn list(&self) -> Result<Arc<[CodeLocationEntry]>> {
         match self {
-            Self::Static(entries) => Ok((**entries).clone()),
+            Self::Static(entries) => Ok(Arc::clone(entries)),
             Self::Grpc(g) => Ok(g.snapshot().await),
             Self::Storage(s) => s.entries().await,
         }
@@ -122,23 +119,33 @@ impl Registry {
     /// Lookup an entry by `(namespace, name)`. Returns `None` if not in the
     /// cache — caller decides whether that's a 404 or a "not yet synced".
     pub async fn lookup(&self, namespace: &str, name: &str) -> Option<CodeLocationEntry> {
-        let find = |entries: &[CodeLocationEntry]| {
-            entries
-                .iter()
-                .find(|e| e.namespace == namespace && e.name == name)
-                .cloned()
-        };
-        match self {
-            Self::Static(entries) => find(entries),
-            Self::Grpc(g) => g.lookup(namespace, name).await,
-            Self::Storage(s) => match s.entries().await {
-                Ok(entries) => find(&entries),
-                Err(error) => {
-                    tracing::warn!(target: "rivers::ui", %error, "reading the code location directory failed");
-                    None
-                }
-            },
-        }
+        self.find(namespace, name, CodeLocationEntry::clone).await
+    }
+
+    /// The identity of the entry `(namespace, name)`; `None` as for
+    /// [`Self::lookup`].
+    pub async fn identity_of(&self, namespace: &str, name: &str) -> Option<String> {
+        self.find(namespace, name, |entry| entry.identity.clone())
+            .await
+    }
+
+    async fn find<T>(
+        &self,
+        namespace: &str,
+        name: &str,
+        read: impl FnOnce(&CodeLocationEntry) -> T,
+    ) -> Option<T> {
+        let entries = self
+            .list()
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(target: "rivers::ui", %error, "reading the code location directory failed");
+            })
+            .ok()?;
+        entries
+            .iter()
+            .find(|e| e.namespace == namespace && e.name == name)
+            .map(read)
     }
 
     /// Pick the first `Ready` entry. Used as the implicit "active" location
@@ -146,8 +153,9 @@ impl Registry {
     pub async fn first_ready(&self) -> Result<CodeLocationEntry> {
         let entries = self.list().await?;
         entries
-            .into_iter()
+            .iter()
             .find(|e| e.is_ready())
+            .cloned()
             .context("no Ready code location available")
     }
 }
@@ -168,20 +176,20 @@ pub struct OwnLocation {
 pub struct StorageRegistry {
     storage: Arc<SurrealStorage>,
     own: Option<OwnLocation>,
-    cache: Mutex<Option<(Instant, Vec<CodeLocationEntry>)>>,
+    cache: Mutex<Option<(Instant, Arc<[CodeLocationEntry]>)>>,
 }
 
 impl StorageRegistry {
-    async fn entries(&self) -> Result<Vec<CodeLocationEntry>> {
+    async fn entries(&self) -> Result<Arc<[CodeLocationEntry]>> {
         let mut cache = self.cache.lock().await;
         if let Some((read_at, entries)) = cache.as_ref()
             && read_at.elapsed() < STORAGE_REFRESH
         {
-            return Ok(entries.clone());
+            return Ok(Arc::clone(entries));
         }
         let listed = self.storage.list_code_locations().await?;
-        let entries = directory_entries(listed, self.own.as_ref(), now_ts());
-        *cache = Some((Instant::now(), entries.clone()));
+        let entries: Arc<[_]> = directory_entries(listed, self.own.as_ref(), now_ts()).into();
+        *cache = Some((Instant::now(), Arc::clone(&entries)));
         Ok(entries)
     }
 }
@@ -237,7 +245,7 @@ pub struct GrpcRegistry {
     endpoint: Endpoint,
     auth: BearerAuth,
     channel: Mutex<Option<Channel>>,
-    entries: Arc<RwLock<EntryMap>>,
+    entries: RwLock<Arc<[CodeLocationEntry]>>,
 }
 
 impl GrpcRegistry {
@@ -254,23 +262,13 @@ impl GrpcRegistry {
             endpoint,
             auth,
             channel: Mutex::new(None),
-            entries: Arc::new(RwLock::new(EntryMap::new())),
+            entries: RwLock::default(),
         })
     }
 
-    /// Snapshot the in-memory entry cache. O(n) clone of the watcher's view.
-    pub async fn snapshot(&self) -> Vec<CodeLocationEntry> {
-        self.entries.read().await.values().cloned().collect()
-    }
-
-    /// O(log n) cache lookup. Returns `None` if the watcher hasn't seen the
-    /// entry yet (or it was deleted).
-    pub async fn lookup(&self, namespace: &str, name: &str) -> Option<CodeLocationEntry> {
-        self.entries
-            .read()
-            .await
-            .get(&(namespace.to_string(), name.to_string()))
-            .cloned()
+    /// The watcher's current view of the entries.
+    pub async fn snapshot(&self) -> Arc<[CodeLocationEntry]> {
+        Arc::clone(&*self.entries.read().await)
     }
 
     async fn channel(&self) -> Result<Channel> {
@@ -321,11 +319,7 @@ impl GrpcRegistry {
             }
             // Reset cache before sleeping — readers should see an empty
             // directory rather than a stale one during the disconnect.
-            let mut cache = self_.entries.write().await;
-            if !cache.is_empty() {
-                cache.clear();
-            }
-            drop(cache);
+            *self_.entries.write().await = Arc::new([]);
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
@@ -346,10 +340,10 @@ impl GrpcRegistry {
             .context("CodeLocationRegistry.Watch call failed")?
             .into_inner();
 
-        // Stage events until SYNCED, then atomically swap the staged map into
-        // place. This guarantees readers never observe a half-built initial
-        // snapshot.
-        let mut staging: EntryMap = EntryMap::new();
+        // Stage events until SYNCED, then atomically swap the staged entries
+        // into place. This guarantees readers never observe a half-built
+        // initial snapshot.
+        let mut staging = Vec::new();
         let mut synced = false;
 
         loop {
@@ -371,32 +365,37 @@ impl GrpcRegistry {
 }
 
 async fn apply_event(
-    entries: &RwLock<EntryMap>,
-    staging: &mut EntryMap,
+    entries: &RwLock<Arc<[CodeLocationEntry]>>,
+    staging: &mut Vec<CodeLocationEntry>,
     synced: &mut bool,
     ev: CodeLocationEvent,
 ) {
     let ty = EventType::try_from(ev.r#type).unwrap_or(EventType::Unspecified);
     if matches!(ty, EventType::Synced) {
-        *entries.write().await = std::mem::take(staging);
+        *entries.write().await = std::mem::take(staging).into();
         *synced = true;
         return;
     }
     let Some(entry) = ev.entry else { return };
     let entry: CodeLocationEntry = entry.into();
-    let key = (entry.namespace.clone(), entry.name.clone());
-    let mutate = |map: &mut EntryMap| match ty {
-        EventType::Added | EventType::Modified => {
-            map.insert(key, entry);
+    let mutate = |list: &mut Vec<CodeLocationEntry>| {
+        let at = list
+            .iter()
+            .position(|e| e.namespace == entry.namespace && e.name == entry.name);
+        match (ty, at) {
+            (EventType::Added | EventType::Modified, Some(at)) => list[at] = entry,
+            (EventType::Added | EventType::Modified, None) => list.push(entry),
+            (EventType::Deleted, Some(at)) => {
+                list.remove(at);
+            }
+            _ => {}
         }
-        EventType::Deleted => {
-            map.remove(&key);
-        }
-        // SYNCED returned early above; Unspecified / unknown variants are dropped.
-        EventType::Synced | EventType::Unspecified => {}
     };
     if *synced {
-        mutate(&mut *entries.write().await);
+        let mut live = entries.write().await;
+        let mut next = live.to_vec();
+        mutate(&mut next);
+        *live = next.into();
     } else {
         mutate(staging);
     }
@@ -438,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_registry_lists_entries_verbatim() {
-        let r = Registry::Static(Arc::new(vec![
+        let r = Registry::Static(Arc::new([
             entry("a", "one", "Ready"),
             entry("b", "two", "Pending"),
         ]));
@@ -450,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_ready_skips_non_ready_entries() {
-        let r = Registry::Static(Arc::new(vec![
+        let r = Registry::Static(Arc::new([
             entry("a", "pending", "Pending"),
             entry("b", "failed", "Failed"),
             entry("c", "ok", "Ready"),
@@ -468,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_ready_errors_when_all_non_ready() {
-        let r = Registry::Static(Arc::new(vec![entry("a", "x", "Pending")]));
+        let r = Registry::Static(Arc::new([entry("a", "x", "Pending")]));
         assert!(r.first_ready().await.is_err());
     }
 
@@ -596,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_lookup_finds_by_key() {
-        let r = Registry::Static(Arc::new(vec![
+        let r = Registry::Static(Arc::new([
             entry("a", "one", "Ready"),
             entry("b", "two", "Pending"),
         ]));
@@ -627,8 +626,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_event_stages_until_synced_then_swaps() {
-        let cache = RwLock::new(EntryMap::new());
-        let mut staging = EntryMap::new();
+        let cache = RwLock::<Arc<[CodeLocationEntry]>>::default();
+        let mut staging = Vec::new();
         let mut synced = false;
 
         // Pre-Synced ADDED writes only to staging, not the live cache.

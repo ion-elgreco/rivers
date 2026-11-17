@@ -26,19 +26,17 @@ async fn load_topology(
     if let Some(ref synthetic) = state.graph {
         return Ok(((**synthetic).clone(), None));
     }
-    let entry = state
+    let identity = state
         .registry
-        .lookup(loc_ns, loc_name)
+        .identity_of(loc_ns, loc_name)
         .await
         .ok_or_else(|| {
             ServerFnError::new(format!(
                 "code location {loc_ns}/{loc_name} not found in registry"
             ))
         })?;
-    let topology = read_topology(state, &entry.identity)
-        .await
-        .unwrap_or_default();
-    Ok((topology, Some(entry.identity)))
+    let topology = read_topology(state, &identity).await.unwrap_or_default();
+    Ok((topology, Some(identity)))
 }
 
 #[cfg(feature = "ssr")]
@@ -81,14 +79,14 @@ async fn load_owners<'t>(
         if owners.contains_key(location) {
             continue;
         }
-        let entry = state
+        let identity = state
             .registry
-            .lookup(location.namespace(), location.name())
+            .identity_of(location.namespace(), location.name())
             .await;
-        let owner = match entry {
-            Some(entry) => Some(Owner {
-                topology: read_topology(state, &entry.identity).await,
-                ctx: CodeLocationContext::new(entry.identity),
+        let owner = match identity {
+            Some(identity) => Some(Owner {
+                topology: read_topology(state, &identity).await,
+                ctx: CodeLocationContext::new(identity),
             }),
             None => None,
         };
@@ -392,7 +390,7 @@ mod tests {
         AppState {
             storage: Arc::clone(storage),
             graph: None,
-            registry: Registry::Static(Arc::new(vec![
+            registry: Registry::Static(Arc::new([
                 entry("warehouse", "wh-id"),
                 entry("shop", "shop-id"),
                 entry("analytics", "an-id"),

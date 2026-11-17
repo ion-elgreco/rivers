@@ -506,12 +506,9 @@ mod read {
 
         let ctx = CodeLocationContext::new(record.code_location_id.clone());
         let storage = state.storage.for_code_location(&ctx);
-        let entry = state
-            .registry
-            .list()
-            .await
-            .unwrap_or_default()
-            .into_iter()
+        let entries = state.registry.list().await.unwrap_or_default();
+        let entry = entries
+            .iter()
             .find(|entry| entry.identity == record.code_location_id);
         let source = match entry {
             Some(entry) => state

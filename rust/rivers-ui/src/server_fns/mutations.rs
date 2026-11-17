@@ -55,7 +55,7 @@ async fn connect_to_owner(
         .iter()
         .find(|e| e.identity == cl)
         // Single-location registries (dev mode) can't cross locations.
-        .or(match entries.as_slice() {
+        .or(match &*entries {
             [only] => Some(only),
             _ => None,
         })
@@ -843,7 +843,7 @@ mod tests {
         let state = AppState {
             storage,
             graph: None,
-            registry: Registry::Static(Arc::new(vec![
+            registry: Registry::Static(Arc::new([
                 entry("other", "other-id", ""),
                 entry("owner", "owner-id", &endpoint),
             ])),
