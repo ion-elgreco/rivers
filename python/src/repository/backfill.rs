@@ -19,6 +19,19 @@ use super::*;
 /// Default run priority for backfill-spawned runs (-10 = lower than regular runs at 0).
 pub(crate) const DEFAULT_BACKFILL_PRIORITY: i32 = -10;
 
+/// The tags of each child run: the backfill's tags, with the default backfill
+/// priority unless they set one. The backfill origin is tracked via
+/// `LaunchedBy::Backfill`, not a tag.
+fn child_run_tags(mut tags: Vec<(String, String)>) -> Vec<(String, String)> {
+    if !tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
+        tags.push((
+            tag_keys::PRIORITY.to_string(),
+            DEFAULT_BACKFILL_PRIORITY.to_string(),
+        ));
+    }
+    tags
+}
+
 /// Check the requested keys of a backfill against `selection`: each value of
 /// each dimension of a batched key one time, and dynamic values against storage.
 fn validate_backfill_keys(
@@ -374,17 +387,17 @@ impl PyCodeRepository {
         state: &ResolvedState,
         job: &Py<PyJob>,
         job_name: &str,
-        run_key: &PartitionKey,
+        run_key: PartitionKey,
         config: Option<String>,
         backfill_id: &str,
         run_id: String,
     ) -> PyResult<PyRunResult> {
-        let py_pk = PyPartitionKey::from(run_key);
+        let py_pk = PyPartitionKey::from(&run_key);
         let run_id = io_rt().block_on(create_started_run(
             state,
             job_name,
             Some(&py_pk),
-            Some(run_key.clone()),
+            Some(run_key),
             LaunchedBy::Backfill {
                 backfill_id: backfill_id.to_string(),
             },
@@ -418,6 +431,7 @@ impl PyCodeRepository {
         }
         fail_backfill_if_job_verb_changed(state, &record)?;
         let (_, run_keys) = start_backfill(state, &record)?;
+        let run_tags = child_run_tags(record.tags);
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -429,7 +443,7 @@ impl PyCodeRepository {
         // Planned runs that end here, before they start.
         let mut unstarted: Vec<UnstartedBackfillRun> = Vec::new();
 
-        for (run_number, run_key) in run_keys.iter().enumerate() {
+        for (run_number, run_key) in run_keys.into_iter().enumerate() {
             let member_count = run_key.member_count();
             let unstarted_as = |outcome: BackfillRunOutcome| UnstartedBackfillRun {
                 run_number,
@@ -481,17 +495,6 @@ impl PyCodeRepository {
                 }
             }
 
-            // Inherit backfill tags and default priority to -10 (lower than
-            // scheduled runs) unless user explicitly set it. The backfill
-            // origin is tracked via `LaunchedBy::Backfill`, not a tag.
-            let mut run_tags: Vec<(String, String)> = record.tags.clone();
-            if !run_tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
-                run_tags.push((
-                    tag_keys::PRIORITY.to_string(),
-                    DEFAULT_BACKFILL_PRIORITY.to_string(),
-                ));
-            }
-
             let run_config = record.config.clone();
             let result = match &record.job_name {
                 Some(job_name) => match state.jobs.get(job_name) {
@@ -502,7 +505,7 @@ impl PyCodeRepository {
                         run_key,
                         run_config,
                         backfill_id,
-                        run_id.clone(),
+                        run_id,
                     ),
                     None => Err(ExecutionError::new_err(format!(
                         "Job '{job_name}' not found"
@@ -513,12 +516,12 @@ impl PyCodeRepository {
                     Some(verb) => self.run_action_with_launcher(
                         verb.clone(),
                         Some(record.asset_selection.clone()),
-                        Some(PyPartitionKey::from(run_key)),
-                        Some(run_key.clone()),
+                        Some(PyPartitionKey::from(&run_key)),
+                        Some(run_key),
                         Some(run_tags.clone()),
                         false,
                         run_config,
-                        Some(run_id.clone()),
+                        Some(run_id),
                         false,
                         LaunchedBy::Backfill {
                             backfill_id: backfill_id.to_string(),
@@ -526,12 +529,12 @@ impl PyCodeRepository {
                     ),
                     None => self.materialize_with_launcher(
                         Some(record.asset_selection.clone()),
-                        Some(PyPartitionKey::from(run_key)),
-                        Some(run_key.clone()),
+                        Some(PyPartitionKey::from(&run_key)),
+                        Some(run_key),
                         Some(run_tags.clone()),
                         false,
                         run_config,
-                        Some(run_id.clone()),
+                        Some(run_id),
                         false,
                         false,
                         None,
@@ -623,14 +626,7 @@ impl PyCodeRepository {
                 record.action.as_deref(),
             )?;
 
-            let mut run_tags: Vec<(String, String)> = record.tags.clone();
-            if !run_tags.iter().any(|(k, _)| k == tag_keys::PRIORITY) {
-                run_tags.push((
-                    tag_keys::PRIORITY.to_string(),
-                    DEFAULT_BACKFILL_PRIORITY.to_string(),
-                ));
-            }
-
+            let run_tags = child_run_tags(record.tags);
             let runs: Vec<RunSubmission> = run_keys
                 .into_iter()
                 .map(|run_key| RunSubmission {
