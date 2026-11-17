@@ -372,7 +372,7 @@ mod tests {
         };
         storage
             .for_code_location(&CodeLocationContext::default_for_tests())
-            .register_assets(&[record])
+            .register_assets(vec![record])
             .await
             .unwrap();
         for event in events {

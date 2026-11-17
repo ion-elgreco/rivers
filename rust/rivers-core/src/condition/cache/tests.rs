@@ -55,7 +55,7 @@ async fn register_blank(
         .collect();
     storage
         .for_code_location(&ctx)
-        .register_assets(&records)
+        .register_assets(records)
         .await
         .unwrap();
 }
@@ -185,7 +185,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
 
     storage
         .for_code_location(&ctx)
-        .register_assets(&[
+        .register_assets(vec![
             rec_with_run("source", Some("r0"), 1000),
             rec_with_run("processed", Some("r0"), 1000),
         ])
@@ -1017,7 +1017,7 @@ async fn events_built_with_rollup(
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
     let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
@@ -1447,7 +1447,7 @@ async fn completed_delete_clears_last_run_maps_in_steady_state() {
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
 
@@ -1724,7 +1724,7 @@ async fn completed_delete_clears_failure_floor_in_steady_state() {
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
 

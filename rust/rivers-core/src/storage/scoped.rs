@@ -87,7 +87,7 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
             .await
     }
 
-    pub async fn register_assets(&self, records: &[AssetRecord]) -> Result<()> {
+    pub async fn register_assets(&self, records: Vec<AssetRecord>) -> Result<()> {
         self.backend
             .register_assets(self.code_location_id, records)
             .await

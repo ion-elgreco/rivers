@@ -59,7 +59,7 @@ async fn register(storage: &SurrealStorage, identity: &str, records: Vec<AssetRe
         .collect();
     storage
         .for_code_location(&CodeLocationContext::new(identity))
-        .register_assets(&records)
+        .register_assets(records)
         .await
         .unwrap();
 }

@@ -71,7 +71,7 @@ fn make_asset_record(key: &str) -> AssetRecord {
 async fn register(storage: &SurrealStorage, keys: &[&str]) {
     let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 }

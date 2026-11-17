@@ -497,7 +497,7 @@ mod tests {
         };
         storage
             .for_code_location(&CodeLocationContext::new(identity))
-            .register_assets(&[record])
+            .register_assets(vec![record])
             .await
             .unwrap();
         let Some(dv) = dv else {

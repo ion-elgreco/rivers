@@ -577,7 +577,7 @@ mod remote_staleness {
 
     async fn register_as(storage: &SurrealStorage, identity: &str, keys: &[&str]) {
         let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
-        storage.register_assets(identity, &records).await.unwrap();
+        storage.register_assets(identity, records).await.unwrap();
     }
 
     /// `analytics` reads `raw_orders` of `warehouse` as `orders`, and
@@ -683,13 +683,13 @@ mod remote_staleness {
         let mut owner = make_asset_record("raw_orders");
         owner.code_version = Some("v1".into());
         storage
-            .register_assets("warehouse", &[owner.clone()])
+            .register_assets("warehouse", vec![owner.clone()])
             .await
             .unwrap();
         materialize(&storage, "warehouse", "raw_orders", "a1", &[], 100).await;
         owner.code_version = Some("v2".into());
         storage
-            .register_assets("warehouse", &[owner])
+            .register_assets("warehouse", vec![owner])
             .await
             .unwrap();
         let owner_scope = CodeLocationContext::new("warehouse");
@@ -780,7 +780,7 @@ mod remote_staleness {
         let mut seed = make_asset_record("seed");
         seed.code_version = Some("v1".into());
         storage
-            .register_assets("analytics", &[seed.clone()])
+            .register_assets("analytics", vec![seed.clone()])
             .await
             .unwrap();
         register_as(
@@ -791,7 +791,10 @@ mod remote_staleness {
         .await;
         materialize(&storage, "analytics", "seed", "s1", &[], 100).await;
         seed.code_version = Some("v2".into());
-        storage.register_assets("analytics", &[seed]).await.unwrap();
+        storage
+            .register_assets("analytics", vec![seed])
+            .await
+            .unwrap();
         materialize(&storage, "analytics", "clean", "c1", &[("seed", "s1")], 110).await;
         materialize(
             &storage,

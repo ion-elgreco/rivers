@@ -492,7 +492,7 @@ pub(crate) fn register_assets_from_nodes(
         })
         .collect();
     py.detach(|| {
-        let _ = io_rt().block_on(storage.scoped().register_assets(&records));
+        let _ = io_rt().block_on(storage.scoped().register_assets(records));
     });
 }
 

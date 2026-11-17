@@ -501,7 +501,7 @@ async fn every_channel_delivers_sse_events_over_http() {
                     .for_code_location(&rivers_core::storage::CodeLocationContext::new(
                         rivers_core::storage::DEFAULT_CODE_LOCATION_ID,
                     ))
-                    .register_assets(&[asset])
+                    .register_assets(vec![asset])
                     .await
                     .expect("register_assets");
             },
@@ -972,7 +972,7 @@ async fn sse_client_isolation_across_channels() {
         .for_code_location(&rivers_core::storage::CodeLocationContext::new(
             rivers_core::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[asset])
+        .register_assets(vec![asset])
         .await
         .unwrap();
 

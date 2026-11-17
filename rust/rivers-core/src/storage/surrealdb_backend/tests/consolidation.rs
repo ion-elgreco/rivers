@@ -35,7 +35,7 @@ async fn race_deletion_against_partitioned_mat(
     for i in 0..iters {
         let key = format!("orders_{i}");
         storage
-            .register_assets(cl, &[make_asset_record(&key)])
+            .register_assets(cl, vec![make_asset_record(&key)])
             .await
             .unwrap();
         let mut seed = make_event(&key, "seed", 1);
@@ -682,7 +682,7 @@ async fn apply_steps(
             Step::Deploy(code_version) => storage
                 .register_assets(
                     cl,
-                    &[AssetRecord {
+                    vec![AssetRecord {
                         code_version: Some(code_version.to_string()),
                         ..make_asset_record(asset_key)
                     }],
@@ -911,7 +911,7 @@ async fn conflict_retry_does_not_duplicate_events() {
     for i in 0..100 {
         let key = format!("orders_{i}");
         storage
-            .register_assets(cl, &[make_asset_record(&key)])
+            .register_assets(cl, vec![make_asset_record(&key)])
             .await
             .unwrap();
         let racers: Vec<EventRecord> = (0..8)
@@ -962,7 +962,7 @@ async fn concurrent_observations_stay_consistent() {
     for i in 0..100 {
         let key = format!("sensor_{i}");
         storage
-            .register_assets(cl, &[make_asset_record(&key)])
+            .register_assets(cl, vec![make_asset_record(&key)])
             .await
             .unwrap();
         let racers: Vec<EventRecord> = (0..8)

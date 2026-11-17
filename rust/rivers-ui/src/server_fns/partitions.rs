@@ -1462,7 +1462,7 @@ mod read {
             };
             storage
                 .for_code_location(&CodeLocationContext::default_for_tests())
-                .register_assets(&[asset])
+                .register_assets(vec![asset])
                 .await
                 .unwrap();
             storage.store_events(events).await.unwrap();

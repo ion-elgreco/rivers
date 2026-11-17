@@ -67,7 +67,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
     fn register_assets(
         &self,
         code_location_id: &str,
-        records: &[AssetRecord],
+        records: Vec<AssetRecord>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn get_asset_record(

@@ -385,7 +385,7 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&asset_records)
+        .register_assets(asset_records)
         .await
         .unwrap();
 

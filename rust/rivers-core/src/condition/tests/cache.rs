@@ -17,7 +17,7 @@ async fn test_cache_detects_in_progress_completion_as_change() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a, rec_b])
+        .register_assets(vec![rec_a, rec_b])
         .await
         .unwrap();
 
@@ -142,7 +142,7 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     // Downstream asset with a baseline materialization.
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_materialized_record("dst", 1000)])
+        .register_assets(vec![make_materialized_record("dst", 1000)])
         .await
         .unwrap();
 
@@ -245,7 +245,7 @@ async fn test_observation_committing_after_load_is_still_seen() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("ext")])
+        .register_assets(vec![make_record("ext")])
         .await
         .unwrap();
 
@@ -306,7 +306,7 @@ async fn test_steady_state_observation_cursor_trails_like_initial_load() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("ext")])
+        .register_assets(vec![make_record("ext")])
         .await
         .unwrap();
 
@@ -375,7 +375,7 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_materialized_record("dst", 1000)])
+        .register_assets(vec![make_materialized_record("dst", 1000)])
         .await
         .unwrap();
 
@@ -505,7 +505,7 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_materialized_record("dst", 1000)])
+        .register_assets(vec![make_materialized_record("dst", 1000)])
         .await
         .unwrap();
 
@@ -598,7 +598,7 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a, rec_b])
+        .register_assets(vec![rec_a, rec_b])
         .await
         .unwrap();
 
@@ -702,7 +702,7 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("x", 1000),
             make_materialized_record("y", 1000),
         ])
@@ -799,7 +799,7 @@ async fn test_failed_joint_run_step_success_records_tick_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("x", 1000),
             make_materialized_record("y", 1000),
         ])
@@ -901,7 +901,7 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -972,7 +972,7 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -1055,7 +1055,7 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
     let storage = SurrealStorage::new_memory().await.unwrap();
-    let recs = [
+    let recs = vec![
         make_materialized_record("a", 1000),
         make_materialized_record("b", 1000),
         make_materialized_record("c", 1000),
@@ -1064,7 +1064,7 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&recs)
+        .register_assets(recs)
         .await
         .unwrap();
 
@@ -1135,7 +1135,7 @@ async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
     let rec_x = make_materialized_record("x", 1000);
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new("cl-a"))
-        .register_assets(&[rec_x])
+        .register_assets(vec![rec_x])
         .await
         .unwrap();
     storage
@@ -1205,7 +1205,7 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_p])
+        .register_assets(vec![rec_p])
         .await
         .unwrap();
     storage
@@ -1280,7 +1280,7 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_p, rec_d])
+        .register_assets(vec![rec_p, rec_d])
         .await
         .unwrap();
 
@@ -1350,7 +1350,7 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_p])
+        .register_assets(vec![rec_p])
         .await
         .unwrap();
 
@@ -1430,7 +1430,7 @@ async fn test_in_progress_partition_keys_expands_batched_members() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[make_materialized_record("a", 1000)])
+        .register_assets(vec![make_materialized_record("a", 1000)])
         .await
         .unwrap();
 
@@ -1486,7 +1486,7 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -1568,7 +1568,7 @@ async fn test_later_finishing_run_keeps_latest_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_x])
+        .register_assets(vec![rec_x])
         .await
         .unwrap();
 
@@ -1636,7 +1636,7 @@ async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealS
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("a", ts),
             make_materialized_record("b", ts),
         ])
@@ -1735,7 +1735,7 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a, rec_b])
+        .register_assets(vec![rec_a, rec_b])
         .await
         .unwrap();
     storage
@@ -1877,7 +1877,7 @@ async fn test_cursor_backoff_lets_init_racing_run_be_observed_terminal() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[make_materialized_record("a", 6000)])
+        .register_assets(vec![make_materialized_record("a", 6000)])
         .await
         .unwrap();
 
@@ -1908,7 +1908,7 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("x", 1000),
             make_materialized_record("y", 1000),
         ])

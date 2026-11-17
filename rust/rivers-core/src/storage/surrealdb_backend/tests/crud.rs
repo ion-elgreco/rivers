@@ -84,14 +84,20 @@ async fn action_materialization_preserves_code_version() {
     };
 
     // A real materialize under v1 stamps the version…
-    storage.register_assets(cl, &[record("v1")]).await.unwrap();
+    storage
+        .register_assets(cl, vec![record("v1")])
+        .await
+        .unwrap();
     storage.create_run(&run("r1", None, 1000)).await.unwrap();
     storage.store_event(&mat_event("r1", 1000)).await.unwrap();
     let records = storage.get_asset_records(cl).await.unwrap();
     assert_eq!(mcv(&records).as_deref(), Some("v1"));
 
     // …the code changes (re-resolve registers v2, leaves mcv at v1)…
-    storage.register_assets(cl, &[record("v2")]).await.unwrap();
+    storage
+        .register_assets(cl, vec![record("v2")])
+        .await
+        .unwrap();
 
     // …then an action run's materialized() lands, via both store paths.
     storage
@@ -448,7 +454,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
         pool: vec![("cpu".to_string(), 1)],
     };
     storage
-        .register_assets(cl, std::slice::from_ref(&materialized))
+        .register_assets(cl, vec![materialized.clone()])
         .await
         .expect("first registration failed");
 
@@ -468,7 +474,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
         ..materialized.clone()
     };
     storage
-        .register_assets(cl, std::slice::from_ref(&redefined))
+        .register_assets(cl, vec![redefined])
         .await
         .expect("re-registration failed");
 
@@ -1124,7 +1130,7 @@ async fn test_observation_updates_registered_asset() {
         pool: vec![],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -1214,7 +1220,7 @@ async fn test_observation_does_not_overwrite_materialization_fields() {
         pool: vec![],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -1941,7 +1947,7 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
         storage
             .register_assets(
                 crate::storage::DEFAULT_CODE_LOCATION_ID,
-                &[make_asset_record("live_asset")],
+                vec![make_asset_record("live_asset")],
             )
             .await
             .unwrap();
@@ -2496,7 +2502,7 @@ async fn test_register_assets_with_catalog_fields() {
         },
     ];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records.clone())
         .await
         .unwrap();
 
@@ -2534,7 +2540,7 @@ async fn test_register_preserves_materialization_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2561,7 +2567,7 @@ async fn test_register_preserves_materialization_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2597,7 +2603,7 @@ async fn test_materialization_preserves_catalog_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2626,7 +2632,7 @@ async fn test_get_assets_by_tag() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),
@@ -2703,7 +2709,7 @@ async fn test_get_assets_by_kind() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),
@@ -2913,7 +2919,7 @@ async fn test_get_assets_by_group() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),
