@@ -200,7 +200,7 @@ pub fn is_reachable(graph: &AssetGraph, from_name: &str, to_name: &str) -> Resul
 /// DFS in `dir` from `name`; result excludes `name` itself.
 ///
 /// Outgoing edges lead to dependencies (upstream); Incoming come from dependents (downstream).
-fn traverse(graph: &AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<String> {
+fn traverse<'g>(graph: &'g AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<&'g str> {
     let mut result = HashSet::new();
     let Some(start) = find_node_by_name(graph, name) else {
         return result;
@@ -208,7 +208,7 @@ fn traverse(graph: &AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet
     let mut stack = vec![start];
     while let Some(idx) = stack.pop() {
         for neighbor in graph.neighbors_directed(idx, dir) {
-            if result.insert(graph[neighbor].name.clone()) {
+            if result.insert(graph[neighbor].name.as_str()) {
                 stack.push(neighbor);
             }
         }
@@ -217,12 +217,12 @@ fn traverse(graph: &AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet
 }
 
 /// Transitive dependencies of `name`, excluding `name` itself.
-pub fn ancestors(graph: &AssetGraph, name: &str) -> HashSet<String> {
+pub fn ancestors<'g>(graph: &'g AssetGraph, name: &str) -> HashSet<&'g str> {
     traverse(graph, name, petgraph::Direction::Outgoing)
 }
 
 /// Transitive dependents of `name`, excluding `name` itself.
-pub fn descendants(graph: &AssetGraph, name: &str) -> HashSet<String> {
+pub fn descendants<'g>(graph: &'g AssetGraph, name: &str) -> HashSet<&'g str> {
     traverse(graph, name, petgraph::Direction::Incoming)
 }
 
@@ -573,20 +573,14 @@ mod tests {
     #[test]
     fn test_ancestors_chain() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
-        assert_eq!(
-            ancestors(&graph, "c"),
-            HashSet::from(["a".into(), "b".into()])
-        );
+        assert_eq!(ancestors(&graph, "c"), HashSet::from(["a", "b"]));
         assert_eq!(ancestors(&graph, "a"), HashSet::new());
     }
 
     #[test]
     fn test_descendants_chain() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
-        assert_eq!(
-            descendants(&graph, "a"),
-            HashSet::from(["b".into(), "c".into()])
-        );
+        assert_eq!(descendants(&graph, "a"), HashSet::from(["b", "c"]));
         assert_eq!(descendants(&graph, "c"), HashSet::new());
     }
 
@@ -598,16 +592,10 @@ mod tests {
             ("c", vec!["a"]),
             ("d", vec!["b", "c"]),
         ]);
-        assert_eq!(
-            ancestors(&graph, "d"),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
-        );
-        assert_eq!(
-            descendants(&graph, "a"),
-            HashSet::from(["b".into(), "c".into(), "d".into()])
-        );
-        assert_eq!(ancestors(&graph, "b"), HashSet::from(["a".into()]));
-        assert_eq!(descendants(&graph, "b"), HashSet::from(["d".into()]));
+        assert_eq!(ancestors(&graph, "d"), HashSet::from(["a", "b", "c"]));
+        assert_eq!(descendants(&graph, "a"), HashSet::from(["b", "c", "d"]));
+        assert_eq!(ancestors(&graph, "b"), HashSet::from(["a"]));
+        assert_eq!(descendants(&graph, "b"), HashSet::from(["d"]));
     }
 
     #[test]

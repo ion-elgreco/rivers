@@ -156,21 +156,21 @@ impl ExecutionPlan {
         // target, or a repeated name runs the verb once per occurrence. The
         // materialize path dedups by construction in `from_subgraph`.
         let mut seen = HashSet::new();
-        let targets: Vec<String> = targets
+        let targets: Vec<&str> = targets
             .iter()
-            .filter(|t| seen.insert(t.as_str()))
-            .cloned()
+            .map(String::as_str)
+            .filter(|t| seen.insert(*t))
             .collect();
 
         // One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
         // reachability probes made DownstreamFirst T·(T−1)² whole-graph
         // walks: minutes of pure planning at a few hundred targets, re-run per
         // backfill child under the repository's state read lock.
-        let related_targets = |closure: HashSet<String>| -> Vec<String> {
+        let related_targets = |closure: HashSet<&str>| -> Vec<String> {
             targets
                 .iter()
-                .filter(|t| closure.contains(t.as_str()))
-                .cloned()
+                .filter(|t| closure.contains(*t))
+                .map(|t| t.to_string())
                 .collect()
         };
 
@@ -186,7 +186,7 @@ impl ExecutionPlan {
                     ActionOrdering::DownstreamFirst => related_targets(descendants(graph, target)),
                 };
                 ExecutionStep {
-                    name: target.clone(),
+                    name: target.to_string(),
                     kind: StepKind::Normal,
                     outputs: Vec::new(),
                     plan_dependencies,
