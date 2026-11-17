@@ -176,8 +176,8 @@ impl InProcessBackend {
             step,
             &instance.instance_name,
             &instance.event_names,
-            instance.pools.to_vec(),
-            instance.asset_scope.as_deref().cloned(),
+            &instance.pools,
+            instance.asset_scope.as_deref(),
             claimed,
             InProcessStepWorker {
                 step,

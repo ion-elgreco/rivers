@@ -77,8 +77,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     step: &ExecutionStep,
     step_name: &str,
     event_names: &[String],
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
+    pools: &[(String, u32)],
+    asset_scope: Option<&rivers_core::storage::AssetScope>,
     // A claim the caller already holds for `pools` (see `try_acquire_blocking`).
     claimed: Option<PoolGuard>,
     worker: W,
@@ -92,8 +92,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         match PoolGuard::acquire_blocking(
             py,
             ctx.sink.storage,
-            &pools,
-            asset_scope.as_ref(),
+            pools,
+            asset_scope,
             ctx.scope.run_id,
             step_name,
             ctx.event_sender(),
@@ -183,8 +183,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                 match PoolGuard::acquire_blocking(
                     py,
                     ctx.sink.storage,
-                    &pools,
-                    asset_scope.as_ref(),
+                    pools,
+                    asset_scope,
                     ctx.scope.run_id,
                     step_name,
                     ctx.event_sender(),

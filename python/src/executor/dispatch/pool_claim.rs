@@ -5,7 +5,7 @@
 //!
 //! Emits concurrency observability events (StepSlotClaimed, StepSlotWaiting, StepSlotRenewed,
 //! StepSlotReleased) through the event channel.
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -60,8 +60,8 @@ impl std::error::Error for ClaimCancelled {}
 /// would keep running and hold a sender clone, blocking `EventWriter::flush`.
 pub(crate) struct PoolGuard {
     storage: ScopedStorageHandle<SurrealStorage>,
-    run_id: String,
-    step_key: String,
+    run_id: Arc<str>,
+    step_key: Arc<str>,
     renewal: AbortOnDrop,
     events: mpsc::UnboundedSender<WriterMsg>,
 }
@@ -94,19 +94,7 @@ impl PoolGuard {
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
         claim_async_poll(storage, pools, scope, run_id, step_key, &events).await?;
-        let renewal = AbortOnDrop(spawn_lease_renewal(
-            storage.clone(),
-            run_id.to_string(),
-            step_key.to_string(),
-            events.clone(),
-        ));
-        Ok(Self {
-            storage: storage.clone(),
-            run_id: run_id.to_string(),
-            step_key: step_key.to_string(),
-            renewal,
-            events,
-        })
+        Ok(Self::hold(storage, run_id, step_key, events))
     }
 
     /// Blocking acquire: claim slots (GIL released) and start background lease renewal.
@@ -119,35 +107,12 @@ impl PoolGuard {
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
     ) -> anyhow::Result<Self> {
-        let storage_c = storage.clone();
-        let pools = pools.to_vec();
-        let scope = scope.cloned();
-        let run_id_s = run_id.to_string();
-        let step_key_s = step_key.to_string();
-        let events_c = events.clone();
-        py.detach(move || {
+        py.detach(|| {
             io_rt().block_on(claim_async_poll(
-                &storage_c,
-                &pools,
-                scope.as_ref(),
-                &run_id_s,
-                &step_key_s,
-                &events_c,
+                storage, pools, scope, run_id, step_key, &events,
             ))
         })?;
-        let renewal = AbortOnDrop(spawn_lease_renewal(
-            storage.clone(),
-            run_id.to_string(),
-            step_key.to_string(),
-            events.clone(),
-        ));
-        Ok(Self {
-            storage: storage.clone(),
-            run_id: run_id.to_string(),
-            step_key: step_key.to_string(),
-            renewal,
-            events,
-        })
+        Ok(Self::hold(storage, run_id, step_key, events))
     }
 
     /// One claim attempt, never waiting: `None` when a pool is busy right now.
@@ -174,7 +139,7 @@ impl PoolGuard {
         if !matches!(status, ConcurrencyClaimStatus::Claimed) {
             return Ok(None);
         }
-        let pool_names: Vec<String> = pools.iter().map(|(k, _)| k.clone()).collect();
+        let pool_names: Vec<&str> = pools.iter().map(|(k, _)| k.as_str()).collect();
         emit_event(
             &events,
             storage.code_location_id(),
@@ -183,19 +148,31 @@ impl PoolGuard {
             EventType::StepSlotClaimed,
             vec![("pools".to_string(), pool_names.join(","))],
         );
+        Ok(Some(Self::hold(storage, run_id, step_key, events)))
+    }
+
+    /// Keep the slots just claimed: renew their lease until release.
+    fn hold(
+        storage: &ScopedStorageHandle<SurrealStorage>,
+        run_id: &str,
+        step_key: &str,
+        events: mpsc::UnboundedSender<WriterMsg>,
+    ) -> Self {
+        let run_id: Arc<str> = run_id.into();
+        let step_key: Arc<str> = step_key.into();
         let renewal = AbortOnDrop(spawn_lease_renewal(
             storage.clone(),
-            run_id.to_string(),
-            step_key.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&step_key),
             events.clone(),
         ));
-        Ok(Some(Self {
+        Self {
             storage: storage.clone(),
-            run_id: run_id.to_string(),
-            step_key: step_key.to_string(),
+            run_id,
+            step_key,
             renewal,
             events,
-        }))
+        }
     }
 
     /// Release slots and stop lease renewal (async).
@@ -273,7 +250,7 @@ async fn claim_async_poll(
             .await?
         {
             ConcurrencyClaimStatus::Claimed => {
-                let pool_names: Vec<String> = pools.iter().map(|(k, _)| k.clone()).collect();
+                let pool_names: Vec<&str> = pools.iter().map(|(k, _)| k.as_str()).collect();
                 emit_event(
                     events,
                     code_location_id,
@@ -359,8 +336,8 @@ fn rand_jitter(attempt: u32, max_jitter: Duration) -> Duration {
 
 fn spawn_lease_renewal(
     storage: ScopedStorageHandle<SurrealStorage>,
-    run_id: String,
-    step_key: String,
+    run_id: Arc<str>,
+    step_key: Arc<str>,
     events: mpsc::UnboundedSender<WriterMsg>,
 ) -> AbortHandle {
     let interval = Duration::from_secs((DEFAULT_LEASE_DURATION_SECS / 3).max(1) as u64);
