@@ -1238,6 +1238,62 @@ fn eager_does_not_redispatch_a_just_dispatched_partition_before_storage_catches_
 }
 
 #[test]
+fn in_progress_is_the_union_of_stored_and_tracked_partitions() {
+    let cases: [(&[&str], &[&str], &[&str]); 6] = [
+        (&[], &[], &[]),
+        (&["a"], &[], &["a"]),
+        (&["a", "b"], &["a"], &["a", "b"]),
+        (&["a"], &["a", "c"], &["a", "c"]),
+        (&[], &["c"], &["c"]),
+        (&["a", "b", "zz"], &["b", "c"], &["a", "b", "c"]),
+    ];
+    for (stored, tracked, expected) in cases {
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("dst".to_string(), test_record("dst"));
+        cache.partition_status.insert(
+            "dst".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                in_progress: make_daily_keys(stored),
+                ..Default::default()
+            },
+        );
+        if !tracked.is_empty() {
+            cache.in_progress_assets.insert(
+                "dst".to_string(),
+                tracked
+                    .iter()
+                    .map(|k| (format!("run_{k}"), Some(spk(k))))
+                    .collect(),
+            );
+        }
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "dst".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["a", "b", "c", "d"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+
+        let out = pass.plan_tick(1000, false);
+
+        assert_eq!(
+            out.results[0].result.selection,
+            Some(PartitionSelection::from_keys(make_daily_keys(expected))),
+            "stored {stored:?}, tracked {tracked:?}"
+        );
+    }
+}
+
+#[test]
 fn commit_marks_all_selection_keys_handled() {
     let mut pass = ConditionPass::new(
         AssetConditionCache::default(),

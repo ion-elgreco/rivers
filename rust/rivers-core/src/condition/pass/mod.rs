@@ -539,17 +539,30 @@ impl ConditionPass {
             };
             let prev = &self.eval_state.assets[&info.asset_key];
 
-            let pending = self.cache.in_progress_partition_keys(&info.asset_key);
-            let partition_status = self.cache.partition_status.get(&info.asset_key);
-            let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
-                None
-            } else {
-                partition_status.map(|status| {
-                    let mut s = status.in_progress.clone();
-                    s.extend(pending);
-                    s
-                })
-            };
+            let partition_status = info
+                .partition_info
+                .as_ref()
+                .and(self.cache.partition_status.get(&info.asset_key));
+            // Tracked runs usually cover every started partition: add only the
+            // stored keys they miss instead of copying the stored set.
+            let merged_in_progress = partition_status.and_then(|status| {
+                let mut pending = self.cache.in_progress_partition_keys(&info.asset_key);
+                if pending.is_subset(&status.in_progress) {
+                    return None;
+                }
+                let missing = status
+                    .in_progress
+                    .iter()
+                    .filter(|k| !pending.contains(*k))
+                    .count();
+                pending.reserve(missing);
+                for k in &status.in_progress {
+                    if !pending.contains(k) {
+                        pending.insert(k.clone());
+                    }
+                }
+                Some(pending)
+            });
             let pctx = info.partition_info.as_ref().and_then(|pi| {
                 partition_status.map(|status| PartitionEvalContext {
                     all_keys: &pi.all_keys,
