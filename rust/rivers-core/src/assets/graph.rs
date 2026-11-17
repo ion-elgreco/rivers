@@ -197,23 +197,56 @@ pub fn is_reachable(graph: &AssetGraph, from_name: &str, to_name: &str) -> Resul
     Ok(has_path_connecting(graph, from_idx, to_idx, None))
 }
 
-/// DFS in `dir` from `name`; result excludes `name` itself.
+/// DFS in one direction that reuses its visited set and stack across walks.
 ///
 /// Outgoing edges lead to dependencies (upstream); Incoming come from dependents (downstream).
-fn traverse<'g>(graph: &'g AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<&'g str> {
-    let mut result = HashSet::new();
-    let Some(start) = find_node_by_name(graph, name) else {
-        return result;
-    };
-    let mut stack = vec![start];
-    while let Some(idx) = stack.pop() {
-        for neighbor in graph.neighbors_directed(idx, dir) {
-            if result.insert(graph[neighbor].name.as_str()) {
-                stack.push(neighbor);
-            }
+pub(crate) struct Walker<'g> {
+    graph: &'g AssetGraph,
+    dir: petgraph::Direction,
+    reached: Vec<bool>,
+    stack: Vec<NodeIndex>,
+}
+
+impl<'g> Walker<'g> {
+    pub(crate) fn new(graph: &'g AssetGraph, dir: petgraph::Direction) -> Self {
+        Self {
+            graph,
+            dir,
+            reached: vec![false; graph.node_count()],
+            stack: Vec::new(),
         }
     }
-    result
+
+    /// Whether each node, by `NodeIndex::index()`, is reachable from `start`;
+    /// `start` itself is not.
+    pub(crate) fn walk(&mut self, start: NodeIndex) -> &[bool] {
+        self.reached.fill(false);
+        self.stack.push(start);
+        while let Some(idx) = self.stack.pop() {
+            for neighbor in self.graph.neighbors_directed(idx, self.dir) {
+                let reached = &mut self.reached[neighbor.index()];
+                if !*reached {
+                    *reached = true;
+                    self.stack.push(neighbor);
+                }
+            }
+        }
+        &self.reached
+    }
+}
+
+/// DFS in `dir` from `name`; result excludes `name` itself.
+fn traverse<'g>(graph: &'g AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<&'g str> {
+    let Some(start) = find_node_by_name(graph, name) else {
+        return HashSet::new();
+    };
+    Walker::new(graph, dir)
+        .walk(start)
+        .iter()
+        .zip(graph.node_indices())
+        .filter(|(reached, _)| **reached)
+        .map(|(_, idx)| graph[idx].name.as_str())
+        .collect()
 }
 
 /// Transitive dependencies of `name`, excluding `name` itself.

@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::assets::graph::{AssetGraph, ancestors, descendants};
+use petgraph::graph::NodeIndex;
+
+use crate::assets::graph::{AssetGraph, Walker, find_node_by_name};
 use crate::composition::InvocationKind;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -162,36 +164,34 @@ impl ExecutionPlan {
             .filter(|t| seen.insert(*t))
             .collect();
 
-        // One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
-        // reachability probes made DownstreamFirst T·(T−1)² whole-graph
-        // walks: minutes of pure planning at a few hundred targets, re-run per
-        // backfill child under the repository's state read lock.
-        let related_targets = |closure: HashSet<&str>| -> Vec<String> {
-            targets
-                .iter()
-                .filter(|t| closure.contains(*t))
-                .map(|t| t.to_string())
-                .collect()
+        let mut related = match ordering {
+            ActionOrdering::Unordered => None,
+            // Wait for every related target upstream of this one.
+            ActionOrdering::UpstreamFirst => Some(related_targets(
+                graph,
+                &targets,
+                petgraph::Direction::Outgoing,
+            )),
+            // Wait for every related target this one is upstream of (its
+            // dependents).
+            ActionOrdering::DownstreamFirst => Some(related_targets(
+                graph,
+                &targets,
+                petgraph::Direction::Incoming,
+            )),
         };
 
         let steps = targets
             .iter()
-            .map(|target| {
-                let plan_dependencies = match ordering {
-                    ActionOrdering::Unordered => Vec::new(),
-                    // Wait for every related target upstream of this one.
-                    ActionOrdering::UpstreamFirst => related_targets(ancestors(graph, target)),
-                    // Wait for every related target this one is upstream of
-                    // (its dependents).
-                    ActionOrdering::DownstreamFirst => related_targets(descendants(graph, target)),
-                };
-                ExecutionStep {
-                    name: target.to_string(),
-                    kind: StepKind::Normal,
-                    outputs: Vec::new(),
-                    plan_dependencies,
-                    graph_dependencies: Vec::new(),
-                }
+            .map(|target| ExecutionStep {
+                name: target.to_string(),
+                kind: StepKind::Normal,
+                outputs: Vec::new(),
+                plan_dependencies: related
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .unwrap_or_default(),
+                graph_dependencies: Vec::new(),
             })
             .collect();
 
@@ -438,6 +438,37 @@ impl ExecutionPlan {
 
         levels
     }
+}
+
+/// For each target, the targets reachable from it in `dir`, in target order.
+///
+/// One transitive-closure walk per target, O(T·(V+E)) overall — pairwise
+/// reachability probes made DownstreamFirst T·(T−1)² whole-graph walks:
+/// minutes of pure planning at a few hundred targets, re-run per backfill
+/// child under the repository's state read lock.
+fn related_targets<'a>(
+    graph: &'a AssetGraph,
+    targets: &'a [&'a str],
+    dir: petgraph::Direction,
+) -> impl Iterator<Item = Vec<String>> + 'a {
+    let nodes: Vec<Option<NodeIndex>> = targets
+        .iter()
+        .map(|target| find_node_by_name(graph, target))
+        .collect();
+    let mut walker = Walker::new(graph, dir);
+
+    (0..nodes.len()).map(move |i| {
+        let Some(start) = nodes[i] else {
+            return Vec::new();
+        };
+        let reached = walker.walk(start);
+        targets
+            .iter()
+            .zip(&nodes)
+            .filter(|(_, node)| node.is_some_and(|node| reached[node.index()]))
+            .map(|(target, _)| target.to_string())
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -922,6 +953,27 @@ mod tests {
             a.plan_dependencies,
             vec!["b".to_string()],
             "ordering still holds on the deduped set"
+        );
+    }
+
+    #[test]
+    fn test_for_action_target_missing_from_graph_is_unordered() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"])]);
+        let plan = ExecutionPlan::for_action(
+            &graph,
+            "delete",
+            &["a".into(), "ghost".into(), "b".into()],
+            ActionOrdering::DownstreamFirst,
+        );
+
+        let steps: Vec<(&str, &[String])> = plan
+            .steps
+            .iter()
+            .map(|s| (s.name.as_str(), s.plan_dependencies.as_slice()))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![("a", &["b".to_string()][..]), ("ghost", &[]), ("b", &[])]
         );
     }
 
