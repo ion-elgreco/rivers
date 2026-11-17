@@ -97,8 +97,8 @@ pub(crate) fn collect_bridged_latch(
             }
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 if marks.contains(&idx) {
-                    let merged = e.get().union(&sel);
-                    e.insert(merged);
+                    let slot = e.get_mut();
+                    *slot = std::mem::replace(slot, PartitionSelection::Empty).union(sel);
                 }
             }
         }

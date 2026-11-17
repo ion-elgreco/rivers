@@ -19,39 +19,41 @@ pub enum PartitionSelection {
 
 impl PartitionSelection {
     /// Set union (OR).
-    pub fn union(&self, other: &Self) -> Self {
+    pub fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
-            (Self::Empty, x) | (x, Self::Empty) => x.clone(),
+            (Self::Empty, x) | (x, Self::Empty) => x,
             (Self::Keys(a), Self::Keys(b)) => {
-                let merged: HashSet<PartitionKey> = a.union(b).cloned().collect();
-                Self::from_keys(merged)
+                let (mut big, mut small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                // `extend` would reserve room for the duplicates too.
+                small.retain(|k| !big.contains(k));
+                big.extend(small);
+                Self::from_keys(big)
             }
         }
     }
 
     /// Set intersection (AND).
-    pub fn intersect(&self, other: &Self) -> Self {
+    pub fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::All, x) | (x, Self::All) => x.clone(),
+            (Self::All, x) | (x, Self::All) => x,
             (Self::Keys(a), Self::Keys(b)) => {
-                let common: HashSet<PartitionKey> = a.intersection(b).cloned().collect();
-                Self::from_keys(common)
+                let (mut small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                small.retain(|k| big.contains(k));
+                Self::from_retained(small)
             }
         }
     }
 
     /// Drop keys no longer in the universe (`All`/`Empty` pass through).
-    pub fn restrict_to(&self, all_keys: &HashSet<PartitionKey>) -> Self {
+    pub fn restrict_to(self, all_keys: &HashSet<PartitionKey>) -> Self {
         match self {
-            Self::All | Self::Empty => self.clone(),
-            Self::Keys(keys) => Self::from_keys(
-                keys.iter()
-                    .filter(|k| all_keys.contains(*k))
-                    .cloned()
-                    .collect(),
-            ),
+            Self::Keys(mut keys) => {
+                keys.retain(|k| all_keys.contains(k));
+                Self::from_retained(keys)
+            }
+            other => other,
         }
     }
 
@@ -87,6 +89,19 @@ impl PartitionSelection {
         }
     }
 
+    /// [`Self::difference`] that reuses `self`'s keys instead of copying them.
+    pub fn subtract(self, other: &Self, all_keys: &HashSet<PartitionKey>) -> Self {
+        match (self, other) {
+            (Self::Empty, _) | (_, Self::All) => Self::Empty,
+            (x, Self::Empty) => x,
+            (Self::All, Self::Keys(_)) => other.complement(all_keys),
+            (Self::Keys(mut a), Self::Keys(b)) => {
+                a.retain(|k| !b.contains(k));
+                Self::from_retained(a)
+            }
+        }
+    }
+
     /// True if this selection contains zero partitions.
     pub fn is_empty(&self) -> bool {
         match self {
@@ -113,6 +128,15 @@ impl PartitionSelection {
         } else {
             Self::Keys(keys)
         }
+    }
+
+    /// [`Self::from_keys`] for a set shrunk in place. `retain` keeps the whole
+    /// table; a latch would carry that spare room from tick to tick.
+    fn from_retained(mut keys: HashSet<PartitionKey>) -> Self {
+        if keys.len() * 2 < keys.capacity() {
+            keys.shrink_to_fit();
+        }
+        Self::from_keys(keys)
     }
 
     /// Number of partition keys in this selection.

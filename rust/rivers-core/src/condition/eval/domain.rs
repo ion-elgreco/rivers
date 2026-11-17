@@ -52,10 +52,11 @@ pub(crate) trait EvalDomain {
     fn all() -> Self::Sel;
     fn empty() -> Self::Sel;
     fn from_bool(b: bool) -> Self::Sel;
-    fn and(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
-    fn or(a: Self::Sel, b: &Self::Sel) -> Self::Sel;
+    fn and(a: Self::Sel, b: Self::Sel) -> Self::Sel;
+    fn or(a: Self::Sel, b: Self::Sel) -> Self::Sel;
     fn not(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn difference(a: &Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
+    fn subtract(a: Self::Sel, b: &Self::Sel, ctx: &EvalContext) -> Self::Sel;
     fn restrict(a: Self::Sel, ctx: &EvalContext) -> Self::Sel;
 
     // leaf status sources
@@ -121,17 +122,20 @@ impl EvalDomain for BoolDomain {
     fn from_bool(b: bool) -> bool {
         b
     }
-    fn and(a: bool, b: &bool) -> bool {
-        a && *b
+    fn and(a: bool, b: bool) -> bool {
+        a && b
     }
-    fn or(a: bool, b: &bool) -> bool {
-        a || *b
+    fn or(a: bool, b: bool) -> bool {
+        a || b
     }
     fn not(a: bool, _ctx: &EvalContext) -> bool {
         !a
     }
     fn difference(a: &bool, b: &bool, _ctx: &EvalContext) -> bool {
         *a && !*b
+    }
+    fn subtract(a: bool, b: &bool, _ctx: &EvalContext) -> bool {
+        a && !*b
     }
     fn restrict(a: bool, _ctx: &EvalContext) -> bool {
         a
@@ -281,10 +285,10 @@ impl EvalDomain for PartitionDomain {
     fn from_bool(b: bool) -> PartitionSelection {
         PartitionSelection::from_bool(b)
     }
-    fn and(a: PartitionSelection, b: &PartitionSelection) -> PartitionSelection {
+    fn and(a: PartitionSelection, b: PartitionSelection) -> PartitionSelection {
         a.intersect(b)
     }
-    fn or(a: PartitionSelection, b: &PartitionSelection) -> PartitionSelection {
+    fn or(a: PartitionSelection, b: PartitionSelection) -> PartitionSelection {
         a.union(b)
     }
     fn not(a: PartitionSelection, ctx: &EvalContext) -> PartitionSelection {
@@ -296,6 +300,13 @@ impl EvalDomain for PartitionDomain {
         ctx: &EvalContext,
     ) -> PartitionSelection {
         a.difference(b, require_pctx(ctx).all_keys)
+    }
+    fn subtract(
+        a: PartitionSelection,
+        b: &PartitionSelection,
+        ctx: &EvalContext,
+    ) -> PartitionSelection {
+        a.subtract(b, require_pctx(ctx).all_keys)
     }
     fn restrict(a: PartitionSelection, ctx: &EvalContext) -> PartitionSelection {
         a.restrict_to(require_pctx(ctx).all_keys)

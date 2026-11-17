@@ -273,10 +273,7 @@ fn eval<D: EvalDomain>(
             let prev = D::prev_latch(dep_scope, ctx, my_idx);
             // Restrict to the current universe so a latch can't carry forward
             // keys retired from the partition set (unpartitioned: a no-op).
-            let result = D::restrict(
-                D::difference(&D::or(prev, &trigger_sel), &reset_sel, ctx),
-                ctx,
-            );
+            let result = D::restrict(D::subtract(D::or(prev, trigger_sel), &reset_sel, ctx), ctx);
             sub.insert(my_idx, result.clone());
             let children = [trigger_tree, reset_tree].into_iter().flatten().collect();
             finish(result, children)
@@ -320,7 +317,7 @@ impl Quantifier {
             Quantifier::All => D::all(),
         }
     }
-    fn combine<D: EvalDomain>(self) -> fn(D::Sel, &D::Sel) -> D::Sel {
+    fn combine<D: EvalDomain>(self) -> fn(D::Sel, D::Sel) -> D::Sel {
         match self {
             Quantifier::Any => D::or,
             Quantifier::All => D::and,
@@ -354,7 +351,7 @@ fn fold_deps<'a, D: EvalDomain>(
     for dep in deps {
         *counter = base;
         let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
-        result = combine(result, &dep_val);
+        result = combine(result, dep_val);
         if quant.saturated(&result) && !eval_all {
             break;
         }
@@ -393,7 +390,7 @@ fn fold_combinator<D: EvalDomain>(
             let (child_sel, child_tree) =
                 eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             if !sat {
-                result = combine(result, &child_sel);
+                result = combine(result, child_sel);
             }
             child_parts.extend(child_tree);
         }
