@@ -184,8 +184,8 @@ struct StepDispatch {
     /// ordering dependency failed.
     action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
+    pools: Arc<[(String, u32)]>,
+    asset_scope: Option<Arc<rivers_core::storage::AssetScope>>,
     semaphore: Option<Arc<Semaphore>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
     events_tx: mpsc::UnboundedSender<WriterMsg>,
@@ -258,8 +258,8 @@ async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
     let action = shared.action.is_some();
     run_step_async_lifecycle(
         storage,
-        pools,
-        asset_scope,
+        &pools,
+        asset_scope.as_deref(),
         run_id,
         pool_step_name,
         start_event_names,

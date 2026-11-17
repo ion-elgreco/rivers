@@ -315,8 +315,8 @@ pub(crate) fn process_finished_steps(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     storage: ScopedStorageHandle<SurrealStorage>,
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
+    pools: &[(String, u32)],
+    asset_scope: Option<&rivers_core::storage::AssetScope>,
     run_id: String,
     pool_step_name: String,
     start_event_names: Vec<String>,
@@ -345,8 +345,8 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     } else {
         match PoolGuard::acquire(
             &storage,
-            &pools,
-            asset_scope.as_ref(),
+            pools,
+            asset_scope,
             &run_id,
             &pool_step_name,
             events_tx.clone(),
@@ -488,8 +488,8 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             if !pools.is_empty() {
                 match PoolGuard::acquire(
                     &storage,
-                    &pools,
-                    asset_scope.as_ref(),
+                    pools,
+                    asset_scope,
                     &run_id,
                     &pool_step_name,
                     events_tx.clone(),

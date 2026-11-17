@@ -172,7 +172,7 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn step_pools(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> (Vec<(String, u32)>, Option<AssetScope>) {
+    ) -> (Arc<[(String, u32)]>, Option<Arc<AssetScope>>) {
         let mut pools = self
             .repo
             .node_map
@@ -223,7 +223,13 @@ impl<'a> BatchContext<'a> {
                 }
             }
         }
-        let scope = (pools.len() > user_pools).then(|| self.asset_scope(exclusive));
+        let scope = (pools.len() > user_pools).then(|| Arc::new(self.asset_scope(exclusive)));
+        // `Arc::from` an empty Vec allocates; `Arc::default` does not.
+        let pools = if pools.is_empty() {
+            Arc::default()
+        } else {
+            pools.into()
+        };
         (pools, scope)
     }
 

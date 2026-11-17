@@ -1,5 +1,6 @@
 //! Dispatch type definitions — StepInstance, StepResult, and batch tracking types.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use tokio::sync::mpsc;
@@ -33,11 +34,11 @@ pub(crate) struct StepInstance {
     /// build worker submit args (mapped instances carry no collect specs).
     pub fan_out: Option<(String, Py<PyAny>)>,
     pub is_async: bool,
-    /// Resolved pool config — same value for every instance of a mapped step,
+    /// Resolved pool config — every instance of a mapped step shares one,
     /// snapshotted up-front so the lifecycle can claim under the GIL.
-    pub pools: Vec<(String, u32)>,
+    pub pools: Arc<[(String, u32)]>,
     /// Partition scope for the implicit asset pool, when this step claims one.
-    pub asset_scope: Option<rivers_core::storage::AssetScope>,
+    pub asset_scope: Option<Arc<rivers_core::storage::AssetScope>>,
 }
 
 /// (stdout, stderr, rust_logs) captured around a step's invocation. Populated

@@ -577,8 +577,8 @@ impl ParallelBackend {
         // Requires GIL + ctx, so pre-build before entering JoinSet.
         struct PreparedPoolStep {
             base: PreparedStep,
-            pools: Vec<(String, u32)>,
-            asset_scope: Option<rivers_core::storage::AssetScope>,
+            pools: Arc<[(String, u32)]>,
+            asset_scope: Option<Arc<rivers_core::storage::AssetScope>>,
             event_names: Vec<String>,
             instance_name: String,
             retry: Option<rivers_core::execution::retry::RetryPolicy>,
@@ -637,8 +637,8 @@ impl ParallelBackend {
                 async move {
                     let (outcome, guard) = run_step_async_lifecycle(
                         storage,
-                        pools,
-                        asset_scope,
+                        &pools,
+                        asset_scope.as_deref(),
                         run_id,
                         pool_step_name,
                         event_names,
