@@ -49,11 +49,12 @@ fn parity_eval_pair(
     } else {
         HashSet::new()
     };
-    let requested: HashMap<String, PartitionSelection> = if scn.requested {
-        HashMap::from([(key.to_string(), PartitionSelection::All)])
+    let fired = Fired::new(if scn.requested {
+        vec![(key, PartitionSelection::All)]
     } else {
-        HashMap::new()
-    };
+        vec![]
+    });
+    let requested = fired.view();
     let cache = CacheSnapshot {
         records: &records,
         upstream_deps: &deps,

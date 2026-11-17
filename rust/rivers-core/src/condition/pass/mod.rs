@@ -12,7 +12,7 @@ use crate::condition::partition::{
 };
 use crate::condition::state::{
     AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
-    EvalNodeResult, EvalResult, PendingDispatch, RunTagSnapshot, StateUpdateContext,
+    EvalResultRow, PendingDispatch, RequestedThisTick, RunTagSnapshot, StateUpdateContext,
     commit_condition_state, update_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
@@ -47,14 +47,6 @@ pub struct PartitionInfo {
     pub time_window_fmt: Option<String>,
     /// How `all_keys` evolves after extraction.
     pub universe: PartitionUniverse,
-}
-
-/// One row of the per-asset evaluation result list.
-pub struct EvalResultRow {
-    pub info_idx: usize,
-    pub result: EvalResult,
-    pub tree: EvalNodeResult,
-    pub duration_us: u64,
 }
 
 /// One asset to materialize this tick, with its (optional) partition selection.
@@ -531,7 +523,7 @@ impl ConditionPass {
             )
             .collect();
 
-        let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
+        let mut fired: HashMap<&str, usize> = HashMap::new();
         let mut results: Vec<EvalResultRow> = Vec::new();
 
         for (idx, info) in self.conditions.iter().enumerate() {
@@ -571,6 +563,7 @@ impl ConditionPass {
                 })
             });
 
+            let requested_this_tick = RequestedThisTick::new(&fired, &results);
             let ctx = EvalContext {
                 target_key: &info.asset_key,
                 root_key: &info.asset_key,
@@ -601,13 +594,7 @@ impl ConditionPass {
             let duration_us = start.elapsed().as_micros() as u64;
 
             if eval_result.fired {
-                requested_this_tick.insert(
-                    info.asset_key.clone(),
-                    eval_result
-                        .selection
-                        .clone()
-                        .unwrap_or(PartitionSelection::All),
-                );
+                fired.insert(&info.asset_key, results.len());
             }
 
             results.push(EvalResultRow {

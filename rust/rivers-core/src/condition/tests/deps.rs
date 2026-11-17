@@ -634,10 +634,11 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     )]);
 
     // Upstream's own condition fired for 'a' only, earlier this tick.
-    let requested = HashMap::from([(
-        "up".to_string(),
+    let fired = Fired::new(vec![(
+        "up",
         PartitionSelection::Keys(HashSet::from([pa.clone()])),
     )]);
+    let requested = fired.view();
 
     let mut ctx = make_ctx("down", &down, &records, &deps);
     let partition_asset_names = slotted_parts(partition_asset_names);

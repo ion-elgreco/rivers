@@ -1,4 +1,5 @@
 use super::*;
+use crate::condition::state::{EvalNodeResult, EvalResult};
 use crate::timegrid::TimeGrid;
 use ordermap::OrderSet;
 
@@ -399,6 +400,46 @@ fn dep_baseline_survives_unrelated_asset_fire() {
     // Tick 5: c acted on it → consumed.
     let out = pass.run(5000, false);
     assert!(!fired(&out, &pass, "c"), "tick 5: c consumed the change");
+}
+
+/// A fire is recorded for `WillBeRequested` even when the firing asset's own
+/// tree lacks the node: the reader is a downstream tree.
+#[test]
+fn will_be_requested_sees_upstream_fire_without_the_node() {
+    let mut cache = AssetConditionCache::default();
+    cache.records.insert("up".to_string(), test_record("up"));
+    let mut down = test_record("down");
+    down.last_timestamp = Some(100);
+    cache.records.insert("down".to_string(), down);
+    cache
+        .upstream_deps
+        .insert("down".to_string(), vec!["up".to_string()]);
+
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            AssetConditionInfo {
+                asset_key: "up".to_string(),
+                condition: ConditionNode::Missing,
+                partition_info: None,
+                backfill_strategy: None,
+            },
+            AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::any_deps_match(ConditionNode::WillBeRequested),
+                partition_info: None,
+                backfill_strategy: None,
+            },
+        ],
+        HashMap::new(),
+    );
+
+    let out = pass.run(1000, false);
+    assert!(
+        out.results.iter().all(|row| row.result.fired),
+        "up fires on Missing, and down must see it via WillBeRequested"
+    );
 }
 
 #[test]

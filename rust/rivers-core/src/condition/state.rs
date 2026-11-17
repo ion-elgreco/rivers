@@ -178,6 +178,31 @@ pub struct RunTagSnapshot<'a> {
     pub last_run_asset_names: &'a super::cache::SlotMap<Arc<[String]>>,
 }
 
+/// Assets that fired earlier in a tick, read in place from that tick's results.
+#[derive(Clone, Copy)]
+pub struct RequestedThisTick<'a> {
+    fired: &'a HashMap<&'a str, usize>,
+    results: &'a [EvalResultRow],
+}
+
+impl<'a> RequestedThisTick<'a> {
+    /// `fired` maps each fired asset to its index in `results`.
+    pub fn new(fired: &'a HashMap<&'a str, usize>, results: &'a [EvalResultRow]) -> Self {
+        Self { fired, results }
+    }
+
+    pub fn contains(&self, asset_key: &str) -> bool {
+        self.fired.contains_key(asset_key)
+    }
+
+    /// The asset's fired selection; an unpartitioned fire reads as `All`.
+    pub fn selection(&self, asset_key: &str) -> Option<&'a PartitionSelection> {
+        static ALL: PartitionSelection = PartitionSelection::All;
+        let &idx = self.fired.get(asset_key)?;
+        Some(self.results[idx].result.selection.as_ref().unwrap_or(&ALL))
+    }
+}
+
 /// Read-only context for evaluating conditions on a single asset during one tick.
 pub struct EvalContext<'a> {
     /// The asset being evaluated.
@@ -194,8 +219,8 @@ pub struct EvalContext<'a> {
     pub prev_state: &'a AssetConditionState,
     /// All per-asset condition states (for dep lookups in AnyDepsMatch/AllDepsMatch).
     pub all_asset_states: &'a HashMap<String, AssetConditionState>,
-    /// Fired selections of assets whose conditions already fired earlier in this tick.
-    pub requested_this_tick: &'a HashMap<String, PartitionSelection>,
+    /// Assets whose conditions already fired earlier in this tick.
+    pub requested_this_tick: &'a RequestedThisTick<'a>,
     /// Current timestamp (nanoseconds).
     pub now: i64,
     /// Whether this is the initial evaluation (daemon just started).
@@ -221,6 +246,14 @@ pub struct EvalResult {
     pub dep_sub_results: HashMap<String, HashMap<u32, bool>>,
     /// Per-dep partition selections inside dep-aggregates (partitioned).
     pub dep_sub_selections: Option<HashMap<String, HashMap<u32, PartitionSelection>>>,
+}
+
+/// One row of the per-asset evaluation result list.
+pub struct EvalResultRow {
+    pub info_idx: usize,
+    pub result: EvalResult,
+    pub tree: EvalNodeResult,
+    pub duration_us: u64,
 }
 
 /// Status of a single node's evaluation in the tree.

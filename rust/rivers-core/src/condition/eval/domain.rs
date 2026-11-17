@@ -224,7 +224,7 @@ impl EvalDomain for BoolDomain {
         }
     }
     fn will_be_requested(ctx: &EvalContext) -> bool {
-        ctx.requested_this_tick.contains_key(ctx.target_key)
+        ctx.requested_this_tick.contains(ctx.target_key)
     }
 
     fn prev_latch<'a>(dep_scope: &DepScope<'a, bool>, ctx: &'a EvalContext, idx: u32) -> &'a bool {
@@ -413,7 +413,7 @@ impl EvalDomain for PartitionDomain {
     }
     fn will_be_requested(ctx: &EvalContext) -> PartitionSelection {
         ctx.requested_this_tick
-            .get(ctx.target_key)
+            .selection(ctx.target_key)
             .cloned()
             .unwrap_or(PartitionSelection::Empty)
     }
