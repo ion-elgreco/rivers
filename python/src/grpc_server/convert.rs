@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use pyo3::prelude::*;
 use rivers_api::rivers::*;
@@ -117,16 +118,11 @@ pub(super) fn proto_tags_to_pairs(tags: Vec<Tag>) -> Option<Vec<(String, String)
     }
 }
 
-pub(super) fn tags_to_proto(tags: Option<&HashMap<String, String>>) -> Vec<Tag> {
-    tags.map(|t| {
-        t.iter()
-            .map(|(k, v)| Tag {
-                key: k.clone(),
-                value: v.clone(),
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+pub(super) fn tags_to_proto(tags: Option<HashMap<String, String>>) -> Vec<Tag> {
+    tags.into_iter()
+        .flatten()
+        .map(|(key, value)| Tag { key, value })
+        .collect()
 }
 
 pub(super) fn collect_run_ids(py: Python<'_>, run_requests: &[TickRequest]) -> Vec<String> {
@@ -413,11 +409,16 @@ pub(super) fn proto_partition_key_to_py(pk: ProtoPartitionKey) -> Result<PyParti
                 }
                 let mut vals = d.keys;
                 vals.sort();
-                if keys.insert(d.name.clone(), vals).is_some() {
-                    return Err(Status::invalid_argument(format!(
-                        "duplicate partition_key dimension '{}'",
-                        d.name
-                    )));
+                match keys.entry(d.name) {
+                    Entry::Occupied(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "duplicate partition_key dimension '{}'",
+                            e.key()
+                        )));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(vals);
+                    }
                 }
             }
             Ok(PyPartitionKey::Multi { keys })
@@ -456,11 +457,16 @@ pub(super) fn proto_partition_range_to_py(
                         DimensionSelection::Keys(k.keys.into_iter().collect())
                     }
                 };
-                if dims.insert(d.name.clone(), sel).is_some() {
-                    return Err(Status::invalid_argument(format!(
-                        "duplicate partition_range dimension '{}'",
-                        d.name
-                    )));
+                match dims.entry(d.name) {
+                    Entry::Occupied(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "duplicate partition_range dimension '{}'",
+                            e.key()
+                        )));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(sel);
+                    }
                 }
             }
             Ok(PyPartitionKeyRange {
