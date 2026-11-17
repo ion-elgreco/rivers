@@ -675,7 +675,7 @@ impl SurrealStorage {
         }
         let by_time: Vec<(i64, Vec<PartitionKey>)> = by_time.into_iter().collect();
         let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
-        let Some(range) = partition_failures::key_range(&keys) else {
+        let Some(range) = partition_failures::key_range(keys.iter()) else {
             return Ok(());
         };
         let rows: Vec<DbPartitionDeletion> = newest
@@ -702,7 +702,7 @@ impl SurrealStorage {
             cl,
             asset_key,
             rows: &rows,
-            range: &range,
+            range,
             by_time: &by_time,
         };
 
@@ -861,8 +861,7 @@ impl SurrealStorage {
         // the asset row first, so it runs before the row's update. The data
         // and provenance updates commit together too: no reader sees new data
         // with the provenance of the materialization it replaced.
-        let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
-        let range = partition_failures::key_range(&keys);
+        let range = partition_failures::key_range(parts.iter().map(|p| &p.partition_key));
         let (guard, body) = match range {
             Some(_) => (
                 partition_failures::failure_rows_guard(),
@@ -880,8 +879,7 @@ impl SurrealStorage {
             data_version,
             provenance: (!from_action).then_some((provenance_timestamp, code_version, idv)),
             parts: &parts,
-            keys: &keys,
-            range: range.as_ref(),
+            range,
         };
 
         // Runs that write one asset at the same time all write its `assets`
@@ -920,8 +918,7 @@ struct MaterializationParams<'a> {
     /// The provenance's time, code version and inputs; none for an action.
     provenance: Option<(i64, Option<&'a str>, Option<&'a [(String, String)]>)>,
     parts: &'a [DbAssetPartitionWrite],
-    keys: &'a [PartitionKey],
-    range: Option<&'a (PartitionKey, PartitionKey)>,
+    range: Option<(&'a PartitionKey, &'a PartitionKey)>,
 }
 
 impl MaterializationParams<'_> {
@@ -942,9 +939,11 @@ impl MaterializationParams<'_> {
             }
         }
         if let Some((lowest, highest)) = self.range {
+            let keys: Vec<PartitionKey> =
+                self.parts.iter().map(|p| p.partition_key.clone()).collect();
             let oldest = self.parts.iter().map(|p| p.last_timestamp).min();
             query = query
-                .bind(("keys", self.keys.to_vec()))
+                .bind(("keys", keys))
                 .bind(("oldest", oldest))
                 .bind(("rows", self.parts.to_vec()))
                 .bind(("lowest", lowest.clone()))
@@ -959,7 +958,7 @@ struct DeletionParams<'a> {
     cl: &'a str,
     asset_key: &'a str,
     rows: &'a [DbPartitionDeletion],
-    range: &'a (PartitionKey, PartitionKey),
+    range: (&'a PartitionKey, &'a PartitionKey),
     by_time: &'a [(i64, Vec<PartitionKey>)],
 }
 

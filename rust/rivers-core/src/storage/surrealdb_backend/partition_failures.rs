@@ -85,10 +85,12 @@ pub(super) fn keyed_failure(event: &EventRecord) -> Option<(&str, &PartitionKey)
 }
 
 /// The first and the last of `keys` in the order of the store.
-pub(super) fn key_range(keys: &[PartitionKey]) -> Option<(PartitionKey, PartitionKey)> {
-    let lowest = keys.iter().min_by(|a, b| stored_order(a, b))?;
-    let highest = keys.iter().max_by(|a, b| stored_order(a, b))?;
-    Some((lowest.clone(), highest.clone()))
+pub(super) fn key_range<'a>(
+    keys: impl Iterator<Item = &'a PartitionKey> + Clone,
+) -> Option<(&'a PartitionKey, &'a PartitionKey)> {
+    let lowest = keys.clone().min_by(|a, b| stored_order(a, b))?;
+    let highest = keys.max_by(|a, b| stored_order(a, b))?;
+    Some((lowest, highest))
 }
 
 /// The store, or a transaction of it.
