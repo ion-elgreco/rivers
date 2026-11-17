@@ -226,8 +226,8 @@ pub(crate) fn load_step_output(
 pub(crate) struct WrittenOutput {
     /// Set by `register_data_version()`; wins over the asset's data version.
     pub data_version: Option<String>,
-    /// The context's metadata after `handle_output`. Overlay it on the
-    /// output's metadata with `merge_metadata`: the handler's entries win.
+    /// The context's metadata after `handle_output`: what it was built with,
+    /// overlaid by the handler's entries.
     pub metadata: Vec<(String, MetadataValue)>,
 }
 

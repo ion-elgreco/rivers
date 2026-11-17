@@ -220,10 +220,10 @@ impl OutputRecorder {
                         value,
                         ctx.scope.partition_key,
                         type_hint,
-                        metadata.clone(),
+                        std::mem::take(&mut metadata),
                         ctx.repo.io_handler_registry,
                     )?;
-                    ops::merge_metadata(&mut metadata, &written.metadata);
+                    metadata = written.metadata;
                     written.data_version.or(data_version)
                 } else {
                     data_version

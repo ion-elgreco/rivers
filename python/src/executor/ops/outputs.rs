@@ -20,8 +20,8 @@
 //! `OutputItem.metadata` is stripped of any `MetadataValue::DataVersion`
 //! entries (those are folded into `data_version`). What the IO handler sets
 //! during the write is NOT considered here — for a Materialization, the
-//! consumer overlays it after `write_output`: the handler's metadata wins via
-//! `merge_metadata`, its data_version via `.or(item.data_version)`.
+//! handler's metadata wins over the item's (see `WrittenOutput`), its
+//! data_version via `.or(item.data_version)`.
 //!
 //! ## Construction discipline
 //!
