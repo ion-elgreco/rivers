@@ -292,29 +292,16 @@ pub fn AssetsListPage() -> impl IntoView {
     let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
     let launch_resources =
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
-    let materialize_picker = Signal::derive(move || {
-        let infos = assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        crate::helpers::partition_picker_for_assets(&selected.get(), &by_key)
+    let materialize_picker = Memo::new(move |_| {
+        asset_info_by_key.with(|defs| {
+            selected.with(|keys| crate::helpers::partition_picker_for_assets(keys, defs))
+        })
     });
     // Verbs every selected asset declares — the selection submits as one
     // action run, so anything less than the full intersection can fail.
     let selection_verbs = Signal::derive(move || {
-        let infos = assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        crate::helpers::common_actions(&selected.get(), &by_key)
+        asset_info_by_key
+            .with(|defs| selected.with(|keys| crate::helpers::common_actions(keys, defs)))
     });
 
     // A click handler can't read the resources, so an effect keeps the

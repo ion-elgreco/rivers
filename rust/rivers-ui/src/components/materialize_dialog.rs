@@ -252,7 +252,7 @@ pub fn MaterializeDialog(
     // sibling execute_job_dialog already memoizes the same predicate.
     // A Keyless verb reads as unpartitioned: no picker, one whole-asset run.
     let is_partitioned = Memo::new(move |_| {
-        !keyless_verb.get() && !matches!(picker_signal.get(), JobPartitionPicker::None)
+        !keyless_verb.get() && picker_signal.with(|p| !matches!(p, JobPartitionPicker::None))
     });
     let summary = Signal::derive(move || {
         launch_summary(

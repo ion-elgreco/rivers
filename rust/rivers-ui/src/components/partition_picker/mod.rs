@@ -65,53 +65,58 @@ pub fn PartitionPicker(
     });
 
     Effect::new(move |_| {
-        let p = picker.get();
-        let s_single = single_selected.get();
-        let s_multi = multi_selected.get();
-        let keys = match span_source(&p) {
-            Some(source) => {
-                paged_labels.with(|l| collect_span_keys(&source, &paged_spans.get(), l))
-            }
-            None => collect_submit_keys(&p, &s_single, &s_multi),
-        };
+        let keys = picker.with(|p| {
+            single_selected.with(|s_single| {
+                multi_selected.with(|s_multi| match span_source(p) {
+                    Some(source) => {
+                        paged_labels.with(|l| collect_span_keys(&source, &paged_spans.get(), l))
+                    }
+                    None => collect_submit_keys(p, s_single, s_multi),
+                })
+            })
+        });
         selected.set(keys);
     });
 
     let toggle_single = move |idx: usize, shift: bool| {
-        let keys = match picker.get_untracked() {
-            JobPartitionPicker::SingleDim { keys, .. } => keys,
-            _ => return,
+        let next = picker.with_untracked(|p| match p {
+            JobPartitionPicker::SingleDim { keys, .. } => Some(apply_toggle(
+                keys,
+                &single_selected.get_untracked(),
+                single_anchor.get_untracked(),
+                idx,
+                shift,
+            )),
+            _ => None,
+        });
+        let Some(next) = next else {
+            return;
         };
-        let next = apply_toggle(
-            &keys,
-            &single_selected.get_untracked(),
-            single_anchor.get_untracked(),
-            idx,
-            shift,
-        );
         single_selected.set(next.selected);
         single_anchor.set(next.anchor);
     };
 
     let toggle_multi = move |dim: String, idx: usize, shift: bool| {
-        let dims = match picker.get_untracked() {
-            JobPartitionPicker::Multi { dimensions, .. } => dimensions,
-            _ => return,
-        };
-        let Some(dim_info) = dims.into_iter().find(|d| d.name == dim) else {
+        let next = picker.with_untracked(|p| {
+            let JobPartitionPicker::Multi { dimensions, .. } = p else {
+                return None;
+            };
+            let dim_info = dimensions.iter().find(|d| d.name == dim)?;
+            let cur = multi_selected
+                .get_untracked()
+                .get(&dim)
+                .cloned()
+                .unwrap_or_default();
+            let anchor = multi_anchors
+                .get_untracked()
+                .get(&dim)
+                .copied()
+                .unwrap_or(None);
+            Some(apply_toggle(&dim_info.keys, &cur, anchor, idx, shift))
+        });
+        let Some(next) = next else {
             return;
         };
-        let cur = multi_selected
-            .get_untracked()
-            .get(&dim)
-            .cloned()
-            .unwrap_or_default();
-        let anchor = multi_anchors
-            .get_untracked()
-            .get(&dim)
-            .copied()
-            .unwrap_or(None);
-        let next = apply_toggle(&dim_info.keys, &cur, anchor, idx, shift);
         multi_selected.update(|m| {
             m.insert(dim.clone(), next.selected);
         });

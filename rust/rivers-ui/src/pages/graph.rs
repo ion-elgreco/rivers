@@ -367,8 +367,9 @@ pub fn GraphPage() -> impl IntoView {
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
-    let materialize_picker = Signal::derive(move || {
-        partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
+    let materialize_picker = Memo::new(move |_| {
+        asset_info_by_key
+            .with(|defs| mat_targets.with(|keys| partition_picker_for_assets(keys, defs)))
     });
     let dialog_asset_keys = Signal::derive(move || mat_targets.get());
     // One opener for both flows — `None` verb materializes. The task-node
@@ -898,7 +899,7 @@ pub fn GraphPage() -> impl IntoView {
                             })}
 
                             <div class="dag-sidebar-footer">
-                                {sorted_verbs(common_actions(&mat_keys, &asset_info_by_key.get())).into_iter().map(|act| {
+                                {sorted_verbs(asset_info_by_key.with(|defs| common_actions(&mat_keys, defs))).into_iter().map(|act| {
                                     let destructive = act.is_destructive();
                                     let label = format!("{}…", crate::helpers::verb_label(&act.name));
                                     let keys = mat_keys.clone();
@@ -1009,10 +1010,9 @@ pub fn GraphPage() -> impl IntoView {
                                             let tags = record.tags.clone();
                                             let ups = upstream.clone();
                                             let downs = downstream.clone();
-                                            let node_verbs = common_actions(
-                                                std::slice::from_ref(&record.asset_key),
-                                                &asset_info_by_key.get(),
-                                            );
+                                            let node_verbs = asset_info_by_key.with(|defs| {
+                                                common_actions(std::slice::from_ref(&record.asset_key), defs)
+                                            });
                                             let key_for_actions = record.asset_key.clone();
                                             view! {
                                                 <div class="dag-sidebar-header">
