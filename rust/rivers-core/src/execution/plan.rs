@@ -354,12 +354,16 @@ impl ExecutionPlan {
     }
 
     /// Effective asset names — all outputs for multi-asset steps, the step name otherwise.
-    pub fn all_asset_names(&self) -> Vec<String> {
+    pub fn asset_names(&self) -> impl Iterator<Item = &str> {
         self.steps
             .iter()
             .flat_map(|s| s.event_names())
-            .cloned()
-            .collect()
+            .map(String::as_str)
+    }
+
+    /// Owned [`ExecutionPlan::asset_names`].
+    pub fn all_asset_names(&self) -> Vec<String> {
+        self.asset_names().map(str::to_owned).collect()
     }
 
     /// Group steps into levels for parallel execution; level-N steps depend only on 0..N-1.
@@ -717,6 +721,8 @@ mod tests {
                 },
             ],
         };
+        assert!(plan.asset_names().eq(["out_a", "out_b", "step_2"]));
+
         let mut names = plan.all_asset_names();
         names.sort();
         assert_eq!(

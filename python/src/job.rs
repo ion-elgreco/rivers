@@ -656,7 +656,7 @@ impl PyJob {
         if let Some(action) = self.action.as_deref() {
             crate::repository::validate_partition_in_map(
                 node_map,
-                plan.all_asset_names().iter().map(String::as_str),
+                plan.asset_names(),
                 partition_key.as_ref(),
                 Some(action),
             )?;
