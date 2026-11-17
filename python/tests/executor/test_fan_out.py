@@ -73,6 +73,18 @@ class PidTrackingIOHandler(rs.PickleIOHandler):
         return super().load_input(context)
 
 
+class PartitionLoggingIOHandler(rs.PickleIOHandler):
+    """PickleIOHandler that records asset_name + partition keys on each load_input call."""
+
+    log_path: str
+
+    def load_input(self, context):
+        keys = [str(k) for k in context.partition.keys] if context.partition else []
+        with open(self.log_path, "a") as f:
+            f.write(f"{context.asset_name}:{','.join(keys)}\n")
+        return super().load_input(context)
+
+
 @rs.Task
 def consume_stream(items: object) -> list:
     return list(items)
@@ -866,6 +878,42 @@ class TestParallelGraphAssets:
             f"They should be loaded in loky subprocesses via _IOLoadSpec. "
             f"Parent loads: {parent_loads}"
         )
+
+    def test_collect_inputs_get_the_run_partition(self, executor_env, tmp_path):
+        """Every collected map instance is loaded with the run's partition."""
+        executor, _, _ = executor_env
+        store = obstore.store.LocalStore(str(tmp_path / "store"), mkdir=True)
+        log = tmp_path / "loads"
+        pio = PartitionLoggingIOHandler(store=store, log_path=str(log))
+        pdef = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @rs.Asset(io_handler=pio, partitions_def=pdef)
+        def nums_a() -> list:
+            return [1, 2, 3]
+
+        @rs.Asset(io_handler=pio, partitions_def=pdef)
+        def nums_b() -> list:
+            return [10, 20, 30]
+
+        @rs.Asset.from_graph(io_handler=pio, node_io_handler=pio, partitions_def=pdef)
+        def graph_a():
+            return sum_all(nums_a().map(double).collect())
+
+        @rs.Asset.from_graph(io_handler=pio, node_io_handler=pio, partitions_def=pdef)
+        def graph_b():
+            return sum_all(nums_b().map(double).collect())
+
+        repo = rs.CodeRepository(
+            assets=[nums_a, nums_b, graph_a, graph_b],
+            tasks=[double, sum_all],
+            default_executor=executor,
+        )
+        result = repo.materialize(partition_key=rs.PartitionKey.single("p2"))
+        assert result.success
+
+        loads = [line for line in log.read_text().splitlines() if "double__" in line]
+        assert len(loads) == 6, loads
+        assert all(line.endswith(":p2") for line in loads), loads
 
 
 # ---------------------------------------------------------------------------
