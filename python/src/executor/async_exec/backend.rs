@@ -34,7 +34,7 @@ fn python_not_attached_outcome() -> WorkOutcome {
 }
 
 struct SharedStepContext {
-    node_map: HashMap<String, ResolvedNode>,
+    node_map: Arc<HashMap<String, ResolvedNode>>,
     partition_key: Option<PyPartitionKey>,
     resources: HashMap<String, ResourceVariant>,
     config_overrides: Option<HashMap<String, Py<PyAny>>>,
@@ -48,7 +48,7 @@ struct SharedStepContext {
 impl SharedStepContext {
     fn clone_from(py: Python, ctx: &BatchContext) -> Self {
         Self {
-            node_map: ctx.repo.node_map.clone(),
+            node_map: Arc::clone(ctx.repo.node_map),
             partition_key: ctx.scope.partition_key.clone(),
             resources: ctx
                 .repo

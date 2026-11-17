@@ -50,7 +50,7 @@ pub struct PyJob {
     synthetic: bool,
     // Set after validation by CodeRepository:
     plan: Option<ExecutionPlan>,
-    node_map: Option<HashMap<String, ResolvedNode>>,
+    node_map: Option<Arc<HashMap<String, ResolvedNode>>>,
     /// Storage scoped to the owning code location, set by `CodeRepository`
     /// during resolve. `None` for unresolved jobs. Used by `run_record` (which
     /// short-circuits when this is None) and `execute_run` for materialization.
@@ -353,7 +353,7 @@ impl PyJob {
                 }
             }
         }
-        self.node_map = Some(subset);
+        self.node_map = Some(Arc::new(subset));
 
         Ok(())
     }
@@ -425,7 +425,7 @@ impl PyJob {
             .iter()
             .filter_map(|n| repo_node_map.get(n).map(|node| (n.clone(), node.clone())))
             .collect();
-        self.node_map = Some(subset);
+        self.node_map = Some(Arc::new(subset));
         Ok(())
     }
 }
@@ -680,7 +680,11 @@ impl PyJob {
 
     fn validated_parts(
         &self,
-    ) -> PyResult<(&ExecutionPlan, &HashMap<String, ResolvedNode>, &Executor)> {
+    ) -> PyResult<(
+        &ExecutionPlan,
+        &Arc<HashMap<String, ResolvedNode>>,
+        &Executor,
+    )> {
         let (plan, node_map) = self
             .plan
             .as_ref()

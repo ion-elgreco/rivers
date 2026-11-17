@@ -5,6 +5,7 @@
 //! can express their dependency narrowly (e.g. an IO helper takes `&Repo`,
 //! a state-mutating helper takes `&mut RunState`).
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
@@ -105,7 +106,7 @@ pub(crate) struct EventSink<'a> {
 
 /// Resolved repository data + execution scope (read-only deps).
 pub(crate) struct Repo<'a> {
-    pub node_map: &'a HashMap<String, ResolvedNode>,
+    pub node_map: &'a Arc<HashMap<String, ResolvedNode>>,
     pub graph_nodes: &'a GraphNodeMap,
     pub io_handler_registry: &'a IOHandlerRegistry,
     pub resources: &'a HashMap<String, ResourceVariant>,

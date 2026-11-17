@@ -17,6 +17,7 @@ pub(crate) mod run_lifecycle;
 pub(crate) mod traceback;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
@@ -245,7 +246,7 @@ impl Executor {
         &self,
         py: Python,
         plan: &ExecutionPlan,
-        node_map: &HashMap<String, ResolvedNode>,
+        node_map: &Arc<HashMap<String, ResolvedNode>>,
         partition_key: &Option<PyPartitionKey>,
         stored_key: Option<&rivers_core::storage::PartitionKey>,
         storage: StorageHandle,
@@ -358,7 +359,7 @@ impl Executor {
             let mut graph_nodes = GraphNodeMap {
                 final_nodes: HashMap::new(),
             };
-            for (name, node) in node_map {
+            for (name, node) in node_map.iter() {
                 if let Some(final_n) = node.graph_final_node() {
                     graph_nodes.final_nodes.insert(final_n, name.clone());
                 }
