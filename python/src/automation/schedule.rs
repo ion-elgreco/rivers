@@ -577,7 +577,12 @@ pub(crate) fn parse_schedule_result(
     }
 
     let apply_defaults = |req: &Bound<PyRunRequest>| -> PyResult<Py<PyRunRequest>> {
-        let mut request = req.borrow().clone();
+        let current = req.get();
+        if current.job_name.is_some() && (current.tags.is_some() || default_tags.is_none()) {
+            return Ok(req.clone().unbind());
+        }
+
+        let mut request = current.clone();
         if request.job_name.is_none() {
             request.job_name = Some(default_job_name.to_string());
         }

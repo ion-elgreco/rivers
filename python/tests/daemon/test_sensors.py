@@ -565,6 +565,57 @@ class TestSensorEvaluation:
         assert result.run_requests[0].job_name == "default_job"
         assert result.run_requests[1].job_name == "override"
 
+    @pytest.mark.parametrize(
+        ("sensor_kwargs", "job_name"),
+        [
+            ({"job_name": "default_job"}, "override"),
+            ({"asset_selection": ["a"]}, None),
+        ],
+        ids=["own_job_name", "no_default_job"],
+    )
+    def test_request_without_missing_default_returned_as_is(
+        self, sensor_kwargs, job_name
+    ):
+        req = rs.RunRequest(run_key="k", tags={"t": "v"}, job_name=job_name)
+
+        @rs.Sensor(**sensor_kwargs)
+        def my_sensor(context: rs.SensorEvaluationContext):
+            return [req]
+
+        @rs.Asset
+        def a() -> Any:
+            return 1
+
+        repo = rs.CodeRepository(assets=[a], sensors=[my_sensor])
+        result = repo.evaluate_sensor("my_sensor")
+
+        assert result.run_requests[0] is req
+        assert result.run_requests[0].job_name == job_name
+
+    def test_default_job_name_leaves_returned_request_unchanged(self):
+        req = rs.RunRequest(run_key="k", tags={"t": "v"}, partition_key="p")
+
+        @rs.Sensor(job_name="default_job")
+        def my_sensor(context: rs.SensorEvaluationContext):
+            return req
+
+        @rs.Asset
+        def a() -> Any:
+            return 1
+
+        repo = rs.CodeRepository(assets=[a], sensors=[my_sensor])
+        result = repo.evaluate_sensor("my_sensor")
+        out = result.run_requests[0]
+
+        assert out is not req
+        assert (out.run_key, out.tags, out.partition_key, out.job_name) == (
+            "k",
+            {"t": "v"},
+            "p",
+            "default_job",
+        )
+        assert req.job_name is None
+
     def test_evaluate_no_context_param(self):
         """Eval function without a context parameter should still work."""
 
