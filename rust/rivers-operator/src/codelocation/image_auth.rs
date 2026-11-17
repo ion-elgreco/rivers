@@ -94,7 +94,7 @@ fn pick_auth(auths: &BTreeMap<String, DockerConfigEntry>, registry: &str) -> Opt
     None
 }
 
-fn extract_host(key: &str) -> String {
+fn extract_host(key: &str) -> &str {
     let stripped = key
         .strip_prefix("https://")
         .or_else(|| key.strip_prefix("http://"))
@@ -104,7 +104,6 @@ fn extract_host(key: &str) -> String {
         .next()
         .unwrap_or(stripped)
         .trim_end_matches('/')
-        .to_string()
 }
 
 #[derive(serde::Deserialize)]
