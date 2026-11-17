@@ -60,23 +60,6 @@ impl AssetConditionState {
         self.is_initial = true;
         self.partition_state = None;
     }
-
-    /// Clone everything except `partition_state` (which can hold a
-    /// per-partition timestamp map far too large to copy around).
-    pub fn scalar_clone(&self) -> Self {
-        Self {
-            previous_results: self.previous_results.clone(),
-            dep_previous_results: self.dep_previous_results.clone(),
-            dep_baselines: self.dep_baselines.clone(),
-            last_handled_timestamp: self.last_handled_timestamp,
-            last_materialized_timestamp: self.last_materialized_timestamp,
-            last_data_version: self.last_data_version.clone(),
-            last_tick_timestamp: self.last_tick_timestamp,
-            condition_fingerprint: self.condition_fingerprint.clone(),
-            is_initial: self.is_initial,
-            partition_state: None,
-        }
-    }
 }
 
 /// Dispatch intent for one tick, persisted BEFORE its runs/backfills go out

@@ -1,5 +1,5 @@
 use super::*;
-use crate::condition::state::{EvalNodeResult, EvalResult};
+use crate::condition::state::{EvalNodeResult, EvalResult, update_condition_state};
 use crate::timegrid::TimeGrid;
 use ordermap::OrderSet;
 
@@ -400,6 +400,89 @@ fn dep_baseline_survives_unrelated_asset_fire() {
     // Tick 5: c acted on it → consumed.
     let out = pass.run(5000, false);
     assert!(!fired(&out, &pass, "c"), "tick 5: c consumed the change");
+}
+
+/// The dispatch intent holds the state the commit persists, partition map aside.
+#[test]
+fn pending_dispatch_state_matches_committed_state() {
+    let mut cache = AssetConditionCache::default();
+    let mut c = test_record("c");
+    c.last_timestamp = Some(100);
+    c.last_data_version = Some("c1".to_string());
+    cache.records.insert("c".to_string(), c);
+    let mut y = test_record("y");
+    y.last_timestamp = Some(50);
+    y.last_data_version = Some("y1".to_string());
+    cache.records.insert("y".to_string(), y.clone());
+    let mut z = test_record("z");
+    z.last_timestamp = Some(40);
+    cache.records.insert("z".to_string(), z);
+    cache
+        .upstream_deps
+        .insert("c".to_string(), vec!["y".to_string(), "z".to_string()]);
+
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            AssetConditionInfo {
+                asset_key: "z".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: None,
+                backfill_strategy: None,
+            },
+            AssetConditionInfo {
+                asset_key: "c".to_string(),
+                condition: ConditionNode::any_deps_match(
+                    ConditionNode::DataVersionChanged.newly_true(),
+                ),
+                partition_info: None,
+                backfill_strategy: None,
+            },
+        ],
+        HashMap::new(),
+    );
+    // Tick 1 fires on the first-seen version; tick 2 lowers the latch.
+    pass.run(1000, false);
+    pass.cache.in_progress_assets.clear();
+    pass.run(1500, false);
+
+    // A baseline for a dep c no longer reads must carry over.
+    let gone = DepBaseline {
+        last_materialized_timestamp: Some(1),
+        last_data_version: Some("g1".to_string()),
+    };
+    pass.eval_state
+        .assets
+        .get_mut("c")
+        .unwrap()
+        .dep_baselines
+        .insert("gone".to_string(), gone.clone());
+    y.last_timestamp = Some(60);
+    y.last_data_version = Some("y2".to_string());
+    pass.cache.records.insert("y".to_string(), y);
+
+    let mut out = pass.plan_tick(2000, false);
+    let pending = pass.pending_dispatch_states(&out, 2000);
+    let [(asset, state, _)] = pending.as_slice() else {
+        panic!("only c fires; got {} entries", pending.len());
+    };
+    assert_eq!(asset, "c");
+    assert!(!state.dep_previous_results.is_empty());
+    assert_eq!(state.dep_baselines.get("gone"), Some(&gone));
+    assert_eq!(
+        state.dep_baselines["y"].last_data_version.as_deref(),
+        Some("y2")
+    );
+    assert!(
+        !state.dep_baselines.contains_key("z"),
+        "z has its own condition"
+    );
+
+    pass.commit_tick(&mut out, &HashSet::new(), 2000);
+    let mut committed = pass.eval_state.assets["c"].clone();
+    committed.partition_state = None;
+    assert_eq!(state, &committed);
 }
 
 /// A fire is recorded for `WillBeRequested` even when the firing asset's own

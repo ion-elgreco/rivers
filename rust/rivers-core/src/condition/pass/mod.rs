@@ -13,7 +13,7 @@ use crate::condition::partition::{
 use crate::condition::state::{
     AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
     EvalResultRow, PendingDispatch, RequestedThisTick, RunTagSnapshot, StateUpdateContext,
-    commit_condition_state, update_condition_state, update_dep_baselines,
+    commit_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
 use jiff::civil;
@@ -421,7 +421,11 @@ impl ConditionPass {
         }
         self.stamp_dispatched_handled(&output.plan, &skip, now);
         let floors_moved = self.eval_state.failed_assets != self.cache.failed_asset_timestamps;
-        self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
+        if floors_moved {
+            self.eval_state
+                .failed_assets
+                .clone_from(&self.cache.failed_asset_timestamps);
+        }
         self.needs_retry = !skip.is_empty();
         !baseline_roots.is_empty() || floors_moved
     }
@@ -450,15 +454,19 @@ impl ConditionPass {
             let Some(prev) = self.eval_state.assets.get(&info.asset_key) else {
                 continue;
             };
-            let mut state = prev.scalar_clone();
-            let update_ctx = StateUpdateContext {
-                target_record_timestamp: record.last_timestamp,
-                target_data_version: record.last_data_version.as_ref(),
-                now,
-                is_initial: prev.is_initial,
-                partition_timestamps: None,
+
+            let mut state = AssetConditionState {
+                previous_results: row.result.sub_results.clone(),
+                dep_previous_results: row.result.dep_sub_results.clone(),
+                dep_baselines: HashMap::with_capacity(prev.dep_baselines.len()),
+                last_handled_timestamp: Some(now),
+                last_materialized_timestamp: record.last_timestamp,
+                last_data_version: record.last_data_version.clone(),
+                last_tick_timestamp: Some(now),
+                condition_fingerprint: prev.condition_fingerprint.clone(),
+                is_initial: false,
+                partition_state: None,
             };
-            update_condition_state(&mut state, &update_ctx, &row.result);
             if let Some(deps) = self.cache.upstream_deps.get(&info.asset_key) {
                 for dep in deps {
                     if self.active.contains(dep) {
@@ -474,7 +482,12 @@ impl ConditionPass {
                     );
                 }
             }
-            state.last_handled_timestamp = Some(now);
+            for (dep, baseline) in &prev.dep_baselines {
+                if !state.dep_baselines.contains_key(dep) {
+                    state.dep_baselines.insert(dep.clone(), baseline.clone());
+                }
+            }
+
             let mut dispatched_keys: Vec<PartitionKey> = output
                 .plan
                 .single_partition_groups
