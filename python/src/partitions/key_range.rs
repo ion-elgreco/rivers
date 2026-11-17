@@ -108,11 +108,8 @@ pub(crate) fn validate_single_dim_range(
             // not a partition key (same contract as Static membership). Name
             // the neighbouring valid keys so the typo is fixable.
             for (k, dt) in [(from_key, from_dt), (to_key, to_dt)] {
-                let single = PyPartitionKey::Single {
-                    key: vec![k.to_string()],
-                };
                 let on_grid = def
-                    .validate_partition_key(&single)
+                    .validate_values(&[k.to_string()])
                     .map_err(|e| e.to_string())?;
                 if !on_grid {
                     let hint = def
@@ -308,11 +305,8 @@ impl PyPartitionKeyRange {
                             let mut sorted: Vec<&String> = keys.iter().collect();
                             sorted.sort();
                             for k in sorted {
-                                let single = PyPartitionKey::Single {
-                                    key: vec![k.clone()],
-                                };
                                 let valid = dd
-                                    .validate_partition_key(&single)
+                                    .validate_values(std::slice::from_ref(k))
                                     .map_err(|e| e.to_string())?;
                                 if !valid {
                                     return Err(format!(
@@ -386,10 +380,7 @@ impl PyPartitionKeyRange {
                             }
                             DimensionSelection::Keys(keys) => {
                                 for k in keys {
-                                    let single = PyPartitionKey::Single {
-                                        key: vec![k.clone()],
-                                    };
-                                    if !dim_def.validate_partition_key(&single)? {
+                                    if !dim_def.validate_values(std::slice::from_ref(k))? {
                                         return Err(ExecutionError::new_err(format!(
                                             "'{k}' is not a partition key of dimension '{dim_name}'"
                                         )));

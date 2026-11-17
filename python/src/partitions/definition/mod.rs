@@ -616,19 +616,7 @@ impl PartitionsDefinition {
     /// Check if a partition key is valid for this definition.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
-            (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
-                Ok(!key.is_empty() && key.iter().all(|k| valid_keys.contains(k)))
-            }
-            (
-                Self::TimeWindow {
-                    cron_schedule,
-                    interval_seconds,
-                    start,
-                    end,
-                    fmt,
-                },
-                PyPartitionKey::Single { key },
-            ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
+            (_, PyPartitionKey::Single { key }) => self.validate_values(key),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
                 if keys.len() != dimensions.len() {
                     return Ok(false);
@@ -636,16 +624,8 @@ impl PartitionsDefinition {
                 for (dim_name, dim_def) in dimensions {
                     match keys.get(dim_name) {
                         Some(vals) => {
-                            if vals.is_empty() {
+                            if !dim_def.validate_values(vals)? {
                                 return Ok(false);
-                            }
-                            for val in vals {
-                                let single_key = PyPartitionKey::Single {
-                                    key: vec![val.clone()],
-                                };
-                                if !dim_def.validate_partition_key(&single_key)? {
-                                    return Ok(false);
-                                }
                             }
                         }
                         None => return Ok(false),
@@ -653,7 +633,6 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
             (_, PyPartitionKey::Set { keys }) => {
                 if keys.is_empty() {
                     return Ok(false);
@@ -666,6 +645,25 @@ impl PartitionsDefinition {
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    /// Whether `values` is a non-empty list of keys of this single-dimension
+    /// definition: the values of a `Single` key or of one dimension.
+    pub(crate) fn validate_values(&self, values: &[String]) -> PyResult<bool> {
+        match self {
+            Self::Static { keys } => {
+                Ok(!values.is_empty() && values.iter().all(|k| keys.contains(k)))
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => validate_time_window_key(values, cron_schedule, interval_seconds, start, end, fmt),
+            Self::Dynamic { .. } => Ok(!values.is_empty()),
+            Self::Multi { .. } => Ok(false),
         }
     }
 
@@ -753,10 +751,7 @@ impl PartitionsDefinition {
     fn valid_values(&self, values: &[String]) -> PyResult<Vec<String>> {
         let mut valid = Vec::new();
         for value in values {
-            let single = PyPartitionKey::Single {
-                key: vec![value.clone()],
-            };
-            if self.validate_partition_key(&single)? {
+            if self.validate_values(std::slice::from_ref(value))? {
                 valid.push(value.clone());
             }
         }
@@ -766,10 +761,7 @@ impl PartitionsDefinition {
     /// The first of `values` that is not a key of this definition.
     fn rejected_value<'a>(&self, values: &'a [String]) -> PyResult<Option<&'a String>> {
         for value in values {
-            let single = PyPartitionKey::Single {
-                key: vec![value.clone()],
-            };
-            if !self.validate_partition_key(&single)? {
+            if !self.validate_values(std::slice::from_ref(value))? {
                 return Ok(Some(value));
             }
         }

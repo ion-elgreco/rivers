@@ -175,11 +175,8 @@ impl PartitionMapping {
                 let def =
                     upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
                 let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
-                let shifted_key = PyPartitionKey::Single {
-                    key: vec![shifted.clone()],
-                };
                 if !def
-                    .validate_partition_key(&shifted_key)
+                    .validate_values(std::slice::from_ref(&shifted))
                     .map_err(|e| e.to_string())?
                 {
                     return Err(format!(
@@ -187,7 +184,7 @@ impl PartitionMapping {
                          which is not a partition of the upstream definition"
                     ));
                 }
-                Ok(shifted_key)
+                Ok(PyPartitionKey::Single { key: vec![shifted] })
             }
 
             Self::Multi { dimension_mappings } => match downstream_key {
