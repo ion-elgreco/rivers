@@ -196,6 +196,103 @@ def test_daily_validate():
     assert pd.validate_partition_key(rs.PartitionKey.single("2024-01-10")) is False
 
 
+JAN_1 = datetime.datetime(2024, 1, 1)
+HOUR = datetime.timedelta(hours=1)
+
+# (definition, keys it has, keys it lacks). The lacking keys are off the grid,
+# before the start, at or after the end, or a cron key written another way.
+TIME_KEY_GRIDS = [
+    pytest.param(
+        lambda: rs.PartitionsDefinition.hourly(start=JAN_1, end=JAN_1 + 48 * HOUR),
+        ["2024-01-01T00:00", "2024-01-01T05:00", "2024-01-02T23:00"],
+        [
+            "2024-01-01T05:30",
+            "2023-12-31T23:00",
+            "2024-01-03T00:00",
+            "2024-1-01T05:00",
+            "2024-01-01T5:00",
+            "2024-01-01",
+            "not a key",
+        ],
+        id="hourly",
+    ),
+    pytest.param(
+        lambda: rs.PartitionsDefinition.hourly(start=datetime.datetime(2000, 1, 1)),
+        ["2000-01-01T00:00", "2020-02-29T13:00"],
+        ["1999-12-31T23:00", "2999-01-01T00:00"],
+        id="hourly-to-now",
+    ),
+    pytest.param(
+        lambda: rs.PartitionsDefinition.time_window(
+            start=JAN_1,
+            cron_schedule="0 9 * * 1-5",
+            end=datetime.datetime(2024, 1, 15),
+            fmt="%Y-%m-%d %H:%M",
+        ),
+        ["2024-01-01 09:00", "2024-01-05 09:00", "2024-01-12 09:00"],
+        [
+            "2024-01-06 09:00",
+            "2024-01-05 10:00",
+            "2023-12-29 09:00",
+            "2024-01-15 09:00",
+            "2024-1-05 09:00",
+        ],
+        id="weekdays",
+    ),
+    pytest.param(
+        lambda: rs.PartitionsDefinition.time_window(
+            start=JAN_1,
+            cron_schedule="0 0 1 * *",
+            end=datetime.datetime(2025, 1, 1),
+            fmt="%Y-%m",
+        ),
+        ["2024-01", "2024-12"],
+        ["2023-12", "2025-01", "2024-1", "2024-13"],
+        id="monthly",
+    ),
+    pytest.param(
+        lambda: rs.PartitionsDefinition.time_window(
+            start=JAN_1,
+            cron_schedule="*/15 * * * * *",
+            end=JAN_1 + HOUR,
+            fmt="%Y-%m-%dT%H:%M:%S%.f",
+        ),
+        ["2024-01-01T00:00:15", "2024-01-01T00:59:45"],
+        [
+            "2024-01-01T00:00:10",
+            "2024-01-01T00:00:15.5",
+            "2024-01-01T00:00:15.0",
+            "2024-01-01T01:00:00",
+        ],
+        id="seconds",
+    ),
+    pytest.param(
+        lambda: rs.PartitionsDefinition.time_window(
+            start=JAN_1 + HOUR / 2, interval_seconds=3600, end=JAN_1 + 48 * HOUR
+        ),
+        ["2024-01-01T00:30:00", "2024-01-02T23:30:00"],
+        ["2024-01-01T01:00:00", "2024-01-01T00:00:00", "2024-01-03T00:30:00"],
+        id="interval",
+    ),
+]
+
+
+@pytest.mark.parametrize(("make_def", "has", "lacks"), TIME_KEY_GRIDS)
+def test_time_window_validate_keys(make_def, has, lacks):
+    """A time key is valid when it is a tick of the grid in [start, end), and
+    a key with several values only when each value is."""
+    pd = make_def()
+    for key in has:
+        assert pd.validate_partition_key(rs.PartitionKey.single(key)) is True, key
+    for key in lacks:
+        assert pd.validate_partition_key(rs.PartitionKey.single(key)) is False, key
+
+    assert pd.validate_partition_key(rs.PartitionKey.single(has)) is True
+    for key in lacks:
+        batch = rs.PartitionKey.single([*has, key])
+        assert pd.validate_partition_key(batch) is False, key
+
+
 # ---------------------------------------------------------------------------
 # Multi
 # ---------------------------------------------------------------------------

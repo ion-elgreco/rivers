@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use croner::Cron;
 use jiff::{SignedDuration, civil};
 use pyo3::prelude::*;
@@ -107,11 +109,13 @@ pub(super) fn validate_time_window_key(
     end: &Option<civil::DateTime>,
     fmt: &str,
 ) -> PyResult<bool> {
-    let now = jiff::Zoned::now().datetime();
-    let end_dt = end.unwrap_or(now);
     if key.is_empty() {
         return Ok(false);
     }
+    let end_dt = time_window_end(end);
+    let mut cron = None;
+    let mut text = String::new();
+
     for k in key {
         let dt = match parse_key_datetime(k, fmt) {
             Ok(dt) => dt,
@@ -130,17 +134,16 @@ pub(super) fn validate_time_window_key(
                 return Ok(false);
             }
         } else if let Some(expr) = cron_schedule {
-            let window_start = (dt - SignedDuration::from_hours(26)).max(*start);
-            let window_end = (dt + SignedDuration::from_hours(26)).min(end_dt);
-            let mut found = false;
-            for_each_cron_tick(expr, &window_start, window_end, |naive| {
-                if naive.strftime(fmt).to_string() == *k {
-                    found = true;
-                    return false;
-                }
-                true
-            })?;
-            if !found {
+            let cron = match cron {
+                Some(ref cron) => cron,
+                None => cron.insert(parse_cron(expr)?),
+            };
+            let on_grid =
+                dt.subsec_nanosecond() == 0 && cron.is_time_matching(&dt).unwrap_or(false);
+
+            // The fmt round-trips the grid, so only the tick at `dt` can have the key's text.
+            text.clear();
+            if !on_grid || write!(text, "{}", dt.strftime(fmt)).is_err() || text != *k {
                 return Ok(false);
             }
         }
