@@ -190,7 +190,7 @@ fn rollout_reads_the_tree_from_the_pod_template() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
-        Some(&pieces),
+        Some(pieces),
     );
     d.metadata.generation = Some(2);
     d.status = Some(DeploymentStatus {

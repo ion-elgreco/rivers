@@ -286,7 +286,7 @@ pub(super) async fn apply_git_workspace(
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,
-        Some(&pieces),
+        Some(pieces),
     );
     let service = build_service(cl);
     let (deployed, served) = tokio::join!(

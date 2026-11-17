@@ -564,7 +564,7 @@ mod tests {
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),
-                Some(&workspace::builder_pod_pieces(
+                Some(workspace::builder_pod_pieces(
                     &tree(),
                     &workspace_cfg.prune(&cl.name_any()),
                 )),
