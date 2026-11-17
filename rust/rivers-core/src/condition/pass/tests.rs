@@ -889,6 +889,18 @@ fn dynamic_universe_mirrors_storage_including_retirement() {
     assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
     refresh_universe(&mut universe, &mut all_keys, now, &HashMap::new());
     assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
+
+    let swapped: HashMap<String, HashSet<String>> = [(
+        "colors".to_string(),
+        ["green".to_string()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let changed = refresh_universe(&mut universe, &mut all_keys, now, &swapped);
+    assert!(changed, "same size, other key");
+    assert_eq!(all_keys, [spk("green")].into_iter().collect::<HashSet<_>>());
+    let changed = refresh_universe(&mut universe, &mut all_keys, now, &swapped);
+    assert!(!changed);
 }
 
 /// A conditioned dep's universe change reaches the dep pivot of a conditioned
