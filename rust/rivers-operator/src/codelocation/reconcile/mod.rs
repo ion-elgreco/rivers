@@ -110,18 +110,18 @@ pub enum Error {
 /// the controller runtime when to requeue.
 pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = cl.name_any();
-    let namespace = cl.namespace().unwrap_or(ctx.namespace.clone());
+    let namespace = cl.metadata.namespace.as_deref().unwrap_or(&ctx.namespace);
 
-    let code_locations_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), &namespace);
-    let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &namespace);
-    let services_api: Api<Service> = Api::namespaced(ctx.client.clone(), &namespace);
-    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+    let code_locations_api: Api<CodeLocation> = Api::namespaced(ctx.client.clone(), namespace);
+    let deployments_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
+    let services_api: Api<Service> = Api::namespaced(ctx.client.clone(), namespace);
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
 
     if cl.spec.is_git() {
         return reconcile_git(
             &cl,
             &ctx,
-            &namespace,
+            namespace,
             &code_locations_api,
             &secrets_api,
             &deployments_api,
@@ -131,7 +131,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
     }
 
     if !ctx.leader.is_leader() {
-        return follow_image(&cl, &ctx, &namespace, &code_locations_api, &deployments_api).await;
+        return follow_image(&cl, &ctx, namespace, &code_locations_api, &deployments_api).await;
     }
 
     let timer = Instant::now();
@@ -176,14 +176,14 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         .get_status(&deployment_name(&name))
         .await
         .ok();
-    let workspace_kept = remove_git_workspace(&cl, &ctx, &namespace, observed.as_ref()).await?;
+    let workspace_kept = remove_git_workspace(&cl, &ctx, namespace, observed.as_ref()).await?;
     let keeps_workspace = workspace_kept.is_some();
     let pass = ImagePass {
         image: resolved_image,
         image_reason,
         workspace_kept,
     };
-    let settled = patch_image_status(&cl, &ctx, &namespace, observed.as_ref(), Some(pass)).await?;
+    let settled = patch_image_status(&cl, &ctx, namespace, observed.as_ref(), Some(pass)).await?;
 
     let requeue = if !settled {
         Action::requeue(DEPLOYMENT_ROLLOUT_POLL)

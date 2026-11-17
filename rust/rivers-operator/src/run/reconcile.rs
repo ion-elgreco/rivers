@@ -58,10 +58,10 @@ pub enum Error {
 /// deletion-timestamp branch can run cleanup before the CR vanishes.
 pub async fn reconcile(run: Arc<Run>, ctx: Arc<Context>) -> Result<Action, Error> {
     let name = run.name_any();
-    let ns = run.namespace().unwrap_or(ctx.namespace.clone());
+    let ns = run.metadata.namespace.as_deref().unwrap_or(&ctx.namespace);
 
-    let runs_api: Api<Run> = Api::namespaced(ctx.client.clone(), &ns);
-    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let runs_api: Api<Run> = Api::namespaced(ctx.client.clone(), ns);
+    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
 
     if run.metadata.deletion_timestamp.is_some() {
         return handle_deletion(&runs_api, &pods_api, &run, &name, &ctx).await;
