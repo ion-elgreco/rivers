@@ -187,10 +187,7 @@ impl SurrealStorage {
         if records.is_empty() {
             return Ok(true);
         }
-        let events: Vec<DbEventWrite> = records
-            .iter()
-            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
-            .collect();
+        let event_ids: Vec<RecordId> = records.iter().map(|_| new_event_record_id()).collect();
         let now = now_nanos();
         let links: Vec<BackfillRunRow> = records
             .iter()
@@ -205,6 +202,11 @@ impl SurrealStorage {
             .collect();
 
         let result = retry::with_retry(&self.retry_config, || async {
+            let events: Vec<DbEventWrite> = records
+                .iter()
+                .zip(&event_ids)
+                .map(|(r, id)| run_queued_row(r, id.clone()))
+                .collect();
             self.db
                 .query(format!(
                     "BEGIN TRANSACTION;\n\
@@ -214,7 +216,7 @@ impl SurrealStorage {
                      COMMIT TRANSACTION;"
                 ))
                 .bind(("runs", records.to_vec()))
-                .bind(("events", events.clone()))
+                .bind(("events", events))
                 .bind(("links", links.clone()))
                 .await
                 .context("failed to enqueue backfill runs batch")?

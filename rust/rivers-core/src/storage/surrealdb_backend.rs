@@ -33,7 +33,7 @@ mod run_queue;
 use backfills::load_backfill_progress;
 use queries::*;
 use rows::*;
-use run_queue::run_queued_event;
+use run_queue::run_queued_row;
 
 /// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was constructed with.
 #[derive(Debug, Clone)]
