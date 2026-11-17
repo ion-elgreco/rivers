@@ -30,7 +30,7 @@ pub fn schema_to_ipc_bytes(schema: &Schema) -> Vec<u8> {
         &mut arrow_ipc::writer::DictionaryTracker::new(false),
         &Default::default(),
     );
-    encoded.ipc_message.to_vec()
+    encoded.ipc_message
 }
 
 /// Deserialize an Arrow schema from IPC bytes.
