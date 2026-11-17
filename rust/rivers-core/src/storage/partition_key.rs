@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use anyhow::Result;
-use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
+use surrealdb::types::{Error as SurrealError, Kind, Object, SurrealValue, Value};
 
 use super::key_item::{self, KeyItem};
 
@@ -391,52 +391,52 @@ impl SurrealValue for PartitionKey {
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
-        if let Ok(s) = String::from_value(value.clone()) {
+        if let Value::String(s) = value {
             return Ok(Self::Single { keys: vec![s] });
         }
 
-        let map = <std::collections::BTreeMap<String, Value>>::from_value(value)?;
+        let mut map = Object::from_value(value)?;
         let variant = map
-            .get("variant")
-            .and_then(|v| String::from_value(v.clone()).ok())
+            .remove("variant")
+            .and_then(|v| String::from_value(v).ok())
             .unwrap_or_default();
         match variant.as_str() {
             "Single" => {
                 let keys = map
-                    .get("keys")
-                    .map(|v| Vec::<String>::from_value(v.clone()))
+                    .remove("keys")
+                    .map(Vec::<String>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Single { keys })
             }
             "Multi" => {
                 let dims = map
-                    .get("dims")
-                    .map(|v| Vec::<(String, Vec<String>)>::from_value(v.clone()))
+                    .remove("dims")
+                    .map(Vec::<(String, Vec<String>)>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Multi { dims })
             }
             "Set" => {
                 let keys = map
-                    .get("keys")
-                    .map(|v| Vec::<PartitionKey>::from_value(v.clone()))
+                    .remove("keys")
+                    .map(Vec::<PartitionKey>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Set { keys })
             }
             "SingleItems" => {
                 let items = map
-                    .get("items")
-                    .map(|v| Vec::<KeyItem>::from_value(v.clone()))
+                    .remove("items")
+                    .map(Vec::<KeyItem>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::SingleItems { items })
             }
             "MultiItems" => {
                 let dims = map
-                    .get("dims")
-                    .map(|v| Vec::<(String, Vec<KeyItem>)>::from_value(v.clone()))
+                    .remove("dims")
+                    .map(Vec::<(String, Vec<KeyItem>)>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::MultiItems { dims })

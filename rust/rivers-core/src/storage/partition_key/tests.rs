@@ -181,6 +181,28 @@ fn a_stored_key_with_a_span_reads_back_as_it_was() {
 }
 
 #[test]
+fn a_stored_key_reads_back_as_it_was() {
+    let single = PartitionKey::Single {
+        keys: strings(&["2024-01-01"]),
+    };
+    let multi = zone_run_expanded();
+    let set = PartitionKey::Set {
+        keys: vec![single.clone(), multi.clone()],
+    };
+    for key in [single, multi, set] {
+        let read = PartitionKey::from_value(key.clone().into_value()).unwrap();
+        assert_eq!(read, key, "{}", key.to_display());
+    }
+
+    assert_eq!(
+        PartitionKey::from_value("2024-01-01".to_string().into_value()).unwrap(),
+        PartitionKey::Single {
+            keys: strings(&["2024-01-01"])
+        }
+    );
+}
+
+#[test]
 fn half_a_year_of_hours_for_one_zone_is_a_small_key() {
     let key = PartitionKey::MultiItems {
         dims: vec![

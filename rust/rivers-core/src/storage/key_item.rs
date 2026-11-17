@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use jiff::{SignedDuration, civil};
-use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
+use surrealdb::types::{Error as SurrealError, Kind, Object, SurrealValue, Value};
 
 use crate::timegrid::{TimeGrid, cron_ticks, cron_ticks_from, parse_cron};
 use crate::util::parse_key_datetime;
@@ -383,11 +383,11 @@ impl SurrealValue for KeyItem {
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
-        if let Ok(value) = String::from_value(value.clone()) {
+        if let Value::String(value) = value {
             return Ok(Self::Value(value));
         }
 
-        let mut map = <std::collections::BTreeMap<String, Value>>::from_value(value)?;
+        let mut map = Object::from_value(value)?;
         let mut text = |field: &str| {
             map.remove(field)
                 .ok_or_else(|| SurrealError::internal(format!("a key span has no '{field}'")))
