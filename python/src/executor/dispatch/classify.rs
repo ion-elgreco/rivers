@@ -59,9 +59,9 @@ pub(crate) fn classify_step(
                 return StepAction::Handled;
             }
             let cut_off = prior.starts > prior.retries;
-            let may_rerun = ctx.retry_policy_for(step).is_some_and(|p| {
-                should_retry(&p, FailureReason::Infrastructure, &[], prior.starts)
-            });
+            let may_rerun = ctx
+                .retry_policy_for(step)
+                .is_some_and(|p| should_retry(p, FailureReason::Infrastructure, &[], prior.starts));
             if cut_off && !may_rerun {
                 let msg = "Interrupted by a restart; an action with no retry budget left \
                            is not run again";

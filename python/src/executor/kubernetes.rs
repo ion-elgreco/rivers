@@ -685,8 +685,8 @@ impl ExecutorBackend for KubernetesBackend {
                     step_name: step.name.clone(),
                     event_names: inst.event_names.clone(),
                     mapping_key: inst.mapping_key.clone(),
-                    policy: ctx.retry_policy_for(step),
-                    compute: ctx.compute_for(step),
+                    policy: ctx.retry_policy_for(step).cloned(),
+                    compute: ctx.compute_for(step).cloned(),
                 }
             })
             .collect();

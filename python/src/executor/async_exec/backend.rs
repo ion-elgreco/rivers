@@ -319,7 +319,7 @@ impl ExecutorBackend for AsyncBackend {
                 if let Some((src, value)) = inst.fan_out {
                     input_overrides.insert(src, value);
                 }
-                let retry = ctx.retry_policy_for(&step);
+                let retry = ctx.retry_policy_for(&step).cloned();
                 let action_key = ctx.action_step_partition_key(&step);
                 let cut_offs = step
                     .event_names()

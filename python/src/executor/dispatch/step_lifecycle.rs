@@ -143,7 +143,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             break start_not_stored(e);
         }
         let mut outcome = worker.run_work(py, ctx);
-        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, &policy) else {
+        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, policy) else {
             break outcome;
         };
         let (reason, exc_types) = classify_pyerr(py, error);

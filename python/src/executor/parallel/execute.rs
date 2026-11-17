@@ -592,7 +592,9 @@ impl ParallelBackend {
                 asset_scope: inst.asset_scope,
                 event_names: inst.event_names,
                 instance_name: inst.instance_name,
-                retry: ctx.retry_policy_for(&ctx.scope.plan.steps[inst.idx]),
+                retry: ctx
+                    .retry_policy_for(&ctx.scope.plan.steps[inst.idx])
+                    .cloned(),
             });
         }
 
