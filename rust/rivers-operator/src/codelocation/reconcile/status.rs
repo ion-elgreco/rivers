@@ -522,13 +522,10 @@ pub(super) async fn patch_status(
     cl: &CodeLocation,
     status: &CodeLocationStatus,
 ) -> Result<(), kube_client::Error> {
-    let unchanged = cl.status.as_ref().is_some_and(|prior| {
-        *status
-            == CodeLocationStatus {
-                last_reconciled: status.last_reconciled.clone(),
-                ..prior.clone()
-            }
-    });
+    let unchanged = cl
+        .status
+        .as_ref()
+        .is_some_and(|prior| same_but_last_reconciled(status, prior));
     if unchanged {
         return Ok(());
     }
@@ -545,6 +542,38 @@ pub(super) async fn patch_status(
         )
         .await?;
     Ok(())
+}
+
+/// Whether every field of `status` but `lastReconciled` is as `prior` has it.
+fn same_but_last_reconciled(status: &CodeLocationStatus, prior: &CodeLocationStatus) -> bool {
+    // No `..`: a new status field must be compared here.
+    let CodeLocationStatus {
+        phase,
+        observed_generation,
+        resolved_image,
+        grpc_endpoint,
+        last_reconciled: _,
+        ready_replicas,
+        message,
+        conditions,
+        source,
+        resolved_commit,
+        resolved_ref,
+        last_fetched_at,
+        run_source,
+    } = status;
+    *phase == prior.phase
+        && *observed_generation == prior.observed_generation
+        && *resolved_image == prior.resolved_image
+        && *grpc_endpoint == prior.grpc_endpoint
+        && *ready_replicas == prior.ready_replicas
+        && *message == prior.message
+        && *conditions == prior.conditions
+        && *source == prior.source
+        && *resolved_commit == prior.resolved_commit
+        && *resolved_ref == prior.resolved_ref
+        && *last_fetched_at == prior.last_fetched_at
+        && *run_source == prior.run_source
 }
 
 /// `cl`'s status for a pass at `at` in `phase`. It keeps what the prior
@@ -723,5 +752,62 @@ mod tests {
             "v1.2.3@9f3c1ab"
         );
         assert_eq!(source_display(&at(None)), "9f3c1ab (pinned)");
+    }
+
+    #[test]
+    fn same_but_last_reconciled_sees_every_other_field() {
+        let prior: CodeLocationStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Ready",
+            "observedGeneration": 7,
+            "resolvedImage": "ghcr.io/acme/rivers-runtime@sha256:aaaa",
+            "grpcEndpoint": "x.y.svc.cluster.local:3001",
+            "lastReconciled": "2026-11-17T10:00:00Z",
+            "readyReplicas": 1,
+            "message": "rolling out",
+            "conditions": [{
+                "type": CONDITION_DEPLOYMENT_AVAILABLE,
+                "status": "True",
+                "lastTransitionTime": "2026-11-17T09:00:00Z",
+                "reason": REASON_MIN_REPLICAS,
+            }],
+            "source": "main@9f3c1ab",
+            "resolvedCommit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+            "resolvedRef": "refs/heads/main",
+            "lastFetchedAt": "2026-11-17T09:59:00Z",
+            "runSource": {
+                "git": {
+                    "url": "https://forge.example/r.git",
+                    "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                },
+                "dependencies": { "mode": "auto" },
+                "runtimeImage": "ghcr.io/acme/rivers-runtime@sha256:aaaa",
+            },
+        }))
+        .unwrap();
+        let later = CodeLocationStatus {
+            last_reconciled: Some("2026-11-17T10:00:30Z".into()),
+            ..prior.clone()
+        };
+        assert!(same_but_last_reconciled(&later, &prior));
+
+        let changes: [fn(&mut CodeLocationStatus); 12] = [
+            |s| s.phase = Some(CodeLocationPhase::Failed),
+            |s| s.observed_generation = Some(8),
+            |s| s.resolved_image = None,
+            |s| s.grpc_endpoint = None,
+            |s| s.ready_replicas = Some(0),
+            |s| s.message = None,
+            |s| s.conditions[0].status = "False".into(),
+            |s| s.source = None,
+            |s| s.resolved_commit = None,
+            |s| s.resolved_ref = None,
+            |s| s.last_fetched_at = None,
+            |s| s.run_source = None,
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut status = later.clone();
+            change(&mut status);
+            assert!(!same_but_last_reconciled(&status, &prior), "change {i}");
+        }
     }
 }
