@@ -297,42 +297,73 @@ pub fn update_condition_state(
     ctx: &StateUpdateContext,
     result: &EvalResult,
 ) {
+    update_scalars(state, ctx);
+    state.previous_results = result.sub_results.clone();
+    state.dep_previous_results = result.dep_sub_results.clone();
+
+    let Some(sub_selections) = &result.sub_selections else {
+        state.partition_state = None;
+        return;
+    };
+    if let Some(ps) = sync_partition_state(state, ctx) {
+        ps.previous_selections = sub_selections.clone();
+        if let Some(dep_sub_selections) = &result.dep_sub_selections {
+            ps.dep_previous_selections = dep_sub_selections.clone();
+        }
+    }
+}
+
+/// [`update_condition_state`] that moves the latches out of `result`
+/// instead of copying them.
+pub fn commit_condition_state(
+    state: &mut AssetConditionState,
+    ctx: &StateUpdateContext,
+    result: &mut EvalResult,
+) {
+    update_scalars(state, ctx);
+    state.previous_results = std::mem::take(&mut result.sub_results);
+    state.dep_previous_results = std::mem::take(&mut result.dep_sub_results);
+
+    let Some(sub_selections) = result.sub_selections.take() else {
+        state.partition_state = None;
+        return;
+    };
+    if let Some(ps) = sync_partition_state(state, ctx) {
+        ps.previous_selections = sub_selections;
+        if let Some(dep_sub_selections) = result.dep_sub_selections.take() {
+            ps.dep_previous_selections = dep_sub_selections;
+        }
+    }
+}
+
+fn update_scalars(state: &mut AssetConditionState, ctx: &StateUpdateContext) {
     state.is_initial = false;
     state.last_materialized_timestamp = ctx.target_record_timestamp;
     state.last_data_version = ctx.target_data_version.cloned();
     state.last_tick_timestamp = Some(ctx.now);
-    state.previous_results = result.sub_results.clone();
-    state.dep_previous_results = result.dep_sub_results.clone();
+}
 
-    if let Some(sub_selections) = &result.sub_selections {
-        if let Some(timestamps) = ctx.partition_timestamps {
-            let ps = state
-                .partition_state
-                .get_or_insert_with(PartitionState::default);
-            // Latches are stable on most ticks; comparing first skips a
-            // potentially 1M-key deep clone (equality is allocation-free).
-            if ps.previous_selections != *sub_selections {
-                ps.previous_selections = sub_selections.clone();
+/// Sync the partition timestamps to `ctx` and reset `handled`; `None` when
+/// `ctx` carries no partition timestamps.
+fn sync_partition_state<'s>(
+    state: &'s mut AssetConditionState,
+    ctx: &StateUpdateContext,
+) -> Option<&'s mut PartitionState> {
+    let timestamps = ctx.partition_timestamps?;
+    let ps = state
+        .partition_state
+        .get_or_insert_with(PartitionState::default);
+    ps.timestamps.retain(|key, _| timestamps.contains_key(key));
+    for (key, ts) in timestamps {
+        match ps.timestamps.get_mut(key) {
+            Some(v) => *v = *ts,
+            None => {
+                ps.timestamps.insert(key.clone(), *ts);
             }
-            if let Some(dep_sub_selections) = &result.dep_sub_selections
-                && ps.dep_previous_selections != *dep_sub_selections
-            {
-                ps.dep_previous_selections = dep_sub_selections.clone();
-            }
-            ps.timestamps.retain(|key, _| timestamps.contains_key(key));
-            for (key, ts) in timestamps {
-                match ps.timestamps.get_mut(key) {
-                    Some(v) => *v = *ts,
-                    None => {
-                        ps.timestamps.insert(key.clone(), *ts);
-                    }
-                }
-            }
-            ps.handled.clear();
         }
-    } else {
-        state.partition_state = None;
     }
+    ps.handled.clear();
+    Some(ps)
 }
 
 /// Establish timestamp / data-version baselines for upstream deps that don't

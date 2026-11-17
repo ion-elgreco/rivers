@@ -82,11 +82,11 @@ fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
         selection: row.result.selection.clone(),
     }];
     let plan = pass.classify_materializations(to_mat);
-    let output = PassOutput {
+    let mut output = PassOutput {
         results: vec![row],
         plan,
     };
-    pass.commit_tick(&output, &HashSet::new(), 5000);
+    pass.commit_tick(&mut output, &HashSet::new(), 5000);
     pass.eval_state.assets["down"].last_handled_timestamp
 }
 
@@ -939,7 +939,7 @@ fn commit_marks_only_surviving_keys_handled() {
         )),
     }]);
     pass.commit_tick(
-        &PassOutput {
+        &mut PassOutput {
             results: vec![],
             plan,
         },
@@ -1222,11 +1222,11 @@ fn commit_marks_all_selection_keys_handled() {
         asset_key: "down".to_string(),
         selection: Some(PartitionSelection::All),
     }]);
-    let output = PassOutput {
+    let mut output = PassOutput {
         results: vec![],
         plan,
     };
-    pass.commit_tick(&output, &HashSet::new(), 2);
+    pass.commit_tick(&mut output, &HashSet::new(), 2);
     let mut backfills = output.plan.multi_partition_backfills;
     assert_eq!(
         backfills.len(),

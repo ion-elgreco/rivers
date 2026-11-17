@@ -180,7 +180,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     pass.refresh_cache(&storage, 4_000).await.unwrap();
 
     // The dep update fires dst, but its dispatch fails.
-    let out = pass.plan_tick(4_000, false);
+    let mut out = pass.plan_tick(4_000, false);
     assert!(
         out.plan.unpartitioned.contains(&"dst".to_string()),
         "precondition: the dep update must fire dst"
@@ -191,7 +191,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     pass.cache.clear_dispatched_run("dst", "run-fail");
     // …and commit the tick with dst's dispatch marked failed.
     let failed: HashSet<String> = ["dst".to_string()].into_iter().collect();
-    let dirty = pass.commit_tick(&out, &failed, 4_000);
+    let dirty = pass.commit_tick(&mut out, &failed, 4_000);
     assert!(
         !dirty,
         "an all-failed tick leaves no latch state to persist"
@@ -201,25 +201,25 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         !pass.should_skip(false),
         "a failed dispatch must force a retry evaluation even with no new changes"
     );
-    let retry = pass.plan_tick(5_000, false);
+    let mut retry = pass.plan_tick(5_000, false);
     assert!(
         retry.plan.unpartitioned.contains(&"dst".to_string()),
         "the un-consumed dep trigger must re-fire on the retry tick"
     );
-    let dirty = pass.commit_tick(&retry, &HashSet::new(), 5_000);
+    let dirty = pass.commit_tick(&mut retry, &HashSet::new(), 5_000);
     assert!(dirty, "a committed fire consumes latches and must persist");
 
     assert!(
         pass.should_skip(false),
         "after a successful commit the pass may skip no-change ticks again"
     );
-    let done = pass.plan_tick(6_000, false);
+    let mut done = pass.plan_tick(6_000, false);
     assert!(
         done.plan.is_empty(),
         "the trigger must be consumed exactly once after a successful dispatch; got {:?}",
         done.plan.unpartitioned
     );
-    let dirty = pass.commit_tick(&done, &HashSet::new(), 6_000);
+    let dirty = pass.commit_tick(&mut done, &HashSet::new(), 6_000);
     assert!(
         !dirty,
         "a passive tick has nothing latch-bearing to persist"

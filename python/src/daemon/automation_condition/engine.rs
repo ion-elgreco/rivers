@@ -93,7 +93,7 @@ impl ConditionTickEngine {
             && !self.pass.needs_retry
             && self.pass.has_time_based
             && self.pass.time_based_eval_set.is_some();
-        let output = self.pass.plan_tick(now, selective);
+        let mut output = self.pass.plan_tick(now, selective);
 
         if tracing::enabled!(target: "rivers::dbg::cond", tracing::Level::TRACE) {
             let mut fired: Vec<&str> = Vec::new();
@@ -224,7 +224,7 @@ impl ConditionTickEngine {
         }
         // Latches advance only for assets whose dispatch went out; failed
         // ones stay armed and force a retry evaluation next tick.
-        let dirty = self.pass.commit_tick(&output, &dispatch_failed, now);
+        let dirty = self.pass.commit_tick(&mut output, &dispatch_failed, now);
 
         // Latch-consuming ticks persist immediately; passive ticks only
         // refresh derivable views, and the full-blob write is the dominant

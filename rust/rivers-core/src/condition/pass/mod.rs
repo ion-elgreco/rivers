@@ -13,7 +13,7 @@ use crate::condition::partition::{
 use crate::condition::state::{
     AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
     EvalNodeResult, EvalResult, PendingDispatch, RunTagSnapshot, StateUpdateContext,
-    update_condition_state, update_dep_baselines,
+    commit_condition_state, update_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
 use jiff::civil;
@@ -304,8 +304,8 @@ impl ConditionPass {
     /// all-successful [`commit_tick`](Self::commit_tick); dispatching callers
     /// use the split so a failed dispatch never consumes eval-state latches.
     pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
-        let output = self.plan_tick(now, selective);
-        self.commit_tick(&output, &HashSet::new(), now);
+        let mut output = self.plan_tick(now, selective);
+        self.commit_tick(&mut output, &HashSet::new(), now);
         output
     }
 
@@ -347,10 +347,11 @@ impl ConditionPass {
         PassOutput { results, plan }
     }
 
-    /// Advance eval-state latches for a planned tick. Fired assets named in
-    /// `dispatch_failed` — and fired assets whose selection classified to
-    /// nothing dispatchable — keep their pre-tick state so their trigger
-    /// re-fires on the retry evaluation this schedules.
+    /// Advance eval-state latches for a planned tick, moving them out of
+    /// `output`. Fired assets named in `dispatch_failed` — and fired assets
+    /// whose selection classified to nothing dispatchable — keep their
+    /// pre-tick state so their trigger re-fires on the retry evaluation this
+    /// schedules.
     ///
     /// Returns whether the state materially advanced (latches consumed via a
     /// fire or initial baseline seeding, or failure floors moved) — passive
@@ -358,7 +359,7 @@ impl ConditionPass {
     /// persistence.
     pub fn commit_tick(
         &mut self,
-        output: &PassOutput,
+        output: &mut PassOutput,
         dispatch_failed: &HashSet<String>,
         now: i64,
     ) -> bool {
@@ -374,7 +375,7 @@ impl ConditionPass {
         }
 
         let mut baseline_roots: Vec<String> = Vec::new();
-        for row in &output.results {
+        for row in &mut output.results {
             let info = &self.conditions[row.info_idx];
             if skip.contains(&info.asset_key) {
                 continue;
@@ -399,7 +400,7 @@ impl ConditionPass {
                 is_initial: was_initial,
                 partition_timestamps,
             };
-            update_condition_state(prev, &update_ctx, &row.result);
+            commit_condition_state(prev, &update_ctx, &mut row.result);
 
             if row.result.fired || was_initial {
                 baseline_roots.push(info.asset_key.clone());
