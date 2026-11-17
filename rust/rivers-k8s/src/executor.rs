@@ -210,10 +210,12 @@ fn build_job_inner(
         args.extend(["--mapping-key".to_string(), key.to_string()]);
     }
 
-    let workspace_pieces = config
-        .workspace
-        .as_ref()
-        .map(crate::workspace::consumer_pod_pieces);
+    let graft = crate::workspace::PodGraft::from(
+        config
+            .workspace
+            .as_ref()
+            .map(crate::workspace::consumer_pod_pieces),
+    );
 
     Job {
         metadata: ObjectMeta {
@@ -245,36 +247,16 @@ fn build_job_inner(
                 spec: Some(PodSpec {
                     service_account_name: Some(config.service_account.clone()),
                     restart_policy: Some("Never".to_string()),
-                    security_context: workspace_pieces
-                        .as_ref()
-                        .map(|p| p.pod_security_context.clone()),
-                    init_containers: workspace_pieces
-                        .as_ref()
-                        .filter(|p| !p.init_containers.is_empty())
-                        .map(|p| p.init_containers.clone()),
-                    volumes: config.config_file_cfg.with_volume(
-                        workspace_pieces
-                            .as_ref()
-                            .filter(|p| !p.volumes.is_empty())
-                            .map(|p| p.volumes.clone()),
-                    ),
+                    security_context: graft.security_context,
+                    init_containers: graft.init_containers,
+                    volumes: config.config_file_cfg.with_volume(graft.volumes),
                     containers: vec![Container {
                         name: "step".to_string(),
                         image: Some(config.worker_image.clone()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(workspace_pieces.as_ref().map_or_else(
-                            || vec!["rivers".to_string()],
-                            |p| p.main_command.clone(),
-                        )),
-                        working_dir: workspace_pieces
-                            .as_ref()
-                            .map(|p| p.main_working_dir.clone()),
-                        volume_mounts: config.config_file_cfg.with_mount(
-                            workspace_pieces
-                                .as_ref()
-                                .filter(|p| !p.main_mounts.is_empty())
-                                .map(|p| p.main_mounts.clone()),
-                        ),
+                        command: Some(graft.command),
+                        working_dir: graft.working_dir,
+                        volume_mounts: config.config_file_cfg.with_mount(graft.volume_mounts),
                         args: Some(args),
                         resources: Some({
                             let cpu = overrides
@@ -344,9 +326,7 @@ fn build_job_inner(
                                 },
                             ];
                             env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
-                            if let Some(pieces) = &workspace_pieces {
-                                env.extend(pieces.main_env.iter().cloned());
-                            }
+                            env.extend(graft.env);
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             env.extend(crate::env::build_config_file_env(&config.config_file_cfg));
                             crate::env::merge_env(env, config.extra_env.iter().cloned())

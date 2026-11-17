@@ -114,6 +114,44 @@ pub struct WorkspacePodPieces {
     pub pod_security_context: PodSecurityContext,
 }
 
+/// The pieces as the pod and main-container fields they set. Image mode (no
+/// pieces) sets none of them and runs the image's `rivers`.
+#[derive(Debug, Default)]
+pub struct PodGraft {
+    pub security_context: Option<PodSecurityContext>,
+    pub init_containers: Option<Vec<Container>>,
+    pub volumes: Option<Vec<Volume>>,
+    pub command: Vec<String>,
+    pub working_dir: Option<String>,
+    pub volume_mounts: Option<Vec<VolumeMount>>,
+    pub env: Vec<EnvVar>,
+}
+
+impl From<Option<WorkspacePodPieces>> for PodGraft {
+    fn from(pieces: Option<WorkspacePodPieces>) -> Self {
+        let Some(pieces) = pieces else {
+            return Self {
+                command: vec!["rivers".to_string()],
+                ..Default::default()
+            };
+        };
+
+        Self {
+            security_context: Some(pieces.pod_security_context),
+            init_containers: non_empty(pieces.init_containers),
+            volumes: non_empty(pieces.volumes),
+            command: pieces.main_command,
+            working_dir: Some(pieces.main_working_dir),
+            volume_mounts: non_empty(pieces.main_mounts),
+            env: pieces.main_env,
+        }
+    }
+}
+
+fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
+    (!items.is_empty()).then_some(items)
+}
+
 /// Pieces for the **code-location pod** — the one pod that builds trees on
 /// the shared PVC, and then prunes the trees beside its own as `prune` says.
 /// In fallback mode it builds its own tree like any other pod.

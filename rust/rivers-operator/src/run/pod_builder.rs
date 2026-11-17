@@ -6,7 +6,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference}
 use kube_client::ResourceExt;
 use rivers_k8s::crd::code_location::CodeLocationSpec;
 use rivers_k8s::crd::run::Run;
-use rivers_k8s::workspace::{self, WorkspaceSpec};
+use rivers_k8s::workspace::{self, PodGraft, WorkspaceSpec};
 
 use crate::codelocation::WorkspaceConfig;
 
@@ -50,9 +50,11 @@ pub fn build_executor_pod(
     let spec = &run.spec;
     let run_uid = run.metadata.uid.as_deref().unwrap_or_default();
     let run_name = run.name_any();
-    let pieces = run_workspace_spec(run, workspace_cfg, cl_spec)
-        .as_ref()
-        .map(workspace::consumer_pod_pieces);
+    let graft = PodGraft::from(
+        run_workspace_spec(run, workspace_cfg, cl_spec)
+            .as_ref()
+            .map(workspace::consumer_pod_pieces),
+    );
 
     Pod {
         metadata: ObjectMeta {
@@ -79,33 +81,16 @@ pub fn build_executor_pod(
         spec: Some(PodSpec {
             service_account_name: Some(spec.service_account_name.clone()),
             restart_policy: Some("Never".to_string()),
-            security_context: pieces.as_ref().map(|p| p.pod_security_context.clone()),
-            init_containers: pieces
-                .as_ref()
-                .filter(|p| !p.init_containers.is_empty())
-                .map(|p| p.init_containers.clone()),
-            volumes: config_file_cfg.with_volume(
-                pieces
-                    .as_ref()
-                    .filter(|p| !p.volumes.is_empty())
-                    .map(|p| p.volumes.clone()),
-            ),
+            security_context: graft.security_context,
+            init_containers: graft.init_containers,
+            volumes: config_file_cfg.with_volume(graft.volumes),
             containers: vec![Container {
                 name: "executor".to_string(),
                 image: Some(spec.image.clone()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
-                command: Some(
-                    pieces
-                        .as_ref()
-                        .map_or_else(|| vec!["rivers".to_string()], |p| p.main_command.clone()),
-                ),
-                working_dir: pieces.as_ref().map(|p| p.main_working_dir.clone()),
-                volume_mounts: config_file_cfg.with_mount(
-                    pieces
-                        .as_ref()
-                        .filter(|p| !p.main_mounts.is_empty())
-                        .map(|p| p.main_mounts.clone()),
-                ),
+                command: Some(graft.command),
+                working_dir: graft.working_dir,
+                volume_mounts: config_file_cfg.with_mount(graft.volume_mounts),
                 args: Some(build_execute_args(spec, run_id, resume)),
                 resources: Some(ResourceRequirements {
                     requests: Some(BTreeMap::from([
@@ -180,9 +165,7 @@ pub fn build_executor_pod(
                             .clone()
                             .with_endpoint(spec.surreal_endpoint.clone()),
                     ));
-                    if let Some(pieces) = &pieces {
-                        env.extend(pieces.main_env.iter().cloned());
-                    }
+                    env.extend(graft.env);
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
                     env.extend(rivers_k8s::env::build_config_file_env(config_file_cfg));
                     rivers_k8s::env::merge_env(env, cl_spec.env.iter().cloned())
