@@ -179,7 +179,7 @@ impl ConditionTickEngine {
             });
         }
 
-        match self.backfill_dispatcher.dispatch(&requests).await {
+        match self.backfill_dispatcher.dispatch(requests).await {
             Ok(outcome) => {
                 for err in &outcome.errors {
                     tracing::error!(

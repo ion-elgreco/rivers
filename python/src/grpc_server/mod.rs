@@ -898,7 +898,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -938,7 +938,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -973,7 +973,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
