@@ -470,6 +470,14 @@ fn eval_on_dep(
     val
 }
 
+/// A partition latch as the bool evaluator reads it.
+fn bool_latch(latch: &HashMap<u32, PartitionSelection>) -> HashMap<u32, bool> {
+    latch
+        .iter()
+        .map(|(idx, sel)| (*idx, sel.to_bool()))
+        .collect()
+}
+
 /// The staleness floor for a bridge into the unpartitioned bool world: inherit
 /// the precomputed root-universe floor, else compute it over the root's
 /// attempted keys. Fan-out ignores never-attempted frontier keys (like an
@@ -509,21 +517,29 @@ fn eval_partitioned_on_dep(
         let root_floor = bridge_floor(ctx, pctx);
         let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, Some(root_floor));
         let mut local = HashMap::new();
-        let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
-            .prev
-            .iter()
-            .map(|(k, m)| {
-                (
-                    k.clone(),
-                    m.iter().map(|(idx, sel)| (*idx, sel.to_bool())).collect(),
-                )
-            })
-            .collect();
+
+        // Only stateful nodes read a latch; only a nested dep-aggregate reads
+        // the other deps' latches.
+        let stateful = !dep_selections.prev.is_empty() && condition.has_stateful_nodes();
+        let own_prev = match dep_selections.prev.get(dep_key) {
+            Some(latch) if stateful => bool_latch(latch),
+            _ => HashMap::new(),
+        };
+        let nested_prev: HashMap<String, HashMap<u32, bool>> =
+            if stateful && condition.has_dep_aggregate() {
+                dep_selections
+                    .prev
+                    .iter()
+                    .map(|(k, latch)| (k.clone(), bool_latch(latch)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
         let mut nested_acc = HashMap::new();
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
-            cur_prev: Some(nested_prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH)),
+            cur_prev: Some(&own_prev),
             bridged: HashMap::new(),
         };
         let val = eval::<BoolDomain>(

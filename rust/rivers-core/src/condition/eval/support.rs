@@ -71,11 +71,12 @@ pub(crate) fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local
             marks.remove(idx);
         }
     }
-    scope
-        .acc
-        .entry(dep_key.to_string())
-        .or_default()
-        .extend(local);
+    match scope.acc.get_mut(dep_key) {
+        Some(slot) => slot.extend(local),
+        None => {
+            scope.acc.insert(dep_key.to_owned(), local);
+        }
+    }
 }
 
 /// Merge latches bridged out of the unpartitioned bool fallback (`from_bool`: true → `All`).
@@ -87,8 +88,18 @@ pub(crate) fn collect_bridged_latch(
     if local.is_empty() {
         return;
     }
-    let slot = scope.acc.entry(dep_key.to_string()).or_default();
-    let marks = scope.bridged.entry(dep_key.to_string()).or_default();
+    // A dep missing from `acc` has no `bridged` marks either.
+    let Some(slot) = scope.acc.get_mut(dep_key) else {
+        scope
+            .bridged
+            .insert(dep_key.to_owned(), local.keys().copied().collect());
+        scope.acc.insert(dep_key.to_owned(), local);
+        return;
+    };
+    let marks = match scope.bridged.get_mut(dep_key) {
+        Some(marks) => marks,
+        None => scope.bridged.entry(dep_key.to_owned()).or_default(),
+    };
     for (idx, sel) in local {
         match slot.entry(idx) {
             std::collections::hash_map::Entry::Vacant(e) => {
