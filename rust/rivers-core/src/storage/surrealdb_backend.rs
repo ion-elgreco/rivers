@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::method::Query;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::{Bytes, RecordId, SurrealValue};
 
 use super::{EventRecord, PartitionKey, StorageBackend};
 
@@ -750,16 +750,49 @@ impl SurrealStorage {
         Ok(rows.into_iter().collect())
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
+    async fn kv_get_bytes(&self, key: &str) -> Result<Option<Bytes>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
+                .bind(("key", key.to_string()))
+                .await?;
+            let kvs: Vec<DbKv> = result.take(0)?;
+            Ok(kvs.into_iter().next().map(|kv| kv.value))
+        })
+        .await
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
+    async fn kv_put(&self, key: &str, value: Bytes) -> Result<()> {
+        // Single atomic upsert on the UNIQUE `kv.key` index — a crash must
+        // never leave the key deleted (the old DELETE+CREATE pair could).
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "INSERT INTO kv { key: $key, value: $value } \
+                     ON DUPLICATE KEY UPDATE value = $input.value",
+                )
+                .bind(("key", key.to_string()))
+                .bind(("value", value.clone()))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn kv_get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        match self.kv_get(key).await? {
+        match self.kv_get_bytes(key).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
     }
 
     async fn kv_set_json<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec(value)?;
-        self.kv_set(key, &bytes).await
+        self.kv_put(key, Bytes::from(serde_json::to_vec(value)?))
+            .await
     }
 }
 

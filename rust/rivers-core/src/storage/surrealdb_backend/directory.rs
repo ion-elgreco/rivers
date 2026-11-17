@@ -5,7 +5,7 @@ use anyhow::Result;
 use surrealdb::types::Bytes;
 
 use crate::assets::remote::LocationRef;
-use crate::storage::{CodeLocationDirectoryEntry, ComponentRecord, StorageBackend, retry};
+use crate::storage::{CodeLocationDirectoryEntry, ComponentRecord, retry};
 
 use super::*;
 
@@ -72,13 +72,20 @@ impl SurrealStorage {
     ) -> Result<bool> {
         let key = crate::code_location_directory_key(location);
         for _ in 0..ATTEMPTS {
-            let current = self.kv_get(&key).await?;
-            let entry = current.as_deref().map(serde_json::from_slice).transpose()?;
+            let current = self.kv_get_bytes(&key).await?;
+            let entry = current
+                .as_ref()
+                .map(|bytes| serde_json::from_slice(bytes))
+                .transpose()?;
             let Some(next) = update(entry) else {
                 return Ok(false);
             };
             if self
-                .kv_compare_and_set(&key, current.as_deref(), &serde_json::to_vec(&next)?)
+                .kv_compare_and_set(
+                    &key,
+                    current.as_ref(),
+                    Bytes::from(serde_json::to_vec(&next)?),
+                )
                 .await?
             {
                 return Ok(true);
@@ -94,7 +101,7 @@ impl SurrealStorage {
     ) -> Result<bool> {
         let key = crate::code_location_directory_key(location);
         for _ in 0..ATTEMPTS {
-            let Some(current) = self.kv_get(&key).await? else {
+            let Some(current) = self.kv_get_bytes(&key).await? else {
                 return Ok(false);
             };
             let entry: CodeLocationDirectoryEntry = serde_json::from_slice(&current)?;
@@ -113,8 +120,8 @@ impl SurrealStorage {
     pub(super) async fn kv_compare_and_set(
         &self,
         key: &str,
-        expected: Option<&[u8]>,
-        value: &[u8],
+        expected: Option<&Bytes>,
+        value: Bytes,
     ) -> Result<bool> {
         retry::with_retry(&self.retry_config, || async {
             let Some(expected) = expected else {
@@ -122,7 +129,7 @@ impl SurrealStorage {
                     self.db
                         .query("CREATE kv CONTENT { key: $key, value: $value }")
                         .bind(("key", key.to_string()))
-                        .bind(("value", Bytes::from(value.to_vec())))
+                        .bind(("value", value.clone()))
                         .await?
                         .check()?;
                     Ok(())
@@ -144,8 +151,8 @@ impl SurrealStorage {
                      WHERE key = $key AND value = $value GROUP ALL",
                 )
                 .bind(("key", key.to_string()))
-                .bind(("expected", Bytes::from(expected.to_vec())))
-                .bind(("value", Bytes::from(value.to_vec())))
+                .bind(("expected", expected.clone()))
+                .bind(("value", value.clone()))
                 .await?
                 .check()?;
             let holds: Option<u32> = response.take((1, "total"))?;
@@ -156,7 +163,7 @@ impl SurrealStorage {
 
     /// Delete the row under `key` if it still holds `expected`. Returns
     /// whether the row is gone.
-    pub(super) async fn kv_compare_and_delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
+    pub(super) async fn kv_compare_and_delete(&self, key: &str, expected: &Bytes) -> Result<bool> {
         retry::with_retry(&self.retry_config, || async {
             let mut response = self
                 .db
@@ -165,7 +172,7 @@ impl SurrealStorage {
                      SELECT count() AS total FROM kv WHERE key = $key GROUP ALL",
                 )
                 .bind(("key", key.to_string()))
-                .bind(("expected", Bytes::from(expected.to_vec())))
+                .bind(("expected", expected.clone()))
                 .await?
                 .check()?;
             let left: Option<u32> = response.take((1, "total"))?;

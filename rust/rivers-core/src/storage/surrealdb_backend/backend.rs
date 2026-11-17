@@ -568,37 +568,15 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
-                .bind(("key", key.to_string()))
-                .await?;
-            let kvs: Vec<DbKv> = result.take(0)?;
-            Ok(kvs.into_iter().next().map(|kv| kv.value.to_vec()))
-        })
-        .await
+        Ok(self
+            .kv_get_bytes(key)
+            .await?
+            .map(|value| value.into_inner().into()))
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_set(&self, key: &str, value: &[u8]) -> Result<()> {
-        // Single atomic upsert on the UNIQUE `kv.key` index — a crash must
-        // never leave the key deleted (the old DELETE+CREATE pair could).
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "INSERT INTO kv { key: $key, value: $value } \
-                     ON DUPLICATE KEY UPDATE value = $input.value",
-                )
-                .bind(("key", key.to_string()))
-                .bind(("value", Bytes::from(value.to_vec())))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await
+        self.kv_put(key, Bytes::from(value.to_vec())).await
     }
 
     async fn list_code_locations(&self) -> Result<Vec<(LocationRef, CodeLocationDirectoryEntry)>> {
@@ -663,11 +641,8 @@ impl StorageBackend for SurrealStorage {
             writes,
             started_at: now,
         };
-        self.kv_set(
-            &format!("{}{name}", crate::COMPONENT_KEY_PREFIX),
-            &serde_json::to_vec(&record)?,
-        )
-        .await
+        self.kv_set_json(&format!("{}{name}", crate::COMPONENT_KEY_PREFIX), &record)
+            .await
     }
 
     async fn list_components(&self) -> Result<Vec<(String, ComponentRecord)>> {
@@ -1012,21 +987,12 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn get_run_outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
-        let key = format!("run_outcome:{run_id}");
-        let data = self.kv_get(&key).await?;
-        match data {
-            Some(bytes) => {
-                let outcome: RunOutcome = serde_json::from_slice(&bytes)?;
-                Ok(Some(outcome))
-            }
-            None => Ok(None),
-        }
+        self.kv_get_json(&format!("run_outcome:{run_id}")).await
     }
 
     async fn set_run_outcome(&self, run_id: &str, outcome: &RunOutcome) -> Result<()> {
-        let key = format!("run_outcome:{run_id}");
-        let bytes = serde_json::to_vec(outcome)?;
-        self.kv_set(&key, &bytes).await
+        self.kv_set_json(&format!("run_outcome:{run_id}"), outcome)
+            .await
     }
 
     async fn request_cancellation(&self, run_id: &str) -> Result<()> {
@@ -1036,7 +1002,7 @@ impl StorageBackend for SurrealStorage {
 
     async fn is_cancelled(&self, run_id: &str) -> Result<bool> {
         let key = format!("cancel:{run_id}");
-        Ok(self.kv_get(&key).await?.is_some())
+        Ok(self.kv_get_bytes(&key).await?.is_some())
     }
 
     async fn get_events_for_step(&self, run_id: &str, step_key: &str) -> Result<Vec<StoredEvent>> {
