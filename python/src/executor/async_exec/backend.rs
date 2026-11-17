@@ -48,12 +48,7 @@ struct SharedStepContext {
 impl SharedStepContext {
     fn clone_from(py: Python, ctx: &BatchContext) -> Self {
         Self {
-            node_map: ctx
-                .repo
-                .node_map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect(),
+            node_map: ctx.repo.node_map.clone(),
             partition_key: ctx.scope.partition_key.clone(),
             resources: ctx
                 .repo

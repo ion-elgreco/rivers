@@ -5,6 +5,9 @@
 //! holds an `inner: Py<...>` back-reference to the originating Python object —
 //! refcount-cheap, accessible for fields not pre-flattened on the struct.
 //!
+//! The structs sit behind an `Arc`, so cloning a node (each job's node subset
+//! does, per run) shares the data. Resolve writes to it before sharing it.
+//!
 //! Invariant fields are pre-flattened at construction — including the
 //! per-output action table (`find_action`/`list_actions`), which is
 //! declarative and never live-read. IO handlers are copied at construction
@@ -12,6 +15,7 @@
 //! built from the same definitions each use their own resources. Other late
 //! values (input_metadata, callable) are still read through `inner`.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -155,15 +159,18 @@ pub(crate) struct ResolvedBashTask {
     pub io_handler: Option<IOHandler>,
 }
 
-/// A node in the dependency graph — Asset, Task, or BashTask.
-///
-/// `ResolvedAsset` is much larger than the other variants (~648 vs ~392 bytes);
-/// boxing it keeps the enum's stack footprint at the size of the next-largest
-/// variant.
+/// A node in the dependency graph — Asset, Task, or BashTask. A clone shares
+/// the node's data.
+#[derive(Clone)]
 pub(crate) enum ResolvedNode {
-    Asset(Box<ResolvedAsset>),
-    Task(ResolvedTask),
-    BashTask(ResolvedBashTask),
+    Asset(Arc<ResolvedAsset>),
+    Task(Arc<ResolvedTask>),
+    BashTask(Arc<ResolvedBashTask>),
+}
+
+/// Write access to node data while resolve still holds the only reference.
+pub(crate) fn unshared<T>(data: &mut Arc<T>) -> &mut T {
+    Arc::get_mut(data).expect("node data is shared only after resolve")
 }
 
 impl ResolvedAsset {
@@ -413,6 +420,7 @@ impl ResolvedAsset {
         })
     }
 
+    /// A deep copy, for a run that changes one node.
     pub fn clone_ref(&self, py: Python) -> Self {
         Self {
             inner: self.inner.clone_ref(py),
@@ -507,28 +515,6 @@ impl ResolvedTask {
             io_handler,
         })
     }
-
-    pub fn clone_ref(&self, py: Python) -> Self {
-        Self {
-            inner: self.inner.clone_ref(py),
-            name: self.name.clone(),
-            is_async: self.is_async,
-            tags: self.tags.clone(),
-            partitions_def: self.partitions_def.clone(),
-            partition_mapping: self.partition_mapping.clone(),
-            param_remap: self.param_remap.clone(),
-            parent_graph_name: self.parent_graph_name.clone(),
-            io_handler_override: self.io_handler_override.as_ref().map(|h| h.clone_ref(py)),
-            input_io_handler_override: self.input_io_handler_override.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                    .collect()
-            }),
-            input_metadata_override: self.input_metadata_override.clone(),
-            retry: self.retry.clone(),
-            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
-        }
-    }
 }
 
 impl ResolvedBashTask {
@@ -557,20 +543,6 @@ impl ResolvedBashTask {
             // Set by resolve_resources_and_handlers once retry refs collapse.
             retry: None,
             io_handler,
-        }
-    }
-
-    pub fn clone_ref(&self, py: Python) -> Self {
-        Self {
-            inner: self.inner.clone_ref(py),
-            name: self.name.clone(),
-            tags: self.tags.clone(),
-            partitions_def: self.partitions_def.clone(),
-            partition_mapping: self.partition_mapping.clone(),
-            parent_graph_name: self.parent_graph_name.clone(),
-            io_handler_override: self.io_handler_override.as_ref().map(|h| h.clone_ref(py)),
-            retry: self.retry.clone(),
-            io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
         }
     }
 }
@@ -848,6 +820,7 @@ impl ResolvedNode {
         };
         match self {
             ResolvedNode::Asset(node) => {
+                let node = unshared(node);
                 let owner = node.output_name.as_deref().unwrap_or(&node.name);
                 if let Some(h) = &mut node.io_handler {
                     resolve(h, "Asset", owner)?;
@@ -857,6 +830,7 @@ impl ResolvedNode {
                 }
             }
             ResolvedNode::Task(node) => {
+                let node = unshared(node);
                 if let Some(h) = &mut node.io_handler {
                     resolve(h, "Task", &node.name)?;
                 }
@@ -869,6 +843,7 @@ impl ResolvedNode {
                 }
             }
             ResolvedNode::BashTask(node) => {
+                let node = unshared(node);
                 if let Some(h) = &mut node.io_handler {
                     resolve(h, "Task", &node.name)?;
                 }
@@ -1086,14 +1061,6 @@ impl ResolvedNode {
         match self {
             ResolvedNode::Task(node) => node.param_remap.as_ref(),
             _ => None,
-        }
-    }
-
-    pub fn clone_ref(&self, py: Python) -> Self {
-        match self {
-            ResolvedNode::Asset(node) => ResolvedNode::Asset(Box::new(node.clone_ref(py))),
-            ResolvedNode::Task(node) => ResolvedNode::Task(node.clone_ref(py)),
-            ResolvedNode::BashTask(node) => ResolvedNode::BashTask(node.clone_ref(py)),
         }
     }
 }

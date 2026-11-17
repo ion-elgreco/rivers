@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 
@@ -114,7 +115,7 @@ pub(crate) fn build_unresolved_graph(
                 let mut resolved =
                     ResolvedAsset::new(py, decorator_py.clone_ref(py), None, partition_defs)?;
                 resolved.lineage_deps = lineage_only(&single_asset.dep_only_names, &inputs);
-                node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
+                node_map.insert(asset_name, ResolvedNode::Asset(Arc::new(resolved)));
             }
             Asset::Multi(multi_asset) => {
                 let func = multi_asset.wraps.as_ref().unwrap();
@@ -153,7 +154,7 @@ pub(crate) fn build_unresolved_graph(
                             .chain(&inner.dep_only_names),
                         &inputs,
                     );
-                    node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
+                    node_map.insert(asset_name, ResolvedNode::Asset(Arc::new(resolved)));
                 }
 
                 // Re-run the per-output compatibility check with registry
@@ -194,7 +195,7 @@ pub(crate) fn build_unresolved_graph(
                 let mut resolved =
                     ResolvedAsset::new(py, decorator_py.clone_ref(py), None, partition_defs)?;
                 resolved.lineage_deps = lineage_only(&graph_asset.dep_only_names, &inputs);
-                node_map.insert(asset_name, ResolvedNode::Asset(Box::new(resolved)));
+                node_map.insert(asset_name, ResolvedNode::Asset(Arc::new(resolved)));
             }
             Asset::External(ExternalAsset { name, .. })
             | Asset::Remote(RemoteAsset { name, .. }) => {
@@ -203,7 +204,7 @@ pub(crate) fn build_unresolved_graph(
                 unresolved_graph.insert(asset_name.clone(), Vec::new());
                 node_map.insert(
                     asset_name,
-                    ResolvedNode::Asset(Box::new(ResolvedAsset::new(
+                    ResolvedNode::Asset(Arc::new(ResolvedAsset::new(
                         py,
                         decorator_py.clone_ref(py),
                         None,
@@ -404,7 +405,7 @@ pub(crate) fn build_unresolved_graph(
                         unresolved_graph.insert(ns_name.clone(), comp_deps);
                         node_map.insert(
                             ns_name.clone(),
-                            ResolvedNode::Task(ResolvedTask::new(
+                            ResolvedNode::Task(Arc::new(ResolvedTask::new(
                                 py,
                                 task_ref.clone_ref(py),
                                 Some(remap),
@@ -414,7 +415,7 @@ pub(crate) fn build_unresolved_graph(
                                 ioh_override,
                                 meta_override,
                                 partition_defs,
-                            )?),
+                            )?)),
                         );
                     }
                     true
@@ -433,7 +434,7 @@ pub(crate) fn build_unresolved_graph(
                 unresolved_graph.insert(task_name.clone(), deps);
                 node_map.insert(
                     task_name,
-                    ResolvedNode::Task(ResolvedTask::new(
+                    ResolvedNode::Task(Arc::new(ResolvedTask::new(
                         py,
                         task_ref,
                         None,
@@ -443,7 +444,7 @@ pub(crate) fn build_unresolved_graph(
                         None,
                         None,
                         partition_defs,
-                    )?),
+                    )?)),
                 );
             }
         } else if let Ok(py_bash) = task_py.cast_bound::<PyBashTask>(py) {
@@ -483,13 +484,13 @@ pub(crate) fn build_unresolved_graph(
                         unresolved_graph.insert(ns_name.clone(), deps);
                         node_map.insert(
                             ns_name.clone(),
-                            ResolvedNode::BashTask(ResolvedBashTask::new(
+                            ResolvedNode::BashTask(Arc::new(ResolvedBashTask::new(
                                 py,
                                 bash_ref.clone_ref(py),
                                 Some(graph_name.to_string()),
                                 pd_override,
                                 pm_override,
-                            )),
+                            ))),
                         );
                     }
                     true
@@ -501,7 +502,9 @@ pub(crate) fn build_unresolved_graph(
                 unresolved_graph.insert(task_name.clone(), Vec::new());
                 node_map.insert(
                     task_name,
-                    ResolvedNode::BashTask(ResolvedBashTask::new(py, bash_ref, None, None, None)),
+                    ResolvedNode::BashTask(Arc::new(ResolvedBashTask::new(
+                        py, bash_ref, None, None, None,
+                    ))),
                 );
             }
         } else {

@@ -305,7 +305,7 @@ impl PyCodeRepository {
         )?;
         if resolve_retry_defaults {
             synthetic_job.resolve_retry_ref(&self.raw_retries)?;
-            synthetic_job.fill_retry_defaults(self.resolved_default_retry()?.as_ref());
+            synthetic_job.set_default_retry(self.resolved_default_retry()?.as_ref());
         }
 
         self.launch_prepared_job(

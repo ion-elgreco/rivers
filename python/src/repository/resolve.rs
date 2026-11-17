@@ -18,6 +18,7 @@ use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 
+use super::resolved_node::unshared;
 use super::*;
 
 impl PyCodeRepository {
@@ -185,7 +186,7 @@ impl PyCodeRepository {
                     &self.raw_retries,
                 )?;
                 job.resolve_retry_ref(&self.raw_retries)?;
-                job.fill_retry_defaults(default_retry.as_ref());
+                job.set_default_retry(default_retry.as_ref());
                 validate_job_partition_compatibility(
                     &name,
                     &job.node_names,
@@ -275,10 +276,10 @@ impl PyCodeRepository {
                 for ns_name in graph_task_names.get(graph_name).into_iter().flatten() {
                     match node_map.get_mut(ns_name) {
                         Some(ResolvedNode::Task(task)) => {
-                            task.io_handler_override = Some(handler.clone_ref(py));
+                            unshared(task).io_handler_override = Some(handler.clone_ref(py));
                         }
                         Some(ResolvedNode::BashTask(task)) => {
-                            task.io_handler_override = Some(handler.clone_ref(py));
+                            unshared(task).io_handler_override = Some(handler.clone_ref(py));
                         }
                         _ => {}
                     }
@@ -292,6 +293,7 @@ impl PyCodeRepository {
         for node in node_map.values_mut() {
             match node {
                 ResolvedNode::Asset(a) => {
+                    let a = unshared(a);
                     let r = a
                         .inner
                         .get()
@@ -301,10 +303,12 @@ impl PyCodeRepository {
                     a.retry = Self::resolve_retry_ref(r, &self.raw_retries, "asset", &a.name)?;
                 }
                 ResolvedNode::Task(t) => {
+                    let t = unshared(t);
                     let r = t.inner.get().inner.retry.clone();
                     t.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &t.name)?;
                 }
                 ResolvedNode::BashTask(b) => {
+                    let b = unshared(b);
                     let r = b.inner.get().retry.clone();
                     b.retry = Self::resolve_retry_ref(r, &self.raw_retries, "task", &b.name)?;
                 }

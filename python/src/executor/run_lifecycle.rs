@@ -47,6 +47,8 @@ pub(crate) struct RunPlanArgs<'a> {
     pub storage: &'a ScopedStorageHandle<SurrealStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    /// Retry policy for the steps whose node sets none.
+    pub default_retry: Option<&'a rivers_core::execution::retry::RetryPolicy>,
     pub io_handler_registry: &'a IOHandlerRegistry,
 
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
@@ -175,6 +177,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
         &args.run_id,
         applied.resources,
         args.retries,
+        args.default_retry,
         &applied.config_overrides,
         args.io_handler_registry,
         args.resume,

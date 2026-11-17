@@ -110,6 +110,8 @@ pub(crate) struct Repo<'a> {
     pub io_handler_registry: &'a IOHandlerRegistry,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    /// Retry policy for the steps whose node sets none.
+    pub default_retry: Option<&'a rivers_core::execution::retry::RetryPolicy>,
     pub config_overrides: &'a Option<HashMap<String, Py<PyAny>>>,
     pub bridge: Option<&'a AsyncBridge>,
 }
@@ -302,10 +304,10 @@ impl<'a> BatchContext<'a> {
             .cloned()
     }
 
-    /// Retry policy of one resolved node (asset-level). Inside a K8s step pod
-    /// this is always `None`: the orchestrator owns the attempt ladder there,
-    /// and the pod re-applying the policy would nest retries (N pods × N
-    /// in-process attempts).
+    /// Retry policy of one resolved node: its own, else the run's default.
+    /// Inside a K8s step pod this is always `None`: the orchestrator owns the
+    /// attempt ladder there, and the pod re-applying the policy would nest
+    /// retries (N pods × N in-process attempts).
     pub(crate) fn retry_policy(
         &self,
         step_name: &str,
@@ -313,7 +315,10 @@ impl<'a> BatchContext<'a> {
         if in_step_pod() {
             return None;
         }
-        self.repo.node_map.get(step_name).and_then(|n| n.retry())
+        self.repo
+            .node_map
+            .get(step_name)
+            .and_then(|n| n.retry().or(self.repo.default_retry))
     }
 
     /// Per-asset compute for a plan step; multi steps read their outputs'

@@ -11,6 +11,7 @@
 //! Every section is optional; an absent one means "as defined".
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use pyo3::prelude::*;
@@ -268,15 +269,15 @@ impl RunDocument {
         if overrides.is_empty() {
             return None;
         }
-        let mut overlay: HashMap<String, ResolvedNode> = node_map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-            .collect();
+        let mut overlay = node_map.clone();
         for (name, metadata) in overrides {
             if let Some(ResolvedNode::Asset(node)) = overlay.get_mut(name) {
-                node.metadata
+                let mut changed = node.clone_ref(py);
+                changed
+                    .metadata
                     .get_or_insert_with(HashMap::new)
                     .extend(metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
+                *node = Arc::new(changed);
             }
         }
         Some(overlay)
