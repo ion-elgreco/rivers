@@ -496,13 +496,14 @@ impl PerCodeLocationStorage for SurrealStorage {
 
         // By id, not by re-running the window: a tick written since the SELECT
         // would shift it and drop a tick whose evaluations are still here.
-        let ids: Vec<RecordId> = dropped.iter().map(|t| t.id.clone()).collect();
+        let count = dropped.len();
+        let ids: Vec<RecordId> = dropped.into_iter().map(|t| t.id).collect();
         self.db
             .query("DELETE FROM condition_ticks WHERE id IN $ids")
             .bind(("ids", ids))
             .await?
             .check()?;
-        Ok(dropped.len())
+        Ok(count)
     }
 
     async fn get_condition_evals(
