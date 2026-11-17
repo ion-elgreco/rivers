@@ -971,29 +971,34 @@ pub(super) async fn submit_runs(
 
         let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
 
-        for sub in &runs {
-            let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
-            let action = sub.action.clone();
-            let run_id = uuid::Uuid::new_v4().to_string();
-            let run_tags = sub.tags.clone().unwrap_or_default();
+        for RunSubmission {
+            selection,
+            partition_key,
+            tags,
+            job_name,
+            action,
+            config,
+        } in runs
+        {
+            let run_tags = tags.unwrap_or_default();
             let priority = priority_from_tags(&run_tags);
 
             records.push(RunRecord {
-                run_id,
+                run_id: uuid::Uuid::new_v4().to_string(),
                 code_location_id: state.code_location_id.clone(),
-                job_name: sub.job_name.clone(),
+                job_name,
                 status: RunStatus::Queued,
                 start_time: now,
                 end_time: None,
                 execution_start_time: None,
                 tags: run_tags,
-                node_names: asset_names,
+                node_names: selection.unwrap_or_else(|| all_names.clone()),
                 priority,
-                partition_key: sub.partition_key.clone(),
+                partition_key,
                 block_reason: None,
                 launched_by: launched_by.clone(),
                 action,
-                config: sub.config.clone(),
+                config,
             });
         }
         (records, state.storage.clone())
