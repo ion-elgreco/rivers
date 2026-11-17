@@ -101,7 +101,7 @@ fn bundle(keys: Vec<Cow<PartitionKey>>) -> PartitionKey {
         candidate
     } else {
         let mut members: Vec<PartitionKey> = keys.into_iter().map(Cow::into_owned).collect();
-        members.sort_by_key(|a| a.to_json());
+        members.sort_by_cached_key(PartitionKey::to_json);
         PartitionKey::Set { keys: members }
     }
 }
