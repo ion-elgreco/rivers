@@ -112,15 +112,14 @@ async fn test_claim_check_statement_index() {
     }
 
     for n in 1..=5 {
-        let pools: Vec<(String, u32)> =
-            pool_names[..n].iter().map(|k| (k.to_string(), 1)).collect();
+        let pools: Vec<(&str, u32)> = pool_names[..n].iter().map(|k| (*k, 1)).collect();
         let query = SurrealStorage::build_claim_transaction(&pools, &[], None);
         let now_ns = now_nanos();
         let lease_exp = now_ns + 300_000_000_000i64;
 
         let mut q = storage.db.query(&query);
         for (i, (pk, _)) in pools.iter().enumerate() {
-            q = q.bind((format!("p{i}"), pk.clone()));
+            q = q.bind((format!("p{i}"), pk.to_string()));
         }
         q = q
             .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
@@ -143,13 +142,11 @@ async fn test_claim_check_statement_index() {
     // predicate) instead of two ($lim/$used), so the formula's asset term
     // is only exercised when both kinds ride one transaction.
     for n_counted in 1..=2 {
-        let mut pools: Vec<(String, u32)> = pool_names[..n_counted]
-            .iter()
-            .map(|k| (k.to_string(), 1))
-            .collect();
         // Distinct per iteration — the exclusive overlap claim from one
         // iteration would contend the next on a shared asset pool.
-        pools.push((format!("__asset__:orders_{n_counted}"), 1));
+        let asset_pool = format!("__asset__:orders_{n_counted}");
+        let mut pools: Vec<(&str, u32)> = pool_names[..n_counted].iter().map(|k| (*k, 1)).collect();
+        pools.push((&asset_pool, 1));
         let asset_idx = [pools.len() - 1];
         let query = SurrealStorage::build_claim_transaction(&pools, &asset_idx, None);
         let now_ns = now_nanos();
@@ -157,7 +154,7 @@ async fn test_claim_check_statement_index() {
 
         let mut q = storage.db.query(&query);
         for (i, (pk, _)) in pools.iter().enumerate() {
-            q = q.bind((format!("p{i}"), pk.clone()));
+            q = q.bind((format!("p{i}"), pk.to_string()));
         }
         q = q
             .bind(("cl", crate::storage::DEFAULT_CODE_LOCATION_ID.to_string()))
@@ -915,7 +912,8 @@ async fn claim_transaction_count(
     scope: Option<&AssetScope>,
 ) -> u32 {
     let now_ns = now_nanos();
-    let query = SurrealStorage::build_claim_transaction(pools, asset_pools, scope);
+    let names: Vec<(&str, u32)> = pools.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+    let query = SurrealStorage::build_claim_transaction(&names, asset_pools, scope);
     let mut q = storage.db.query(&query);
     for (i, (pool_key, _)) in pools.iter().enumerate() {
         q = q.bind((format!("p{i}"), pool_key.clone()));

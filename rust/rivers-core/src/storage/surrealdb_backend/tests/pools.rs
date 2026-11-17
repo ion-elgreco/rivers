@@ -394,10 +394,7 @@ fn conflict_predicate_shared_between_precheck_and_transaction() {
 /// nothing, paid per attempt and per ~1s blocked poll).
 #[test]
 fn claim_transaction_skips_capacity_lets_for_asset_pools() {
-    let pools = vec![
-        ("__asset__:orders".to_string(), 1u32),
-        ("db".to_string(), 2u32),
-    ];
+    let pools = [("__asset__:orders", 1u32), ("db", 2u32)];
     let q = SurrealStorage::build_claim_transaction(&pools, &[0], None);
     assert!(
         !q.contains("LET $lim_0") && !q.contains("LET $used_0"),
