@@ -181,7 +181,7 @@ impl ConditionTickEngine {
                 }
             }
             self.dispatch_materializations(
-                output.plan.clone(),
+                &output.plan,
                 run_requests,
                 &backfill_ids_by_asset,
                 &mut handle,

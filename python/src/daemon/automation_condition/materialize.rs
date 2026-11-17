@@ -79,7 +79,7 @@ impl ConditionTickEngine {
     /// Dispatch the prepared run requests plus the plan's backfills.
     pub(super) async fn dispatch_materializations(
         &mut self,
-        plan: MaterializationPlan,
+        plan: &MaterializationPlan,
         run_requests: Vec<MaterializationRequestData>,
         backfill_ids_by_asset: &HashMap<String, String>,
         handle: &mut ConditionTickHandle,
@@ -131,7 +131,7 @@ impl ConditionTickEngine {
 
         if !plan.multi_partition_backfills.is_empty() {
             self.dispatch_multi_partition_backfills(
-                plan.multi_partition_backfills,
+                &plan.multi_partition_backfills,
                 backfill_ids_by_asset,
                 handle,
             )
@@ -142,14 +142,13 @@ impl ConditionTickEngine {
     /// Multi-partition selections become a backfill per asset.
     async fn dispatch_multi_partition_backfills(
         &mut self,
-        mats: Vec<(String, Vec<CorePartitionKey>)>,
+        mats: &[(String, Vec<CorePartitionKey>)],
         backfill_ids_by_asset: &HashMap<String, String>,
         handle: &mut ConditionTickHandle,
     ) {
-        let backfill_asset_keys: Vec<String> = mats.iter().map(|(k, _)| k.clone()).collect();
         let mut requests: Vec<BackfillRequestData> = Vec::with_capacity(mats.len());
         for (asset_key, partition_keys) in mats {
-            let backfill_id = backfill_ids_by_asset.get(&asset_key).cloned();
+            let backfill_id = backfill_ids_by_asset.get(asset_key).cloned();
             let strategy = self
                 .pass
                 .conditions_by_key
@@ -165,7 +164,7 @@ impl ConditionTickEngine {
                 crate::repository::DEFAULT_BACKFILL_PRIORITY.to_string(),
             );
             requests.push(BackfillRequestData {
-                target: crate::daemon::RunType::Materialization(vec![asset_key]),
+                target: crate::daemon::RunType::Materialization(vec![asset_key.clone()]),
                 partition_keys: Some(py_keys),
                 partition_range: None,
                 strategy,
@@ -198,7 +197,7 @@ impl ConditionTickEngine {
                 // `results` holds the successes in request order (one asset
                 // per condition backfill request).
                 let mut results = outcome.results.iter();
-                for asset_key in &backfill_asset_keys {
+                for (asset_key, _) in mats {
                     if failed.contains(asset_key.as_str()) {
                         self.pass.cache.clear_predispatch_mark(asset_key);
                         handle.note_backfill_error(asset_key, "backfill dispatch failed");
@@ -216,7 +215,7 @@ impl ConditionTickEngine {
                     "condition backfill dispatch failed"
                 );
                 let error = format!("backfill dispatch failed: {e}");
-                for asset_key in &backfill_asset_keys {
+                for (asset_key, _) in mats {
                     self.pass.cache.clear_predispatch_mark(asset_key);
                     handle.note_backfill_error(asset_key, &error);
                 }
