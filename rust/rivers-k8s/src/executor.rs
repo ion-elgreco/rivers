@@ -325,7 +325,10 @@ fn build_job_inner(
                                     ..Default::default()
                                 },
                             ];
-                            env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
+                            env.extend(crate::env::build_surreal_pod_env(
+                                &config.surreal_pod_cfg.endpoint,
+                                &config.surreal_pod_cfg,
+                            ));
                             env.extend(graft.env);
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             env.extend(crate::env::build_config_file_env(&config.config_file_cfg));
@@ -354,8 +357,10 @@ mod tests {
             worker_cpu: "1".to_string(),
             worker_memory: "2Gi".to_string(),
             module: "my_project.definitions".to_string(),
-            surreal_pod_cfg: crate::env::SurrealPodConfig::default()
-                .with_endpoint("ws://surrealdb:8000"),
+            surreal_pod_cfg: crate::env::SurrealPodConfig {
+                endpoint: "ws://surrealdb:8000".to_string(),
+                ..Default::default()
+            },
             otel_pod_cfg: crate::env::OtelPodConfig::default(),
             config_file_cfg: crate::env::ConfigFilePodConfig::default(),
             run_id: "abc-123".to_string(),

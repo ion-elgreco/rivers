@@ -315,7 +315,10 @@ fn build_base_env(
             ..Default::default()
         },
     ];
-    env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
+    env.extend(rivers_k8s::env::build_surreal_pod_env(
+        &surreal_pod_cfg.endpoint,
+        surreal_pod_cfg,
+    ));
     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
     env
 }

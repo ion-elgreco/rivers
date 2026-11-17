@@ -262,9 +262,9 @@ impl SurrealAuthSecretRef {
     }
 }
 
-/// SurrealDB connection bundle stamped on rivers pods. The endpoint can be
-/// overridden per-Run via [`with_endpoint`](Self::with_endpoint) while
-/// keeping the operator-level scope and auth-secret coordinates.
+/// SurrealDB connection bundle stamped on rivers pods. A Run's pod passes its
+/// own endpoint to [`build_surreal_pod_env`] while keeping the operator-level
+/// scope and auth-secret coordinates.
 #[derive(Debug, Clone)]
 pub struct SurrealPodConfig {
     pub endpoint: String,
@@ -287,11 +287,6 @@ impl SurrealPodConfig {
             auth_secret: SurrealAuthSecretRef::from_env(),
         }
     }
-
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
-    }
 }
 
 impl Default for SurrealPodConfig {
@@ -306,8 +301,8 @@ impl Default for SurrealPodConfig {
 }
 
 /// Build the standard SurrealDB env-var block stamped on rivers pods
-/// (operator, UI, CodeLocation daemon, run, step). Always emits the
-/// endpoint, namespace, and database (plain values). When the bundle's
+/// (operator, UI, CodeLocation daemon, run, step). Always emits `endpoint`
+/// and the bundle's namespace and database (plain values). When the bundle's
 /// `auth_secret` is set, also emits:
 ///
 /// - `RIVERS_SURREAL_USERNAME` / `RIVERS_SURREAL_PASSWORD` via
@@ -315,9 +310,9 @@ impl Default for SurrealPodConfig {
 /// - `RIVERS_SURREAL_AUTH_SECRET_NAME` / `_USERNAME_KEY` / `_PASSWORD_KEY` as
 ///   plain values so the run pod can re-emit the same secretKeyRef on step
 ///   pods without holding the password in memory
-pub fn build_surreal_pod_env(cfg: &SurrealPodConfig) -> Vec<EnvVar> {
+pub fn build_surreal_pod_env(endpoint: &str, cfg: &SurrealPodConfig) -> Vec<EnvVar> {
     let mut env = vec![
-        value_env(ENV_SURREAL_ENDPOINT, &cfg.endpoint),
+        value_env(ENV_SURREAL_ENDPOINT, endpoint),
         value_env(ENV_SURREAL_NAMESPACE, &cfg.namespace),
         value_env(ENV_SURREAL_DATABASE, &cfg.database),
     ];
@@ -857,7 +852,7 @@ mod tests {
             database: "main".to_string(),
             auth_secret: SurrealAuthSecretRef::default(),
         };
-        let env = build_surreal_pod_env(&cfg);
+        let env = build_surreal_pod_env(&cfg.endpoint, &cfg);
         assert_eq!(
             env_value_of(&env, ENV_SURREAL_ENDPOINT).as_deref(),
             Some("ws://surrealdb:8000")
@@ -896,7 +891,7 @@ mod tests {
                 password_key: "password".to_string(),
             },
         };
-        let env = build_surreal_pod_env(&cfg);
+        let env = build_surreal_pod_env(&cfg.endpoint, &cfg);
         // Plain values still present.
         assert_eq!(
             env_value_of(&env, ENV_SURREAL_ENDPOINT).as_deref(),

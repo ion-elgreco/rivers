@@ -161,9 +161,8 @@ pub fn build_executor_pod(
                     ];
                     // Endpoint comes from RunSpec; scope + auth coords from operator state.
                     env.extend(rivers_k8s::env::build_surreal_pod_env(
-                        &surreal_pod_cfg
-                            .clone()
-                            .with_endpoint(spec.surreal_endpoint.clone()),
+                        &spec.surreal_endpoint,
+                        surreal_pod_cfg,
                     ));
                     env.extend(graft.env);
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
@@ -832,6 +831,47 @@ mod tests {
         assert_eq!(env_map["RIVERS_RUN_CR_NAME"], "test-run");
         assert_eq!(env_map["RIVERS_RUN_CR_UID"], "");
         assert!(!env_map.contains_key(rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT));
+    }
+
+    #[test]
+    fn executor_pod_takes_the_runs_surreal_endpoint_and_the_operators_scope() {
+        let run = test_run();
+        let surreal = rivers_k8s::env::SurrealPodConfig {
+            endpoint: "ws://operator-only:8000".to_string(),
+            namespace: "team-ns".to_string(),
+            database: "team-db".to_string(),
+            ..Default::default()
+        };
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &CodeLocationSpec::default(),
+            &surreal,
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
+            &WorkspaceConfig::default(),
+        );
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let value = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.clone())
+        };
+
+        assert_eq!(
+            value(rivers_k8s::env::ENV_SURREAL_ENDPOINT).as_deref(),
+            Some("ws://surrealdb.rivers.svc:8000")
+        );
+        assert_eq!(
+            value(rivers_k8s::env::ENV_SURREAL_NAMESPACE).as_deref(),
+            Some("team-ns")
+        );
+        assert_eq!(
+            value(rivers_k8s::env::ENV_SURREAL_DATABASE).as_deref(),
+            Some("team-db")
+        );
     }
 
     #[test]
