@@ -155,6 +155,20 @@ async fn derive_failure_floors<'r, S: StorageBackend>(
     Ok(out)
 }
 
+/// Set `asset`'s `partition_key` slot; the keys are copied only for a new slot.
+fn set_slot<V>(map: &mut SlotMap<V>, asset: &str, partition_key: &Option<PartitionKey>, value: V) {
+    let slots = match map.get_mut(asset) {
+        Some(slots) => slots,
+        None => map.entry(asset.to_string()).or_default(),
+    };
+    match slots.get_mut(partition_key) {
+        Some(slot) => *slot = value,
+        None => {
+            slots.insert(partition_key.clone(), value);
+        }
+    }
+}
+
 impl AssetConditionCache {
     pub fn new(code_location_id: String) -> Self {
         Self {
@@ -604,15 +618,19 @@ impl AssetConditionCache {
                 slots.remove(partition_key);
             }
         } else {
-            self.last_run_tags
-                .entry(asset.to_string())
-                .or_default()
-                .insert(partition_key.clone(), Arc::clone(tags));
+            set_slot(
+                &mut self.last_run_tags,
+                asset,
+                partition_key,
+                Arc::clone(tags),
+            );
         }
-        self.last_run_asset_names
-            .entry(asset.to_string())
-            .or_default()
-            .insert(partition_key.clone(), Arc::clone(asset_names));
+        set_slot(
+            &mut self.last_run_asset_names,
+            asset,
+            partition_key,
+            Arc::clone(asset_names),
+        );
     }
 
     /// The targets of verb run `run_id` built with `asset`. A verb's steps may
