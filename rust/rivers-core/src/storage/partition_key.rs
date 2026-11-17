@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 
 use anyhow::Result;
 use surrealdb::types::{Error as SurrealError, Kind, Object, SurrealValue, Value};
@@ -61,11 +62,56 @@ enum Shape<'a> {
     Set(&'a [PartitionKey]),
 }
 
-/// `dims` sorted by name.
-fn by_name<T>(dims: &[(String, T)]) -> Vec<&(String, T)> {
-    let mut sorted: Vec<&(String, T)> = dims.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    sorted
+/// Keys with up to this many dims are put in name order on the stack.
+const STACK_DIMS: usize = 8;
+
+/// `dims` in name order, equal names in their given order. Allocates nothing:
+/// Hash and Eq of every key in a set walk it.
+fn by_name<T>(dims: &[(String, T)]) -> impl Iterator<Item = &(String, T)> {
+    let (few, many) = if dims.len() <= STACK_DIMS {
+        (dims, &dims[..0])
+    } else {
+        (&dims[..0], dims)
+    };
+
+    let mut order: [u8; STACK_DIMS] = [0, 1, 2, 3, 4, 5, 6, 7];
+    for i in 1..few.len() {
+        let mut j = i;
+        while j > 0 && few[usize::from(order[j - 1])].0 > few[i].0 {
+            order[j] = order[j - 1];
+            j -= 1;
+        }
+        order[j] = i as u8;
+    }
+
+    (0..few.len())
+        .map(move |i| &few[usize::from(order[i])])
+        .chain(search_by_name(many))
+}
+
+/// [`by_name`] for keys with more than `STACK_DIMS` dims: each step searches
+/// for the next dim.
+fn search_by_name<T>(dims: &[(String, T)]) -> impl Iterator<Item = &(String, T)> {
+    let mut last = None;
+    std::iter::from_fn(move || {
+        let (at, dim) = dims
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| ((dim.0.as_str(), i), dim))
+            .filter(|&(at, _)| Some(at) > last)
+            .min_by_key(|&(at, _)| at)?;
+        last = Some(at);
+        Some(dim)
+    })
+}
+
+fn by_name_eq<T: PartialEq>(a: &[(String, T)], b: &[(String, T)]) -> bool {
+    a.len() == b.len() && by_name(a).eq(by_name(b))
+}
+
+fn hash_by_name<T: Hash, H: Hasher>(dims: &[(String, T)], state: &mut H) {
+    state.write_usize(dims.len());
+    by_name(dims).for_each(|dim| dim.hash(state));
 }
 
 impl PartitionKey {
@@ -75,13 +121,11 @@ impl PartitionKey {
             Self::SingleItems { items } => Shape::One(Values::Items(items)),
             Self::Multi { dims } => Shape::Named(
                 by_name(dims)
-                    .into_iter()
                     .map(|(name, values)| (name.as_str(), Values::Plain(values)))
                     .collect(),
             ),
             Self::MultiItems { dims } => Shape::Named(
                 by_name(dims)
-                    .into_iter()
                     .map(|(name, items)| (name.as_str(), Values::Items(items)))
                     .collect(),
             ),
@@ -327,12 +371,10 @@ impl PartialEq for PartitionKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Single { keys: a }, Self::Single { keys: b }) => a == b,
-            (Self::Multi { dims: a }, Self::Multi { dims: b }) => by_name(a) == by_name(b),
+            (Self::Multi { dims: a }, Self::Multi { dims: b }) => by_name_eq(a, b),
             (Self::Set { keys: a }, Self::Set { keys: b }) => a == b,
             (Self::SingleItems { items: a }, Self::SingleItems { items: b }) => a == b,
-            (Self::MultiItems { dims: a }, Self::MultiItems { dims: b }) => {
-                by_name(a) == by_name(b)
-            }
+            (Self::MultiItems { dims: a }, Self::MultiItems { dims: b }) => by_name_eq(a, b),
             _ => false,
         }
     }
@@ -340,15 +382,15 @@ impl PartialEq for PartitionKey {
 
 impl Eq for PartitionKey {}
 
-impl std::hash::Hash for PartitionKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl Hash for PartitionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Single { keys } => keys.hash(state),
-            Self::Multi { dims } => by_name(dims).hash(state),
+            Self::Multi { dims } => hash_by_name(dims, state),
             Self::Set { keys } => keys.hash(state),
             Self::SingleItems { items } => items.hash(state),
-            Self::MultiItems { dims } => by_name(dims).hash(state),
+            Self::MultiItems { dims } => hash_by_name(dims, state),
         }
     }
 }
