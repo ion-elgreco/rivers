@@ -105,8 +105,8 @@ impl ExecutorBackend for ParallelBackend {
                 self.run_no_pool_windowed(py, ctx, &executor, no_pool_instances, limit, failures);
                 windowed_done = true;
             } else {
-                for inst in &no_pool_instances {
-                    let Some(prep) = Self::prepare_step_for_loky(py, inst, ctx, failures) else {
+                for inst in no_pool_instances {
+                    let Some(prep) = Self::prepare_step_for_loky(py, &inst, ctx, failures) else {
                         continue;
                     };
                     for name in &inst.event_names {
@@ -118,15 +118,15 @@ impl ExecutorBackend for ParallelBackend {
                         Ok(future) => {
                             loky_futures.push(SubmittedStep {
                                 idx: prep.idx,
-                                instance_name: prep.instance_name,
-                                event_names: inst.event_names.clone(),
+                                instance_name: inst.instance_name,
+                                event_names: inst.event_names,
                                 future: future.into(),
                                 input_versions: prep.input_versions,
                                 failure_config: prep.failure_config,
                             });
                         }
                         Err(e) => {
-                            ctx.record_failure_no_hooks(&prep.instance_name, e, failures);
+                            ctx.record_failure_no_hooks(&inst.instance_name, e, failures);
                         }
                     }
                 }
@@ -189,7 +189,6 @@ struct SubmittedStep {
 
 struct PreparedStep {
     idx: usize,
-    instance_name: String,
     submit_args: Vec<Py<PyAny>>,
     input_versions: Vec<(String, String)>,
     /// Resolved Pydantic config instance — propagated to
@@ -329,7 +328,6 @@ impl ParallelBackend {
 
         Some(PreparedStep {
             idx: instance.idx,
-            instance_name: instance.instance_name.clone(),
             submit_args,
             input_versions,
             failure_config,
@@ -585,16 +583,16 @@ impl ParallelBackend {
         }
         let mut prepared: Vec<PreparedPoolStep> = Vec::new();
 
-        for inst in &pool_instances {
-            let Some(base) = Self::prepare_step_for_loky(py, inst, ctx, failures) else {
+        for inst in pool_instances {
+            let Some(base) = Self::prepare_step_for_loky(py, &inst, ctx, failures) else {
                 continue;
             };
             prepared.push(PreparedPoolStep {
                 base,
-                pools: inst.pools.clone(),
-                asset_scope: inst.asset_scope.clone(),
-                event_names: inst.event_names.clone(),
-                instance_name: inst.instance_name.clone(),
+                pools: inst.pools,
+                asset_scope: inst.asset_scope,
+                event_names: inst.event_names,
+                instance_name: inst.instance_name,
                 retry: ctx.retry_policy_for(&ctx.scope.plan.steps[inst.idx]),
             });
         }
@@ -603,8 +601,8 @@ impl ParallelBackend {
             return;
         }
 
-        let storage = ctx.sink.storage.clone();
-        let run_id = ctx.scope.run_id.to_string();
+        let storage = Arc::new(ctx.sink.storage.clone());
+        let run_id: Arc<str> = Arc::from(ctx.scope.run_id);
         let events_tx = ctx.event_sender();
         let window = max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
         let resume = ctx.scope.resume;
@@ -620,11 +618,9 @@ impl ParallelBackend {
                 retry,
             } = prep;
             let idx = base.idx;
-            let pool_step_name = instance_name.clone();
-            let storage = storage.clone();
-            let run_id = run_id.clone();
+            let storage = Arc::clone(&storage);
+            let run_id = Arc::clone(&run_id);
             let events_tx = events_tx.clone();
-            let event_names_for_outcome = event_names.clone();
             let window = window.clone();
             let worker = LokyPoolWorker {
                 max_workers: self.max_workers,
@@ -636,12 +632,12 @@ impl ParallelBackend {
             tasks.spawn_on(
                 async move {
                     let (outcome, guard) = run_step_async_lifecycle(
-                        storage,
+                        &storage,
                         &pools,
                         asset_scope.as_deref(),
-                        run_id,
-                        pool_step_name,
-                        event_names,
+                        &run_id,
+                        &instance_name,
+                        &event_names,
                         events_tx,
                         window,
                         retry,
@@ -655,7 +651,7 @@ impl ParallelBackend {
                     FinishedStep {
                         idx,
                         instance_name,
-                        event_names: event_names_for_outcome,
+                        event_names,
                         outcome,
                         guard,
                     }
