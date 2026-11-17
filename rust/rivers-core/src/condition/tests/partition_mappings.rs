@@ -57,6 +57,49 @@ fn test_partition_mapping_static_identity_fallback() {
 }
 
 #[test]
+fn test_partition_mapping_static_matches_single_value_keys_only() {
+    let m = PartitionMappingKind::Static {
+        mapping: HashMap::from([("d1".to_string(), "u1".to_string())]),
+    };
+    let not_single_value = [
+        PartitionKey::Single { keys: vec![] },
+        PartitionKey::Single {
+            keys: vec!["u1".to_string(), "u2".to_string()],
+        },
+        mpk(&[("dim", "u1")]),
+        PartitionKey::Set {
+            keys: vec![spk("u1")],
+        },
+        PartitionKey::SingleItems {
+            items: vec![crate::storage::KeyItem::Value("u1".to_string())],
+        },
+    ];
+    for key in &not_single_value {
+        assert_eq!(
+            m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([key.clone()]))),
+            PartitionSelection::Empty,
+            "{key:?} must not match the mapping value u1 nor pass through"
+        );
+    }
+
+    let mut mixed: HashSet<PartitionKey> = not_single_value.into_iter().collect();
+    mixed.insert(spk("u1"));
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(mixed)),
+        PartitionSelection::Keys(HashSet::from([spk("d1"), spk("u1")]))
+    );
+
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::All),
+        PartitionSelection::All
+    );
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Empty),
+        PartitionSelection::Empty
+    );
+}
+
+#[test]
 fn test_partition_mapping_specific() {
     let m = PartitionMappingKind::SpecificPartitions {
         keys: vec!["latest".into()],

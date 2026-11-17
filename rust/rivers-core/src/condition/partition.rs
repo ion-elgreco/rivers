@@ -292,12 +292,18 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
+                    // One key refilled per entry: a lookup set built from
+                    // `keys` would grow with the whole dep result.
+                    let mut probe = PartitionKey::Single {
+                        keys: vec![String::new()],
+                    };
                     let mut mapped: HashSet<PartitionKey> = mapping
                         .iter()
                         .filter(|(_, v)| {
-                            keys.contains(&PartitionKey::Single {
-                                keys: vec![(*v).clone()],
-                            })
+                            if let PartitionKey::Single { keys: value } = &mut probe {
+                                value[0].clone_from(v);
+                            }
+                            keys.contains(&probe)
                         })
                         .map(|(k, _)| PartitionKey::Single {
                             keys: vec![k.clone()],
