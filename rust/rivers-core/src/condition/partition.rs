@@ -102,6 +102,25 @@ impl PartitionSelection {
         }
     }
 
+    /// [`Self::subtract`] of `Self::from_keys(keys)`, without copying `keys`.
+    pub fn subtract_keys(
+        self,
+        keys: &HashSet<PartitionKey>,
+        all_keys: &HashSet<PartitionKey>,
+    ) -> Self {
+        if keys.is_empty() {
+            return self;
+        }
+        match self {
+            Self::Empty => Self::Empty,
+            Self::All => Self::from_keys(all_keys.difference(keys).cloned().collect()),
+            Self::Keys(mut a) => {
+                a.retain(|k| !keys.contains(k));
+                Self::from_retained(a)
+            }
+        }
+    }
+
     /// True if this selection contains zero partitions.
     pub fn is_empty(&self) -> bool {
         match self {

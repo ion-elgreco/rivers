@@ -152,6 +152,42 @@ fn test_partition_selection_subtract_matches_difference() {
     }
 }
 
+#[test]
+fn test_partition_selection_subtract_keys_matches_difference() {
+    let sels = [
+        PartitionSelection::All,
+        PartitionSelection::Empty,
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")])),
+    ];
+    let handled_sets = [
+        HashSet::new(),
+        HashSet::from([spk("p2")]),
+        HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
+        HashSet::from([spk("p4")]),
+    ];
+    let universes = [
+        ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect(),
+        HashSet::new(),
+    ];
+    for universe in &universes {
+        for a in &sels {
+            for h in &handled_sets {
+                assert_eq!(
+                    a.clone().subtract_keys(h, universe),
+                    a.difference(&PartitionSelection::from_keys(h.clone()), universe),
+                    "{a:?} - {h:?} over {universe:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        PartitionSelection::All.subtract_keys(&HashSet::new(), &universes[0]),
+        PartitionSelection::All
+    );
+}
+
 /// `time_window(offset)` must shift in condition eval exactly as the runtime IO
 /// path does, or it fires the partition that never read the updated upstream.
 #[test]

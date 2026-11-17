@@ -444,10 +444,7 @@ impl EvalDomain for PartitionDomain {
                 .map(|ps| &ps.handled)
             {
                 None => current,
-                Some(handled_set) => {
-                    let handled_sel = PartitionSelection::from_keys(handled_set.clone());
-                    current.difference(&handled_sel, pctx.all_keys)
-                }
+                Some(handled_set) => current.subtract_keys(handled_set, pctx.all_keys),
             }
         }
     }
