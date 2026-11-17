@@ -1,5 +1,6 @@
 //! Backfill planning — split the requested partition keys into runs per strategy.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::storage::{BackfillStrategy, PartitionKey};
@@ -11,27 +12,25 @@ pub fn plan_runs(strategy: &BackfillStrategy, requested: &[PartitionKey]) -> Vec
     let requested = without_sets(requested);
 
     match strategy {
-        BackfillStrategy::MultiRun => requested.iter().flat_map(PartitionKey::members).collect(),
+        BackfillStrategy::MultiRun => requested.iter().flat_map(|key| key.members()).collect(),
         BackfillStrategy::SingleRun => {
             if requested.is_empty() {
                 vec![]
             } else {
-                vec![bundle_keys(&requested)]
+                vec![bundle(requested)]
             }
         }
         BackfillStrategy::PerDimension { multi_run, .. } => {
             // A sorted map: the run order does not depend on the input order,
             // so stop-on-failure cancels the same runs each time.
-            let mut groups: BTreeMap<Vec<(String, String)>, Vec<PartitionKey>> = BTreeMap::new();
+            let mut groups: BTreeMap<Vec<(String, String)>, Vec<Cow<PartitionKey>>> =
+                BTreeMap::new();
             for key in &requested {
                 for (group, part) in split_along(key, multi_run) {
-                    groups.entry(group).or_default().push(part);
+                    groups.entry(group).or_default().push(Cow::Owned(part));
                 }
             }
-            groups
-                .into_values()
-                .map(|parts| bundle_keys(&parts))
-                .collect()
+            groups.into_values().map(bundle).collect()
         }
     }
 }
@@ -91,13 +90,17 @@ impl RunNumbers {
 /// explicit `Set` for a sparse multi-dim group no cartesian Multi can express.
 /// One batched key stays as it is, with its values in sorted order.
 pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
-    let keys = without_sets(keys);
+    bundle(without_sets(keys))
+}
+
+/// [`bundle_keys`] of keys with no `Set` and no span.
+fn bundle(keys: Vec<Cow<PartitionKey>>) -> PartitionKey {
     let candidate = union_per_dimension(&keys);
 
     if covers_exactly(&candidate, &keys) {
         candidate
     } else {
-        let mut members = keys;
+        let mut members: Vec<PartitionKey> = keys.into_iter().map(Cow::into_owned).collect();
         members.sort_by_key(|a| a.to_json());
         PartitionKey::Set { keys: members }
     }
@@ -105,12 +108,12 @@ pub fn bundle_keys(keys: &[PartitionKey]) -> PartitionKey {
 
 /// `keys` with each `Set` replaced by the keys it holds, and each span
 /// written out: the planner reads `Single` and `Multi` keys only.
-fn without_sets(keys: &[PartitionKey]) -> Vec<PartitionKey> {
+fn without_sets(keys: &[PartitionKey]) -> Vec<Cow<'_, PartitionKey>> {
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         match key {
             PartitionKey::Set { keys } => out.extend(without_sets(keys)),
-            key => out.push(key.expanded().into_owned()),
+            key => out.push(key.expanded()),
         }
     }
     out
@@ -176,14 +179,14 @@ fn split_along(
 /// The values of `keys` joined per dimension, sorted: the smallest batched
 /// key that holds every member of `keys`. Keys of another kind than the
 /// first are left out, so the result then does not cover `keys`.
-fn union_per_dimension(keys: &[PartitionKey]) -> PartitionKey {
-    match keys.first() {
+fn union_per_dimension(keys: &[Cow<PartitionKey>]) -> PartitionKey {
+    match keys.first().map(|key| &**key) {
         Some(PartitionKey::Multi { .. }) => {
             // Dimensions in first-seen order.
             let mut order: Vec<String> = Vec::new();
             let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             for key in keys {
-                if let PartitionKey::Multi { dims } = key {
+                if let PartitionKey::Multi { dims } = &**key {
                     for (name, vals) in dims {
                         values
                             .entry(name.clone())
@@ -207,7 +210,7 @@ fn union_per_dimension(keys: &[PartitionKey]) -> PartitionKey {
         _ => {
             let union: BTreeSet<String> = keys
                 .iter()
-                .filter_map(|k| match k {
+                .filter_map(|k| match &**k {
                     PartitionKey::Single { keys } => Some(keys.clone()),
                     _ => None,
                 })
@@ -227,10 +230,10 @@ const MAX_KEYS_COMPARED_IN_PAIRS: usize = 1024;
 /// True if the members of `keys` are exactly the members of `candidate`,
 /// each one time. `candidate` holds every member of `keys` of its own kind,
 /// so the keys must only add up to its size and not overlap.
-fn covers_exactly(candidate: &PartitionKey, keys: &[PartitionKey]) -> bool {
+fn covers_exactly(candidate: &PartitionKey, keys: &[Cow<PartitionKey>]) -> bool {
     let total = keys
         .iter()
-        .map(PartitionKey::member_count)
+        .map(|key| key.member_count())
         .fold(0usize, usize::saturating_add);
     if total != candidate.member_count() {
         return false;
