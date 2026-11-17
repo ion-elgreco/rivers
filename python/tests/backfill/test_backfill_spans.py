@@ -7,17 +7,22 @@ every window, as before.
 
 import asyncio
 import contextlib
+import importlib.util
 import time
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
-import grpc
 import pytest
 import rivers as rs
 from rivers._core import AutomationDaemon
 
 START = datetime(2024, 1, 1)
 ZONES = ["132", "7"]
+
+# The free-threaded venv has no grpcio.
+needs_grpc = pytest.mark.skipif(
+    importlib.util.find_spec("grpc") is None, reason="needs grpcio"
+)
 
 # The first and the last of the 48 hours of each grid, in the text of its keys.
 GRIDS = pytest.mark.parametrize(
@@ -395,6 +400,8 @@ def test_queued_backfill_stores_each_run_key_as_a_span(storage, grid, first, las
 
 @contextlib.contextmanager
 def _serving(repo, grpc_stubs):
+    import grpc
+
     port = repo._start_grpc_server("127.0.0.1", 0)
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
     grpc.channel_ready_future(channel).result(timeout=5)
@@ -447,6 +454,7 @@ def _pick_up(repo, storage, backfill_id, pickup):
     return repo.get_backfill(backfill_id)
 
 
+@needs_grpc
 @pytest.mark.parametrize("pickup", ["execute_backfill", "execute_backfill_queued"])
 def test_job_backfill_stores_each_run_key_as_a_span(grpc_stubs, storage, pickup):
     hours = _hours("2024-01-01T00:00", "2024-01-02T23:00")
@@ -473,6 +481,7 @@ def test_job_backfill_stores_each_run_key_as_a_span(grpc_stubs, storage, pickup)
     }
 
 
+@needs_grpc
 @pytest.mark.parametrize("pickup", ["execute_backfill", "execute_backfill_queued"])
 def test_failed_job_run_of_a_backfill_names_its_partitions_in_one_span(
     grpc_stubs, storage, pickup
