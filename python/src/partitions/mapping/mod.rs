@@ -149,43 +149,16 @@ impl PartitionMapping {
 
             Self::AllPartitions {} => Ok(downstream_key.clone()),
 
-            Self::Static { mapping } => match downstream_key {
-                PyPartitionKey::Single { key } => {
-                    let downstream_str = key.first().ok_or("Empty partition key")?;
-                    match mapping.get(downstream_str) {
-                        Some(upstream_str) => Ok(PyPartitionKey::Single {
-                            key: vec![upstream_str.clone()],
-                        }),
-                        None => Ok(downstream_key.clone()),
-                    }
-                }
+            Self::Static { .. } => match downstream_key {
+                PyPartitionKey::Single { key } => self.map_values(key, upstream_def),
                 _ => Err("Static mapping only works with Single partition keys".to_string()),
             },
 
-            Self::TimeWindow { offset } => {
-                if *offset == 0 {
-                    return Ok(downstream_key.clone());
-                }
-                let PyPartitionKey::Single { key } = downstream_key else {
-                    return Err(
-                        "TimeWindow mapping only works with Single partition keys".to_string()
-                    );
-                };
-                let k = key.first().ok_or("Empty partition key")?;
-                let def =
-                    upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
-                let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
-                if !def
-                    .validate_values(std::slice::from_ref(&shifted))
-                    .map_err(|e| e.to_string())?
-                {
-                    return Err(format!(
-                        "time_window(offset={offset}) maps '{k}' to '{shifted}', \
-                         which is not a partition of the upstream definition"
-                    ));
-                }
-                Ok(PyPartitionKey::Single { key: vec![shifted] })
-            }
+            Self::TimeWindow { offset } => match downstream_key {
+                PyPartitionKey::Single { key } => self.map_values(key, upstream_def),
+                _ if *offset == 0 => Ok(downstream_key.clone()),
+                _ => Err("TimeWindow mapping only works with Single partition keys".to_string()),
+            },
 
             Self::Multi { dimension_mappings } => match downstream_key {
                 PyPartitionKey::Multi {
@@ -202,9 +175,6 @@ impl PartitionMapping {
                                         downstream_keys.keys().collect::<Vec<_>>()
                                     )
                                 })?;
-                        let single_key = PyPartitionKey::Single {
-                            key: dim_values.clone(),
-                        };
                         let dim_def = upstream_def.and_then(|d| match d {
                             PartitionsDefinition::Multi { dimensions } => dimensions
                                 .iter()
@@ -212,7 +182,7 @@ impl PartitionMapping {
                                 .map(|(_, dd)| dd),
                             _ => None,
                         });
-                        let mapped = per_dim_mapping.map_key(&single_key, dim_def)?;
+                        let mapped = per_dim_mapping.map_values(dim_values, dim_def)?;
                         match mapped {
                             PyPartitionKey::Single { key } => {
                                 upstream_keys.insert(upstream_dim.clone(), key);
@@ -263,21 +233,20 @@ impl PartitionMapping {
                         }
                     };
 
-                    let single_key = PyPartitionKey::Single { key: key.clone() };
                     let named_dim_def = dimensions
                         .iter()
                         .find(|(n, _)| n == dimension_name)
                         .map(|(_, dd)| dd);
-                    let mapped_single = partition_mapping.0.map_key(&single_key, named_dim_def)?;
-                    let mapped_values = match &mapped_single {
-                        PyPartitionKey::Single { key } => key.clone(),
-                        _ => return Err("Inner mapping produced a Multi key".to_string()),
-                    };
+                    let mut mapped_values =
+                        match partition_mapping.0.map_values(key, named_dim_def)? {
+                            PyPartitionKey::Single { key } => key,
+                            _ => return Err("Inner mapping produced a Multi key".to_string()),
+                        };
 
                     let mut multi_keys = HashMap::new();
                     for (dim_name, dim_def) in dimensions {
                         if dim_name == dimension_name {
-                            multi_keys.insert(dim_name.clone(), mapped_values.clone());
+                            multi_keys.insert(dim_name.clone(), std::mem::take(&mut mapped_values));
                         } else {
                             let key_strings = dim_def.enumerate_single_dim_keys().map_err(|e| {
                                 format!(
@@ -298,15 +267,66 @@ impl PartitionMapping {
                             keys.keys().collect::<Vec<_>>()
                         )
                     })?;
-                    let single_key = PyPartitionKey::Single {
-                        key: dim_values.clone(),
-                    };
-                    partition_mapping.0.map_key(&single_key, upstream_def)
+                    partition_mapping.0.map_values(dim_values, upstream_def)
                 }
                 PyPartitionKey::Set { .. } => {
                     Err("MultiToSingle mapping does not support batched Set keys".to_string())
                 }
             },
+        }
+    }
+
+    /// [`map_key`](Self::map_key) for a single-dimension key given by its values.
+    fn map_values(
+        &self,
+        key: &[String],
+        upstream_def: Option<&PartitionsDefinition>,
+    ) -> Result<PyPartitionKey, String> {
+        match self {
+            Self::Identity {} | Self::AllPartitions {} => {
+                Ok(PyPartitionKey::Single { key: key.to_vec() })
+            }
+
+            Self::Static { mapping } => {
+                let downstream_str = key.first().ok_or("Empty partition key")?;
+                let key = match mapping.get(downstream_str) {
+                    Some(upstream_str) => vec![upstream_str.clone()],
+                    None => key.to_vec(),
+                };
+                Ok(PyPartitionKey::Single { key })
+            }
+
+            Self::TimeWindow { offset } => {
+                if *offset == 0 {
+                    return Ok(PyPartitionKey::Single { key: key.to_vec() });
+                }
+                let k = key.first().ok_or("Empty partition key")?;
+                let def =
+                    upstream_def.ok_or("TimeWindow mapping requires a partitioned upstream")?;
+                let shifted = def.shift_time_key(k, *offset).map_err(|e| e.to_string())?;
+                if !def
+                    .validate_values(std::slice::from_ref(&shifted))
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err(format!(
+                        "time_window(offset={offset}) maps '{k}' to '{shifted}', \
+                         which is not a partition of the upstream definition"
+                    ));
+                }
+                Ok(PyPartitionKey::Single { key: vec![shifted] })
+            }
+
+            Self::SpecificPartitions { partition_keys } => Ok(PyPartitionKey::Single {
+                key: partition_keys.clone(),
+            }),
+
+            // The constructors reject these as inner mappings.
+            Self::Multi { .. }
+            | Self::MultiToSingle { .. }
+            | Self::ForKeys { .. }
+            | Self::Subset {} => {
+                self.map_key(&PyPartitionKey::Single { key: key.to_vec() }, upstream_def)
+            }
         }
     }
 }
