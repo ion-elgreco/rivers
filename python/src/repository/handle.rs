@@ -820,7 +820,9 @@ impl RepoHandle {
 
         let missing: Vec<PyPartitionKey> = all
             .into_iter()
-            .filter(|pk| !materialized.contains(&rivers_core::storage::PartitionKey::from(pk)))
+            .map(PartitionKey::from)
+            .filter(|k| !materialized.contains(k))
+            .map(PyPartitionKey::from)
             .collect();
 
         if missing.is_empty() {
