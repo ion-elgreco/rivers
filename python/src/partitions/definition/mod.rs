@@ -248,17 +248,22 @@ impl PartitionsDefinition {
 
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.
     pub fn enumerate_single_dim_keys(&self) -> PyResult<Vec<String>> {
-        self.get_partition_keys()?
-            .into_iter()
-            .map(|pk| match pk {
-                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
-                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
-                    Err(PartitionDefinitionError::new_err(
-                        "enumerate_single_dim_keys called on a non-single-dimension definition",
-                    ))
-                }
-            })
-            .collect()
+        match self {
+            Self::Static { keys } => Ok(keys.iter().cloned().collect()),
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => enumerate_time_windows(cron_schedule, interval_seconds, start, end, fmt),
+            Self::Multi { .. } => Err(PartitionDefinitionError::new_err(
+                "enumerate_single_dim_keys called on a non-single-dimension definition",
+            )),
+            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
+                "Cannot enumerate dynamic partition keys",
+            )),
+        }
     }
 
     /// Enumerate all valid partition keys.
@@ -270,20 +275,11 @@ impl PartitionsDefinition {
                     key: vec![k.clone()],
                 })
                 .collect()),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let keys =
-                    enumerate_time_windows(cron_schedule, interval_seconds, start, end, fmt)?;
-                Ok(keys
-                    .into_iter()
-                    .map(|k| PyPartitionKey::Single { key: vec![k] })
-                    .collect())
-            }
+            Self::TimeWindow { .. } | Self::Dynamic { .. } => Ok(self
+                .enumerate_single_dim_keys()?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect()),
             Self::Multi { dimensions } => {
                 let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
                 for (name, def) in dimensions {
@@ -297,38 +293,17 @@ impl PartitionsDefinition {
                     })
                     .collect())
             }
-            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
-                "Cannot enumerate dynamic partition keys",
-            )),
         }
     }
 
     /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every TimeWindow grid's effective end to `cap`.
     pub fn get_partition_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<PyPartitionKey>> {
         match self {
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let capped_end = Some(match end {
-                    Some(e) => (*e).min(cap),
-                    None => cap,
-                });
-                let keys = enumerate_time_windows(
-                    cron_schedule,
-                    interval_seconds,
-                    start,
-                    &capped_end,
-                    fmt,
-                )?;
-                Ok(keys
-                    .into_iter()
-                    .map(|k| PyPartitionKey::Single { key: vec![k] })
-                    .collect())
-            }
+            Self::TimeWindow { .. } => Ok(self
+                .enumerate_single_dim_keys_capped(cap)?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect()),
             Self::Multi { dimensions } => {
                 let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
                 for (name, def) in dimensions {
@@ -348,17 +323,22 @@ impl PartitionsDefinition {
 
     /// Single-dimension variant of [`get_partition_keys_capped`].
     pub fn enumerate_single_dim_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<String>> {
-        self.get_partition_keys_capped(cap)?
-            .into_iter()
-            .map(|pk| match pk {
-                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
-                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
-                    Err(PartitionDefinitionError::new_err(
-                        "enumerate_single_dim_keys called on a non-single-dimension definition",
-                    ))
-                }
-            })
-            .collect()
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let capped_end = Some(match end {
+                    Some(e) => (*e).min(cap),
+                    None => cap,
+                });
+                enumerate_time_windows(cron_schedule, interval_seconds, start, &capped_end, fmt)
+            }
+            _ => self.enumerate_single_dim_keys(),
+        }
     }
 
     /// A window `[offset, offset+limit)` of keys without materializing the full set.
