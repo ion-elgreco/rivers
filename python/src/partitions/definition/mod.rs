@@ -363,44 +363,13 @@ impl PartitionsDefinition {
                 Ok(keys.into_iter().map(single).collect())
             }
             Self::Multi { dimensions } => {
-                let n = dimensions.len();
-                let by_place = dimensions
-                    .iter()
-                    .map(|(_, def)| def.keys_by_place())
-                    .collect::<PyResult<Vec<_>>>()?;
-                let sizes: Vec<usize> = by_place
-                    .iter()
-                    .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
-                    .collect();
-                let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
-                let end = offset.saturating_add(limit).min(total);
-                if offset >= end {
-                    return Ok(Vec::new());
-                }
-                let mut strides = vec![1usize; n];
-                for i in (0..n.saturating_sub(1)).rev() {
-                    strides[i] = strides[i + 1].saturating_mul(sizes[i + 1]);
-                }
-                let mut out = Vec::with_capacity(end - offset);
-                for k in offset..end {
-                    let mut rem = k;
-                    let mut combo: HashMap<String, Vec<String>> = HashMap::new();
-                    for (i, (name, _)) in dimensions.iter().enumerate() {
-                        let idx_i = rem / strides[i];
-                        rem %= strides[i];
-                        let key = by_place[i]
-                            .as_ref()
-                            .and_then(|keys| keys.get(idx_i))
-                            .ok_or_else(|| {
-                                PartitionDefinitionError::new_err(format!(
-                                    "dimension '{name}' has no key at index {idx_i}"
-                                ))
-                            })?;
-                        combo.insert(name.clone(), vec![key]);
-                    }
-                    out.push(PyPartitionKey::Multi { keys: combo });
-                }
-                Ok(out)
+                multi_window(dimensions, offset, limit, |values| PyPartitionKey::Multi {
+                    keys: dimensions
+                        .iter()
+                        .zip(values)
+                        .map(|((name, _), value)| (name.clone(), vec![value.to_string()]))
+                        .collect(),
+                })
             }
             Self::Dynamic { .. } => Ok(self
                 .get_partition_keys()?
@@ -408,6 +377,42 @@ impl PartitionsDefinition {
                 .skip(offset)
                 .take(limit)
                 .collect()),
+        }
+    }
+
+    /// The window `[offset, offset+limit)` of keys as the UI shows them: a key
+    /// with more dimensions as `dim=value|dim=value`, its dimensions in the
+    /// order of their names.
+    pub(crate) fn display_keys_window(&self, offset: usize, limit: usize) -> PyResult<Vec<String>> {
+        match self {
+            Self::Static { .. } | Self::TimeWindow { .. } => Ok(self
+                .keys_by_place()?
+                .map(|keys| keys.window(offset, limit))
+                .unwrap_or_default()),
+            Self::Multi { dimensions } => {
+                let mut by_name: Vec<usize> = (0..dimensions.len()).collect();
+                by_name.sort_by_key(|&i| &dimensions[i].0);
+
+                multi_window(dimensions, offset, limit, |values| {
+                    let len = by_name
+                        .iter()
+                        .map(|&i| dimensions[i].0.len() + values[i].len() + 2)
+                        .sum();
+                    let mut text = String::with_capacity(len);
+                    for (n, &i) in by_name.iter().enumerate() {
+                        if n > 0 {
+                            text.push('|');
+                        }
+                        text.push_str(&dimensions[i].0);
+                        text.push('=');
+                        text.push_str(values[i]);
+                    }
+                    text
+                })
+            }
+            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
+                "Cannot enumerate dynamic partition keys",
+            )),
         }
     }
 
@@ -1159,6 +1164,70 @@ impl PartitionsDefinition {
     fn __eq__(&self, other: &Self) -> bool {
         self == other
     }
+}
+
+/// The keys `[offset, offset+limit)` of a definition with `dimensions`, each
+/// built by `key` from its values in the order of the dimensions. Each value
+/// is read once.
+fn multi_window<T>(
+    dimensions: &[(String, PartitionsDefinition)],
+    offset: usize,
+    limit: usize,
+    mut key: impl FnMut(&[&str]) -> T,
+) -> PyResult<Vec<T>> {
+    let by_place = dimensions
+        .iter()
+        .map(|(_, def)| def.keys_by_place())
+        .collect::<PyResult<Vec<_>>>()?;
+    let sizes: Vec<usize> = by_place
+        .iter()
+        .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
+        .collect();
+    let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
+    let end = offset.saturating_add(limit).min(total);
+    if offset >= end {
+        return Ok(Vec::new());
+    }
+
+    let mut strides = vec![1usize; sizes.len()];
+    for i in (0..sizes.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1].saturating_mul(sizes[i + 1]);
+    }
+
+    // The values of each dimension in the window, from its value at `offset` on.
+    let values: Vec<Vec<String>> = by_place
+        .iter()
+        .zip(&sizes)
+        .zip(&strides)
+        .map(|((keys, &size), &stride)| {
+            let Some(keys) = keys else {
+                return Vec::new();
+            };
+            let first = offset / stride;
+            let count = ((end - 1) / stride - first + 1).min(size);
+            let mut values = keys.window(first % size, count);
+            values.extend(keys.window(0, count - values.len()));
+            values
+        })
+        .collect();
+
+    let mut row = Vec::with_capacity(dimensions.len());
+    (offset..end)
+        .map(|k| {
+            row.clear();
+            for (i, (name, _)) in dimensions.iter().enumerate() {
+                let place = (k / strides[i] - offset / strides[i]) % sizes[i];
+                let value = values[i].get(place).ok_or_else(|| {
+                    PartitionDefinitionError::new_err(format!(
+                        "dimension '{name}' has no key at index {}",
+                        k / strides[i] % sizes[i]
+                    ))
+                })?;
+                row.push(value.as_str());
+            }
+            Ok(key(&row))
+        })
+        .collect()
 }
 
 /// Compute the cartesian product of dimension keys.

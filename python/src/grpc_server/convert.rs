@@ -176,12 +176,9 @@ pub(super) fn partition_keys(
     let (offset, limit) = (req.offset as usize, req.limit as usize);
 
     if req.query.is_empty() {
-        let keys: Vec<String> = target
-            .get_partition_keys_window(offset, limit)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(py_partition_key_display)
-            .collect();
+        let keys = target
+            .display_keys_window(offset, limit)
+            .map_err(|e| e.to_string())?;
         return Ok(GetPartitionKeysResponse {
             indices: (req.offset..).take(keys.len()).collect(),
             keys,
@@ -323,22 +320,14 @@ pub(super) fn partition_groups(
 
 /// For Multi, surface per-dimension keys so the UI can render one selector per
 /// dimension instead of the cartesian-product enumeration. Static and TimeWindow
-/// populate the flat `keys` list. Dynamic returns Err from `get_partition_keys`
+/// populate the flat `keys` list. Dynamic returns Err from `display_keys_window`
 /// — both lists stay empty and the UI hides the picker.
 pub(super) fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDefInfo {
     // Max keys shipped inline. Beyond this the UI pages via the windowed API,
     // so the payload stays bounded no matter how many partitions exist.
     const KEYS_WINDOW: usize = 1000;
-    let window = |d: &PartitionsDefinition| {
-        d.get_partition_keys_window(0, KEYS_WINDOW)
-            .ok()
-            .map(|pks| {
-                pks.into_iter()
-                    .map(py_partition_key_display)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
+    let window =
+        |d: &PartitionsDefinition| d.display_keys_window(0, KEYS_WINDOW).unwrap_or_default();
     let total = pd.partition_count() as u64;
     let (kind, keys, dimensions, keys_truncated) = match pd {
         // Static and TimeWindow are both single-dim: a windowed `keys` list,
@@ -387,12 +376,6 @@ pub(super) fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDef
         keys_truncated,
         dynamic_name,
     }
-}
-
-/// Render a `PyPartitionKey` for display in the UI — delegates to the
-/// canonical `PartitionKey::to_display` encoding (`dim=val|dim=val`).
-pub(super) fn py_partition_key_display(pk: PyPartitionKey) -> String {
-    rivers_core::storage::PartitionKey::from(pk).to_display()
 }
 
 /// gRPC is the system boundary: malformed partition keys are rejected with
