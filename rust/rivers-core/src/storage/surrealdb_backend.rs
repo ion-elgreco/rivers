@@ -599,7 +599,7 @@ impl SurrealStorage {
             .bind(("key", asset_key.to_string()))
             .await?;
         let rows: Vec<OptStringField> = result.take(0)?;
-        Ok(rows.first().and_then(|r| r.value.clone()))
+        Ok(rows.into_iter().next().and_then(|r| r.value))
     }
 
     /// Apply one Deletion event's state clearing.
