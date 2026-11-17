@@ -1307,4 +1307,74 @@ mod drift {
         assert!(status.in_progress.is_empty());
         assert!(in_progress(&cache).is_empty());
     }
+
+    /// Every unpaused local bound to a key takes the same partition status,
+    /// at load and on a later re-read; a paused one between them has none.
+    #[tokio::test]
+    async fn every_unpaused_local_takes_the_partition_status() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        warehouse_owning(&storage, vec![make_record("events")]).await;
+        materialize(
+            &storage,
+            "wh",
+            "events",
+            "run-1",
+            Some(spk("2024-01-01")),
+            1_000,
+        )
+        .await;
+        let day = spk("2024-01-02");
+        storage
+            .create_run(&run(
+                "wh",
+                "run-2",
+                RunStatus::Started,
+                &["events"],
+                Some(day.clone()),
+                2_000,
+            ))
+            .await
+            .unwrap();
+        owner_topology(&storage, &[("events", hourly())]).await;
+
+        let locals = ["orders", "orders_paused", "orders_again"];
+        let mut cache = cache_with(vec![
+            mirrored("orders", "events", hourly()),
+            mirrored("orders_paused", "events", daily()),
+            mirrored("orders_again", "events", hourly()),
+        ]);
+        cache.set_partitioned_assets(locals.iter().map(|l| l.to_string()).collect());
+        cache.refresh(&storage, 0).await.unwrap();
+
+        let paused = &cache.partition_status["orders_paused"];
+        assert!(paused.timestamps.is_empty() && paused.in_progress.is_empty());
+        for local in ["orders", "orders_again"] {
+            let status = &cache.partition_status[local];
+            assert_eq!(
+                status.timestamps,
+                HashMap::from([(spk("2024-01-01"), 1_000)]),
+                "{local}"
+            );
+            assert_eq!(status.in_progress, HashSet::from([day.clone()]), "{local}");
+        }
+
+        materialize(&storage, "wh", "events", "run-2", Some(day.clone()), 3_000).await;
+        storage
+            .update_run_status("run-2", RunStatus::Success, Some(3_000))
+            .await
+            .unwrap();
+        assert!(cache.refresh(&storage, SEC).await.unwrap());
+
+        let paused = &cache.partition_status["orders_paused"];
+        assert!(paused.timestamps.is_empty() && paused.in_progress.is_empty());
+        for local in ["orders", "orders_again"] {
+            let status = &cache.partition_status[local];
+            assert_eq!(
+                status.timestamps,
+                HashMap::from([(spk("2024-01-01"), 1_000), (day.clone(), 3_000)]),
+                "{local}"
+            );
+            assert!(status.in_progress.is_empty(), "{local}");
+        }
+    }
 }
