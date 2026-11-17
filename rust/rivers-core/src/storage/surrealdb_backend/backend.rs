@@ -1206,24 +1206,24 @@ impl StorageBackend for SurrealStorage {
 }
 
 impl EventStore for SurrealStorage {
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
-    async fn store_events_with_ids(&self, events: &[EventWithId]) -> Result<()> {
-        if events.is_empty() {
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = batch.len()))]
+    async fn store_events_with_ids(&self, batch: &[EventWithId]) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
+        let event_ids: Vec<String> = batch.iter().map(|e| record_id_str(&e.id)).collect();
+        let events: Vec<&EventRecord> = batch.iter().map(|e| &e.event).collect();
+        retry::with_retry(&self.retry_config, || async {
         // The ids come with the events: one consolidation conflict replays
         // the whole batch, and so does a send of the batch again; INSERT
         // IGNORE needs the same record ids to turn the re-insert into a no-op.
-        let rows: Vec<DbEventWrite> = events
+        let rows: Vec<DbEventWrite> = batch
             .iter()
             .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
             .collect();
-        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
-        let events: Vec<&EventRecord> = events.iter().map(|e| &e.event).collect();
-        retry::with_retry(&self.retry_config, || async {
         self.db
             .query("INSERT IGNORE INTO events $rows RETURN NONE")
-            .bind(("rows", rows.clone()))
+            .bind(("rows", rows))
             .await
             .context("failed to batch store events")?
             .check()?;
