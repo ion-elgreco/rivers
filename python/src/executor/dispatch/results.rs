@@ -330,7 +330,7 @@ pub(crate) fn process_step_result(
     ctx: &mut BatchContext,
     step: &ExecutionStep,
     step_name: &str,
-    step_result: ops::StepResult,
+    mut step_result: ops::StepResult,
     captured_logs: CapturedLogs,
     recorder: Option<OutputRecorder>,
     failures: &mut Vec<(String, PyErr)>,
@@ -415,7 +415,7 @@ pub(crate) fn process_step_result(
         .then(|| StepCapture::start(py));
     let result = ops::for_each_output(
         py,
-        &step_result,
+        &mut step_result,
         &selected_outputs,
         step_name,
         |py, item| recorder.record(py, ctx, step, item),

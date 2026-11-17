@@ -66,11 +66,11 @@ pub(crate) struct StepResult {
 /// Upsert: for each overlay entry, remove any existing entry with the same key, then append.
 pub(crate) fn merge_metadata(
     target: &mut Vec<(String, MetadataValue)>,
-    overlay: &[(String, MetadataValue)],
+    overlay: Vec<(String, MetadataValue)>,
 ) {
     for (k, v) in overlay {
-        target.retain(|(ek, _)| ek != k);
-        target.push((k.clone(), v.clone()));
+        target.retain(|(ek, _)| *ek != k);
+        target.push((k, v));
     }
 }
 

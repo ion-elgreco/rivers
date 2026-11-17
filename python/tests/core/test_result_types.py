@@ -1,5 +1,6 @@
 """Tests for Output and Observation result types."""
 
+import pytest
 import rivers as rs
 
 from _helpers import DictIOHandler, observation_metadata
@@ -164,6 +165,49 @@ def test_context_and_output_data_version(storage):
     events = storage.get_events_for_asset("a")
     mat_events = [e for e in events if e.event_type == "Materialization"]
     assert mat_events[0].data_version == "from_output"
+
+
+@pytest.mark.parametrize(
+    "executor",
+    [rs.Executor.in_process(), rs.Executor.parallel(max_workers=2)],
+    ids=["in_process", "parallel"],
+)
+@pytest.mark.parametrize("shape", ["single", "dict", "generator"])
+def test_data_version_entry_in_output_metadata(executor, shape, storage):
+    """A `DataVersion` entry in the metadata is the data version when nothing
+    else sets one. It leaves the metadata; the other entries keep their order."""
+    io = DictIOHandler()
+    metadata = {"a": 1, "dv": rs.MetadataValue.data_version("v7"), "b": 2}
+
+    if shape == "single":
+
+        @rs.Asset(io_handler=io)
+        def users() -> rs.Output:
+            return rs.Output(value=1, metadata=metadata)
+
+        step = users
+    elif shape == "dict":
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("users", io_handler=io)])
+        def step():
+            return {"users": rs.Output(value=1, metadata=metadata)}
+    else:
+
+        @rs.Asset.from_multi(output_defs=[rs.AssetDef("users", io_handler=io)])
+        def step():
+            yield rs.Output(value=1, output_name="users", metadata=metadata)
+
+    @rs.Asset(io_handler=io)
+    def regions() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[step, regions], default_executor=executor)
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+
+    event = storage.get_latest_materialization("users")
+    assert event.data_version == "v7"
+    assert [key for key, _ in event.metadata] == ["a", "b"]
 
 
 # ── Type validation ────────────────────────────────────────────────────

@@ -124,13 +124,14 @@ fn item_for_kind(
 ///
 /// `step_name` equals `step.name` for non-mapped runs and the per-instance
 /// name for mapped fan-out (single-output only — multi-asset is never
-/// mapped). Multi-asset paths ignore `step_name`.
+/// mapped). Multi-asset paths ignore `step_name`. A single output takes the
+/// step's `output_metadata`.
 ///
 /// On `Err` from `on_item` (or from a generator), iteration short-circuits
 /// and the error propagates.
 pub(crate) fn for_each_output<F>(
     py: Python,
-    step_result: &StepResult,
+    step_result: &mut StepResult,
     selected_outputs: &[(String, Option<Py<PyAny>>)],
     step_name: &str,
     mut on_item: F,
@@ -165,7 +166,7 @@ fn check_output(
     let value = value.unwrap_or_else(|| py.None());
     let checked = validate_return_type(py, &value, Some(hint), name)?;
     let mut merged = checked.metadata;
-    merge_metadata(&mut merged, &metadata);
+    merge_metadata(&mut merged, metadata);
     Ok((Some(checked.value), merged))
 }
 
@@ -272,10 +273,10 @@ where
         // Note: the gen path historically does NOT incorporate
         // step_result.output_metadata as a shared layer — only ctx-set.
         let mut merged_metadata = ctx_metadata;
-        merge_metadata(&mut merged_metadata, &ext.metadata);
+        merge_metadata(&mut merged_metadata, ext.metadata);
         let (value, merged_metadata) =
             check_output(py, &output_name, ext.kind, ext.value, hint, merged_metadata)?;
-        let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
+        let (legacy_dv, stripped_metadata) = extract_data_version(merged_metadata);
 
         // dv precedence: per-yield > ctx > legacy-from-metadata.
         let resolved_dv = ext.data_version.clone().or(ctx_dv).or(legacy_dv);
@@ -316,10 +317,10 @@ where
             };
 
         let mut merged_metadata = shared_metadata.clone();
-        merge_metadata(&mut merged_metadata, &per_metadata);
+        merge_metadata(&mut merged_metadata, per_metadata);
         let (value, merged_metadata) =
             check_output(py, output_name, kind, value, hint.as_ref(), merged_metadata)?;
-        let (legacy_dv, stripped_metadata) = extract_data_version(&merged_metadata);
+        let (legacy_dv, stripped_metadata) = extract_data_version(merged_metadata);
 
         // dv precedence: per-output > shared > legacy-from-metadata.
         let resolved_dv = per_dv.or(shared_dv.map(String::from)).or(legacy_dv);
@@ -339,14 +340,15 @@ where
 
 fn for_each_output_single<F>(
     py: Python,
-    step_result: &StepResult,
+    step_result: &mut StepResult,
     step_name: &str,
     on_item: &mut F,
 ) -> PyResult<()>
 where
     F: FnMut(Python, OutputItem) -> PyResult<()>,
 {
-    let (legacy_dv, stripped_metadata) = extract_data_version(&step_result.output_metadata);
+    let (legacy_dv, stripped_metadata) =
+        extract_data_version(std::mem::take(&mut step_result.output_metadata));
     let resolved_dv = step_result.data_version.clone().or(legacy_dv);
 
     let item = item_for_kind(

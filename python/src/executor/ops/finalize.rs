@@ -499,18 +499,17 @@ pub(crate) fn register_assets_from_nodes(
 /// Extract any DataVersion from output metadata, removing it from the list.
 /// Returns (data_version, remaining_metadata).
 pub(crate) fn extract_data_version(
-    output_metadata: &[(String, MetadataValue)],
+    mut output_metadata: Vec<(String, MetadataValue)>,
 ) -> (Option<String>, Vec<(String, MetadataValue)>) {
     let mut data_version = None;
-    let mut remaining = Vec::new();
-    for (k, v) in output_metadata {
-        if let MetadataValue::DataVersion { value } = v {
-            data_version = Some(value.clone());
-        } else {
-            remaining.push((k.clone(), v.clone()));
+    output_metadata.retain_mut(|(_, v)| match v {
+        MetadataValue::DataVersion { value } => {
+            data_version = Some(std::mem::take(value));
+            false
         }
-    }
-    (data_version, remaining)
+        _ => true,
+    });
+    (data_version, output_metadata)
 }
 
 /// Look up the data versions for upstream dependencies from an in-memory map.

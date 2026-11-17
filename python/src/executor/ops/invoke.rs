@@ -243,8 +243,8 @@ pub(crate) fn process_raw_result(
 
     // A validator's entries describe the hint; what the asset sets wins.
     let mut output_metadata = checked.metadata;
-    super::merge_metadata(&mut output_metadata, &context_metadata);
-    super::merge_metadata(&mut output_metadata, &result_metadata);
+    super::merge_metadata(&mut output_metadata, context_metadata);
+    super::merge_metadata(&mut output_metadata, result_metadata);
     let data_version = result_data_version.or(context_data_version);
 
     let (final_result, dynamic_keys) =
@@ -596,7 +596,7 @@ pub(crate) fn execute_action_step(
             data_version = ctx_ref.drain_data_version();
         }
         if let Some(ext) = crate::result_types::try_extract_result_type(py, &result)? {
-            super::merge_metadata(&mut output_metadata, &ext.metadata);
+            super::merge_metadata(&mut output_metadata, ext.metadata);
             data_version = ext.data_version.or(data_version);
             result = ext.value.unwrap_or_else(|| py.None());
         }
