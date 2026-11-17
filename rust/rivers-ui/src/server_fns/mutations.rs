@@ -130,15 +130,12 @@ async fn expand_spans(
 ) -> Result<Vec<SubmitPartitionKey>, ServerFnError> {
     use crate::types::SpanSource;
     use rivers_api::rivers::GetPartitionKeysRequest;
-    use std::collections::HashSet;
 
-    let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(keys.len());
+    let mut deduped_len = 0;
     for key in keys {
         let SubmitPartitionKey::Span { source, start, end } = key else {
-            if seen.insert(key.clone()) {
-                out.push(key);
-            }
+            out.push(key);
             continue;
         };
 
@@ -176,14 +173,30 @@ async fn expand_spans(
             ));
         }
 
-        for k in covered {
-            let key = SubmitPartitionKey::Single(k);
-            if seen.insert(key.clone()) {
-                out.push(key);
-            }
+        out.extend(covered.into_iter().map(SubmitPartitionKey::Single));
+
+        // A request that repeats a span must not hold every copy.
+        if out.len() > 2 * deduped_len {
+            keep_first(&mut out);
+            deduped_len = out.len();
         }
     }
+
+    keep_first(&mut out);
     Ok(out)
+}
+
+/// Drop each key that comes again after its first place, keeping the order.
+#[cfg(feature = "ssr")]
+fn keep_first(keys: &mut Vec<SubmitPartitionKey>) {
+    use std::collections::HashSet;
+
+    let first: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(keys.len());
+        keys.iter().map(|key| seen.insert(key)).collect()
+    };
+    let mut first = first.into_iter();
+    keys.retain(|_| first.next() == Some(true));
 }
 
 /// Result of a `trigger_materialize` call. Always fire-and-forget — the
@@ -717,7 +730,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
-    use rivers_api::rivers::{CancelBackfillRequest, CancelBackfillResponse};
+    use rivers_api::rivers::{
+        CancelBackfillRequest, CancelBackfillResponse, GetPartitionKeysRequest,
+        GetPartitionKeysResponse,
+    };
     use rivers_core::storage::surrealdb_backend::SurrealStorage;
     use rivers_core::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
@@ -726,15 +742,16 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    use crate::code_location_registry::Registry;
+    use crate::code_location_registry::{Registry, connect_code_location};
     use crate::state::AppState;
-    use crate::types::CodeLocationEntry;
+    use crate::types::{CodeLocationEntry, SpanSource, SubmitPartitionKey};
 
-    /// A code location that answers only `CancelBackfill`, and keeps the
-    /// backfills it was asked to cancel.
+    /// A code location that answers `CancelBackfill`, keeping the backfills it
+    /// was asked to cancel, and `GetPartitionKeys` from `keys`.
     #[derive(Clone, Default)]
     struct FakeLocation {
         canceled: Arc<Mutex<Vec<String>>>,
+        keys: Arc<Vec<String>>,
     }
 
     impl tonic::server::NamedService for FakeLocation {
@@ -754,6 +771,27 @@ mod tests {
         }
     }
 
+    impl tonic::server::UnaryService<GetPartitionKeysRequest> for FakeLocation {
+        type Response = GetPartitionKeysResponse;
+        type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+        fn call(&mut self, request: tonic::Request<GetPartitionKeysRequest>) -> Self::Future {
+            let request = request.into_inner();
+            let keys = self
+                .keys
+                .iter()
+                .skip(request.offset as usize)
+                .take(request.limit as usize)
+                .cloned()
+                .collect();
+            std::future::ready(Ok(tonic::Response::new(GetPartitionKeysResponse {
+                keys,
+                total: self.keys.len() as u64,
+                indices: Vec::new(),
+            })))
+        }
+    }
+
     impl tower::Service<http::Request<tonic::body::Body>> for FakeLocation {
         type Response = http::Response<tonic::body::Body>;
         type Error = Infallible;
@@ -764,31 +802,39 @@ mod tests {
         }
 
         fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            use tonic::server::Grpc;
+            use tonic_prost::ProstCodec;
+
             let fake = self.clone();
             Box::pin(async move {
-                assert_eq!(
-                    request.uri().path(),
-                    "/rivers.v1.CodeLocationService/CancelBackfill"
-                );
-                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
-                Ok(grpc.unary(fake, request).await)
+                Ok(match request.uri().path() {
+                    "/rivers.v1.CodeLocationService/CancelBackfill" => {
+                        Grpc::new(ProstCodec::<_, CancelBackfillRequest>::default())
+                            .unary(fake, request)
+                            .await
+                    }
+                    "/rivers.v1.CodeLocationService/GetPartitionKeys" => {
+                        Grpc::new(ProstCodec::<_, GetPartitionKeysRequest>::default())
+                            .unary(fake, request)
+                            .await
+                    }
+                    path => panic!("unexpected call to {path}"),
+                })
             })
         }
     }
 
-    async fn spawn_fake() -> (String, FakeLocation) {
+    async fn spawn_fake(fake: FakeLocation) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let fake = FakeLocation::default();
-        let service = fake.clone();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(service)
+                .add_service(fake)
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        (format!("http://{addr}"), fake)
+        format!("http://{addr}")
     }
 
     fn entry(name: &str, identity: &str, grpc_endpoint: &str) -> CodeLocationEntry {
@@ -834,7 +880,8 @@ mod tests {
     /// store alone lets the queued runs go on.
     #[tokio::test]
     async fn a_backfill_is_canceled_by_the_code_location_that_owns_it() {
-        let (endpoint, fake) = spawn_fake().await;
+        let fake = FakeLocation::default();
+        let endpoint = spawn_fake(fake.clone()).await;
         let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
         storage
             .create_backfill(&backfill("owner-id"), &[])
@@ -855,5 +902,95 @@ mod tests {
             .unwrap();
 
         assert_eq!(*fake.canceled.lock().unwrap(), ["bf"]);
+    }
+
+    fn single(key: &str) -> SubmitPartitionKey {
+        SubmitPartitionKey::Single(key.into())
+    }
+
+    fn span(start: u64, end: u64) -> SubmitPartitionKey {
+        SubmitPartitionKey::Span {
+            source: SpanSource::Asset("asset".into()),
+            start,
+            end,
+        }
+    }
+
+    /// `keys` expanded by a code location whose asset has the keys `a` to `f`.
+    async fn expand(keys: Vec<SubmitPartitionKey>) -> Vec<SubmitPartitionKey> {
+        let fake = FakeLocation {
+            keys: Arc::new(["a", "b", "c", "d", "e", "f"].map(String::from).into()),
+            ..Default::default()
+        };
+        let mut client = connect_code_location(&spawn_fake(fake).await)
+            .await
+            .unwrap();
+        super::expand_spans("dev", "owner", &mut client, keys)
+            .await
+            .unwrap()
+    }
+
+    /// Overlapping spans and repeated keys submit each key once, where it
+    /// first appears.
+    #[tokio::test]
+    async fn expanded_spans_keep_the_first_of_each_key_in_order() {
+        let multi = |value: &str| SubmitPartitionKey::Multi(vec![("dim".into(), value.into())]);
+
+        let expanded = expand(vec![
+            single("c"),
+            span(1, 3),
+            multi("x"),
+            span(2, 5),
+            single("b"),
+            single("z"),
+            multi("x"),
+            span(0, 1),
+            single("z"),
+            multi("y"),
+        ])
+        .await;
+
+        assert_eq!(
+            expanded,
+            [
+                single("c"),
+                single("b"),
+                single("d"),
+                multi("x"),
+                single("e"),
+                single("f"),
+                single("z"),
+                single("a"),
+                multi("y"),
+            ]
+        );
+    }
+
+    /// A span sent many times submits each key once, where it first appears.
+    #[tokio::test]
+    async fn a_repeated_span_submits_each_key_once_in_order() {
+        let expanded = expand(vec![
+            span(3, 5),
+            span(3, 5),
+            single("a"),
+            span(3, 5),
+            span(3, 5),
+            span(3, 5),
+            span(0, 4),
+            span(3, 5),
+        ])
+        .await;
+
+        assert_eq!(
+            expanded,
+            [
+                single("d"),
+                single("e"),
+                single("f"),
+                single("a"),
+                single("b"),
+                single("c"),
+            ]
+        );
     }
 }
