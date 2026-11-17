@@ -2,8 +2,19 @@ use kube_client::Api;
 use rivers_core::storage::StorageBackend;
 use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_k8s::crd::run::Run;
+use serde::Serialize;
 
 use super::reconcile::{Error, patch_status};
+
+/// The `RunCrdStatus` fields a progress poll changes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressPatch {
+    completed_steps: u32,
+    total_steps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_progress_at: Option<jiff::Timestamp>,
+}
 
 /// Bumps `lastProgressAt` only when forward progress happened. Returns
 /// `true` if the patch was applied (the restart-without-progress detector
@@ -33,15 +44,12 @@ pub async fn update_progress(
         return Ok(false);
     }
 
-    let mut new_status = status.clone();
-    new_status.completed_steps = Some(progress.completed_steps);
-    new_status.total_steps = Some(progress.total_steps);
-
-    if new_completed > old_completed {
-        new_status.last_progress_at = Some(jiff::Timestamp::now().to_string());
-    }
-
-    patch_status(runs_api, name, &new_status).await?;
+    let patch = ProgressPatch {
+        completed_steps: progress.completed_steps,
+        total_steps: progress.total_steps,
+        last_progress_at: (new_completed > old_completed).then(jiff::Timestamp::now),
+    };
+    patch_status(runs_api, name, &patch).await?;
 
     tracing::debug!(
         run = %name,
@@ -61,6 +69,22 @@ mod tests {
     use rivers_core::storage::{EventRecord, EventType, StorageBackend};
 
     use crate::run::test_helpers::*;
+
+    fn patched_fields(state: &MockApiState) -> Vec<String> {
+        let patch = state
+            .requests
+            .iter()
+            .rfind(|r| r.method == "PATCH")
+            .expect("no PATCH request found");
+        let mut fields: Vec<String> = patch.body.as_ref().unwrap()["status"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        fields
+    }
 
     async fn seed_step_events(storage: &SurrealStorage, run_id: &str, completed: u32, total: u32) {
         let ts = jiff::Timestamp::now().as_second();
@@ -116,7 +140,17 @@ mod tests {
         let status = last_status_patch(&state);
         assert_eq!(status.completed_steps, Some(3));
         assert_eq!(status.total_steps, Some(5));
-        assert!(status.last_progress_at.is_some());
+        assert!(
+            status
+                .last_progress_at
+                .unwrap()
+                .parse::<jiff::Timestamp>()
+                .is_ok()
+        );
+        assert_eq!(
+            patched_fields(&state),
+            ["completedSteps", "lastProgressAt", "totalSteps"]
+        );
     }
 
     #[tokio::test]
@@ -189,5 +223,6 @@ mod tests {
             status.last_progress_at.is_none(),
             "completed didn't advance so last_progress_at should not be set"
         );
+        assert_eq!(patched_fields(&state), ["completedSteps", "totalSteps"]);
     }
 }

@@ -9,6 +9,7 @@ use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{RunOutcome, RunStatus, StorageBackend};
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::{CONDITION_EXECUTOR_READY, Run, RunCondition, RunCrdStatus, RunPhase};
+use serde::Serialize;
 
 use super::cancel;
 use super::cleanup;
@@ -439,10 +440,11 @@ pub(crate) async fn sync_run_status_to_storage(
 
 /// Single authority for status writes — every reconciler branch routes
 /// through here so the field manager (`rivers-operator`) is consistent.
+/// A merge patch: `status` may carry only the fields to change.
 pub async fn patch_status(
     runs_api: &Api<Run>,
     name: &str,
-    status: &RunCrdStatus,
+    status: &impl Serialize,
 ) -> Result<(), Error> {
     let patch = serde_json::json!({ "status": status });
     runs_api
