@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::{AssetRecord, PartitionKey};
 
 use super::node::ConditionNode;
-use super::partition::{PartitionEvalContext, PartitionResolver, PartitionSelection};
+use super::partition::{
+    PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
+};
 use super::state::{AssetConditionState, EvalContext, EvalNodeResult, EvalResult, NodeStatus};
 
 /// Per-dep latch state for stateful ops inside dep-aggregates, keyed by dep then node index.
@@ -565,11 +567,10 @@ fn eval_partitioned_on_dep(
         .get(dep_key)
         .unwrap_or(&empty_status);
 
-    let mapping_kind = pctx.resolver.mapping_kind(dep_key, ctx.target_key);
-    let is_identity = matches!(
-        mapping_kind,
-        None | Some(crate::condition::partition::PartitionMappingKind::Identity)
-    );
+    let mapping = pctx
+        .resolver
+        .mapping_kind(dep_key, ctx.target_key)
+        .filter(|m| !matches!(m, PartitionMappingKind::Identity));
     let needs_floor = contains_newly_updated(condition);
     let dep_root_floor = pctx
         .all_partition_statuses
@@ -585,22 +586,17 @@ fn eval_partitioned_on_dep(
                 .timestamps
                 .keys()
                 .filter_map(move |uk| {
-                    if is_identity {
+                    let Some(mapping) = mapping else {
                         if !pctx.all_keys.contains(uk) {
                             return None;
                         }
-                        return Some((uk.clone(), effective_attempt_ts(root_status, uk)));
-                    }
+                        return Some((uk, effective_attempt_ts(root_status, uk)));
+                    };
                     if let PartitionSelection::Keys(s) = &mut scratch {
                         s.clear();
                         s.insert(uk.clone());
                     }
-                    let mapped = pctx.resolver.map_downstream(
-                        dep_key,
-                        ctx.target_key,
-                        &scratch,
-                        Some(pctx.all_keys),
-                    );
+                    let mapped = mapping.map_to_downstream_in(&scratch, Some(pctx.all_keys));
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
                         PartitionSelection::All => *all_floor.get_or_init(|| {
@@ -615,9 +611,9 @@ fn eval_partitioned_on_dep(
                             root_floor_over(in_universe.into_iter(), root_status)
                         }
                     };
-                    Some((uk.clone(), floor))
+                    Some((uk, floor))
                 })
-                .collect::<HashMap<PartitionKey, Option<i64>>>()
+                .collect::<HashMap<&PartitionKey, Option<i64>>>()
         });
 
     let upstream_pctx = PartitionEvalContext {
@@ -660,14 +656,8 @@ fn eval_partitioned_on_dep(
     dep_selections.cur_prev = saved;
     collect_dep_latch(dep_selections, dep_key, local);
 
-    if is_identity {
-        upstream_result
-    } else {
-        pctx.resolver.map_downstream(
-            dep_key,
-            ctx.target_key,
-            &upstream_result,
-            Some(pctx.all_keys),
-        )
+    match mapping {
+        Some(m) => m.map_to_downstream_in(&upstream_result, Some(pctx.all_keys)),
+        None => upstream_result,
     }
 }

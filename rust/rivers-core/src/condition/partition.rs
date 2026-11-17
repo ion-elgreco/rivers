@@ -535,7 +535,7 @@ pub struct PartitionEvalContext<'a> {
     /// Per-asset partition status for ALL assets in the cache (not just this asset).
     pub all_partition_statuses: &'a HashMap<String, crate::condition::cache::PartitionStatusEntry>,
     /// Staleness floor for `NewlyUpdated` in a dep pivot, keyed by upstream key.
-    pub dep_root_floor: Option<&'a HashMap<PartitionKey, Option<i64>>>,
+    pub dep_root_floor: Option<&'a HashMap<&'a PartitionKey, Option<i64>>>,
 }
 
 /// Serde adapter for a `PartitionKey`-keyed map (persisted as `(key, value)` pairs).
