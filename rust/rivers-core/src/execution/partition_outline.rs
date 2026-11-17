@@ -300,11 +300,11 @@ pub fn marks(groups: &[KeyGroup], of_format: &[usize], most: usize) -> Vec<(usiz
     let mut finest = None;
     let mut above = 1;
     for shared in cuts(&first.first, of_format) {
-        let mut level: Vec<(usize, String)> = Vec::new();
+        let mut level: Vec<(usize, &str)> = Vec::new();
         for (at, group) in groups.iter().enumerate() {
             let text = start(&group.first, shared);
-            if level.last().is_none_or(|(_, last)| last != text) {
-                level.push((at, text.to_string()));
+            if level.last().is_none_or(|(_, last)| *last != text) {
+                level.push((at, text));
             }
         }
 
@@ -318,7 +318,10 @@ pub fn marks(groups: &[KeyGroup], of_format: &[usize], most: usize) -> Vec<(usiz
         }
     }
     if let Some(level) = finest {
-        return level;
+        return level
+            .into_iter()
+            .map(|(at, text)| (at, text.to_owned()))
+            .collect();
     }
 
     let count = (most / 2).clamp(1, groups.len());
