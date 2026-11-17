@@ -118,23 +118,20 @@ const SKYLINE_MAX_CLUSTERS: usize = 64;
 /// Lay out a DAG. Nodes joined by an edge or a shared group form a cluster;
 /// each cluster gets its own layered layout, and the clusters are packed to
 /// fill a wide canvas.
-pub fn compute_layout(topology: &GraphTopology, center_layers: bool) -> LayoutResult {
+pub fn compute_layout(topology: GraphTopology, center_layers: bool) -> LayoutResult {
     if topology.nodes.is_empty() {
         return LayoutResult::default();
     }
-    let lay_out = |cluster: &GraphTopology| {
-        if cluster.edges.is_empty() {
-            trim(grid_cluster(cluster))
-        } else {
-            trim(layout_cluster(cluster, center_layers))
-        }
-    };
-    let clusters = split_clusters(topology);
-    let parts = if clusters.len() == 1 {
-        vec![lay_out(topology)]
-    } else {
-        clusters.iter().map(lay_out).collect()
-    };
+    let parts = split_clusters(topology)
+        .into_iter()
+        .map(|cluster| {
+            if cluster.edges.is_empty() {
+                trim(grid_cluster(&cluster))
+            } else {
+                trim(layout_cluster(&cluster, center_layers))
+            }
+        })
+        .collect();
     pack(parts)
 }
 
@@ -199,9 +196,8 @@ fn grid_cluster(topology: &GraphTopology) -> LayoutResult {
 }
 
 /// Sub-topologies of nodes joined by an edge or a shared group, in the
-/// order their first node appears. A single cluster comes back empty-handed
-/// (no nodes copied): the caller lays out the topology itself.
-fn split_clusters(topology: &GraphTopology) -> Vec<GraphTopology> {
+/// order their first node appears. A single cluster is the topology itself.
+fn split_clusters(topology: GraphTopology) -> Vec<GraphTopology> {
     fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
@@ -217,47 +213,50 @@ fn split_clusters(topology: &GraphTopology) -> Vec<GraphTopology> {
     }
 
     let n = topology.nodes.len();
-    let index: HashMap<&str, usize> = topology
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, nd)| (nd.name.as_str(), i))
-        .collect();
     let mut parent: Vec<usize> = (0..n).collect();
-    for (from, to) in &topology.edges {
-        if let (Some(&a), Some(&b)) = (index.get(from.as_str()), index.get(to.as_str())) {
-            union(&mut parent, a, b);
+    let mut edge_sources = Vec::with_capacity(topology.edges.len());
+    {
+        let index: HashMap<&str, usize> = topology
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, nd)| (nd.name.as_str(), i))
+            .collect();
+        for (from, to) in &topology.edges {
+            let ends = index.get(from.as_str()).zip(index.get(to.as_str()));
+            if let Some((&a, &b)) = ends {
+                union(&mut parent, a, b);
+            }
+            edge_sources.push(ends.map(|(&a, _)| a));
         }
-    }
-    let mut group_first: HashMap<&str, usize> = HashMap::new();
-    for (i, nd) in topology.nodes.iter().enumerate() {
-        if let Some(g) = nd.group.as_deref() {
-            let first = *group_first.entry(g).or_insert(i);
-            union(&mut parent, first, i);
+        let mut group_first: HashMap<&str, usize> = HashMap::new();
+        for (i, nd) in topology.nodes.iter().enumerate() {
+            if let Some(g) = nd.group.as_deref() {
+                let first = *group_first.entry(g).or_insert(i);
+                union(&mut parent, first, i);
+            }
         }
     }
 
     let roots: HashSet<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
     if roots.len() == 1 {
-        return vec![GraphTopology::default()];
+        return vec![topology];
     }
     let mut slot_of_root: HashMap<usize, usize> = HashMap::new();
     let mut slot_of_node = vec![0usize; n];
     let mut clusters: Vec<GraphTopology> = Vec::new();
-    for (i, node) in topology.nodes.iter().enumerate() {
+    for (i, node) in topology.nodes.into_iter().enumerate() {
         let root = find(&mut parent, i);
         let slot = *slot_of_root.entry(root).or_insert_with(|| {
             clusters.push(GraphTopology::default());
             clusters.len() - 1
         });
         slot_of_node[i] = slot;
-        clusters[slot].nodes.push(node.clone());
+        clusters[slot].nodes.push(node);
     }
-    for (from, to) in &topology.edges {
-        if let (Some(&a), Some(_)) = (index.get(from.as_str()), index.get(to.as_str())) {
-            clusters[slot_of_node[a]]
-                .edges
-                .push((from.clone(), to.clone()));
+    for (edge, source) in topology.edges.into_iter().zip(edge_sources) {
+        if let Some(a) = source {
+            clusters[slot_of_node[a]].edges.push(edge);
         }
     }
     clusters
@@ -1499,9 +1498,10 @@ mod tests {
     /// shown at 29% when fitted to the canvas.
     #[test]
     fn demo_layout_is_wide_without_overlaps() {
-        let topo = real_demo_topology().visible(&[], &[], &[]);
-        let result = compute_layout(&topo, false);
-        assert_eq!(result.nodes.len(), topo.nodes.len());
+        let topo = real_demo_topology().into_visible(&[], &[], &[]);
+        let shown = topo.nodes.len();
+        let result = compute_layout(topo, false);
+        assert_eq!(result.nodes.len(), shown);
         assert!(
             result.width > result.height,
             "{}x{}",
@@ -1517,7 +1517,7 @@ mod tests {
 
     #[test]
     fn a_separate_chain_stays_on_one_row() {
-        let result = compute_layout(&real_demo_topology().visible(&[], &[], &[]), false);
+        let result = compute_layout(real_demo_topology().into_visible(&[], &[], &[]), false);
         let rows: HashSet<i64> = ["slow_step_a", "slow_step_b", "slow_step_c", "slow_step_d"]
             .iter()
             .map(|id| find(&result, id).y.round() as i64)
@@ -1530,7 +1530,7 @@ mod tests {
     /// before) and no other node lands between them.
     #[test]
     fn a_group_stays_together() {
-        let result = compute_layout(&real_demo_topology().visible(&[], &[], &[]), false);
+        let result = compute_layout(real_demo_topology().into_visible(&[], &[], &[]), false);
         let in_group = |n: &&LayoutNode| n.group.as_deref() == Some("backfill_demo");
         let area = bounds(result.nodes.iter().filter(in_group));
         assert!(
@@ -1555,7 +1555,7 @@ mod tests {
                 .collect(),
             edges: vec![("b".into(), "a".into()), ("d".into(), "c".into())],
         };
-        let result = compute_layout(&topo, false);
+        let result = compute_layout(topo, false);
         let first = bounds(["a", "b"].iter().map(|id| find(&result, id)));
         let second = bounds(["c", "d"].iter().map(|id| find(&result, id)));
         let gap_x = (second.0 - first.2).max(first.0 - second.2);
@@ -1569,16 +1569,111 @@ mod tests {
     #[test]
     fn a_cluster_without_edges_fills_columns() {
         let analytics = vec!["analytics".to_string()];
-        let result = compute_layout(&real_demo_topology().visible(&[], &analytics, &[]), false);
+        let result = compute_layout(
+            real_demo_topology().into_visible(&[], &analytics, &[]),
+            false,
+        );
         let columns: HashSet<i64> = result.nodes.iter().map(|n| n.x.round() as i64).collect();
         assert_eq!(result.nodes.len(), 8);
         assert!(columns.len() > 1, "8 nodes without edges formed one column");
     }
 
+    /// Pins the layout of a topology with a collapsed graph asset and three
+    /// clusters, one of them without edges.
+    #[test]
+    fn layout_of_collapsed_graphs_and_clusters_is_pinned() {
+        let inside = |name: &str, graph: &str| TopologyNode {
+            parent_graph: Some(graph.into()),
+            ..node(name, "task", None)
+        };
+        let topo = GraphTopology {
+            nodes: vec![
+                node("raw", "asset", Some("ingest")),
+                node("pipe", "graph_asset", Some("ingest")),
+                inside("pipe/a", "pipe"),
+                inside("pipe/b", "pipe"),
+                node("report", "asset", Some("reports")),
+                node("summary", "asset", None),
+                node("src", "asset", None),
+                node("dst", "asset", None),
+                node("lone_a", "asset", Some("misc")),
+                node("lone_b", "asset", Some("misc")),
+            ],
+            edges: [
+                ("pipe/a", "raw"),
+                ("pipe/b", "pipe/a"),
+                ("pipe", "pipe/b"),
+                ("report", "pipe/a"),
+                ("report", "pipe/b"),
+                ("summary", "report"),
+                ("summary", "raw"),
+                ("dst", "src"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .to_vec(),
+        };
+
+        let result = compute_layout(topo.into_visible(&[], &[], &[]), false);
+
+        let nodes: Vec<_> = result
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.x, n.y))
+            .collect();
+        let edges: Vec<_> = result
+            .edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str(), e.waypoints.clone()))
+            .collect();
+        let mut groups: Vec<_> = result
+            .groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.x, g.y, g.width, g.height))
+            .collect();
+        groups.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            nodes,
+            vec![
+                ("lone_a", 68.0, 68.0),
+                ("lone_b", 68.0, 132.0),
+                ("raw", 68.0, 236.0),
+                ("pipe", 328.0, 236.00038143615174),
+                ("report", 588.0, 236.00297762107834),
+                ("summary", 848.0, 236.0056099971826),
+                ("src", 60.0, 332.00297762107834),
+                ("dst", 320.0, 332.00297762107834),
+            ]
+        );
+        assert_eq!(
+            edges,
+            vec![
+                ("raw", "pipe", vec![]),
+                ("pipe", "report", vec![]),
+                ("report", "summary", vec![]),
+                (
+                    "raw",
+                    "summary",
+                    vec![(428.0, 260.00388010594867), (688.0, 260.0055808007002)]
+                ),
+                ("src", "dst", vec![]),
+            ]
+        );
+        assert_eq!(
+            groups,
+            vec![
+                ("ingest", 60.0, 228.0, 216.0, 64.0),
+                ("ingest", 320.0, 228.00038143615174, 216.0, 64.0),
+                ("misc", 60.0, 60.0, 216.0, 128.0),
+                ("reports", 580.0, 228.00297762107834, 216.0, 64.0),
+            ]
+        );
+        assert_eq!((result.width, result.height), (1108.0, 440.00297762107834));
+    }
+
     #[test]
     fn test_generate_svg() {
         let topo = demo_topology();
-        let result = compute_layout(&topo, false);
+        let result = compute_layout(topo, false);
         let svg = render_svg(&result);
         let path = "/tmp/dag_layout.svg";
         std::fs::write(path, &svg).expect("failed to write SVG");
@@ -1644,11 +1739,11 @@ mod tests {
         ] {
             // Warmup
             for _ in 0..10 {
-                std::hint::black_box(compute_layout(topo, false));
+                std::hint::black_box(compute_layout(topo.clone(), false));
             }
             let start = Instant::now();
             for _ in 0..iters {
-                std::hint::black_box(compute_layout(topo, false));
+                std::hint::black_box(compute_layout(topo.clone(), false));
             }
             let elapsed = start.elapsed();
             let per_iter = elapsed / iters as u32;
@@ -1798,11 +1893,11 @@ mod tests {
             ("large (200 nodes)", &large, 200),
         ] {
             for _ in 0..10 {
-                std::hint::black_box(compute_layout(topo, false));
+                std::hint::black_box(compute_layout(topo.clone(), false));
             }
             let start = Instant::now();
             for _ in 0..iters {
-                std::hint::black_box(compute_layout(topo, false));
+                std::hint::black_box(compute_layout(topo.clone(), false));
             }
             let elapsed = start.elapsed();
             let per_iter = elapsed / iters as u32;
@@ -1813,7 +1908,7 @@ mod tests {
     #[test]
     fn test_layout_demo_topology() {
         let topo = demo_topology();
-        let result = compute_layout(&topo, false);
+        let result = compute_layout(topo, false);
 
         eprintln!("=== Layout Result ===");
         eprintln!("Dimensions: {}x{}", result.width, result.height);

@@ -218,7 +218,7 @@ async fn load_remote_statuses(
 }
 
 /// Layout of what the lineage page shows: the kind and group filters, with
-/// graph assets outside `expanded` collapsed. See [`GraphTopology::visible`].
+/// graph assets outside `expanded` collapsed. See [`GraphTopology::into_visible`].
 #[server(input = Json)]
 pub async fn get_graph_layout(
     loc_ns: String,
@@ -231,7 +231,7 @@ pub async fn get_graph_layout(
     let state = expect_context::<crate::state::AppState>();
     let topo = load_ui_topology(&state, &loc_ns, &loc_name).await?;
     Ok(compute_layout(
-        &topo.visible(&kinds, &groups, &expanded),
+        topo.into_visible(&kinds, &groups, &expanded),
         center_layers,
     ))
 }

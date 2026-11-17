@@ -14,16 +14,14 @@ impl GraphTopology {
     /// shows as the outermost collapsed graph around it, and its edges move
     /// there; then the kind and group filters apply. An empty filter keeps
     /// everything; a group filter drops ungrouped nodes.
-    pub fn visible(&self, kinds: &[String], groups: &[String], expanded: &[String]) -> Self {
+    pub fn into_visible(self, kinds: &[String], groups: &[String], expanded: &[String]) -> Self {
         use std::collections::{HashMap, HashSet};
 
-        let parent: HashMap<&str, &str> = self
-            .nodes
-            .iter()
-            .filter_map(|n| n.parent_graph.as_deref().map(|p| (n.name.as_str(), p)))
-            .collect();
-        let expanded: HashSet<&str> = expanded.iter().map(String::as_str).collect();
-        let shown_as = |name: &str| -> String {
+        fn shown_as<'a>(
+            parent: &HashMap<&'a str, &'a str>,
+            expanded: &HashSet<&str>,
+            name: &'a str,
+        ) -> &'a str {
             let (mut shown, mut current) = (name, name);
             for _ in 0..=parent.len() {
                 let Some(&p) = parent.get(current) else { break };
@@ -32,27 +30,50 @@ impl GraphTopology {
                 }
                 current = p;
             }
-            shown.to_string()
-        };
+            shown
+        }
 
-        let nodes: Vec<TopologyNode> = self
-            .nodes
+        let Self { nodes, edges } = self;
+        let parent: HashMap<&str, &str> = nodes
             .iter()
-            .filter(|n| shown_as(&n.name) == n.name)
-            .filter(|n| kinds.is_empty() || kinds.contains(&n.kind))
-            .filter(|n| groups.is_empty() || n.group.as_ref().is_some_and(|g| groups.contains(g)))
-            .cloned()
+            .filter_map(|n| n.parent_graph.as_deref().map(|p| (n.name.as_str(), p)))
             .collect();
-        let names: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-        let mut seen = HashSet::new();
-        let edges = self
-            .edges
+        let expanded: HashSet<&str> = expanded.iter().map(String::as_str).collect();
+
+        let keep: Vec<bool> = nodes
             .iter()
-            .map(|(from, to)| (shown_as(from), shown_as(to)))
-            .filter(|(from, to)| {
-                from != to && names.contains(from.as_str()) && names.contains(to.as_str())
+            .map(|n| {
+                shown_as(&parent, &expanded, &n.name) == n.name
+                    && (kinds.is_empty() || kinds.contains(&n.kind))
+                    && (groups.is_empty() || n.group.as_ref().is_some_and(|g| groups.contains(g)))
             })
-            .filter(|edge| seen.insert(edge.clone()))
+            .collect();
+        let names: HashSet<&str> = nodes
+            .iter()
+            .zip(&keep)
+            .filter(|(_, keep)| **keep)
+            .map(|(n, _)| n.name.as_str())
+            .collect();
+
+        let mut seen = HashSet::new();
+        let edges = edges
+            .into_iter()
+            .filter_map(|(from, to)| {
+                let shown_from = *names.get(shown_as(&parent, &expanded, &from))?;
+                let shown_to = *names.get(shown_as(&parent, &expanded, &to))?;
+                if shown_from == shown_to || !seen.insert((shown_from, shown_to)) {
+                    return None;
+                }
+                let own =
+                    |name: String, shown: &str| if name == shown { name } else { shown.into() };
+                Some((own(from, shown_from), own(to, shown_to)))
+            })
+            .collect();
+
+        let nodes = nodes
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(n, keep)| keep.then_some(n))
             .collect();
         Self { nodes, edges }
     }
@@ -314,14 +335,14 @@ mod topology_tests {
             ],
         };
 
-        let collapsed = topo.visible(&[], &[], &[]);
+        let collapsed = topo.clone().into_visible(&[], &[], &[]);
         assert_eq!(names(&collapsed), vec!["raw", "pipe", "report"]);
         assert_eq!(
             collapsed.edges,
             vec![edge("pipe", "raw"), edge("report", "pipe")]
         );
 
-        let expanded = topo.visible(&[], &[], &["pipe".into()]);
+        let expanded = topo.clone().into_visible(&[], &[], &["pipe".into()]);
         assert_eq!(expanded.nodes.len(), 5);
         assert_eq!(expanded.edges, topo.edges);
     }
@@ -339,7 +360,7 @@ mod topology_tests {
             ],
             edges: vec![edge("leaf", "src")],
         };
-        let shown = topo.visible(&[], &[], &["inner".into()]);
+        let shown = topo.clone().into_visible(&[], &[], &["inner".into()]);
         assert_eq!(names(&shown), vec!["src", "outer"]);
         assert_eq!(shown.edges, vec![edge("outer", "src")]);
     }
@@ -360,11 +381,15 @@ mod topology_tests {
             edges: vec![edge("b", "a"), edge("c", "b")],
         };
 
-        let g1_g2 = topo.visible(&[], &["g1".into(), "g2".into()], &[]);
+        let g1_g2 = topo
+            .clone()
+            .into_visible(&[], &["g1".into(), "g2".into()], &[]);
         assert_eq!(names(&g1_g2), vec!["a", "b"]);
         assert_eq!(g1_g2.edges, vec![edge("b", "a")]);
 
-        let tasks = topo.visible(&["task".into()], &[], &["b".into()]);
+        let tasks = topo
+            .clone()
+            .into_visible(&["task".into()], &[], &["b".into()]);
         assert_eq!(names(&tasks), vec!["t"]);
         assert!(tasks.edges.is_empty());
     }

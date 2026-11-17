@@ -146,7 +146,7 @@ pub(super) fn RunTimelinePanel(
                 .cloned()
                 .collect();
             let subset_topo = crate::types::GraphTopology { nodes, edges };
-            crate::components::dag::layout::compute_layout(&subset_topo, true)
+            crate::components::dag::layout::compute_layout(subset_topo, true)
         });
 
     let mut status_by_asset: std::collections::HashMap<String, StepStatus> =
