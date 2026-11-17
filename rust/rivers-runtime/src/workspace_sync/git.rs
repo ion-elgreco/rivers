@@ -171,7 +171,7 @@ pub(crate) fn fetch(cfg: &Config, auth: &Auth, deadline: &Deadline) -> Result<()
         cmd.arg("-C")
             .arg(&src)
             .args(args)
-            .envs(auth.env.iter().cloned());
+            .envs(auth.env.iter().map(|(k, v)| (k, v)));
         let done = child::run(&mut cmd, deadline, output)?;
         if done.status.success() {
             Ok(done)
@@ -187,7 +187,7 @@ pub(crate) fn fetch(cfg: &Config, auth: &Auth, deadline: &Deadline) -> Result<()
             .arg("-C")
             .arg(&src)
             .args(["fetch", "-q", "--depth", "1", "origin", what])
-            .envs(auth.env.iter().cloned());
+            .envs(auth.env.iter().map(|(k, v)| (k, v)));
         let done = child::run(&mut cmd, deadline, Output::Capture)?;
         Ok(if done.status.success() {
             Ok(())
@@ -222,10 +222,8 @@ pub(crate) fn fetch(cfg: &Config, auth: &Auth, deadline: &Deadline) -> Result<()
         }
     }
     git(&["checkout", "-q", "FETCH_HEAD"], Output::Inherit)?;
-    let actual = git(&["rev-parse", "HEAD"], Output::Stdout)?
-        .captured
-        .trim()
-        .to_string();
+    let head = git(&["rev-parse", "HEAD"], Output::Stdout)?;
+    let actual = head.captured.trim();
     if actual != *commit {
         return Err(Failure::Message(format!(
             "fetched commit {actual} does not match pinned {commit} — ref moved between resolve and fetch; retrying on next pod start"
