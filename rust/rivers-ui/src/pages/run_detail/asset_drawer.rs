@@ -86,8 +86,8 @@ fn asset_chip_status(asset_events: &[StoredEvent]) -> (&'static str, &'static st
 pub fn RunAssetDrawer(
     asset_key: String,
     run_id: String,
-    step_events: Vec<StoredEvent>,
-    topology: Option<crate::types::GraphTopology>,
+    asset_step_events: Vec<StoredEvent>,
+    upstream: Vec<String>,
     mat_page: ReadSignal<u64>,
     set_mat_page: WriteSignal<u64>,
     obs_page: ReadSignal<u64>,
@@ -99,12 +99,6 @@ pub fn RunAssetDrawer(
     on_close: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     // Status/timing from this asset's step events; materializations paginated below.
-    let asset_step_events: Vec<StoredEvent> = step_events
-        .iter()
-        .filter(|e| e.asset_key.as_ref() == Some(&asset_key))
-        .cloned()
-        .collect();
-
     let start_ns: Option<i64> = asset_step_events
         .iter()
         .filter(|e| matches!(e.event_type, EventType::StepStart))
@@ -143,10 +137,6 @@ pub fn RunAssetDrawer(
     let started_label = start_ns
         .map(|t| format_log_timestamp(t))
         .unwrap_or_else(|| "—".to_string());
-    let upstream: Vec<String> = topology
-        .as_ref()
-        .map(|t| t.direct_upstream(&asset_key))
-        .unwrap_or_default();
 
     // Paginated materialization / observation cards; page totals drive the headers.
     let (mat_page_size, set_mat_page_size) = signal(25u64);

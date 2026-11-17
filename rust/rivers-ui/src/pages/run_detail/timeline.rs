@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -6,12 +6,12 @@ use leptos::prelude::*;
 use crate::components::dag::layout::{LayoutResult, compute_layout};
 use crate::components::ui_kit::EmptyState;
 use crate::now::use_now;
-use crate::types::{EventType, StoredEvent};
+use crate::types::{EventType, GraphTopology, StoredEvent, TopologyNode};
 
 use super::dag_view::RunDagView;
 
 #[derive(Clone)]
-struct GanttStep {
+pub(super) struct GanttStep {
     asset: String,
     start: i64,
     end: Option<i64>,
@@ -32,7 +32,7 @@ struct AssetEvents {
 }
 
 /// Groups all events by asset first, so the result is correct regardless of event ordering.
-fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
+pub(super) fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
     let mut by_asset: HashMap<String, AssetEvents> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
@@ -94,21 +94,40 @@ fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
     steps
 }
 
+/// The nodes of `topology` that are steps of the run, and the edges between them.
+pub(super) fn run_topology(topology: &GraphTopology, node_names: &[String]) -> GraphTopology {
+    let names: HashSet<&str> = node_names.iter().map(String::as_str).collect();
+    let nodes: Vec<TopologyNode> = topology
+        .nodes
+        .iter()
+        .filter(|n| names.contains(n.name.as_str()))
+        .cloned()
+        .collect();
+
+    let kept: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let edges = topology
+        .edges
+        .iter()
+        .filter(|(from, to)| kept.contains(from.as_str()) && kept.contains(to.as_str()))
+        .cloned()
+        .collect();
+    GraphTopology { nodes, edges }
+}
+
 /// A "ghost: last run" overlay (previous-run delta bars + legend) was scaffolded
 /// here; see [`docs/deferred/run-detail-ghost-overlay.md`] for the full design
 /// and how to reintroduce it once real previous-run data lands.
 #[component]
 pub(super) fn RunTimelinePanel(
-    events: Vec<StoredEvent>,
+    steps: Vec<GanttStep>,
     run_start: Option<i64>,
-    node_names: Vec<String>,
-    topology: Option<crate::types::GraphTopology>,
+    /// The run's part of the topology (`run_topology`).
+    topology: Option<GraphTopology>,
     selected_step: ReadSignal<Option<String>>,
     on_select: WriteSignal<Option<String>>,
     view_mode: ReadSignal<String>,
     set_view_mode: WriteSignal<String>,
 ) -> impl IntoView {
-    let steps = build_gantt_steps(&events);
     let has_steps = !steps.is_empty();
 
     // Anchor the displayed window to the STEP execution range, not the run-level
@@ -130,25 +149,8 @@ pub(super) fn RunTimelinePanel(
     });
     let show_gantt = Signal::derive(move || view_mode.get() != "dag");
 
-    let asset_set: std::collections::HashSet<String> = node_names.iter().cloned().collect();
-    let dag_layout: Option<Arc<LayoutResult>> = topology.as_ref().map(|topo| {
-        let nodes: Vec<_> = topo
-            .nodes
-            .iter()
-            .filter(|n| asset_set.contains(&n.name))
-            .cloned()
-            .collect();
-        let subset: std::collections::HashSet<&str> =
-            nodes.iter().map(|n| n.name.as_str()).collect();
-        let edges: Vec<_> = topo
-            .edges
-            .iter()
-            .filter(|(a, b)| subset.contains(a.as_str()) && subset.contains(b.as_str()))
-            .cloned()
-            .collect();
-        let subset_topo = crate::types::GraphTopology { nodes, edges };
-        Arc::new(compute_layout(subset_topo, true))
-    });
+    let dag_layout: Option<Arc<LayoutResult>> =
+        topology.map(|topo| Arc::new(compute_layout(topo, true)));
 
     let status_by_asset: Arc<HashMap<String, StepStatus>> = Arc::new(
         steps
@@ -405,5 +407,33 @@ mod tests {
         assert_eq!(fmt_dur_short(0.0042), "4.2ms");
         assert_eq!(fmt_dur_short(0.25), "250ms");
         assert_eq!(fmt_dur_short(3.0), "3.0s");
+    }
+
+    #[test]
+    fn run_topology_keeps_the_runs_nodes_and_the_edges_between_them() {
+        let node = |name: &str| TopologyNode {
+            name: name.into(),
+            kind: "asset".into(),
+            group: None,
+            parent_graph: None,
+            remote: None,
+        };
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topology = GraphTopology {
+            nodes: vec![node("a"), node("b"), node("c"), node("d")],
+            edges: vec![
+                edge("b", "a"),
+                edge("c", "b"),
+                edge("d", "c"),
+                edge("c", "x"),
+            ],
+        };
+
+        let names = ["c", "x", "b", "d"].map(String::from);
+        let run = run_topology(&topology, &names);
+
+        let kept: Vec<&str> = run.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(kept, ["b", "c", "d"]);
+        assert_eq!(run.edges, [edge("c", "b"), edge("d", "c")]);
     }
 }

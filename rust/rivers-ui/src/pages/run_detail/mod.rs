@@ -27,7 +27,7 @@ mod timeline;
 pub use asset_drawer::*;
 
 use logs::RunLogPanel;
-use timeline::RunTimelinePanel;
+use timeline::{RunTimelinePanel, build_gantt_steps, run_topology};
 
 #[component]
 pub fn RunDetailPage() -> impl IntoView {
@@ -449,7 +449,7 @@ pub fn RunDetailPage() -> impl IntoView {
         </Transition>
 
         <Transition>
-            <Show when=move || !matches!(run.get(), Some(Ok(None)))>
+            <Show when=move || run.with(|r| !matches!(r, Some(Ok(None))))>
                 <div class="tab-content">
                     <RunFailures
                         step_events=Signal::derive(move || {
@@ -459,15 +459,27 @@ pub fn RunDetailPage() -> impl IntoView {
                     />
                     <Transition fallback=move || view! { <div class="loading">"Loading timeline…"</div> }>
                         {move || {
-                            let run_data = run.get().and_then(|r| r.ok()).flatten();
-                            let steps = step_events.get()?.ok()?;
-                            let run_start = run_data.as_ref().map(|r| r.start_time);
+                            let (run_start, steps, topo) = {
+                                let run_guard = run.read();
+                                let record = run_guard
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(Option::as_ref);
+                                let steps =
+                                    build_gantt_steps(step_events.read().as_ref()?.as_ref().ok()?);
+                                let node_names = record.map_or(&[][..], |r| r.node_names.as_slice());
+                                let topo = topology
+                                    .read()
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .map(|t| run_topology(t, node_names));
+                                (record.map(|r| r.start_time), steps, topo)
+                            };
                             Some(view! {
                                 <RunTimelinePanel
-                                    events={steps}
-                                    run_start={run_start}
-                                    node_names={run_data.as_ref().map(|r| r.node_names.clone()).unwrap_or_default()}
-                                    topology={topology.get().and_then(|r| r.ok())}
+                                    steps=steps
+                                    run_start=run_start
+                                    topology=topo
                                     selected_step=selected_step
                                     on_select=set_selected_step
                                     view_mode=view_mode
@@ -503,14 +515,27 @@ pub fn RunDetailPage() -> impl IntoView {
             <Transition fallback=|| ()>
                 {move || {
                     let asset = selected_step.get()?;
-                    let steps = step_events.get()?.ok()?;
-                    let topo = topology.get().and_then(|r| r.ok());
+                    let asset_step_events = step_events
+                        .read()
+                        .as_ref()?
+                        .as_ref()
+                        .ok()?
+                        .iter()
+                        .filter(|e| e.asset_key.as_ref() == Some(&asset))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let upstream = topology
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|t| t.direct_upstream(&asset))
+                        .unwrap_or_default();
                     Some(view! {
                         <RunAssetDrawer
                             asset_key=asset
                             run_id=run_id()
-                            step_events=steps
-                            topology=topo
+                            asset_step_events=asset_step_events
+                            upstream=upstream
                             mat_page=mat_page
                             set_mat_page=set_mat_page
                             obs_page=obs_page

@@ -67,8 +67,8 @@ async fn deletion_events_show_in_the_asset_drawer() {
                 <RunAssetDrawer
                     asset_key="events".to_string()
                     run_id="r1".to_string()
-                    step_events=vec![]
-                    topology=None
+                    asset_step_events=vec![]
+                    upstream=vec![]
                     mat_page=mat_page
                     set_mat_page=set_mat_page
                     obs_page=obs_page
