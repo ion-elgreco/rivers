@@ -573,7 +573,7 @@ pub(super) fn validate_partition_mappings(
             };
             let upstream_partitions = upstream_node.partitions_def();
 
-            let mapping = explicit_mappings.as_ref().and_then(|m| m.get(dep_name));
+            let mapping = explicit_mappings.and_then(|m| m.get(dep_name));
 
             PartitionMapping::validate_edge(mapping, downstream_partitions, upstream_partitions)
                 .map_err(|e| {
@@ -585,7 +585,7 @@ pub(super) fn validate_partition_mappings(
         }
 
         // Check that all explicit mapping keys reference actual dependencies
-        if let Some(ref mappings) = explicit_mappings {
+        if let Some(mappings) = explicit_mappings {
             let dep_names: HashSet<&str> = deps
                 .iter()
                 .filter_map(|d| match d {

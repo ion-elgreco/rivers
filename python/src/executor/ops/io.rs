@@ -91,12 +91,12 @@ pub(crate) fn map_partition_key_for_upstream(
     }
     let mapping = downstream_node
         .partition_mapping()
-        .and_then(|m| m.get(upstream_name).cloned());
+        .and_then(|m| m.get(upstream_name));
     let down_def = downstream_node.partitions_def();
     let up_def = upstream_node.partitions_def();
 
     let identity = PartitionMapping::Identity {};
-    let m = mapping.as_ref().unwrap_or(&identity);
+    let m = mapping.unwrap_or(&identity);
     m.resolve_upstream_key(partition_key.as_ref(), down_def, up_def)
         .map_err(|e| PartitionValidationError::new_err(e.to_string()))
 }
@@ -131,7 +131,7 @@ pub(crate) fn load_self_dependency(
 
     let type_hint = annotation.getattr("__args__")?.get_item(0)?.unbind();
 
-    let metadata = node.metadata();
+    let metadata = node.metadata().cloned();
     let partition = build_partition_context(node, partition_key)?;
     let ctx = PyInputContext {
         asset_name: step_name.to_string(),
@@ -174,11 +174,11 @@ pub(crate) fn load_upstream_input(
     }
     let metadata = downstream_node
         .input_metadata(param_name)
-        .or_else(|| upstream_node.metadata());
+        .or_else(|| upstream_node.metadata())
+        .cloned();
     let has_mapping = downstream_node
         .partition_mapping()
-        .and_then(|m| m.get(param_name).cloned())
-        .is_some();
+        .is_some_and(|m| m.contains_key(param_name));
     // When a mapping was applied, the mapped key may not match the upstream's
     // full partition definition (e.g. multi_to_single produces a Single key for
     // a Multi-partitioned upstream). Build context without validation in that case.
@@ -214,7 +214,7 @@ pub(crate) fn load_step_output(
     let ctx = PyInputContext {
         asset_name: step_name.to_string(),
         downstream_asset: downstream_name.to_string(),
-        asset_metadata: node.metadata(),
+        asset_metadata: node.metadata().cloned(),
         partition: build_partition_context(node, partition_key)?,
         type_hint: type_hint.map(|h| h.clone_ref(py)),
         code_location: None,
@@ -264,7 +264,7 @@ pub(crate) fn handle_step_output(
     registry: &IOHandlerRegistry,
 ) -> PyResult<WrittenOutput> {
     let handler = registry.for_output(py, node);
-    let metadata = node.metadata();
+    let metadata = node.metadata().cloned();
     let partition = build_partition_context(node, partition_key)?;
     let ctx = Py::new(
         py,

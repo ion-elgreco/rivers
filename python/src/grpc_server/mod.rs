@@ -553,7 +553,7 @@ impl CodeLocationService for CodeLocationImpl {
                         asset_type: node.asset_type().to_string(),
                         actions,
                         config_schema,
-                        metadata: node.metadata().unwrap_or_default(),
+                        metadata: node.metadata().cloned().unwrap_or_default(),
                     });
                 }
 

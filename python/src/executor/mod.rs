@@ -399,7 +399,7 @@ impl Executor {
                         step.name.as_str()
                     };
                     if !metadata_cache.contains_key(lookup_name) {
-                        let meta = node_map.get(lookup_name).and_then(|n| n.metadata());
+                        let meta = node_map.get(lookup_name).and_then(|n| n.metadata().cloned());
                         metadata_cache.insert(lookup_name.to_string(), meta);
                     }
                     let executor_key = metadata_cache

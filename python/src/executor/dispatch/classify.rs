@@ -105,7 +105,7 @@ pub(crate) fn classify_step(
                     &step.name,
                     ctx.scope.run_id,
                     msg,
-                    node.metadata(),
+                    node.metadata().cloned(),
                     None,
                 );
             });
@@ -198,7 +198,7 @@ pub(crate) fn classify_step(
                         &step.name,
                         ctx.scope.run_id,
                         &py.None(),
-                        node.metadata(),
+                        node.metadata().cloned(),
                         None,
                     );
                 });

@@ -136,7 +136,7 @@ pub(crate) fn load_fan_out_source(
     let ctx = PyInputContext::new(
         source_name.to_string(),
         "fan_out".to_string(),
-        source_node.metadata(),
+        source_node.metadata().cloned(),
         partition,
         None,
         None,
@@ -224,7 +224,7 @@ impl MappedResultsIter {
             keys,
             index: AtomicUsize::new(0),
             io_handler,
-            metadata: mapped_node.metadata(),
+            metadata: mapped_node.metadata().cloned(),
             partition,
         })
     }

@@ -460,7 +460,7 @@ impl PyCodeRepository {
         let ctx = crate::context::io::PyInputContext {
             asset_name,
             downstream_asset: "__load_node__".to_string(),
-            asset_metadata: node.metadata(),
+            asset_metadata: node.metadata().cloned(),
             partition,
             type_hint,
             code_location,

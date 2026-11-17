@@ -903,11 +903,9 @@ impl ResolvedNode {
         }
     }
 
-    pub fn input_metadata(&self, param_name: &str) -> Option<HashMap<String, String>> {
+    pub fn input_metadata(&self, param_name: &str) -> Option<&HashMap<String, String>> {
         match self {
-            ResolvedNode::Asset(node) => {
-                node.inner.get().inner().input_metadata(param_name).cloned()
-            }
+            ResolvedNode::Asset(node) => node.inner.get().inner().input_metadata(param_name),
             ResolvedNode::Task(node) => {
                 let resolved = node
                     .param_remap
@@ -918,7 +916,6 @@ impl ResolvedNode {
                 node.input_metadata_override
                     .as_ref()
                     .and_then(|m| m.get(resolved))
-                    .cloned()
             }
             _ => None,
         }
@@ -948,9 +945,9 @@ impl ResolvedNode {
         }
     }
 
-    pub fn metadata(&self) -> Option<HashMap<String, String>> {
+    pub fn metadata(&self) -> Option<&HashMap<String, String>> {
         match self {
-            ResolvedNode::Asset(node) => node.metadata.clone(),
+            ResolvedNode::Asset(node) => node.metadata.as_ref(),
             ResolvedNode::Task(_) | ResolvedNode::BashTask(_) => None,
         }
     }
@@ -1021,11 +1018,11 @@ impl ResolvedNode {
         }
     }
 
-    pub fn partition_mapping(&self) -> Option<HashMap<String, PartitionMapping>> {
+    pub fn partition_mapping(&self) -> Option<&HashMap<String, PartitionMapping>> {
         match self {
-            ResolvedNode::Asset(node) => node.partition_mapping.clone(),
-            ResolvedNode::Task(node) => node.partition_mapping.clone(),
-            ResolvedNode::BashTask(node) => node.partition_mapping.clone(),
+            ResolvedNode::Asset(node) => node.partition_mapping.as_ref(),
+            ResolvedNode::Task(node) => node.partition_mapping.as_ref(),
+            ResolvedNode::BashTask(node) => node.partition_mapping.as_ref(),
         }
     }
 

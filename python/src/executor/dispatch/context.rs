@@ -695,7 +695,7 @@ impl<'a> BatchContext<'a> {
                         &inst.instance_name,
                         self.scope.run_id,
                         msg,
-                        node.metadata(),
+                        node.metadata().cloned(),
                         None,
                     );
                 });

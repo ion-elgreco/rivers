@@ -68,7 +68,7 @@ fn emit_materialization_and_hooks(
                 name,
                 ctx.scope.run_id,
                 value.unwrap_or(&none),
-                node.metadata(),
+                node.metadata().cloned(),
                 config_instance.map(|c| c.clone_ref(py)),
             );
         });
@@ -750,7 +750,7 @@ pub(crate) fn handle_failure(
             name_for_hooks,
             ctx.scope.run_id,
             &err_msg,
-            node.metadata(),
+            node.metadata().cloned(),
             config_instance,
         );
     }
@@ -1044,7 +1044,7 @@ fn process_one_worker_item(
             &name,
             ctx.scope.run_id,
             &py.None(),
-            node.metadata(),
+            node.metadata().cloned(),
             step_config.map(|c| c.clone_ref(py)),
         );
     }

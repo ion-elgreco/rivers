@@ -161,7 +161,7 @@ impl ParallelBackend {
         keys: &[String],
         io_handler_ref: &Py<PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
-        let metadata = mapped_node.metadata();
+        let metadata = mapped_node.metadata().cloned();
         let partition = ops::build_partition_context(mapped_node, partition_key)?;
 
         let specs = pyo3::types::PyList::empty(py);
