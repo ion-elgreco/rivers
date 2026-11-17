@@ -1126,8 +1126,8 @@ pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures
     // partition row, which a deletion or a newer run moves off the run. The
     // failure happens when the run ends, so a deletion during the run does
     // not outrank it.
-    let failed_runs: Vec<&RunRow> = runs
-        .iter()
+    let failed_runs: Vec<RunRow> = runs
+        .into_iter()
         .filter(|run| run.status == "Failure" && run.action.is_none())
         .filter(|run| run.partition_key.is_some())
         .collect();
@@ -1137,7 +1137,6 @@ pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures
     for run in failed_runs {
         let Some(partition_key) = run
             .partition_key
-            .clone()
             .and_then(|key| stored_key(key, &mut unknown))
         else {
             continue;
@@ -1359,20 +1358,29 @@ pub(super) async fn fill_partition_failures(db: &Surreal<Any>) -> Result<()> {
 
     for ((cl, asset_key), failures) in derived {
         let (rows, run_rows) = rows_of_derived(db, &cl, &asset_key, failures).await?;
-        for chunk in rows.chunks(FAILURES_PER_TRANSACTION) {
+        for chunk in owned_chunks(rows, FAILURES_PER_TRANSACTION) {
             db.query(PUT_PARTITION_FAILURES)
-                .bind(("rows", chunk.to_vec()))
+                .bind(("rows", chunk))
                 .await?
                 .check()?;
         }
-        for chunk in run_rows.chunks(FAILURES_PER_TRANSACTION) {
+        for chunk in owned_chunks(run_rows, FAILURES_PER_TRANSACTION) {
             db.query(PUT_RUN_FAILURES)
-                .bind(("run_rows", chunk.to_vec()))
+                .bind(("run_rows", chunk))
                 .await?
                 .check()?;
         }
     }
     Ok(())
+}
+
+/// `rows` in order, `size` at a time.
+fn owned_chunks<T>(rows: Vec<T>, size: usize) -> impl Iterator<Item = Vec<T>> {
+    let mut rows = rows.into_iter();
+    std::iter::from_fn(move || {
+        let chunk: Vec<T> = rows.by_ref().take(size).collect();
+        (!chunk.is_empty()).then_some(chunk)
+    })
 }
 
 /// The failure rows of one asset that the derivation gives, in the order of
