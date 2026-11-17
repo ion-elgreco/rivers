@@ -8,6 +8,7 @@
 //! key.
 
 use std::collections::HashMap;
+use std::fmt::{self, Write};
 
 use anyhow::Result;
 use jiff::SignedDuration;
@@ -363,13 +364,26 @@ impl DayGrid {
             return true;
         }
 
+        let mut key = vec![0u8; layout.sources.len()];
         [0, self.len - 1].into_iter().all(|index| {
             let tick = self.tick(index);
-            let mut key = vec![0u8; layout.sources.len()];
             layout.write_day(tick.date(), &mut key);
             layout.write_time(tick.time(), &mut key);
-            key == tick.strftime(fmt).to_string().as_bytes()
+
+            let mut unwritten = Unwritten(&key);
+            write!(unwritten, "{}", tick.strftime(fmt)).is_ok() && unwritten.0.is_empty()
         })
+    }
+}
+
+/// The part of a key that a format has not written yet. A write of a text
+/// that is not the next part of the key fails.
+struct Unwritten<'a>(&'a [u8]);
+
+impl fmt::Write for Unwritten<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.strip_prefix(text.as_bytes()).ok_or(fmt::Error)?;
+        Ok(())
     }
 }
 
