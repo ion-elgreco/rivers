@@ -502,18 +502,29 @@ impl PartitionMappingKind {
     }
 }
 
+/// Where the resolver finds an upstream asset's valid partition keys.
+pub trait UpstreamPartitionKeys {
+    /// `None` for an unpartitioned asset.
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>>;
+}
+
+impl UpstreamPartitionKeys for HashMap<String, HashSet<PartitionKey>> {
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>> {
+        self.get(asset)
+    }
+}
+
 /// Resolves partition key mappings between connected assets.
 pub struct PartitionResolver<'a> {
     /// Per-edge mapping kind. Key = (downstream_asset, upstream_asset).
     mappings: &'a HashMap<(String, String), PartitionMappingKind>,
-    /// Upstream asset → its valid partition keys.
-    pub(crate) upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
+    upstream_partition_keys: &'a dyn UpstreamPartitionKeys,
 }
 
 impl<'a> PartitionResolver<'a> {
     pub fn new(
         mappings: &'a HashMap<(String, String), PartitionMappingKind>,
-        upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
+        upstream_partition_keys: &'a dyn UpstreamPartitionKeys,
     ) -> Self {
         Self {
             mappings,
@@ -549,6 +560,11 @@ impl<'a> PartitionResolver<'a> {
             None => return upstream_keys.clone(),
         };
         mapping.map_to_downstream_in(upstream_keys, downstream_universe)
+    }
+
+    /// An upstream asset's valid partition keys; `None` if it is unpartitioned.
+    pub(crate) fn upstream_keys(&self, asset: &str) -> Option<&'a HashSet<PartitionKey>> {
+        self.upstream_partition_keys.partition_keys(asset)
     }
 
     /// The mapping kind for an edge, if one was declared (absent = Identity).

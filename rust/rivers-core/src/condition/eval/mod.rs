@@ -500,7 +500,7 @@ fn eval_partitioned_on_dep(
 
     let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
-    let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
+    let upstream_entry = pctx.resolver.upstream_keys(dep_key);
 
     if upstream_entry.is_none() {
         // In a nested pivot `pctx.all_keys` is the intermediate dep's key

@@ -808,6 +808,89 @@ fn dynamic_universe_mirrors_storage_including_retirement() {
     assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
 }
 
+/// A conditioned dep's universe change reaches the dep pivot of a conditioned
+/// downstream: the pass reads the dep's keys from its `PartitionInfo`.
+#[test]
+fn conditioned_dep_universe_change_reaches_downstream() {
+    let colors = |ks: &[&str]| {
+        HashMap::from([(
+            "colors".to_string(),
+            ks.iter().map(|k| k.to_string()).collect::<HashSet<_>>(),
+        )])
+    };
+    let now = naive("2024-01-01T00:00:00");
+
+    let mut cache = AssetConditionCache::default();
+    for asset in ["up", "down"] {
+        let mut record = test_record(asset);
+        record.last_timestamp = Some(100);
+        cache.records.insert(asset.to_string(), record);
+        cache.partition_status.insert(
+            asset.to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                timestamps: HashMap::from([(spk("red"), 100i64), (spk("blue"), 100)]),
+                ..Default::default()
+            },
+        );
+    }
+    cache
+        .upstream_deps
+        .insert("down".to_string(), vec!["up".to_string()]);
+
+    let info = |asset: &str, condition, mappings| AssetConditionInfo {
+        asset_key: asset.to_string(),
+        condition,
+        partition_info: Some(PartitionInfo {
+            all_keys: make_daily_keys(&["red", "blue"]),
+            mappings,
+            time_window_fmt: None,
+            universe: PartitionUniverse::Dynamic {
+                namespace: "colors".to_string(),
+            },
+        }),
+        backfill_strategy: None,
+    };
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            info("up", ConditionNode::InProgress, HashMap::new()),
+            info(
+                "down",
+                ConditionNode::any_deps_match(ConditionNode::Missing),
+                HashMap::from([(
+                    ("down".to_string(), "up".to_string()),
+                    PartitionMappingKind::Identity,
+                )]),
+            ),
+        ],
+        HashMap::new(),
+    );
+    let down = |out: &PassOutput| {
+        let row = out.results.iter().find(|r| r.info_idx == 1).unwrap();
+        (row.result.fired, row.result.selection.clone())
+    };
+
+    assert!(!pass.refresh_partition_universes(now, &colors(&["red", "blue"])));
+    let out = pass.run(1000, false);
+    assert_eq!(
+        down(&out),
+        (false, Some(PartitionSelection::Empty)),
+        "every key of up is materialized"
+    );
+
+    assert!(pass.refresh_partition_universes(now, &colors(&["red", "blue", "green"])));
+    let out = pass.run(2000, false);
+    assert_eq!(
+        down(&out),
+        (
+            true,
+            Some(PartitionSelection::Keys(make_daily_keys(&["green"])))
+        ),
+        "up's new key is missing and maps to down's new key"
+    );
+}
+
 #[test]
 fn multi_universe_recomputes_cartesian_on_dimension_change() {
     let mut universe = PartitionUniverse::Multi {

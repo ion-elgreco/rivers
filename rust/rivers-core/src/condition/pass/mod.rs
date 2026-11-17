@@ -8,7 +8,7 @@ use crate::condition::eval::evaluate_with_tree;
 use crate::condition::node::ConditionNode;
 use crate::condition::partition::{
     PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
-    PartitionState,
+    PartitionState, UpstreamPartitionKeys,
 };
 use crate::condition::state::{
     AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
@@ -107,6 +107,8 @@ pub struct ConditionPass {
     pub has_time_based: bool,
     /// Asset subset to evaluate when only time-based conditions need re-eval.
     pub time_based_eval_set: Option<HashSet<String>>,
+    /// Partition keys of the upstream assets without a condition; a conditioned
+    /// asset's keys are its `PartitionInfo::all_keys`.
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
     /// How each `upstream_partition_keys` entry evolves.
     pub upstream_universes: HashMap<String, PartitionUniverse>,
@@ -240,14 +242,7 @@ impl ConditionPass {
         let mut changed = false;
         for info in &mut self.conditions {
             if let Some(pi) = info.partition_info.as_mut() {
-                let pi_changed =
-                    refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
-                changed |= pi_changed;
-                if pi_changed
-                    && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
-                {
-                    entry.clone_from(&pi.all_keys);
-                }
+                changed |= refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
             }
         }
         for (asset, universe) in &mut self.upstream_universes {
@@ -569,7 +564,7 @@ impl ConditionPass {
                     in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
                     failed: &status.failed,
                     timestamps: &status.timestamps,
-                    resolver: PartitionResolver::new(&pi.mappings, &self.upstream_partition_keys),
+                    resolver: PartitionResolver::new(&pi.mappings, self),
                     time_windows: Some(&time_windows),
                     all_partition_statuses: &self.cache.partition_status,
                     dep_root_floor: None,
@@ -738,6 +733,15 @@ impl ConditionPass {
             if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
                 prev.last_handled_timestamp = Some(now);
             }
+        }
+    }
+}
+
+impl UpstreamPartitionKeys for ConditionPass {
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>> {
+        match self.partition_info_for(asset) {
+            Some(pi) => Some(&pi.all_keys),
+            None => self.upstream_partition_keys.get(asset),
         }
     }
 }
