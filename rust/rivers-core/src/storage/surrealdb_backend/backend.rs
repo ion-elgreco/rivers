@@ -134,11 +134,11 @@ impl StorageBackend for SurrealStorage {
         if logs.is_empty() {
             return Ok(());
         }
-        let rows: Vec<DbRunLogWrite> = logs.iter().map(DbRunLogWrite::from).collect();
         retry::with_retry(&self.retry_config, || async {
+            let rows: Vec<DbRunLogWrite> = logs.iter().map(DbRunLogWrite::from).collect();
             self.db
                 .query("INSERT INTO run_logs $rows RETURN NONE")
-                .bind(("rows", rows.clone()))
+                .bind(("rows", rows))
                 .await
                 .context("failed to store run logs")?
                 .check()
