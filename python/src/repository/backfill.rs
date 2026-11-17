@@ -615,7 +615,7 @@ impl PyCodeRepository {
         let submit = || -> PyResult<Vec<String>> {
             // The definitions can have changed since the backfill was created.
             let requested: Vec<PyPartitionKey> =
-                requested.iter().map(PyPartitionKey::from).collect();
+                requested.into_iter().map(PyPartitionKey::from).collect();
             validate_backfill_keys(
                 state,
                 &record.asset_selection,

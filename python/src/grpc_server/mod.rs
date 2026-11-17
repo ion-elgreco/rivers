@@ -790,7 +790,7 @@ impl CodeLocationService for CodeLocationImpl {
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
             asset_selection,
-            partition_key: pk.as_ref().map(|k| k.into()),
+            partition_key: pk.map(Into::into),
             tags,
             launched_by,
             action: Some(req.action),

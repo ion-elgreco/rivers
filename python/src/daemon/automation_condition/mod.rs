@@ -33,7 +33,7 @@ fn def_keys_and_universe(
     let keys = def
         .get_partition_keys_capped(now)
         .ok()
-        .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
+        .map(|keys| keys.into_iter().map(CorePartitionKey::from).collect())
         .unwrap_or_default();
     (keys, universe)
 }

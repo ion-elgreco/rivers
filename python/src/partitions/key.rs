@@ -214,7 +214,42 @@ impl PyPartitionKey {
     /// run into per-partition contexts and materialization events.
     pub fn members(&self) -> Vec<PyPartitionKey> {
         let core: rivers_core::storage::PartitionKey = self.into();
-        core.members().iter().map(PyPartitionKey::from).collect()
+        core.members()
+            .into_iter()
+            .map(PyPartitionKey::from)
+            .collect()
+    }
+}
+
+/// A key decoded from storage can keep the decoder's larger buffer;
+/// `shrink_to_fit` frees the excess before the key lives on in Python.
+impl From<rivers_core::storage::PartitionKey> for PyPartitionKey {
+    fn from(spk: rivers_core::storage::PartitionKey) -> Self {
+        match spk {
+            rivers_core::storage::PartitionKey::Single { mut keys } => {
+                keys.shrink_to_fit();
+                keys.sort();
+                Self::Single { key: keys }
+            }
+            rivers_core::storage::PartitionKey::Multi { dims } => {
+                let keys = dims
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        v.shrink_to_fit();
+                        v.sort();
+                        (k, v)
+                    })
+                    .collect();
+                Self::Multi { keys }
+            }
+            rivers_core::storage::PartitionKey::Set { keys } => Self::Set {
+                keys: keys.into_iter().map(PyPartitionKey::from).collect(),
+            },
+            key @ (rivers_core::storage::PartitionKey::SingleItems { .. }
+            | rivers_core::storage::PartitionKey::MultiItems { .. }) => {
+                Self::from(key.expanded().into_owned())
+            }
+        }
     }
 }
 
@@ -242,7 +277,7 @@ impl From<&rivers_core::storage::PartitionKey> for PyPartitionKey {
             },
             key @ (rivers_core::storage::PartitionKey::SingleItems { .. }
             | rivers_core::storage::PartitionKey::MultiItems { .. }) => {
-                Self::from(key.expanded().as_ref())
+                Self::from(key.expanded().into_owned())
             }
         }
     }
@@ -262,6 +297,22 @@ impl From<&PyPartitionKey> for rivers_core::storage::PartitionKey {
             }
             PyPartitionKey::Set { keys } => Self::Set {
                 keys: keys.iter().map(|k| k.into()).collect(),
+            },
+        }
+    }
+}
+
+impl From<PyPartitionKey> for rivers_core::storage::PartitionKey {
+    fn from(pk: PyPartitionKey) -> Self {
+        match pk {
+            PyPartitionKey::Single { key } => Self::Single { keys: key },
+            PyPartitionKey::Multi { keys } => {
+                let mut dims: Vec<(String, Vec<String>)> = keys.into_iter().collect();
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
+                Self::Multi { dims }
+            }
+            PyPartitionKey::Set { keys } => Self::Set {
+                keys: keys.into_iter().map(Self::from).collect(),
             },
         }
     }

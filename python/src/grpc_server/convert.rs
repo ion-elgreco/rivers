@@ -392,7 +392,7 @@ pub(super) fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDef
 /// Render a `PyPartitionKey` for display in the UI — delegates to the
 /// canonical `PartitionKey::to_display` encoding (`dim=val|dim=val`).
 pub(super) fn py_partition_key_display(pk: PyPartitionKey) -> String {
-    rivers_core::storage::PartitionKey::from(&pk).to_display()
+    rivers_core::storage::PartitionKey::from(pk).to_display()
 }
 
 /// gRPC is the system boundary: malformed partition keys are rejected with

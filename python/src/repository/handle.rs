@@ -606,7 +606,7 @@ impl RepoHandle {
 
         let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(requested.len());
         let mut kept = 0usize;
-        for key in &requested {
+        for key in requested {
             let Some(key) = valid_part_for_verb(
                 &state,
                 &asset_names,
@@ -737,7 +737,7 @@ impl RepoHandle {
                     crate::daemon::RunRequestData {
                         run_key: None,
                         tags: Some(tags.into_iter().collect()),
-                        partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
+                        partition_key: record.partition_key.map(PyPartitionKey::from),
                         job_name: Some(job_name),
                         launched_by,
                         config: record.config,
