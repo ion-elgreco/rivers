@@ -353,17 +353,24 @@ fn sync_partition_state<'s>(
     let ps = state
         .partition_state
         .get_or_insert_with(PartitionState::default);
-    ps.timestamps.retain(|key, _| timestamps.contains_key(key));
-    for (key, ts) in timestamps {
-        match ps.timestamps.get_mut(key) {
+    sync_timestamps(&mut ps.timestamps, timestamps);
+    ps.handled.clear();
+    Some(ps)
+}
+
+/// Make `dst` equal to `src` in place, cloning only the keys new to `dst`.
+fn sync_timestamps(dst: &mut HashMap<PartitionKey, i64>, src: &HashMap<PartitionKey, i64>) {
+    dst.retain(|key, _| src.contains_key(key));
+    dst.reserve(src.len() - dst.len());
+
+    for (key, ts) in src {
+        match dst.get_mut(key) {
             Some(v) => *v = *ts,
             None => {
-                ps.timestamps.insert(key.clone(), *ts);
+                dst.insert(key.clone(), *ts);
             }
         }
     }
-    ps.handled.clear();
-    Some(ps)
 }
 
 /// Establish timestamp / data-version baselines for upstream deps that don't
@@ -417,7 +424,7 @@ pub fn update_dep_baselines(
             let ps = dep_state
                 .partition_state
                 .get_or_insert_with(Default::default);
-            ps.timestamps = entry.timestamps.clone();
+            sync_timestamps(&mut ps.timestamps, &entry.timestamps);
         }
     }
 }
