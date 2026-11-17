@@ -183,41 +183,45 @@ fn union_per_dimension(keys: &[Cow<PartitionKey>]) -> PartitionKey {
     match keys.first().map(|key| &**key) {
         Some(PartitionKey::Multi { .. }) => {
             // Dimensions in first-seen order.
-            let mut order: Vec<String> = Vec::new();
-            let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let mut order: Vec<&str> = Vec::new();
+            let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
             for key in keys {
                 if let PartitionKey::Multi { dims } = &**key {
                     for (name, vals) in dims {
                         values
-                            .entry(name.clone())
+                            .entry(name)
                             .or_insert_with(|| {
-                                order.push(name.clone());
+                                order.push(name);
                                 BTreeSet::new()
                             })
-                            .extend(vals.iter().cloned());
+                            .extend(vals.iter().map(String::as_str));
                     }
                 }
             }
             let dims = order
                 .into_iter()
                 .map(|name| {
-                    let vals = values.remove(&name).unwrap_or_default();
-                    (name, vals.into_iter().collect())
+                    let vals = values.remove(name).unwrap_or_default();
+                    (
+                        name.to_owned(),
+                        vals.into_iter().map(str::to_owned).collect(),
+                    )
                 })
                 .collect();
             PartitionKey::Multi { dims }
         }
         _ => {
-            let union: BTreeSet<String> = keys
+            let union: BTreeSet<&str> = keys
                 .iter()
                 .filter_map(|k| match &**k {
-                    PartitionKey::Single { keys } => Some(keys.clone()),
+                    PartitionKey::Single { keys } => Some(keys),
                     _ => None,
                 })
                 .flatten()
+                .map(String::as_str)
                 .collect();
             PartitionKey::Single {
-                keys: union.into_iter().collect(),
+                keys: union.into_iter().map(str::to_owned).collect(),
             }
         }
     }
