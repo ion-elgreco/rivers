@@ -66,7 +66,9 @@ def test_an_invocation_runs_once(shop, wait):
 @pytest.mark.skipif(os.name == "nt", reason="dbt gets no SIGINT on Windows")
 @pytest.mark.parametrize("exits", [True, False], ids=["exits", "keeps running"])
 def test_cancelling_an_async_run_stops_dbt(tmp_path, monkeypatch, exits):
-    monkeypatch.setattr("rivers.integrations.dbt.resource._STOP_TIMEOUT_S", 0.5)
+    # Long enough for a loaded CI runner to run the interrupted dbt; the
+    # `keeps running` case waits all of it.
+    monkeypatch.setattr("rivers.integrations.dbt.resource._STOP_TIMEOUT_S", 5)
     started = tmp_path / "started"
     interrupted = tmp_path / "interrupted"
     executable = tmp_path / "dbt"
