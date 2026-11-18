@@ -12,5 +12,6 @@ pub async fn list_code_locations() -> Result<Vec<CodeLocationEntry>, ServerFnErr
         .registry
         .list()
         .await
+        .map(|entries| entries.to_vec())
         .map_err(|e| ServerFnError::new(e.to_string()))
 }

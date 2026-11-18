@@ -244,7 +244,7 @@ fn check_annotated(py: Python, value: &Py<PyAny>, hint: &Bound<PyAny>) -> PyResu
     for item in hint.getattr("__metadata__")?.try_iter()? {
         match run_validator(py, &checked.value, &item?)? {
             Some(HintMatch::Yes(next)) => {
-                super::merge_metadata(&mut checked.metadata, &next.metadata);
+                super::merge_metadata(&mut checked.metadata, next.metadata);
                 checked.value = next.value;
             }
             Some(no) => return Ok(no),

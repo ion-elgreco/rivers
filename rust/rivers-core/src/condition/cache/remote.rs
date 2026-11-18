@@ -729,24 +729,6 @@ impl AssetConditionCache {
                 });
             }
         }
-        let mut partitions = Vec::new();
-        for (key, patch) in read.partitions {
-            let live = slot.live_partitions(&key);
-            for local in slot.bindings[&key]
-                .iter()
-                .filter(|l| self.is_partitioned(l))
-            {
-                if slot.paused(local) {
-                    let nothing = RemotePartitions {
-                        full: true,
-                        ..Default::default()
-                    };
-                    partitions.push((local.clone(), nothing, HashSet::new()));
-                } else {
-                    partitions.push((local.clone(), patch.clone(), live.clone()));
-                }
-            }
-        }
 
         let mut changed = false;
         for record in records {
@@ -755,8 +737,30 @@ impl AssetConditionCache {
                 changed = true;
             }
         }
-        for (local, patch, live) in partitions {
-            let entry = self.partition_status.entry(local).or_default();
+
+        for (key, patch) in read.partitions {
+            let live = slot.live_partitions(&key);
+            let (paused, locals): (Vec<&String>, Vec<&String>) = slot.bindings[&key]
+                .iter()
+                .filter(|local| self.is_partitioned(local))
+                .partition(|local| slot.paused(local));
+            for local in paused {
+                let nothing = RemotePartitions {
+                    full: true,
+                    ..Default::default()
+                };
+                let entry = self.partition_status.entry(local.clone()).or_default();
+                changed |= nothing.apply(entry, &HashSet::new());
+            }
+
+            let Some((last, rest)) = locals.split_last() else {
+                continue;
+            };
+            for &local in rest {
+                let entry = self.partition_status.entry(local.clone()).or_default();
+                changed |= patch.clone().apply(entry, &live);
+            }
+            let entry = self.partition_status.entry((*last).clone()).or_default();
             changed |= patch.apply(entry, &live);
         }
         changed

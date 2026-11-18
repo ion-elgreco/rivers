@@ -39,21 +39,22 @@ fn parity_eval_pair(
     let records = HashMap::from([(key.to_string(), record.clone())]);
     let deps = HashMap::new();
 
-    let in_progress_assets: HashSet<String> = if scn.in_progress {
-        HashSet::from([key.to_string()])
+    let in_progress_assets: HashSet<&str> = if scn.in_progress {
+        HashSet::from([key])
     } else {
         HashSet::new()
     };
-    let failed_assets: HashSet<String> = if scn.failed {
-        HashSet::from([key.to_string()])
+    let failed_assets: HashSet<&str> = if scn.failed {
+        HashSet::from([key])
     } else {
         HashSet::new()
     };
-    let requested: HashMap<String, PartitionSelection> = if scn.requested {
-        HashMap::from([(key.to_string(), PartitionSelection::All)])
+    let fired = Fired::new(if scn.requested {
+        vec![(key, PartitionSelection::All)]
     } else {
-        HashMap::new()
-    };
+        vec![]
+    });
+    let requested = fired.view();
     let cache = CacheSnapshot {
         records: &records,
         upstream_deps: &deps,

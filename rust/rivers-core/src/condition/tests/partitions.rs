@@ -4,15 +4,22 @@ use super::*;
 fn test_partition_selection_union() {
     let a = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
     let b = PartitionSelection::Keys(HashSet::from([spk("p2"), spk("p3")]));
-    assert_eq!(
-        a.union(&b),
-        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")]))
-    );
+    let abc = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")]));
+    assert_eq!(a.clone().union(b.clone()), abc);
+    assert_eq!(b.union(a.clone()), abc);
 
-    assert_eq!(a.union(&PartitionSelection::All), PartitionSelection::All);
-    assert_eq!(a.union(&PartitionSelection::Empty), a);
     assert_eq!(
-        PartitionSelection::Empty.union(&PartitionSelection::Empty),
+        a.clone().union(PartitionSelection::All),
+        PartitionSelection::All
+    );
+    assert_eq!(a.clone().union(PartitionSelection::Empty), a);
+    assert_eq!(PartitionSelection::Empty.union(a.clone()), a);
+    assert_eq!(
+        PartitionSelection::Empty.union(PartitionSelection::Empty),
+        PartitionSelection::Empty
+    );
+    assert_eq!(
+        PartitionSelection::Keys(HashSet::new()).union(PartitionSelection::Keys(HashSet::new())),
         PartitionSelection::Empty
     );
 }
@@ -20,17 +27,54 @@ fn test_partition_selection_union() {
 #[test]
 fn test_partition_selection_intersect() {
     let a = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")]));
-    let b = PartitionSelection::Keys(HashSet::from([spk("p2"), spk("p3")]));
-    assert_eq!(
-        a.intersect(&b),
-        PartitionSelection::Keys(HashSet::from([spk("p2")]))
-    );
+    let b = PartitionSelection::Keys(HashSet::from([spk("p2"), spk("p3"), spk("p4")]));
+    let p2 = PartitionSelection::Keys(HashSet::from([spk("p2")]));
+    assert_eq!(a.clone().intersect(b.clone()), p2);
+    assert_eq!(b.intersect(a.clone()), p2);
 
-    assert_eq!(a.intersect(&PartitionSelection::All), a);
+    assert_eq!(a.clone().intersect(PartitionSelection::All), a);
+    assert_eq!(PartitionSelection::All.intersect(a.clone()), a);
     assert_eq!(
-        a.intersect(&PartitionSelection::Empty),
+        a.clone().intersect(PartitionSelection::Empty),
         PartitionSelection::Empty
     );
+    assert_eq!(
+        a.intersect(PartitionSelection::Keys(HashSet::from([spk("p9")]))),
+        PartitionSelection::Empty
+    );
+}
+
+#[test]
+fn test_partition_selection_restrict_to() {
+    let universe: HashSet<PartitionKey> = ["p1", "p2"].iter().map(|s| spk(s)).collect();
+    let a = PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p3")]));
+    assert_eq!(
+        a.restrict_to(&universe),
+        PartitionSelection::Keys(HashSet::from([spk("p1")]))
+    );
+    assert_eq!(
+        PartitionSelection::Keys(HashSet::from([spk("p3")])).restrict_to(&universe),
+        PartitionSelection::Empty
+    );
+    assert_eq!(
+        PartitionSelection::All.restrict_to(&universe),
+        PartitionSelection::All
+    );
+}
+
+/// An in-place shrink must not leave a near-empty latch holding the table of
+/// the large set it came from.
+#[test]
+fn test_partition_selection_retain_releases_spare_capacity() {
+    let big: HashSet<PartitionKey> = (0..10_000).map(|i| spk(&i.to_string())).collect();
+    let few: HashSet<PartitionKey> = (0..10).map(|i| spk(&i.to_string())).collect();
+    match PartitionSelection::Keys(big).restrict_to(&few) {
+        PartitionSelection::Keys(keys) => {
+            assert_eq!(keys.len(), 10);
+            assert!(keys.capacity() < 100, "capacity {}", keys.capacity());
+        }
+        other => panic!("expected Keys, got {other:?}"),
+    }
 }
 
 #[test]
@@ -84,6 +128,63 @@ fn test_partition_selection_difference() {
     assert_eq!(
         PartitionSelection::Empty.difference(&b, &universe),
         PartitionSelection::Empty
+    );
+}
+
+#[test]
+fn test_partition_selection_subtract_matches_difference() {
+    let universe: HashSet<PartitionKey> = ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect();
+    let sels = [
+        PartitionSelection::All,
+        PartitionSelection::Empty,
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")])),
+    ];
+    for a in &sels {
+        for b in &sels {
+            assert_eq!(
+                a.clone().subtract(b, &universe),
+                a.difference(b, &universe),
+                "{a:?} - {b:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_partition_selection_subtract_keys_matches_difference() {
+    let sels = [
+        PartitionSelection::All,
+        PartitionSelection::Empty,
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p2")])),
+        PartitionSelection::Keys(HashSet::from([spk("p1"), spk("p2"), spk("p3")])),
+    ];
+    let handled_sets = [
+        HashSet::new(),
+        HashSet::from([spk("p2")]),
+        HashSet::from([spk("p1"), spk("p2"), spk("p3")]),
+        HashSet::from([spk("p4")]),
+    ];
+    let universes = [
+        ["p1", "p2", "p3"].iter().map(|s| spk(s)).collect(),
+        HashSet::new(),
+    ];
+    for universe in &universes {
+        for a in &sels {
+            for h in &handled_sets {
+                assert_eq!(
+                    a.clone().subtract_keys(h, universe),
+                    a.difference(&PartitionSelection::from_keys(h.clone()), universe),
+                    "{a:?} - {h:?} over {universe:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        PartitionSelection::All.subtract_keys(&HashSet::new(), &universes[0]),
+        PartitionSelection::All
     );
 }
 
@@ -200,7 +301,7 @@ fn test_partitioned_in_latest_time_window_selects_recent_keys() {
         &[("2020-01-01", 100), ("2020-01-02", 100)],
     );
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,
@@ -239,7 +340,7 @@ fn test_partitioned_in_latest_time_window_empty_when_no_recent() {
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["2020-02-01", "2020-02-02", "2020-02-03"], &[], &[]);
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,
@@ -274,7 +375,7 @@ fn test_partitioned_in_latest_time_window_static_partitions_selects_none() {
     let records = HashMap::from([("a".into(), record.clone())]);
     let deps = HashMap::new();
     let pdata = OwnedPartitionData::new(&["us", "eu", "ap"], &["us"], &[("us", 100)]);
-    let fmts: HashMap<String, TimeWindowSource> = HashMap::new(); // "a" is not time-partitioned
+    let fmts = HashMap::new(); // "a" is not time-partitioned
     let now_local = jiff::civil::date(2020, 1, 1).at(0, 0, 0, 0);
     let tw = TimeWindowResolver::new(&fmts, now_local);
     let empty_partition_statuses = HashMap::new();
@@ -317,7 +418,7 @@ fn test_partitioned_in_latest_time_window_combined_with_missing() {
         &[("2020-01-01", 100)],
     );
     let fmts = HashMap::from([(
-        "a".to_string(),
+        "a".into(),
         TimeWindowSource {
             fmt: "%Y-%m-%d".to_string(),
             grid: None,

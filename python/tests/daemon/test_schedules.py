@@ -428,6 +428,61 @@ class TestScheduleEvaluation:
 
         assert result.run_requests[0].job_name == "target_job"
 
+    @pytest.mark.parametrize(
+        ("schedule_tags", "tags"),
+        [({"source": "auto"}, {"t": "v"}), (None, None)],
+        ids=["own_tags", "no_default_tags"],
+    )
+    def test_request_without_missing_default_returned_as_is(self, schedule_tags, tags):
+        req = rs.RunRequest(run_key="k", tags=tags, job_name="override")
+
+        @rs.Schedule(cron_schedule="0 0 * * *", job_name="my_job", tags=schedule_tags)
+        def my_sched(context: rs.ScheduleEvaluationContext):
+            return [req]
+
+        @rs.Asset
+        def a() -> Any:
+            return 1
+
+        repo = rs.CodeRepository(assets=[a], schedules=[my_sched])
+        result = repo.evaluate_schedule("my_sched")
+
+        assert result.run_requests[0] is req
+        assert result.run_requests[0].tags == tags
+
+    @pytest.mark.parametrize(
+        ("job_name", "expected_job_name"),
+        [(None, "my_job"), ("override", "override")],
+        ids=["missing_job_name", "own_job_name"],
+    )
+    def test_defaults_leave_returned_request_unchanged(
+        self, job_name, expected_job_name
+    ):
+        req = rs.RunRequest(run_key="k", partition_key="p", job_name=job_name)
+
+        @rs.Schedule(
+            cron_schedule="0 0 * * *", job_name="my_job", tags={"source": "auto"}
+        )
+        def my_sched(context: rs.ScheduleEvaluationContext):
+            return req
+
+        @rs.Asset
+        def a() -> Any:
+            return 1
+
+        repo = rs.CodeRepository(assets=[a], schedules=[my_sched])
+        result = repo.evaluate_schedule("my_sched")
+        out = result.run_requests[0]
+
+        assert out is not req
+        assert (out.run_key, out.tags, out.partition_key, out.job_name) == (
+            "k",
+            {"source": "auto"},
+            "p",
+            expected_job_name,
+        )
+        assert (req.job_name, req.tags) == (job_name, None)
+
     def test_evaluate_no_context_param(self):
         """Eval function without a context parameter should still work."""
 

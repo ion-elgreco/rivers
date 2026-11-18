@@ -42,12 +42,19 @@ pub(super) async fn git_credentials(
         }
         e => git::GitError::Unreachable(format!("reading git Secret '{name}': {e}")),
     })?;
-    let data = secret.data.unwrap_or_default();
-    let entry = |key: &str| {
-        data.get(key)
-            .map(|v| String::from_utf8_lossy(&v.0).into_owned())
+    let mut data = secret.data.unwrap_or_default();
+    let mut entry = |key: &str| {
+        data.remove(key).map(|v| {
+            String::from_utf8(v.0)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        })
     };
-    let cat = |key: &str| entry(key).map(|v| v.trim_end_matches('\n').to_owned());
+    let mut cat = |key: &str| {
+        entry(key).map(|mut v| {
+            v.truncate(v.trim_end_matches('\n').len());
+            v
+        })
+    };
 
     match transport {
         git::Transport::Ssh => match (entry("identity"), entry("known_hosts")) {
@@ -90,6 +97,8 @@ mod tests {
         IDENTITY, KNOWN_HOSTS, PASSWORD, USERNAME, secret,
     };
     use crate::run::test_helpers::{MockApiState, mock_client};
+    use k8s_openapi::ByteString;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     const SECRET: &str = "git-creds";
@@ -303,5 +312,39 @@ mod tests {
 
             assert_eq!(basic(&got), [read, read], "stored {stored:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_reads_as_replacement_characters() {
+        let stored = Secret {
+            data: Some(BTreeMap::from([
+                ("username".into(), ByteString(b"bot\xff\n".to_vec())),
+                ("password".into(), ByteString(b"ghp_\xc3TOKEN\n\n".to_vec())),
+                ("identity".into(), ByteString(b"PRIVATE\xfe KEY\n".to_vec())),
+                (
+                    "known_hosts".into(),
+                    ByteString(b"forge.example\xff\n".to_vec()),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let https = credentials(HTTPS, true, Some(Ok(stored.clone())))
+            .await
+            .unwrap();
+        assert_eq!(basic(&https), ["bot\u{FFFD}", "ghp_\u{FFFD}TOKEN"]);
+
+        let ssh = credentials(SSH, true, Some(Ok(stored))).await.unwrap();
+        let GitCredentials::Ssh {
+            private_key_openssh,
+            known_hosts,
+        } = &ssh
+        else {
+            panic!("not Ssh: {ssh:?}");
+        };
+        assert_eq!(
+            [private_key_openssh.as_str(), known_hosts.as_str()],
+            ["PRIVATE\u{FFFD} KEY\n", "forge.example\u{FFFD}\n"]
+        );
     }
 }

@@ -222,27 +222,26 @@ pub fn job_partition_picker(
 /// in display strings (`py_partition_key_display`) and equality checks
 /// downstream.
 pub fn cartesian_partition_keys(
-    selections: &[(String, Vec<String>)],
+    mut selections: Vec<(&str, &[String])>,
 ) -> Vec<crate::types::SubmitPartitionKey> {
     if selections.is_empty() || selections.iter().any(|(_, vs)| vs.is_empty()) {
         return Vec::new();
     }
-    let mut sorted = selections.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out: Vec<Vec<(String, String)>> = vec![vec![]];
-    for (dim, vals) in &sorted {
-        let mut next: Vec<Vec<(String, String)>> = Vec::with_capacity(out.len() * vals.len());
-        for combo in &out {
-            for val in vals {
-                let mut extended = combo.clone();
-                extended.push((dim.clone(), val.clone()));
-                next.push(extended);
-            }
-        }
-        out = next;
-    }
-    out.into_iter()
-        .map(crate::types::SubmitPartitionKey::Multi)
+    selections.sort_by_key(|(dim, _)| *dim);
+
+    let total: usize = selections.iter().map(|(_, vs)| vs.len()).product();
+    (0..total)
+        .map(|i| {
+            let mut stride = total;
+            let combo = selections
+                .iter()
+                .map(|(dim, vals)| {
+                    stride /= vals.len();
+                    (dim.to_string(), vals[i / stride % vals.len()].clone())
+                })
+                .collect();
+            crate::types::SubmitPartitionKey::Multi(combo)
+        })
         .collect()
 }
 
@@ -635,18 +634,21 @@ mod tests {
         )
     }
 
+    fn keys(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn cartesian_single_dim_single_value() {
-        let out = cartesian_partition_keys(&[("color".into(), vec!["r".into()])]);
+        let r = keys(&["r"]);
+        let out = cartesian_partition_keys(vec![("color", &r)]);
         assert_eq!(out, vec![multi(&[("color", "r")])]);
     }
 
     #[test]
     fn cartesian_two_dims_two_values_each_produces_four_combinations() {
-        let out = cartesian_partition_keys(&[
-            ("color".into(), vec!["r".into(), "g".into()]),
-            ("size".into(), vec!["s".into(), "m".into()]),
-        ]);
+        let (colors, sizes) = (keys(&["r", "g"]), keys(&["s", "m"]));
+        let out = cartesian_partition_keys(vec![("size", &sizes), ("color", &colors)]);
         // Dims are sorted alphabetically; values iterate in order.
         assert_eq!(
             out,
@@ -663,15 +665,13 @@ mod tests {
     fn cartesian_empty_when_any_dim_has_no_selection() {
         // User must pick at least one value per dimension; the helper
         // returns nothing if any dim is empty.
-        let out = cartesian_partition_keys(&[
-            ("color".into(), vec!["r".into()]),
-            ("size".into(), vec![]),
-        ]);
+        let r = keys(&["r"]);
+        let out = cartesian_partition_keys(vec![("color", &r), ("size", &[])]);
         assert!(out.is_empty());
     }
 
     #[test]
     fn cartesian_empty_when_no_dims_supplied() {
-        assert!(cartesian_partition_keys(&[]).is_empty());
+        assert!(cartesian_partition_keys(vec![]).is_empty());
     }
 }

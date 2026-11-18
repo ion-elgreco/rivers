@@ -41,13 +41,12 @@ impl Allowlists {
         if self.is_empty() {
             return true;
         }
-        let email = id.email.as_deref().map(str::to_ascii_lowercase);
-        if let Some(email) = &email
-            && let Some(domain) = email
-                .rsplit_once('@')
-                .filter(|(local, _)| !local.is_empty())
-                .map(|(_, d)| d)
-            && self.domains.iter().any(|d| d == domain)
+        let email = id.email.as_deref();
+        if let Some(domain) = email
+            .and_then(|e| e.rsplit_once('@'))
+            .filter(|(local, _)| !local.is_empty())
+            .map(|(_, d)| d)
+            && self.domains.iter().any(|d| d.eq_ignore_ascii_case(domain))
         {
             return true;
         }
@@ -61,7 +60,7 @@ impl Allowlists {
         self.users.iter().any(|u| {
             // Subject is an exact match; email is case-insensitive without
             // allocating a lowercased copy of each configured user per request.
-            u == &id.subject || email.as_deref().is_some_and(|e| u.eq_ignore_ascii_case(e))
+            u == &id.subject || email.is_some_and(|e| u.eq_ignore_ascii_case(e))
         })
     }
 }
@@ -105,6 +104,24 @@ mod tests {
             ..Default::default()
         };
         assert!(!allow.permits(&id(Some("@example.com"), &[])));
+    }
+
+    /// The domain is everything after the last `@`, matched whole: no
+    /// subdomains, and non-ASCII letters only match exactly.
+    #[test]
+    fn domain_match_uses_the_last_at_and_the_whole_domain() {
+        let allow = Allowlists {
+            domains: vec!["example.com".into(), "élan.org".into()],
+            ..Default::default()
+        };
+        assert!(!allow.permits(&id(Some("jane"), &[])));
+        assert!(!allow.permits(&id(Some("jane@"), &[])));
+        assert!(allow.permits(&id(Some("a@b@Example.COM"), &[])));
+        assert!(!allow.permits(&id(Some("jane@example.com@other.org"), &[])));
+        assert!(!allow.permits(&id(Some("jane@sub.example.com"), &[])));
+        assert!(!allow.permits(&id(Some("jane@notexample.com"), &[])));
+        assert!(allow.permits(&id(Some("jane@éLAN.ORG"), &[])));
+        assert!(!allow.permits(&id(Some("jane@Élan.org"), &[])));
     }
 
     #[test]

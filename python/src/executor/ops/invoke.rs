@@ -52,7 +52,7 @@ pub(crate) fn build_step_args(
     run_id: &str,
     config_out: &mut Option<Py<PyAny>>,
 ) -> PyResult<BuiltStepArgs> {
-    let partition = build_partition_context(node, partition_key)?;
+    let mut partition = build_partition_context(py, node, partition_key)?;
     let func = node.callable(py)?;
     let return_hint = extract_return_hint(py, &func)?;
 
@@ -93,7 +93,7 @@ pub(crate) fn build_step_args(
                     .is_some_and(|a| is_task_context_annotation(py, a));
                 let ctx_obj = if is_task_ctx {
                     let ctx =
-                        PyTaskExecutionContext::new(step.name.clone(), tags, partition.clone())
+                        PyTaskExecutionContext::new(step.name.clone(), tags, partition.take())
                             .with_config(config_instance.as_ref().map(|c| c.clone_ref(py)));
                     Py::new(py, ctx)?.into_any()
                 } else {
@@ -110,8 +110,8 @@ pub(crate) fn build_step_args(
                         node.kinds(),
                         node.group(),
                         node.code_version(),
-                        node.metadata(),
-                        partition.clone(),
+                        node.metadata().cloned(),
+                        partition.take(),
                         is_multi,
                         if is_multi {
                             step.outputs.clone()
@@ -243,8 +243,8 @@ pub(crate) fn process_raw_result(
 
     // A validator's entries describe the hint; what the asset sets wins.
     let mut output_metadata = checked.metadata;
-    super::merge_metadata(&mut output_metadata, &context_metadata);
-    super::merge_metadata(&mut output_metadata, &result_metadata);
+    super::merge_metadata(&mut output_metadata, context_metadata);
+    super::merge_metadata(&mut output_metadata, result_metadata);
     let data_version = result_data_version.or(context_data_version);
 
     let (final_result, dynamic_keys) =
@@ -476,8 +476,8 @@ pub(crate) fn execute_action_step(
                     node.kinds(),
                     node.group(),
                     None,
-                    node.metadata(),
-                    super::build_partition_context(node, partition_key)?,
+                    node.metadata().cloned(),
+                    super::build_partition_context(py, node, partition_key)?,
                     false,
                     vec![],
                 )
@@ -489,7 +489,7 @@ pub(crate) fn execute_action_step(
                 (&func, Vec::new())
             }
         } else {
-            let partition = super::build_partition_context(node, partition_key)?;
+            let partition = super::build_partition_context(py, node, partition_key)?;
             // First parameter is the context; the rest are resources injected
             // by name — the same rule materialize functions use.
             let params = enumerate_params(py, &func)?;
@@ -518,7 +518,7 @@ pub(crate) fn execute_action_step(
                 step.name.clone(),
                 verb.to_string(),
                 run_id.to_string(),
-                node.metadata(),
+                node.metadata().cloned(),
                 partition,
                 handler,
                 config_instance,
@@ -596,7 +596,7 @@ pub(crate) fn execute_action_step(
             data_version = ctx_ref.drain_data_version();
         }
         if let Some(ext) = crate::result_types::try_extract_result_type(py, &result)? {
-            super::merge_metadata(&mut output_metadata, &ext.metadata);
+            super::merge_metadata(&mut output_metadata, ext.metadata);
             data_version = ext.data_version.or(data_version);
             result = ext.value.unwrap_or_else(|| py.None());
         }

@@ -39,6 +39,15 @@ def partition_kinds_grpc_channel(grpc_stubs):
             "day": rs.PartitionsDefinition.static_([f"d{i:04d}" for i in range(1500)]),
         }
     )
+    pd_multi_three = rs.PartitionsDefinition.multi(
+        {
+            "zone": rs.PartitionsDefinition.static_(["a", "b", "c"]),
+            "day": rs.PartitionsDefinition.daily(
+                start=datetime(2024, 1, 1), end=datetime(2024, 1, 5)
+            ),
+            "size": rs.PartitionsDefinition.static_(["s", "m"]),
+        }
+    )
     # 100 days of one-second windows = 8,640,000 partitions — far past the 1M
     # cap. Closed-form count + seek must serve it without enumerating.
     pd_interval_big = rs.PartitionsDefinition.time_window(
@@ -71,6 +80,10 @@ def partition_kinds_grpc_channel(grpc_stubs):
     def multi_big_asset():
         return 1
 
+    @rs.Asset(io_handler=rs.InMemoryIOHandler(), partitions_def=pd_multi_three)
+    def multi_three_asset():
+        return 1
+
     @rs.Asset(io_handler=rs.InMemoryIOHandler(), partitions_def=pd_interval_big)
     def interval_big_asset():
         return 1
@@ -90,6 +103,7 @@ def partition_kinds_grpc_channel(grpc_stubs):
             dynamic_asset,
             multi_asset,
             multi_big_asset,
+            multi_three_asset,
             interval_big_asset,
             interval_small_asset,
             plain_asset,
@@ -490,6 +504,35 @@ def test_multi_full_product_window_is_lazy(partition_kinds_grpc_channel):
         "day=d0500|region=eu",
         "day=d0501|region=eu",
     ]
+
+
+def test_multi_window_crosses_the_ends_of_dimensions(partition_kinds_grpc_channel):
+    """Windows of a three-dimension product, from every offset, cross the ends
+    of the inner dimensions. The keys come in the order of the dimensions
+    (zone, day, size) and show their dimensions in the order of the names."""
+    channel, pb2, pb2_grpc = partition_kinds_grpc_channel
+    stub = pb2_grpc.CodeLocationServiceStub(channel)
+    days = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+    keys = [
+        f"day={day}|size={size}|zone={zone}"
+        for zone in ["a", "b", "c"]
+        for day in days
+        for size in ["s", "m"]
+    ]
+
+    for offset in range(len(keys) + 1):
+        for limit in [1, 3, 10, len(keys)]:
+            resp = stub.GetPartitionKeys(
+                pb2.GetPartitionKeysRequest(
+                    asset_key="multi_three_asset", offset=offset, limit=limit, query=""
+                )
+            )
+            assert list(resp.keys) == keys[offset : offset + limit], (offset, limit)
+            assert resp.total == len(keys)
+
+    info = _asset(stub.GetAssetsInfo(pb2.GetAssetsInfoRequest()), "multi_three_asset")
+    by_name = {d.name: list(d.keys) for d in info.partition_def.dimensions}
+    assert by_name == {"zone": ["a", "b", "c"], "day": days, "size": ["s", "m"]}
 
 
 def test_multi_window_past_one_million(grpc_stubs):

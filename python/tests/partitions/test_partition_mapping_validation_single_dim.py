@@ -11,9 +11,11 @@ from rivers.exceptions import PartitionValidationError
 
 from .mapping_validation_helpers import (
     DAILY_START,
+    KEY_LOOKUP_GRIDS,
     STATIC_KEYS,
     _identity_edge,
     make_repo,
+    validate_mapped_edge,
 )
 
 
@@ -551,6 +553,101 @@ def test_static_mapping_invalid_upstream_key():
         PartitionValidationError, match="Static mapping target 'INVALID'"
     ):
         make_repo([upstream, downstream])
+
+
+@pytest.mark.parametrize(("make_parts", "has", "lacks"), KEY_LOOKUP_GRIDS)
+def test_static_mapping_keys_must_be_keys_of_each_side(make_parts, has, lacks):
+    """Static mapping takes each side's keys in their exact text only."""
+    parts = make_parts()
+    validate_mapped_edge(
+        parts, parts, rs.PartitionMapping.static_(dict(zip(has, reversed(has))))
+    )
+
+    for key in lacks:
+        with pytest.raises(
+            PartitionValidationError,
+            match=f"Static partition mapping key '{re.escape(key)}' is not a valid",
+        ):
+            validate_mapped_edge(
+                parts, parts, rs.PartitionMapping.static_({key: has[0]})
+            )
+        with pytest.raises(
+            PartitionValidationError,
+            match=f"Static mapping target '{re.escape(key)}' is not a valid",
+        ):
+            validate_mapped_edge(
+                parts, parts, rs.PartitionMapping.static_({has[0]: key})
+            )
+
+
+@pytest.mark.parametrize(
+    ("down", "up", "mapping", "match"),
+    [
+        pytest.param(
+            lambda: rs.PartitionsDefinition.dynamic("colors"),
+            lambda: rs.PartitionsDefinition.static_(STATIC_KEYS),
+            {},
+            "NotImplementedError: Cannot enumerate dynamic partition keys",
+            id="dynamic-down",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.static_(["x"]),
+            lambda: rs.PartitionsDefinition.dynamic("colors"),
+            {"x": "a"},
+            "NotImplementedError: Cannot enumerate dynamic partition keys",
+            id="dynamic-up",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.static_(["x"]),
+            lambda: rs.PartitionsDefinition.dynamic("colors"),
+            {"y": "a"},
+            "Static partition mapping key 'y' is not a valid",
+            id="dynamic-up-checks-down-first",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.multi(
+                {
+                    "letter": rs.PartitionsDefinition.static_(["x"]),
+                    "color": rs.PartitionsDefinition.dynamic("colors"),
+                }
+            ),
+            lambda: rs.PartitionsDefinition.static_(STATIC_KEYS),
+            {"x": "a"},
+            "NotImplementedError: Cannot enumerate dynamic partition keys",
+            id="multi-dynamic-down",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.multi(
+                {"letter": rs.PartitionsDefinition.static_(["x"])}
+            ),
+            lambda: rs.PartitionsDefinition.static_(STATIC_KEYS),
+            {"x": "a"},
+            "Static partition mapping key 'x' is not a valid",
+            id="multi-down",
+        ),
+        pytest.param(
+            lambda: rs.PartitionsDefinition.static_(["x"]),
+            lambda: rs.PartitionsDefinition.multi(
+                {"letter": rs.PartitionsDefinition.static_(STATIC_KEYS)}
+            ),
+            {"x": "a"},
+            "Static mapping target 'a' is not a valid",
+            id="multi-up",
+        ),
+    ],
+)
+def test_static_mapping_side_without_single_dim_keys_rejected(down, up, mapping, match):
+    """Static mapping needs both sides' single-dimension keys to be known."""
+    with pytest.raises(PartitionValidationError, match=re.escape(match)):
+        validate_mapped_edge(down(), up(), rs.PartitionMapping.static_(mapping))
+
+
+def test_static_mapping_empty_on_multi_allowed():
+    """An empty Static mapping looks no key up, so a Multi side passes."""
+    multi = rs.PartitionsDefinition.multi(
+        {"letter": rs.PartitionsDefinition.static_(STATIC_KEYS)}
+    )
+    validate_mapped_edge(multi, multi, rs.PartitionMapping.static_({}))
 
 
 # ---------------------------------------------------------------------------

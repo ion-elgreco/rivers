@@ -33,7 +33,7 @@ fn def_keys_and_universe(
     let keys = def
         .get_partition_keys_capped(now)
         .ok()
-        .map(|keys| keys.iter().map(CorePartitionKey::from).collect())
+        .map(|keys| keys.into_iter().map(CorePartitionKey::from).collect())
         .unwrap_or_default();
     (keys, universe)
 }
@@ -164,18 +164,19 @@ pub(in crate::daemon) fn extract_remote_deps(state: &ResolvedState) -> Vec<Remot
         .collect()
 }
 
-/// Extract upstream partition keys for all conditioned assets.
+/// Extract the partition keys of the upstreams that have no condition; the pass
+/// reads a conditioned asset's keys from its `PartitionInfo`.
 pub(in crate::daemon) fn extract_upstream_partition_keys(
     state: &ResolvedState,
     conditions: &[AssetConditionInfo],
 ) -> HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> {
+    let conditioned: HashSet<&str> = conditions.iter().map(|c| c.asset_key.as_str()).collect();
     let mut map: HashMap<String, (HashSet<CorePartitionKey>, PartitionUniverse)> = HashMap::new();
     for cond in conditions {
         if let Some(ref pi) = cond.partition_info {
-            map.entry(cond.asset_key.clone())
-                .or_insert_with(|| (pi.all_keys.clone(), PartitionUniverse::Frozen));
             for (_, upstream_key) in pi.mappings.keys() {
-                if !map.contains_key(upstream_key)
+                if !conditioned.contains(upstream_key.as_str())
+                    && !map.contains_key(upstream_key)
                     && let Some(node) = state.node_map.get(upstream_key)
                     && let Some(def) = node.partitions_def()
                 {
@@ -258,7 +259,7 @@ fn extract_partition_mappings(
 ) -> HashMap<(String, String), PartitionMappingKind> {
     let mut result = HashMap::new();
     if let Some(mappings) = node.partition_mapping() {
-        for (upstream_name, mapping) in &mappings {
+        for (upstream_name, mapping) in mappings {
             let upstream_def = node_map.get(upstream_name).and_then(|n| n.partitions_def());
             let kind = mapping_to_kind(mapping, upstream_def);
             result.insert((asset_name.to_string(), upstream_name.clone()), kind);

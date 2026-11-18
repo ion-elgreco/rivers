@@ -16,6 +16,10 @@ use crate::storage::{
 use super::partition_failures::{RunChange, StoredStatus, keyed_failure};
 use super::*;
 
+pub(super) const STEP_TRACEBACKS: &str = "SELECT VALUE traceback FROM run_logs \
+     WHERE run_id = $id AND step_key = $step AND timestamp = $at AND traceback != NONE \
+     ORDER BY id ASC";
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -46,12 +50,12 @@ impl StorageBackend for SurrealStorage {
 
         if let Some(asset_key) = &event.asset_key
             && event.event_type.is_materialization() {
-                let input_data_versions = event.input_data_versions.clone();
                 let is_action = !self
                     .action_run_ids(vec![event.run_id.clone()])
                     .await?
                     .is_empty();
-                let idv = (!input_data_versions.is_empty()).then_some(input_data_versions);
+                let idv = (!event.input_data_versions.is_empty())
+                    .then_some(event.input_data_versions.as_slice());
                 let parts = event
                     .partition_key
                     .as_ref()
@@ -77,9 +81,9 @@ impl StorageBackend for SurrealStorage {
                     &event_id,
                     &event.run_id,
                     event.timestamp,
-                    event.event_type.data_version().map(|s| s.to_string()),
+                    event.event_type.data_version(),
                     event.timestamp,
-                    materialization_code_version,
+                    materialization_code_version.as_deref(),
                     idv,
                     is_action,
                     parts,
@@ -112,7 +116,7 @@ impl StorageBackend for SurrealStorage {
                 let failures = partition_key
                     .members()
                     .into_iter()
-                    .map(|member| (member, event.timestamp, event.run_id.clone()))
+                    .map(|member| (member, event.timestamp, event.run_id.as_str()))
                     .collect();
                 self.record_partition_failures(cl, asset_key, failures, None)
                     .await?;
@@ -124,9 +128,10 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        let events: Vec<EventWithId> = events.iter().cloned().map(EventWithId::new).collect();
-        self.store_events_with_ids(&events).await?;
-        Ok(events.iter().map(|e| record_id_str(&e.id)).collect())
+        let ids: Vec<RecordId> = events.iter().map(|_| new_event_record_id()).collect();
+        let batch: Vec<(&EventRecord, &RecordId)> = events.iter().zip(&ids).collect();
+        self.store_with_ids(&batch).await?;
+        Ok(ids.iter().map(record_id_str).collect())
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = logs.len()))]
@@ -134,11 +139,11 @@ impl StorageBackend for SurrealStorage {
         if logs.is_empty() {
             return Ok(());
         }
-        let rows: Vec<DbRunLogWrite> = logs.iter().map(DbRunLogWrite::from).collect();
         retry::with_retry(&self.retry_config, || async {
+            let rows: Vec<DbRunLogWrite> = logs.iter().map(DbRunLogWrite::from).collect();
             self.db
                 .query("INSERT INTO run_logs $rows RETURN NONE")
-                .bind(("rows", rows.clone()))
+                .bind(("rows", rows))
                 .await
                 .context("failed to store run logs")?
                 .check()
@@ -157,6 +162,25 @@ impl StorageBackend for SurrealStorage {
                 .await?;
             let rows: Vec<DbStoredRunLog> = result.take(0)?;
             Ok(rows.into_iter().map(|l| l.into_stored_log()).collect())
+        })
+        .await
+    }
+
+    async fn get_step_tracebacks(
+        &self,
+        run_id: &str,
+        step_key: &str,
+        timestamp: i64,
+    ) -> Result<Vec<String>> {
+        retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(STEP_TRACEBACKS)
+                .bind(("id", run_id.to_string()))
+                .bind(("step", step_key.to_string()))
+                .bind(("at", timestamp))
+                .await?;
+            Ok(result.take(0)?)
         })
         .await
     }
@@ -568,37 +592,15 @@ impl StorageBackend for SurrealStorage {
         .await
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        retry::with_retry(&self.retry_config, || async {
-            let mut result = self
-                .db
-                .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
-                .bind(("key", key.to_string()))
-                .await?;
-            let kvs: Vec<DbKv> = result.take(0)?;
-            Ok(kvs.into_iter().next().map(|kv| kv.value.to_vec()))
-        })
-        .await
+        Ok(self
+            .kv_get_bytes(key)
+            .await?
+            .map(|value| value.into_inner().into()))
     }
 
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
     async fn kv_set(&self, key: &str, value: &[u8]) -> Result<()> {
-        // Single atomic upsert on the UNIQUE `kv.key` index — a crash must
-        // never leave the key deleted (the old DELETE+CREATE pair could).
-        retry::with_retry(&self.retry_config, || async {
-            self.db
-                .query(
-                    "INSERT INTO kv { key: $key, value: $value } \
-                     ON DUPLICATE KEY UPDATE value = $input.value",
-                )
-                .bind(("key", key.to_string()))
-                .bind(("value", Bytes::from(value.to_vec())))
-                .await?
-                .check()?;
-            Ok(())
-        })
-        .await
+        self.kv_put(key, Bytes::from(value.to_vec())).await
     }
 
     async fn list_code_locations(&self) -> Result<Vec<(LocationRef, CodeLocationDirectoryEntry)>> {
@@ -663,11 +665,8 @@ impl StorageBackend for SurrealStorage {
             writes,
             started_at: now,
         };
-        self.kv_set(
-            &format!("{}{name}", crate::COMPONENT_KEY_PREFIX),
-            &serde_json::to_vec(&record)?,
-        )
-        .await
+        self.kv_set_json(&format!("{}{name}", crate::COMPONENT_KEY_PREFIX), &record)
+            .await
     }
 
     async fn list_components(&self) -> Result<Vec<(String, ComponentRecord)>> {
@@ -1012,21 +1011,12 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn get_run_outcome(&self, run_id: &str) -> Result<Option<RunOutcome>> {
-        let key = format!("run_outcome:{run_id}");
-        let data = self.kv_get(&key).await?;
-        match data {
-            Some(bytes) => {
-                let outcome: RunOutcome = serde_json::from_slice(&bytes)?;
-                Ok(Some(outcome))
-            }
-            None => Ok(None),
-        }
+        self.kv_get_json(&format!("run_outcome:{run_id}")).await
     }
 
     async fn set_run_outcome(&self, run_id: &str, outcome: &RunOutcome) -> Result<()> {
-        let key = format!("run_outcome:{run_id}");
-        let bytes = serde_json::to_vec(outcome)?;
-        self.kv_set(&key, &bytes).await
+        self.kv_set_json(&format!("run_outcome:{run_id}"), outcome)
+            .await
     }
 
     async fn request_cancellation(&self, run_id: &str) -> Result<()> {
@@ -1036,7 +1026,7 @@ impl StorageBackend for SurrealStorage {
 
     async fn is_cancelled(&self, run_id: &str) -> Result<bool> {
         let key = format!("cancel:{run_id}");
-        Ok(self.kv_get(&key).await?.is_some())
+        Ok(self.kv_get_bytes(&key).await?.is_some())
     }
 
     async fn get_events_for_step(&self, run_id: &str, step_key: &str) -> Result<Vec<StoredEvent>> {
@@ -1206,24 +1196,31 @@ impl StorageBackend for SurrealStorage {
 }
 
 impl EventStore for SurrealStorage {
-    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = events.len()))]
-    async fn store_events_with_ids(&self, events: &[EventWithId]) -> Result<()> {
-        if events.is_empty() {
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = batch.len()))]
+    async fn store_events_with_ids(&self, batch: &[EventWithId]) -> Result<()> {
+        let batch: Vec<(&EventRecord, &RecordId)> =
+            batch.iter().map(|e| (&e.event, &e.id)).collect();
+        self.store_with_ids(&batch).await
+    }
+}
+
+impl SurrealStorage {
+    async fn store_with_ids(&self, batch: &[(&EventRecord, &RecordId)]) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
+        let event_ids: Vec<String> = batch.iter().map(|&(_, id)| record_id_str(id)).collect();
+        retry::with_retry(&self.retry_config, || async {
         // The ids come with the events: one consolidation conflict replays
         // the whole batch, and so does a send of the batch again; INSERT
         // IGNORE needs the same record ids to turn the re-insert into a no-op.
-        let rows: Vec<DbEventWrite> = events
+        let rows: Vec<DbEventWrite> = batch
             .iter()
-            .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+            .map(|&(event, id)| DbEventWrite::from_event(event, id.clone()))
             .collect();
-        let event_ids: Vec<String> = rows.iter().map(|r| record_id_str(&r.id)).collect();
-        let events: Vec<&EventRecord> = events.iter().map(|e| &e.event).collect();
-        retry::with_retry(&self.retry_config, || async {
         self.db
             .query("INSERT IGNORE INTO events $rows RETURN NONE")
-            .bind(("rows", rows.clone()))
+            .bind(("rows", rows))
             .await
             .context("failed to batch store events")?
             .check()?;
@@ -1244,7 +1241,7 @@ impl EventStore for SurrealStorage {
         > = std::collections::HashMap::new();
         let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
 
-        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
+        for (idx, (&(event, _), event_id)) in batch.iter().zip(event_ids.iter()).enumerate() {
             let Some(asset_key) = &event.asset_key else {
                 continue;
             };
@@ -1254,7 +1251,7 @@ impl EventStore for SurrealStorage {
             let cl = event.code_location_id.as_str();
             let key = (cl, asset_key.as_str());
             let newest = |held: Option<&usize>| {
-                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
+                held.is_none_or(|&i| batch[i].0.timestamp <= event.timestamp)
             };
             if newest(latest_mat.get(&key)) {
                 latest_mat.insert(key, idx);
@@ -1290,9 +1287,10 @@ impl EventStore for SurrealStorage {
         // One `assets` row update per materialized asset (newest event wins).
         let update_run_ids: Vec<String> = latest_mat
             .values()
-            .map(|&idx| events[idx].run_id.clone())
-            .collect::<std::collections::HashSet<String>>()
+            .map(|&idx| batch[idx].0.run_id.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
+            .map(str::to_owned)
             .collect();
         let action_ids = self.action_run_ids(update_run_ids).await?;
         // Each asset's partition rows commit in one transaction with its
@@ -1306,10 +1304,10 @@ impl EventStore for SurrealStorage {
             parts_by_asset.entry((cl, ak)).or_default().push(row);
         }
         for (&(cl, asset_key), &idx) in &latest_mat {
-            let event = &events[idx];
+            let event = batch[idx].0;
             let event_id = &event_ids[idx];
-            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
-            let idv = idv_event.map(|e| e.input_data_versions.clone());
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| batch[i].0);
+            let idv = idv_event.map(|e| e.input_data_versions.as_slice());
             let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
             // A co-drained real materialize (the `idv` entry) legitimately
             // owns provenance and the code-version stamp even when the
@@ -1328,9 +1326,9 @@ impl EventStore for SurrealStorage {
                 event_id,
                 &event.run_id,
                 event.timestamp,
-                event.event_type.data_version().map(|s| s.to_string()),
+                event.event_type.data_version(),
                 provenance_timestamp,
-                code_version,
+                code_version.as_deref(),
                 idv,
                 action_only,
                 parts,
@@ -1343,7 +1341,7 @@ impl EventStore for SurrealStorage {
         // purge over a date range lands thousands of them in one drain.
         let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
         let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
-        for (&event, event_id) in events.iter().zip(event_ids.iter()) {
+        for (&(event, _), event_id) in batch.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
             if let Some(asset_key) = &event.asset_key
                 && event.event_type.is_observation() {
@@ -1389,16 +1387,17 @@ impl EventStore for SurrealStorage {
 
         // The failures last: each is compared with the materializations and
         // deletions above.
-        let failure_runs: Vec<String> = events
+        let failure_runs: Vec<String> = batch
             .iter()
-            .filter(|event| keyed_failure(event).is_some())
-            .map(|event| event.run_id.clone())
-            .collect::<HashSet<String>>()
+            .filter(|(event, _)| keyed_failure(event).is_some())
+            .map(|(event, _)| event.run_id.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
+            .map(str::to_owned)
             .collect();
         let action_failure_runs = self.action_run_ids(failure_runs).await?;
-        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, String)>> = HashMap::new();
-        for &event in &events {
+        let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, &str)>> = HashMap::new();
+        for &(event, _) in batch {
             let Some((asset_key, partition_key)) = keyed_failure(event) else {
                 continue;
             };
@@ -1409,7 +1408,7 @@ impl EventStore for SurrealStorage {
                 .entry((event.code_location_id.as_str(), asset_key))
                 .or_default();
             for member in partition_key.members() {
-                of_asset.push((member, event.timestamp, event.run_id.clone()));
+                of_asset.push((member, event.timestamp, event.run_id.as_str()));
             }
         }
         for ((cl, asset_key), failures) in failures {

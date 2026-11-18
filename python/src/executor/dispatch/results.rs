@@ -22,7 +22,7 @@ use crate::result_types::ResultKind;
 
 use super::super::in_step_pod;
 use super::super::ops::{self, OutOfProcess, now_ts};
-use super::super::parallel::worker::unwrap_worker_error;
+use super::super::parallel::worker::{PyWorkerResult, unwrap_worker_error};
 use super::super::traceback;
 use super::context::BatchContext;
 use super::types::{CapturedLogs, StepCapture, WorkOutcome, YieldedOutput};
@@ -68,7 +68,7 @@ fn emit_materialization_and_hooks(
                 name,
                 ctx.scope.run_id,
                 value.unwrap_or(&none),
-                node.metadata(),
+                node.metadata().cloned(),
                 config_instance.map(|c| c.clone_ref(py)),
             );
         });
@@ -104,8 +104,9 @@ pub(crate) struct OutputRecorder {
     is_single: bool,
     return_hint: Option<Py<PyAny>>,
     config_instance: Option<Py<PyAny>>,
-    /// dynamic_keys writes the `__keys` index alongside the step's value.
-    /// Only meaningful on the single-output path (multi-assets write per-output).
+    /// dynamic_keys writes the `__keys` index alongside the step's value; the
+    /// run state takes them after the outputs. Only meaningful on the
+    /// single-output path (multi-assets write per-output).
     dynamic_keys: Option<Vec<String>>,
     input_versions: Vec<(String, String)>,
     /// A generator's context, until its first output: the partitions that the
@@ -143,13 +144,13 @@ impl OutputRecorder {
         }
     }
 
-    /// For the outputs of `step_result`.
+    /// For the outputs of `step_result`. Takes its dynamic keys.
     fn of(
         py: Python,
         ctx: &BatchContext,
         step: &ExecutionStep,
         step_name: &str,
-        step_result: &ops::StepResult,
+        step_result: &mut ops::StepResult,
     ) -> Self {
         let context = match &step_result.generator {
             Some(
@@ -167,7 +168,7 @@ impl OutputRecorder {
         }
         Self {
             return_hint: step_result.return_hint.as_ref().map(|h| h.clone_ref(py)),
-            dynamic_keys: step_result.dynamic_keys.clone(),
+            dynamic_keys: step_result.dynamic_keys.take(),
             ..recorder
         }
     }
@@ -220,10 +221,10 @@ impl OutputRecorder {
                         value,
                         ctx.scope.partition_key,
                         type_hint,
-                        metadata.clone(),
+                        std::mem::take(&mut metadata),
                         ctx.repo.io_handler_registry,
                     )?;
-                    ops::merge_metadata(&mut metadata, &written.metadata);
+                    metadata = written.metadata;
                     written.data_version.or(data_version)
                 } else {
                     data_version
@@ -330,7 +331,7 @@ pub(crate) fn process_step_result(
     ctx: &mut BatchContext,
     step: &ExecutionStep,
     step_name: &str,
-    step_result: ops::StepResult,
+    mut step_result: ops::StepResult,
     captured_logs: CapturedLogs,
     recorder: Option<OutputRecorder>,
     failures: &mut Vec<(String, PyErr)>,
@@ -346,8 +347,8 @@ pub(crate) fn process_step_result(
 
     // Action runs: the verb ran against existing data — no output iteration,
     // no hooks. The runtime report decides what lands on the timeline.
-    if let Some(verb) = ctx.scope.plan.action.clone() {
-        handle_action_result(py, ctx, step, step_name, &verb, step_result, failures);
+    if let Some(verb) = ctx.scope.plan.action.as_deref() {
+        handle_action_result(py, ctx, step, step_name, verb, step_result, failures);
         return;
     }
 
@@ -363,37 +364,26 @@ pub(crate) fn process_step_result(
     let is_single = step.outputs.is_empty();
     let is_non_mapped = step_name == step.name;
 
-    // Step-level pre-iter (single non-mapped only):
-    //   1. record dynamic_keys so a downstream fan-out can skip a potentially
-    //      stale on-disk `__keys`. Empty Vec = ran with plain values.
-    //   2. dual IO write for final graph asset node — only non-mapped (a
-    //      mapped instance is a per-key write, not the step's "final" output).
+    // Dual IO write for final graph asset node — only non-mapped (a mapped
+    // instance is a per-key write, not the step's "final" output).
     let mut wrote_graph: Option<String> = None;
-    if is_single && is_non_mapped {
-        ctx.state.record_dynamic_keys(
-            step.name.clone(),
-            step_result.dynamic_keys.clone().unwrap_or_default(),
-        );
-
-        if let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
-            && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
-        {
-            match ops::handle_step_output(
-                py,
-                graph_name,
-                graph_node,
-                &step_result.result,
-                ctx.scope.partition_key,
-                step_result.return_hint.as_ref(),
-                Vec::new(),
-                ctx.repo.io_handler_registry,
-            ) {
-                Ok(_) => wrote_graph = Some(graph_name.clone()),
-                Err(e) => {
-                    let gn = graph_name.clone();
-                    ctx.record_failure_no_hooks(&gn, e, failures);
-                }
-            }
+    if is_single
+        && is_non_mapped
+        && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
+        && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
+    {
+        match ops::handle_step_output(
+            py,
+            graph_name,
+            graph_node,
+            &step_result.result,
+            ctx.scope.partition_key,
+            step_result.return_hint.as_ref(),
+            Vec::new(),
+            ctx.repo.io_handler_registry,
+        ) {
+            Ok(_) => wrote_graph = Some(graph_name.clone()),
+            Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
         }
     }
 
@@ -407,7 +397,7 @@ pub(crate) fn process_step_result(
         })
         .collect();
     let mut recorder =
-        recorder.unwrap_or_else(|| OutputRecorder::of(py, ctx, step, step_name, &step_result));
+        recorder.unwrap_or_else(|| OutputRecorder::of(py, ctx, step, step_name, &mut step_result));
 
     let body_capture = step_result
         .generator
@@ -415,7 +405,7 @@ pub(crate) fn process_step_result(
         .then(|| StepCapture::start(py));
     let result = ops::for_each_output(
         py,
-        &step_result,
+        &mut step_result,
         &selected_outputs,
         step_name,
         |py, item| recorder.record(py, ctx, step, item),
@@ -423,6 +413,13 @@ pub(crate) fn process_step_result(
     if let Some(capture) = body_capture {
         let logs = join_logs(call_logs, recorder.logs.take());
         emit_captured_logs(ctx, step_name, join_logs(logs, capture.finish()));
+    }
+
+    // A downstream fan-out in this run reads these keys instead of KV; an
+    // empty Vec means the step returned plain values.
+    if is_single && is_non_mapped {
+        let keys = recorder.dynamic_keys.take().unwrap_or_default();
+        ctx.state.record_dynamic_keys(step.name.clone(), keys);
     }
 
     if let Err(e) = result {
@@ -743,6 +740,7 @@ pub(crate) fn handle_failure(
     // Asset hooks carry materialize semantics; action runs don't fire them.
     if ctx.scope.plan.is_materialize()
         && let Some(node) = ctx.repo.node_map.get(&step.name)
+        && node.has_failure_hooks()
     {
         ops::run_failure_hooks(
             py,
@@ -750,7 +748,7 @@ pub(crate) fn handle_failure(
             name_for_hooks,
             ctx.scope.run_id,
             &err_msg,
-            node.metadata(),
+            node.metadata().cloned(),
             config_instance,
         );
     }
@@ -793,25 +791,22 @@ pub(crate) fn process_worker_result(
     step_config: Option<Py<PyAny>>,
     failures: &mut Vec<(String, PyErr)>,
 ) {
-    // Emit captured stdout/stderr/rust_logs from the worker subprocess as a
-    // `run_logs` row before output processing, mirroring the in-process path
-    // (`execute_step_with_capture` → `emit_captured_logs`).
-    if let Ok(logs_obj) = worker_result.getattr(py, "captured_logs")
-        && !logs_obj.is_none(py)
-        && let Ok((stdout, stderr, rust_logs)) = logs_obj.extract::<(String, String, String)>(py)
-    {
-        ctx.emit_log_output(step_name, &stdout, &stderr, &rust_logs, now_ts());
-    }
-
-    let outputs_obj = match worker_result.getattr(py, "outputs") {
-        Ok(o) => o,
+    let worker_result = match worker_result.bind(py).cast::<PyWorkerResult>() {
+        Ok(r) => r.get(),
         Err(e) => {
-            ctx.record_failure_no_hooks(step_name, e, failures);
+            ctx.record_failure_no_hooks(step_name, e.into(), failures);
             return;
         }
     };
-    let outputs_bound = outputs_obj.bind(py);
-    let outputs_list: &Bound<PyList> = match outputs_bound.cast() {
+
+    // Emit captured stdout/stderr/rust_logs from the worker subprocess as a
+    // `run_logs` row before output processing, mirroring the in-process path
+    // (`execute_step_with_capture` → `emit_captured_logs`).
+    if let Some((stdout, stderr, rust_logs)) = &worker_result.captured_logs {
+        ctx.emit_log_output(step_name, stdout, stderr, rust_logs, now_ts());
+    }
+
+    let outputs_list: &Bound<PyList> = match worker_result.outputs.bind(py).cast() {
         Ok(l) => l,
         Err(e) => {
             ctx.record_failure_no_hooks(step_name, e.into(), failures);
@@ -825,12 +820,8 @@ pub(crate) fn process_worker_result(
     // Single-output dynamic_keys come back at top-level on WorkerResult; the
     // orchestrator persists them to KV (loky workers don't write KV — embedded
     // SurrealKV is single-process and the orchestrator owns the lock).
-    let dynamic_keys: Option<Vec<String>> = if is_single {
-        worker_result
-            .getattr(py, "dynamic_keys")
-            .ok()
-            .and_then(|o| o.extract::<Option<Vec<String>>>(py).ok())
-            .flatten()
+    let dynamic_keys = if is_single {
+        worker_result.dynamic_keys.as_deref()
     } else {
         None
     };
@@ -838,17 +829,13 @@ pub(crate) fn process_worker_result(
     // Worker-drained mark_partition_failed marks cross IPC as (key_json, error);
     // stash them like process_step_result so emit_materialization emits a
     // per-partition StepFailure instead of a Materialization.
-    let worker_marks: Vec<(String, String)> = worker_result
-        .getattr(py, "failed_partitions")
-        .ok()
-        .and_then(|o| o.extract::<Vec<(String, String)>>(py).ok())
-        .unwrap_or_default();
-    let marks: Vec<(crate::partitions::PyPartitionKey, String)> = worker_marks
-        .into_iter()
+    let marks: Vec<(crate::partitions::PyPartitionKey, String)> = worker_result
+        .failed_partitions
+        .iter()
         .filter_map(|(json, err)| {
-            rivers_core::storage::PartitionKey::from_json(&json)
+            rivers_core::storage::PartitionKey::from_json(json)
                 .ok()
-                .map(|core| ((&core).into(), err))
+                .map(|core| ((&core).into(), err.clone()))
         })
         .collect();
     stash_failed_partitions(ctx, step, marks);
@@ -860,7 +847,7 @@ pub(crate) fn process_worker_result(
         .flatten();
     let mut graph_written = false;
     if let Some(graph_name) = &graph_name {
-        match write_graph_after_worker(py, ctx, step, graph_name, &worker_result, outputs_list) {
+        match write_graph_after_worker(py, ctx, step, graph_name, worker_result, outputs_list) {
             Ok(written) => graph_written = written,
             Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
         }
@@ -876,7 +863,7 @@ pub(crate) fn process_worker_result(
             end_ts,
             &item_any,
             step_config.as_ref(),
-            dynamic_keys.as_deref(),
+            dynamic_keys,
         ) {
             ctx.record_failure_no_hooks(step_name, e, failures);
         }
@@ -890,9 +877,9 @@ pub(crate) fn process_worker_result(
             .iter()
             .filter_map(|item| item.get_item(0).ok()?.extract().ok())
             .collect();
-        match worker_result.getattr(py, "error") {
-            Ok(error) if !error.is_none(py) => {
-                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.into_bound(py)));
+        match &worker_result.error {
+            Some(error) => {
+                let (error, _) = unwrap_worker_error(py, PyErr::from_value(error.bind(py).clone()));
                 handle_failure(
                     py,
                     ctx,
@@ -904,7 +891,7 @@ pub(crate) fn process_worker_result(
                     failures,
                 );
             }
-            _ => fail_unyielded_outputs(ctx, step, &yielded, failures),
+            None => fail_unyielded_outputs(ctx, step, &yielded, failures),
         }
     }
 
@@ -924,17 +911,13 @@ fn write_graph_after_worker(
     ctx: &BatchContext,
     step: &ExecutionStep,
     graph_name: &str,
-    worker_result: &Py<PyAny>,
+    worker_result: &PyWorkerResult,
     outputs: &Bound<PyList>,
 ) -> PyResult<bool> {
-    let err = worker_result.getattr(py, "graph_error")?;
-    if !err.is_none(py) {
-        return Err(PyErr::from_value(err.into_bound(py)));
+    if let Some(err) = &worker_result.graph_error {
+        return Err(PyErr::from_value(err.bind(py).clone()));
     }
-    if worker_result
-        .getattr(py, "graph_written")?
-        .extract::<bool>(py)?
-    {
+    if worker_result.graph_written {
         return Ok(true);
     }
     let task_output = match outputs.iter().next() {
@@ -1044,7 +1027,7 @@ fn process_one_worker_item(
             &name,
             ctx.scope.run_id,
             &py.None(),
-            node.metadata(),
+            node.metadata().cloned(),
             step_config.map(|c| c.clone_ref(py)),
         );
     }

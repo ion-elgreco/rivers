@@ -177,9 +177,9 @@ fn rollout_reads_the_tree_from_the_pod_template() {
     let cl = git_cl_at('b', serving_status('a'));
     let pieces = workspace::builder_pod_pieces(
         &WorkspaceSpec {
-            source: tree('b'),
-            volume: WorkspaceVolume::EmptyDir { size_limit: None },
-            extra_env: Vec::new(),
+            source: &tree('b'),
+            volume: &WorkspaceVolume::EmptyDir { size_limit: None },
+            extra_env: &[],
         },
         &WorkspaceConfig::default().prune("x"),
     );
@@ -190,7 +190,7 @@ fn rollout_reads_the_tree_from_the_pod_template() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
-        Some(&pieces),
+        Some(pieces),
     );
     d.metadata.generation = Some(2);
     d.status = Some(DeploymentStatus {

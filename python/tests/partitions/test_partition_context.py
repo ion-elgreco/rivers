@@ -1,4 +1,5 @@
 import datetime
+import pickle
 
 import pytest
 
@@ -78,3 +79,78 @@ def test_empty_keys_rejected():
     pd = rs.PartitionsDefinition.static_(["a"])
     with pytest.raises(ValueError, match="must not be empty"):
         rs.PartitionContext(keys=[], definition=pd)
+
+
+def test_reads_share_one_partition():
+    """Every read returns the same frozen objects; `keys` is a new list each read."""
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+    keys = [rs.PartitionKey.single("a"), rs.PartitionKey.single("b")]
+    ctx = rs.AssetExecutionContext(
+        "asset", partition=rs.PartitionContext(keys=keys, definition=pd)
+    )
+
+    assert ctx.partition is ctx.partition
+    assert ctx.partition.keys[0] is ctx.partition.keys[0]
+    assert ctx.partition.key is ctx.partition.keys[0]
+    assert ctx.partition.definition is ctx.partition.definition
+
+    ctx.partition.keys.clear()
+    assert ctx.partition.keys == keys
+    with pytest.raises(AttributeError):
+        ctx.partition.keys = []
+
+
+def test_pickle_round_trip():
+    """A pickled PartitionContext comes back with equal keys and definition."""
+    pd = rs.PartitionsDefinition.static_(["a", "b"])
+    keys = [rs.PartitionKey.single("a"), rs.PartitionKey.single("b")]
+    restored = pickle.loads(pickle.dumps(rs.PartitionContext(keys=keys, definition=pd)))
+
+    assert restored.keys == keys
+    assert all(isinstance(k, rs.PartitionKey.Single) for k in restored.keys)
+    assert isinstance(restored.definition, rs.PartitionsDefinition.Static)
+    assert restored.definition == pd
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_executor_built_partition(executor_env, is_async):
+    """A step reads one shared PartitionContext whose keys and definition are
+    the variant classes. Two steps in one level, so the parallel executor
+    pickles the partition to its workers."""
+    executor, make_handler = executor_env
+    handler = make_handler()
+    pd = rs.PartitionsDefinition.static_(["a", "b", "c"])
+
+    def members(context: rs.AssetExecutionContext) -> list[str]:
+        partition = context.partition
+        assert partition is context.partition
+        assert partition.keys[0] is partition.keys[0]
+        assert all(isinstance(k, rs.PartitionKey.Single) for k in partition.keys)
+        assert isinstance(partition.definition, rs.PartitionsDefinition.Static)
+        return [k.key[0] for k in partition.keys]
+
+    if is_async:
+
+        @rs.Asset(io_handler=handler, partitions_def=pd)
+        async def left(context: rs.AssetExecutionContext) -> list[str]:
+            return members(context)
+
+        @rs.Asset(io_handler=handler, partitions_def=pd)
+        async def right(context: rs.AssetExecutionContext) -> list[str]:
+            return members(context)
+
+    else:
+
+        @rs.Asset(io_handler=handler, partitions_def=pd)
+        def left(context: rs.AssetExecutionContext) -> list[str]:
+            return members(context)
+
+        @rs.Asset(io_handler=handler, partitions_def=pd)
+        def right(context: rs.AssetExecutionContext) -> list[str]:
+            return members(context)
+
+    repo = rs.CodeRepository(assets=[left, right], default_executor=executor)
+    pk = rs.PartitionKey.single(["a", "b"])
+    assert repo.materialize(partition_key=pk).success
+    assert repo.load_node("left", partition_key=pk) == ["a", "b"]
+    assert repo.load_node("right", partition_key=pk) == ["a", "b"]

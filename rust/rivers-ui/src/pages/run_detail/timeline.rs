@@ -1,13 +1,17 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use leptos::prelude::*;
 
+use crate::components::dag::layout::{LayoutResult, compute_layout};
 use crate::components::ui_kit::EmptyState;
 use crate::now::use_now;
-use crate::types::{EventType, StoredEvent};
+use crate::types::{EventType, GraphTopology, StoredEvent, TopologyNode};
 
 use super::dag_view::RunDagView;
 
 #[derive(Clone)]
-struct GanttStep {
+pub(super) struct GanttStep {
     asset: String,
     start: i64,
     end: Option<i64>,
@@ -28,9 +32,7 @@ struct AssetEvents {
 }
 
 /// Groups all events by asset first, so the result is correct regardless of event ordering.
-fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
-    use std::collections::HashMap;
-
+pub(super) fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
     let mut by_asset: HashMap<String, AssetEvents> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
@@ -92,21 +94,40 @@ fn build_gantt_steps(events: &[StoredEvent]) -> Vec<GanttStep> {
     steps
 }
 
+/// The nodes of `topology` that are steps of the run, and the edges between them.
+pub(super) fn run_topology(topology: &GraphTopology, node_names: &[String]) -> GraphTopology {
+    let names: HashSet<&str> = node_names.iter().map(String::as_str).collect();
+    let nodes: Vec<TopologyNode> = topology
+        .nodes
+        .iter()
+        .filter(|n| names.contains(n.name.as_str()))
+        .cloned()
+        .collect();
+
+    let kept: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let edges = topology
+        .edges
+        .iter()
+        .filter(|(from, to)| kept.contains(from.as_str()) && kept.contains(to.as_str()))
+        .cloned()
+        .collect();
+    GraphTopology { nodes, edges }
+}
+
 /// A "ghost: last run" overlay (previous-run delta bars + legend) was scaffolded
 /// here; see [`docs/deferred/run-detail-ghost-overlay.md`] for the full design
 /// and how to reintroduce it once real previous-run data lands.
 #[component]
 pub(super) fn RunTimelinePanel(
-    events: Vec<StoredEvent>,
+    steps: Vec<GanttStep>,
     run_start: Option<i64>,
-    node_names: Vec<String>,
-    topology: Option<crate::types::GraphTopology>,
+    /// The run's part of the topology (`run_topology`).
+    topology: Option<GraphTopology>,
     selected_step: ReadSignal<Option<String>>,
     on_select: WriteSignal<Option<String>>,
     view_mode: ReadSignal<String>,
     set_view_mode: WriteSignal<String>,
 ) -> impl IntoView {
-    let steps = build_gantt_steps(&events);
     let has_steps = !steps.is_empty();
 
     // Anchor the displayed window to the STEP execution range, not the run-level
@@ -128,32 +149,16 @@ pub(super) fn RunTimelinePanel(
     });
     let show_gantt = Signal::derive(move || view_mode.get() != "dag");
 
-    let asset_set: std::collections::HashSet<String> = node_names.iter().cloned().collect();
-    let dag_layout: Option<crate::components::dag::layout::LayoutResult> =
-        topology.as_ref().map(|topo| {
-            let nodes: Vec<_> = topo
-                .nodes
-                .iter()
-                .filter(|n| asset_set.contains(&n.name))
-                .cloned()
-                .collect();
-            let subset: std::collections::HashSet<&str> =
-                nodes.iter().map(|n| n.name.as_str()).collect();
-            let edges: Vec<_> = topo
-                .edges
-                .iter()
-                .filter(|(a, b)| subset.contains(a.as_str()) && subset.contains(b.as_str()))
-                .cloned()
-                .collect();
-            let subset_topo = crate::types::GraphTopology { nodes, edges };
-            crate::components::dag::layout::compute_layout(&subset_topo, true)
-        });
+    let dag_layout: Option<Arc<LayoutResult>> =
+        topology.map(|topo| Arc::new(compute_layout(topo, true)));
 
-    let mut status_by_asset: std::collections::HashMap<String, StepStatus> =
-        std::collections::HashMap::new();
-    for s in &steps {
-        status_by_asset.insert(s.asset.clone(), s.status.clone());
-    }
+    let status_by_asset: Arc<HashMap<String, StepStatus>> = Arc::new(
+        steps
+            .iter()
+            .map(|s| (s.asset.clone(), s.status.clone()))
+            .collect(),
+    );
+    let steps = Arc::new(steps);
 
     let now_signal = use_now();
 
@@ -162,90 +167,57 @@ pub(super) fn RunTimelinePanel(
     // (`end == None`) the bar widths and duration labels grow each second.
     // The Show, RunGanttBody, and RunDagView all re-instantiate per tick —
     // they're stateless given their inputs, and Leptos diffs the DOM.
-    let body_view = {
-        let steps = steps.clone();
+    let body_view = move || {
+        let now_secs = now_signal.get();
+        let now_ns = now_secs.saturating_mul(1_000_000_000);
+        let range_end = steps
+            .iter()
+            .map(|s| s.end.unwrap_or(now_ns))
+            .max()
+            .unwrap_or(now_ns);
+        let total_ns = (range_end - range_start).max(1) as f64;
+        let total_secs = total_ns / 1e9;
+
+        let tick_count = 8;
+        let ticks_secs: Vec<(f64, f64)> = (0..=tick_count)
+            .map(|i| {
+                let pct = i as f64 / tick_count as f64;
+                (pct, pct * total_secs)
+            })
+            .collect();
+
+        let gantt_steps = Arc::clone(&steps);
+        let dag_steps = Arc::clone(&steps);
         let dag_layout = dag_layout.clone();
-        let status_by_asset = status_by_asset.clone();
-        move || {
-            let now_secs = now_signal.get();
-            let now_ns = now_secs.saturating_mul(1_000_000_000);
-            let range_end = steps
-                .iter()
-                .map(|s| s.end.unwrap_or(now_ns))
-                .max()
-                .unwrap_or(now_ns);
-            let total_ns = (range_end - range_start).max(1) as f64;
-            let total_secs = total_ns / 1e9;
-
-            let tick_count = 8;
-            let ticks_secs: Vec<(f64, f64)> = (0..=tick_count)
-                .map(|i| {
-                    let pct = i as f64 / tick_count as f64;
-                    (pct, pct * total_secs)
-                })
-                .collect();
-
-            let lane_rows: Vec<LaneRow> = steps
-                .iter()
-                .map(|s| {
-                    let cur_dur_ns = s.end.unwrap_or(now_ns) - s.start;
-                    let start_pct = (s.start - range_start) as f64 / total_ns * 100.0;
-                    let width_pct = (cur_dur_ns as f64 / total_ns) * 100.0;
-                    LaneRow {
-                        asset: s.asset.clone(),
-                        status: s.status.clone(),
-                        start_pct,
-                        width_pct,
-                    }
-                })
-                .collect();
-
-            let mut duration_by_asset: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for s in &steps {
-                let dur_ns = s.end.unwrap_or(now_ns) - s.start;
-                let dur_secs = (dur_ns as f64 / 1e9).max(0.0);
-                duration_by_asset.insert(s.asset.clone(), fmt_dur_short(dur_secs));
-            }
-
-            let dl = dag_layout.clone();
-            let statuses = status_by_asset.clone();
-            view! {
-                <Show
-                    when=move || show_gantt.get()
-                    fallback={
-                        let dl = dl.clone();
-                        let statuses = statuses.clone();
-                        let durations = duration_by_asset.clone();
-                        move || {
-                            match dl.clone() {
-                                Some(layout) if !layout.nodes.is_empty() => view! {
-                                    <RunDagView
-                                        layout=layout
-                                        status_by_asset=statuses.clone()
-                                        duration_by_asset=durations.clone()
-                                        selected_step=selected_step
-                                        on_select=on_select
-                                    />
-                                }.into_any(),
-                                _ => view! {
-                                    <div class="run-dag-placeholder">
-                                        <div class="run-dag-placeholder-title">"No lineage"</div>
-                                        <div class="run-dag-placeholder-hint">"Could not resolve asset dependencies for this run."</div>
-                                    </div>
-                                }.into_any(),
-                            }
-                        }
-                    }
-                >
-                    <RunGanttBody
-                        lanes=lane_rows.clone()
-                        ticks=ticks_secs.clone()
-                        selected_step=selected_step
-                        on_select=on_select
-                    />
-                </Show>
-            }
+        let status_by_asset = Arc::clone(&status_by_asset);
+        view! {
+            <Show
+                when=move || show_gantt.get()
+                fallback=move || match &dag_layout {
+                    Some(layout) if !layout.nodes.is_empty() => view! {
+                        <RunDagView
+                            layout=Arc::clone(layout)
+                            status_by_asset=Arc::clone(&status_by_asset)
+                            duration_by_asset=duration_by_asset(&dag_steps, now_ns)
+                            selected_step=selected_step
+                            on_select=on_select
+                        />
+                    }.into_any(),
+                    _ => view! {
+                        <div class="run-dag-placeholder">
+                            <div class="run-dag-placeholder-title">"No lineage"</div>
+                            <div class="run-dag-placeholder-hint">"Could not resolve asset dependencies for this run."</div>
+                        </div>
+                    }.into_any(),
+                }
+            >
+                <RunGanttBody
+                    lanes=lane_rows(&gantt_steps, range_start, total_ns, now_ns)
+                    ticks=ticks_secs.clone()
+                    selected_step=selected_step
+                    on_select=on_select
+                />
+            </Show>
         }
     };
 
@@ -285,6 +257,34 @@ struct LaneRow {
     status: StepStatus,
     start_pct: f64,
     width_pct: f64,
+}
+
+fn lane_rows(steps: &[GanttStep], range_start: i64, total_ns: f64, now_ns: i64) -> Vec<LaneRow> {
+    steps
+        .iter()
+        .map(|s| {
+            let cur_dur_ns = s.end.unwrap_or(now_ns) - s.start;
+            let start_pct = (s.start - range_start) as f64 / total_ns * 100.0;
+            let width_pct = (cur_dur_ns as f64 / total_ns) * 100.0;
+            LaneRow {
+                asset: s.asset.clone(),
+                status: s.status.clone(),
+                start_pct,
+                width_pct,
+            }
+        })
+        .collect()
+}
+
+fn duration_by_asset(steps: &[GanttStep], now_ns: i64) -> HashMap<String, String> {
+    steps
+        .iter()
+        .map(|s| {
+            let dur_ns = s.end.unwrap_or(now_ns) - s.start;
+            let dur_secs = (dur_ns as f64 / 1e9).max(0.0);
+            (s.asset.clone(), fmt_dur_short(dur_secs))
+        })
+        .collect()
 }
 
 /// Finer units for shorter spans, so the axis ticks of a fast run stay distinct.
@@ -407,5 +407,33 @@ mod tests {
         assert_eq!(fmt_dur_short(0.0042), "4.2ms");
         assert_eq!(fmt_dur_short(0.25), "250ms");
         assert_eq!(fmt_dur_short(3.0), "3.0s");
+    }
+
+    #[test]
+    fn run_topology_keeps_the_runs_nodes_and_the_edges_between_them() {
+        let node = |name: &str| TopologyNode {
+            name: name.into(),
+            kind: "asset".into(),
+            group: None,
+            parent_graph: None,
+            remote: None,
+        };
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topology = GraphTopology {
+            nodes: vec![node("a"), node("b"), node("c"), node("d")],
+            edges: vec![
+                edge("b", "a"),
+                edge("c", "b"),
+                edge("d", "c"),
+                edge("c", "x"),
+            ],
+        };
+
+        let names = ["c", "x", "b", "d"].map(String::from);
+        let run = run_topology(&topology, &names);
+
+        let kept: Vec<&str> = run.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(kept, ["b", "c", "d"]);
+        assert_eq!(run.edges, [edge("c", "b"), edge("d", "c")]);
     }
 }

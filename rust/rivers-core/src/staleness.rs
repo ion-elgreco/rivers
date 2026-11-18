@@ -3,36 +3,46 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::assets::graph::GraphTopology;
+use crate::assets::remote::RemoteRef;
 use crate::storage::{AssetRecord, StaleCause, StaleCauseCategory, StaleStatus};
 
-/// What the staleness of `keys` reads: the part of `topology` from `keys` up,
-/// and the keys in it of the assets that this code location owns (`keys`
-/// included). The owners of its remote nodes hold their records.
-pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, GraphTopology) {
+/// The part of a topology from some keys up. The owners of its remote nodes
+/// hold their records.
+pub struct Upstream<'t> {
+    /// The keys in it of the assets that this code location owns, sorted.
+    pub owned: Vec<String>,
+    /// Its remote nodes, as [`GraphTopology::remotes`] gives them.
+    pub remotes: Vec<(&'t str, &'t RemoteRef)>,
+    pub edges: Vec<&'t (String, String)>,
+}
+
+/// What the staleness of `keys` reads: the part of `topology` from `keys`
+/// up (`keys` included in its owned keys).
+pub fn upstream_of<'t>(keys: &[String], topology: &'t GraphTopology) -> Upstream<'t> {
     let part = topology.with_upstream(keys.iter().map(String::as_str));
 
-    let upstream = GraphTopology {
-        nodes: topology
-            .nodes
-            .iter()
-            .filter(|node| part.contains(node.name.as_str()))
-            .cloned()
-            .collect(),
-        edges: topology
-            .edges
-            .iter()
-            .filter(|(from, _)| part.contains(from.as_str()))
-            .cloned()
-            .collect(),
-    };
-    let remote: HashSet<&str> = upstream.remotes().map(|(name, _)| name).collect();
+    let remotes: Vec<(&str, &RemoteRef)> = topology
+        .remotes()
+        .filter(|(name, _)| part.contains(*name))
+        .collect();
+    let edges = topology
+        .edges
+        .iter()
+        .filter(|(from, _)| part.contains(from.as_str()))
+        .collect();
+
+    let remote: HashSet<&str> = remotes.iter().map(|&(name, _)| name).collect();
     let mut owned: Vec<String> = part
         .into_iter()
         .filter(|name| !remote.contains(name))
         .map(str::to_string)
         .collect();
     owned.sort();
-    (owned, upstream)
+    Upstream {
+        owned,
+        remotes,
+        edges,
+    }
 }
 
 /// The owner's record of a remote asset, under its `local` name. Only the
@@ -40,11 +50,19 @@ pub fn upstream_of(keys: &[String], topology: &GraphTopology) -> (Vec<String>, G
 /// not the consumer.
 pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
     AssetRecord {
+        code_location_id: owner.code_location_id.clone(),
         asset_key: local.to_string(),
+        tags: owner.tags.clone(),
+        kinds: owner.kinds.clone(),
+        asset_group: owner.asset_group.clone(),
         code_version: None,
+        last_event_id: owner.last_event_id.clone(),
+        last_run_id: owner.last_run_id.clone(),
+        last_timestamp: owner.last_timestamp,
+        last_data_version: owner.last_data_version.clone(),
         last_materialization_code_version: None,
         last_input_data_versions: Vec::new(),
-        ..owner.clone()
+        pool: owner.pool.clone(),
     }
 }
 
@@ -54,17 +72,24 @@ pub fn remote_input_record(local: &str, owner: &AssetRecord) -> AssetRecord {
 /// This matches the convention used by `GraphTopology.edges`.
 ///
 /// Returns a map from asset_key to (status, causes).
-pub fn compute_staleness<'a>(
-    records: impl IntoIterator<Item = &'a AssetRecord>,
-    edges: &[(String, String)],
+pub fn compute_staleness<'r, 'e>(
+    records: impl IntoIterator<Item = &'r AssetRecord>,
+    edges: impl IntoIterator<Item = &'e (String, String)>,
 ) -> HashMap<String, (StaleStatus, Vec<StaleCause>)> {
     let records: Vec<&AssetRecord> = records.into_iter().collect();
     let record_map: HashMap<&str, &AssetRecord> =
         records.iter().map(|r| (r.asset_key.as_str(), *r)).collect();
 
+    // Kahn's algorithm — upstreams must be processed before downstreams so
+    // transitive staleness propagates correctly below.
+    // An upstream without a record (a remote asset) must still enter the
+    // queue, or it never releases its downstreams.
     let mut upstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut downstream_deps: HashMap<&str, Vec<&str>> = HashMap::new();
-
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    for r in &records {
+        in_degree.entry(r.asset_key.as_str()).or_insert(0);
+    }
     for (from, to) in edges {
         upstream_deps
             .entry(from.as_str())
@@ -74,17 +99,6 @@ pub fn compute_staleness<'a>(
             .entry(to.as_str())
             .or_default()
             .push(from.as_str());
-    }
-
-    // Kahn's algorithm — upstreams must be processed before downstreams so
-    // transitive staleness propagates correctly below.
-    // An upstream without a record (a remote asset) must still enter the
-    // queue, or it never releases its downstreams.
-    let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    for r in &records {
-        in_degree.entry(r.asset_key.as_str()).or_insert(0);
-    }
-    for (from, to) in edges {
         *in_degree.entry(from.as_str()).or_insert(0) += 1;
         in_degree.entry(to.as_str()).or_insert(0);
     }
@@ -400,63 +414,63 @@ mod tests {
     }
 
     /// `report` ← `clean` ← `seed`, and `count` ← the remote `orders`.
-    /// `unrelated` is downstream of `report`; `fresh` stands alone.
+    /// `unrelated` is downstream of `report` and reads the remote `returns`;
+    /// `fresh` stands alone.
     #[test]
     fn test_upstream_of_reads_only_what_is_above_the_keys() {
         use crate::assets::graph::{NodeKind, TopologyNode};
-        use crate::assets::remote::{LocationRef, RemoteRef};
+        use crate::assets::remote::LocationRef;
 
         let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
-        let orders = TopologyNode {
+        let remote = |name: &str, asset_key: &str| TopologyNode {
             remote: Some(RemoteRef {
                 code_location: LocationRef::new("dev", "warehouse").unwrap(),
-                asset_key: "raw_orders".to_string(),
+                asset_key: asset_key.to_string(),
             }),
-            ..node("orders")
+            ..node(name)
         };
         let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
         let topology = GraphTopology {
             nodes: vec![
-                orders,
+                remote("orders", "raw_orders"),
                 node("seed"),
                 node("clean"),
                 node("report"),
                 node("count"),
                 node("fresh"),
                 node("unrelated"),
+                remote("returns", "raw_returns"),
             ],
             edges: vec![
                 edge("clean", "seed"),
                 edge("report", "clean"),
                 edge("count", "orders"),
                 edge("unrelated", "report"),
+                edge("unrelated", "returns"),
             ],
         };
         let keys = ["report", "count", "no_node"].map(String::from);
 
-        let (owned, upstream) = upstream_of(&keys, &topology);
+        let Upstream {
+            owned,
+            remotes,
+            edges,
+        } = upstream_of(&keys, &topology);
 
         assert_eq!(owned, ["clean", "count", "no_node", "report", "seed"]);
         assert_eq!(
-            upstream
-                .nodes
+            remotes
                 .iter()
-                .map(|n| (n.name.as_str(), n.remote.is_some()))
+                .map(|(name, remote)| (*name, remote.asset_key.as_str()))
                 .collect::<Vec<_>>(),
-            [
-                ("orders", true),
-                ("seed", false),
-                ("clean", false),
-                ("report", false),
-                ("count", false),
-            ]
+            [("orders", "raw_orders")]
         );
         assert_eq!(
-            upstream.edges,
+            edges,
             [
-                edge("clean", "seed"),
-                edge("report", "clean"),
-                edge("count", "orders"),
+                &edge("clean", "seed"),
+                &edge("report", "clean"),
+                &edge("count", "orders"),
             ]
         );
     }

@@ -73,6 +73,18 @@ class PidTrackingIOHandler(rs.PickleIOHandler):
         return super().load_input(context)
 
 
+class PartitionLoggingIOHandler(rs.PickleIOHandler):
+    """PickleIOHandler that records asset_name + partition keys on each load_input call."""
+
+    log_path: str
+
+    def load_input(self, context):
+        keys = [str(k) for k in context.partition.keys] if context.partition else []
+        with open(self.log_path, "a") as f:
+            f.write(f"{context.asset_name}:{','.join(keys)}\n")
+        return super().load_input(context)
+
+
 @rs.Task
 def consume_stream(items: object) -> list:
     return list(items)
@@ -867,6 +879,42 @@ class TestParallelGraphAssets:
             f"Parent loads: {parent_loads}"
         )
 
+    def test_collect_inputs_get_the_run_partition(self, executor_env, tmp_path):
+        """Every collected map instance is loaded with the run's partition."""
+        executor, _, _ = executor_env
+        store = obstore.store.LocalStore(str(tmp_path / "store"), mkdir=True)
+        log = tmp_path / "loads"
+        pio = PartitionLoggingIOHandler(store=store, log_path=str(log))
+        pdef = rs.PartitionsDefinition.static_(["p1", "p2"])
+
+        @rs.Asset(io_handler=pio, partitions_def=pdef)
+        def nums_a() -> list:
+            return [1, 2, 3]
+
+        @rs.Asset(io_handler=pio, partitions_def=pdef)
+        def nums_b() -> list:
+            return [10, 20, 30]
+
+        @rs.Asset.from_graph(io_handler=pio, node_io_handler=pio, partitions_def=pdef)
+        def graph_a():
+            return sum_all(nums_a().map(double).collect())
+
+        @rs.Asset.from_graph(io_handler=pio, node_io_handler=pio, partitions_def=pdef)
+        def graph_b():
+            return sum_all(nums_b().map(double).collect())
+
+        repo = rs.CodeRepository(
+            assets=[nums_a, nums_b, graph_a, graph_b],
+            tasks=[double, sum_all],
+            default_executor=executor,
+        )
+        result = repo.materialize(partition_key=rs.PartitionKey.single("p2"))
+        assert result.success
+
+        loads = [line for line in log.read_text().splitlines() if "double__" in line]
+        assert len(loads) == 6, loads
+        assert all(line.endswith(":p2") for line in loads), loads
+
 
 # ---------------------------------------------------------------------------
 # Predefined keys (__keys path)
@@ -1207,6 +1255,72 @@ def test_predefined_keys_honor_changed_dynamic_keys_between_runs(tmp_path):
     assert os.path.exists(
         os.path.join(store_root, "ck_pipeline", "ck_double__renamed_y.pkl")
     )
+
+
+@pytest.mark.parametrize("executor", ["in_process", "parallel"])
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_predefined_keys_read_from_kv_in_a_later_run(
+    tmp_path, storage, executor, is_async
+):
+    """The source's DynamicOutput keys are written to KV when the source runs
+    on the orchestrator. A later run that maps over the source without
+    running it reads the keys from KV, so mapped instances keep the source's
+    keys instead of synthetic indices."""
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+    handler = rs.PickleIOHandler(store=store)
+
+    @rs.Task
+    def kv_inc(x: int) -> int:
+        return x + 1
+
+    @rs.Task
+    def kv_sum(values: list) -> int:
+        return sum(values)
+
+    def outputs() -> list:
+        return [
+            rs.DynamicOutput(key="alpha", value=10),
+            rs.DynamicOutput(key="beta", value=20),
+        ]
+
+    if is_async:
+
+        @rs.Asset(io_handler=handler)
+        async def kv_source() -> list:
+            return outputs()
+
+    else:
+
+        @rs.Asset(io_handler=handler)
+        def kv_source() -> list:
+            return outputs()
+
+    @rs.Asset.from_graph(io_handler=handler, node_io_handler=handler)
+    def kv_pipeline():
+        mapped = kv_source().map(kv_inc)
+        return kv_sum(mapped.collect())
+
+    repo = rs.CodeRepository(
+        assets=[kv_source, kv_pipeline],
+        tasks=[kv_inc, kv_sum],
+        default_executor=rs.Executor.in_process()
+        if executor == "in_process"
+        else rs.Executor.parallel(max_workers=2),
+    )
+    repo.resolve(storage=storage)
+    assert repo.materialize(selection=["kv_source"]).success
+    assert repo.materialize(selection=["kv_pipeline"]).success
+
+    assert (
+        handler.load_input(
+            rs.InputContext(asset_name="kv_pipeline", downstream_asset="t")
+        )
+        == 32
+    )
+    store_root = handler.store.prefix
+    assert os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__alpha.pkl"))
+    assert os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__beta.pkl"))
+    assert not os.path.exists(os.path.join(store_root, "kv_pipeline", "kv_inc__0.pkl"))
 
 
 # ---------------------------------------------------------------------------

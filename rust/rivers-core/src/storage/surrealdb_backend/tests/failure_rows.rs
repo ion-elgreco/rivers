@@ -618,6 +618,35 @@ async fn a_deletion_replaces_an_older_failure_and_the_row_of_a_newer_one() {
     assert_derived(&storage, "a", "after the deletions").await;
 }
 
+/// More keys than are read one by one: their failure rows are read as the
+/// range from the first key to the last, in the order of the store.
+#[tokio::test]
+async fn a_deletion_of_many_partitions_replaces_their_older_failures() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    let names: Vec<String> = (0..40).map(|i| format!("p{i:02}")).collect();
+    let all: Vec<&str> = names.iter().map(String::as_str).collect();
+    storage
+        .store_events(&[
+            failed("a", "r1", keys(&all), 100),
+            failed("a", "r2", single("p20"), 300),
+        ])
+        .await
+        .unwrap();
+
+    let deletions: Vec<EventRecord> = all
+        .iter()
+        .map(|&name| deleted("a", Some(name), 200))
+        .collect();
+    storage.store_events(&deletions).await.unwrap();
+
+    assert_eq!(
+        rows(&storage, "a").await,
+        vec![failure("p20", 300, "r2", false)]
+    );
+    assert_derived(&storage, "a", "after the deletions").await;
+}
+
 #[tokio::test]
 async fn an_asset_deletion_replaces_older_failures_and_their_rows() {
     let storage = make_storage().await;

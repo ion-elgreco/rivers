@@ -1,24 +1,28 @@
 use anyhow::{Context, Result};
 
 use crate::storage::retry;
-use crate::storage::{EventRecord, EventType, RunRecord};
+use crate::storage::{EventType, RunRecord};
 
 use super::partition_failures::StoredStatus;
 use super::*;
 
 /// Build the `RunQueued` event row that pairs with a freshly-written queued `RunRecord`.
-pub(super) fn run_queued_event(record: &RunRecord) -> EventRecord {
-    EventRecord {
+pub(super) fn run_queued_row(record: &RunRecord, id: RecordId) -> DbEventWrite {
+    DbEventWrite {
+        id,
         code_location_id: record.code_location_id.clone(),
-        event_type: EventType::RunQueued,
+        event_type: EventType::RunQueued.type_name().to_string(),
         asset_key: None,
         run_id: record.run_id.clone(),
         partition_key: record.partition_key.clone(),
         timestamp: record.start_time,
+        sort_order: EventType::RunQueued.sort_order(),
         metadata: vec![(
             crate::storage::tag_keys::PRIORITY.to_string(),
             record.priority.to_string(),
         )],
+        data_version: None,
+        code_version: None,
         input_data_versions: vec![],
     }
 }
@@ -70,7 +74,7 @@ impl SurrealStorage {
 
     /// Persist a queued `RunRecord` and emit its `RunQueued` event in one step.
     pub async fn enqueue_run(&self, record: &RunRecord) -> Result<()> {
-        let event = DbEventWrite::from_event(&run_queued_event(record), new_event_record_id());
+        let event_id = new_event_record_id();
         let result = retry::with_retry(&self.retry_config, || async {
             self.db
                 .query(
@@ -80,7 +84,7 @@ impl SurrealStorage {
                      COMMIT TRANSACTION;",
                 )
                 .bind(("run", record.clone()))
-                .bind(("event", event.clone()))
+                .bind(("event", run_queued_row(record, event_id.clone())))
                 .await
                 .context("failed to enqueue run")?;
             Ok(())
@@ -94,11 +98,13 @@ impl SurrealStorage {
         if records.is_empty() {
             return Ok(());
         }
-        let events: Vec<DbEventWrite> = records
-            .iter()
-            .map(|r| DbEventWrite::from_event(&run_queued_event(r), new_event_record_id()))
-            .collect();
+        let event_ids: Vec<RecordId> = records.iter().map(|_| new_event_record_id()).collect();
         let result = retry::with_retry(&self.retry_config, || async {
+            let events: Vec<DbEventWrite> = records
+                .iter()
+                .zip(&event_ids)
+                .map(|(r, id)| run_queued_row(r, id.clone()))
+                .collect();
             self.db
                 .query(
                     "BEGIN TRANSACTION;\n\
@@ -107,7 +113,7 @@ impl SurrealStorage {
                      COMMIT TRANSACTION;",
                 )
                 .bind(("runs", records.to_vec()))
-                .bind(("events", events.clone()))
+                .bind(("events", events))
                 .await
                 .context("failed to enqueue runs batch")?;
             Ok(())

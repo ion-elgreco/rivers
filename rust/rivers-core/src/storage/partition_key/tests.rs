@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::hash::{BuildHasher, RandomState};
 
 use surrealdb::types::SurrealValue;
 
-use super::PartitionKey;
+use super::{PartitionKey, STACK_DIMS, by_name};
 use crate::storage::{KeyItem, KeySpan, SpanStep};
 
 const HOUR_FMT: &str = "%Y-%m-%d-%H:%M";
@@ -181,6 +182,28 @@ fn a_stored_key_with_a_span_reads_back_as_it_was() {
 }
 
 #[test]
+fn a_stored_key_reads_back_as_it_was() {
+    let single = PartitionKey::Single {
+        keys: strings(&["2024-01-01"]),
+    };
+    let multi = zone_run_expanded();
+    let set = PartitionKey::Set {
+        keys: vec![single.clone(), multi.clone()],
+    };
+    for key in [single, multi, set] {
+        let read = PartitionKey::from_value(key.clone().into_value()).unwrap();
+        assert_eq!(read, key, "{}", key.to_display());
+    }
+
+    assert_eq!(
+        PartitionKey::from_value("2024-01-01".to_string().into_value()).unwrap(),
+        PartitionKey::Single {
+            keys: strings(&["2024-01-01"])
+        }
+    );
+}
+
+#[test]
 fn half_a_year_of_hours_for_one_zone_is_a_small_key() {
     let key = PartitionKey::MultiItems {
         dims: vec![
@@ -223,6 +246,70 @@ fn keys_with_spans_are_equal_when_they_hold_the_same_items() {
         PartitionKey::SingleItems {
             items: vec![hours("2024-01-01-00:00", "2024-01-01-02:00")],
         }
+    );
+}
+
+#[test]
+fn multi_keys_are_equal_in_any_dimension_order() {
+    let multi = |dims: &[(&str, &str)]| PartitionKey::Multi {
+        dims: dims
+            .iter()
+            .map(|(name, value)| (name.to_string(), strings(&[value])))
+            .collect(),
+    };
+    let (color, date, region) = (("color", "blue"), ("date", "2024-01-01"), ("region", "us"));
+    let key = multi(&[color, date, region]);
+    let orders = [
+        [color, region, date],
+        [date, color, region],
+        [date, region, color],
+        [region, color, date],
+        [region, date, color],
+    ];
+
+    let hasher = RandomState::new();
+    for order in orders {
+        assert_eq!(multi(&order), key, "{order:?}");
+        assert_eq!(hasher.hash_one(multi(&order)), hasher.hash_one(&key));
+    }
+    let seen: HashSet<PartitionKey> = orders.iter().map(|order| multi(order)).collect();
+    assert_eq!(seen, HashSet::from([key.clone()]));
+
+    assert_ne!(multi(&[region, ("date", "2024-01-02"), color]), key);
+    assert_ne!(multi(&[region, date]), key);
+    assert_ne!(multi(&[region, date, ("colour", "blue")]), key);
+}
+
+#[test]
+fn dims_walk_in_stable_name_order_with_few_or_many_dims() {
+    let names = ["k", "c", "a", "k", "b", "a", "j", "d", "c", "e"];
+    let dims: Vec<(String, usize)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_string(), i))
+        .collect();
+    assert!(dims.len() > STACK_DIMS);
+
+    for n in 0..=dims.len() {
+        let mut sorted: Vec<&(String, usize)> = dims[..n].iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(by_name(&dims[..n]).collect::<Vec<_>>(), sorted, "{n} dims");
+    }
+
+    let multi = |dims: &[(String, usize)]| PartitionKey::Multi {
+        dims: dims
+            .iter()
+            .map(|(name, i)| (name.clone(), vec![i.to_string()]))
+            .collect(),
+    };
+    let mut sorted = dims.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let hasher = RandomState::new();
+    assert_eq!(multi(&sorted), multi(&dims));
+    assert_eq!(
+        hasher.hash_one(multi(&sorted)),
+        hasher.hash_one(multi(&dims))
     );
 }
 

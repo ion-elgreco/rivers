@@ -141,7 +141,7 @@ async fn try_acquire_or_renew(
             }
         }
         Some(lease) => {
-            let spec = lease.spec.clone().unwrap_or_default();
+            let spec = lease.spec.unwrap_or_default();
             let holder = spec.holder_identity.as_deref().unwrap_or_default();
             let ttl = spec
                 .lease_duration_seconds

@@ -1,5 +1,6 @@
 //! Dispatch orchestrator — schedules ready steps across executor backends.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep, StepKind};
@@ -102,7 +103,7 @@ pub(crate) fn execute_level_batch(
             }
         });
 
-        finalize_mapped_steps(ctx, &mapped_records);
+        finalize_mapped_steps(ctx, mapped_records);
 
         failures
     })
@@ -116,20 +117,20 @@ struct MappedStepRecord {
     keys: Vec<String>,
 }
 
-fn finalize_mapped_steps(ctx: &mut BatchContext, records: &[MappedStepRecord]) {
+fn finalize_mapped_steps(ctx: &mut BatchContext, records: Vec<MappedStepRecord>) {
     for rec in records {
         let step = &ctx.scope.plan.steps[rec.idx];
         let mut successful = Vec::with_capacity(rec.keys.len());
         let mut any_failed = false;
         let mut any_cancelled = false;
-        for key in &rec.keys {
+        for key in rec.keys {
             let instance_name = format!("{}__{}", step.name, key);
             if ctx.state.was_failed(&instance_name) {
                 any_failed = true;
             } else if ctx.state.was_cancelled(&instance_name) {
                 any_cancelled = true;
             } else {
-                successful.push(key.clone());
+                successful.push(key);
             }
         }
         if any_failed {
@@ -246,16 +247,16 @@ fn build_mapped_instances(
                 input_overrides: HashMap::new(),
                 fan_out: Some((fan_out_source.to_string(), value)),
                 is_async,
-                pools: pools.clone(),
+                pools: Arc::clone(&pools),
                 asset_scope: asset_scope.clone(),
             }
         };
 
         if let Some(keys) = predefined_keys {
+            let mut keys = keys.into_iter();
             items
                 .into_iter()
-                .enumerate()
-                .map(|(i, item)| build_instance(keys[i].clone(), item))
+                .map(|item| build_instance(keys.next().expect("a key per fan-out item"), item))
                 .collect()
         } else {
             // Each item may be a `DynamicOutput` PyClass we need to extract.

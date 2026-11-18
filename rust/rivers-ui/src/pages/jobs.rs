@@ -65,7 +65,14 @@ pub fn JobsListPage() -> impl IntoView {
 
     let assets_info = Resource::new(
         move || (loc.get(), live.definitions.get()),
-        |((ns, name), _)| async move { get_assets_info(ns, name).await },
+        |((ns, name), _)| async move {
+            get_assets_info(ns, name).await.map(|infos| {
+                infos
+                    .into_iter()
+                    .map(|i| (i.asset_key.clone(), i))
+                    .collect::<HashMap<_, _>>()
+            })
+        },
     );
 
     let navigate = leptos_router::hooks::use_navigate();
@@ -94,7 +101,12 @@ pub fn JobsListPage() -> impl IntoView {
             .map(|j| j.asset_selection)
             .unwrap_or_default()
     });
-    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
+    let asset_info_by_key = Memo::new(move |_| {
+        assets_info_value.with(|info| match info {
+            Some(Ok(by_key)) => by_key.clone(),
+            _ => HashMap::new(),
+        })
+    });
 
     view! {
         <Topbar
@@ -136,10 +148,10 @@ pub fn JobsListPage() -> impl IntoView {
                 };
                 // assets_info may still be loading; default to empty so a slow
                 // gRPC call doesn't block the whole table from rendering.
-                let infos: Vec<AssetDefinitionInfo> =
-                    assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-                let asset_info_by_key: HashMap<String, AssetDefinitionInfo> =
-                    infos.into_iter().map(|i| (i.asset_key.clone(), i)).collect();
+                let infos = assets_info.read();
+                let no_infos = HashMap::new();
+                let asset_info_by_key: &HashMap<String, AssetDefinitionInfo> =
+                    infos.as_ref().and_then(|r| r.as_ref().ok()).unwrap_or(&no_infos);
                 let last_runs_map: HashMap<String, RunRecord> =
                     last_runs_result.ok().unwrap_or_default().into_iter().collect();
                 Some(match jobs_result {
@@ -178,9 +190,9 @@ pub fn JobsListPage() -> impl IntoView {
                                         .map(|r| format!("grid-row-rail grid-row-rail--{}", run_status_class(&r.status)))
                                         .unwrap_or_else(|| "grid-row-rail grid-row-rail--muted".to_string());
 
-                                    let verb = job_verb(job.action.as_deref(), &asset_selection, &asset_info_by_key);
+                                    let verb = job_verb(job.action.as_deref(), &asset_selection, asset_info_by_key);
                                     let row_picker =
-                                        job_partition_picker(verb.as_ref(), &asset_selection, &asset_info_by_key);
+                                        job_partition_picker(verb.as_ref(), &asset_selection, asset_info_by_key);
                                     let destructive = verb.as_ref().is_some_and(|v| v.is_destructive());
                                     let verb_name = verb.as_ref().map(|v| v.name.clone());
                                     // The dialog picks partitions and edits config; a job
@@ -188,7 +200,7 @@ pub fn JobsListPage() -> impl IntoView {
                                     let opens_dialog = !matches!(row_picker, JobPartitionPicker::None)
                                         || crate::components::config_editor::launch_takes_config(
                                             &asset_selection,
-                                            &asset_info_by_key,
+                                            asset_info_by_key,
                                             verb_name.as_deref(),
                                         );
                                     let armed_label = verb_name.clone().unwrap_or_default();

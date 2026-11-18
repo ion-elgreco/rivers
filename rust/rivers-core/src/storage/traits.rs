@@ -67,7 +67,7 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
     fn register_assets(
         &self,
         code_location_id: &str,
-        records: &[AssetRecord],
+        records: Vec<AssetRecord>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn get_asset_record(
@@ -488,6 +488,15 @@ pub trait StorageBackend: PerCodeLocationStorage {
     // Step logs (`run_logs` — one row per step execution)
     fn store_run_logs(&self, logs: &[LogRecord]) -> impl Future<Output = Result<()>> + Send;
     fn get_run_logs(&self, run_id: &str) -> impl Future<Output = Result<Vec<StoredLog>>> + Send;
+
+    /// The stored traceback JSON of each of `step_key`'s rows at `timestamp`
+    /// in the run, in [`Self::get_run_logs`] order. Rows without one are left out.
+    fn get_step_tracebacks(
+        &self,
+        run_id: &str,
+        step_key: &str,
+        timestamp: i64,
+    ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
     /// Every terminal step among `asset_keys` inside `run_ids`, in one query.
     ///

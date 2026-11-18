@@ -72,7 +72,7 @@ fn make_materialized_record(key: &str, ts: i64) -> AssetRecord {
     r
 }
 
-static EMPTY_SET: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+static EMPTY_SET: std::sync::LazyLock<HashSet<&str>> = std::sync::LazyLock::new(HashSet::new);
 
 static EMPTY_BACKFILL: std::sync::LazyLock<crate::condition::cache::BackfillState> =
     std::sync::LazyLock::new(crate::condition::cache::BackfillState::default);
@@ -136,8 +136,48 @@ fn mpk(dims: &[(&str, &str)]) -> PartitionKey {
     }
 }
 
-static EMPTY_REQUESTED: std::sync::LazyLock<HashMap<String, PartitionSelection>> =
+static NO_FIRES: std::sync::LazyLock<HashMap<&'static str, usize>> =
     std::sync::LazyLock::new(HashMap::new);
+
+static EMPTY_REQUESTED: std::sync::LazyLock<RequestedThisTick<'static>> =
+    std::sync::LazyLock::new(|| RequestedThisTick::new(&NO_FIRES, &[]));
+
+/// Owned backing for a test `RequestedThisTick`: each asset fired with its selection.
+struct Fired<'a> {
+    keys: HashMap<&'a str, usize>,
+    results: Vec<EvalResultRow>,
+}
+
+impl<'a> Fired<'a> {
+    fn new(fires: Vec<(&'a str, PartitionSelection)>) -> Self {
+        let mut keys = HashMap::new();
+        let mut results = Vec::new();
+        for (key, selection) in fires {
+            keys.insert(key, results.len());
+            results.push(EvalResultRow {
+                info_idx: results.len(),
+                result: EvalResult {
+                    fired: true,
+                    selection: Some(selection),
+                    ..Default::default()
+                },
+                tree: EvalNodeResult::new(
+                    &ConditionNode::WillBeRequested,
+                    0,
+                    NodeStatus::True,
+                    vec![],
+                    None,
+                ),
+                duration_us: 0,
+            });
+        }
+        Self { keys, results }
+    }
+
+    fn view(&self) -> RequestedThisTick<'_> {
+        RequestedThisTick::new(&self.keys, &self.results)
+    }
+}
 
 static EMPTY_FAILED_TS: std::sync::LazyLock<HashMap<String, i64>> =
     std::sync::LazyLock::new(HashMap::new);

@@ -58,31 +58,19 @@ pub fn AssetsListPage() -> impl IntoView {
     );
 
     let all_records = move || -> Vec<AssetRecord> {
-        let records = all_assets.get().and_then(|r| r.ok()).unwrap_or_default();
-        let definitions = assets_info.get().and_then(|r| r.ok());
-        crate::helpers::defined_assets(records, definitions.as_deref())
-    };
-
-    let unique_tags = move || {
-        let mut tags: Vec<String> = all_records().iter().flat_map(|r| r.tags.clone()).collect();
-        tags.sort();
-        tags.dedup();
-        tags
-    };
-    let unique_kinds = move || {
-        let mut kinds: Vec<String> = all_records().iter().flat_map(|r| r.kinds.clone()).collect();
-        kinds.sort();
-        kinds.dedup();
-        kinds
-    };
-    let unique_groups = move || {
-        let mut groups: Vec<String> = all_records()
-            .iter()
-            .filter_map(|r| r.asset_group.clone())
-            .collect();
-        groups.sort();
-        groups.dedup();
-        groups
+        let records = all_assets.read();
+        let definitions = assets_info.read();
+        crate::helpers::defined_assets(
+            records
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            definitions
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(Vec::as_slice),
+        )
     };
 
     // Cross-filtered: each filter's available values are determined by the OTHER active filters.
@@ -90,7 +78,7 @@ pub fn AssetsListPage() -> impl IntoView {
         let records = all_records();
         let kinds = filter_kinds.get();
         let groups = filter_groups.get();
-        let available: HashSet<String> = records
+        let available: HashSet<&str> = records
             .iter()
             .filter(|r| kinds.is_empty() || r.kinds.iter().any(|k| kinds.contains(k)))
             .filter(|r| {
@@ -100,26 +88,21 @@ pub fn AssetsListPage() -> impl IntoView {
                         .map(|g| groups.contains(g))
                         .unwrap_or(false)
             })
-            .flat_map(|r| r.tags.clone())
+            .flat_map(|r| r.tags.iter().map(String::as_str))
             .collect();
-        unique_tags()
-            .into_iter()
-            .map(|t| {
-                let enabled = available.contains(&t);
-                SelectOption {
-                    label: t.clone(),
-                    value: t,
-                    enabled,
-                }
-            })
-            .collect::<Vec<_>>()
+        select_options(
+            records
+                .iter()
+                .flat_map(|r| r.tags.iter().map(String::as_str)),
+            &available,
+        )
     });
 
     let kind_options = Signal::derive(move || {
         let records = all_records();
         let tags = filter_tags.get();
         let groups = filter_groups.get();
-        let available: HashSet<String> = records
+        let available: HashSet<&str> = records
             .iter()
             .filter(|r| tags.is_empty() || r.tags.iter().any(|t| tags.contains(t)))
             .filter(|r| {
@@ -129,42 +112,30 @@ pub fn AssetsListPage() -> impl IntoView {
                         .map(|g| groups.contains(g))
                         .unwrap_or(false)
             })
-            .flat_map(|r| r.kinds.clone())
+            .flat_map(|r| r.kinds.iter().map(String::as_str))
             .collect();
-        unique_kinds()
-            .into_iter()
-            .map(|k| {
-                let enabled = available.contains(&k);
-                SelectOption {
-                    label: k.clone(),
-                    value: k,
-                    enabled,
-                }
-            })
-            .collect::<Vec<_>>()
+        select_options(
+            records
+                .iter()
+                .flat_map(|r| r.kinds.iter().map(String::as_str)),
+            &available,
+        )
     });
 
     let group_options = Signal::derive(move || {
         let records = all_records();
         let tags = filter_tags.get();
         let kinds = filter_kinds.get();
-        let available: HashSet<String> = records
+        let available: HashSet<&str> = records
             .iter()
             .filter(|r| tags.is_empty() || r.tags.iter().any(|t| tags.contains(t)))
             .filter(|r| kinds.is_empty() || r.kinds.iter().any(|k| kinds.contains(k)))
-            .filter_map(|r| r.asset_group.clone())
+            .filter_map(|r| r.asset_group.as_deref())
             .collect();
-        unique_groups()
-            .into_iter()
-            .map(|g| {
-                let enabled = available.contains(&g);
-                SelectOption {
-                    label: g.clone(),
-                    value: g,
-                    enabled,
-                }
-            })
-            .collect::<Vec<_>>()
+        select_options(
+            records.iter().filter_map(|r| r.asset_group.as_deref()),
+            &available,
+        )
     });
 
     let toggle_tag = {
@@ -231,31 +202,34 @@ pub fn AssetsListPage() -> impl IntoView {
 
         let sort_field = sort_by.get();
         let asc = sort_asc.get();
-        let infos_for_sort = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-        let type_map: std::collections::HashMap<String, String> = infos_for_sort
+        let infos_for_sort = assets_info.read();
+        let type_map: std::collections::HashMap<&str, &str> = infos_for_sort
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .into_iter()
-            .map(|i| (i.asset_key.clone(), i.asset_type.clone()))
+            .flatten()
+            .map(|i| (i.asset_key.as_str(), i.asset_type.as_str()))
             .collect();
 
+        fn first(values: &[String]) -> &str {
+            values.first().map(String::as_str).unwrap_or_default()
+        }
         records.sort_by(|a, b| {
             let ord = match sort_field.as_str() {
-                "kind" => a
-                    .kinds
-                    .first()
-                    .cloned()
-                    .unwrap_or_default()
-                    .cmp(&b.kinds.first().cloned().unwrap_or_default()),
+                "kind" => first(&a.kinds).cmp(first(&b.kinds)),
                 "group" => a.asset_group.cmp(&b.asset_group),
                 "type" => {
-                    let at = type_map.get(&a.asset_key).cloned().unwrap_or_default();
-                    let bt = type_map.get(&b.asset_key).cloned().unwrap_or_default();
-                    at.cmp(&bt)
+                    let at = type_map
+                        .get(a.asset_key.as_str())
+                        .copied()
+                        .unwrap_or_default();
+                    let bt = type_map
+                        .get(b.asset_key.as_str())
+                        .copied()
+                        .unwrap_or_default();
+                    at.cmp(bt)
                 }
-                "tags" => {
-                    let at = a.tags.first().cloned().unwrap_or_default();
-                    let bt = b.tags.first().cloned().unwrap_or_default();
-                    at.cmp(&bt)
-                }
+                "tags" => first(&a.tags).cmp(first(&b.tags)),
                 "status" => crate::helpers::stale_status_kind(&a.stale_status)
                     .cmp(crate::helpers::stale_status_kind(&b.stale_status)),
                 "last_materialized" => a.last_timestamp.cmp(&b.last_timestamp),
@@ -273,29 +247,16 @@ pub fn AssetsListPage() -> impl IntoView {
     let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
     let launch_resources =
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
-    let materialize_picker = Signal::derive(move || {
-        let infos = assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        crate::helpers::partition_picker_for_assets(&selected.get(), &by_key)
+    let materialize_picker = Memo::new(move |_| {
+        asset_info_by_key.with(|defs| {
+            selected.with(|keys| crate::helpers::partition_picker_for_assets(keys, defs))
+        })
     });
     // Verbs every selected asset declares — the selection submits as one
     // action run, so anything less than the full intersection can fail.
     let selection_verbs = Signal::derive(move || {
-        let infos = assets_info_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> = infos
-            .into_iter()
-            .map(|i| (i.asset_key.clone(), i))
-            .collect();
-        crate::helpers::common_actions(&selected.get(), &by_key)
+        asset_info_by_key
+            .with(|defs| selected.with(|keys| crate::helpers::common_actions(keys, defs)))
     });
 
     // A click handler can't read the resources, so an effect keeps the
@@ -465,15 +426,26 @@ pub fn AssetsListPage() -> impl IntoView {
 
         <Transition fallback=move || view! { <TableSkeleton rows=8 cols=7/> }>
             {move || {
-                if let Some(Err(e)) = all_assets.get() {
+                if let Some(Err(e)) = &*all_assets.read() {
                     return view! {
-                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(&e))}</div>
+                        <div class="error-msg">{format!("Couldn't load assets: {}", crate::helpers::err_text(e))}</div>
                     }.into_any();
                 }
                 let records = sorted_filtered();
-                let infos = assets_info.get().and_then(|r| r.ok()).unwrap_or_default();
-                let info_map: std::collections::HashMap<String, _> = infos.into_iter().map(|i| (i.asset_key.clone(), i)).collect();
-                let topo = graph.get().and_then(|r| r.ok());
+                let infos = assets_info.read();
+                let types: std::collections::HashMap<&str, &str> = infos
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .into_iter()
+                    .flatten()
+                    .map(|i| (i.asset_key.as_str(), i.asset_type.as_str()))
+                    .collect();
+                let topology = graph.read();
+                let lineage = topology
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(crate::types::GraphTopology::direct_lineage)
+                    .unwrap_or_default();
 
                 if records.is_empty() {
                     return view! { <EmptyState message="No assets match the filters" hint="Clear a filter to see more"/> }.into_any();
@@ -490,10 +462,10 @@ pub fn AssetsListPage() -> impl IntoView {
 
                 fn render_row(
                     record: crate::types::AssetRecord,
-                    info_map: &std::collections::HashMap<String, crate::types::AssetDefinitionInfo>,
+                    types: &std::collections::HashMap<&str, &str>,
                     selected: ReadSignal<Vec<String>>,
                     set_selected: WriteSignal<Vec<String>>,
-                    topo: &Option<crate::types::GraphTopology>,
+                    lineage: &std::collections::HashMap<&str, (Vec<&str>, Vec<&str>)>,
                     loc_ns: &str,
                     loc_name: &str,
                 ) -> impl IntoView + use<> {
@@ -501,8 +473,7 @@ pub fn AssetsListPage() -> impl IntoView {
                     let key_for_check = key.clone();
                     let key_for_toggle = key.clone();
                     let href = loc_path(loc_ns, loc_name, &format!("assets/{}", key));
-                    let info: Option<crate::types::AssetDefinitionInfo> = info_map.get(&key).cloned();
-                    let asset_type = info.as_ref().map(|i| i.asset_type.clone()).unwrap_or_default();
+                    let asset_type = types.get(key.as_str()).map(|t| t.to_string()).unwrap_or_default();
                     let kinds_str = record.kinds.join(", ");
                     let kinds_for_badge = record.kinds.first().cloned().unwrap_or_else(|| "—".into());
                     let group = record.asset_group.clone().unwrap_or_default();
@@ -524,59 +495,56 @@ pub fn AssetsListPage() -> impl IntoView {
                     // Hover preview caps each column; the full lineage is on the
                     // asset's Lineage tab / DAG sidebar.
                     const LINEAGE_PREVIEW: usize = 3;
-                    let (upstream, downstream): (Vec<String>, Vec<String>) = if let Some(t) = topo {
-                        (
-                            t.direct_upstream(&record.asset_key),
-                            t.direct_downstream(&record.asset_key),
-                        )
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                    let (upstream, downstream) = lineage
+                        .get(record.asset_key.as_str())
+                        .map(|(up, down)| (up.as_slice(), down.as_slice()))
+                        .unwrap_or_default();
                     let has_lineage = !upstream.is_empty() || !downstream.is_empty();
+                    let lineage_tip = has_lineage.then(|| {
+                        let up_rows = upstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
+                            <div class="mini-lineage-row">
+                                <span class="mini-lineage-row-dot" style="background:var(--secondary)"></span>
+                                <span>{k.to_string()}</span>
+                            </div>
+                        }).collect::<Vec<_>>();
+                        let up_more = upstream.len().saturating_sub(LINEAGE_PREVIEW);
+                        let down_rows = downstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
+                            <div class="mini-lineage-row">
+                                <span class="mini-lineage-row-dot" style="background:var(--accent)"></span>
+                                <span>{k.to_string()}</span>
+                            </div>
+                        }).collect::<Vec<_>>();
+                        let down_more = downstream.len().saturating_sub(LINEAGE_PREVIEW);
+                        let has_up = !upstream.is_empty();
+                        let has_down = !downstream.is_empty();
+                        view! {
+                            <span class="mini-lineage-tip">
+                                {has_up.then(|| view! {
+                                    <div class="mini-lineage-col">
+                                        <span class="mini-lineage-col-label">"UPSTREAM"</span>
+                                        {up_rows}
+                                        {(up_more > 0).then(|| view! {
+                                            <div class="mini-lineage-more">{format!("+{up_more} more")}</div>
+                                        })}
+                                    </div>
+                                })}
+                                {has_down.then(|| view! {
+                                    <div class="mini-lineage-col">
+                                        <span class="mini-lineage-col-label">"DOWNSTREAM"</span>
+                                        {down_rows}
+                                        {(down_more > 0).then(|| view! {
+                                            <div class="mini-lineage-more">{format!("+{down_more} more")}</div>
+                                        })}
+                                    </div>
+                                })}
+                            </span>
+                        }
+                    });
 
                     view! {
                         <A href=href attr:class="grid-row mini-lineage-host" attr:style=GRID attr:title=last_ts_abs>
                             <span class=rail></span>
-                            {has_lineage.then(|| {
-                                let up_rows = upstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
-                                    <div class="mini-lineage-row">
-                                        <span class="mini-lineage-row-dot" style="background:var(--secondary)"></span>
-                                        <span>{k.clone()}</span>
-                                    </div>
-                                }).collect::<Vec<_>>();
-                                let up_more = upstream.len().saturating_sub(LINEAGE_PREVIEW);
-                                let down_rows = downstream.iter().take(LINEAGE_PREVIEW).map(|k| view! {
-                                    <div class="mini-lineage-row">
-                                        <span class="mini-lineage-row-dot" style="background:var(--accent)"></span>
-                                        <span>{k.clone()}</span>
-                                    </div>
-                                }).collect::<Vec<_>>();
-                                let down_more = downstream.len().saturating_sub(LINEAGE_PREVIEW);
-                                let has_up = !upstream.is_empty();
-                                let has_down = !downstream.is_empty();
-                                view! {
-                                    <span class="mini-lineage-tip">
-                                        {has_up.then(|| view! {
-                                            <div class="mini-lineage-col">
-                                                <span class="mini-lineage-col-label">"UPSTREAM"</span>
-                                                {up_rows}
-                                                {(up_more > 0).then(|| view! {
-                                                    <div class="mini-lineage-more">{format!("+{up_more} more")}</div>
-                                                })}
-                                            </div>
-                                        })}
-                                        {has_down.then(|| view! {
-                                            <div class="mini-lineage-col">
-                                                <span class="mini-lineage-col-label">"DOWNSTREAM"</span>
-                                                {down_rows}
-                                                {(down_more > 0).then(|| view! {
-                                                    <div class="mini-lineage-more">{format!("+{down_more} more")}</div>
-                                                })}
-                                            </div>
-                                        })}
-                                    </span>
-                                }
-                            })}
+                            {lineage_tip}
                             <span on:click=move |ev: leptos::ev::MouseEvent| ev.stop_propagation()>
                                 <input
                                     class="asset-row-check"
@@ -622,7 +590,7 @@ pub fn AssetsListPage() -> impl IntoView {
                         </div>
                         {{
                             let (lns, lnm) = loc.get();
-                            attention.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            attention.into_iter().map(|r| render_row(r, &types, selected, set_selected, &lineage, &lns, &lnm)).collect::<Vec<_>>()
                         }}
                         {(n_attention > 0 && !healthy.is_empty()).then(|| view! {
                             <div style="display:flex; align-items:center; gap:10px; padding:12px 20px 6px; font-family:'Inter',sans-serif; font-size:var(--fs-2xs); font-weight:500; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted)">
@@ -632,7 +600,7 @@ pub fn AssetsListPage() -> impl IntoView {
                         })}
                         {{
                             let (lns, lnm) = loc.get();
-                            healthy.into_iter().map(|r| render_row(r, &info_map, selected, set_selected, &topo, &lns, &lnm)).collect::<Vec<_>>()
+                            healthy.into_iter().map(|r| render_row(r, &types, selected, set_selected, &lineage, &lns, &lnm)).collect::<Vec<_>>()
                         }}
                     </div>
                 }.into_any()
@@ -651,4 +619,23 @@ pub fn AssetsListPage() -> impl IntoView {
             resources=launch_resources
         />
     }
+}
+
+/// One option per distinct value, sorted; enabled when the value is in
+/// `available`.
+fn select_options<'a>(
+    values: impl Iterator<Item = &'a str>,
+    available: &HashSet<&str>,
+) -> Vec<SelectOption> {
+    let mut values: Vec<&str> = values.collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+        .into_iter()
+        .map(|v| SelectOption {
+            label: v.to_string(),
+            value: v.to_string(),
+            enabled: available.contains(v),
+        })
+        .collect()
 }

@@ -17,9 +17,10 @@ use crate::partitions::{PartitionContext, PartitionMapping, PyPartitionKey};
 use crate::repository::resolved_node::ResolvedNode;
 
 pub(crate) fn build_partition_context(
+    py: Python,
     node: &ResolvedNode,
     partition_key: &Option<PyPartitionKey>,
-) -> PyResult<Option<PartitionContext>> {
+) -> PyResult<Option<Py<PartitionContext>>> {
     let partition_key = match partition_key.as_ref() {
         Some(k) => k,
         None => return Ok(None),
@@ -41,9 +42,10 @@ pub(crate) fn build_partition_context(
         )));
     }
     Ok(Some(PartitionContext::new_multi(
+        py,
         partition_key.members(),
         def.clone(),
-    )))
+    )?))
 }
 
 /// Build a PartitionContext for a mapped upstream key.
@@ -51,9 +53,10 @@ pub(crate) fn build_partition_context(
 /// may not match the upstream's full partition definition (e.g. a Single key
 /// for a Multi-partitioned upstream via multi_to_single).
 pub(crate) fn build_mapped_partition_context(
+    py: Python,
     node: &ResolvedNode,
     partition_key: &Option<PyPartitionKey>,
-) -> PyResult<Option<PartitionContext>> {
+) -> PyResult<Option<Py<PartitionContext>>> {
     let key = match partition_key {
         Some(k) => k,
         None => return Ok(None),
@@ -67,7 +70,7 @@ pub(crate) fn build_mapped_partition_context(
             )));
         }
     };
-    Ok(Some(PartitionContext::new(key.clone(), def.clone())))
+    Ok(Some(PartitionContext::new(py, key.clone(), def.clone())?))
 }
 
 /// Apply the downstream node's partition_mapping to decide how to load the upstream.
@@ -91,12 +94,12 @@ pub(crate) fn map_partition_key_for_upstream(
     }
     let mapping = downstream_node
         .partition_mapping()
-        .and_then(|m| m.get(upstream_name).cloned());
+        .and_then(|m| m.get(upstream_name));
     let down_def = downstream_node.partitions_def();
     let up_def = upstream_node.partitions_def();
 
     let identity = PartitionMapping::Identity {};
-    let m = mapping.as_ref().unwrap_or(&identity);
+    let m = mapping.unwrap_or(&identity);
     m.resolve_upstream_key(partition_key.as_ref(), down_def, up_def)
         .map_err(|e| PartitionValidationError::new_err(e.to_string()))
 }
@@ -131,8 +134,8 @@ pub(crate) fn load_self_dependency(
 
     let type_hint = annotation.getattr("__args__")?.get_item(0)?.unbind();
 
-    let metadata = node.metadata();
-    let partition = build_partition_context(node, partition_key)?;
+    let metadata = node.metadata().cloned();
+    let partition = build_partition_context(py, node, partition_key)?;
     let ctx = PyInputContext {
         asset_name: step_name.to_string(),
         downstream_asset: step_name.to_string(),
@@ -174,18 +177,18 @@ pub(crate) fn load_upstream_input(
     }
     let metadata = downstream_node
         .input_metadata(param_name)
-        .or_else(|| upstream_node.metadata());
+        .or_else(|| upstream_node.metadata())
+        .cloned();
     let has_mapping = downstream_node
         .partition_mapping()
-        .and_then(|m| m.get(param_name).cloned())
-        .is_some();
+        .is_some_and(|m| m.contains_key(param_name));
     // When a mapping was applied, the mapped key may not match the upstream's
     // full partition definition (e.g. multi_to_single produces a Single key for
     // a Multi-partitioned upstream). Build context without validation in that case.
     let partition = if has_mapping {
-        build_mapped_partition_context(upstream_node, &upstream_key)?
+        build_mapped_partition_context(py, upstream_node, &upstream_key)?
     } else {
-        build_partition_context(upstream_node, &upstream_key)?
+        build_partition_context(py, upstream_node, &upstream_key)?
     };
     let (asset_name, code_location) = upstream_source(param_name, upstream_node);
     let ctx = PyInputContext {
@@ -214,8 +217,8 @@ pub(crate) fn load_step_output(
     let ctx = PyInputContext {
         asset_name: step_name.to_string(),
         downstream_asset: downstream_name.to_string(),
-        asset_metadata: node.metadata(),
-        partition: build_partition_context(node, partition_key)?,
+        asset_metadata: node.metadata().cloned(),
+        partition: build_partition_context(py, node, partition_key)?,
         type_hint: type_hint.map(|h| h.clone_ref(py)),
         code_location: None,
     };
@@ -226,8 +229,8 @@ pub(crate) fn load_step_output(
 pub(crate) struct WrittenOutput {
     /// Set by `register_data_version()`; wins over the asset's data version.
     pub data_version: Option<String>,
-    /// The context's metadata after `handle_output`. Overlay it on the
-    /// output's metadata with `merge_metadata`: the handler's entries win.
+    /// The context's metadata after `handle_output`: what it was built with,
+    /// overlaid by the handler's entries.
     pub metadata: Vec<(String, MetadataValue)>,
 }
 
@@ -264,8 +267,8 @@ pub(crate) fn handle_step_output(
     registry: &IOHandlerRegistry,
 ) -> PyResult<WrittenOutput> {
     let handler = registry.for_output(py, node);
-    let metadata = node.metadata();
-    let partition = build_partition_context(node, partition_key)?;
+    let metadata = node.metadata().cloned();
+    let partition = build_partition_context(py, node, partition_key)?;
     let ctx = Py::new(
         py,
         PyOutputContext::new_with_metadata(

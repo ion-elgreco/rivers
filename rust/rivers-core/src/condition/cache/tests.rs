@@ -55,7 +55,7 @@ async fn register_blank(
         .collect();
     storage
         .for_code_location(&ctx)
-        .register_assets(&records)
+        .register_assets(records)
         .await
         .unwrap();
 }
@@ -185,7 +185,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
 
     storage
         .for_code_location(&ctx)
-        .register_assets(&[
+        .register_assets(vec![
             rec_with_run("source", Some("r0"), 1000),
             rec_with_run("processed", Some("r0"), 1000),
         ])
@@ -1017,7 +1017,7 @@ async fn events_built_with_rollup(
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
     let mut mat = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
@@ -1313,6 +1313,49 @@ async fn a_run_is_the_last_run_of_only_the_partitions_it_materialized() {
     }
 }
 
+/// After a restart, every asset and partition one run built shares that run's
+/// names and tags.
+#[tokio::test]
+async fn initial_load_shares_one_runs_names_and_tags() {
+    use crate::storage::PerCodeLocationStorage;
+    use crate::storage::surrealdb_backend::SurrealStorage;
+
+    let storage = SurrealStorage::new_memory().await.unwrap();
+    let cl = crate::storage::default_code_location_id();
+    storage
+        .register_assets(
+            &cl,
+            vec![
+                rec_with_run("events", Some("r1"), 1000),
+                rec_with_run("rollup", Some("r1"), 1000),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut run = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1000);
+    run.tags = team("data");
+    run.partition_key = parts(&["p1", "p2"]);
+    storage.create_run(&run).await.unwrap();
+
+    let mut cache = AssetConditionCache::new(cl);
+    cache.set_partitioned_assets(vec!["events".to_string()]);
+    cache.refresh(&storage, 0).await.unwrap();
+
+    let slot = |asset: &str, pk: Option<PartitionKey>| {
+        (
+            &cache.last_run_asset_names[asset][&pk],
+            &cache.last_run_tags[asset][&pk],
+        )
+    };
+    let (names, tags) = slot("events", part("p1"));
+    assert_eq!(&names[..], ["events", "rollup"]);
+    assert_eq!(&tags[..], team("data"));
+    for (other_names, other_tags) in [slot("events", part("p2")), slot("rollup", None)] {
+        assert!(Arc::ptr_eq(names, other_names));
+        assert!(Arc::ptr_eq(tags, other_tags));
+    }
+}
+
 /// A verb's steps may run in any order: `refresh` over rollup and events may
 /// run rollup first. The run includes rollup in events' last run only if
 /// rollup's own materialization came after events' — a rollup step that ran
@@ -1404,7 +1447,7 @@ async fn completed_delete_clears_last_run_maps_in_steady_state() {
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
 
@@ -1681,7 +1724,7 @@ async fn completed_delete_clears_failure_floor_in_steady_state() {
     let storage = SurrealStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
-        .register_assets(&cl, &[rec_with_run("events", None, 0)])
+        .register_assets(&cl, vec![rec_with_run("events", None, 0)])
         .await
         .unwrap();
 

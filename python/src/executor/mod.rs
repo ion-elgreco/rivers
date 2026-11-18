@@ -17,6 +17,7 @@ pub(crate) mod run_lifecycle;
 pub(crate) mod traceback;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
@@ -245,13 +246,14 @@ impl Executor {
         &self,
         py: Python,
         plan: &ExecutionPlan,
-        node_map: &HashMap<String, ResolvedNode>,
+        node_map: &Arc<HashMap<String, ResolvedNode>>,
         partition_key: &Option<PyPartitionKey>,
         stored_key: Option<&rivers_core::storage::PartitionKey>,
         storage: StorageHandle,
         run_id: &str,
         resources: &HashMap<String, ResourceVariant>,
         retries: &HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+        default_retry: Option<&rivers_core::execution::retry::RetryPolicy>,
         config_overrides: &Option<HashMap<String, Py<PyAny>>>,
         io_handler_registry: &IOHandlerRegistry,
         resume: bool,
@@ -357,7 +359,7 @@ impl Executor {
             let mut graph_nodes = GraphNodeMap {
                 final_nodes: HashMap::new(),
             };
-            for (name, node) in node_map {
+            for (name, node) in node_map.iter() {
                 if let Some(final_n) = node.graph_final_node() {
                     graph_nodes.final_nodes.insert(final_n, name.clone());
                 }
@@ -386,9 +388,7 @@ impl Executor {
 
                 // For namespaced tasks (graph/task), check the parent graph asset's
                 // NODE_EXECUTOR first, then EXECUTOR, then default.
-                let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-                let mut metadata_cache: HashMap<String, Option<HashMap<String, String>>> =
-                    HashMap::new();
+                let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
                 for &step_idx in level {
                     let step = &plan.steps[step_idx];
                     let lookup_name = if step.name.contains('/') {
@@ -396,13 +396,9 @@ impl Executor {
                     } else {
                         step.name.as_str()
                     };
-                    if !metadata_cache.contains_key(lookup_name) {
-                        let meta = node_map.get(lookup_name).and_then(|n| n.metadata());
-                        metadata_cache.insert(lookup_name.to_string(), meta);
-                    }
-                    let executor_key = metadata_cache
+                    let executor_key = node_map
                         .get(lookup_name)
-                        .and_then(|m| m.as_ref())
+                        .and_then(|n| n.metadata())
                         .and_then(|m| {
                             if step.name.contains('/') {
                                 m.get(metadata_keys::NODE_EXECUTOR)
@@ -411,12 +407,11 @@ impl Executor {
                                 m.get(metadata_keys::EXECUTOR)
                             }
                         })
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_EXECUTOR_KEY.to_string());
+                        .map_or(DEFAULT_EXECUTOR_KEY, String::as_str);
                     groups.entry(executor_key).or_default().push(step_idx);
                 }
 
-                for (executor_key, step_indices) in &groups {
+                for (&executor_key, step_indices) in &groups {
                     let executor = if executor_key == DEFAULT_EXECUTOR_KEY {
                         self.clone()
                     } else {
@@ -479,6 +474,7 @@ impl Executor {
                             io_handler_registry,
                             resources,
                             retries,
+                            default_retry,
                             config_overrides,
                             bridge: bridge.as_ref(),
                         },

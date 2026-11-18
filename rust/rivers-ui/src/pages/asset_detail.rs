@@ -289,31 +289,23 @@ pub fn AssetDetailPage() -> impl IntoView {
     // Picker for this asset: drives dialog-vs-one-click below. Tracks params so
     // it follows navigation between assets.
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    let materialize_picker = Signal::derive(move || {
+    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
+    let materialize_picker = Memo::new(move |_| {
         params.track();
         let current = key();
-        let by_key: std::collections::HashMap<String, crate::types::AssetDefinitionInfo> =
-            assets_info_value
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|i| (i.asset_key.clone(), i))
-                .collect();
-        partition_picker_for_assets(&[current], &by_key)
+        asset_info_by_key.with(|defs| partition_picker_for_assets(&[current], defs))
     });
     let dialog_asset_keys = Signal::derive(move || {
         params.track();
         vec![key()]
     });
-    let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
     let show_dialog = RwSignal::new(false);
     let launch_resources =
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     // One click materializes an unpartitioned asset — unless it takes config,
     // which only the dialog can edit.
     let materialize_opens_dialog = Signal::derive(move || {
-        !matches!(materialize_picker.get(), JobPartitionPicker::None)
+        materialize_picker.with(|p| !matches!(p, JobPartitionPicker::None))
             || asset_info_by_key.with(|defs| {
                 crate::components::config_editor::launch_takes_config(&[key()], defs, None)
             })
@@ -380,7 +372,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                 Err(e) => view! { <span class="text-error">{crate::helpers::err_text(&e)}</span> }.into_any(),
             })}
             {move || {
-                let partitioned = !matches!(materialize_picker.get(), JobPartitionPicker::None);
+                let partitioned = materialize_picker.with(|p| !matches!(p, JobPartitionPicker::None));
                 crate::helpers::sorted_verbs(asset_actions.get()).into_iter().map(|act| {
                     let verb = act.name.clone();
                     // An Unmaterialize verb throws the asset's materialization

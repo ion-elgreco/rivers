@@ -26,19 +26,17 @@ async fn load_topology(
     if let Some(ref synthetic) = state.graph {
         return Ok(((**synthetic).clone(), None));
     }
-    let entry = state
+    let identity = state
         .registry
-        .lookup(loc_ns, loc_name)
+        .identity_of(loc_ns, loc_name)
         .await
         .ok_or_else(|| {
             ServerFnError::new(format!(
                 "code location {loc_ns}/{loc_name} not found in registry"
             ))
         })?;
-    let topology = read_topology(state, &entry.identity)
-        .await
-        .unwrap_or_default();
-    Ok((topology, Some(entry.identity)))
+    let topology = read_topology(state, &identity).await.unwrap_or_default();
+    Ok((topology, Some(identity)))
 }
 
 #[cfg(feature = "ssr")]
@@ -81,14 +79,14 @@ async fn load_owners<'t>(
         if owners.contains_key(location) {
             continue;
         }
-        let entry = state
+        let identity = state
             .registry
-            .lookup(location.namespace(), location.name())
+            .identity_of(location.namespace(), location.name())
             .await;
-        let owner = match entry {
-            Some(entry) => Some(Owner {
-                topology: read_topology(state, &entry.identity).await,
-                ctx: CodeLocationContext::new(entry.identity),
+        let owner = match identity {
+            Some(identity) => Some(Owner {
+                topology: read_topology(state, &identity).await,
+                ctx: CodeLocationContext::new(identity),
             }),
             None => None,
         };
@@ -218,7 +216,7 @@ async fn load_remote_statuses(
 }
 
 /// Layout of what the lineage page shows: the kind and group filters, with
-/// graph assets outside `expanded` collapsed. See [`GraphTopology::visible`].
+/// graph assets outside `expanded` collapsed. See [`GraphTopology::into_visible`].
 #[server(input = Json)]
 pub async fn get_graph_layout(
     loc_ns: String,
@@ -231,7 +229,7 @@ pub async fn get_graph_layout(
     let state = expect_context::<crate::state::AppState>();
     let topo = load_ui_topology(&state, &loc_ns, &loc_name).await?;
     Ok(compute_layout(
-        &topo.visible(&kinds, &groups, &expanded),
+        topo.into_visible(&kinds, &groups, &expanded),
         center_layers,
     ))
 }
@@ -392,7 +390,7 @@ mod tests {
         AppState {
             storage: Arc::clone(storage),
             graph: None,
-            registry: Registry::Static(Arc::new(vec![
+            registry: Registry::Static(Arc::new([
                 entry("warehouse", "wh-id"),
                 entry("shop", "shop-id"),
                 entry("analytics", "an-id"),
@@ -497,7 +495,7 @@ mod tests {
         };
         storage
             .for_code_location(&CodeLocationContext::new(identity))
-            .register_assets(&[record])
+            .register_assets(vec![record])
             .await
             .unwrap();
         let Some(dv) = dv else {

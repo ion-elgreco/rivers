@@ -85,10 +85,12 @@ pub(super) fn keyed_failure(event: &EventRecord) -> Option<(&str, &PartitionKey)
 }
 
 /// The first and the last of `keys` in the order of the store.
-pub(super) fn key_range(keys: &[PartitionKey]) -> Option<(PartitionKey, PartitionKey)> {
-    let lowest = keys.iter().min_by(|a, b| stored_order(a, b))?;
-    let highest = keys.iter().max_by(|a, b| stored_order(a, b))?;
-    Some((lowest.clone(), highest.clone()))
+pub(super) fn key_range<'a>(
+    keys: impl Iterator<Item = &'a PartitionKey> + Clone,
+) -> Option<(&'a PartitionKey, &'a PartitionKey)> {
+    let lowest = keys.clone().min_by(|a, b| stored_order(a, b))?;
+    let highest = keys.max_by(|a, b| stored_order(a, b))?;
+    Some((lowest, highest))
 }
 
 /// The store, or a transaction of it.
@@ -327,13 +329,10 @@ async fn write_failures(
     cl: &str,
     asset_key: &str,
     deletions: &Deletions,
-    failures: &[(PartitionKey, i64, String)],
+    mut failures: Vec<&(PartitionKey, i64, &str)>,
     run_end: bool,
 ) -> Result<()> {
-    let failures: Vec<&(PartitionKey, i64, String)> = failures
-        .iter()
-        .filter(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at))
-        .collect();
+    failures.retain(|(_, at, _)| deletions.deleted_at.is_none_or(|deleted| deleted < *at));
     if failures.is_empty() {
         return Ok(());
     }
@@ -342,7 +341,7 @@ async fn write_failures(
 
     let built = built_at_of(txn, cl, asset_key, &keys).await?;
     let deleted = deleted_at_of(txn, cl, asset_key, deletions, &keys).await?;
-    let failures: Vec<&(PartitionKey, i64, String)> = failures
+    let failures: Vec<&(PartitionKey, i64, &str)> = failures
         .into_iter()
         .filter(|(key, at, _)| {
             built.get(key).is_none_or(|built| built < at)
@@ -353,12 +352,12 @@ async fn write_failures(
         return Ok(());
     }
 
-    let mut latest: HashMap<&PartitionKey, &(PartitionKey, i64, String)> = HashMap::new();
+    let mut latest: HashMap<&PartitionKey, &(PartitionKey, i64, &str)> = HashMap::new();
     for &failure in &failures {
         let (key, at, run_id) = failure;
         if latest
             .get(key)
-            .is_none_or(|held| rank(held.1, &held.2) < rank(*at, run_id))
+            .is_none_or(|held| rank(held.1, held.2) < rank(*at, run_id))
         {
             latest.insert(key, failure);
         }
@@ -372,7 +371,7 @@ async fn write_failures(
                 asset_key: asset_key.to_string(),
                 partition_key: key.clone(),
                 failed_at: *at,
-                run_id: run_id.clone(),
+                run_id: run_id.to_string(),
                 built_at,
                 has_row: built_at.is_some(),
             }
@@ -384,7 +383,7 @@ async fn write_failures(
             code_location_id: cl.to_string(),
             asset_key: asset_key.to_string(),
             partition_key: key.clone(),
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             step_failed_at: (!run_end).then_some(*at),
             run_failed_at: run_end.then_some(*at),
         })
@@ -554,18 +553,15 @@ pub(super) async fn fix_failures_after_materialization(
     Ok(())
 }
 
-/// In `txn`, after the deletion of the partitions `keys`: the failures at or
-/// before their deletion go.
+/// In `txn`, after the deletion of the partitions `keys`, each once and in
+/// the order of the store: the failures at or before their deletion go.
 pub(super) async fn fix_failures_after_deletion(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
     keys: &[PartitionKey],
 ) -> Result<()> {
-    let mut keys = keys.to_vec();
-    keys.sort_by(stored_order);
-    keys.dedup();
-    refresh_partitions(txn, cl, asset_key, None, &keys, RunFailedRow::failure).await?;
+    refresh_partitions(txn, cl, asset_key, None, keys, RunFailedRow::failure).await?;
     Ok(())
 }
 
@@ -642,15 +638,15 @@ impl SurrealStorage {
         &self,
         cl: &str,
         asset_key: &str,
-        failures: Vec<(PartitionKey, i64, String)>,
+        failures: Vec<(PartitionKey, i64, &str)>,
         failed_run: Option<&str>,
     ) -> Result<()> {
-        let mut latest: HashMap<(PartitionKey, String), i64> = HashMap::new();
+        let mut latest: HashMap<(PartitionKey, &str), i64> = HashMap::new();
         for (key, at, run_id) in failures {
             let held = latest.entry((key, run_id)).or_insert(at);
             *held = (*held).max(at);
         }
-        let mut failures: Vec<(PartitionKey, i64, String)> = latest
+        let mut failures: Vec<(PartitionKey, i64, &str)> = latest
             .into_iter()
             .map(|((key, run_id), at)| (key, at, run_id))
             .collect();
@@ -665,10 +661,10 @@ impl SurrealStorage {
                 // commits after this makes the transaction retry.
                 let chunk = match failed_run {
                     Some(run_id) => not_built_by(&self.db, asset_key, run_id, chunk).await?,
-                    None => chunk.to_vec(),
+                    None => chunk.iter().collect(),
                 };
                 let run_end = failed_run.is_some();
-                write_failures(&txn, cl, asset_key, &deletions, &chunk, run_end).await?;
+                write_failures(&txn, cl, asset_key, &deletions, chunk, run_end).await?;
                 txn.commit().await?;
                 Ok(())
             })
@@ -704,15 +700,17 @@ impl SurrealStorage {
         else {
             return Ok(());
         };
-        let built = materialized_by_runs(&self.db, None, std::slice::from_ref(&run.run_id)).await?;
+        let built = materialized_by_runs(&self.db, None, &[run.run_id.as_str()]).await?;
         let members = partition_key.members();
+        let mut probe = (String::new(), run.run_id.clone());
 
         for asset_key in &run.node_names {
-            let done = built.get(&(asset_key.clone(), run.run_id.clone()));
-            let failures: Vec<(PartitionKey, i64, String)> = members
+            probe.0.clone_from(asset_key);
+            let done = built.get(&probe);
+            let failures: Vec<(PartitionKey, i64, &str)> = members
                 .iter()
                 .filter(|member| done.is_none_or(|done| !done.contains(*member)))
-                .map(|member| (member.clone(), at, run.run_id.clone()))
+                .map(|member| (member.clone(), at, run.run_id.as_str()))
                 .collect();
             if !failures.is_empty() {
                 let failed_run = Some(run.run_id.as_str());
@@ -1130,26 +1128,28 @@ pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures
     // partition row, which a deletion or a newer run moves off the run. The
     // failure happens when the run ends, so a deletion during the run does
     // not outrank it.
-    let failed_runs: Vec<&RunRow> = runs
-        .iter()
+    let failed_runs: Vec<RunRow> = runs
+        .into_iter()
         .filter(|run| run.status == "Failure" && run.action.is_none())
         .filter(|run| run.partition_key.is_some())
         .collect();
-    let failed_run_ids: Vec<String> = failed_runs.iter().map(|run| run.run_id.clone()).collect();
+    let failed_run_ids: Vec<&str> = failed_runs.iter().map(|run| run.run_id.as_str()).collect();
     let built = materialized_by_runs(db, None, &failed_run_ids).await?;
+    let mut probe = (String::new(), String::new());
 
     for run in failed_runs {
         let Some(partition_key) = run
             .partition_key
-            .clone()
             .and_then(|key| stored_key(key, &mut unknown))
         else {
             continue;
         };
         let at = run.end_time.unwrap_or(run.start_time);
         let members = partition_key.members();
+        probe.1.clone_from(&run.run_id);
         for asset_key in &run.node_names {
-            let done = built.get(&(asset_key.clone(), run.run_id.clone()));
+            probe.0.clone_from(asset_key);
+            let done = built.get(&probe);
             let of_asset = failures
                 .entry((run.code_location_id.clone(), asset_key.clone()))
                 .or_default();
@@ -1244,7 +1244,7 @@ fn stored_key(value: Value, unknown: &mut usize) -> Option<PartitionKey> {
 async fn materialized_by_runs(
     db: &Surreal<Any>,
     asset_key: Option<&str>,
-    run_ids: &[String],
+    run_ids: &[&str],
 ) -> Result<HashMap<AssetOf, HashSet<PartitionKey>>> {
     #[derive(Debug, SurrealValue)]
     struct BuiltByRun {
@@ -1265,7 +1265,8 @@ async fn materialized_by_runs(
 
     let mut built: HashMap<AssetOf, HashSet<PartitionKey>> = HashMap::new();
     for runs in run_ids.chunks(RUNS_PER_QUERY) {
-        let mut query = db.query(sql.as_str()).bind(("runs", runs.to_vec()));
+        let runs: Vec<String> = runs.iter().map(|run_id| run_id.to_string()).collect();
+        let mut query = db.query(sql.as_str()).bind(("runs", runs));
         if let Some(asset_key) = asset_key {
             query = query.bind(("asset_key", asset_key.to_string()));
         }
@@ -1287,18 +1288,17 @@ async fn materialized_by_runs(
 
 /// The failures of `failures` whose partition the run `run_id` did not
 /// materialize.
-async fn not_built_by(
+async fn not_built_by<'a>(
     db: &Surreal<Any>,
     asset_key: &str,
     run_id: &str,
-    failures: &[(PartitionKey, i64, String)],
-) -> Result<Vec<(PartitionKey, i64, String)>> {
-    let built = materialized_by_runs(db, Some(asset_key), &[run_id.to_string()]).await?;
-    let done = built.get(&(asset_key.to_string(), run_id.to_string()));
+    failures: &'a [(PartitionKey, i64, &'a str)],
+) -> Result<Vec<&'a (PartitionKey, i64, &'a str)>> {
+    let built = materialized_by_runs(db, Some(asset_key), &[run_id]).await?;
+    let done = built.into_values().next().unwrap_or_default();
     Ok(failures
         .iter()
-        .filter(|(key, _, _)| done.is_none_or(|done| !done.contains(key)))
-        .cloned()
+        .filter(|(key, _, _)| !done.contains(key))
         .collect())
 }
 
@@ -1364,20 +1364,29 @@ pub(super) async fn fill_partition_failures(db: &Surreal<Any>) -> Result<()> {
 
     for ((cl, asset_key), failures) in derived {
         let (rows, run_rows) = rows_of_derived(db, &cl, &asset_key, failures).await?;
-        for chunk in rows.chunks(FAILURES_PER_TRANSACTION) {
+        for chunk in owned_chunks(rows, FAILURES_PER_TRANSACTION) {
             db.query(PUT_PARTITION_FAILURES)
-                .bind(("rows", chunk.to_vec()))
+                .bind(("rows", chunk))
                 .await?
                 .check()?;
         }
-        for chunk in run_rows.chunks(FAILURES_PER_TRANSACTION) {
+        for chunk in owned_chunks(run_rows, FAILURES_PER_TRANSACTION) {
             db.query(PUT_RUN_FAILURES)
-                .bind(("run_rows", chunk.to_vec()))
+                .bind(("run_rows", chunk))
                 .await?
                 .check()?;
         }
     }
     Ok(())
+}
+
+/// `rows` in order, `size` at a time.
+fn owned_chunks<T>(rows: Vec<T>, size: usize) -> impl Iterator<Item = Vec<T>> {
+    let mut rows = rows.into_iter();
+    std::iter::from_fn(move || {
+        let chunk: Vec<T> = rows.by_ref().take(size).collect();
+        (!chunk.is_empty()).then_some(chunk)
+    })
 }
 
 /// The failure rows of one asset that the derivation gives, in the order of

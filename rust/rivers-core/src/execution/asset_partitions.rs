@@ -1,5 +1,6 @@
 //! The partitions of an asset by state: counts for a run of keys, and rows.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -47,13 +48,14 @@ impl FailedPartitions {
         let partitions = match count.failed {
             0 => Some(Vec::new()),
             failed if failed <= FAILURES_READ_AT_ONCE => {
-                let mut partitions = storage
-                    .get_partition_failures(asset_key, None, FAILURES_READ_AT_ONCE)
-                    .await?;
-                if let Some(bounds) = bounds {
-                    partitions
-                        .retain(|failed| bounds.iter().any(|bounds| bounds.contains(&failed.key)));
-                }
+                let mut partitions = match bounds {
+                    Some(bounds) => Self::read_in(storage, asset_key, bounds).await?,
+                    None => {
+                        storage
+                            .get_partition_failures(asset_key, None, FAILURES_READ_AT_ONCE)
+                            .await?
+                    }
+                };
                 partitions.sort_by(|a, b| stored_order(&a.key, &b.key));
                 Some(partitions)
             }
@@ -61,6 +63,37 @@ impl FailedPartitions {
         };
 
         Ok(Self { count, partitions })
+    }
+
+    /// The failed partitions in one of `bounds`, of an asset with at most
+    /// [`FAILURES_READ_AT_ONCE`]. One read from the lowest key of the bounds
+    /// to the highest: a read per bounds costs more than the rows of a page.
+    async fn read_in<S: StorageBackend>(
+        storage: &ScopedStorage<'_, S>,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<PartitionFailure>> {
+        let lower = bounds
+            .iter()
+            .map(|bounds| &bounds.lower)
+            .min_by(|a, b| stored_order(a, b));
+        let upper = bounds
+            .iter()
+            .map(|bounds| &bounds.upper)
+            .max_by(|a, b| stored_order(a, b));
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            return Ok(Vec::new());
+        };
+        let around = PartitionBounds {
+            lower: lower.clone(),
+            upper: upper.clone(),
+        };
+
+        let mut partitions = storage
+            .get_partition_failures(asset_key, Some(&around), FAILURES_READ_AT_ONCE)
+            .await?;
+        partitions.retain(|failed| bounds.iter().any(|bounds| bounds.contains(&failed.key)));
+        Ok(partitions)
     }
 
     /// All the failed partitions of the asset.
@@ -107,18 +140,21 @@ impl FailedPartitions {
         asset_key: &str,
         bounds: Option<&PartitionBounds>,
         partitions: &[PartitionKey],
-    ) -> Result<HashMap<PartitionKey, PartitionFailure>> {
-        let failures = match (&self.partitions, bounds) {
-            (Some(read), _) => partitions
+    ) -> Result<Vec<Cow<'_, PartitionFailure>>> {
+        if let Some(read) = &self.partitions {
+            return Ok(partitions
                 .iter()
                 .filter_map(|key| {
                     let at = read
                         .binary_search_by(|failed| stored_order(&failed.key, key))
                         .ok()?;
-                    Some(read[at].clone())
+                    Some(Cow::Borrowed(&read[at]))
                 })
-                .collect(),
-            (None, Some(bounds)) => {
+                .collect());
+        }
+
+        let failures = match bounds {
+            Some(bounds) => {
                 let limit = rows_limit(partitions.len());
                 let in_bounds = storage
                     .get_partition_failures(asset_key, Some(bounds), limit)
@@ -132,17 +168,14 @@ impl FailedPartitions {
                     false => in_bounds,
                 }
             }
-            (None, None) => {
+            None => {
                 storage
                     .get_partition_failures_for_keys(asset_key, partitions)
                     .await?
             }
         };
 
-        Ok(failures
-            .into_iter()
-            .map(|failed| (failed.key.clone(), failed))
-            .collect())
+        Ok(failures.into_iter().map(Cow::Owned).collect())
     }
 }
 
@@ -260,10 +293,14 @@ pub async fn partition_rows_of<S: StorageBackend>(
 }
 
 fn rows_of(
-    failures: &HashMap<PartitionKey, PartitionFailure>,
+    failures: &[Cow<'_, PartitionFailure>],
     partitions: &[PartitionKey],
     stored: Vec<(PartitionKey, i64, Option<String>)>,
 ) -> Vec<PartitionRow> {
+    let failures: HashMap<&PartitionKey, &PartitionFailure> = failures
+        .iter()
+        .map(|failed| (&failed.key, failed.as_ref()))
+        .collect();
     let stored: HashMap<PartitionKey, (i64, Option<String>)> = stored
         .into_iter()
         .map(|(key, time, run_id)| (key, (time, run_id)))
@@ -367,7 +404,7 @@ mod tests {
         };
         storage
             .for_code_location(&CodeLocationContext::default_for_tests())
-            .register_assets(&[record])
+            .register_assets(vec![record])
             .await
             .unwrap();
         for event in events {
@@ -546,19 +583,52 @@ mod tests {
         assert_eq!(of_zone_c.count().failed, 2);
     }
 
+    #[tokio::test]
+    async fn failed_partitions_between_the_bounds_are_left_out() {
+        let events: Vec<EventRecord> = (0..6)
+            .map(|i| failure("plain", single(&format!("p{i}")), 200))
+            .collect();
+        let storage = storage_with("plain", &events).await;
+        let ctx = CodeLocationContext::default_for_tests();
+        let scoped = storage.for_code_location(&ctx);
+        let read = |bounds: Vec<PartitionBounds>| {
+            let scoped = &scoped;
+            async move {
+                let failed = FailedPartitions::read(scoped, "plain", Some(&bounds))
+                    .await
+                    .unwrap();
+                assert_eq!(failed.count().failed, 6);
+                failed
+                    .partitions
+                    .unwrap()
+                    .into_iter()
+                    .map(|failed| failed.key)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let scattered = read(vec![
+            PartitionBounds::of_keys("p4", "p5"),
+            PartitionBounds::of_keys("p0", "p0"),
+            PartitionBounds::of_keys("p0", "p1"),
+        ])
+        .await;
+        let none = read(vec![]).await;
+
+        assert_eq!(scattered, ["p0", "p1", "p4", "p5"].map(single));
+        assert!(none.is_empty());
+    }
+
     #[test]
     fn a_partition_materialized_after_its_failure_is_not_failed() {
         // The rows are read apart from the failures: a materialization
         // between the two reads replaced the failure.
-        let failures = HashMap::from([(
-            single("p1"),
-            PartitionFailure {
-                key: single("p1"),
-                failed_at: 200,
-                run_id: "run-200".to_string(),
-                has_row: false,
-            },
-        )]);
+        let failures = [Cow::Owned(PartitionFailure {
+            key: single("p1"),
+            failed_at: 200,
+            run_id: "run-200".to_string(),
+            has_row: false,
+        })];
         let stored = |at: i64| vec![(single("p1"), at, Some(format!("run-{at}")))];
 
         let built_later = rows_of(&failures, &[single("p1")], stored(300));

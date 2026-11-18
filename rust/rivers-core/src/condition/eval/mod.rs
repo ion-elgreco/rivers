@@ -261,7 +261,7 @@ fn eval<D: EvalDomain>(
         ConditionNode::NewlyTrue(child) => {
             let (current, child_tree) = eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             let previous = D::prev_latch(dep_scope, ctx, my_idx);
-            let result = D::difference(&current, &previous, ctx);
+            let result = D::difference(&current, previous, ctx);
             sub.insert(my_idx, current);
             finish(result, child_tree.into_iter().collect())
         }
@@ -273,10 +273,8 @@ fn eval<D: EvalDomain>(
             let prev = D::prev_latch(dep_scope, ctx, my_idx);
             // Restrict to the current universe so a latch can't carry forward
             // keys retired from the partition set (unpartitioned: a no-op).
-            let result = D::restrict(
-                D::difference(&D::or(prev, &trigger_sel), &reset_sel, ctx),
-                ctx,
-            );
+            let latched = D::or(prev.clone(), trigger_sel);
+            let result = D::restrict(D::subtract(latched, &reset_sel, ctx), ctx);
             sub.insert(my_idx, result.clone());
             let children = [trigger_tree, reset_tree].into_iter().flatten().collect();
             finish(result, children)
@@ -320,7 +318,7 @@ impl Quantifier {
             Quantifier::All => D::all(),
         }
     }
-    fn combine<D: EvalDomain>(self) -> fn(D::Sel, &D::Sel) -> D::Sel {
+    fn combine<D: EvalDomain>(self) -> fn(D::Sel, D::Sel) -> D::Sel {
         match self {
             Quantifier::Any => D::or,
             Quantifier::All => D::and,
@@ -354,7 +352,7 @@ fn fold_deps<'a, D: EvalDomain>(
     for dep in deps {
         *counter = base;
         let dep_val = D::pivot_into_dep(dep, condition, ctx, counter, dep_scope);
-        result = combine(result, &dep_val);
+        result = combine(result, dep_val);
         if quant.saturated(&result) && !eval_all {
             break;
         }
@@ -393,7 +391,7 @@ fn fold_combinator<D: EvalDomain>(
             let (child_sel, child_tree) =
                 eval::<D>(child, ctx, counter, sub, dep_scope, build_tree);
             if !sat {
-                result = combine(result, &child_sel);
+                result = combine(result, child_sel);
             }
             child_parts.extend(child_tree);
         }
@@ -472,6 +470,14 @@ fn eval_on_dep(
     val
 }
 
+/// A partition latch as the bool evaluator reads it.
+fn bool_latch(latch: &HashMap<u32, PartitionSelection>) -> HashMap<u32, bool> {
+    latch
+        .iter()
+        .map(|(idx, sel)| (*idx, sel.to_bool()))
+        .collect()
+}
+
 /// The staleness floor for a bridge into the unpartitioned bool world: inherit
 /// the precomputed root-universe floor, else compute it over the root's
 /// attempted keys. Fan-out ignores never-attempted frontier keys (like an
@@ -502,7 +508,7 @@ fn eval_partitioned_on_dep(
 
     let prev_dep_sel: Option<&HashMap<u32, PartitionSelection>> = dep_selections.prev.get(dep_key);
 
-    let upstream_entry = pctx.resolver.upstream_partition_keys.get(dep_key);
+    let upstream_entry = pctx.resolver.upstream_keys(dep_key);
 
     if upstream_entry.is_none() {
         // In a nested pivot `pctx.all_keys` is the intermediate dep's key
@@ -511,21 +517,29 @@ fn eval_partitioned_on_dep(
         let root_floor = bridge_floor(ctx, pctx);
         let dep_ctx = dep_eval_context(ctx, dep_key, dep_record, None, Some(root_floor));
         let mut local = HashMap::new();
-        let nested_prev: HashMap<String, HashMap<u32, bool>> = dep_selections
-            .prev
-            .iter()
-            .map(|(k, m)| {
-                (
-                    k.clone(),
-                    m.iter().map(|(idx, sel)| (*idx, sel.to_bool())).collect(),
-                )
-            })
-            .collect();
+
+        // Only stateful nodes read a latch; only a nested dep-aggregate reads
+        // the other deps' latches.
+        let stateful = !dep_selections.prev.is_empty() && condition.has_stateful_nodes();
+        let own_prev = match dep_selections.prev.get(dep_key) {
+            Some(latch) if stateful => bool_latch(latch),
+            _ => HashMap::new(),
+        };
+        let nested_prev: HashMap<String, HashMap<u32, bool>> =
+            if stateful && condition.has_dep_aggregate() {
+                dep_selections
+                    .prev
+                    .iter()
+                    .map(|(k, latch)| (k.clone(), bool_latch(latch)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
         let mut nested_acc = HashMap::new();
         let mut bool_scope = DepScope {
             prev: &nested_prev,
             acc: &mut nested_acc,
-            cur_prev: Some(nested_prev.get(dep_key).unwrap_or(&EMPTY_BOOL_LATCH)),
+            cur_prev: Some(&own_prev),
             bridged: HashMap::new(),
         };
         let val = eval::<BoolDomain>(
@@ -567,11 +581,10 @@ fn eval_partitioned_on_dep(
         .get(dep_key)
         .unwrap_or(&empty_status);
 
-    let mapping_kind = pctx.resolver.mapping_kind(dep_key, ctx.target_key);
-    let is_identity = matches!(
-        mapping_kind,
-        None | Some(crate::condition::partition::PartitionMappingKind::Identity)
-    );
+    let mapping = pctx
+        .resolver
+        .mapping_kind(dep_key, ctx.target_key)
+        .filter(|m| !m.is_identity());
     let needs_floor = contains_newly_updated(condition);
     let dep_root_floor = pctx
         .all_partition_statuses
@@ -587,22 +600,17 @@ fn eval_partitioned_on_dep(
                 .timestamps
                 .keys()
                 .filter_map(move |uk| {
-                    if is_identity {
+                    let Some(mapping) = mapping else {
                         if !pctx.all_keys.contains(uk) {
                             return None;
                         }
-                        return Some((uk.clone(), effective_attempt_ts(root_status, uk)));
-                    }
+                        return Some((uk, effective_attempt_ts(root_status, uk)));
+                    };
                     if let PartitionSelection::Keys(s) = &mut scratch {
                         s.clear();
                         s.insert(uk.clone());
                     }
-                    let mapped = pctx.resolver.map_downstream(
-                        dep_key,
-                        ctx.target_key,
-                        &scratch,
-                        Some(pctx.all_keys),
-                    );
+                    let mapped = mapping.map_to_downstream_in(&scratch, Some(pctx.all_keys));
                     let floor = match &mapped {
                         PartitionSelection::Empty => return None,
                         PartitionSelection::All => *all_floor.get_or_init(|| {
@@ -617,9 +625,9 @@ fn eval_partitioned_on_dep(
                             root_floor_over(in_universe.into_iter(), root_status)
                         }
                     };
-                    Some((uk.clone(), floor))
+                    Some((uk, floor))
                 })
-                .collect::<HashMap<PartitionKey, Option<i64>>>()
+                .collect::<HashMap<&PartitionKey, Option<i64>>>()
         });
 
     let upstream_pctx = PartitionEvalContext {
@@ -662,14 +670,8 @@ fn eval_partitioned_on_dep(
     dep_selections.cur_prev = saved;
     collect_dep_latch(dep_selections, dep_key, local);
 
-    if is_identity {
-        upstream_result
-    } else {
-        pctx.resolver.map_downstream(
-            dep_key,
-            ctx.target_key,
-            &upstream_result,
-            Some(pctx.all_keys),
-        )
+    match mapping {
+        Some(m) => m.map_to_downstream_in(&upstream_result, Some(pctx.all_keys)),
+        None => upstream_result,
     }
 }

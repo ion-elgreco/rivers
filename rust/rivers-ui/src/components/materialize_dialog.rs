@@ -252,11 +252,11 @@ pub fn MaterializeDialog(
     // sibling execute_job_dialog already memoizes the same predicate.
     // A Keyless verb reads as unpartitioned: no picker, one whole-asset run.
     let is_partitioned = Memo::new(move |_| {
-        !keyless_verb.get() && !matches!(picker_signal.get(), JobPartitionPicker::None)
+        !keyless_verb.get() && picker_signal.with(|p| !matches!(p, JobPartitionPicker::None))
     });
     let summary = Signal::derive(move || {
         launch_summary(
-            selected.get().len(),
+            selected.with(Vec::len),
             partition_keys.with(|k| submit_partition_count(k)),
             partition_keys.with(|k| launches_backfill(k)),
             is_partitioned.get(),
@@ -344,13 +344,12 @@ pub fn MaterializeDialog(
                                 </div>
                                 <div class="mat-dialog-asset-list">
                                     {
-                                        {move || {
-                                            let meta = records.get();
-                                            asset_keys.get().into_iter().map(|key| {
+                                        {move || records.with(|meta| asset_keys.with(|keys| {
+                                            keys.iter().map(|key| {
                                                 let k_checked = key.clone();
                                                 let k_toggle = key.clone();
-                                                let checked = move || selected.get().contains(&k_checked);
-                                                let record = meta.get(&key);
+                                                let checked = move || selected.with(|s| s.contains(&k_checked));
+                                                let record = meta.get(key);
                                                 let (dot_cls, status_word) = status_bits(record);
                                                 let group = record.and_then(|r| r.asset_group.clone());
                                                 let last_ts = record.and_then(|r| r.last_timestamp);
@@ -388,7 +387,7 @@ pub fn MaterializeDialog(
                                                     </label>
                                                 }
                                             }).collect::<Vec<_>>()
-                                        }}
+                                        }))}
                                     }
                                 </div>
                             </div>
@@ -485,13 +484,13 @@ pub fn MaterializeDialog(
                                 on:click=move |_| { materialize_action.dispatch(()); }
                                 disabled=move || {
                                     if pending.get()
-                                        || selected.get().is_empty()
-                                        || !config_check.get().issues.is_empty()
+                                        || selected.with(Vec::is_empty)
+                                        || !config_check.with(|c| c.issues.is_empty())
                                     {
                                         return true;
                                     }
                                     is_partitioned.get()
-                                        && partition_keys.get().is_empty()
+                                        && partition_keys.with(Vec::is_empty)
                                         && !whole_asset_chosen.get()
                                 }
                             >

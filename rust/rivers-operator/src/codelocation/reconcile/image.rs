@@ -136,18 +136,12 @@ async fn resolve_image_ref(
         return ImageOutcome::AwaitingLeader;
     }
 
-    let secret_names: Vec<String> = cl
-        .spec
-        .image_pull_secrets
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
-
-    let registry_host = first_component(&image.repository).unwrap_or_default();
-    let auth: RegistryAuth = if secret_names.is_empty() {
+    let pull_secrets = &cl.spec.image_pull_secrets;
+    let registry_host = first_component(&image.repository);
+    let auth: RegistryAuth = if pull_secrets.is_empty() {
         RegistryAuth::Anonymous
     } else {
-        resolve_auth(secrets_api, &secret_names, &registry_host).await
+        resolve_auth(secrets_api, pull_secrets, registry_host).await
     };
 
     let req = ResolveRequest {
@@ -186,8 +180,8 @@ impl From<RegistryError> for ImageError {
     }
 }
 
-fn first_component(image: &str) -> Option<String> {
-    image.split('/').next().map(str::to_string)
+fn first_component(image: &str) -> &str {
+    image.split('/').next().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -205,14 +199,8 @@ mod tests {
 
     #[test]
     fn first_component_extracts_host() {
-        assert_eq!(
-            first_component("ghcr.io/acme/pipeline"),
-            Some("ghcr.io".into())
-        );
-        assert_eq!(
-            first_component("localhost:5000/x"),
-            Some("localhost:5000".into())
-        );
+        assert_eq!(first_component("ghcr.io/acme/pipeline"), "ghcr.io");
+        assert_eq!(first_component("localhost:5000/x"), "localhost:5000");
     }
 
     fn digest(c: char) -> String {

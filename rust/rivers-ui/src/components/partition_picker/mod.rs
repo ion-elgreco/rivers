@@ -65,58 +65,46 @@ pub fn PartitionPicker(
     });
 
     Effect::new(move |_| {
-        let p = picker.get();
-        let s_single = single_selected.get();
-        let s_multi = multi_selected.get();
-        let keys = match span_source(&p) {
-            Some(source) => {
-                paged_labels.with(|l| collect_span_keys(&source, &paged_spans.get(), l))
-            }
-            None => collect_submit_keys(&p, &s_single, &s_multi),
-        };
+        let keys = picker.with(|p| {
+            single_selected.with(|s_single| {
+                multi_selected.with(|s_multi| match span_source(p) {
+                    Some(source) => {
+                        paged_labels.with(|l| collect_span_keys(&source, &paged_spans.get(), l))
+                    }
+                    None => collect_submit_keys(p, s_single, s_multi),
+                })
+            })
+        });
         selected.set(keys);
     });
 
     let toggle_single = move |idx: usize, shift: bool| {
-        let keys = match picker.get_untracked() {
-            JobPartitionPicker::SingleDim { keys, .. } => keys,
-            _ => return,
-        };
-        let next = apply_toggle(
-            &keys,
-            &single_selected.get_untracked(),
-            single_anchor.get_untracked(),
-            idx,
-            shift,
-        );
-        single_selected.set(next.selected);
-        single_anchor.set(next.anchor);
+        picker.with_untracked(|p| {
+            let JobPartitionPicker::SingleDim { keys, .. } = p else {
+                return;
+            };
+            let mut anchor = single_anchor.get_untracked();
+            single_selected.update(|sel| anchor = apply_toggle(keys, sel, anchor, idx, shift));
+            single_anchor.set(anchor);
+        });
     };
 
     let toggle_multi = move |dim: String, idx: usize, shift: bool| {
-        let dims = match picker.get_untracked() {
-            JobPartitionPicker::Multi { dimensions, .. } => dimensions,
-            _ => return,
-        };
-        let Some(dim_info) = dims.into_iter().find(|d| d.name == dim) else {
-            return;
-        };
-        let cur = multi_selected
-            .get_untracked()
-            .get(&dim)
-            .cloned()
-            .unwrap_or_default();
-        let anchor = multi_anchors
-            .get_untracked()
-            .get(&dim)
-            .copied()
-            .unwrap_or(None);
-        let next = apply_toggle(&dim_info.keys, &cur, anchor, idx, shift);
-        multi_selected.update(|m| {
-            m.insert(dim.clone(), next.selected);
-        });
-        multi_anchors.update(|m| {
-            m.insert(dim, next.anchor);
+        picker.with_untracked(|p| {
+            let JobPartitionPicker::Multi { dimensions, .. } = p else {
+                return;
+            };
+            let Some(dim_info) = dimensions.iter().find(|d| d.name == dim) else {
+                return;
+            };
+            let mut anchor = multi_anchors.with_untracked(|m| m.get(&dim).copied().flatten());
+            multi_selected.update(|m| {
+                let sel = m.entry(dim.clone()).or_default();
+                anchor = apply_toggle(&dim_info.keys, sel, anchor, idx, shift);
+            });
+            multi_anchors.update(|m| {
+                m.insert(dim, anchor);
+            });
         });
     };
 
@@ -235,14 +223,11 @@ pub fn PartitionPicker(
                         let dim_for_select_all = dim_name.clone();
                         let dim_for_signal = dim_name.clone();
                         let dim_for_toggle = dim_name.clone();
-                        let keys = dim.keys.clone();
+                        let keys = dim.keys;
                         let keys_for_select_all = keys.clone();
                         let selected_signal: Signal<Vec<String>> = Signal::derive(move || {
                             multi_selected
-                                .get()
-                                .get(&dim_for_signal)
-                                .cloned()
-                                .unwrap_or_default()
+                                .with(|m| m.get(&dim_for_signal).cloned().unwrap_or_default())
                         });
                         view! {
                             <div class="exec-dialog-partition-dim">
@@ -351,14 +336,14 @@ fn collect_submit_keys(
             .map(SubmitPartitionKey::Single)
             .collect(),
         JobPartitionPicker::Multi { dimensions, .. } => {
-            let mut per_dim: Vec<(String, Vec<String>)> = Vec::with_capacity(dimensions.len());
-            for dim in dimensions {
-                per_dim.push((
-                    dim.name.clone(),
-                    multi_selected.get(&dim.name).cloned().unwrap_or_default(),
-                ));
-            }
-            cartesian_partition_keys(&per_dim)
+            let per_dim = dimensions
+                .iter()
+                .map(|dim| {
+                    let selected = multi_selected.get(&dim.name).map_or(&[][..], Vec::as_slice);
+                    (dim.name.as_str(), selected)
+                })
+                .collect();
+            cartesian_partition_keys(per_dim)
         }
     }
 }
@@ -396,7 +381,7 @@ fn PartitionList(
         <div class="exec-dialog-partition-head">
             <label>{label}</label>
             <span class="exec-dialog-partition-count">
-                {move || format!("{} / {} selected", selected_signal.get().len(), total)}
+                {move || format!("{} / {} selected", selected_signal.with(Vec::len), total)}
             </span>
             <span class="exec-dialog-partition-actions">
                 <button class="link-btn" on:click=move |_| select_all.run(())>
@@ -413,7 +398,7 @@ fn PartitionList(
         </div>
         <div class="exec-dialog-partition-list">
             {move || {
-                let sel = selected_signal.get();
+                let sel = selected_signal.read();
                 keys.iter().enumerate().map(|(idx, key)| {
                     let key_for_display = key.clone();
                     let is_selected = sel.iter().any(|k| k == key);
@@ -439,61 +424,43 @@ fn PartitionList(
     }
 }
 
-/// Pure-Rust state transition for a partition-row click. Lives outside
-/// the component so the multi-select + shift-range logic is unit-testable
-/// without a Leptos runtime or DOM.
-struct ToggleResult {
-    selected: Vec<String>,
-    anchor: Option<usize>,
-}
-
-/// Apply a click at `idx` with `shift` against the current `selected` /
-/// `anchor` state. A plain click toggles the key and re-anchors; a
-/// shift-click with an anchor extends the selection over `[anchor, idx]`
-/// without removing already-selected items and without moving the anchor;
-/// a shift-click without an anchor falls back to a plain toggle. An
-/// out-of-bounds `idx` is a no-op.
+/// Apply a click at `idx` with `shift` to `selected` and return the new
+/// anchor. A plain click toggles the key and re-anchors; a shift-click with
+/// an anchor extends the selection over `[anchor, idx]` without removing
+/// already-selected items and without moving the anchor; a shift-click
+/// without an anchor falls back to a plain toggle. An out-of-bounds `idx`
+/// is a no-op. Lives outside the component so the multi-select +
+/// shift-range logic is unit-testable without a Leptos runtime or DOM.
 fn apply_toggle(
     keys: &[String],
-    selected: &[String],
+    selected: &mut Vec<String>,
     anchor: Option<usize>,
     idx: usize,
     shift: bool,
-) -> ToggleResult {
+) -> Option<usize> {
     let Some(key) = keys.get(idx) else {
-        return ToggleResult {
-            selected: selected.to_vec(),
-            anchor,
-        };
+        return anchor;
     };
 
     if shift && let Some(a) = anchor {
         let lo = a.min(idx);
         let hi = a.max(idx);
-        let mut next = selected.to_vec();
         for i in lo..=hi {
             let Some(k) = keys.get(i) else { continue };
-            if !next.iter().any(|x| x == k) {
-                next.push(k.clone());
+            if !selected.iter().any(|x| x == k) {
+                selected.push(k.clone());
             }
         }
-        return ToggleResult {
-            selected: next,
-            anchor,
-        };
+        return anchor;
     }
 
-    let mut next = selected.to_vec();
-    match next.iter().position(|k| k == key) {
+    match selected.iter().position(|k| k == key) {
         Some(pos) => {
-            next.remove(pos);
+            selected.remove(pos);
         }
-        None => next.push(key.clone()),
+        None => selected.push(key.clone()),
     }
-    ToggleResult {
-        selected: next,
-        anchor: Some(idx),
-    }
+    Some(idx)
 }
 
 #[cfg(test)]
@@ -509,126 +476,109 @@ mod tests {
 
     #[test]
     fn plain_click_adds_unselected_key_and_sets_anchor() {
-        let r = apply_toggle(&keys(&["a", "b", "c"]), &[], None, 1, false);
-        assert_eq!(r.selected, vec!["b"]);
-        assert_eq!(r.anchor, Some(1));
+        let mut sel = vec![];
+        let anchor = apply_toggle(&keys(&["a", "b", "c"]), &mut sel, None, 1, false);
+        assert_eq!(sel, vec!["b"]);
+        assert_eq!(anchor, Some(1));
     }
 
     #[test]
     fn plain_click_removes_already_selected_key_and_re_anchors() {
-        let r = apply_toggle(
-            &keys(&["a", "b", "c"]),
-            &["a".into(), "b".into()],
-            Some(0),
-            1,
-            false,
-        );
-        assert_eq!(r.selected, vec!["a"]);
-        assert_eq!(r.anchor, Some(1));
+        let mut sel = keys(&["a", "b"]);
+        let anchor = apply_toggle(&keys(&["a", "b", "c"]), &mut sel, Some(0), 1, false);
+        assert_eq!(sel, vec!["a"]);
+        assert_eq!(anchor, Some(1));
     }
 
     #[test]
     fn shift_click_without_anchor_falls_back_to_toggle() {
-        let r = apply_toggle(&keys(&["a", "b", "c"]), &[], None, 2, true);
-        assert_eq!(r.selected, vec!["c"]);
-        assert_eq!(r.anchor, Some(2));
+        let mut sel = vec![];
+        let anchor = apply_toggle(&keys(&["a", "b", "c"]), &mut sel, None, 2, true);
+        assert_eq!(sel, vec!["c"]);
+        assert_eq!(anchor, Some(2));
     }
 
     #[test]
     fn shift_click_extends_range_forward() {
-        let r = apply_toggle(
+        let mut sel = keys(&["a"]);
+        let anchor = apply_toggle(
             &keys(&["a", "b", "c", "d", "e"]),
-            &["a".into()],
+            &mut sel,
             Some(0),
             3,
             true,
         );
-        assert_eq!(r.selected, vec!["a", "b", "c", "d"]);
-        assert_eq!(r.anchor, Some(0));
+        assert_eq!(sel, vec!["a", "b", "c", "d"]);
+        assert_eq!(anchor, Some(0));
     }
 
     #[test]
     fn shift_click_extends_range_backward() {
-        let r = apply_toggle(
+        let mut sel = keys(&["e"]);
+        let anchor = apply_toggle(
             &keys(&["a", "b", "c", "d", "e"]),
-            &["e".into()],
+            &mut sel,
             Some(4),
             1,
             true,
         );
-        assert_eq!(r.selected, vec!["e", "b", "c", "d"]);
-        assert_eq!(r.anchor, Some(4));
+        assert_eq!(sel, vec!["e", "b", "c", "d"]);
+        assert_eq!(anchor, Some(4));
     }
 
     #[test]
     fn shift_click_preserves_already_selected_items() {
-        let r = apply_toggle(
-            &keys(&["a", "b", "c", "d"]),
-            &["z".into(), "b".into()],
-            Some(1),
-            3,
-            true,
-        );
-        assert_eq!(r.selected, vec!["z", "b", "c", "d"]);
-        assert_eq!(r.anchor, Some(1));
+        let mut sel = keys(&["z", "b"]);
+        let anchor = apply_toggle(&keys(&["a", "b", "c", "d"]), &mut sel, Some(1), 3, true);
+        assert_eq!(sel, vec!["z", "b", "c", "d"]);
+        assert_eq!(anchor, Some(1));
     }
 
     #[test]
     fn shift_click_on_anchor_itself_is_idempotent() {
-        let r = apply_toggle(&keys(&["a", "b", "c"]), &["b".into()], Some(1), 1, true);
-        assert_eq!(r.selected, vec!["b"]);
-        assert_eq!(r.anchor, Some(1));
+        let mut sel = keys(&["b"]);
+        let anchor = apply_toggle(&keys(&["a", "b", "c"]), &mut sel, Some(1), 1, true);
+        assert_eq!(sel, vec!["b"]);
+        assert_eq!(anchor, Some(1));
     }
 
     #[test]
     fn out_of_bounds_idx_is_noop() {
-        let r = apply_toggle(&keys(&["a", "b"]), &["a".into()], Some(0), 99, false);
-        assert_eq!(r.selected, vec!["a"]);
-        assert_eq!(r.anchor, Some(0));
+        let mut sel = keys(&["a"]);
+        let anchor = apply_toggle(&keys(&["a", "b"]), &mut sel, Some(0), 99, false);
+        assert_eq!(sel, vec!["a"]);
+        assert_eq!(anchor, Some(0));
     }
 
     #[test]
     fn empty_keys_is_noop() {
-        let r = apply_toggle(&[], &[], None, 0, false);
-        assert!(r.selected.is_empty());
-        assert!(r.anchor.is_none());
+        let mut sel = vec![];
+        let anchor = apply_toggle(&[], &mut sel, None, 0, false);
+        assert!(sel.is_empty());
+        assert!(anchor.is_none());
     }
 
     #[test]
     fn consecutive_shift_clicks_extend_from_same_anchor() {
-        let after_anchor = apply_toggle(&keys(&["a", "b", "c", "d"]), &[], None, 1, false);
-        let after_first_shift = apply_toggle(
-            &keys(&["a", "b", "c", "d"]),
-            &after_anchor.selected,
-            after_anchor.anchor,
-            2,
-            true,
-        );
-        assert_eq!(after_first_shift.selected, vec!["b", "c"]);
-        assert_eq!(after_first_shift.anchor, Some(1));
+        let all = keys(&["a", "b", "c", "d"]);
+        let mut sel = vec![];
+        let anchor = apply_toggle(&all, &mut sel, None, 1, false);
 
-        let after_second_shift = apply_toggle(
-            &keys(&["a", "b", "c", "d"]),
-            &after_first_shift.selected,
-            after_first_shift.anchor,
-            3,
-            true,
-        );
-        assert_eq!(after_second_shift.selected, vec!["b", "c", "d"]);
-        assert_eq!(after_second_shift.anchor, Some(1));
+        let anchor = apply_toggle(&all, &mut sel, anchor, 2, true);
+        assert_eq!(sel, vec!["b", "c"]);
+        assert_eq!(anchor, Some(1));
+
+        let anchor = apply_toggle(&all, &mut sel, anchor, 3, true);
+        assert_eq!(sel, vec!["b", "c", "d"]);
+        assert_eq!(anchor, Some(1));
     }
 
     #[test]
     fn plain_click_after_shift_resets_anchor() {
-        let r = apply_toggle(
-            &keys(&["a", "b", "c", "d"]),
-            &["b".into(), "c".into()],
-            Some(1),
-            3,
-            false,
-        );
-        assert_eq!(r.selected, vec!["b", "c", "d"]);
-        assert_eq!(r.anchor, Some(3));
+        let mut sel = keys(&["b", "c"]);
+        let anchor = apply_toggle(&keys(&["a", "b", "c", "d"]), &mut sel, Some(1), 3, false);
+        assert_eq!(sel, vec!["b", "c", "d"]);
+        assert_eq!(anchor, Some(3));
     }
 
     // ── collect_submit_keys ──

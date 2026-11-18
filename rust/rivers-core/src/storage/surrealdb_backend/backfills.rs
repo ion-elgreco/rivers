@@ -19,21 +19,21 @@ const KEY_PAGE_BYTES: usize = 256 * 1024;
 /// Split the requested keys of a backfill into pages of at most about
 /// [`KEY_PAGE_BYTES`], in order. A key larger than a page is a page of its
 /// own. There is always a page 0.
-fn key_pages(keys: &[PartitionKey]) -> Vec<Vec<PartitionKey>> {
-    let mut pages: Vec<Vec<PartitionKey>> = vec![Vec::new()];
+fn key_pages(keys: &[PartitionKey]) -> Vec<&[PartitionKey]> {
+    let mut pages = Vec::new();
+    let mut start = 0;
     let mut page_bytes = 0usize;
 
-    for key in keys {
+    for (i, key) in keys.iter().enumerate() {
         let bytes = key_bytes(key);
-        let page = pages.last_mut().expect("there is always a page");
-        if !page.is_empty() && page_bytes + bytes > KEY_PAGE_BYTES {
-            pages.push(vec![key.clone()]);
-            page_bytes = bytes;
-        } else {
-            page.push(key.clone());
-            page_bytes += bytes;
+        if i > start && page_bytes + bytes > KEY_PAGE_BYTES {
+            pages.push(&keys[start..i]);
+            start = i;
+            page_bytes = 0;
         }
+        page_bytes += bytes;
     }
+    pages.push(&keys[start..]);
     pages
 }
 
@@ -143,8 +143,7 @@ impl SurrealStorage {
         backfill: &BackfillRecord,
         partition_keys: &[PartitionKey],
     ) -> Result<()> {
-        let mut row = backfill.clone();
-        row.num_partitions = partition_keys
+        let num_partitions = partition_keys
             .iter()
             .map(|key| key.member_count() as u64)
             .sum();
@@ -159,9 +158,9 @@ impl SurrealStorage {
             retry::with_retry(&self.retry_config, || async {
                 self.db
                     .query(WRITE_KEY_PAGE)
-                    .bind(("id", row.backfill_id.clone()))
+                    .bind(("id", backfill.backfill_id.clone()))
                     .bind(("page", page))
-                    .bind(("keys", keys.clone()))
+                    .bind(("keys", keys.to_vec()))
                     .await
                     .context("failed to store the requested keys of the backfill")?
                     .check()?;
@@ -178,17 +177,23 @@ impl SurrealStorage {
                      {WRITE_KEY_PAGE};\n\
                      COMMIT TRANSACTION;"
                 ))
-                .bind(("backfill", row.clone()))
-                .bind(("id", row.backfill_id.clone()))
+                .bind((
+                    "backfill",
+                    BackfillRecord {
+                        num_partitions,
+                        ..backfill.clone()
+                    },
+                ))
+                .bind(("id", backfill.backfill_id.clone()))
                 .bind(("page", pages.len()))
-                .bind(("keys", last_page.clone()))
+                .bind(("keys", last_page.to_vec()))
                 .await
                 .context("failed to create backfill")?
                 .check()?;
             Ok(())
         })
         .await;
-        swallow_phantom_commit(result, "create_backfill", &row.backfill_id)
+        swallow_phantom_commit(result, "create_backfill", &backfill.backfill_id)
     }
 
     /// One page per read, so no message holds more than a page of keys.
@@ -372,13 +377,13 @@ mod tests {
 
     #[test]
     fn no_keys_are_one_empty_page() {
-        assert_eq!(key_pages(&[]), vec![Vec::<PartitionKey>::new()]);
+        assert_eq!(key_pages(&[]), vec![&[] as &[PartitionKey]]);
     }
 
     #[test]
     fn small_keys_share_a_page_in_order() {
         let keys = vec![single(&["a"]), single(&["b"]), single(&["c"])];
-        assert_eq!(key_pages(&keys), vec![keys]);
+        assert_eq!(key_pages(&keys), vec![keys.as_slice()]);
     }
 
     #[test]
@@ -400,7 +405,7 @@ mod tests {
 
         assert_eq!(
             key_pages(&keys),
-            vec![vec![single(&["a"])], vec![big], vec![single(&["b"])]]
+            vec![&[single(&["a"])][..], &[big], &[single(&["b"])]]
         );
     }
 }

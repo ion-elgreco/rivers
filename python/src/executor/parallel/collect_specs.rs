@@ -100,14 +100,14 @@ impl ParallelBackend {
             .expect("mapped step must be in node_map — invalid plan");
         let keys = mapped_instance_keys
             .get(mapped_step)
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let specs = Self::build_instance_io_specs(
             py,
             mapped_step,
             mapped_node,
             partition_key,
-            &keys,
+            keys,
             io_handler_ref,
         )?;
         Ok(specs.unbind().into_any())
@@ -162,7 +162,9 @@ impl ParallelBackend {
         io_handler_ref: &Py<PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         let metadata = mapped_node.metadata();
-        let partition = ops::build_partition_context(mapped_node, partition_key)?;
+        // Shared by every spec: `PartitionContext` is frozen.
+        let partition =
+            ops::build_partition_context(py, mapped_node, partition_key)?.into_pyobject(py)?;
 
         let specs = pyo3::types::PyList::empty(py);
         for key in keys {
@@ -170,8 +172,8 @@ impl ParallelBackend {
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("asset_name", &instance_name)?;
             kwargs.set_item("downstream_asset", "collect")?;
-            kwargs.set_item("asset_metadata", metadata.clone())?;
-            kwargs.set_item("partition", partition.clone())?;
+            kwargs.set_item("asset_metadata", metadata)?;
+            kwargs.set_item("partition", &partition)?;
             kwargs.set_item("type_hint", py.None())?;
             let spec = super::worker::PyIOLoadSpec {
                 handler: io_handler_ref.clone_ref(py),

@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use surrealdb::Surreal;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::method::Query;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::{Bytes, RecordId, SurrealValue};
 
-use super::{EventRecord, PartitionKey, StorageBackend};
+use super::{EventRecord, PartitionKey, StorageBackend, stored_order};
 
 mod migration;
 pub use migration::{
@@ -33,7 +33,7 @@ mod run_queue;
 use backfills::load_backfill_progress;
 use queries::*;
 use rows::*;
-use run_queue::run_queued_event;
+use run_queue::run_queued_row;
 
 /// Identifies which underlying SurrealDB transport a [`SurrealStorage`] was constructed with.
 #[derive(Debug, Clone)]
@@ -599,7 +599,7 @@ impl SurrealStorage {
             .bind(("key", asset_key.to_string()))
             .await?;
         let rows: Vec<OptStringField> = result.take(0)?;
-        Ok(rows.first().and_then(|r| r.value.clone()))
+        Ok(rows.into_iter().next().and_then(|r| r.value))
     }
 
     /// Apply one Deletion event's state clearing.
@@ -669,24 +669,14 @@ impl SurrealStorage {
                 .and_modify(|t| *t = (*t).max(ts))
                 .or_insert(ts);
         }
-        let mut by_time: HashMap<i64, Vec<PartitionKey>> = HashMap::new();
+        let mut by_time: HashMap<i64, Vec<&PartitionKey>> = HashMap::new();
         for (pk, ts) in &newest {
-            by_time.entry(*ts).or_default().push(pk.clone());
+            by_time.entry(*ts).or_default().push(pk);
         }
-        let by_time: Vec<(i64, Vec<PartitionKey>)> = by_time.into_iter().collect();
-        let keys: Vec<PartitionKey> = newest.keys().cloned().collect();
-        let Some(range) = partition_failures::key_range(&keys) else {
+        let by_time: Vec<(i64, Vec<&PartitionKey>)> = by_time.into_iter().collect();
+        let Some(range) = partition_failures::key_range(newest.keys()) else {
             return Ok(());
         };
-        let rows: Vec<DbPartitionDeletion> = newest
-            .iter()
-            .map(|(partition_key, timestamp)| DbPartitionDeletion {
-                code_location_id: cl.to_string(),
-                asset_key: asset_key.to_string(),
-                partition_key: partition_key.clone(),
-                timestamp: *timestamp,
-            })
-            .collect();
         // One DELETE per deletion time, not a FOR loop, which costs more. The
         // members of one delete step share a time, so this is one statement.
         let mut body = String::from(HOLD_FOR_PARTITION_DELETIONS);
@@ -701,8 +691,8 @@ impl SurrealStorage {
         let bind = DeletionParams {
             cl,
             asset_key,
-            rows: &rows,
-            range: &range,
+            newest: &newest,
+            range,
             by_time: &by_time,
         };
 
@@ -724,6 +714,8 @@ impl SurrealStorage {
 
         // Failure rows are in the range of the keys: one transaction deletes
         // and brings the failure rows in line.
+        let mut keys: Vec<PartitionKey> = newest.keys().cloned().collect();
+        keys.sort_by(stored_order);
         super::retry::with_retry(&retry_config, || async {
             let txn = self.db.clone().begin().await?;
             bind.bind(txn.query(body.as_str())).await?.check()?;
@@ -750,16 +742,49 @@ impl SurrealStorage {
         Ok(rows.into_iter().collect())
     }
 
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
+    async fn kv_get_bytes(&self, key: &str) -> Result<Option<Bytes>> {
+        super::retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query("SELECT * FROM kv WHERE key = $key LIMIT 1")
+                .bind(("key", key.to_string()))
+                .await?;
+            let kvs: Vec<DbKv> = result.take(0)?;
+            Ok(kvs.into_iter().next().map(|kv| kv.value))
+        })
+        .await
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::storage", fields(%key))]
+    async fn kv_put(&self, key: &str, value: Bytes) -> Result<()> {
+        // Single atomic upsert on the UNIQUE `kv.key` index — a crash must
+        // never leave the key deleted (the old DELETE+CREATE pair could).
+        super::retry::with_retry(&self.retry_config, || async {
+            self.db
+                .query(
+                    "INSERT INTO kv { key: $key, value: $value } \
+                     ON DUPLICATE KEY UPDATE value = $input.value",
+                )
+                .bind(("key", key.to_string()))
+                .bind(("value", value.clone()))
+                .await?
+                .check()?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn kv_get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        match self.kv_get(key).await? {
+        match self.kv_get_bytes(key).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
     }
 
     async fn kv_set_json<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec(value)?;
-        self.kv_set(key, &bytes).await
+        self.kv_put(key, Bytes::from(serde_json::to_vec(value)?))
+            .await
     }
 }
 
@@ -803,10 +828,10 @@ impl SurrealStorage {
         event_id: &str,
         run_id: &str,
         timestamp: i64,
-        data_version: Option<String>,
+        data_version: Option<&str>,
         provenance_timestamp: i64,
-        code_version: Option<String>,
-        idv: Option<Vec<(String, String)>>,
+        code_version: Option<&str>,
+        idv: Option<&[(String, String)]>,
         from_action: bool,
         parts: Vec<DbAssetPartitionWrite>,
         built_by: &[(&PartitionKey, &str)],
@@ -828,8 +853,7 @@ impl SurrealStorage {
         // the asset row first, so it runs before the row's update. The data
         // and provenance updates commit together too: no reader sees new data
         // with the provenance of the materialization it replaced.
-        let keys: Vec<PartitionKey> = parts.iter().map(|p| p.partition_key.clone()).collect();
-        let range = partition_failures::key_range(&keys);
+        let range = partition_failures::key_range(parts.iter().map(|p| &p.partition_key));
         let (guard, body) = match range {
             Some(_) => (
                 partition_failures::failure_rows_guard(),
@@ -844,11 +868,10 @@ impl SurrealStorage {
             event_id,
             run_id,
             timestamp,
-            data_version: &data_version,
-            provenance: (!from_action).then_some((provenance_timestamp, &code_version, &idv)),
+            data_version,
+            provenance: (!from_action).then_some((provenance_timestamp, code_version, idv)),
             parts: &parts,
-            keys: &keys,
-            range: range.as_ref(),
+            range,
         };
 
         // Runs that write one asset at the same time all write its `assets`
@@ -883,12 +906,11 @@ struct MaterializationParams<'a> {
     event_id: &'a str,
     run_id: &'a str,
     timestamp: i64,
-    data_version: &'a Option<String>,
+    data_version: Option<&'a str>,
     /// The provenance's time, code version and inputs; none for an action.
-    provenance: Option<(i64, &'a Option<String>, &'a Option<Vec<(String, String)>>)>,
+    provenance: Option<(i64, Option<&'a str>, Option<&'a [(String, String)]>)>,
     parts: &'a [DbAssetPartitionWrite],
-    keys: &'a [PartitionKey],
-    range: Option<&'a (PartitionKey, PartitionKey)>,
+    range: Option<(&'a PartitionKey, &'a PartitionKey)>,
 }
 
 impl MaterializationParams<'_> {
@@ -899,19 +921,21 @@ impl MaterializationParams<'_> {
             .bind(("event_id", self.event_id.to_string()))
             .bind(("run_id", self.run_id.to_string()))
             .bind(("timestamp", self.timestamp))
-            .bind(("data_version", self.data_version.clone()));
+            .bind(("data_version", self.data_version.map(str::to_owned)));
         if let Some((provenance_timestamp, code_version, idv)) = self.provenance {
             query = query
                 .bind(("provenance_timestamp", provenance_timestamp))
-                .bind(("mcv", code_version.clone()));
+                .bind(("mcv", code_version.map(str::to_owned)));
             if let Some(idv) = idv {
-                query = query.bind(("idv", idv.clone()));
+                query = query.bind(("idv", idv.to_vec()));
             }
         }
         if let Some((lowest, highest)) = self.range {
+            let keys: Vec<PartitionKey> =
+                self.parts.iter().map(|p| p.partition_key.clone()).collect();
             let oldest = self.parts.iter().map(|p| p.last_timestamp).min();
             query = query
-                .bind(("keys", self.keys.to_vec()))
+                .bind(("keys", keys))
                 .bind(("oldest", oldest))
                 .bind(("rows", self.parts.to_vec()))
                 .bind(("lowest", lowest.clone()))
@@ -925,23 +949,35 @@ impl MaterializationParams<'_> {
 struct DeletionParams<'a> {
     cl: &'a str,
     asset_key: &'a str,
-    rows: &'a [DbPartitionDeletion],
-    range: &'a (PartitionKey, PartitionKey),
-    by_time: &'a [(i64, Vec<PartitionKey>)],
+    /// Each key's newest deletion time.
+    newest: &'a HashMap<PartitionKey, i64>,
+    range: (&'a PartitionKey, &'a PartitionKey),
+    by_time: &'a [(i64, Vec<&'a PartitionKey>)],
 }
 
 impl DeletionParams<'_> {
     fn bind<'q>(&self, query: Query<'q, Any>) -> Query<'q, Any> {
         let (lowest, highest) = self.range;
+        let rows: Vec<DbPartitionDeletion> = self
+            .newest
+            .iter()
+            .map(|(partition_key, timestamp)| DbPartitionDeletion {
+                code_location_id: self.cl.to_string(),
+                asset_key: self.asset_key.to_string(),
+                partition_key: partition_key.clone(),
+                timestamp: *timestamp,
+            })
+            .collect();
         let mut query = query
             .bind(("cl", self.cl.to_string()))
             .bind(("asset_key", self.asset_key.to_string()))
-            .bind(("rows", self.rows.to_vec()))
+            .bind(("rows", rows))
             .bind(("lowest", lowest.clone()))
             .bind(("highest", highest.clone()));
         for (i, (deleted_at, keys)) in self.by_time.iter().enumerate() {
+            let keys: Vec<PartitionKey> = keys.iter().map(|&key| key.clone()).collect();
             query = query
-                .bind((format!("keys_{i}"), keys.clone()))
+                .bind((format!("keys_{i}"), keys))
                 .bind((format!("deleted_at_{i}"), *deleted_at));
         }
         query

@@ -161,3 +161,45 @@ def test_handler_metadata_wins_on_a_key_conflict(executor, storage, tmp_path):
         "note": "from context",
         "owner": "ops",
     }
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_handler_metadata_keeps_the_entry_order(executor, is_async, storage, tmp_path):
+    """The asset's entries keep their order, without the keys the handler
+    overrides, and the handler's entries follow. Each key is stored once."""
+    io = JsonHandler(root=str(tmp_path))
+    metadata = {"owner": "ops", "rows": 100, "tier": "gold", "path": "s3://guess"}
+
+    if is_async:
+
+        @rs.Asset(io_handler=io)
+        async def orders() -> rs.Output:
+            return rs.Output(value=[1, 2, 3], metadata=metadata)
+    else:
+
+        @rs.Asset(io_handler=io)
+        def orders() -> rs.Output:
+            return rs.Output(value=[1, 2, 3], metadata=metadata)
+
+    @rs.Asset(io_handler=io)
+    def regions() -> list:
+        return ["eu"]
+
+    repo = rs.CodeRepository(assets=[orders, regions], default_executor=executor)
+    repo.resolve(storage=storage)
+    assert repo.materialize().success
+
+    event = storage.get_latest_materialization("orders")
+    assert [key for key, _ in event.metadata] == [
+        "owner",
+        "tier",
+        "rows",
+        "path",
+        "pid",
+    ]
+    assert materialization_metadata(storage, "orders") == {
+        "owner": "ops",
+        "tier": "gold",
+        "rows": 3,
+        "path": str(tmp_path / "orders.json"),
+    }

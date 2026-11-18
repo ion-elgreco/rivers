@@ -123,16 +123,15 @@ pub fn ExecuteJobDialog(
     // Memoize the run count for the button label and post-submit nav
     // target. None-picker: one unpartitioned run. Otherwise the count
     // is whatever the picker has expanded into `selected`.
+    let partitioned = Memo::new(move |_| picker.with(|p| !matches!(p, JobPartitionPicker::None)));
     let run_count = Memo::new(move |_| {
-        if matches!(picker.get(), JobPartitionPicker::None) {
-            1
-        } else {
+        if partitioned.get() {
             selected.with(|k| submit_partition_count(k))
+        } else {
+            1
         }
     });
-    let backfill = Memo::new(move |_| {
-        !matches!(picker.get(), JobPartitionPicker::None) && selected.with(|k| launches_backfill(k))
-    });
+    let backfill = Memo::new(move |_| partitioned.get() && selected.with(|k| launches_backfill(k)));
 
     Effect::new(move |_| {
         let Some(result) = action.value().get() else {
@@ -194,9 +193,7 @@ pub fn ExecuteJobDialog(
                                 "Clears materialization state for the job's assets."
                             </p>
                         </Show>
-                        <Show when=move || {
-                            key_optional.get() && !matches!(picker.get(), JobPartitionPicker::None)
-                        }>
+                        <Show when=move || key_optional.get() && partitioned.get()>
                             <WholeAssetChoice checked=whole_asset selected=selected/>
                         </Show>
                         <Show when=move || !whole_asset_chosen.get()>
@@ -217,11 +214,12 @@ pub fn ExecuteJobDialog(
                         <button
                             class=move || if destructive.get() { "btn btn-danger" } else { "btn btn-primary" }
                             on:click=move |_| {
-                                let p = picker.get_untracked();
                                 let keys = selected.get_untracked();
                                 let whole = whole_asset_chosen.get_untracked();
-                                if keys.is_empty() && !whole && !matches!(p, JobPartitionPicker::None) {
-                                    let msg = if matches!(p, JobPartitionPicker::Multi { .. }) {
+                                if keys.is_empty() && !whole && partitioned.get_untracked() {
+                                    let multi = picker
+                                        .with_untracked(|p| matches!(p, JobPartitionPicker::Multi { .. }));
+                                    let msg = if multi {
                                         "Select at least one value for every dimension."
                                     } else {
                                         "Select at least one partition."

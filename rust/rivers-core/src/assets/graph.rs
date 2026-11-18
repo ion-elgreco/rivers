@@ -197,37 +197,70 @@ pub fn is_reachable(graph: &AssetGraph, from_name: &str, to_name: &str) -> Resul
     Ok(has_path_connecting(graph, from_idx, to_idx, None))
 }
 
-/// DFS in `dir` from `name`; result excludes `name` itself.
+/// DFS in one direction that reuses its visited set and stack across walks.
 ///
 /// Outgoing edges lead to dependencies (upstream); Incoming come from dependents (downstream).
-fn traverse(graph: &AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<String> {
-    let mut result = HashSet::new();
-    let Some(start) = find_node_by_name(graph, name) else {
-        return result;
-    };
-    let mut stack = vec![start];
-    while let Some(idx) = stack.pop() {
-        for neighbor in graph.neighbors_directed(idx, dir) {
-            if result.insert(graph[neighbor].name.clone()) {
-                stack.push(neighbor);
-            }
+pub(crate) struct Walker<'g> {
+    graph: &'g AssetGraph,
+    dir: petgraph::Direction,
+    reached: Vec<bool>,
+    stack: Vec<NodeIndex>,
+}
+
+impl<'g> Walker<'g> {
+    pub(crate) fn new(graph: &'g AssetGraph, dir: petgraph::Direction) -> Self {
+        Self {
+            graph,
+            dir,
+            reached: vec![false; graph.node_count()],
+            stack: Vec::new(),
         }
     }
-    result
+
+    /// Whether each node, by `NodeIndex::index()`, is reachable from `start`;
+    /// `start` itself is not.
+    pub(crate) fn walk(&mut self, start: NodeIndex) -> &[bool] {
+        self.reached.fill(false);
+        self.stack.push(start);
+        while let Some(idx) = self.stack.pop() {
+            for neighbor in self.graph.neighbors_directed(idx, self.dir) {
+                let reached = &mut self.reached[neighbor.index()];
+                if !*reached {
+                    *reached = true;
+                    self.stack.push(neighbor);
+                }
+            }
+        }
+        &self.reached
+    }
+}
+
+/// DFS in `dir` from `name`; result excludes `name` itself.
+fn traverse<'g>(graph: &'g AssetGraph, name: &str, dir: petgraph::Direction) -> HashSet<&'g str> {
+    let Some(start) = find_node_by_name(graph, name) else {
+        return HashSet::new();
+    };
+    Walker::new(graph, dir)
+        .walk(start)
+        .iter()
+        .zip(graph.node_indices())
+        .filter(|(reached, _)| **reached)
+        .map(|(_, idx)| graph[idx].name.as_str())
+        .collect()
 }
 
 /// Transitive dependencies of `name`, excluding `name` itself.
-pub fn ancestors(graph: &AssetGraph, name: &str) -> HashSet<String> {
+pub fn ancestors<'g>(graph: &'g AssetGraph, name: &str) -> HashSet<&'g str> {
     traverse(graph, name, petgraph::Direction::Outgoing)
 }
 
 /// Transitive dependents of `name`, excluding `name` itself.
-pub fn descendants(graph: &AssetGraph, name: &str) -> HashSet<String> {
+pub fn descendants<'g>(graph: &'g AssetGraph, name: &str) -> HashSet<&'g str> {
     traverse(graph, name, petgraph::Direction::Incoming)
 }
 
 /// Upstream closure: `targets` plus every transitive dependency they require.
-pub fn upstream_closure(graph: &AssetGraph, targets: &HashSet<String>) -> HashSet<String> {
+pub fn upstream_closure<'g>(graph: &'g AssetGraph, targets: &HashSet<String>) -> HashSet<&'g str> {
     let lookup = name_to_index(graph);
     let mut result = HashSet::new();
     let mut stack: Vec<NodeIndex> = targets
@@ -236,8 +269,7 @@ pub fn upstream_closure(graph: &AssetGraph, targets: &HashSet<String>) -> HashSe
         .collect();
 
     while let Some(idx) = stack.pop() {
-        let name = graph[idx].name.clone();
-        if result.insert(name) {
+        if result.insert(graph[idx].name.as_str()) {
             for dep_idx in graph.neighbors_directed(idx, petgraph::Direction::Outgoing) {
                 stack.push(dep_idx);
             }
@@ -350,21 +382,17 @@ fn reach<'a>(adj: &HashMap<&'a str, Vec<&'a str>>, start: Vec<&'a str>) -> HashS
 
 impl CodeRepository {
     pub fn resolve_asset_graph(&mut self) -> Result<(), String> {
-        let mut graph: AssetGraph = Graph::new();
-        let mut name_to_index: HashMap<String, NodeIndex> = HashMap::new();
+        let edges = self.assets.values().map(Vec::len).sum();
+        let mut graph: AssetGraph = Graph::with_capacity(self.assets.len(), edges);
+        let name_to_index: HashMap<&str, NodeIndex> = self
+            .assets
+            .keys()
+            .map(|name| (name.as_str(), graph.add_node(DagNode::new(name))))
+            .collect();
 
-        for (name, asset_inputs) in self.assets() {
-            let mut node = DagNode::new(name);
-            node.inputs = asset_inputs.clone();
-            let idx = graph.add_node(node);
-            name_to_index.insert(name.to_string(), idx);
-        }
-
-        // Resolve ByName → Resolved and add edges.
-        let node_indices: Vec<NodeIndex> = graph.node_indices().collect();
-        for idx in node_indices {
-            let inputs = std::mem::take(&mut graph[idx].inputs);
-            let mut resolved_inputs = Vec::<NodeRef>::with_capacity(inputs.len());
+        // Nodes were added in `self.assets` order, so the indices line up.
+        for ((name, inputs), idx) in self.assets.iter().zip(graph.node_indices()) {
+            let mut resolved_inputs = Vec::with_capacity(inputs.len());
 
             for input in inputs {
                 let NodeRef::ByName(dep_name) = input else {
@@ -373,17 +401,13 @@ impl CodeRepository {
                         "resolve_asset_graph expected NodeRef::ByName, got a resolved ref"
                     );
                 };
-                let Some(&dep_idx) = name_to_index.get(&dep_name) else {
-                    return Err(format!(
-                        "Asset '{}': unresolved input '{}'",
-                        &graph[idx].name, dep_name
-                    ));
+                let Some(&dep_idx) = name_to_index.get(dep_name.as_str()) else {
+                    return Err(format!("Asset '{name}': unresolved input '{dep_name}'"));
                 };
                 if dep_idx == idx {
                     return Err(format!(
-                        "Asset '{}': depends on itself; use SelfDependency[T] \
-                         to reference an asset's own previous output",
-                        &graph[idx].name
+                        "Asset '{name}': depends on itself; use SelfDependency[T] \
+                         to reference an asset's own previous output"
                     ));
                 }
                 resolved_inputs.push(NodeRef::Resolved(dep_idx));
@@ -495,6 +519,33 @@ mod tests {
     }
 
     #[test]
+    fn test_resolved_nodes_follow_asset_order() {
+        let graph = make_graph(vec![("c", vec!["b", "a"]), ("a", vec![]), ("b", vec!["a"])]);
+
+        let resolved: Vec<(&str, Vec<&str>)> = graph
+            .node_indices()
+            .map(|idx| {
+                let inputs = graph[idx]
+                    .inputs
+                    .iter()
+                    .map(|input| match input {
+                        NodeRef::Resolved(dep) => graph[*dep].name.as_str(),
+                        NodeRef::ByName(dep) => panic!("unresolved input '{dep}'"),
+                    })
+                    .collect();
+                (graph[idx].name.as_str(), inputs)
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            [("a", vec![]), ("b", vec!["a"]), ("c", vec!["b", "a"])]
+        );
+
+        let edges = [("b", "a"), ("c", "a"), ("c", "b")].map(|(f, t)| (f.into(), t.into()));
+        assert_eq!(to_topology(&graph).edges, edges);
+    }
+
+    #[test]
     fn test_detect_cycles_on_acyclic_graph() {
         let mut graph: AssetGraph = Graph::new();
         let _a = graph.add_node(DagNode::new("a"));
@@ -573,20 +624,14 @@ mod tests {
     #[test]
     fn test_ancestors_chain() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
-        assert_eq!(
-            ancestors(&graph, "c"),
-            HashSet::from(["a".into(), "b".into()])
-        );
+        assert_eq!(ancestors(&graph, "c"), HashSet::from(["a", "b"]));
         assert_eq!(ancestors(&graph, "a"), HashSet::new());
     }
 
     #[test]
     fn test_descendants_chain() {
         let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["b"])]);
-        assert_eq!(
-            descendants(&graph, "a"),
-            HashSet::from(["b".into(), "c".into()])
-        );
+        assert_eq!(descendants(&graph, "a"), HashSet::from(["b", "c"]));
         assert_eq!(descendants(&graph, "c"), HashSet::new());
     }
 
@@ -598,16 +643,10 @@ mod tests {
             ("c", vec!["a"]),
             ("d", vec!["b", "c"]),
         ]);
-        assert_eq!(
-            ancestors(&graph, "d"),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
-        );
-        assert_eq!(
-            descendants(&graph, "a"),
-            HashSet::from(["b".into(), "c".into(), "d".into()])
-        );
-        assert_eq!(ancestors(&graph, "b"), HashSet::from(["a".into()]));
-        assert_eq!(descendants(&graph, "b"), HashSet::from(["d".into()]));
+        assert_eq!(ancestors(&graph, "d"), HashSet::from(["a", "b", "c"]));
+        assert_eq!(descendants(&graph, "a"), HashSet::from(["b", "c", "d"]));
+        assert_eq!(ancestors(&graph, "b"), HashSet::from(["a"]));
+        assert_eq!(descendants(&graph, "b"), HashSet::from(["d"]));
     }
 
     #[test]
@@ -620,10 +659,7 @@ mod tests {
     fn test_upstream_closure_single_root() {
         let graph = make_graph(vec![("a", vec![])]);
         let targets = HashSet::from(["a".into()]);
-        assert_eq!(
-            upstream_closure(&graph, &targets),
-            HashSet::from(["a".into()])
-        );
+        assert_eq!(upstream_closure(&graph, &targets), HashSet::from(["a"]));
     }
 
     #[test]
@@ -632,7 +668,7 @@ mod tests {
         let targets = HashSet::from(["c".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
+            HashSet::from(["a", "b", "c"])
         );
     }
 
@@ -642,7 +678,7 @@ mod tests {
         let targets = HashSet::from(["b".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into()])
+            HashSet::from(["a", "b"])
         );
     }
 
@@ -894,7 +930,7 @@ mod tests {
         let targets = HashSet::from(["b".into(), "c".into()]);
         assert_eq!(
             upstream_closure(&graph, &targets),
-            HashSet::from(["a".into(), "b".into(), "c".into()])
+            HashSet::from(["a", "b", "c"])
         );
     }
 
@@ -902,10 +938,7 @@ mod tests {
     fn test_upstream_closure_ignores_unknown_targets() {
         let graph = make_graph(vec![("a", vec![])]);
         let targets = HashSet::from(["a".into(), "missing".into()]);
-        assert_eq!(
-            upstream_closure(&graph, &targets),
-            HashSet::from(["a".into()])
-        );
+        assert_eq!(upstream_closure(&graph, &targets), HashSet::from(["a"]));
     }
 
     #[test]

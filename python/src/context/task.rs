@@ -14,7 +14,7 @@ pub struct PyTaskExecutionContext {
     #[pyo3(get)]
     pub tags: Option<Vec<String>>,
     #[pyo3(get)]
-    pub partition: Option<PartitionContext>,
+    pub partition: Option<Py<PartitionContext>>,
     /// Pydantic config instance (set via `TaskExecutionContext[Config]` generic).
     pub config_instance: Option<Py<PyAny>>,
     _logger: PyOnceLock<Py<PyAny>>,
@@ -24,7 +24,7 @@ impl PyTaskExecutionContext {
     pub fn new(
         task_name: String,
         tags: Option<Vec<String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
     ) -> Self {
         Self {
             task_name,
@@ -48,7 +48,7 @@ impl PyTaskExecutionContext {
     fn py_new(
         task_name: String,
         tags: Option<Vec<String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
     ) -> Self {
         Self::new(task_name, tags, partition)
     }
@@ -66,7 +66,7 @@ impl PyTaskExecutionContext {
     #[getter]
     fn partition_key(&self) -> PyResult<String> {
         match &self.partition {
-            Some(ctx) => match ctx.first_key() {
+            Some(ctx) => match ctx.get().first_key() {
                 crate::partitions::PyPartitionKey::Single { key } if !key.is_empty() => {
                     Ok(key[0].clone())
                 }
@@ -83,7 +83,7 @@ impl PyTaskExecutionContext {
     #[getter]
     fn partition_time_window(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match &self.partition {
-            Some(ctx) => ctx.time_window(py),
+            Some(ctx) => ctx.get().time_window(py),
             None => Ok(None),
         }
     }

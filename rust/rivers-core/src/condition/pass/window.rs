@@ -1,5 +1,6 @@
 //! Latest-time-window resolution (grid-derived fast path + full scan).
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::storage::PartitionKey;
 use crate::util::parse_key_datetime;
@@ -19,14 +20,17 @@ pub struct TimeWindowSource {
 /// pivots resolve against the dep's own window instead of selecting
 /// everything.
 pub struct TimeWindowResolver<'a> {
-    sources: &'a HashMap<String, TimeWindowSource>,
+    sources: &'a HashMap<Arc<str>, TimeWindowSource>,
     now_local: civil::DateTime,
     #[allow(clippy::type_complexity)]
-    memo: std::cell::RefCell<HashMap<(String, u64), std::sync::Arc<HashSet<PartitionKey>>>>,
+    memo: std::cell::RefCell<HashMap<(Arc<str>, u64), Arc<HashSet<PartitionKey>>>>,
 }
 
 impl<'a> TimeWindowResolver<'a> {
-    pub fn new(sources: &'a HashMap<String, TimeWindowSource>, now_local: civil::DateTime) -> Self {
+    pub fn new(
+        sources: &'a HashMap<Arc<str>, TimeWindowSource>,
+        now_local: civil::DateTime,
+    ) -> Self {
         Self {
             sources,
             now_local,
@@ -41,14 +45,14 @@ impl<'a> TimeWindowResolver<'a> {
         asset: &str,
         all_keys: &HashSet<PartitionKey>,
         lookback_delta: Option<f64>,
-    ) -> Option<std::sync::Arc<HashSet<PartitionKey>>> {
-        let source = self.sources.get(asset)?;
+    ) -> Option<Arc<HashSet<PartitionKey>>> {
+        let (asset, source) = self.sources.get_key_value(asset)?;
         let memo_key = (
-            asset.to_string(),
+            Arc::clone(asset),
             lookback_delta.map(f64::to_bits).unwrap_or(u64::MAX),
         );
         if let Some(hit) = self.memo.borrow().get(&memo_key) {
-            return Some(std::sync::Arc::clone(hit));
+            return Some(Arc::clone(hit));
         }
         let keys = source
             .grid
@@ -64,10 +68,8 @@ impl<'a> TimeWindowResolver<'a> {
                     lookback_delta,
                 )
             });
-        let keys = std::sync::Arc::new(keys);
-        self.memo
-            .borrow_mut()
-            .insert(memo_key, std::sync::Arc::clone(&keys));
+        let keys = Arc::new(keys);
+        self.memo.borrow_mut().insert(memo_key, Arc::clone(&keys));
         Some(keys)
     }
 }

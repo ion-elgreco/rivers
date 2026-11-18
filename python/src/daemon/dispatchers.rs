@@ -423,7 +423,7 @@ impl BackfillDispatcherKind {
 
     pub(crate) async fn dispatch(
         &self,
-        requests: &[BackfillRequestData],
+        requests: Vec<BackfillRequestData>,
     ) -> anyhow::Result<BackfillDispatchOutcome> {
         match self {
             Self::Local(d) => d.dispatch(requests).await,
@@ -435,7 +435,7 @@ impl LocalBackfillDispatcher {
     /// Spawn one OS thread per backfill request; collect [`PyBackfillResult`]s via oneshot.
     async fn dispatch(
         &self,
-        requests: &[BackfillRequestData],
+        requests: Vec<BackfillRequestData>,
     ) -> anyhow::Result<BackfillDispatchOutcome> {
         if requests.is_empty() {
             return Ok(BackfillDispatchOutcome::default());
@@ -448,33 +448,41 @@ impl LocalBackfillDispatcher {
 
         for bf in requests {
             let repo = Arc::clone(&self.repo);
-            let bf = bf.clone();
-            let target = bf.target.clone();
-            let label: Vec<String> = match &target {
+            let label: Vec<String> = match &bf.target {
                 crate::daemon::RunType::Materialization(sel) => sel.clone(),
                 crate::daemon::RunType::Job(name) => vec![format!("job:{name}")],
             };
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<PyBackfillResult, String>>();
             self.gil_threads.spawn(move || {
-                let tags = bf.tags.as_ref().map(|t| {
-                    t.iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect::<Vec<(String, String)>>()
-                });
+                let BackfillRequestData {
+                    target,
+                    partition_keys,
+                    partition_range,
+                    strategy,
+                    failure_policy,
+                    max_concurrency,
+                    tags,
+                    dry_run,
+                    backfill_id,
+                    launched_by,
+                    action,
+                    config,
+                } = bf;
+
                 let result = match repo.get().backfill_inner(
                     target,
-                    bf.partition_keys.clone(),
-                    bf.partition_range.clone(),
-                    bf.strategy.clone(),
-                    bf.failure_policy.as_deref().unwrap_or("continue"),
-                    bf.max_concurrency,
-                    tags,
-                    bf.config.clone(),
+                    partition_keys,
+                    partition_range,
+                    strategy,
+                    failure_policy.as_deref().unwrap_or("continue"),
+                    max_concurrency,
+                    tags.map(|t| t.into_iter().collect()),
+                    config,
                     false, // block=false
-                    bf.dry_run,
-                    bf.backfill_id.clone(),
-                    bf.launched_by.clone(),
-                    bf.action.clone(),
+                    dry_run,
+                    backfill_id,
+                    launched_by,
+                    action,
                 ) {
                     Ok(result) => {
                         tracing::info!(

@@ -30,25 +30,24 @@ pub fn scale_quantity(q: &str, factor: f64, max: Option<&str>) -> Option<String>
 /// by `factor` (clamped to `max_memory`) and CPU by `cpu_factor` if set. A
 /// non-escalating reason, or an axis left unset, is returned unchanged.
 pub fn escalate_compute(
-    current: &Compute,
+    mut current: Compute,
     esc: &ComputeEscalation,
     reason: FailureReason,
 ) -> Compute {
     if !esc.on.contains(&reason) {
-        return current.clone();
+        return current;
     }
-    let mut next = current.clone();
     if let Some(mem) = &current.memory
         && let Some(scaled) = scale_quantity(mem, esc.factor, Some(&esc.max_memory))
     {
-        next.memory = Some(scaled);
+        current.memory = Some(scaled);
     }
     if let (Some(cpu), Some(cpu_factor)) = (&current.cpu, esc.cpu_factor)
         && let Some(scaled) = scale_quantity(cpu, cpu_factor, esc.max_cpu.as_deref())
     {
-        next.cpu = Some(scaled);
+        current.cpu = Some(scaled);
     }
-    next
+    current
 }
 
 #[cfg(test)]
@@ -106,14 +105,14 @@ mod tests {
             memory: Some("8Gi".into()),
             ..Default::default()
         };
-        let a = escalate_compute(&base, &esc, FailureReason::OutOfMemory);
+        let a = escalate_compute(base, &esc, FailureReason::OutOfMemory);
         same(a.memory.as_deref().unwrap(), "16Gi");
-        let b = escalate_compute(&a, &esc, FailureReason::OutOfMemory);
+        let b = escalate_compute(a, &esc, FailureReason::OutOfMemory);
         same(b.memory.as_deref().unwrap(), "32Gi");
-        let c = escalate_compute(&b, &esc, FailureReason::OutOfMemory);
+        let c = escalate_compute(b, &esc, FailureReason::OutOfMemory);
         same(c.memory.as_deref().unwrap(), "64Gi");
         // already at the ceiling: stays clamped
-        let d = escalate_compute(&c, &esc, FailureReason::OutOfMemory);
+        let d = escalate_compute(c, &esc, FailureReason::OutOfMemory);
         same(d.memory.as_deref().unwrap(), "64Gi");
     }
 
@@ -124,7 +123,7 @@ mod tests {
             memory: Some("8Gi".into()),
             ..Default::default()
         };
-        let same_c = escalate_compute(&base, &esc, FailureReason::Error);
+        let same_c = escalate_compute(base, &esc, FailureReason::Error);
         same(same_c.memory.as_deref().unwrap(), "8Gi");
     }
 
@@ -136,7 +135,7 @@ mod tests {
             memory: Some("8Gi".into()),
             ..Default::default()
         };
-        let a = escalate_compute(&base, &esc, FailureReason::OutOfMemory);
+        let a = escalate_compute(base, &esc, FailureReason::OutOfMemory);
         same(a.cpu.as_deref().unwrap(), "4");
         same(a.memory.as_deref().unwrap(), "16Gi");
     }
@@ -144,7 +143,7 @@ mod tests {
     #[test]
     fn escalation_leaves_unset_memory_alone() {
         let esc = oom(None, None);
-        let out = escalate_compute(&Compute::default(), &esc, FailureReason::OutOfMemory);
+        let out = escalate_compute(Compute::default(), &esc, FailureReason::OutOfMemory);
         assert_eq!(out.memory, None);
     }
 }

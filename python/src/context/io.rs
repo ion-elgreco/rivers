@@ -19,7 +19,7 @@ pub struct PyOutputContext {
     #[pyo3(get)]
     pub asset_metadata: Option<HashMap<String, String>>,
     #[pyo3(get)]
-    pub partition: Option<PartitionContext>,
+    pub partition: Option<Py<PartitionContext>>,
     #[pyo3(get)]
     pub type_hint: Option<Py<PyAny>>,
     _output_metadata: Mutex<Vec<(String, MetadataValue)>>,
@@ -30,7 +30,7 @@ impl PyOutputContext {
     pub fn new(
         asset_name: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         type_hint: Option<Py<PyAny>>,
     ) -> Self {
         Self {
@@ -46,7 +46,7 @@ impl PyOutputContext {
     pub fn new_with_metadata(
         asset_name: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         type_hint: Option<Py<PyAny>>,
         initial: Vec<(String, MetadataValue)>,
     ) -> Self {
@@ -73,7 +73,7 @@ impl PyOutputContext {
     fn py_new(
         asset_name: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         type_hint: Option<Py<PyAny>>,
     ) -> Self {
         Self::new(asset_name, asset_metadata, partition, type_hint)
@@ -121,7 +121,7 @@ impl PyOutputContext {
         let asset_metadata: Option<HashMap<String, String>> = kwargs
             .get_item("asset_metadata")?
             .and_then(|v| v.extract().ok());
-        let partition: Option<PartitionContext> =
+        let partition: Option<Py<PartitionContext>> =
             kwargs.get_item("partition")?.and_then(|v| v.extract().ok());
         let type_hint: Option<Py<PyAny>> = kwargs
             .get_item("type_hint")?
@@ -139,7 +139,7 @@ pub struct PyInputContext {
     pub asset_name: String,
     pub downstream_asset: String,
     pub asset_metadata: Option<HashMap<String, String>>,
-    pub partition: Option<PartitionContext>,
+    pub partition: Option<Py<PartitionContext>>,
     pub type_hint: Option<Py<PyAny>>,
     /// The owning code location (`"namespace/name"`) of a remote upstream.
     pub code_location: Option<String>,
@@ -160,7 +160,7 @@ impl PyInputContext {
         asset_name: String,
         downstream_asset: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         type_hint: Option<Py<PyAny>>,
         code_location: Option<String>,
     ) -> Self {
@@ -182,7 +182,7 @@ impl PyInputContext {
         let asset_metadata: Option<HashMap<String, String>> = kwargs
             .get_item("asset_metadata")?
             .and_then(|v| v.extract().ok());
-        let partition: Option<PartitionContext> =
+        let partition: Option<Py<PartitionContext>> =
             kwargs.get_item("partition")?.and_then(|v| v.extract().ok());
         let type_hint: Option<Py<PyAny>> = kwargs
             .get_item("type_hint")?

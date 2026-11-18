@@ -97,7 +97,7 @@ pub(super) fn resolve_worker_args(
                 kwargs.set_item("group", node.group())?;
                 kwargs.set_item("code_version", node.code_version())?;
                 kwargs.set_item("asset_metadata", node.metadata())?;
-                let partition = ops::build_partition_context(node, partition_key)?;
+                let partition = ops::build_partition_context(py, node, partition_key)?;
                 kwargs.set_item("partition", partition)?;
                 kwargs.set_item("is_multi_asset", is_multi)?;
                 kwargs.set_item("output_selection", output_selection.to_vec())?;
@@ -179,7 +179,7 @@ pub(super) fn resolve_worker_args(
                 ops::UpstreamKeyResolution::Skip => {
                     args.push(py.None());
                 }
-                ops::UpstreamKeyResolution::Load(_) => {
+                ops::UpstreamKeyResolution::Load(upstream_key) => {
                     // Type hint is `None` for unannotated params.
                     let type_hint = annotation
                         .as_ref()
@@ -191,7 +191,7 @@ pub(super) fn resolve_worker_args(
                         step_name,
                         node,
                         upstream_node,
-                        partition_key,
+                        &upstream_key,
                         type_hint,
                         registry,
                     )?;
@@ -220,14 +220,15 @@ pub(super) fn resolve_worker_args(
 
 /// Build an _IOLoadSpec Python object for loading an upstream input in the subprocess.
 /// This avoids pickling large data across process boundaries — the worker loads
-/// directly from the IO handler.
+/// directly from the IO handler. `upstream_key` is the downstream key already
+/// mapped through the input's partition mapping.
 fn build_io_load_spec(
     py: Python,
     param_name: &str,
     downstream_name: &str,
     downstream_node: &ResolvedNode,
     upstream_node: &ResolvedNode,
-    partition_key: &Option<PyPartitionKey>,
+    upstream_key: &Option<PyPartitionKey>,
     type_hint: Py<PyAny>,
     registry: &IOHandlerRegistry,
 ) -> PyResult<Py<PyAny>> {
@@ -254,27 +255,13 @@ fn build_io_load_spec(
         .input_metadata(param_name)
         .or_else(|| upstream_node.metadata());
 
-    // Skip is already handled by the caller — build_io_load_spec is only called
-    // for Load resolutions.
     let has_mapping = downstream_node
         .partition_mapping()
-        .and_then(|m| m.get(param_name).cloned())
-        .is_some();
-    let upstream_key = match ops::map_partition_key_for_upstream(
-        param_name,
-        downstream_node,
-        upstream_node,
-        partition_key,
-    )? {
-        ops::UpstreamKeyResolution::Load(key) => key,
-        ops::UpstreamKeyResolution::Skip => {
-            unreachable!("build_io_load_spec called for a Skip resolution")
-        }
-    };
+        .is_some_and(|m| m.contains_key(param_name));
     let partition = if has_mapping {
-        ops::build_mapped_partition_context(upstream_node, &upstream_key)?
+        ops::build_mapped_partition_context(py, upstream_node, upstream_key)?
     } else {
-        ops::build_partition_context(upstream_node, &upstream_key)?
+        ops::build_partition_context(py, upstream_node, upstream_key)?
     };
 
     let (asset_name, code_location) = ops::upstream_source(param_name, upstream_node);
@@ -595,7 +582,7 @@ fn build_single_output_spec(
     kwargs.set_item("asset_metadata", node.metadata())?;
     kwargs.set_item(
         "partition",
-        ops::build_partition_context(node, partition_key)?,
+        ops::build_partition_context(py, node, partition_key)?,
     )?;
     kwargs.set_item("type_hint", return_hint)?;
     let handler = resolve_io_handler_ref(py, step_name, func, node_map, registry)?;
@@ -631,7 +618,7 @@ fn build_graph_output_spec(
     kwargs.set_item("asset_metadata", graph_node.metadata())?;
     kwargs.set_item(
         "partition",
-        ops::build_partition_context(graph_node, partition_key)?,
+        ops::build_partition_context(py, graph_node, partition_key)?,
     )?;
     kwargs.set_item("type_hint", task_return_hint)?;
     Ok(PyTuple::new(py, [handler, kwargs.unbind().into_any()])?
@@ -661,7 +648,7 @@ fn build_multi_output_specs(
         let kwargs = PyDict::new(py);
         kwargs.set_item("asset_name", out_name)?;
         kwargs.set_item("asset_metadata", out_node.metadata())?;
-        let partition = ops::build_partition_context(out_node, partition_key)?;
+        let partition = ops::build_partition_context(py, out_node, partition_key)?;
         kwargs.set_item("partition", partition)?;
         kwargs.set_item("type_hint", out_node.output_type_hint())?;
         let tuple = PyTuple::new(

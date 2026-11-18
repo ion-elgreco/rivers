@@ -19,39 +19,41 @@ pub enum PartitionSelection {
 
 impl PartitionSelection {
     /// Set union (OR).
-    pub fn union(&self, other: &Self) -> Self {
+    pub fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
-            (Self::Empty, x) | (x, Self::Empty) => x.clone(),
+            (Self::Empty, x) | (x, Self::Empty) => x,
             (Self::Keys(a), Self::Keys(b)) => {
-                let merged: HashSet<PartitionKey> = a.union(b).cloned().collect();
-                Self::from_keys(merged)
+                let (mut big, mut small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                // `extend` would reserve room for the duplicates too.
+                small.retain(|k| !big.contains(k));
+                big.extend(small);
+                Self::from_keys(big)
             }
         }
     }
 
     /// Set intersection (AND).
-    pub fn intersect(&self, other: &Self) -> Self {
+    pub fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::All, x) | (x, Self::All) => x.clone(),
+            (Self::All, x) | (x, Self::All) => x,
             (Self::Keys(a), Self::Keys(b)) => {
-                let common: HashSet<PartitionKey> = a.intersection(b).cloned().collect();
-                Self::from_keys(common)
+                let (mut small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                small.retain(|k| big.contains(k));
+                Self::from_retained(small)
             }
         }
     }
 
     /// Drop keys no longer in the universe (`All`/`Empty` pass through).
-    pub fn restrict_to(&self, all_keys: &HashSet<PartitionKey>) -> Self {
+    pub fn restrict_to(self, all_keys: &HashSet<PartitionKey>) -> Self {
         match self {
-            Self::All | Self::Empty => self.clone(),
-            Self::Keys(keys) => Self::from_keys(
-                keys.iter()
-                    .filter(|k| all_keys.contains(*k))
-                    .cloned()
-                    .collect(),
-            ),
+            Self::Keys(mut keys) => {
+                keys.retain(|k| all_keys.contains(k));
+                Self::from_retained(keys)
+            }
+            other => other,
         }
     }
 
@@ -87,6 +89,38 @@ impl PartitionSelection {
         }
     }
 
+    /// [`Self::difference`] that reuses `self`'s keys instead of copying them.
+    pub fn subtract(self, other: &Self, all_keys: &HashSet<PartitionKey>) -> Self {
+        match (self, other) {
+            (Self::Empty, _) | (_, Self::All) => Self::Empty,
+            (x, Self::Empty) => x,
+            (Self::All, Self::Keys(_)) => other.complement(all_keys),
+            (Self::Keys(mut a), Self::Keys(b)) => {
+                a.retain(|k| !b.contains(k));
+                Self::from_retained(a)
+            }
+        }
+    }
+
+    /// [`Self::subtract`] of `Self::from_keys(keys)`, without copying `keys`.
+    pub fn subtract_keys(
+        self,
+        keys: &HashSet<PartitionKey>,
+        all_keys: &HashSet<PartitionKey>,
+    ) -> Self {
+        if keys.is_empty() {
+            return self;
+        }
+        match self {
+            Self::Empty => Self::Empty,
+            Self::All => Self::from_keys(all_keys.difference(keys).cloned().collect()),
+            Self::Keys(mut a) => {
+                a.retain(|k| !keys.contains(k));
+                Self::from_retained(a)
+            }
+        }
+    }
+
     /// True if this selection contains zero partitions.
     pub fn is_empty(&self) -> bool {
         match self {
@@ -113,6 +147,15 @@ impl PartitionSelection {
         } else {
             Self::Keys(keys)
         }
+    }
+
+    /// [`Self::from_keys`] for a set shrunk in place. `retain` keeps the whole
+    /// table; a latch would carry that spare room from tick to tick.
+    fn from_retained(mut keys: HashSet<PartitionKey>) -> Self {
+        if keys.len() * 2 < keys.capacity() {
+            keys.shrink_to_fit();
+        }
+        Self::from_keys(keys)
     }
 
     /// Number of partition keys in this selection.
@@ -202,10 +245,30 @@ fn shift_selection(
 }
 
 impl PartitionMappingKind {
+    /// True if the mapping sends every key to itself.
+    pub(crate) fn is_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::Identity
+                | Self::Subset
+                | Self::TimeWindow { offset: 0, .. }
+                | Self::TimeWindow { grid: None, .. }
+        )
+    }
+
     /// Map upstream partition keys to downstream partition keys, without a
     /// downstream universe: dimension fan-outs over-approximate to `All`.
     pub fn map_to_downstream(&self, upstream_keys: &PartitionSelection) -> PartitionSelection {
         self.map_to_downstream_in(upstream_keys, None)
+    }
+
+    /// [`Self::map_to_downstream`] that returns `upstream_keys` itself when the
+    /// mapping is an identity.
+    fn map_to_downstream_owned(&self, upstream_keys: PartitionSelection) -> PartitionSelection {
+        if self.is_identity() {
+            return upstream_keys;
+        }
+        self.map_to_downstream_in(&upstream_keys, None)
     }
 
     /// Map upstream partition keys to downstream partition keys. With a
@@ -229,12 +292,18 @@ impl PartitionMappingKind {
                 PartitionSelection::Empty => PartitionSelection::Empty,
                 PartitionSelection::All => PartitionSelection::All,
                 PartitionSelection::Keys(keys) => {
+                    // One key refilled per entry: a lookup set built from
+                    // `keys` would grow with the whole dep result.
+                    let mut probe = PartitionKey::Single {
+                        keys: vec![String::new()],
+                    };
                     let mut mapped: HashSet<PartitionKey> = mapping
                         .iter()
                         .filter(|(_, v)| {
-                            keys.contains(&PartitionKey::Single {
-                                keys: vec![(*v).clone()],
-                            })
+                            if let PartitionKey::Single { keys: value } = &mut probe {
+                                value[0].clone_from(v);
+                            }
+                            keys.contains(&probe)
                         })
                         .map(|(k, _)| PartitionKey::Single {
                             keys: vec![k.clone()],
@@ -275,8 +344,8 @@ impl PartitionMappingKind {
                         {
                             let val = upstream_dims.get(upstream_dim.as_str())?;
                             let single_key = PartitionKey::Single { keys: val.to_vec() };
-                            let mapped = per_dim_mapping.map_to_downstream(
-                                &PartitionSelection::Keys(std::iter::once(single_key).collect()),
+                            let mapped = per_dim_mapping.map_to_downstream_owned(
+                                PartitionSelection::Keys(std::iter::once(single_key).collect()),
                             );
                             match mapped {
                                 PartitionSelection::Keys(ks) => {
@@ -382,7 +451,7 @@ impl PartitionMappingKind {
                     });
                     for dim_val in dim_vals {
                         let sel = PartitionSelection::Keys(std::iter::once(dim_val).collect());
-                        match inner.map_to_downstream(&sel) {
+                        match inner.map_to_downstream_owned(sel) {
                             PartitionSelection::Keys(ks) => mapped.extend(ks),
                             PartitionSelection::All => return PartitionSelection::All,
                             PartitionSelection::Empty => {}
@@ -398,7 +467,7 @@ impl PartitionMappingKind {
                             continue;
                         }
                         let sel = PartitionSelection::Keys(std::iter::once(uk.clone()).collect());
-                        match inner.map_to_downstream(&sel) {
+                        match inner.map_to_downstream_owned(sel) {
                             PartitionSelection::Keys(ks) => {
                                 for k in ks {
                                     if let PartitionKey::Single { keys: vals } = k {
@@ -433,18 +502,29 @@ impl PartitionMappingKind {
     }
 }
 
+/// Where the resolver finds an upstream asset's valid partition keys.
+pub trait UpstreamPartitionKeys {
+    /// `None` for an unpartitioned asset.
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>>;
+}
+
+impl UpstreamPartitionKeys for HashMap<String, HashSet<PartitionKey>> {
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>> {
+        self.get(asset)
+    }
+}
+
 /// Resolves partition key mappings between connected assets.
 pub struct PartitionResolver<'a> {
     /// Per-edge mapping kind. Key = (downstream_asset, upstream_asset).
     mappings: &'a HashMap<(String, String), PartitionMappingKind>,
-    /// Upstream asset → its valid partition keys.
-    pub(crate) upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
+    upstream_partition_keys: &'a dyn UpstreamPartitionKeys,
 }
 
 impl<'a> PartitionResolver<'a> {
     pub fn new(
         mappings: &'a HashMap<(String, String), PartitionMappingKind>,
-        upstream_partition_keys: &'a HashMap<String, HashSet<PartitionKey>>,
+        upstream_partition_keys: &'a dyn UpstreamPartitionKeys,
     ) -> Self {
         Self {
             mappings,
@@ -482,6 +562,11 @@ impl<'a> PartitionResolver<'a> {
         mapping.map_to_downstream_in(upstream_keys, downstream_universe)
     }
 
+    /// An upstream asset's valid partition keys; `None` if it is unpartitioned.
+    pub(crate) fn upstream_keys(&self, asset: &str) -> Option<&'a HashSet<PartitionKey>> {
+        self.upstream_partition_keys.partition_keys(asset)
+    }
+
     /// The mapping kind for an edge, if one was declared (absent = Identity).
     pub(crate) fn mapping_kind(
         &self,
@@ -511,7 +596,7 @@ pub struct PartitionEvalContext<'a> {
     /// Per-asset partition status for ALL assets in the cache (not just this asset).
     pub all_partition_statuses: &'a HashMap<String, crate::condition::cache::PartitionStatusEntry>,
     /// Staleness floor for `NewlyUpdated` in a dep pivot, keyed by upstream key.
-    pub dep_root_floor: Option<&'a HashMap<PartitionKey, Option<i64>>>,
+    pub dep_root_floor: Option<&'a HashMap<&'a PartitionKey, Option<i64>>>,
 }
 
 /// Serde adapter for a `PartitionKey`-keyed map (persisted as `(key, value)` pairs).

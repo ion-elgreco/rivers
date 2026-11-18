@@ -332,18 +332,15 @@ pub async fn get_dynamic_partition_keys_page(
     limit: u64,
 ) -> Result<(Vec<(u64, String)>, u64), ServerFnError> {
     let all = load_dynamic_partition_keys(&loc_ns, &loc_name, &dynamic_name).await?;
-    let filtered: Vec<(u64, String)> = all
+    let mut matches = all
         .into_iter()
         .enumerate()
-        .map(|(i, k)| (i as u64, k))
         .filter(|(_, k)| k.contains(&query))
-        .collect();
-    let total = filtered.len() as u64;
-    let window: Vec<(u64, String)> = filtered
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+        .map(|(i, k)| (i as u64, k));
+
+    let skipped = matches.by_ref().take(offset as usize).count();
+    let window: Vec<(u64, String)> = matches.by_ref().take(limit as usize).collect();
+    let total = (skipped + window.len() + matches.count()) as u64;
     Ok((window, total))
 }
 

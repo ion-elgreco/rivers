@@ -1,4 +1,4 @@
-use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
+use surrealdb::types::{Error as SurrealError, Kind, Object, SurrealValue, Value};
 
 use super::PartitionKey;
 
@@ -143,40 +143,40 @@ impl SurrealValue for LaunchedBy {
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
-        let map = <std::collections::BTreeMap<String, Value>>::from_value(value)?;
+        let mut map = Object::from_value(value)?;
         let kind = map
-            .get("kind")
-            .and_then(|v| String::from_value(v.clone()).ok())
+            .remove("kind")
+            .and_then(|v| String::from_value(v).ok())
             .unwrap_or_default();
         match kind.as_str() {
             "" | "manual" => {
                 let user = map
-                    .get("user")
+                    .remove("user")
                     .filter(|v| !matches!(v, Value::None | Value::Null))
-                    .map(|v| UserRef::from_value(v.clone()))
+                    .map(UserRef::from_value)
                     .transpose()?;
                 Ok(Self::Manual { user })
             }
             "schedule" => {
                 let name = map
-                    .get("name")
-                    .map(|v| String::from_value(v.clone()))
+                    .remove("name")
+                    .map(String::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Schedule { name })
             }
             "sensor" => {
                 let name = map
-                    .get("name")
-                    .map(|v| String::from_value(v.clone()))
+                    .remove("name")
+                    .map(String::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Sensor { name })
             }
             "backfill" => {
                 let backfill_id = map
-                    .get("backfill_id")
-                    .map(|v| String::from_value(v.clone()))
+                    .remove("backfill_id")
+                    .map(String::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Backfill { backfill_id })

@@ -15,6 +15,7 @@ use rivers_api::rivers::code_location_service_server::{
 use rivers_api::rivers::*;
 use tonic::{Request, Response, Status};
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -267,13 +268,13 @@ impl CodeLocationService for CodeLocationImpl {
     ) -> Result<Response<ExecuteJobResponse>, Status> {
         let req = request.into_inner();
         let launched_by = manual_launch(req.user);
-        let jobs = self.handle.job_names();
-        if !jobs.contains(&req.job_name) {
+        let Some(job_assets) = self.handle.job_asset_names(&req.job_name) else {
+            let jobs = self.handle.job_names();
             return Err(Status::not_found(format!(
                 "unknown job '{}'; registered jobs: {jobs:?}",
                 req.job_name
             )));
-        }
+        };
         let shown = req.action.filter(|a| !a.is_empty());
         self.handle
             .validate_job_verb(&req.job_name, shown.as_deref())
@@ -287,10 +288,6 @@ impl CodeLocationService for CodeLocationImpl {
                 .validate_keyless_job(&req.job_name)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
-        let job_assets = self
-            .handle
-            .job_asset_names(&req.job_name)
-            .unwrap_or_default();
         let config = self
             .launch_config(req.config, &job_assets, shown.as_deref())
             .await?;
@@ -336,21 +333,20 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if let Some(config) = req.config {
-            let (selection, action) = match &rerun {
+            let config = match &rerun {
                 crate::daemon::RunRerunRequest::Job(r) => {
                     let job = r.job_name.as_deref().unwrap_or_default();
-                    (
-                        self.handle.job_asset_names(job).unwrap_or_default(),
-                        self.handle.job_verb(job),
-                    )
+                    let selection = self.handle.job_asset_names(job).unwrap_or_default();
+                    let action = self.handle.job_verb(job);
+                    self.launch_config(Some(config), &selection, action.as_deref())
+                        .await?
                 }
                 crate::daemon::RunRerunRequest::Materialization(m) => {
-                    (m.asset_selection.clone(), m.action.clone())
+                    self.launch_config(Some(config), &m.asset_selection, m.action.as_deref())
+                        .await?
                 }
             };
-            *rerun.config_mut() = self
-                .launch_config(Some(config), &selection, action.as_deref())
-                .await?;
+            *rerun.config_mut() = config;
         }
 
         let status = self.run_dispatcher.mode_label().to_string();
@@ -557,7 +553,7 @@ impl CodeLocationService for CodeLocationImpl {
                         asset_type: node.asset_type().to_string(),
                         actions,
                         config_schema,
-                        metadata: node.metadata().unwrap_or_default(),
+                        metadata: node.metadata().cloned().unwrap_or_default(),
                     });
                 }
 
@@ -606,7 +602,7 @@ impl CodeLocationService for CodeLocationImpl {
                     status: status.to_string(),
                     timezone: s.timezone,
                     description: s.description,
-                    tags: tags_to_proto(s.tags.as_ref()),
+                    tags: tags_to_proto(s.tags),
                 }
             })
             .collect();
@@ -634,7 +630,7 @@ impl CodeLocationService for CodeLocationImpl {
                     minimum_interval: s.minimum_interval,
                     description: s.description,
                     asset_selection: s.asset_selection.unwrap_or_default(),
-                    tags: tags_to_proto(s.tags.as_ref()),
+                    tags: tags_to_proto(s.tags),
                 }
             })
             .collect();
@@ -790,7 +786,7 @@ impl CodeLocationService for CodeLocationImpl {
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
             asset_selection,
-            partition_key: pk.as_ref().map(|k| k.into()),
+            partition_key: pk.map(Into::into),
             tags,
             launched_by,
             action: Some(req.action),
@@ -869,13 +865,14 @@ impl CodeLocationService for CodeLocationImpl {
         };
         // The assets the children run: a job's own, or the selection (empty
         // means every asset).
-        let child_assets: Vec<String> = match &req.job_name {
-            Some(name) => self.handle.job_asset_names(name).unwrap_or_default(),
-            None if req.selection.is_empty() => self
-                .handle
-                .asset_names()
-                .map_err(|e| Status::internal(e.to_string()))?,
-            None => req.selection.clone(),
+        let child_assets: Cow<'_, [String]> = match &req.job_name {
+            Some(name) => Cow::Owned(self.handle.job_asset_names(name).unwrap_or_default()),
+            None if req.selection.is_empty() => Cow::Owned(
+                self.handle
+                    .asset_names()
+                    .map_err(|e| Status::internal(e.to_string()))?,
+            ),
+            None => Cow::Borrowed(&req.selection),
         };
         let config = self
             .launch_config(req.config, &child_assets, action.as_deref())
@@ -901,7 +898,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -941,7 +938,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -976,7 +973,7 @@ impl CodeLocationService for CodeLocationImpl {
 
         let mut outcome = self
             .backfill_dispatcher
-            .dispatch(&[backfill_request])
+            .dispatch(vec![backfill_request])
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

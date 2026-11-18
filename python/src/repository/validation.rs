@@ -386,19 +386,18 @@ fn collect_dynamic_namespaces(
 pub(super) fn valid_part_for_verb<'a>(
     state: &'a ResolvedState,
     asset_names: &'a [String],
-    key: &PyPartitionKey,
+    mut key: PyPartitionKey,
     verb: Option<&str>,
 ) -> Option<PyPartitionKey> {
     let names = || asset_names.iter().map(String::as_str);
-    let mut part = key.clone();
 
     for (_, definition) in iter_partitioned_assets(&state.node_map, names()) {
-        part = definition.valid_part(&part).ok().flatten()?;
+        key = definition.valid_part(&key).ok().flatten()?;
     }
 
-    validate_partition_for_verb(state, names(), Some(&part), verb)
+    validate_partition_for_verb(state, names(), Some(&key), verb)
         .is_ok()
-        .then_some(part)
+        .then_some(key)
 }
 
 /// `key` without the dynamic values in `retired`, pairs of namespace and
@@ -406,59 +405,53 @@ pub(super) fn valid_part_for_verb<'a>(
 pub(super) fn without_dynamic_values<'a>(
     state: &'a ResolvedState,
     asset_names: &'a [String],
-    key: &PyPartitionKey,
+    mut key: PyPartitionKey,
     retired: &HashSet<(&str, &str)>,
 ) -> Option<PyPartitionKey> {
     let names = asset_names.iter().map(String::as_str);
-    let mut part = key.clone();
 
     for (_, definition) in iter_partitioned_assets(&state.node_map, names) {
-        part = remove_dynamic_values(definition, &part, retired)?;
+        key = remove_dynamic_values(definition, key, retired)?;
     }
 
-    Some(part)
+    Some(key)
 }
 
 fn remove_dynamic_values(
     pd: &PartitionsDefinition,
-    pk: &PyPartitionKey,
+    pk: PyPartitionKey,
     retired: &HashSet<(&str, &str)>,
 ) -> Option<PyPartitionKey> {
-    let live = |namespace: &str, values: &[String]| -> Vec<String> {
-        values
-            .iter()
-            .filter(|value| !retired.contains(&(namespace, value.as_str())))
-            .cloned()
-            .collect()
+    let drop_retired = |namespace: &str, values: &mut Vec<String>| {
+        values.retain(|value| !retired.contains(&(namespace, value.as_str())));
     };
 
     match (pd, pk) {
-        (PartitionsDefinition::Dynamic { name }, PyPartitionKey::Single { key }) => {
-            let kept = live(name, key);
-            (!kept.is_empty()).then_some(PyPartitionKey::Single { key: kept })
+        (PartitionsDefinition::Dynamic { name }, PyPartitionKey::Single { mut key }) => {
+            drop_retired(name, &mut key);
+            (!key.is_empty()).then_some(PyPartitionKey::Single { key })
         }
-        (PartitionsDefinition::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
-            let mut kept = keys.clone();
+        (PartitionsDefinition::Multi { dimensions }, PyPartitionKey::Multi { mut keys }) => {
             for (dim, dim_def) in dimensions {
                 if let PartitionsDefinition::Dynamic { name } = dim_def
-                    && let Some(values) = kept.get_mut(dim)
+                    && let Some(values) = keys.get_mut(dim)
                 {
-                    *values = live(name, values);
+                    drop_retired(name, values);
                     if values.is_empty() {
                         return None;
                     }
                 }
             }
-            Some(PyPartitionKey::Multi { keys: kept })
+            Some(PyPartitionKey::Multi { keys })
         }
         (_, PyPartitionKey::Set { keys }) => {
             let kept: Vec<PyPartitionKey> = keys
-                .iter()
+                .into_iter()
                 .filter_map(|member| remove_dynamic_values(pd, member, retired))
                 .collect();
             (!kept.is_empty()).then_some(PyPartitionKey::Set { keys: kept })
         }
-        _ => Some(pk.clone()),
+        (_, pk) => Some(pk),
     }
 }
 

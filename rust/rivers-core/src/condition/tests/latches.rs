@@ -297,9 +297,9 @@ fn test_dep_aggregate_short_circuit_preserves_skipped_dep_latch() {
     );
     let deps = HashMap::from([("r".to_string(), vec!["a".to_string(), "b".to_string()])]);
 
-    let both = HashSet::from(["a".to_string(), "b".to_string()]);
-    let none: HashSet<String> = HashSet::new();
-    let only_a = HashSet::from(["a".to_string()]);
+    let both = HashSet::from(["a", "b"]);
+    let none: HashSet<&str> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
 
     let r = make_record("r");
     let a = make_materialized_record("a", 100);
@@ -377,8 +377,8 @@ fn test_sibling_dep_aggregates_do_not_clobber_shared_dep_latch() {
     let tree = ConditionNode::And(vec![agg(), agg()]);
     let deps = HashMap::from([("r".to_string(), vec!["a".to_string()])]);
 
-    let only_a = HashSet::from(["a".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
+    let none: HashSet<&str> = HashSet::new();
     let r = make_record("r");
     let a = make_materialized_record("a", 100);
     let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
@@ -418,6 +418,23 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
     let tree = ConditionNode::any_deps_match(ConditionNode::any_deps_match(
         ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
     ));
+    assert_unpartitioned_dep_latch_persists(&tree, "c");
+}
+
+/// The bool fallback for an unpartitioned dep reads that dep's own latch back, also after a
+/// stateless sibling aggregate has pivoted into the same dep.
+#[test]
+fn test_unpartitioned_dep_latch_persists_under_partitioned_root() {
+    let tree = ConditionNode::any_deps_match(ConditionNode::Missing)
+        | ConditionNode::any_deps_match(
+            ConditionNode::InProgress.since(ConditionNode::ExecutionFailed),
+        );
+    assert_unpartitioned_dep_latch_persists(&tree, "b");
+}
+
+/// Partitioned root r ← unpartitioned b ← c. Tick 1: `latched` in progress; tick 2: not in
+/// progress, never failed, so `tree` fires only from the persisted Since latch.
+fn assert_unpartitioned_dep_latch_persists(tree: &ConditionNode, latched: &str) {
     let p1 = spk("p1");
     let all_keys = HashSet::from([p1.clone()]);
 
@@ -434,8 +451,8 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
         ("b".to_string(), vec!["c".to_string()]),
     ]);
 
-    let only_c = HashSet::from(["c".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_latched = HashSet::from([latched]);
+    let none: HashSet<&str> = HashSet::new();
 
     let r_timestamps = HashMap::from([(p1.clone(), 50i64)]);
     let r_status = crate::condition::cache::PartitionStatusEntry {
@@ -459,13 +476,13 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
         dep_root_floor: None,
     };
 
-    // ── Tick 1: c in-progress → inner Since latches true for c ──
+    // ── Tick 1: `latched` in-progress → its Since latches true ──
     let mut ctx1 = make_ctx("r", &r, &records, &deps);
-    ctx1.cache.in_progress_assets = &only_c;
+    ctx1.cache.in_progress_assets = &only_latched;
     let pctx1 = make_pctx();
     ctx1.partitions = Some(&pctx1);
-    let result1 = evaluate(&tree, &ctx1);
-    assert!(result1.fired, "tick 1: c in-progress → nested Since fires");
+    let result1 = evaluate(tree, &ctx1);
+    assert!(result1.fired, "tick 1: {latched} in-progress → Since fires");
 
     let mut state_r = AssetConditionState::default();
     update_condition_state(
@@ -480,18 +497,17 @@ fn test_nested_dep_aggregate_under_unpartitioned_dep_persists_latch() {
         &result1,
     );
 
-    // Tick 2: c no longer in-progress, never failed → the inner Since fires only from its persisted latch, which must survive.
+    // Tick 2: `latched` no longer in-progress, never failed → the Since fires only from its persisted latch, which must survive.
     let mut ctx2 = make_ctx("r", &r, &records, &deps);
     ctx2.prev_state = &state_r;
     ctx2.cache.in_progress_assets = &none;
     ctx2.now = 2000;
     let pctx2 = make_pctx();
     ctx2.partitions = Some(&pctx2);
-    let result2 = evaluate(&tree, &ctx2);
+    let result2 = evaluate(tree, &ctx2);
     assert!(
         result2.fired,
-        "tick 2: a dep-aggregate nested inside the unpartitioned-dep fallback \
-         must persist its per-dep latch"
+        "tick 2: the {latched} latch under the unpartitioned-dep fallback must persist"
     );
 }
 
@@ -507,8 +523,8 @@ fn test_and_short_circuit_preserves_stateful_child_latch() {
     let deps = HashMap::new();
     let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
     let records = HashMap::from([("r".to_string(), r.clone())]);
-    let only_r = HashSet::from(["r".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_r = HashSet::from(["r"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // Tick 1: gate (InProgress) and trigger (ExecutionFailed) true → Since latches, And fires.
     let mut ctx1 = make_ctx("r", &r, &records, &deps);
@@ -578,8 +594,8 @@ fn test_cron_reset_in_dep_pivot_uses_root_tick() {
     let a = make_materialized_record("a", 100);
     let records = HashMap::from([("r".to_string(), r.clone()), ("a".to_string(), a.clone())]);
 
-    let only_a = HashSet::from(["a".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_a = HashSet::from(["a"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // Tue 2023-11-14: 16:00 (tick 1) → 16:31 (tick 2); cron tick at 16:30.
     let t1: i64 = 1_699_977_600_000_000_000;
@@ -670,8 +686,8 @@ fn test_or_short_circuit_preserves_stateful_child_latch() {
     let deps = HashMap::new();
     let r = make_materialized_record("r", 100); // materialized → Missing (reset) false
     let records = HashMap::from([("r".to_string(), r.clone())]);
-    let only_r = HashSet::from(["r".to_string()]);
-    let none: HashSet<String> = HashSet::new();
+    let only_r = HashSet::from(["r"]);
+    let none: HashSet<&str> = HashSet::new();
 
     // ── Tick 1: gate false, trigger true → Or evaluates the Since (latches true) ──
     let mut ctx1 = make_ctx("r", &r, &records, &deps);

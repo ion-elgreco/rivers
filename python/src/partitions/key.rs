@@ -214,7 +214,63 @@ impl PyPartitionKey {
     /// run into per-partition contexts and materialization events.
     pub fn members(&self) -> Vec<PyPartitionKey> {
         let core: rivers_core::storage::PartitionKey = self.into();
-        core.members().iter().map(PyPartitionKey::from).collect()
+        core.members()
+            .into_iter()
+            .map(PyPartitionKey::from)
+            .collect()
+    }
+
+    /// Number of members this key expands to, without building them.
+    pub fn member_count(&self) -> usize {
+        match self {
+            Self::Single { key } => key.len(),
+            Self::Multi { keys } => keys
+                .values()
+                .map(Vec::len)
+                .fold(1usize, |a, n| a.saturating_mul(n)),
+            Self::Set { keys } => keys.iter().map(Self::member_count).sum(),
+        }
+    }
+
+    /// Frees the spare capacity of the value lists.
+    pub fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Single { key } => key.shrink_to_fit(),
+            Self::Multi { keys } => keys.values_mut().for_each(Vec::shrink_to_fit),
+            Self::Set { keys } => keys.iter_mut().for_each(Self::shrink_to_fit),
+        }
+    }
+}
+
+/// A key decoded from storage can keep the decoder's larger buffer;
+/// `shrink_to_fit` frees the excess before the key lives on in Python.
+impl From<rivers_core::storage::PartitionKey> for PyPartitionKey {
+    fn from(spk: rivers_core::storage::PartitionKey) -> Self {
+        match spk {
+            rivers_core::storage::PartitionKey::Single { mut keys } => {
+                keys.shrink_to_fit();
+                keys.sort();
+                Self::Single { key: keys }
+            }
+            rivers_core::storage::PartitionKey::Multi { dims } => {
+                let keys = dims
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        v.shrink_to_fit();
+                        v.sort();
+                        (k, v)
+                    })
+                    .collect();
+                Self::Multi { keys }
+            }
+            rivers_core::storage::PartitionKey::Set { keys } => Self::Set {
+                keys: keys.into_iter().map(PyPartitionKey::from).collect(),
+            },
+            key @ (rivers_core::storage::PartitionKey::SingleItems { .. }
+            | rivers_core::storage::PartitionKey::MultiItems { .. }) => {
+                Self::from(key.expanded().into_owned())
+            }
+        }
     }
 }
 
@@ -242,7 +298,7 @@ impl From<&rivers_core::storage::PartitionKey> for PyPartitionKey {
             },
             key @ (rivers_core::storage::PartitionKey::SingleItems { .. }
             | rivers_core::storage::PartitionKey::MultiItems { .. }) => {
-                Self::from(key.expanded().as_ref())
+                Self::from(key.expanded().into_owned())
             }
         }
     }
@@ -264,5 +320,73 @@ impl From<&PyPartitionKey> for rivers_core::storage::PartitionKey {
                 keys: keys.iter().map(|k| k.into()).collect(),
             },
         }
+    }
+}
+
+impl From<PyPartitionKey> for rivers_core::storage::PartitionKey {
+    fn from(pk: PyPartitionKey) -> Self {
+        match pk {
+            PyPartitionKey::Single { key } => Self::Single { keys: key },
+            PyPartitionKey::Multi { keys } => {
+                let mut dims: Vec<(String, Vec<String>)> = keys.into_iter().collect();
+                dims.sort_by(|a, b| a.0.cmp(&b.0));
+                Self::Multi { dims }
+            }
+            PyPartitionKey::Set { keys } => Self::Set {
+                keys: keys.into_iter().map(Self::from).collect(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn single(values: &[&str]) -> PyPartitionKey {
+        PyPartitionKey::Single {
+            key: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn multi(dims: &[(&str, &[&str])]) -> PyPartitionKey {
+        PyPartitionKey::Multi {
+            keys: dims
+                .iter()
+                .map(|(dim, values)| {
+                    (
+                        dim.to_string(),
+                        values.iter().map(|v| v.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn member_count_matches_core() {
+        let batched = PyPartitionKey::Single {
+            key: (0..100_000).map(|i| format!("k{i:07}")).collect(),
+        };
+        let keys = [
+            single(&["a"]),
+            batched,
+            multi(&[("day", &["d1"]), ("zone", &["z1"])]),
+            multi(&[("day", &["d1", "d2", "d3"]), ("zone", &["z1", "z2"])]),
+            PyPartitionKey::Set {
+                keys: vec![
+                    single(&["a", "b"]),
+                    multi(&[("day", &["d1", "d2"]), ("zone", &["z1", "z2"])]),
+                ],
+            },
+        ];
+
+        let counts: Vec<usize> = keys.iter().map(PyPartitionKey::member_count).collect();
+        let core_counts: Vec<usize> = keys
+            .iter()
+            .map(|key| rivers_core::storage::PartitionKey::from(key).member_count())
+            .collect();
+        assert_eq!(counts, core_counts);
+        assert_eq!(counts, [1, 100_000, 1, 6, 6]);
     }
 }

@@ -6,6 +6,7 @@
 //! the edges of its groups by their place and does not read every key: a
 //! dimension can have millions.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// The most rows that one row of the outline opens to.
@@ -16,7 +17,7 @@ pub trait Keys {
     fn len(&self) -> usize;
 
     /// The key at the place `index`, which is less than `len()`.
-    fn key(&self, index: usize) -> String;
+    fn key(&self, index: usize) -> Cow<'_, str>;
 
     /// The places where `key` is cut into the starts that the keys of a
     /// group share.
@@ -34,8 +35,8 @@ impl Keys for [String] {
         <[String]>::len(self)
     }
 
-    fn key(&self, index: usize) -> String {
-        self[index].clone()
+    fn key(&self, index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(&self[index])
     }
 }
 
@@ -44,8 +45,8 @@ impl Keys for Vec<String> {
         Vec::len(self)
     }
 
-    fn key(&self, index: usize) -> String {
-        self[index].clone()
+    fn key(&self, index: usize) -> Cow<'_, str> {
+        Cow::Borrowed(&self[index])
     }
 }
 
@@ -82,8 +83,8 @@ pub fn between<K: Keys + ?Sized>(keys: &K, first: &str, last: &str) -> Range<usi
     if first.is_empty() && last.is_empty() {
         return 0..keys.len();
     }
-    let start = first_place(0..keys.len(), |at| keys.key(at).as_str() >= first);
-    let end = first_place(start..keys.len(), |at| keys.key(at).as_str() > last);
+    let start = first_place(0..keys.len(), |at| *keys.key(at) >= *first);
+    let end = first_place(start..keys.len(), |at| *keys.key(at) > *last);
     start..end
 }
 
@@ -142,7 +143,7 @@ pub fn children<K: Keys + ?Sized>(keys: &K, places: Range<usize>) -> Split {
 /// where the keys end to differ. `None` when there are fewer than two keys.
 pub fn key_length<K: Keys + ?Sized>(keys: &K) -> Option<usize> {
     // One pair of keys can differ early: 23:00 and 00:00 of the next day.
-    let sample: Vec<String> = (0..keys.len().min(4)).map(|at| keys.key(at)).collect();
+    let sample: Vec<Cow<str>> = (0..keys.len().min(4)).map(|at| keys.key(at)).collect();
     sample
         .windows(2)
         .map(|pair| {
@@ -223,7 +224,7 @@ fn at_level<K: Keys + ?Sized>(keys: &K, shared: usize, runs: Vec<Range<usize>>) 
         .map(|run| {
             let first = keys.key(run.start);
             let label = start(&first, shared).to_string();
-            group(keys, run, first, label)
+            group(keys, run, first.into_owned(), label)
         })
         .collect();
     Split {
@@ -236,7 +237,7 @@ fn at_level<K: Keys + ?Sized>(keys: &K, shared: usize, runs: Vec<Range<usize>>) 
 fn of_keys<K: Keys + ?Sized>(keys: &K, places: Range<usize>) -> Split {
     let groups = places
         .map(|at| {
-            let key = keys.key(at);
+            let key = keys.key(at).into_owned();
             KeyGroup {
                 label: key.clone(),
                 first: key.clone(),
@@ -260,7 +261,7 @@ fn parts<K: Keys + ?Sized>(keys: &K, places: Range<usize>, most: usize) -> Split
         .step_by(size)
         .map(|from| {
             let run = from..(from + size).min(places.end);
-            let first = keys.key(run.start);
+            let first = keys.key(run.start).into_owned();
             let label = if run.len() == 1 {
                 first.clone()
             } else {
@@ -279,7 +280,7 @@ fn parts<K: Keys + ?Sized>(keys: &K, places: Range<usize>, most: usize) -> Split
 fn group<K: Keys + ?Sized>(keys: &K, run: Range<usize>, first: String, label: String) -> KeyGroup {
     KeyGroup {
         label,
-        last: keys.key(run.end - 1),
+        last: keys.key(run.end - 1).into_owned(),
         first,
         keys: run.len(),
     }
@@ -299,11 +300,11 @@ pub fn marks(groups: &[KeyGroup], of_format: &[usize], most: usize) -> Vec<(usiz
     let mut finest = None;
     let mut above = 1;
     for shared in cuts(&first.first, of_format) {
-        let mut level: Vec<(usize, String)> = Vec::new();
+        let mut level: Vec<(usize, &str)> = Vec::new();
         for (at, group) in groups.iter().enumerate() {
             let text = start(&group.first, shared);
-            if level.last().is_none_or(|(_, last)| last != text) {
-                level.push((at, text.to_string()));
+            if level.last().is_none_or(|(_, last)| *last != text) {
+                level.push((at, text));
             }
         }
 
@@ -317,7 +318,10 @@ pub fn marks(groups: &[KeyGroup], of_format: &[usize], most: usize) -> Vec<(usiz
         }
     }
     if let Some(level) = finest {
-        return level;
+        return level
+            .into_iter()
+            .map(|(at, text)| (at, text.to_owned()))
+            .collect();
     }
 
     let count = (most / 2).clamp(1, groups.len());
@@ -687,8 +691,8 @@ mod tests {
             self.keys.len()
         }
 
-        fn key(&self, index: usize) -> String {
-            self.keys[index].clone()
+        fn key(&self, index: usize) -> Cow<'_, str> {
+            Cow::Borrowed(&self.keys[index])
         }
 
         fn cuts(&self, key: &str) -> Vec<usize> {
@@ -769,16 +773,16 @@ mod tests {
             1_000_000
         }
 
-        fn key(&self, index: usize) -> String {
+        fn key(&self, index: usize) -> Cow<'_, str> {
             self.read.set(self.read.get() + 1);
             let (day, second) = (index / 86_400, index % 86_400);
-            format!(
+            Cow::Owned(format!(
                 "2024-01-{:02}T{:02}:{:02}:{:02}",
                 day + 1,
                 second / 3_600,
                 second / 60 % 60,
                 second % 60
-            )
+            ))
         }
     }
 

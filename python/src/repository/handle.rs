@@ -147,8 +147,7 @@ pub(crate) struct RepoHandle {
 
 /// One run to enqueue via [`submit_runs`].
 pub(crate) struct RunSubmission {
-    /// `None` = all assets.
-    pub(crate) selection: Option<Vec<String>>,
+    pub(crate) selection: Vec<String>,
     /// The key as the run record holds it.
     pub(crate) partition_key: Option<rivers_core::storage::PartitionKey>,
     pub(crate) tags: Option<Vec<(String, String)>>,
@@ -312,14 +311,12 @@ impl RepoHandle {
                 .as_ref()
                 .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
 
-            let asset_names: Vec<String> = if let Some(ref sel) = selection {
-                sel.clone()
-            } else {
+            let asset_names: Vec<String> = selection.unwrap_or_else(|| {
                 graph
                     .node_indices()
                     .map(|idx| graph[idx].name.clone())
                     .collect()
-            };
+            });
 
             // The record carries the job's verb, so the key must satisfy it.
             let action = job_action(&state.jobs_info, job_name.as_deref());
@@ -417,7 +414,7 @@ impl RepoHandle {
     /// no `job_name`). Caller-minted `run_id`. No validation — the
     /// caller is responsible (gRPC validates at the boundary;
     /// internal callers like sensors/schedules/conditions trust their
-    /// upstream).
+    /// upstream). Returns the written record.
     ///
     /// Used by:
     ///   * `DirectRunDispatcher::dispatch_materialization` (async fn,
@@ -435,7 +432,7 @@ impl RepoHandle {
         run_id: String,
         action: Option<String>,
         config: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<RunRecord> {
         let state = self.resolved()?;
         create_materialization_run(
             &state,
@@ -595,22 +592,22 @@ impl RepoHandle {
             .map_err(load_failed)?;
         let total: usize = requested.iter().map(PartitionKey::member_count).sum();
 
-        let asset_names: Vec<String> = match &record.job_name {
+        let asset_names: &[String] = match &record.job_name {
             Some(name) => state
                 .jobs_info
                 .get(name)
-                .map(|job| job.asset_names.clone())
+                .map(|job| job.asset_names.as_slice())
                 .ok_or_else(|| ExecutionError::new_err(format!("Job '{name}' not found")))?,
-            None => record.asset_selection.clone(),
+            None => &record.asset_selection,
         };
 
         let mut partition_keys: Vec<PyPartitionKey> = Vec::with_capacity(requested.len());
         let mut kept = 0usize;
-        for key in &requested {
+        for key in requested {
             let Some(key) = valid_part_for_verb(
                 &state,
-                &asset_names,
-                &PyPartitionKey::from(key),
+                asset_names,
+                PyPartitionKey::from(key),
                 record.action.as_deref(),
             ) else {
                 continue;
@@ -629,11 +626,14 @@ impl RepoHandle {
                 .iter()
                 .map(|(_, namespace, value)| (namespace.as_str(), value.as_str()))
                 .collect();
-            let Some(key) = without_dynamic_values(&state, &asset_names, &key, &retired) else {
+            let Some(mut key) = without_dynamic_values(&state, asset_names, key, &retired) else {
                 continue;
             };
 
-            kept += PartitionKey::from(&key).member_count();
+            // The filtered value lists keep their growth capacity, and the
+            // keys live on in the request.
+            key.shrink_to_fit();
+            kept += key.member_count();
             partition_keys.push(key);
         }
 
@@ -737,7 +737,7 @@ impl RepoHandle {
                     crate::daemon::RunRequestData {
                         run_key: None,
                         tags: Some(tags.into_iter().collect()),
-                        partition_key: record.partition_key.as_ref().map(PyPartitionKey::from),
+                        partition_key: record.partition_key.map(PyPartitionKey::from),
                         job_name: Some(job_name),
                         launched_by,
                         config: record.config,
@@ -820,7 +820,9 @@ impl RepoHandle {
 
         let missing: Vec<PyPartitionKey> = all
             .into_iter()
-            .filter(|pk| !materialized.contains(&rivers_core::storage::PartitionKey::from(pk)))
+            .map(PartitionKey::from)
+            .filter(|k| !materialized.contains(k))
+            .map(PyPartitionKey::from)
             .collect();
 
         if missing.is_empty() {
@@ -957,43 +959,37 @@ pub(super) async fn submit_runs(
     launched_by: LaunchedBy,
 ) -> PyResult<Vec<String>> {
     let (records, storage) = {
-        let graph = state
-            .inner_repo
-            .graph
-            .as_ref()
-            .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
-
         let now = now_ts();
-        let all_names: Vec<String> = graph
-            .node_indices()
-            .map(|idx| graph[idx].name.clone())
-            .collect();
-
         let mut records: Vec<RunRecord> = Vec::with_capacity(runs.len());
 
-        for sub in &runs {
-            let asset_names = sub.selection.clone().unwrap_or_else(|| all_names.clone());
-            let action = sub.action.clone();
-            let run_id = uuid::Uuid::new_v4().to_string();
-            let run_tags = sub.tags.clone().unwrap_or_default();
+        for RunSubmission {
+            selection,
+            partition_key,
+            tags,
+            job_name,
+            action,
+            config,
+        } in runs
+        {
+            let run_tags = tags.unwrap_or_default();
             let priority = priority_from_tags(&run_tags);
 
             records.push(RunRecord {
-                run_id,
+                run_id: uuid::Uuid::new_v4().to_string(),
                 code_location_id: state.code_location_id.clone(),
-                job_name: sub.job_name.clone(),
+                job_name,
                 status: RunStatus::Queued,
                 start_time: now,
                 end_time: None,
                 execution_start_time: None,
                 tags: run_tags,
-                node_names: asset_names,
+                node_names: selection,
                 priority,
-                partition_key: sub.partition_key.clone(),
+                partition_key,
                 block_reason: None,
                 launched_by: launched_by.clone(),
                 action,
-                config: sub.config.clone(),
+                config,
             });
         }
         (records, state.storage.clone())
@@ -1112,7 +1108,7 @@ pub(super) async fn create_materialization_run(
     run_id: String,
     action: Option<String>,
     config: Option<String>,
-) -> PyResult<()> {
+) -> PyResult<RunRecord> {
     let priority = priority_from_tags(&tags);
     let record = RunRecord {
         run_id,
@@ -1144,7 +1140,7 @@ pub(super) async fn create_materialization_run(
         "materialization run created"
     );
 
-    Ok(())
+    Ok(record)
 }
 
 /// Serializes the first resolve, so concurrent first callers resolve once.

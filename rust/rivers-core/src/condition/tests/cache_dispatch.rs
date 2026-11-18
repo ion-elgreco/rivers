@@ -15,7 +15,7 @@ async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -95,7 +95,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("raw", 1_000),
             make_materialized_record("dst", 1_000),
         ])
@@ -180,7 +180,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     pass.refresh_cache(&storage, 4_000).await.unwrap();
 
     // The dep update fires dst, but its dispatch fails.
-    let out = pass.plan_tick(4_000, false);
+    let mut out = pass.plan_tick(4_000, false);
     assert!(
         out.plan.unpartitioned.contains(&"dst".to_string()),
         "precondition: the dep update must fire dst"
@@ -191,7 +191,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     pass.cache.clear_dispatched_run("dst", "run-fail");
     // …and commit the tick with dst's dispatch marked failed.
     let failed: HashSet<String> = ["dst".to_string()].into_iter().collect();
-    let dirty = pass.commit_tick(&out, &failed, 4_000);
+    let dirty = pass.commit_tick(&mut out, &failed, 4_000);
     assert!(
         !dirty,
         "an all-failed tick leaves no latch state to persist"
@@ -201,25 +201,25 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         !pass.should_skip(false),
         "a failed dispatch must force a retry evaluation even with no new changes"
     );
-    let retry = pass.plan_tick(5_000, false);
+    let mut retry = pass.plan_tick(5_000, false);
     assert!(
         retry.plan.unpartitioned.contains(&"dst".to_string()),
         "the un-consumed dep trigger must re-fire on the retry tick"
     );
-    let dirty = pass.commit_tick(&retry, &HashSet::new(), 5_000);
+    let dirty = pass.commit_tick(&mut retry, &HashSet::new(), 5_000);
     assert!(dirty, "a committed fire consumes latches and must persist");
 
     assert!(
         pass.should_skip(false),
         "after a successful commit the pass may skip no-change ticks again"
     );
-    let done = pass.plan_tick(6_000, false);
+    let mut done = pass.plan_tick(6_000, false);
     assert!(
         done.plan.is_empty(),
         "the trigger must be consumed exactly once after a successful dispatch; got {:?}",
         done.plan.unpartitioned
     );
-    let dirty = pass.commit_tick(&done, &HashSet::new(), 6_000);
+    let dirty = pass.commit_tick(&mut done, &HashSet::new(), 6_000);
     assert!(
         !dirty,
         "a passive tick has nothing latch-bearing to persist"
@@ -239,7 +239,7 @@ async fn test_initial_evaluation_fires_once_not_per_restart() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_materialized_record("a", 1_000)])
+        .register_assets(vec![make_materialized_record("a", 1_000)])
         .await
         .unwrap();
 
@@ -311,7 +311,7 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("a"), make_materialized_record("b", 5_000)])
+        .register_assets(vec![make_record("a"), make_materialized_record("b", 5_000)])
         .await
         .unwrap();
 
@@ -407,7 +407,7 @@ async fn test_initial_load_ignores_failed_action_runs() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("a")])
+        .register_assets(vec![make_record("a")])
         .await
         .unwrap();
 
@@ -473,7 +473,7 @@ async fn test_materializing_action_triggers_downstream_eager() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("events"), make_record("rollup")])
+        .register_assets(vec![make_record("events"), make_record("rollup")])
         .await
         .unwrap();
     let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
@@ -642,7 +642,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
         let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
         storage
             .for_code_location(&ctx)
-            .register_assets(&[make_record("events"), make_record("daily_summary")])
+            .register_assets(vec![make_record("events"), make_record("daily_summary")])
             .await
             .unwrap();
         storage
@@ -732,7 +732,7 @@ async fn storage_with_live_action_run(
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("a")])
+        .register_assets(vec![make_record("a")])
         .await
         .unwrap();
     storage
@@ -824,7 +824,7 @@ async fn test_steady_state_refresh_ignores_live_action_runs() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[make_record("a")])
+        .register_assets(vec![make_record("a")])
         .await
         .unwrap();
 
@@ -1190,7 +1190,7 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("raw", 1_000),
             make_materialized_record("dst", 1_000),
         ])
@@ -1381,7 +1381,7 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("raw", 1_000),
             make_materialized_record("dst", 1_000),
         ])
@@ -1532,7 +1532,7 @@ async fn pending_test_setup() -> (
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[make_materialized_record("a", 1000)])
+        .register_assets(vec![make_materialized_record("a", 1000)])
         .await
         .unwrap();
     let mut cache = AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string());
@@ -1792,7 +1792,7 @@ async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[
+        .register_assets(vec![
             make_materialized_record("x", 1000),
             make_materialized_record("y", 1000),
         ])

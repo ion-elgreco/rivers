@@ -1,5 +1,6 @@
 //! Condition evaluation state and context types.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -58,23 +59,6 @@ impl AssetConditionState {
         self.condition_fingerprint = new_fingerprint;
         self.is_initial = true;
         self.partition_state = None;
-    }
-
-    /// Clone everything except `partition_state` (which can hold a
-    /// per-partition timestamp map far too large to copy around).
-    pub fn scalar_clone(&self) -> Self {
-        Self {
-            previous_results: self.previous_results.clone(),
-            dep_previous_results: self.dep_previous_results.clone(),
-            dep_baselines: self.dep_baselines.clone(),
-            last_handled_timestamp: self.last_handled_timestamp,
-            last_materialized_timestamp: self.last_materialized_timestamp,
-            last_data_version: self.last_data_version.clone(),
-            last_tick_timestamp: self.last_tick_timestamp,
-            condition_fingerprint: self.condition_fingerprint.clone(),
-            is_initial: self.is_initial,
-            partition_state: None,
-        }
     }
 }
 
@@ -156,9 +140,9 @@ pub struct CacheSnapshot<'a> {
     /// Upstream dependencies per asset (precomputed from graph edges).
     pub upstream_deps: &'a HashMap<String, Vec<String>>,
     /// Assets currently part of in-progress (Started) runs.
-    pub in_progress_assets: &'a HashSet<String>,
+    pub in_progress_assets: &'a HashSet<&'a str>,
     /// Assets whose latest run failed.
-    pub failed_assets: &'a HashSet<String>,
+    pub failed_assets: &'a HashSet<&'a str>,
     /// Latest failure timestamp per currently-failed asset.
     pub failed_asset_timestamps: &'a HashMap<String, i64>,
     /// Active backfill state: asset→backfill_ids + backfill_id→partition_keys.
@@ -178,6 +162,31 @@ pub struct RunTagSnapshot<'a> {
     pub last_run_asset_names: &'a super::cache::SlotMap<Arc<[String]>>,
 }
 
+/// Assets that fired earlier in a tick, read in place from that tick's results.
+#[derive(Clone, Copy)]
+pub struct RequestedThisTick<'a> {
+    fired: &'a HashMap<&'a str, usize>,
+    results: &'a [EvalResultRow],
+}
+
+impl<'a> RequestedThisTick<'a> {
+    /// `fired` maps each fired asset to its index in `results`.
+    pub fn new(fired: &'a HashMap<&'a str, usize>, results: &'a [EvalResultRow]) -> Self {
+        Self { fired, results }
+    }
+
+    pub fn contains(&self, asset_key: &str) -> bool {
+        self.fired.contains_key(asset_key)
+    }
+
+    /// The asset's fired selection; an unpartitioned fire reads as `All`.
+    pub fn selection(&self, asset_key: &str) -> Option<&'a PartitionSelection> {
+        static ALL: PartitionSelection = PartitionSelection::All;
+        let &idx = self.fired.get(asset_key)?;
+        Some(self.results[idx].result.selection.as_ref().unwrap_or(&ALL))
+    }
+}
+
 /// Read-only context for evaluating conditions on a single asset during one tick.
 pub struct EvalContext<'a> {
     /// The asset being evaluated.
@@ -194,8 +203,8 @@ pub struct EvalContext<'a> {
     pub prev_state: &'a AssetConditionState,
     /// All per-asset condition states (for dep lookups in AnyDepsMatch/AllDepsMatch).
     pub all_asset_states: &'a HashMap<String, AssetConditionState>,
-    /// Fired selections of assets whose conditions already fired earlier in this tick.
-    pub requested_this_tick: &'a HashMap<String, PartitionSelection>,
+    /// Assets whose conditions already fired earlier in this tick.
+    pub requested_this_tick: &'a RequestedThisTick<'a>,
     /// Current timestamp (nanoseconds).
     pub now: i64,
     /// Whether this is the initial evaluation (daemon just started).
@@ -223,6 +232,14 @@ pub struct EvalResult {
     pub dep_sub_selections: Option<HashMap<String, HashMap<u32, PartitionSelection>>>,
 }
 
+/// One row of the per-asset evaluation result list.
+pub struct EvalResultRow {
+    pub info_idx: usize,
+    pub result: EvalResult,
+    pub tree: EvalNodeResult,
+    pub duration_us: u64,
+}
+
 /// Status of a single node's evaluation in the tree.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NodeStatus {
@@ -238,9 +255,9 @@ pub struct EvalNodeResult {
     /// Index of this node in the pre-order traversal (matches the u32 counter system).
     pub node_idx: u32,
     /// Human-readable label (e.g. "missing", "All of", "newly_true").
-    pub label: String,
+    pub label: Cow<'static, str>,
     /// Type tag for UI rendering (e.g. "And", "Or", "Not", "Leaf").
-    pub node_type: String,
+    pub node_type: Cow<'static, str>,
     /// Whether this node evaluated to true, false, or was skipped.
     pub status: NodeStatus,
     /// Child evaluation results (empty for leaf nodes).
@@ -261,7 +278,7 @@ impl EvalNodeResult {
         Self {
             node_idx: idx,
             label: node.display_label(),
-            node_type: node.node_type_str().to_string(),
+            node_type: node.node_type_str().into(),
             status,
             children,
             num_partitions,
@@ -297,41 +314,79 @@ pub fn update_condition_state(
     ctx: &StateUpdateContext,
     result: &EvalResult,
 ) {
+    update_scalars(state, ctx);
+    state.previous_results = result.sub_results.clone();
+    state.dep_previous_results = result.dep_sub_results.clone();
+
+    let Some(sub_selections) = &result.sub_selections else {
+        state.partition_state = None;
+        return;
+    };
+    if let Some(ps) = sync_partition_state(state, ctx) {
+        ps.previous_selections = sub_selections.clone();
+        if let Some(dep_sub_selections) = &result.dep_sub_selections {
+            ps.dep_previous_selections = dep_sub_selections.clone();
+        }
+    }
+}
+
+/// [`update_condition_state`] that moves the latches out of `result`
+/// instead of copying them.
+pub fn commit_condition_state(
+    state: &mut AssetConditionState,
+    ctx: &StateUpdateContext,
+    result: &mut EvalResult,
+) {
+    update_scalars(state, ctx);
+    state.previous_results = std::mem::take(&mut result.sub_results);
+    state.dep_previous_results = std::mem::take(&mut result.dep_sub_results);
+
+    let Some(sub_selections) = result.sub_selections.take() else {
+        state.partition_state = None;
+        return;
+    };
+    if let Some(ps) = sync_partition_state(state, ctx) {
+        ps.previous_selections = sub_selections;
+        if let Some(dep_sub_selections) = result.dep_sub_selections.take() {
+            ps.dep_previous_selections = dep_sub_selections;
+        }
+    }
+}
+
+fn update_scalars(state: &mut AssetConditionState, ctx: &StateUpdateContext) {
     state.is_initial = false;
     state.last_materialized_timestamp = ctx.target_record_timestamp;
     state.last_data_version = ctx.target_data_version.cloned();
     state.last_tick_timestamp = Some(ctx.now);
-    state.previous_results = result.sub_results.clone();
-    state.dep_previous_results = result.dep_sub_results.clone();
+}
 
-    if let Some(sub_selections) = &result.sub_selections {
-        if let Some(timestamps) = ctx.partition_timestamps {
-            let ps = state
-                .partition_state
-                .get_or_insert_with(PartitionState::default);
-            // Latches are stable on most ticks; comparing first skips a
-            // potentially 1M-key deep clone (equality is allocation-free).
-            if ps.previous_selections != *sub_selections {
-                ps.previous_selections = sub_selections.clone();
+/// Sync the partition timestamps to `ctx` and reset `handled`; `None` when
+/// `ctx` carries no partition timestamps.
+fn sync_partition_state<'s>(
+    state: &'s mut AssetConditionState,
+    ctx: &StateUpdateContext,
+) -> Option<&'s mut PartitionState> {
+    let timestamps = ctx.partition_timestamps?;
+    let ps = state
+        .partition_state
+        .get_or_insert_with(PartitionState::default);
+    sync_timestamps(&mut ps.timestamps, timestamps);
+    ps.handled.clear();
+    Some(ps)
+}
+
+/// Make `dst` equal to `src` in place, cloning only the keys new to `dst`.
+fn sync_timestamps(dst: &mut HashMap<PartitionKey, i64>, src: &HashMap<PartitionKey, i64>) {
+    dst.retain(|key, _| src.contains_key(key));
+    dst.reserve(src.len() - dst.len());
+
+    for (key, ts) in src {
+        match dst.get_mut(key) {
+            Some(v) => *v = *ts,
+            None => {
+                dst.insert(key.clone(), *ts);
             }
-            if let Some(dep_sub_selections) = &result.dep_sub_selections
-                && ps.dep_previous_selections != *dep_sub_selections
-            {
-                ps.dep_previous_selections = dep_sub_selections.clone();
-            }
-            ps.timestamps.retain(|key, _| timestamps.contains_key(key));
-            for (key, ts) in timestamps {
-                match ps.timestamps.get_mut(key) {
-                    Some(v) => *v = *ts,
-                    None => {
-                        ps.timestamps.insert(key.clone(), *ts);
-                    }
-                }
-            }
-            ps.handled.clear();
         }
-    } else {
-        state.partition_state = None;
     }
 }
 
@@ -386,7 +441,7 @@ pub fn update_dep_baselines(
             let ps = dep_state
                 .partition_state
                 .get_or_insert_with(Default::default);
-            ps.timestamps = entry.timestamps.clone();
+            sync_timestamps(&mut ps.timestamps, &entry.timestamps);
         }
     }
 }

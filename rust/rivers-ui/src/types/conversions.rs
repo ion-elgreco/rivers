@@ -279,8 +279,8 @@ impl From<rivers_core::condition::EvalNodeResult> for EvalNodeResult {
     fn from(t: rivers_core::condition::EvalNodeResult) -> Self {
         Self {
             node_idx: t.node_idx,
-            label: t.label,
-            node_type: t.node_type,
+            label: t.label.into_owned(),
+            node_type: t.node_type.into_owned(),
             status: t.status.into(),
             children: t.children.into_iter().map(Into::into).collect(),
             num_partitions: t.num_partitions,

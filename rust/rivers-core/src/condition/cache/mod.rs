@@ -155,6 +155,20 @@ async fn derive_failure_floors<'r, S: StorageBackend>(
     Ok(out)
 }
 
+/// Set `asset`'s `partition_key` slot; the keys are copied only for a new slot.
+fn set_slot<V>(map: &mut SlotMap<V>, asset: &str, partition_key: &Option<PartitionKey>, value: V) {
+    let slots = match map.get_mut(asset) {
+        Some(slots) => slots,
+        None => map.entry(asset.to_string()).or_default(),
+    };
+    match slots.get_mut(partition_key) {
+        Some(slot) => *slot = value,
+        None => {
+            slots.insert(partition_key.clone(), value);
+        }
+    }
+}
+
 impl AssetConditionCache {
     pub fn new(code_location_id: String) -> Self {
         Self {
@@ -488,46 +502,51 @@ impl AssetConditionCache {
         let last_run_ids: Vec<String> = self
             .records
             .values()
-            .filter_map(|r| r.last_run_id.clone())
+            .filter_map(|r| r.last_run_id.as_deref())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
             .collect();
         if !last_run_ids.is_empty() {
             let last_runs = storage.get_runs_by_ids(&last_run_ids, None).await?;
-            let runs_by_id: HashMap<&str, &crate::storage::RunRecord> =
-                last_runs.iter().map(|r| (r.run_id.as_str(), r)).collect();
-            type AssetRunRow = (String, Option<PartitionKey>, i64, RunTags, Arc<[String]>);
-            let asset_runs: Vec<AssetRunRow> = self
+            // A verb run's names depend on the asset, so it has none per run.
+            type SharedRun<'a> = (&'a RunRecord, RunTags, Option<Arc<[String]>>);
+            let runs_by_id: HashMap<&str, SharedRun> = last_runs
+                .iter()
+                .map(|run| {
+                    let names = (!run.is_action()).then(|| Arc::from(run.node_names.as_slice()));
+                    (
+                        run.run_id.as_str(),
+                        (run, Arc::from(run.tags.as_slice()), names),
+                    )
+                })
+                .collect();
+            let asset_runs: Vec<_> = self
                 .records
                 .values()
                 .filter_map(|record| {
                     // Only a Materialization sets `last_run_id`, so this run
                     // materialized the asset — a verb's `materialized()` too.
-                    let run = runs_by_id.get(record.last_run_id.as_deref()?)?;
-                    let run_ts = run.end_time.unwrap_or(run.start_time);
-                    let names: Arc<[String]> = if run.is_action() {
-                        self.verb_run_names(&record.asset_key, &run.run_id, &run.node_names)
-                    } else {
-                        Arc::from(run.node_names.as_slice())
+                    let (run, tags, names) = runs_by_id.get(record.last_run_id.as_deref()?)?;
+                    let names = match names {
+                        Some(names) => Arc::clone(names),
+                        None => {
+                            self.verb_run_names(&record.asset_key, &run.run_id, &run.node_names)
+                        }
                     };
-                    let partitions =
-                        run_partition_slots(self.is_partitioned(&record.asset_key), run);
-                    let rows: Vec<AssetRunRow> = partitions
-                        .into_iter()
-                        .map(|pk| {
-                            (
-                                record.asset_key.clone(),
-                                pk,
-                                run_ts,
-                                Arc::from(run.tags.as_slice()),
-                                Arc::clone(&names),
-                            )
-                        })
-                        .collect();
-                    Some(rows)
+                    Some((
+                        record.asset_key.clone(),
+                        run_partition_slots(self.is_partitioned(&record.asset_key), run),
+                        run.end_time.unwrap_or(run.start_time),
+                        Arc::clone(tags),
+                        names,
+                    ))
                 })
-                .flatten()
                 .collect();
-            for (asset_key, partition_key, run_ts, tags, asset_names) in &asset_runs {
-                self.update_last_run_maps(asset_key, partition_key, *run_ts, tags, asset_names);
+            for (asset_key, slots, run_ts, tags, asset_names) in &asset_runs {
+                for partition_key in slots {
+                    self.update_last_run_maps(asset_key, partition_key, *run_ts, tags, asset_names);
+                }
             }
         }
 
@@ -604,15 +623,19 @@ impl AssetConditionCache {
                 slots.remove(partition_key);
             }
         } else {
-            self.last_run_tags
-                .entry(asset.to_string())
-                .or_default()
-                .insert(partition_key.clone(), Arc::clone(tags));
+            set_slot(
+                &mut self.last_run_tags,
+                asset,
+                partition_key,
+                Arc::clone(tags),
+            );
         }
-        self.last_run_asset_names
-            .entry(asset.to_string())
-            .or_default()
-            .insert(partition_key.clone(), Arc::clone(asset_names));
+        set_slot(
+            &mut self.last_run_asset_names,
+            asset,
+            partition_key,
+            Arc::clone(asset_names),
+        );
     }
 
     /// The targets of verb run `run_id` built with `asset`. A verb's steps may

@@ -215,20 +215,22 @@ pub(super) async fn apply_git_workspace(
 ) -> Result<Applied, Error> {
     let name = cl.name_any();
     let git_spec = cl.spec.git.as_ref().expect("git CL");
-    let wspec = WorkspaceSpec {
-        source: RunSource {
-            git: GitCoordinates {
-                url: git_spec.url.clone(),
-                commit: resolved.commit.clone(),
-                r#ref: resolved.ref_name.clone(),
-                path: git_spec.path.clone(),
-                secret_name: git_spec.secret_ref.as_ref().map(|s| s.name.clone()),
-            },
-            dependencies: git_spec.dependencies.clone(),
-            runtime_image: resolved_image.to_string(),
+    let source = RunSource {
+        git: GitCoordinates {
+            url: git_spec.url.clone(),
+            commit: resolved.commit.clone(),
+            r#ref: resolved.ref_name.clone(),
+            path: git_spec.path.clone(),
+            secret_name: git_spec.secret_ref.as_ref().map(|s| s.name.clone()),
         },
-        volume: ctx.workspace.volume(&name, &cl.spec),
-        extra_env: cl.spec.env.clone(),
+        dependencies: git_spec.dependencies.clone(),
+        runtime_image: resolved_image.to_string(),
+    };
+    let volume = ctx.workspace.volume(&name, &cl.spec);
+    let wspec = WorkspaceSpec {
+        source: &source,
+        volume: &volume,
+        extra_env: &cl.spec.env,
     };
     let pieces = workspace::builder_pod_pieces(&wspec, &ctx.workspace.prune(&name));
 
@@ -263,7 +265,7 @@ pub(super) async fn apply_git_workspace(
                 .map(RunSource::workspace_key);
             let runs = ctx.runs.state();
             let keep = workspace_keep_csv(
-                &wspec.source.workspace_key(),
+                &source.workspace_key(),
                 serving_key.as_deref(),
                 namespace,
                 &name,
@@ -286,7 +288,7 @@ pub(super) async fn apply_git_workspace(
         &ctx.surreal_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,
-        Some(&pieces),
+        Some(pieces),
     );
     let service = build_service(cl);
     let (deployed, served) = tokio::join!(

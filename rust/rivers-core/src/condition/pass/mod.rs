@@ -1,5 +1,6 @@
 //! Per-tick orchestration for the condition evaluation engine.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -8,12 +9,12 @@ use crate::condition::eval::evaluate_with_tree;
 use crate::condition::node::ConditionNode;
 use crate::condition::partition::{
     PartitionEvalContext, PartitionMappingKind, PartitionResolver, PartitionSelection,
-    PartitionState,
+    PartitionState, UpstreamPartitionKeys,
 };
 use crate::condition::state::{
     AssetConditionState, CacheSnapshot, ConditionEvalState, DepBaseline, EvalContext,
-    EvalNodeResult, EvalResult, PendingDispatch, RunTagSnapshot, StateUpdateContext,
-    update_condition_state, update_dep_baselines,
+    EvalResultRow, PendingDispatch, RequestedThisTick, RunTagSnapshot, StateUpdateContext,
+    commit_condition_state, update_dep_baselines,
 };
 use crate::storage::{BackfillStrategy, PartitionKey, StorageBackend};
 use jiff::civil;
@@ -47,14 +48,6 @@ pub struct PartitionInfo {
     pub time_window_fmt: Option<String>,
     /// How `all_keys` evolves after extraction.
     pub universe: PartitionUniverse,
-}
-
-/// One row of the per-asset evaluation result list.
-pub struct EvalResultRow {
-    pub info_idx: usize,
-    pub result: EvalResult,
-    pub tree: EvalNodeResult,
-    pub duration_us: u64,
 }
 
 /// One asset to materialize this tick, with its (optional) partition selection.
@@ -115,12 +108,14 @@ pub struct ConditionPass {
     pub has_time_based: bool,
     /// Asset subset to evaluate when only time-based conditions need re-eval.
     pub time_based_eval_set: Option<HashSet<String>>,
+    /// Partition keys of the upstream assets without a condition; a conditioned
+    /// asset's keys are its `PartitionInfo::all_keys`.
     pub upstream_partition_keys: HashMap<String, HashSet<PartitionKey>>,
     /// How each `upstream_partition_keys` entry evolves.
     pub upstream_universes: HashMap<String, PartitionUniverse>,
     /// Time-window resolution source per time-window-partitioned asset
     /// (conditioned assets and upstream deps), for `InLatestTimeWindow`.
-    pub time_window_sources: HashMap<String, TimeWindowSource>,
+    pub time_window_sources: HashMap<Arc<str>, TimeWindowSource>,
     /// Set when the last committed tick had to skip fired assets (failed or
     /// fully-dropped dispatch); forces the next tick to re-evaluate so their
     /// un-consumed triggers can re-fire.
@@ -182,7 +177,7 @@ impl ConditionPass {
                 .entry(asset.clone())
                 .or_insert(*ts);
         }
-        let mut time_window_sources: HashMap<String, TimeWindowSource> = HashMap::new();
+        let mut time_window_sources: HashMap<Arc<str>, TimeWindowSource> = HashMap::new();
         for info in &conditions {
             if let Some(pi) = &info.partition_info
                 && let Some(fmt) = &pi.time_window_fmt
@@ -192,7 +187,7 @@ impl ConditionPass {
                     _ => None,
                 };
                 time_window_sources.insert(
-                    info.asset_key.clone(),
+                    info.asset_key.as_str().into(),
                     TimeWindowSource {
                         fmt: fmt.clone(),
                         grid,
@@ -203,7 +198,7 @@ impl ConditionPass {
         for (asset, universe) in &universes_map {
             if let PartitionUniverse::TimeWindow { grid, .. } = universe {
                 time_window_sources
-                    .entry(asset.clone())
+                    .entry(asset.as_str().into())
                     .or_insert_with(|| TimeWindowSource {
                         fmt: grid.fmt.clone(),
                         grid: Some(grid.clone()),
@@ -248,14 +243,7 @@ impl ConditionPass {
         let mut changed = false;
         for info in &mut self.conditions {
             if let Some(pi) = info.partition_info.as_mut() {
-                let pi_changed =
-                    refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
-                changed |= pi_changed;
-                if pi_changed
-                    && let Some(entry) = self.upstream_partition_keys.get_mut(&info.asset_key)
-                {
-                    entry.clone_from(&pi.all_keys);
-                }
+                changed |= refresh_universe(&mut pi.universe, &mut pi.all_keys, now, dynamic_keys);
             }
         }
         for (asset, universe) in &mut self.upstream_universes {
@@ -304,8 +292,8 @@ impl ConditionPass {
     /// all-successful [`commit_tick`](Self::commit_tick); dispatching callers
     /// use the split so a failed dispatch never consumes eval-state latches.
     pub fn run(&mut self, now: i64, selective: bool) -> PassOutput {
-        let output = self.plan_tick(now, selective);
-        self.commit_tick(&output, &HashSet::new(), now);
+        let mut output = self.plan_tick(now, selective);
+        self.commit_tick(&mut output, &HashSet::new(), now);
         output
     }
 
@@ -347,10 +335,11 @@ impl ConditionPass {
         PassOutput { results, plan }
     }
 
-    /// Advance eval-state latches for a planned tick. Fired assets named in
-    /// `dispatch_failed` — and fired assets whose selection classified to
-    /// nothing dispatchable — keep their pre-tick state so their trigger
-    /// re-fires on the retry evaluation this schedules.
+    /// Advance eval-state latches for a planned tick, moving them out of
+    /// `output`. Fired assets named in `dispatch_failed` — and fired assets
+    /// whose selection classified to nothing dispatchable — keep their
+    /// pre-tick state so their trigger re-fires on the retry evaluation this
+    /// schedules.
     ///
     /// Returns whether the state materially advanced (latches consumed via a
     /// fire or initial baseline seeding, or failure floors moved) — passive
@@ -358,7 +347,7 @@ impl ConditionPass {
     /// persistence.
     pub fn commit_tick(
         &mut self,
-        output: &PassOutput,
+        output: &mut PassOutput,
         dispatch_failed: &HashSet<String>,
         now: i64,
     ) -> bool {
@@ -374,7 +363,7 @@ impl ConditionPass {
         }
 
         let mut baseline_roots: Vec<String> = Vec::new();
-        for row in &output.results {
+        for row in &mut output.results {
             let info = &self.conditions[row.info_idx];
             if skip.contains(&info.asset_key) {
                 continue;
@@ -399,7 +388,7 @@ impl ConditionPass {
                 is_initial: was_initial,
                 partition_timestamps,
             };
-            update_condition_state(prev, &update_ctx, &row.result);
+            commit_condition_state(prev, &update_ctx, &mut row.result);
 
             if row.result.fired || was_initial {
                 baseline_roots.push(info.asset_key.clone());
@@ -433,7 +422,11 @@ impl ConditionPass {
         }
         self.stamp_dispatched_handled(&output.plan, &skip, now);
         let floors_moved = self.eval_state.failed_assets != self.cache.failed_asset_timestamps;
-        self.eval_state.failed_assets = self.cache.failed_asset_timestamps.clone();
+        if floors_moved {
+            self.eval_state
+                .failed_assets
+                .clone_from(&self.cache.failed_asset_timestamps);
+        }
         self.needs_retry = !skip.is_empty();
         !baseline_roots.is_empty() || floors_moved
     }
@@ -462,15 +455,19 @@ impl ConditionPass {
             let Some(prev) = self.eval_state.assets.get(&info.asset_key) else {
                 continue;
             };
-            let mut state = prev.scalar_clone();
-            let update_ctx = StateUpdateContext {
-                target_record_timestamp: record.last_timestamp,
-                target_data_version: record.last_data_version.as_ref(),
-                now,
-                is_initial: prev.is_initial,
-                partition_timestamps: None,
+
+            let mut state = AssetConditionState {
+                previous_results: row.result.sub_results.clone(),
+                dep_previous_results: row.result.dep_sub_results.clone(),
+                dep_baselines: HashMap::with_capacity(prev.dep_baselines.len()),
+                last_handled_timestamp: Some(now),
+                last_materialized_timestamp: record.last_timestamp,
+                last_data_version: record.last_data_version.clone(),
+                last_tick_timestamp: Some(now),
+                condition_fingerprint: prev.condition_fingerprint.clone(),
+                is_initial: false,
+                partition_state: None,
             };
-            update_condition_state(&mut state, &update_ctx, &row.result);
             if let Some(deps) = self.cache.upstream_deps.get(&info.asset_key) {
                 for dep in deps {
                     if self.active.contains(dep) {
@@ -486,7 +483,12 @@ impl ConditionPass {
                     );
                 }
             }
-            state.last_handled_timestamp = Some(now);
+            for (dep, baseline) in &prev.dep_baselines {
+                if !state.dep_baselines.contains_key(dep) {
+                    state.dep_baselines.insert(dep.clone(), baseline.clone());
+                }
+            }
+
             let mut dispatched_keys: Vec<PartitionKey> = output
                 .plan
                 .single_partition_groups
@@ -507,30 +509,30 @@ impl ConditionPass {
     fn evaluate(&self, now: i64, selective: bool) -> Vec<EvalResultRow> {
         let now_local = crate::util::local_datetime(now);
         let time_windows = TimeWindowResolver::new(&self.time_window_sources, now_local);
-        let in_progress_keys: HashSet<String> = self
+        let in_progress_keys: HashSet<&str> = self
             .cache
             .in_progress_assets
             .keys()
             .chain(self.cache.remote_in_progress_keys())
-            .cloned()
+            .map(String::as_str)
             .collect();
 
-        let failed_keys: HashSet<String> = self
+        let failed_keys: HashSet<&str> = self
             .cache
             .failed_assets
             .iter()
             .chain(self.cache.remote_failed_keys())
-            .cloned()
+            .map(String::as_str)
             .chain(
                 self.cache
                     .partition_status
                     .iter()
                     .filter(|(_, status)| !status.failed.is_empty())
-                    .map(|(key, _)| key.clone()),
+                    .map(|(key, _)| key.as_str()),
             )
             .collect();
 
-        let mut requested_this_tick: HashMap<String, PartitionSelection> = HashMap::new();
+        let mut fired: HashMap<&str, usize> = HashMap::new();
         let mut results: Vec<EvalResultRow> = Vec::new();
 
         for (idx, info) in self.conditions.iter().enumerate() {
@@ -546,30 +548,44 @@ impl ConditionPass {
             };
             let prev = &self.eval_state.assets[&info.asset_key];
 
-            let pending = self.cache.in_progress_partition_keys(&info.asset_key);
-            let partition_status = self.cache.partition_status.get(&info.asset_key);
-            let merged_in_progress: Option<HashSet<PartitionKey>> = if pending.is_empty() {
-                None
-            } else {
-                partition_status.map(|status| {
-                    let mut s = status.in_progress.clone();
-                    s.extend(pending);
-                    s
-                })
-            };
+            let partition_status = info
+                .partition_info
+                .as_ref()
+                .and(self.cache.partition_status.get(&info.asset_key));
+            // Tracked runs usually cover every started partition: add only the
+            // stored keys they miss instead of copying the stored set.
+            let merged_in_progress = partition_status.and_then(|status| {
+                let mut pending = self.cache.in_progress_partition_keys(&info.asset_key);
+                if pending.is_subset(&status.in_progress) {
+                    return None;
+                }
+                let missing = status
+                    .in_progress
+                    .iter()
+                    .filter(|k| !pending.contains(*k))
+                    .count();
+                pending.reserve(missing);
+                for k in &status.in_progress {
+                    if !pending.contains(k) {
+                        pending.insert(k.clone());
+                    }
+                }
+                Some(pending)
+            });
             let pctx = info.partition_info.as_ref().and_then(|pi| {
                 partition_status.map(|status| PartitionEvalContext {
                     all_keys: &pi.all_keys,
                     in_progress: merged_in_progress.as_ref().unwrap_or(&status.in_progress),
                     failed: &status.failed,
                     timestamps: &status.timestamps,
-                    resolver: PartitionResolver::new(&pi.mappings, &self.upstream_partition_keys),
+                    resolver: PartitionResolver::new(&pi.mappings, self),
                     time_windows: Some(&time_windows),
                     all_partition_statuses: &self.cache.partition_status,
                     dep_root_floor: None,
                 })
             });
 
+            let requested_this_tick = RequestedThisTick::new(&fired, &results);
             let ctx = EvalContext {
                 target_key: &info.asset_key,
                 root_key: &info.asset_key,
@@ -600,13 +616,7 @@ impl ConditionPass {
             let duration_us = start.elapsed().as_micros() as u64;
 
             if eval_result.fired {
-                requested_this_tick.insert(
-                    info.asset_key.clone(),
-                    eval_result
-                        .selection
-                        .clone()
-                        .unwrap_or(PartitionSelection::All),
-                );
+                fired.insert(&info.asset_key, results.len());
             }
 
             results.push(EvalResultRow {
@@ -737,6 +747,15 @@ impl ConditionPass {
             if let Some(prev) = self.eval_state.assets.get_mut(asset_key) {
                 prev.last_handled_timestamp = Some(now);
             }
+        }
+    }
+}
+
+impl UpstreamPartitionKeys for ConditionPass {
+    fn partition_keys(&self, asset: &str) -> Option<&HashSet<PartitionKey>> {
+        match self.partition_info_for(asset) {
+            Some(pi) => Some(&pi.all_keys),
+            None => self.upstream_partition_keys.get(asset),
         }
     }
 }

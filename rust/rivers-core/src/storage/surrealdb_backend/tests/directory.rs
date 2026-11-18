@@ -436,30 +436,36 @@ async fn compare_and_set_leaves_a_changed_entry() {
         .upsert_code_location_registration(&wh, entry("uuid-1"))
         .await
         .unwrap();
-    let read = storage.kv_get(&key).await.unwrap().unwrap();
+    let read = storage.kv_get_bytes(&key).await.unwrap().unwrap();
     storage
         .touch_code_location(&wh, "uuid-1", "127.0.0.1:50051", 100)
         .await
         .unwrap();
-    let changed = storage.kv_get(&key).await.unwrap().unwrap();
+    let changed = storage.kv_get_bytes(&key).await.unwrap().unwrap();
+    let empty = || Bytes::from(b"{}".to_vec());
 
     assert!(!storage.kv_compare_and_delete(&key, &read).await.unwrap());
     assert!(
         !storage
-            .kv_compare_and_set(&key, Some(&read), b"{}")
+            .kv_compare_and_set(&key, Some(&read), empty())
             .await
             .unwrap()
     );
-    assert!(!storage.kv_compare_and_set(&key, None, b"{}").await.unwrap());
-    assert_eq!(storage.kv_get(&key).await.unwrap().unwrap(), changed);
+    assert!(
+        !storage
+            .kv_compare_and_set(&key, None, empty())
+            .await
+            .unwrap()
+    );
+    assert_eq!(storage.kv_get_bytes(&key).await.unwrap().unwrap(), changed);
 
     assert!(
         storage
-            .kv_compare_and_set(&key, Some(&changed), &read)
+            .kv_compare_and_set(&key, Some(&changed), read.clone())
             .await
             .unwrap()
     );
-    assert_eq!(storage.kv_get(&key).await.unwrap().unwrap(), read);
+    assert_eq!(storage.kv_get_bytes(&key).await.unwrap().unwrap(), read);
 }
 
 /// Concurrent heartbeats and registrations of one location lose neither the

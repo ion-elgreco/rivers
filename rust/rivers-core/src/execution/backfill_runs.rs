@@ -17,23 +17,19 @@ pub async fn backfill_runs_page<S: StorageBackend>(
     offset: u64,
     limit: u64,
 ) -> Result<Vec<RunRecord>> {
-    let run_ids: Vec<String> = backfill
-        .run_ids
-        .iter()
-        .rev()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .cloned()
-        .collect();
+    let end = backfill.run_ids.len().saturating_sub(offset as usize);
+    let start = end.saturating_sub(limit as usize);
+    let run_ids = &backfill.run_ids[start..end];
 
     let mut runs: HashMap<String, RunRecord> = storage
-        .get_runs_by_ids(&run_ids, None)
+        .get_runs_by_ids(run_ids, None)
         .await?
         .into_iter()
         .map(|run| (run.run_id.clone(), run))
         .collect();
     Ok(run_ids
         .iter()
+        .rev()
         .filter_map(|run_id| runs.remove(run_id))
         .collect())
 }

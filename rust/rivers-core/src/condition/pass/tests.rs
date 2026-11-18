@@ -1,4 +1,5 @@
 use super::*;
+use crate::condition::state::{EvalNodeResult, EvalResult, update_condition_state};
 use crate::timegrid::TimeGrid;
 use ordermap::OrderSet;
 
@@ -82,11 +83,11 @@ fn handled_after_fired_selection(selection: PartitionSelection) -> Option<i64> {
         selection: row.result.selection.clone(),
     }];
     let plan = pass.classify_materializations(to_mat);
-    let output = PassOutput {
+    let mut output = PassOutput {
         results: vec![row],
         plan,
     };
-    pass.commit_tick(&output, &HashSet::new(), 5000);
+    pass.commit_tick(&mut output, &HashSet::new(), 5000);
     pass.eval_state.assets["down"].last_handled_timestamp
 }
 
@@ -148,7 +149,7 @@ fn grid_derivation_matches_the_scan() {
     for lookback in [None, Some(86_400.0), Some(2.5 * 86_400.0)] {
         let scanned = compute_latest_time_window_keys(&keys, "%Y-%m-%d", now, lookback);
         let sources = HashMap::from([(
-            "a".to_string(),
+            "a".into(),
             TimeWindowSource {
                 fmt: "%Y-%m-%d".to_string(),
                 grid: Some(grid.clone()),
@@ -399,6 +400,129 @@ fn dep_baseline_survives_unrelated_asset_fire() {
     // Tick 5: c acted on it → consumed.
     let out = pass.run(5000, false);
     assert!(!fired(&out, &pass, "c"), "tick 5: c consumed the change");
+}
+
+/// The dispatch intent holds the state the commit persists, partition map aside.
+#[test]
+fn pending_dispatch_state_matches_committed_state() {
+    let mut cache = AssetConditionCache::default();
+    let mut c = test_record("c");
+    c.last_timestamp = Some(100);
+    c.last_data_version = Some("c1".to_string());
+    cache.records.insert("c".to_string(), c);
+    let mut y = test_record("y");
+    y.last_timestamp = Some(50);
+    y.last_data_version = Some("y1".to_string());
+    cache.records.insert("y".to_string(), y.clone());
+    let mut z = test_record("z");
+    z.last_timestamp = Some(40);
+    cache.records.insert("z".to_string(), z);
+    cache
+        .upstream_deps
+        .insert("c".to_string(), vec!["y".to_string(), "z".to_string()]);
+
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            AssetConditionInfo {
+                asset_key: "z".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: None,
+                backfill_strategy: None,
+            },
+            AssetConditionInfo {
+                asset_key: "c".to_string(),
+                condition: ConditionNode::any_deps_match(
+                    ConditionNode::DataVersionChanged.newly_true(),
+                ),
+                partition_info: None,
+                backfill_strategy: None,
+            },
+        ],
+        HashMap::new(),
+    );
+    // Tick 1 fires on the first-seen version; tick 2 lowers the latch.
+    pass.run(1000, false);
+    pass.cache.in_progress_assets.clear();
+    pass.run(1500, false);
+
+    // A baseline for a dep c no longer reads must carry over.
+    let gone = DepBaseline {
+        last_materialized_timestamp: Some(1),
+        last_data_version: Some("g1".to_string()),
+    };
+    pass.eval_state
+        .assets
+        .get_mut("c")
+        .unwrap()
+        .dep_baselines
+        .insert("gone".to_string(), gone.clone());
+    y.last_timestamp = Some(60);
+    y.last_data_version = Some("y2".to_string());
+    pass.cache.records.insert("y".to_string(), y);
+
+    let mut out = pass.plan_tick(2000, false);
+    let pending = pass.pending_dispatch_states(&out, 2000);
+    let [(asset, state, _)] = pending.as_slice() else {
+        panic!("only c fires; got {} entries", pending.len());
+    };
+    assert_eq!(asset, "c");
+    assert!(!state.dep_previous_results.is_empty());
+    assert_eq!(state.dep_baselines.get("gone"), Some(&gone));
+    assert_eq!(
+        state.dep_baselines["y"].last_data_version.as_deref(),
+        Some("y2")
+    );
+    assert!(
+        !state.dep_baselines.contains_key("z"),
+        "z has its own condition"
+    );
+
+    pass.commit_tick(&mut out, &HashSet::new(), 2000);
+    let mut committed = pass.eval_state.assets["c"].clone();
+    committed.partition_state = None;
+    assert_eq!(state, &committed);
+}
+
+/// A fire is recorded for `WillBeRequested` even when the firing asset's own
+/// tree lacks the node: the reader is a downstream tree.
+#[test]
+fn will_be_requested_sees_upstream_fire_without_the_node() {
+    let mut cache = AssetConditionCache::default();
+    cache.records.insert("up".to_string(), test_record("up"));
+    let mut down = test_record("down");
+    down.last_timestamp = Some(100);
+    cache.records.insert("down".to_string(), down);
+    cache
+        .upstream_deps
+        .insert("down".to_string(), vec!["up".to_string()]);
+
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            AssetConditionInfo {
+                asset_key: "up".to_string(),
+                condition: ConditionNode::Missing,
+                partition_info: None,
+                backfill_strategy: None,
+            },
+            AssetConditionInfo {
+                asset_key: "down".to_string(),
+                condition: ConditionNode::any_deps_match(ConditionNode::WillBeRequested),
+                partition_info: None,
+                backfill_strategy: None,
+            },
+        ],
+        HashMap::new(),
+    );
+
+    let out = pass.run(1000, false);
+    assert!(
+        out.results.iter().all(|row| row.result.fired),
+        "up fires on Missing, and down must see it via WillBeRequested"
+    );
 }
 
 #[test]
@@ -765,6 +889,101 @@ fn dynamic_universe_mirrors_storage_including_retirement() {
     assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
     refresh_universe(&mut universe, &mut all_keys, now, &HashMap::new());
     assert_eq!(all_keys, [spk("blue")].into_iter().collect::<HashSet<_>>());
+
+    let swapped: HashMap<String, HashSet<String>> = [(
+        "colors".to_string(),
+        ["green".to_string()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let changed = refresh_universe(&mut universe, &mut all_keys, now, &swapped);
+    assert!(changed, "same size, other key");
+    assert_eq!(all_keys, [spk("green")].into_iter().collect::<HashSet<_>>());
+    let changed = refresh_universe(&mut universe, &mut all_keys, now, &swapped);
+    assert!(!changed);
+}
+
+/// A conditioned dep's universe change reaches the dep pivot of a conditioned
+/// downstream: the pass reads the dep's keys from its `PartitionInfo`.
+#[test]
+fn conditioned_dep_universe_change_reaches_downstream() {
+    let colors = |ks: &[&str]| {
+        HashMap::from([(
+            "colors".to_string(),
+            ks.iter().map(|k| k.to_string()).collect::<HashSet<_>>(),
+        )])
+    };
+    let now = naive("2024-01-01T00:00:00");
+
+    let mut cache = AssetConditionCache::default();
+    for asset in ["up", "down"] {
+        let mut record = test_record(asset);
+        record.last_timestamp = Some(100);
+        cache.records.insert(asset.to_string(), record);
+        cache.partition_status.insert(
+            asset.to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                timestamps: HashMap::from([(spk("red"), 100i64), (spk("blue"), 100)]),
+                ..Default::default()
+            },
+        );
+    }
+    cache
+        .upstream_deps
+        .insert("down".to_string(), vec!["up".to_string()]);
+
+    let info = |asset: &str, condition, mappings| AssetConditionInfo {
+        asset_key: asset.to_string(),
+        condition,
+        partition_info: Some(PartitionInfo {
+            all_keys: make_daily_keys(&["red", "blue"]),
+            mappings,
+            time_window_fmt: None,
+            universe: PartitionUniverse::Dynamic {
+                namespace: "colors".to_string(),
+            },
+        }),
+        backfill_strategy: None,
+    };
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![
+            info("up", ConditionNode::InProgress, HashMap::new()),
+            info(
+                "down",
+                ConditionNode::any_deps_match(ConditionNode::Missing),
+                HashMap::from([(
+                    ("down".to_string(), "up".to_string()),
+                    PartitionMappingKind::Identity,
+                )]),
+            ),
+        ],
+        HashMap::new(),
+    );
+    let down = |out: &PassOutput| {
+        let row = out.results.iter().find(|r| r.info_idx == 1).unwrap();
+        (row.result.fired, row.result.selection.clone())
+    };
+
+    assert!(!pass.refresh_partition_universes(now, &colors(&["red", "blue"])));
+    let out = pass.run(1000, false);
+    assert_eq!(
+        down(&out),
+        (false, Some(PartitionSelection::Empty)),
+        "every key of up is materialized"
+    );
+
+    assert!(pass.refresh_partition_universes(now, &colors(&["red", "blue", "green"])));
+    let out = pass.run(2000, false);
+    assert_eq!(
+        down(&out),
+        (
+            true,
+            Some(PartitionSelection::Keys(make_daily_keys(&["green"])))
+        ),
+        "up's new key is missing and maps to down's new key"
+    );
 }
 
 #[test]
@@ -939,7 +1158,7 @@ fn commit_marks_only_surviving_keys_handled() {
         )),
     }]);
     pass.commit_tick(
-        &PassOutput {
+        &mut PassOutput {
             results: vec![],
             plan,
         },
@@ -1197,6 +1416,62 @@ fn eager_does_not_redispatch_a_just_dispatched_partition_before_storage_catches_
 }
 
 #[test]
+fn in_progress_is_the_union_of_stored_and_tracked_partitions() {
+    let cases: [(&[&str], &[&str], &[&str]); 6] = [
+        (&[], &[], &[]),
+        (&["a"], &[], &["a"]),
+        (&["a", "b"], &["a"], &["a", "b"]),
+        (&["a"], &["a", "c"], &["a", "c"]),
+        (&[], &["c"], &["c"]),
+        (&["a", "b", "zz"], &["b", "c"], &["a", "b", "c"]),
+    ];
+    for (stored, tracked, expected) in cases {
+        let mut cache = AssetConditionCache::default();
+        cache.records.insert("dst".to_string(), test_record("dst"));
+        cache.partition_status.insert(
+            "dst".to_string(),
+            crate::condition::cache::PartitionStatusEntry {
+                in_progress: make_daily_keys(stored),
+                ..Default::default()
+            },
+        );
+        if !tracked.is_empty() {
+            cache.in_progress_assets.insert(
+                "dst".to_string(),
+                tracked
+                    .iter()
+                    .map(|k| (format!("run_{k}"), Some(spk(k))))
+                    .collect(),
+            );
+        }
+        let mut pass = ConditionPass::new(
+            cache,
+            ConditionEvalState::default(),
+            vec![AssetConditionInfo {
+                asset_key: "dst".to_string(),
+                condition: ConditionNode::InProgress,
+                partition_info: Some(PartitionInfo {
+                    all_keys: make_daily_keys(&["a", "b", "c", "d"]),
+                    mappings: HashMap::new(),
+                    time_window_fmt: None,
+                    universe: PartitionUniverse::Frozen,
+                }),
+                backfill_strategy: None,
+            }],
+            HashMap::new(),
+        );
+
+        let out = pass.plan_tick(1000, false);
+
+        assert_eq!(
+            out.results[0].result.selection,
+            Some(PartitionSelection::from_keys(make_daily_keys(expected))),
+            "stored {stored:?}, tracked {tracked:?}"
+        );
+    }
+}
+
+#[test]
 fn commit_marks_all_selection_keys_handled() {
     let mut pass = ConditionPass::new(
         AssetConditionCache::default(),
@@ -1222,11 +1497,11 @@ fn commit_marks_all_selection_keys_handled() {
         asset_key: "down".to_string(),
         selection: Some(PartitionSelection::All),
     }]);
-    let output = PassOutput {
+    let mut output = PassOutput {
         results: vec![],
         plan,
     };
-    pass.commit_tick(&output, &HashSet::new(), 2);
+    pass.commit_tick(&mut output, &HashSet::new(), 2);
     let mut backfills = output.plan.multi_partition_backfills;
     assert_eq!(
         backfills.len(),

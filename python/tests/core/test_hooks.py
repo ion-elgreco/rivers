@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import obstore
 import pytest
 import rivers as rs
 from rivers.exceptions import AssetDefinitionError
@@ -302,6 +303,50 @@ class TestHookExecution:
 
         assert len(seen_metadata) == 1
         assert seen_metadata[0] == {"env": "test"}
+
+    @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("executor", ["in_process", "parallel"])
+    def test_failure_hook_context_has_metadata(self, executor, is_async, tmp_path):
+        """Failure hook context should include asset metadata."""
+        seen_metadata = []
+
+        @rs.Hook.failure
+        def check_meta(context: rs.HookContext):
+            seen_metadata.append(context.metadata)
+
+        handler = rs.PickleIOHandler(
+            store=obstore.store.LocalStore(str(tmp_path), mkdir=True)
+        )
+
+        if is_async:
+
+            @rs.Asset(io_handler=handler, hooks=[check_meta], metadata={"env": "test"})
+            async def my_asset() -> Any:
+                raise ValueError("boom")
+        else:
+
+            @rs.Asset(io_handler=handler, hooks=[check_meta], metadata={"env": "test"})
+            def my_asset() -> Any:
+                raise ValueError("boom")
+
+        # A second step in the level makes the parallel executor use its workers.
+        @rs.Asset(io_handler=handler)
+        def sibling() -> Any:
+            return 1
+
+        executors = {
+            "in_process": rs.Executor.in_process(),
+            "parallel": rs.Executor.parallel(max_workers=2),
+        }
+        repo = rs.CodeRepository(
+            assets=[my_asset, sibling], default_executor=executors[executor]
+        )
+        repo.resolve()
+
+        with pytest.raises(Exception, match="boom"):
+            repo.materialize()
+
+        assert seen_metadata == [{"env": "test"}]
 
     def test_hook_on_downstream_asset(self):
         """Hooks should fire for the specific asset they're attached to."""

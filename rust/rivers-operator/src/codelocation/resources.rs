@@ -17,6 +17,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, 
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube_client::ResourceExt;
 use rivers_k8s::crd::code_location::CodeLocation;
+use rivers_k8s::workspace::{PodGraft, WorkspacePodPieces};
 
 pub const COMPONENT_LABEL: &str = "code-location";
 pub const MANAGED_BY: &str = "rivers-operator";
@@ -87,12 +88,14 @@ pub fn build_deployment(
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     config_file_cfg: &rivers_k8s::env::ConfigFilePodConfig,
-    workspace: Option<&rivers_k8s::workspace::WorkspacePodPieces>,
+    workspace: Option<WorkspacePodPieces>,
 ) -> Deployment {
-    let name = deployment_name(&cl.name_any());
+    let cr_name = cl.name_any();
     let ns = cl.namespace();
     let spec = &cl.spec;
-    let lbls = labels(&cl.name_any());
+    let lbls = labels(&cr_name);
+    let git = workspace.is_some();
+    let graft = PodGraft::from(workspace);
 
     let pull_secrets = if spec.image_pull_secrets.is_empty() {
         None
@@ -100,17 +103,22 @@ pub fn build_deployment(
         Some(spec.image_pull_secrets.clone())
     };
 
-    let mut env = build_base_env(cl, resolved_image, surreal_pod_cfg, otel_pod_cfg);
-    if let Some(pieces) = workspace {
-        env.extend(pieces.main_env.iter().cloned());
-    }
+    let mut env = build_base_env(
+        cl,
+        &cr_name,
+        ns.as_deref().unwrap_or_default(),
+        resolved_image,
+        surreal_pod_cfg,
+        otel_pod_cfg,
+    );
+    env.extend(graft.env);
     env.extend(rivers_k8s::env::build_config_file_env(config_file_cfg));
     let env = rivers_k8s::env::merge_env(env, spec.env.iter().cloned());
 
     Deployment {
         metadata: ObjectMeta {
-            name: Some(name),
-            namespace: ns.clone(),
+            name: Some(deployment_name(&cr_name)),
+            namespace: ns,
             labels: Some(lbls.clone()),
             owner_references: Some(vec![owner_reference(cl)]),
             ..Default::default()
@@ -124,7 +132,7 @@ pub fn build_deployment(
             // Old pods keep serving the rolled-out tree until their
             // replacements are ready: the ready count never drops below
             // spec.replicas, even when a new commit never builds.
-            strategy: workspace.map(|_| DeploymentStrategy {
+            strategy: git.then(|| DeploymentStrategy {
                 type_: Some("RollingUpdate".to_string()),
                 rolling_update: Some(RollingUpdateDeployment {
                     max_unavailable: Some(IntOrString::Int(0)),
@@ -133,7 +141,7 @@ pub fn build_deployment(
             }),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
-                    labels: Some(lbls.clone()),
+                    labels: Some(lbls),
                     annotations: config_file_cfg.annotations(),
                     ..Default::default()
                 }),
@@ -144,17 +152,14 @@ pub fn build_deployment(
                             .unwrap_or_else(|| code_location_service_account.to_string()),
                     ),
                     image_pull_secrets: pull_secrets,
-                    security_context: workspace.map(|p| p.pod_security_context.clone()),
-                    init_containers: workspace.map(|p| p.init_containers.clone()),
-                    volumes: config_file_cfg.with_volume(workspace.map(|p| p.volumes.clone())),
+                    security_context: graft.security_context,
+                    init_containers: graft.init_containers,
+                    volumes: config_file_cfg.with_volume(graft.volumes),
                     containers: vec![Container {
                         name: MAIN_CONTAINER.to_string(),
                         image: Some(resolved_image.to_string()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(workspace.map_or_else(
-                            || vec!["rivers".to_string()],
-                            |p| p.main_command.clone(),
-                        )),
+                        command: Some(graft.command),
                         // `module` is a positional argument to `rivers serve`;
                         // `--grpc-port` is the flag name (not `--port`).
                         // `--surreal-endpoint` is read from the env we inject
@@ -165,7 +170,7 @@ pub fn build_deployment(
                             "--grpc-port".to_string(),
                             spec.grpc_port.to_string(),
                         ]),
-                        working_dir: workspace.map(|p| p.main_working_dir.clone()),
+                        working_dir: graft.working_dir,
                         ports: Some(vec![ContainerPort {
                             name: Some("grpc".to_string()),
                             container_port: spec.grpc_port,
@@ -193,8 +198,7 @@ pub fn build_deployment(
                         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
                         resources: Some(spec.resources.clone()),
                         env: Some(env),
-                        volume_mounts: config_file_cfg
-                            .with_mount(workspace.map(|p| p.main_mounts.clone())),
+                        volume_mounts: config_file_cfg.with_mount(graft.volume_mounts),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -273,15 +277,16 @@ pub fn build_keep_config_map(
 /// `spec.env` (merged last, after any workspace env, so it overrides by name).
 fn build_base_env(
     cl: &CodeLocation,
+    cr_name: &str,
+    namespace: &str,
     resolved_image: &str,
     surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Vec<EnvVar> {
-    let namespace = cl.namespace().unwrap_or_default();
     let mut env = vec![
         EnvVar {
             name: "RIVERS_CODE_LOCATION_NAME".to_string(),
-            value: Some(cl.name_any()),
+            value: Some(cr_name.to_string()),
             ..Default::default()
         },
         EnvVar {
@@ -291,12 +296,12 @@ fn build_base_env(
         },
         EnvVar {
             name: rivers_k8s::env::ENV_CODE_LOCATION_NAMESPACE.to_string(),
-            value: Some(namespace.clone()),
+            value: Some(namespace.to_string()),
             ..Default::default()
         },
         EnvVar {
             name: rivers_k8s::env::ENV_CODE_LOCATION_GRPC_ENDPOINT.to_string(),
-            value: Some(grpc_endpoint(&cl.name_any(), &namespace, cl.spec.grpc_port)),
+            value: Some(grpc_endpoint(cr_name, namespace, cl.spec.grpc_port)),
             ..Default::default()
         },
         EnvVar {
@@ -310,7 +315,10 @@ fn build_base_env(
             ..Default::default()
         },
     ];
-    env.extend(rivers_k8s::env::build_surreal_pod_env(surreal_pod_cfg));
+    env.extend(rivers_k8s::env::build_surreal_pod_env(
+        &surreal_pod_cfg.endpoint,
+        surreal_pod_cfg,
+    ));
     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
     env
 }
@@ -828,7 +836,7 @@ mod tests {
         let git = cl.spec.git.as_ref().unwrap();
         rivers_k8s::workspace::builder_pod_pieces(
             &rivers_k8s::workspace::WorkspaceSpec {
-                source: rivers_k8s::crd::run::RunSource {
+                source: &rivers_k8s::crd::run::RunSource {
                     git: rivers_k8s::crd::run::GitCoordinates {
                         url: git.url.clone(),
                         commit: "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8".to_string(),
@@ -839,8 +847,8 @@ mod tests {
                     dependencies: git.dependencies.clone(),
                     runtime_image: "ghcr.io/rt@sha256:1a2b3c4dff".to_string(),
                 },
-                volume,
-                extra_env: cl.spec.env.clone(),
+                volume: &volume,
+                extra_env: &cl.spec.env,
             },
             &crate::codelocation::WorkspaceConfig::default().prune("analytics"),
         )
@@ -860,7 +868,7 @@ mod tests {
             &rivers_k8s::env::SurrealPodConfig::default(),
             &otel_endpoint(),
             &Default::default(),
-            Some(&git_pieces(&cl, shared_volume())),
+            Some(git_pieces(&cl, shared_volume())),
         );
 
         let sync = json!({
@@ -986,7 +994,7 @@ mod tests {
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
-            Some(&git_pieces(&cl, fallback_volume())),
+            Some(git_pieces(&cl, fallback_volume())),
         );
 
         let sync = json!({
@@ -1084,7 +1092,7 @@ mod tests {
     #[test]
     fn git_deployment_is_the_image_deployment_plus_the_workspace() {
         let cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
-        let build = |workspace: Option<&rivers_k8s::workspace::WorkspacePodPieces>| {
+        let build = |workspace: Option<rivers_k8s::workspace::WorkspacePodPieces>| {
             serde_json::to_value(build_deployment(
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
@@ -1100,7 +1108,7 @@ mod tests {
         for (shape, volume) in [("shared", shared_volume()), ("fallback", fallback_volume())] {
             let pieces = git_pieces(&cl, volume);
             let mut image = build(None);
-            let mut git = build(Some(&pieces));
+            let mut git = build(Some(pieces.clone()));
 
             // Git-only fields: image mode must leave them unset, or git mode
             // would silently drop the image-mode value.
@@ -1209,7 +1217,7 @@ mod tests {
             &rivers_k8s::env::SurrealPodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
-            Some(&git_pieces(&cl, shared_volume())),
+            Some(git_pieces(&cl, shared_volume())),
         );
 
         // maxSurge stays the Kubernetes default (25%, at least one pod).
@@ -1229,7 +1237,7 @@ mod tests {
         );
         let git_cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
         let pieces = git_pieces(&git_cl, shared_volume());
-        for (cl, workspace, port) in [(&image_cl, None, 4000), (&git_cl, Some(&pieces), 50051)] {
+        for (cl, workspace, port) in [(&image_cl, None, 4000), (&git_cl, Some(pieces), 50051)] {
             let d = build_deployment(
                 cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
@@ -1247,7 +1255,7 @@ mod tests {
                 main["readinessProbe"],
                 json!({ "grpc": { "port": port, "service": "rivers.v1.CodeLocationService" } }),
                 "git: {}",
-                workspace.is_some()
+                cl.spec.is_git()
             );
             assert_eq!(main["terminationMessagePolicy"], "FallbackToLogsOnError");
         }
@@ -1263,7 +1271,7 @@ mod tests {
         );
         let git_cl = make_cl(full_git_spec_json(), "analytics", "team-data", "uid-1234");
         let pieces = git_pieces(&git_cl, shared_volume());
-        for (cl, workspace) in [(&image_cl, None), (&git_cl, Some(&pieces))] {
+        for (cl, workspace) in [(&image_cl, None), (&git_cl, Some(pieces))] {
             let d = build_deployment(
                 cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
@@ -1288,7 +1296,7 @@ mod tests {
                 advertised,
                 [Some(endpoint.as_str())],
                 "git: {}",
-                workspace.is_some()
+                cl.spec.is_git()
             );
         }
     }
@@ -1326,7 +1334,7 @@ mod tests {
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
-                Some(&git_pieces(&cl, volume)),
+                Some(git_pieces(&cl, volume)),
             );
             let pod = d.spec.template.spec.unwrap();
 
@@ -1376,7 +1384,7 @@ mod tests {
                 &rivers_k8s::env::SurrealPodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
-                Some(&git_pieces(&cl, volume)),
+                Some(git_pieces(&cl, volume)),
             );
             let pod = d.spec.template.spec.unwrap();
             let env: std::collections::HashMap<String, Option<String>> = pod.containers[0]

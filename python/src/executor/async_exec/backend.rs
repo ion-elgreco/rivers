@@ -34,7 +34,7 @@ fn python_not_attached_outcome() -> WorkOutcome {
 }
 
 struct SharedStepContext {
-    node_map: HashMap<String, ResolvedNode>,
+    node_map: Arc<HashMap<String, ResolvedNode>>,
     partition_key: Option<PyPartitionKey>,
     resources: HashMap<String, ResourceVariant>,
     config_overrides: Option<HashMap<String, Py<PyAny>>>,
@@ -48,12 +48,7 @@ struct SharedStepContext {
 impl SharedStepContext {
     fn clone_from(py: Python, ctx: &BatchContext) -> Self {
         Self {
-            node_map: ctx
-                .repo
-                .node_map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect(),
+            node_map: Arc::clone(ctx.repo.node_map),
             partition_key: ctx.scope.partition_key.clone(),
             resources: ctx
                 .repo
@@ -184,25 +179,17 @@ fn run_async_generator_body(
 
 struct StepDispatch {
     shared: Arc<SharedStepContext>,
-    step: ExecutionStep,
+    step: Arc<ExecutionStep>,
     /// The key an action step acts on — the run's key minus members an
     /// ordering dependency failed.
     action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
+    pools: Arc<[(String, u32)]>,
+    asset_scope: Option<Arc<rivers_core::storage::AssetScope>>,
     semaphore: Option<Arc<Semaphore>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
     events_tx: mpsc::UnboundedSender<WriterMsg>,
     outputs: OutputSender,
-    /// Step name reported on the `StepSlotWaiting` events emitted by the pool
-    /// guard. Single-step name for `schedule_batch`; instance name for
-    /// mapped fan-out.
-    pool_step_name: String,
-    /// Names emitted as `StepStart` once the pool slot is acquired. For
-    /// multi-output steps this is `step.event_names()`; for mapped instances
-    /// it's `vec![instance_name]`.
-    start_event_names: Vec<String>,
     retry: Option<rivers_core::execution::retry::RetryPolicy>,
     resume: bool,
     cut_offs: u32,
@@ -212,7 +199,7 @@ struct StepDispatch {
 /// the GIL, and runs `execute_with_capture`.
 struct AsyncStepWorker {
     shared: Arc<SharedStepContext>,
-    step: ExecutionStep,
+    step: Arc<ExecutionStep>,
     action_key: Option<PyPartitionKey>,
     input_overrides: HashMap<String, Py<PyAny>>,
     locals: Option<pyo3_async_runtimes::TaskLocals>,
@@ -240,7 +227,11 @@ impl AsyncWorker for AsyncStepWorker {
     }
 }
 
-async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
+async fn dispatch_step(
+    d: StepDispatch,
+    pool_step_name: &str,
+    start_event_names: &[String],
+) -> (WorkOutcome, Option<PoolGuard>) {
     let StepDispatch {
         shared,
         step,
@@ -252,20 +243,16 @@ async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
         locals,
         events_tx,
         outputs,
-        pool_step_name,
-        start_event_names,
         retry,
         resume,
         cut_offs,
     } = d;
-    let storage = shared.storage.clone();
-    let run_id = shared.run_id.clone();
     let action = shared.action.is_some();
     run_step_async_lifecycle(
-        storage,
-        pools,
-        asset_scope,
-        run_id,
+        &shared.storage,
+        &pools,
+        asset_scope.as_deref(),
+        &shared.run_id,
         pool_step_name,
         start_event_names,
         events_tx,
@@ -275,7 +262,7 @@ async fn dispatch_step(d: StepDispatch) -> (WorkOutcome, Option<PoolGuard>) {
         cut_offs,
         action,
         AsyncStepWorker {
-            shared,
+            shared: Arc::clone(&shared),
             step,
             action_key,
             input_overrides,
@@ -319,17 +306,20 @@ impl ExecutorBackend for AsyncBackend {
         let events_tx = ctx.event_sender();
         let (outputs_tx, outputs_rx) = mpsc::unbounded_channel();
 
+        let mut steps: HashMap<usize, Arc<ExecutionStep>> = HashMap::new();
         let dispatches: Vec<(usize, String, Vec<String>, StepDispatch)> = instances
             .into_iter()
             .map(|inst| {
-                let step = ctx.scope.plan.steps[inst.idx].clone();
+                let step = Arc::clone(
+                    steps
+                        .entry(inst.idx)
+                        .or_insert_with(|| Arc::new(ctx.scope.plan.steps[inst.idx].clone())),
+                );
                 let mut input_overrides = inst.input_overrides;
                 if let Some((src, value)) = inst.fan_out {
                     input_overrides.insert(src, value);
                 }
-                let pool_step_name = inst.instance_name.clone();
-                let start_event_names = inst.event_names.clone();
-                let retry = ctx.retry_policy_for(&step);
+                let retry = ctx.retry_policy_for(&step).cloned();
                 let action_key = ctx.action_step_partition_key(&step);
                 let cut_offs = step
                     .event_names()
@@ -353,8 +343,6 @@ impl ExecutorBackend for AsyncBackend {
                             idx: inst.idx,
                             tx: outputs_tx.clone(),
                         },
-                        pool_step_name,
-                        start_event_names,
                         retry,
                         resume: ctx.scope.resume,
                         cut_offs,
@@ -367,7 +355,8 @@ impl ExecutorBackend for AsyncBackend {
         for (idx, instance_name, event_names, dispatch) in dispatches {
             tasks.spawn_on(
                 async move {
-                    let (outcome, guard) = dispatch_step(dispatch).await;
+                    let (outcome, guard) =
+                        dispatch_step(dispatch, &instance_name, &event_names).await;
                     FinishedStep {
                         idx,
                         instance_name,

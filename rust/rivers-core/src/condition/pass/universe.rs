@@ -64,13 +64,20 @@ pub(crate) fn refresh_universe(
             let Some(keys) = dynamic_keys.get(namespace) else {
                 return false;
             };
+
+            let mut probe = PartitionKey::Single {
+                keys: vec![String::new()],
+            };
             if !dynamic_axis_changed(keys, all_keys.len(), |k| {
-                all_keys.contains(&PartitionKey::Single {
-                    keys: vec![k.to_string()],
-                })
+                if let PartitionKey::Single { keys: value } = &mut probe {
+                    value[0].clear();
+                    value[0].push_str(k);
+                }
+                all_keys.contains(&probe)
             }) {
                 return false;
             }
+
             *all_keys = keys
                 .iter()
                 .map(|k| PartitionKey::Single {
@@ -150,7 +157,7 @@ fn advance_time_window_axis(
 fn dynamic_axis_changed(
     fresh: &HashSet<String>,
     current_len: usize,
-    contains: impl Fn(&str) -> bool,
+    mut contains: impl FnMut(&str) -> bool,
 ) -> bool {
     fresh.len() != current_len || !fresh.iter().all(|k| contains(k.as_str()))
 }

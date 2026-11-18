@@ -73,57 +73,52 @@ impl fmt::Display for BlockReason {
     }
 }
 
+#[derive(Default)]
+struct KeyCounts {
+    /// Runs that carry the key, whatever the value.
+    runs: u32,
+    by_value: HashMap<String, u32>,
+}
+
 pub struct TagConcurrencyCounter<'a> {
-    key_counts: HashMap<String, u32>,
-    key_value_counts: HashMap<(String, String), u32>,
-    /// key -> (value -> count); used for per_unique_value limits.
-    unique_value_counts: HashMap<String, HashMap<String, u32>>,
+    /// One entry per limit key; tags of other keys are not counted.
+    counts: HashMap<&'a str, KeyCounts>,
     limits: &'a [TagConcurrencyLimit],
 }
 
 impl<'a> TagConcurrencyCounter<'a> {
     pub fn from_runs(runs: &[impl Tagged], limits: &'a [TagConcurrencyLimit]) -> Self {
-        let mut key_counts: HashMap<String, u32> = HashMap::new();
-        let mut key_value_counts: HashMap<(String, String), u32> = HashMap::new();
-        let mut unique_value_counts: HashMap<String, HashMap<String, u32>> = HashMap::new();
-
-        // Only count tags for keys that appear in limits.
-        let limit_keys: std::collections::HashSet<&str> =
-            limits.iter().map(|l| l.key.as_str()).collect();
+        let mut counter = Self {
+            counts: limits
+                .iter()
+                .map(|l| (l.key.as_str(), KeyCounts::default()))
+                .collect(),
+            limits,
+        };
 
         for run in runs {
-            for (k, v) in run.tags() {
-                if !limit_keys.contains(k.as_str()) {
-                    continue;
-                }
-                *key_counts.entry(k.clone()).or_default() += 1;
-                *key_value_counts.entry((k.clone(), v.clone())).or_default() += 1;
-                *unique_value_counts
-                    .entry(k.clone())
-                    .or_default()
-                    .entry(v.clone())
-                    .or_default() += 1;
-            }
+            counter.record_launch(run);
         }
+        counter
+    }
 
-        Self {
-            key_counts,
-            key_value_counts,
-            unique_value_counts,
-            limits,
-        }
+    fn value_count(&self, key: &str, value: &str) -> u32 {
+        self.counts
+            .get(key)
+            .and_then(|c| c.by_value.get(value))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Returns `Some(reason)` if launching this run would violate a limit.
     pub fn is_blocked(&self, run: &impl Tagged) -> Option<BlockReason> {
         for limit in self.limits {
             if limit.per_unique_value {
-                let counts = self.unique_value_counts.get(&limit.key);
                 for (k, v) in run.tags() {
                     if k != &limit.key {
                         continue;
                     }
-                    let current = counts.and_then(|m| m.get(v.as_str())).copied().unwrap_or(0);
+                    let current = self.value_count(&limit.key, v);
                     if current >= limit.limit {
                         return Some(BlockReason::TagLimit {
                             key: limit.key.clone(),
@@ -139,11 +134,7 @@ impl<'a> TagConcurrencyCounter<'a> {
                     .iter()
                     .any(|(k, v)| k == &limit.key && v == required_value)
                 {
-                    let current = self
-                        .key_value_counts
-                        .get(&(limit.key.clone(), required_value.clone()))
-                        .copied()
-                        .unwrap_or(0);
+                    let current = self.value_count(&limit.key, required_value);
                     if current >= limit.limit {
                         return Some(BlockReason::TagLimit {
                             key: limit.key.clone(),
@@ -154,7 +145,7 @@ impl<'a> TagConcurrencyCounter<'a> {
                     }
                 }
             } else if run.tags().iter().any(|(k, _)| k == &limit.key) {
-                let current = self.key_counts.get(&limit.key).copied().unwrap_or(0);
+                let current = self.counts.get(limit.key.as_str()).map_or(0, |c| c.runs);
                 if current >= limit.limit {
                     return Some(BlockReason::TagLimit {
                         key: limit.key.clone(),
@@ -170,17 +161,16 @@ impl<'a> TagConcurrencyCounter<'a> {
 
     pub fn record_launch(&mut self, run: &impl Tagged) {
         for (k, v) in run.tags() {
-            *self.key_counts.entry(k.clone()).or_default() += 1;
-            *self
-                .key_value_counts
-                .entry((k.clone(), v.clone()))
-                .or_default() += 1;
-            *self
-                .unique_value_counts
-                .entry(k.clone())
-                .or_default()
-                .entry(v.clone())
-                .or_default() += 1;
+            let Some(counts) = self.counts.get_mut(k.as_str()) else {
+                continue;
+            };
+            counts.runs += 1;
+            match counts.by_value.get_mut(v.as_str()) {
+                Some(n) => *n += 1,
+                None => {
+                    counts.by_value.insert(v.clone(), 1);
+                }
+            }
         }
     }
 }

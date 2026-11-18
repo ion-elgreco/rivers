@@ -35,10 +35,14 @@ pub struct K8sStepExecutorConfig {
     /// verbatim onto every step pod's container so `valueFrom.secretKeyRef` /
     /// `configMapKeyRef` / `fieldRef` semantics are preserved end-to-end.
     pub extra_env: Vec<EnvVar>,
-    /// Git-mode workspace: when set, each step Job mounts the
-    /// materialized tree (read-only in shared mode; built per pod in
-    /// fallback mode) and runs the venv's `rivers` from the checkout.
-    pub workspace: Option<crate::workspace::WorkspaceSpec>,
+    /// Git-mode workspace, the tree and the volume it lives on: when set,
+    /// each step Job mounts the materialized tree (read-only in shared mode;
+    /// built per pod in fallback mode) and runs the venv's `rivers` from the
+    /// checkout.
+    pub workspace: Option<(
+        crate::crd::run::RunSource,
+        crate::workspace::WorkspaceVolume,
+    )>,
 }
 
 impl K8sStepExecutorConfig {
@@ -47,14 +51,18 @@ impl K8sStepExecutorConfig {
     /// it; `worker_image` runs on that tree. Image mode leaves `workspace`
     /// unset.
     pub fn with_detected_workspace(mut self) -> Self {
-        self.workspace = crate::env::detect_git_workspace().map(|(source, volume)| {
-            crate::workspace::WorkspaceSpec {
+        self.workspace = crate::env::detect_git_workspace();
+        self
+    }
+
+    fn workspace_spec(&self) -> Option<crate::workspace::WorkspaceSpec<'_>> {
+        self.workspace
+            .as_ref()
+            .map(|(source, volume)| crate::workspace::WorkspaceSpec {
                 source,
                 volume,
-                extra_env: self.extra_env.clone(),
-            }
-        });
-        self
+                extra_env: &self.extra_env,
+            })
     }
 }
 
@@ -210,10 +218,12 @@ fn build_job_inner(
         args.extend(["--mapping-key".to_string(), key.to_string()]);
     }
 
-    let workspace_pieces = config
-        .workspace
-        .as_ref()
-        .map(crate::workspace::consumer_pod_pieces);
+    let graft = crate::workspace::PodGraft::from(
+        config
+            .workspace_spec()
+            .as_ref()
+            .map(crate::workspace::consumer_pod_pieces),
+    );
 
     Job {
         metadata: ObjectMeta {
@@ -245,36 +255,16 @@ fn build_job_inner(
                 spec: Some(PodSpec {
                     service_account_name: Some(config.service_account.clone()),
                     restart_policy: Some("Never".to_string()),
-                    security_context: workspace_pieces
-                        .as_ref()
-                        .map(|p| p.pod_security_context.clone()),
-                    init_containers: workspace_pieces
-                        .as_ref()
-                        .filter(|p| !p.init_containers.is_empty())
-                        .map(|p| p.init_containers.clone()),
-                    volumes: config.config_file_cfg.with_volume(
-                        workspace_pieces
-                            .as_ref()
-                            .filter(|p| !p.volumes.is_empty())
-                            .map(|p| p.volumes.clone()),
-                    ),
+                    security_context: graft.security_context,
+                    init_containers: graft.init_containers,
+                    volumes: config.config_file_cfg.with_volume(graft.volumes),
                     containers: vec![Container {
                         name: "step".to_string(),
                         image: Some(config.worker_image.clone()),
                         image_pull_policy: Some("IfNotPresent".to_string()),
-                        command: Some(workspace_pieces.as_ref().map_or_else(
-                            || vec!["rivers".to_string()],
-                            |p| p.main_command.clone(),
-                        )),
-                        working_dir: workspace_pieces
-                            .as_ref()
-                            .map(|p| p.main_working_dir.clone()),
-                        volume_mounts: config.config_file_cfg.with_mount(
-                            workspace_pieces
-                                .as_ref()
-                                .filter(|p| !p.main_mounts.is_empty())
-                                .map(|p| p.main_mounts.clone()),
-                        ),
+                        command: Some(graft.command),
+                        working_dir: graft.working_dir,
+                        volume_mounts: config.config_file_cfg.with_mount(graft.volume_mounts),
                         args: Some(args),
                         resources: Some({
                             let cpu = overrides
@@ -343,10 +333,11 @@ fn build_job_inner(
                                     ..Default::default()
                                 },
                             ];
-                            env.extend(crate::env::build_surreal_pod_env(&config.surreal_pod_cfg));
-                            if let Some(pieces) = &workspace_pieces {
-                                env.extend(pieces.main_env.iter().cloned());
-                            }
+                            env.extend(crate::env::build_surreal_pod_env(
+                                &config.surreal_pod_cfg.endpoint,
+                                &config.surreal_pod_cfg,
+                            ));
+                            env.extend(graft.env);
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             env.extend(crate::env::build_config_file_env(&config.config_file_cfg));
                             crate::env::merge_env(env, config.extra_env.iter().cloned())
@@ -374,8 +365,10 @@ mod tests {
             worker_cpu: "1".to_string(),
             worker_memory: "2Gi".to_string(),
             module: "my_project.definitions".to_string(),
-            surreal_pod_cfg: crate::env::SurrealPodConfig::default()
-                .with_endpoint("ws://surrealdb:8000"),
+            surreal_pod_cfg: crate::env::SurrealPodConfig {
+                endpoint: "ws://surrealdb:8000".to_string(),
+                ..Default::default()
+            },
             otel_pod_cfg: crate::env::OtelPodConfig::default(),
             config_file_cfg: crate::env::ConfigFilePodConfig::default(),
             run_id: "abc-123".to_string(),
@@ -387,7 +380,12 @@ mod tests {
         }
     }
 
-    fn git_workspace(volume: crate::workspace::WorkspaceVolume) -> crate::workspace::WorkspaceSpec {
+    fn git_workspace(
+        volume: crate::workspace::WorkspaceVolume,
+    ) -> (
+        crate::crd::run::RunSource,
+        crate::workspace::WorkspaceVolume,
+    ) {
         let source: crate::crd::run::RunSource = serde_json::from_value(serde_json::json!({
             "git": {
                 "url": "https://forge.example/acme/pipelines.git",
@@ -400,11 +398,7 @@ mod tests {
             "runtimeImage": "ghcr.io/rt@sha256:1a2b3c4dffff",
         }))
         .unwrap();
-        crate::workspace::WorkspaceSpec {
-            source,
-            volume,
-            extra_env: vec![],
-        }
+        (source, volume)
     }
 
     #[test]
@@ -415,7 +409,7 @@ mod tests {
                 claim_name: "analytics-workspace".to_string(),
             },
         ));
-        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let pieces = crate::workspace::consumer_pod_pieces(&config.workspace_spec().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 
@@ -448,7 +442,7 @@ mod tests {
         config.workspace = Some(git_workspace(crate::workspace::WorkspaceVolume::EmptyDir {
             size_limit: None,
         }));
-        let pieces = crate::workspace::consumer_pod_pieces(config.workspace.as_ref().unwrap());
+        let pieces = crate::workspace::consumer_pod_pieces(&config.workspace_spec().unwrap());
         let job = build_step_job(&config, "parse_document");
         let pod = job.spec.unwrap().template.spec.unwrap();
 

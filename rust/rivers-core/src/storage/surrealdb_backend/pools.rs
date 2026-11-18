@@ -101,7 +101,7 @@ impl SurrealStorage {
     /// overlap instead of slot count; they still take their slot so the shared
     /// `claim_version` bump keeps concurrent claims serialized.
     pub(super) fn build_claim_transaction(
-        pools: &[(String, u32)],
+        pools: &[(&str, u32)],
         asset_pools: &[usize],
         scope: Option<&AssetScope>,
     ) -> String {
@@ -273,7 +273,7 @@ impl SurrealStorage {
         let lease_exp = now_ns + (lease_duration_secs as i64) * 1_000_000_000;
 
         let mut blocked = Vec::new();
-        let mut limited_pools: Vec<(String, u32)> = Vec::new();
+        let mut limited_pools: Vec<(&str, u32)> = Vec::new();
         let mut asset_pools: Vec<usize> = Vec::new();
         for (pool_key, slots_needed) in pools {
             // An implicit asset pool is never "unlimited": its admission is by
@@ -304,7 +304,7 @@ impl SurrealStorage {
                     });
                 }
                 asset_pools.push(limited_pools.len());
-                limited_pools.push((pool_key.clone(), *slots_needed));
+                limited_pools.push((pool_key, *slots_needed));
                 continue;
             }
             let (pool, current_used) = self
@@ -313,7 +313,7 @@ impl SurrealStorage {
             if pool.slot_limit < 0 {
                 continue;
             }
-            limited_pools.push((pool_key.clone(), *slots_needed));
+            limited_pools.push((pool_key, *slots_needed));
             if current_used + *slots_needed > pool.slot_limit as u32 {
                 blocked.push(PoolBlockDetail {
                     pool_key: pool_key.clone(),
@@ -375,7 +375,7 @@ impl SurrealStorage {
         let txn_query = Self::build_claim_transaction(&limited_pools, &asset_pools, scope);
         let mut q = self.db.query(&txn_query);
         for (i, (pool_key, _)) in limited_pools.iter().enumerate() {
-            q = q.bind((format!("p{i}"), pool_key.clone()));
+            q = q.bind((format!("p{i}"), pool_key.to_string()));
         }
         if let Some(parts) = scope.and_then(|s| s.partitions.as_ref()) {
             for &i in &asset_pools {

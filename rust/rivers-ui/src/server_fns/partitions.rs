@@ -86,7 +86,7 @@ mod read {
         CodeLocationContext, PartitionBounds, PartitionKey, ScopedStorage, StorageBackend,
     };
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tokio::sync::OnceCell;
     use tonic::transport::Channel;
 
@@ -364,8 +364,25 @@ mod read {
 
     /// The keys of one dimension of a backfill.
     struct BackfillKeys {
+        /// In the order they were asked for. The keys of a dynamic set are
+        /// sorted: they are read in ascending order only.
         in_order: Vec<String>,
-        sorted: Vec<String>,
+        /// A sorted copy of `in_order`, made on the first read when
+        /// `in_order` does not ascend.
+        sorted: OnceLock<Option<Vec<String>>>,
+    }
+
+    impl BackfillKeys {
+        fn sorted(&self) -> &[String] {
+            let copy = self.sorted.get_or_init(|| {
+                (!self.in_order.is_sorted()).then(|| {
+                    let mut sorted = self.in_order.clone();
+                    sorted.sort_unstable();
+                    sorted
+                })
+            });
+            copy.as_deref().unwrap_or(&self.in_order)
+        }
     }
 
     /// The backfill of an outline: what happened to its partitions, and the
@@ -383,16 +400,27 @@ mod read {
             }
         }
 
-        fn keys(&self, dimension: &str) -> Arc<BackfillKeys> {
+        fn keys(&self, dimension: &str, dynamic_name: &str) -> Arc<BackfillKeys> {
             let mut keys = self.keys.lock().expect("no read panics with the lock held");
-            keys.entry(dimension.to_string())
-                .or_insert_with(|| {
-                    let in_order = self.states.keys_of(dimension);
-                    let mut sorted = in_order.clone();
-                    sorted.sort();
-                    Arc::new(BackfillKeys { in_order, sorted })
-                })
-                .clone()
+            if let Some(found) = keys.get(dimension) {
+                return Arc::clone(found);
+            }
+
+            let mut in_order: Vec<String> = self
+                .states
+                .keys_of(dimension)
+                .into_iter()
+                .map(String::from)
+                .collect();
+            if !dynamic_name.is_empty() {
+                in_order.sort_unstable();
+            }
+            let found = Arc::new(BackfillKeys {
+                in_order,
+                sorted: OnceLock::new(),
+            });
+            keys.insert(dimension.to_string(), Arc::clone(&found));
+            found
         }
 
         /// One page of the partitions in the order they were asked for, for a
@@ -506,12 +534,9 @@ mod read {
 
         let ctx = CodeLocationContext::new(record.code_location_id.clone());
         let storage = state.storage.for_code_location(&ctx);
-        let entry = state
-            .registry
-            .list()
-            .await
-            .unwrap_or_default()
-            .into_iter()
+        let entries = state.registry.list().await.unwrap_or_default();
+        let entry = entries
+            .iter()
             .find(|entry| entry.identity == record.code_location_id);
         let source = match entry {
             Some(entry) => state
@@ -615,7 +640,10 @@ mod read {
                     .iter()
                     .map(|dimension| OutlineDimension {
                         name: dimension.name.clone(),
-                        keys: backfill.keys(&dimension.name).in_order.len() as u64,
+                        keys: backfill
+                            .keys(&dimension.name, &dimension.dynamic_name)
+                            .in_order
+                            .len() as u64,
                         dynamic_name: dimension.dynamic_name.clone(),
                     })
                     .collect(),
@@ -625,15 +653,13 @@ mod read {
                 .dimensions
                 .first()
                 .context("the asset has no partition dimension")?;
-            let keys = backfill.keys(&leading.name);
-            if let (true, true, Some(first), Some(last)) = (
-                leading.dynamic_name.is_empty(),
-                reply.ascending,
-                keys.sorted.first(),
-                keys.sorted.last(),
-            ) {
-                root.first_key = first.clone();
-                root.last_key = last.clone();
+            if leading.dynamic_name.is_empty() && reply.ascending {
+                let keys = backfill.keys(&leading.name, &leading.dynamic_name);
+                let sorted = keys.sorted();
+                if let (Some(first), Some(last)) = (sorted.first(), sorted.last()) {
+                    root.first_key = first.clone();
+                    root.last_key = last.clone();
+                }
             }
 
             let bars = self.split(&root, BARS_MOST).await?;
@@ -664,12 +690,15 @@ mod read {
                     } else {
                         ROWS_MOST
                     };
+                    let finer;
                     let top = if bars.groups.len() <= most as usize {
-                        bars.clone()
+                        &bars
                     } else {
-                        self.split(&root, most)
+                        finer = self
+                            .split(&root, most)
                             .await?
-                            .context("the keys of the dimension do not ascend")?
+                            .context("the keys of the dimension do not ascend")?;
+                        &finer
                     };
 
                     let (strip, level) = futures_util::try_join!(
@@ -683,11 +712,13 @@ mod read {
                     let shown = page.len().min(PAGE as usize);
                     let more = keys_total.saturating_sub(shown as u64);
                     let top = Split::of_keys(page[..shown].to_vec());
-                    let bars = Split::of_keys(page);
 
-                    let level = self.level(&root, top, false, more, states).await?;
+                    let level = self.level(&root, &top, false, more, states).await?;
                     let strip = match keys_total <= BARS_MOST as u64 {
-                        true => Some(self.strip(&root, &bars, false, states).await?),
+                        true => {
+                            let bars = Split::of_keys(page);
+                            Some(self.strip(&root, &bars, false, states).await?)
+                        }
                         false => None,
                     };
                     (strip, level, Split::default())
@@ -747,7 +778,7 @@ mod read {
 
             if let Some(backfill) = &self.backfill {
                 let states = States::Backfill(&backfill.states);
-                return self.level(place, split, in_order, more, &states).await;
+                return self.level(place, &split, in_order, more, &states).await;
             }
 
             // The failed partitions that the rows can show, and no others.
@@ -761,7 +792,7 @@ mod read {
             let failed =
                 FailedPartitions::read(self.storage, self.asset_key, Some(&bounds)).await?;
 
-            self.level(place, split, in_order, more, &States::Asset(&failed))
+            self.level(place, &split, in_order, more, &States::Asset(&failed))
                 .await
         }
 
@@ -829,10 +860,13 @@ mod read {
                 .first()
                 .context("the place has no dimension")?;
 
-            let backfill_keys = self.backfill.as_ref().map(|b| b.keys(&dimension.name));
+            let backfill_keys = self
+                .backfill
+                .as_ref()
+                .map(|b| b.keys(&dimension.name, &dimension.dynamic_name));
             if !dimension.dynamic_name.is_empty() {
                 let all = match &backfill_keys {
-                    Some(keys) => keys.sorted.as_slice(),
+                    Some(keys) => keys.sorted(),
                     None => self.dynamic_keys(&dimension.dynamic_name).await?,
                 };
                 let places = keys::between(all, &place.first_key, &place.last_key);
@@ -862,8 +896,9 @@ mod read {
             // A group of a backfill holds the keys of the backfill only.
             let mut split = Split::of_reply(reply);
             if let Some(keys) = backfill_keys {
+                let sorted = keys.sorted();
                 split.groups.retain_mut(|group| {
-                    group.keys = keys::between(&keys.sorted, &group.first, &group.last).len();
+                    group.keys = keys::between(sorted, &group.first, &group.last).len();
                     group.keys > 0
                 });
             }
@@ -886,10 +921,13 @@ mod read {
                 .first()
                 .context("the place has no dimension")?;
 
-            let backfill_keys = self.backfill.as_ref().map(|b| b.keys(&dimension.name));
+            let backfill_keys = self
+                .backfill
+                .as_ref()
+                .map(|b| b.keys(&dimension.name, &dimension.dynamic_name));
             let all = match (&backfill_keys, dimension.dynamic_name.is_empty()) {
                 (Some(keys), true) => Some(keys.in_order.as_slice()),
-                (Some(keys), false) => Some(keys.sorted.as_slice()),
+                (Some(keys), false) => Some(keys.sorted()),
                 (None, false) => Some(self.dynamic_keys(&dimension.dynamic_name).await?),
                 (None, true) => None,
             };
@@ -1020,17 +1058,17 @@ mod read {
         async fn level(
             &self,
             place: &OutlinePlace,
-            split: Split,
+            split: &Split,
             in_order: bool,
             more: u64,
             states: &States<'_>,
         ) -> Result<OutlineLevel> {
-            let heading = heading_of(place, &split);
+            let heading = heading_of(place, split);
             let newest_first = in_order && split.time;
 
             let rows = if split.of_keys && place.dimensions.len() == 1 {
                 let mut rows: Vec<PartitionRow> = self
-                    .partitions(place, &split, in_order, states)
+                    .partitions(place, split, in_order, states)
                     .await?
                     .into_iter()
                     .flatten()
@@ -1040,8 +1078,8 @@ mod read {
                 }
                 OutlineRows::Partitions(rows)
             } else {
-                let counts = self.counts(place, &split, states).await?;
-                let mut rows = group_rows(place, &split, counts);
+                let counts = self.counts(place, split, states).await?;
+                let mut rows = group_rows(place, split, counts);
                 if matches!(states, States::Backfill(_)) {
                     rows.retain(|row| row.counts.total > 0);
                 }
@@ -1156,6 +1194,8 @@ mod read {
 
     #[cfg(test)]
     mod tests {
+        use std::borrow::Cow;
+
         use rivers_api::rivers::PartitionKeyGroup;
         use rivers_core::execution::backfill::plan_runs;
         use rivers_core::storage::{
@@ -1264,8 +1304,8 @@ mod read {
                 self.keys.len()
             }
 
-            fn key(&self, index: usize) -> String {
-                self.keys[index].clone()
+            fn key(&self, index: usize) -> Cow<'_, str> {
+                Cow::Borrowed(&self.keys[index])
             }
 
             fn cuts(&self, key: &str) -> Vec<usize> {
@@ -1460,7 +1500,7 @@ mod read {
             };
             storage
                 .for_code_location(&CodeLocationContext::default_for_tests())
-                .register_assets(&[asset])
+                .register_assets(vec![asset])
                 .await
                 .unwrap();
             storage.store_events(events).await.unwrap();
@@ -2172,6 +2212,75 @@ mod read {
             assert_eq!(
                 bars_of(&overview),
                 vec![("large", 1, 1, 0), ("small", 1, 0, 1)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_backfill_of_windows_asked_newest_first_spans_its_oldest_to_its_newest() {
+            let storage = store_with(&[]).await;
+            let requested = [single("2024-02-10T05:00"), single("2024-01-20T12:00")];
+            let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+            ended_run(&storage, &plan, 0, RunStatus::Success, &[]).await;
+
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let hours = Dimension {
+                name: "",
+                ..hours_of_two_months()
+            };
+            let outline = backfill_outline(&scoped, &storage, Some(Definition(vec![hours]))).await;
+
+            let overview = outline.overview().await.unwrap();
+
+            assert_eq!(
+                (
+                    overview.root.first_key.as_str(),
+                    overview.root.last_key.as_str()
+                ),
+                ("2024-01-20T12:00", "2024-02-10T05:00")
+            );
+            assert_eq!(
+                bars_of(&overview),
+                vec![("2024-01-20", 1, 0, 0), ("2024-02-10", 1, 1, 0)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_backfill_of_a_dynamic_set_lists_its_keys_in_ascending_order() {
+            let storage = store_with(&[]).await;
+            let requested = [PartitionKey::Single {
+                keys: ["globex", "acme", "initech"].map(str::to_string).to_vec(),
+            }];
+            let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+            ended_run(&storage, &plan, 0, RunStatus::Success, &[]).await;
+
+            let ctx = CodeLocationContext::default_for_tests();
+            let scoped = storage.for_code_location(&ctx);
+            let customers = Dimension {
+                name: "",
+                keys: vec![],
+                key_unit: "",
+                dynamic: "customers",
+                cuts: vec![],
+            };
+            let outline =
+                backfill_outline(&scoped, &storage, Some(Definition(vec![customers]))).await;
+
+            let overview = outline.overview().await.unwrap();
+            let found = outline.rows(&overview.root, "ex", 0).await.unwrap();
+
+            assert_eq!(overview.counts, PartitionCounts::of_backfill(3, 1, 0, 0));
+            assert_eq!(
+                runs(&overview.top),
+                vec![
+                    ("acme", PartitionRowState::Pending, None),
+                    ("globex", PartitionRowState::Done, Some("run-0")),
+                    ("initech", PartitionRowState::Pending, None),
+                ]
+            );
+            assert_eq!(
+                runs(&found),
+                vec![("globex", PartitionRowState::Done, Some("run-0"))]
             );
         }
 

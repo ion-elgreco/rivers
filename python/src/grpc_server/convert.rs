@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use pyo3::prelude::*;
 use rivers_api::rivers::*;
@@ -117,16 +118,11 @@ pub(super) fn proto_tags_to_pairs(tags: Vec<Tag>) -> Option<Vec<(String, String)
     }
 }
 
-pub(super) fn tags_to_proto(tags: Option<&HashMap<String, String>>) -> Vec<Tag> {
-    tags.map(|t| {
-        t.iter()
-            .map(|(k, v)| Tag {
-                key: k.clone(),
-                value: v.clone(),
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+pub(super) fn tags_to_proto(tags: Option<HashMap<String, String>>) -> Vec<Tag> {
+    tags.into_iter()
+        .flatten()
+        .map(|(key, value)| Tag { key, value })
+        .collect()
 }
 
 pub(super) fn collect_run_ids(py: Python<'_>, run_requests: &[TickRequest]) -> Vec<String> {
@@ -176,12 +172,9 @@ pub(super) fn partition_keys(
     let (offset, limit) = (req.offset as usize, req.limit as usize);
 
     if req.query.is_empty() {
-        let keys: Vec<String> = target
-            .get_partition_keys_window(offset, limit)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(py_partition_key_display)
-            .collect();
+        let keys = target
+            .display_keys_window(offset, limit)
+            .map_err(|e| e.to_string())?;
         return Ok(GetPartitionKeysResponse {
             indices: (req.offset..).take(keys.len()).collect(),
             keys,
@@ -323,22 +316,14 @@ pub(super) fn partition_groups(
 
 /// For Multi, surface per-dimension keys so the UI can render one selector per
 /// dimension instead of the cartesian-product enumeration. Static and TimeWindow
-/// populate the flat `keys` list. Dynamic returns Err from `get_partition_keys`
+/// populate the flat `keys` list. Dynamic returns Err from `display_keys_window`
 /// — both lists stay empty and the UI hides the picker.
 pub(super) fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDefInfo {
     // Max keys shipped inline. Beyond this the UI pages via the windowed API,
     // so the payload stays bounded no matter how many partitions exist.
     const KEYS_WINDOW: usize = 1000;
-    let window = |d: &PartitionsDefinition| {
-        d.get_partition_keys_window(0, KEYS_WINDOW)
-            .ok()
-            .map(|pks| {
-                pks.into_iter()
-                    .map(py_partition_key_display)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
+    let window =
+        |d: &PartitionsDefinition| d.display_keys_window(0, KEYS_WINDOW).unwrap_or_default();
     let total = pd.partition_count() as u64;
     let (kind, keys, dimensions, keys_truncated) = match pd {
         // Static and TimeWindow are both single-dim: a windowed `keys` list,
@@ -389,12 +374,6 @@ pub(super) fn node_partition_def_info(pd: &PartitionsDefinition) -> PartitionDef
     }
 }
 
-/// Render a `PyPartitionKey` for display in the UI — delegates to the
-/// canonical `PartitionKey::to_display` encoding (`dim=val|dim=val`).
-pub(super) fn py_partition_key_display(pk: PyPartitionKey) -> String {
-    rivers_core::storage::PartitionKey::from(&pk).to_display()
-}
-
 /// gRPC is the system boundary: malformed partition keys are rejected with
 /// `InvalidArgument` instead of being silently dropped or coerced. `Single`
 /// values are sorted to match the in-process constructors, so the same
@@ -430,11 +409,16 @@ pub(super) fn proto_partition_key_to_py(pk: ProtoPartitionKey) -> Result<PyParti
                 }
                 let mut vals = d.keys;
                 vals.sort();
-                if keys.insert(d.name.clone(), vals).is_some() {
-                    return Err(Status::invalid_argument(format!(
-                        "duplicate partition_key dimension '{}'",
-                        d.name
-                    )));
+                match keys.entry(d.name) {
+                    Entry::Occupied(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "duplicate partition_key dimension '{}'",
+                            e.key()
+                        )));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(vals);
+                    }
                 }
             }
             Ok(PyPartitionKey::Multi { keys })
@@ -473,11 +457,16 @@ pub(super) fn proto_partition_range_to_py(
                         DimensionSelection::Keys(k.keys.into_iter().collect())
                     }
                 };
-                if dims.insert(d.name.clone(), sel).is_some() {
-                    return Err(Status::invalid_argument(format!(
-                        "duplicate partition_range dimension '{}'",
-                        d.name
-                    )));
+                match dims.entry(d.name) {
+                    Entry::Occupied(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "duplicate partition_range dimension '{}'",
+                            e.key()
+                        )));
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(sel);
+                    }
                 }
             }
             Ok(PyPartitionKeyRange {

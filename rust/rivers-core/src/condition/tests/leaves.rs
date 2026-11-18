@@ -39,7 +39,7 @@ fn test_in_progress() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
@@ -69,7 +69,7 @@ fn test_execution_failed() {
     let record = make_record("a");
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let failed = HashSet::from(["a".to_string()]);
+    let failed = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
@@ -989,7 +989,7 @@ async fn deleted_asset_reads_missing_again() {
     let scoped = storage.for_code_location(&ctx_cl);
 
     scoped
-        .register_assets(&[make_record("table")])
+        .register_assets(vec![make_record("table")])
         .await
         .unwrap();
     let event = |event_type, ts| crate::storage::EventRecord {
@@ -1062,7 +1062,7 @@ async fn deleted_asset_does_not_read_newly_updated_downstream() {
     let scoped = storage.for_code_location(&ctx_cl);
 
     scoped
-        .register_assets(&[make_record("events"), make_record("rollups")])
+        .register_assets(vec![make_record("events"), make_record("rollups")])
         .await
         .unwrap();
     let event = |asset: &str, event_type, ts| crate::storage::EventRecord {

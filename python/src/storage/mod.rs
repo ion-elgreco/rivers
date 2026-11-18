@@ -721,7 +721,7 @@ impl PyStorage {
                 .block_on(self.scoped().get_materialized_partitions(asset_key))
                 .map_err(to_py_err)
         })?;
-        Ok(storage_keys.iter().map(PyPartitionKey::from).collect())
+        Ok(storage_keys.into_iter().map(PyPartitionKey::from).collect())
     }
 
     /// Number of materialized partitions for an asset (aggregate count, not the
@@ -919,7 +919,7 @@ impl PyStorage {
             tags,
             node_names,
             priority,
-            partition_key: partition_key.as_ref().map(Into::into),
+            partition_key: partition_key.map(Into::into),
             block_reason,
             launched_by: LaunchedBy::Manual { user: None },
             action,

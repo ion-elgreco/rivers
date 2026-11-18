@@ -84,14 +84,20 @@ async fn action_materialization_preserves_code_version() {
     };
 
     // A real materialize under v1 stamps the version…
-    storage.register_assets(cl, &[record("v1")]).await.unwrap();
+    storage
+        .register_assets(cl, vec![record("v1")])
+        .await
+        .unwrap();
     storage.create_run(&run("r1", None, 1000)).await.unwrap();
     storage.store_event(&mat_event("r1", 1000)).await.unwrap();
     let records = storage.get_asset_records(cl).await.unwrap();
     assert_eq!(mcv(&records).as_deref(), Some("v1"));
 
     // …the code changes (re-resolve registers v2, leaves mcv at v1)…
-    storage.register_assets(cl, &[record("v2")]).await.unwrap();
+    storage
+        .register_assets(cl, vec![record("v2")])
+        .await
+        .unwrap();
 
     // …then an action run's materialized() lands, via both store paths.
     storage
@@ -256,6 +262,77 @@ async fn run_logs_roundtrip() {
 
     assert!(storage.get_run_logs("missing").await.unwrap().is_empty());
     storage.store_run_logs(&[]).await.unwrap();
+}
+
+/// `get_step_tracebacks` returns the tracebacks of one step's rows at one
+/// time, in `get_run_logs` order, read off the run's index.
+#[tokio::test]
+async fn step_tracebacks_match_the_run_logs_rows() {
+    let storage = make_storage().await;
+    let log = |run: &str, step: &str, at: i64, traceback: Option<&str>| LogRecord {
+        code_location_id: "default".into(),
+        run_id: run.into(),
+        step_key: step.into(),
+        timestamp: at,
+        stdout: traceback.is_none().then(|| "out".to_string()),
+        stderr: None,
+        logs: None,
+        traceback: traceback.map(String::from),
+    };
+    let mut rows = vec![
+        log("run-1", "a", 10, None),
+        log("run-1", "a", 20, Some("a later")),
+        log("run-1", "b", 10, Some("b")),
+        log("run-2", "a", 10, Some("other run")),
+    ];
+    for i in 0..8 {
+        rows.push(log("run-1", "a", 10, Some(&format!("a {i}"))));
+        rows.push(log("run-1", "a", 10, None));
+    }
+    storage.store_run_logs(&rows).await.unwrap();
+
+    let in_run_logs_order: Vec<String> = storage
+        .get_run_logs("run-1")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.step_key == "a" && l.timestamp == 10)
+        .filter_map(|l| l.traceback)
+        .collect();
+    assert_eq!(in_run_logs_order.len(), 8);
+    assert_eq!(
+        storage.get_step_tracebacks("run-1", "a", 10).await.unwrap(),
+        in_run_logs_order
+    );
+
+    let tracebacks = async |run: &str, step: &str, at: i64| {
+        storage.get_step_tracebacks(run, step, at).await.unwrap()
+    };
+    assert_eq!(tracebacks("run-1", "a", 20).await, ["a later"]);
+    assert_eq!(tracebacks("run-1", "b", 10).await, ["b"]);
+    assert_eq!(tracebacks("run-2", "a", 10).await, ["other run"]);
+    assert!(tracebacks("run-1", "a", 15).await.is_empty());
+    assert!(tracebacks("run-1", "c", 10).await.is_empty());
+    assert!(tracebacks("missing", "a", 10).await.is_empty());
+
+    let plan: Vec<serde_json::Value> = storage
+        .db
+        .query(format!(
+            "{} EXPLAIN",
+            super::super::backend::STEP_TRACEBACKS
+        ))
+        .bind(("id", "run-1".to_string()))
+        .bind(("step", "a".to_string()))
+        .bind(("at", 10))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let plan = serde_json::to_string(&plan).unwrap();
+    assert!(
+        plan.contains("idx_run_logs_run"),
+        "should scan idx_run_logs_run: {plan}"
+    );
 }
 
 /// The asset-events page must scan `idx_events_loc_asset_ts`, not sort every matching event.
@@ -448,7 +525,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
         pool: vec![("cpu".to_string(), 1)],
     };
     storage
-        .register_assets(cl, std::slice::from_ref(&materialized))
+        .register_assets(cl, vec![materialized.clone()])
         .await
         .expect("first registration failed");
 
@@ -468,7 +545,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
         ..materialized.clone()
     };
     storage
-        .register_assets(cl, std::slice::from_ref(&redefined))
+        .register_assets(cl, vec![redefined])
         .await
         .expect("re-registration failed");
 
@@ -1124,7 +1201,7 @@ async fn test_observation_updates_registered_asset() {
         pool: vec![],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -1214,7 +1291,7 @@ async fn test_observation_does_not_overwrite_materialization_fields() {
         pool: vec![],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -1941,7 +2018,7 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
         storage
             .register_assets(
                 crate::storage::DEFAULT_CODE_LOCATION_ID,
-                &[make_asset_record("live_asset")],
+                vec![make_asset_record("live_asset")],
             )
             .await
             .unwrap();
@@ -2496,7 +2573,7 @@ async fn test_register_assets_with_catalog_fields() {
         },
     ];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records.clone())
         .await
         .unwrap();
 
@@ -2534,7 +2611,7 @@ async fn test_register_preserves_materialization_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2561,7 +2638,7 @@ async fn test_register_preserves_materialization_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2597,7 +2674,7 @@ async fn test_materialization_preserves_catalog_fields() {
         pool: vec![],
     }];
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &records)
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, records)
         .await
         .unwrap();
 
@@ -2626,7 +2703,7 @@ async fn test_get_assets_by_tag() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),
@@ -2703,7 +2780,7 @@ async fn test_get_assets_by_kind() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),
@@ -2913,7 +2990,7 @@ async fn test_get_assets_by_group() {
     storage
         .register_assets(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
-            &[
+            vec![
                 AssetRecord {
                     code_location_id: crate::storage::DEFAULT_CODE_LOCATION_ID.to_string(),
                     asset_key: "a".to_string(),

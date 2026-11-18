@@ -5,6 +5,8 @@
 //! can express their dependency narrowly (e.g. an IO helper takes `&Repo`,
 //! a state-mutating helper takes `&mut RunState`).
 use std::collections::{HashMap, HashSet};
+use std::iter::repeat_n;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
@@ -105,11 +107,13 @@ pub(crate) struct EventSink<'a> {
 
 /// Resolved repository data + execution scope (read-only deps).
 pub(crate) struct Repo<'a> {
-    pub node_map: &'a HashMap<String, ResolvedNode>,
+    pub node_map: &'a Arc<HashMap<String, ResolvedNode>>,
     pub graph_nodes: &'a GraphNodeMap,
     pub io_handler_registry: &'a IOHandlerRegistry,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    /// Retry policy for the steps whose node sets none.
+    pub default_retry: Option<&'a rivers_core::execution::retry::RetryPolicy>,
     pub config_overrides: &'a Option<HashMap<String, Py<PyAny>>>,
     pub bridge: Option<&'a AsyncBridge>,
 }
@@ -169,7 +173,7 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn step_pools(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> (Vec<(String, u32)>, Option<AssetScope>) {
+    ) -> (Arc<[(String, u32)]>, Option<Arc<AssetScope>>) {
         let mut pools = self
             .repo
             .node_map
@@ -220,7 +224,13 @@ impl<'a> BatchContext<'a> {
                 }
             }
         }
-        let scope = (pools.len() > user_pools).then(|| self.asset_scope(exclusive));
+        let scope = (pools.len() > user_pools).then(|| Arc::new(self.asset_scope(exclusive)));
+        // `Arc::from` an empty Vec allocates; `Arc::default` does not.
+        let pools = if pools.is_empty() {
+            Arc::default()
+        } else {
+            pools.into()
+        };
         (pools, scope)
     }
 
@@ -282,7 +292,7 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn retry_policy_for(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> Option<rivers_core::execution::retry::RetryPolicy> {
+    ) -> Option<&'a rivers_core::execution::retry::RetryPolicy> {
         if let Some(verb) = self.scope.plan.verb() {
             return self
                 .repo
@@ -291,29 +301,31 @@ impl<'a> BatchContext<'a> {
                 .and_then(|n| n.find_action(verb))
                 .and_then(|a| a.retry.as_ref())
                 .and_then(|r| match r {
-                    rivers_core::execution::retry::RetryRef::Inline(p) => Some(p.clone()),
+                    rivers_core::execution::retry::RetryRef::Inline(p) => Some(p),
                     rivers_core::execution::retry::RetryRef::Named(key) => {
-                        self.repo.retries.get(key).cloned()
+                        self.repo.retries.get(key)
                     }
                 });
         }
         self.retry_policy(&step.name)
             .or_else(|| step.outputs.iter().find_map(|n| self.retry_policy(n)))
-            .cloned()
     }
 
-    /// Retry policy of one resolved node (asset-level). Inside a K8s step pod
-    /// this is always `None`: the orchestrator owns the attempt ladder there,
-    /// and the pod re-applying the policy would nest retries (N pods × N
-    /// in-process attempts).
+    /// Retry policy of one resolved node: its own, else the run's default.
+    /// Inside a K8s step pod this is always `None`: the orchestrator owns the
+    /// attempt ladder there, and the pod re-applying the policy would nest
+    /// retries (N pods × N in-process attempts).
     pub(crate) fn retry_policy(
         &self,
         step_name: &str,
-    ) -> Option<&rivers_core::execution::retry::RetryPolicy> {
+    ) -> Option<&'a rivers_core::execution::retry::RetryPolicy> {
         if in_step_pod() {
             return None;
         }
-        self.repo.node_map.get(step_name).and_then(|n| n.retry())
+        self.repo
+            .node_map
+            .get(step_name)
+            .and_then(|n| n.retry().or(self.repo.default_retry))
     }
 
     /// Per-asset compute for a plan step; multi steps read their outputs'
@@ -322,13 +334,8 @@ impl<'a> BatchContext<'a> {
     pub(crate) fn compute_for(
         &self,
         step: &rivers_core::execution::plan::ExecutionStep,
-    ) -> Option<rivers_core::execution::compute::Compute> {
-        let lookup = |name: &str| {
-            self.repo
-                .node_map
-                .get(name)
-                .and_then(|n| n.compute().cloned())
-        };
+    ) -> Option<&'a rivers_core::execution::compute::Compute> {
+        let lookup = |name: &str| self.repo.node_map.get(name).and_then(|n| n.compute());
         lookup(&step.name).or_else(|| step.outputs.iter().find_map(|n| lookup(n)))
     }
 
@@ -374,17 +381,21 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
+        let metadata = ops::metadata_json(metadata);
         match self.scope.partition_key {
             Some(pk) => {
-                for member in self.surviving_members(step_name, pk, ts) {
+                let members = self.surviving_members(step_name, pk, ts);
+                // `repeat_n` moves the last copy: a one-member key copies nothing.
+                let copies = repeat_n((metadata, data_version, input_versions), members.len());
+                for (member, (metadata, dv, inputs)) in members.into_iter().zip(copies) {
                     ops::emit_materialization(
                         self.sink.writer,
                         self.scope.run_id,
                         step_name,
                         &Some(member),
                         metadata,
-                        data_version.clone(),
-                        input_versions.clone(),
+                        dv,
+                        inputs,
                         ts,
                     );
                 }
@@ -689,7 +700,7 @@ impl<'a> BatchContext<'a> {
                         &inst.instance_name,
                         self.scope.run_id,
                         msg,
-                        node.metadata(),
+                        node.metadata().cloned(),
                         None,
                     );
                 });

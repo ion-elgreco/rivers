@@ -138,16 +138,19 @@ impl PerCodeLocationStorage for SurrealStorage {
     /// *definition*. Everything else on an existing row — last event, last run,
     /// data versions — is materialization history, and re-resolving a code
     /// location must not wipe it.
-    async fn register_assets(&self, code_location_id: &str, records: &[AssetRecord]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        for chunk in records.chunks(REGISTER_ASSETS_CHUNK) {
-            let rows: Vec<AssetRecord> = chunk
-                .iter()
-                .map(|record| AssetRecord {
-                    code_location_id: code_location_id.to_string(),
-                    ..record.clone()
+    async fn register_assets(
+        &self,
+        code_location_id: &str,
+        records: Vec<AssetRecord>,
+    ) -> Result<()> {
+        let mut records = records.into_iter();
+        while records.len() > 0 {
+            let rows: Vec<AssetRecord> = records
+                .by_ref()
+                .take(REGISTER_ASSETS_CHUNK)
+                .map(|mut record| {
+                    code_location_id.clone_into(&mut record.code_location_id);
+                    record
                 })
                 .collect();
             self.db
@@ -493,13 +496,14 @@ impl PerCodeLocationStorage for SurrealStorage {
 
         // By id, not by re-running the window: a tick written since the SELECT
         // would shift it and drop a tick whose evaluations are still here.
-        let ids: Vec<RecordId> = dropped.iter().map(|t| t.id.clone()).collect();
+        let count = dropped.len();
+        let ids: Vec<RecordId> = dropped.into_iter().map(|t| t.id).collect();
         self.db
             .query("DELETE FROM condition_ticks WHERE id IN $ids")
             .bind(("ids", ids))
             .await?
             .check()?;
-        Ok(dropped.len())
+        Ok(count)
     }
 
     async fn get_condition_evals(

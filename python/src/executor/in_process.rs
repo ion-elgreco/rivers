@@ -91,10 +91,7 @@ pub(crate) fn resolve_in_memory_collect_overrides(
                 inst.input_overrides = overrides;
                 resolved.push(inst);
             }
-            Err((_msg, e)) => {
-                let name = step.name.clone();
-                ctx.record_failure_no_hooks(&name, e, failures);
-            }
+            Err((_msg, e)) => ctx.record_failure_no_hooks(&step.name, e, failures),
         }
     }
     resolved
@@ -125,7 +122,7 @@ impl InProcessBackend {
                     py,
                     ctx.sink.storage,
                     &inst.pools,
-                    inst.asset_scope.as_ref(),
+                    inst.asset_scope.as_deref(),
                     ctx.scope.run_id,
                     &inst.instance_name,
                     ctx.event_sender(),
@@ -179,8 +176,8 @@ impl InProcessBackend {
             step,
             &instance.instance_name,
             &instance.event_names,
-            instance.pools.clone(),
-            instance.asset_scope.clone(),
+            &instance.pools,
+            instance.asset_scope.as_deref(),
             claimed,
             InProcessStepWorker {
                 step,

@@ -161,26 +161,26 @@ impl PyWorkerResult {
     ) -> PyResult<(
         Py<PyAny>,
         (
-            Py<PyAny>,
-            Option<(String, String, String)>,
-            Option<Vec<String>>,
-            Vec<(String, String)>,
+            &Py<PyAny>,
+            &Option<(String, String, String)>,
+            &Option<Vec<String>>,
+            &[(String, String)],
             bool,
-            Option<Py<PyAny>>,
-            Option<Py<PyAny>>,
+            &Option<Py<PyAny>>,
+            &Option<Py<PyAny>>,
         ),
     )> {
         let cls = py.import("rivers._core")?.getattr("WorkerResult")?;
         Ok((
             cls.unbind(),
             (
-                self.outputs.clone_ref(py),
-                self.captured_logs.clone(),
-                self.dynamic_keys.clone(),
-                self.failed_partitions.clone(),
+                &self.outputs,
+                &self.captured_logs,
+                &self.dynamic_keys,
+                &self.failed_partitions,
                 self.graph_written,
-                self.graph_error.as_ref().map(|e| e.clone_ref(py)),
-                self.error.as_ref().map(|e| e.clone_ref(py)),
+                &self.graph_error,
+                &self.error,
             ),
         ))
     }
@@ -339,7 +339,7 @@ pub fn worker_execute_step(
                 .import("inspect")?
                 .call_method1("isgenerator", (&raw_result,))?
                 .is_truthy()?;
-        let synth = if is_gen {
+        let mut synth = if is_gen {
             ops::StepResult {
                 result: raw_result,
                 return_hint: None,
@@ -381,7 +381,7 @@ pub fn worker_execute_step(
                 selected_outputs.push((name, type_hint));
             }
 
-            ops::for_each_output(py, &synth, &selected_outputs, "", |py, item| {
+            ops::for_each_output(py, &mut synth, &selected_outputs, "", |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
@@ -403,7 +403,7 @@ pub fn worker_execute_step(
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
                             let written = write_output(py, handler, &out_ctx, &value)?;
-                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            ops::merge_metadata(&mut metadata, written.metadata);
                             (written.data_version.or(data_version), ResultKind::Output)
                         } else {
                             (data_version, ResultKind::Materialization)
@@ -431,7 +431,7 @@ pub fn worker_execute_step(
             // selected_outputs (single shape). Surface the dynamic keys to the
             // outer scope so PyWorkerResult can ship them back; the
             // orchestrator persists keys to KV after the worker returns.
-            single_dynamic_keys = synth.dynamic_keys.clone();
+            single_dynamic_keys = synth.dynamic_keys.take();
 
             // Asset name from the OutputContext kwargs — the orchestrator
             // populated this with `step_name` (instance_name for mapped).
@@ -445,7 +445,7 @@ pub fn worker_execute_step(
                 String::new()
             };
 
-            ops::for_each_output(py, &synth, &[], &asset_name, |py, item| {
+            ops::for_each_output(py, &mut synth, &[], &asset_name, |py, item| {
                 match item {
                     ops::OutputItem::Materialization {
                         name,
@@ -462,7 +462,7 @@ pub fn worker_execute_step(
                             let out_dict: &Bound<PyDict> = out_kwargs.bind(py).cast()?;
                             let out_ctx = Py::new(py, PyOutputContext::from_kwargs(py, out_dict)?)?;
                             let written = write_output(py, handler, &out_ctx, &value)?;
-                            ops::merge_metadata(&mut metadata, &written.metadata);
+                            ops::merge_metadata(&mut metadata, written.metadata);
                             let final_dv = written.data_version.or(data_version);
                             if let Some((graph_handler, graph_kwargs)) = &graph_output {
                                 let graph_dict: &Bound<PyDict> = graph_kwargs.bind(py).cast()?;

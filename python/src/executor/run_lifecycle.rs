@@ -10,6 +10,7 @@
 //!   5. Build the `PyRunResult`; raise the first failure when `raise_on_error`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
@@ -42,11 +43,13 @@ pub(crate) enum RunInit {
 
 pub(crate) struct RunPlanArgs<'a> {
     pub plan: &'a ExecutionPlan,
-    pub node_map: &'a HashMap<String, ResolvedNode>,
+    pub node_map: &'a Arc<HashMap<String, ResolvedNode>>,
     pub executor: &'a Executor,
     pub storage: &'a ScopedStorageHandle<SurrealStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
+    /// Retry policy for the steps whose node sets none.
+    pub default_retry: Option<&'a rivers_core::execution::retry::RetryPolicy>,
     pub io_handler_registry: &'a IOHandlerRegistry,
 
     /// `None` for ad-hoc runs (`materialize`, asset-selection sensors); `Some`
@@ -65,7 +68,7 @@ pub(crate) struct RunPlanArgs<'a> {
 
 /// What the launch document changed for this run, else the repository's own.
 struct Applied<'a> {
-    node_map: &'a HashMap<String, ResolvedNode>,
+    node_map: &'a Arc<HashMap<String, ResolvedNode>>,
     resources: &'a HashMap<String, ResourceVariant>,
     config_overrides: Option<HashMap<String, Py<PyAny>>>,
     executor: Executor,
@@ -84,7 +87,8 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
         .transpose()?;
     let overlay = document
         .as_ref()
-        .and_then(|d| d.overlay_node_map(py, args.node_map));
+        .and_then(|d| d.overlay_node_map(py, args.node_map))
+        .map(Arc::new);
     let run_resources = document
         .as_ref()
         .map(|d| RunResources::build(py, d, args.resources))
@@ -175,6 +179,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
         &args.run_id,
         applied.resources,
         args.retries,
+        args.default_retry,
         &applied.config_overrides,
         args.io_handler_registry,
         args.resume,

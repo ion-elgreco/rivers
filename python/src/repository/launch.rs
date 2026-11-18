@@ -110,23 +110,25 @@ impl PyCodeRepository {
             }
             None => (uuid::Uuid::new_v4().to_string(), None),
         };
-        let tags_vec = tags.unwrap_or_default();
-        let stored_key = match existing {
-            Some(run) => run.partition_key,
+        let (run_id, stored_key, tags, config) = match existing {
+            Some(run) => (run_id, run.partition_key, tags.unwrap_or_default(), config),
             None => {
-                let stored_key = stored_key.or_else(|| partition_key.as_ref().map(Into::into));
-                let asset_selection: Vec<String> = synthetic_job.asset_names();
-                io_rt().block_on(create_materialization_run(
+                let record = io_rt().block_on(create_materialization_run(
                     state,
-                    asset_selection,
-                    stored_key.clone(),
-                    tags_vec.clone(),
+                    synthetic_job.asset_names(),
+                    stored_key.or_else(|| partition_key.as_ref().map(Into::into)),
+                    tags.unwrap_or_default(),
                     launched_by,
-                    run_id.clone(),
+                    run_id,
                     synthetic_job.action.clone(),
-                    config.clone(),
+                    config,
                 ))?;
-                stored_key
+                (
+                    record.run_id,
+                    record.partition_key,
+                    record.tags,
+                    record.config,
+                )
             }
         };
 
@@ -136,7 +138,7 @@ impl PyCodeRepository {
                 run_id,
                 crate::executor::run_lifecycle::RunInit::Existing { stored_key },
                 partition_key,
-                tags_vec,
+                tags,
                 config,
                 resume,
                 raise_on_error,
@@ -178,9 +180,10 @@ impl PyCodeRepository {
         // Job::validate_and_build_plan auto-includes graph task names and
         // collect-step virtual nodes, so we only need to compute the
         // externally-visible selection here.
-        let mut selected_names: HashSet<String> = if let Some(ref sel) = selection {
-            ensure_materializable(&state.node_map, sel)?;
-            for name in sel {
+        let expand_upstream = include_upstream && selection.is_some();
+        let mut selected_names: HashSet<String> = if let Some(sel) = selection {
+            ensure_materializable(&state.node_map, &sel)?;
+            for name in &sel {
                 match state.node_map.get(name) {
                     None => {
                         return Err(AssetNotFoundError::new_err(format!(
@@ -195,7 +198,7 @@ impl PyCodeRepository {
                     _ => {}
                 }
             }
-            sel.iter().cloned().collect()
+            sel.into_iter().collect()
         } else {
             state
                 .node_map
@@ -205,16 +208,17 @@ impl PyCodeRepository {
                 .collect()
         };
 
-        if include_upstream && selection.is_some() {
+        if expand_upstream {
             let expanded = rivers_core::assets::graph::upstream_closure(graph, &selected_names);
             selected_names = expanded
                 .into_iter()
                 .filter(|name| {
                     state
                         .node_map
-                        .get(name)
+                        .get(*name)
                         .is_some_and(|n| n.is_materializable())
                 })
+                .map(str::to_owned)
                 .collect();
         };
 
@@ -301,7 +305,7 @@ impl PyCodeRepository {
         )?;
         if resolve_retry_defaults {
             synthetic_job.resolve_retry_ref(&self.raw_retries)?;
-            synthetic_job.fill_retry_defaults(self.resolved_default_retry()?.as_ref());
+            synthetic_job.set_default_retry(self.resolved_default_retry()?.as_ref());
         }
 
         self.launch_prepared_job(

@@ -77,8 +77,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
     step: &ExecutionStep,
     step_name: &str,
     event_names: &[String],
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
+    pools: &[(String, u32)],
+    asset_scope: Option<&rivers_core::storage::AssetScope>,
     // A claim the caller already holds for `pools` (see `try_acquire_blocking`).
     claimed: Option<PoolGuard>,
     worker: W,
@@ -92,8 +92,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
         match PoolGuard::acquire_blocking(
             py,
             ctx.sink.storage,
-            &pools,
-            asset_scope.as_ref(),
+            pools,
+            asset_scope,
             ctx.scope.run_id,
             step_name,
             ctx.event_sender(),
@@ -143,7 +143,7 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
             break start_not_stored(e);
         }
         let mut outcome = worker.run_work(py, ctx);
-        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, &policy) else {
+        let (WorkOutcome::Error { error, .. }, Some(policy)) = (&outcome, policy) else {
             break outcome;
         };
         let (reason, exc_types) = classify_pyerr(py, error);
@@ -183,8 +183,8 @@ pub(crate) fn run_step_sync_lifecycle<W: SyncWorker>(
                 match PoolGuard::acquire_blocking(
                     py,
                     ctx.sink.storage,
-                    &pools,
-                    asset_scope.as_ref(),
+                    pools,
+                    asset_scope,
                     ctx.scope.run_id,
                     step_name,
                     ctx.event_sender(),
@@ -314,12 +314,12 @@ pub(crate) fn process_finished_steps(
 /// preserves long-standing per-backend behavior.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
-    storage: ScopedStorageHandle<SurrealStorage>,
-    pools: Vec<(String, u32)>,
-    asset_scope: Option<rivers_core::storage::AssetScope>,
-    run_id: String,
-    pool_step_name: String,
-    start_event_names: Vec<String>,
+    storage: &ScopedStorageHandle<SurrealStorage>,
+    pools: &[(String, u32)],
+    asset_scope: Option<&rivers_core::storage::AssetScope>,
+    run_id: &str,
+    pool_step_name: &str,
+    start_event_names: &[String],
     events_tx: mpsc::UnboundedSender<WriterMsg>,
     semaphore: Option<Arc<Semaphore>>,
     retry_policy: Option<rivers_core::execution::retry::RetryPolicy>,
@@ -344,11 +344,11 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         None
     } else {
         match PoolGuard::acquire(
-            &storage,
-            &pools,
-            asset_scope.as_ref(),
-            &run_id,
-            &pool_step_name,
+            storage,
+            pools,
+            asset_scope,
+            run_id,
+            pool_step_name,
             events_tx.clone(),
         )
         .await
@@ -362,7 +362,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
     };
     if storage
         .backend()
-        .is_cancelled(&run_id)
+        .is_cancelled(run_id)
         .await
         .unwrap_or(false)
     {
@@ -372,23 +372,23 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         return (WorkOutcome::Cancelled, None);
     }
 
-    let code_location_id = storage.code_location_id().to_string();
+    let code_location_id = storage.code_location_id();
     let worker = Arc::new(worker);
     let mut attempt: u32 = 1;
     if resume
         && retry_policy.is_some()
         && let Some(first) = start_event_names.first()
     {
-        attempt += failure::prior_step_retries(storage.backend(), &run_id, first).await;
+        attempt += failure::prior_step_retries(storage.backend(), run_id, first).await;
         attempt += cut_offs;
     }
     let want_classify = retry_policy.is_some();
     let outcome = loop {
         if let Err(e) = start_attempt_async(
             &events_tx,
-            &code_location_id,
-            &run_id,
-            &start_event_names,
+            code_location_id,
+            run_id,
+            start_event_names,
             store_start,
         )
         .await
@@ -423,8 +423,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         else {
             break outcome;
         };
-        let Some(delay) =
-            failure::admit_retry(policy, &pool_step_name, *reason, exc_types, attempt)
+        let Some(delay) = failure::admit_retry(policy, pool_step_name, *reason, exc_types, attempt)
         else {
             break outcome;
         };
@@ -435,9 +434,9 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         {
             ops::emit_log_output_via_tx(
                 &events_tx,
-                &code_location_id,
-                &run_id,
-                &pool_step_name,
+                code_location_id,
+                run_id,
+                pool_step_name,
                 &stdout,
                 &stderr,
                 &logs,
@@ -445,12 +444,12 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             );
         }
         let retried_at = now_ts();
-        for name in &start_event_names {
+        for name in start_event_names {
             if let Some(tb) = failed_traceback {
                 ops::emit_traceback_via_tx(
                     &events_tx,
-                    &code_location_id,
-                    &run_id,
+                    code_location_id,
+                    run_id,
                     name,
                     tb,
                     retried_at,
@@ -458,8 +457,8 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             }
             ops::emit_step_retry_via_tx(
                 &events_tx,
-                &code_location_id,
-                &run_id,
+                code_location_id,
+                run_id,
                 name,
                 attempt,
                 *reason,
@@ -474,7 +473,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
                 g.release().await;
             }
             drop(permit.take());
-            if failure::backoff_sleep_cancellable(storage.backend(), &run_id, delay).await {
+            if failure::backoff_sleep_cancellable(storage.backend(), run_id, delay).await {
                 break outcome;
             }
             if let Some(sem) = &semaphore {
@@ -487,11 +486,11 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
             }
             if !pools.is_empty() {
                 match PoolGuard::acquire(
-                    &storage,
-                    &pools,
-                    asset_scope.as_ref(),
-                    &run_id,
-                    &pool_step_name,
+                    storage,
+                    pools,
+                    asset_scope,
+                    run_id,
+                    pool_step_name,
                     events_tx.clone(),
                 )
                 .await
@@ -507,7 +506,7 @@ pub(crate) async fn run_step_async_lifecycle<W: AsyncWorker>(
         // attempt so a cancelled run stops instead of burning the budget.
         if storage
             .backend()
-            .is_cancelled(&run_id)
+            .is_cancelled(run_id)
             .await
             .unwrap_or(false)
         {

@@ -41,7 +41,7 @@ fn test_on_missing_does_not_fire_when_in_progress() {
     let b = make_record("b"); // missing
     let records = HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b.clone())]);
     let deps = HashMap::from([("b".to_string(), vec!["a".to_string()])]);
-    let in_progress = HashSet::from(["b".to_string()]);
+    let in_progress = HashSet::from(["b"]);
     let ctx = EvalContext {
         target_key: "b",
         root_key: "b",
@@ -537,7 +537,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
         ("a".to_string(), rec_a_new.clone()),
         ("b".to_string(), rec_b.clone()),
     ]);
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
 
     // ── Tick 2: a is in-progress, b should NOT fire ──
     let now2 = 4_000_000_000;
@@ -580,7 +580,7 @@ fn test_eager_fires_after_dep_in_progress_clears() {
     );
 
     // ── a completes (no longer in-progress) ──
-    let empty_in_progress: HashSet<String> = HashSet::new();
+    let empty_in_progress: HashSet<&str> = HashSet::new();
 
     // ── Tick 3: a completed, b SHOULD fire ──
     let now3 = 5_000_000_000;

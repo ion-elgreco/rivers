@@ -14,7 +14,7 @@ async fn test_restart_does_not_replay_newest_run_tick_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
     storage
@@ -61,7 +61,7 @@ async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
     let storage = SurrealStorage::new_memory().await.unwrap();
-    let recs = [
+    let recs = vec![
         make_materialized_record("a", 1000),
         make_materialized_record("b", 1000),
     ];
@@ -69,7 +69,7 @@ async fn test_same_timestamp_run_committed_after_refresh_is_seen() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&recs)
+        .register_assets(recs)
         .await
         .unwrap();
 
@@ -141,7 +141,7 @@ async fn test_failure_floor_survives_daemon_restart() {
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
     let storage = SurrealStorage::new_memory().await.unwrap();
-    let recs = [
+    let recs = vec![
         make_materialized_record("a", 1000),
         make_materialized_record("b", 1000),
     ];
@@ -149,7 +149,7 @@ async fn test_failure_floor_survives_daemon_restart() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&recs)
+        .register_assets(recs)
         .await
         .unwrap();
 
@@ -235,7 +235,7 @@ async fn test_initial_load_seeds_observation_cursor() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_x])
+        .register_assets(vec![rec_x])
         .await
         .unwrap();
 
@@ -303,7 +303,7 @@ async fn test_clearable_sweep_sets_failure_floor_on_missed_terminal_failure() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -370,7 +370,7 @@ async fn test_clearable_sweep_records_partitioned_failure_in_partition_status() 
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_p])
+        .register_assets(vec![rec_p])
         .await
         .unwrap();
 
@@ -447,7 +447,7 @@ async fn test_queued_run_is_not_cleared_by_sweep() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec_a])
+        .register_assets(vec![rec_a])
         .await
         .unwrap();
 
@@ -503,7 +503,7 @@ async fn test_cache_does_not_store_empty_run_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec])
+        .register_assets(vec![rec])
         .await
         .unwrap();
 
@@ -617,7 +617,7 @@ async fn test_cache_tick_materialization_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec])
+        .register_assets(vec![rec])
         .await
         .unwrap();
 
@@ -686,7 +686,7 @@ async fn test_cache_tick_materialization_tags_includes_empty_tags() {
         .for_code_location(&crate::storage::CodeLocationContext::new(
             crate::storage::DEFAULT_CODE_LOCATION_ID,
         ))
-        .register_assets(&[rec])
+        .register_assets(vec![rec])
         .await
         .unwrap();
 

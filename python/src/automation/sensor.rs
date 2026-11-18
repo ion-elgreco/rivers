@@ -509,10 +509,13 @@ pub(crate) fn parse_sensor_result(
     }
 
     let apply_defaults = |req: &Bound<PyRunRequest>| -> PyResult<Py<PyRunRequest>> {
-        let mut request = req.borrow().clone();
-        if request.job_name.is_none() {
-            request.job_name = default_job_name.map(|s| s.to_string());
-        }
+        let current = req.get();
+        let (None, Some(job_name)) = (&current.job_name, default_job_name) else {
+            return Ok(req.clone().unbind());
+        };
+
+        let mut request = current.clone();
+        request.job_name = Some(job_name.to_string());
         Py::new(py, request)
     };
 

@@ -14,7 +14,8 @@ fn test_will_be_requested_true_when_in_set() {
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let requested = HashMap::from([("a".to_string(), PartitionSelection::All)]);
+    let fired = Fired::new(vec![("a", PartitionSelection::All)]);
+    let requested = fired.view();
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",
@@ -49,7 +50,8 @@ fn test_will_be_requested_in_dep_pivot() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
+    let fired = Fired::new(vec![("upstream", PartitionSelection::All)]);
+    let requested = fired.view();
     let ctx = EvalContext {
         target_key: "downstream",
         root_key: "downstream",
@@ -121,7 +123,8 @@ fn test_any_deps_updated_fires_via_will_be_requested() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
+    let fired = Fired::new(vec![("upstream", PartitionSelection::All)]);
+    let requested = fired.view();
     // upstream has prev_state with same timestamp → NewlyUpdated is false
     let up_state = AssetConditionState {
         last_materialized_timestamp: Some(100),
@@ -166,7 +169,8 @@ fn test_any_deps_missing_suppressed_by_will_be_requested() {
         ("downstream".to_string(), down_record.clone()),
     ]);
     let deps = HashMap::from([("downstream".to_string(), vec!["upstream".to_string()])]);
-    let requested = HashMap::from([("upstream".to_string(), PartitionSelection::All)]);
+    let fired = Fired::new(vec![("upstream", PartitionSelection::All)]);
+    let requested = fired.view();
     let ctx = EvalContext {
         target_key: "downstream",
         root_key: "downstream",
@@ -231,7 +235,8 @@ fn test_will_be_requested_tree_output() {
     let record = make_materialized_record("a", 100);
     let records = HashMap::from([("a".to_string(), record.clone())]);
     let deps = HashMap::new();
-    let requested = HashMap::from([("a".to_string(), PartitionSelection::All)]);
+    let fired = Fired::new(vec![("a", PartitionSelection::All)]);
+    let requested = fired.view();
     let ctx = EvalContext {
         target_key: "a",
         root_key: "a",

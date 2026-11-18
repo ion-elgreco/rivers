@@ -205,7 +205,7 @@ async fn test_asset_record_with_pool() {
         pool: vec![("database".to_string(), 1), ("api_quota".to_string(), 2)],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -240,7 +240,7 @@ async fn test_asset_pool_preserved_on_re_register() {
         pool: vec![("database".to_string(), 3)],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record])
         .await
         .unwrap();
 
@@ -261,7 +261,7 @@ async fn test_asset_pool_preserved_on_re_register() {
         pool: vec![("api".to_string(), 1)],
     };
     storage
-        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, &[record2])
+        .register_assets(crate::storage::DEFAULT_CODE_LOCATION_ID, vec![record2])
         .await
         .unwrap();
 
@@ -394,10 +394,7 @@ fn conflict_predicate_shared_between_precheck_and_transaction() {
 /// nothing, paid per attempt and per ~1s blocked poll).
 #[test]
 fn claim_transaction_skips_capacity_lets_for_asset_pools() {
-    let pools = vec![
-        ("__asset__:orders".to_string(), 1u32),
-        ("db".to_string(), 2u32),
-    ];
+    let pools = [("__asset__:orders", 1u32), ("db", 2u32)];
     let q = SurrealStorage::build_claim_transaction(&pools, &[0], None);
     assert!(
         !q.contains("LET $lim_0") && !q.contains("LET $used_0"),

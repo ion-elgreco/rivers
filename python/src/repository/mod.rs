@@ -455,12 +455,12 @@ impl PyCodeRepository {
             NodeNotFoundError::new_err(format!("Node '{}' not found in repository", name))
         })?;
         let handler = state.io_handler_registry.for_output(py, node);
-        let partition = crate::executor::ops::build_partition_context(node, &partition_key)?;
+        let partition = crate::executor::ops::build_partition_context(py, node, &partition_key)?;
         let (asset_name, code_location) = crate::executor::ops::upstream_source(&name, node);
         let ctx = crate::context::io::PyInputContext {
             asset_name,
             downstream_asset: "__load_node__".to_string(),
-            asset_metadata: node.metadata(),
+            asset_metadata: node.metadata().cloned(),
             partition,
             type_hint,
             code_location,
@@ -589,12 +589,12 @@ impl PyCodeRepository {
             };
             let max_concurrency = record.max_concurrency.clamp(0, u32::MAX as i64) as u32;
 
-            let mut tags = record.tags.clone();
+            let mut tags = record.tags;
             tags.push((tag_keys::RERUN_OF.to_string(), backfill_id));
 
-            let target = match &record.job_name {
-                Some(name) => crate::daemon::RunType::Job(name.clone()),
-                None => crate::daemon::RunType::Materialization(record.asset_selection.clone()),
+            let target = match record.job_name {
+                Some(name) => crate::daemon::RunType::Job(name),
+                None => crate::daemon::RunType::Materialization(record.asset_selection),
             };
 
             self.backfill_inner(
@@ -610,7 +610,7 @@ impl PyCodeRepository {
                 dry_run,
                 None,
                 rivers_core::storage::LaunchedBy::default(),
-                record.action.clone(),
+                record.action,
             )
         })
     }

@@ -1,5 +1,7 @@
 //! The keys of a definition with one dimension, each found by its place.
 
+use std::borrow::Cow;
+
 use jiff::civil;
 use pyo3::prelude::*;
 use rivers_core::execution::partition_outline::{Keys, cuts, time_cuts};
@@ -206,8 +208,15 @@ impl Keys for KeysByPlace<'_> {
         KeysByPlace::len(self)
     }
 
-    fn key(&self, index: usize) -> String {
-        self.get(index).unwrap_or_default()
+    fn key(&self, index: usize) -> Cow<'_, str> {
+        let listed = match self {
+            Self::Static(keys) => keys.get_at(index),
+            Self::Listed { keys, .. } => keys.get(index),
+            Self::Days { .. } | Self::Interval { .. } => {
+                return Cow::Owned(self.get(index).unwrap_or_default());
+            }
+        };
+        Cow::Borrowed(listed.map_or("", String::as_str))
     }
 
     fn cuts(&self, key: &str) -> Vec<usize> {

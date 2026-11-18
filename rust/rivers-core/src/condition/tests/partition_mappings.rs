@@ -57,6 +57,49 @@ fn test_partition_mapping_static_identity_fallback() {
 }
 
 #[test]
+fn test_partition_mapping_static_matches_single_value_keys_only() {
+    let m = PartitionMappingKind::Static {
+        mapping: HashMap::from([("d1".to_string(), "u1".to_string())]),
+    };
+    let not_single_value = [
+        PartitionKey::Single { keys: vec![] },
+        PartitionKey::Single {
+            keys: vec!["u1".to_string(), "u2".to_string()],
+        },
+        mpk(&[("dim", "u1")]),
+        PartitionKey::Set {
+            keys: vec![spk("u1")],
+        },
+        PartitionKey::SingleItems {
+            items: vec![crate::storage::KeyItem::Value("u1".to_string())],
+        },
+    ];
+    for key in &not_single_value {
+        assert_eq!(
+            m.map_to_downstream(&PartitionSelection::Keys(HashSet::from([key.clone()]))),
+            PartitionSelection::Empty,
+            "{key:?} must not match the mapping value u1 nor pass through"
+        );
+    }
+
+    let mut mixed: HashSet<PartitionKey> = not_single_value.into_iter().collect();
+    mixed.insert(spk("u1"));
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Keys(mixed)),
+        PartitionSelection::Keys(HashSet::from([spk("d1"), spk("u1")]))
+    );
+
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::All),
+        PartitionSelection::All
+    );
+    assert_eq!(
+        m.map_to_downstream(&PartitionSelection::Empty),
+        PartitionSelection::Empty
+    );
+}
+
+#[test]
 fn test_partition_mapping_specific() {
     let m = PartitionMappingKind::SpecificPartitions {
         keys: vec!["latest".into()],
@@ -82,6 +125,219 @@ fn test_partition_resolver_no_mapping_is_identity() {
     let resolver = PartitionResolver::empty();
     let sel = PartitionSelection::Keys(HashSet::from([spk("p1")]));
     assert_eq!(resolver.map_downstream("d", "c", &sel, None), sel);
+}
+
+fn daily_grid() -> crate::timegrid::TimeGrid {
+    crate::timegrid::TimeGrid {
+        cron_schedule: None,
+        interval_seconds: Some(86400.0),
+        start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+        end: Some(jiff::civil::date(2024, 2, 1).at(0, 0, 0, 0)),
+        fmt: "%Y-%m-%d".to_string(),
+    }
+}
+
+/// Two ticks of `cond` on a root `dst` with one dep edge `src` → `dst` mapped
+/// by `mapping` (`None`: undeclared). Covers the staleness floor: a
+/// never-attempted root key, a failure newer than the dep, root keys newer and
+/// older than the dep, a missing dep key and a dep key outside the root's keys.
+fn eval_over_edge(
+    cond: &ConditionNode,
+    mapping: Option<PartitionMappingKind>,
+) -> Vec<(
+    bool,
+    Option<PartitionSelection>,
+    Option<HashMap<u32, PartitionSelection>>,
+)> {
+    const SEC: i64 = 1_000_000_000;
+    let t0 = utc(2024, 1, 10, 12, 0, 0).as_nanosecond() as i64;
+    let day = |d: u32| spk(&format!("2024-01-{d:02}"));
+    let root_keys: HashSet<PartitionKey> = (1..=8).map(day).collect();
+    let dep_keys: HashSet<PartitionKey> = (1..=7).map(day).chain([spk("2023-12-31")]).collect();
+
+    let mut cache = AssetConditionCache::default();
+    cache.records.insert(
+        "dst".into(),
+        make_materialized_record("dst", t0 - 100 * SEC),
+    );
+    cache.records.insert(
+        "src".into(),
+        make_materialized_record("src", t0 - 200 * SEC),
+    );
+    cache
+        .upstream_deps
+        .insert("dst".into(), vec!["src".to_string()]);
+    cache.partition_status.insert(
+        "dst".into(),
+        crate::condition::cache::PartitionStatusEntry {
+            timestamps: [
+                (2, 400),
+                (3, 100),
+                (4, 400),
+                (5, 400),
+                (6, 400),
+                (7, 400),
+                (8, 400),
+            ]
+            .into_iter()
+            .map(|(d, ago)| (day(d), t0 - ago * SEC))
+            .collect(),
+            failed: HashSet::from([day(2)]),
+            failed_timestamps: HashMap::from([(day(2), t0 - 50 * SEC)]),
+            ..Default::default()
+        },
+    );
+    cache.partition_status.insert(
+        "src".into(),
+        crate::condition::cache::PartitionStatusEntry {
+            timestamps: [1, 2, 3, 4, 5, 6]
+                .into_iter()
+                .map(day)
+                .chain([spk("2023-12-31")])
+                .map(|k| (k, t0 - 200 * SEC))
+                .collect(),
+            ..Default::default()
+        },
+    );
+
+    let mut pass = ConditionPass::new(
+        cache,
+        ConditionEvalState::default(),
+        vec![AssetConditionInfo {
+            asset_key: "dst".into(),
+            condition: cond.clone(),
+            partition_info: Some(PartitionInfo {
+                all_keys: root_keys,
+                mappings: mapping
+                    .into_iter()
+                    .map(|m| (("dst".to_string(), "src".to_string()), m))
+                    .collect(),
+                time_window_fmt: None,
+                universe: PartitionUniverse::Frozen,
+            }),
+            backfill_strategy: None,
+        }],
+        HashMap::from([("src".into(), (dep_keys, PartitionUniverse::Frozen))]),
+    );
+
+    let mut out = Vec::new();
+    for (tick, now) in [t0, t0 + 30 * SEC].into_iter().enumerate() {
+        if tick == 1 {
+            let ts = &mut pass
+                .cache
+                .partition_status
+                .get_mut("src")
+                .unwrap()
+                .timestamps;
+            ts.insert(day(5), t0 + 10 * SEC);
+            ts.insert(day(7), t0 + 10 * SEC);
+        }
+        let mut output = pass.plan_tick(now, false);
+        let r = &output.results[0].result;
+        out.push((r.fired, r.selection.clone(), r.sub_selections.clone()));
+        out.push((
+            false,
+            None,
+            r.dep_sub_selections
+                .as_ref()
+                .and_then(|d| d.get("src").cloned()),
+        ));
+        pass.commit_tick(&mut output, &HashSet::new(), now);
+        pass.cache.in_progress_assets.clear();
+    }
+    out
+}
+
+/// `is_identity` holds exactly for the mappings that return their input.
+#[test]
+fn test_is_identity_mappings_return_their_input() {
+    let universe: HashSet<PartitionKey> =
+        (1..=4).map(|d| spk(&format!("2024-01-{d:02}"))).collect();
+    let sels = [
+        PartitionSelection::All,
+        PartitionSelection::Empty,
+        PartitionSelection::Keys(HashSet::from([spk("2024-01-02"), spk("2024-01-03")])),
+        PartitionSelection::Keys(HashSet::from([spk("not-a-date")])),
+    ];
+    let identities = [
+        PartitionMappingKind::Identity,
+        PartitionMappingKind::Subset,
+        PartitionMappingKind::TimeWindow {
+            offset: 0,
+            grid: Some(daily_grid()),
+        },
+        PartitionMappingKind::TimeWindow {
+            offset: -1,
+            grid: None,
+        },
+    ];
+    for m in &identities {
+        assert!(m.is_identity(), "{m:?}");
+        for sel in &sels {
+            assert_eq!(m.map_to_downstream_in(sel, Some(&universe)), *sel, "{m:?}");
+        }
+    }
+    let shifts = [
+        PartitionMappingKind::TimeWindow {
+            offset: -1,
+            grid: Some(daily_grid()),
+        },
+        PartitionMappingKind::AllPartitions,
+        PartitionMappingKind::Static {
+            mapping: HashMap::from([("2024-01-01".into(), "2024-01-02".into())]),
+        },
+    ];
+    for m in &shifts {
+        assert!(!m.is_identity(), "{m:?}");
+        assert_ne!(
+            m.map_to_downstream_in(&sels[2], Some(&universe)),
+            sels[2],
+            "{m:?}"
+        );
+    }
+}
+
+/// An edge whose mapping sends every key to itself evaluates exactly like an
+/// undeclared edge, staleness floor included.
+#[test]
+fn test_identity_like_dep_mappings_evaluate_like_identity() {
+    let conds = [
+        ConditionNode::eager(),
+        ConditionNode::on_cron("0 0 * * *".to_string(), None),
+    ];
+    let mappings = [
+        PartitionMappingKind::Identity,
+        PartitionMappingKind::Subset,
+        PartitionMappingKind::TimeWindow {
+            offset: 0,
+            grid: Some(daily_grid()),
+        },
+        PartitionMappingKind::TimeWindow {
+            offset: -1,
+            grid: None,
+        },
+    ];
+    let shifted = PartitionMappingKind::TimeWindow {
+        offset: -1,
+        grid: Some(daily_grid()),
+    };
+    for cond in &conds {
+        let expected = eval_over_edge(cond, None);
+        for m in &mappings {
+            assert_eq!(
+                eval_over_edge(cond, Some(m.clone())),
+                expected,
+                "{m:?} under {}",
+                cond.describe()
+            );
+        }
+        assert_ne!(
+            eval_over_edge(cond, Some(shifted.clone())),
+            expected,
+            "a real shift must change the result under {}",
+            cond.describe()
+        );
+    }
 }
 
 #[test]

@@ -248,17 +248,22 @@ impl PartitionsDefinition {
 
     /// Enumerate keys for a single-dimension definition (Static or TimeWindow) as plain strings.
     pub fn enumerate_single_dim_keys(&self) -> PyResult<Vec<String>> {
-        self.get_partition_keys()?
-            .into_iter()
-            .map(|pk| match pk {
-                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
-                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
-                    Err(PartitionDefinitionError::new_err(
-                        "enumerate_single_dim_keys called on a non-single-dimension definition",
-                    ))
-                }
-            })
-            .collect()
+        match self {
+            Self::Static { keys } => Ok(keys.iter().cloned().collect()),
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => enumerate_time_windows(cron_schedule, interval_seconds, start, end, fmt),
+            Self::Multi { .. } => Err(PartitionDefinitionError::new_err(
+                "enumerate_single_dim_keys called on a non-single-dimension definition",
+            )),
+            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
+                "Cannot enumerate dynamic partition keys",
+            )),
+        }
     }
 
     /// Enumerate all valid partition keys.
@@ -270,20 +275,11 @@ impl PartitionsDefinition {
                     key: vec![k.clone()],
                 })
                 .collect()),
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let keys =
-                    enumerate_time_windows(cron_schedule, interval_seconds, start, end, fmt)?;
-                Ok(keys
-                    .into_iter()
-                    .map(|k| PyPartitionKey::Single { key: vec![k] })
-                    .collect())
-            }
+            Self::TimeWindow { .. } | Self::Dynamic { .. } => Ok(self
+                .enumerate_single_dim_keys()?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect()),
             Self::Multi { dimensions } => {
                 let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
                 for (name, def) in dimensions {
@@ -297,38 +293,17 @@ impl PartitionsDefinition {
                     })
                     .collect())
             }
-            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
-                "Cannot enumerate dynamic partition keys",
-            )),
         }
     }
 
     /// Like [`get_partition_keys`](Self::get_partition_keys) but clamps every TimeWindow grid's effective end to `cap`.
     pub fn get_partition_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<PyPartitionKey>> {
         match self {
-            Self::TimeWindow {
-                cron_schedule,
-                interval_seconds,
-                start,
-                end,
-                fmt,
-            } => {
-                let capped_end = Some(match end {
-                    Some(e) => (*e).min(cap),
-                    None => cap,
-                });
-                let keys = enumerate_time_windows(
-                    cron_schedule,
-                    interval_seconds,
-                    start,
-                    &capped_end,
-                    fmt,
-                )?;
-                Ok(keys
-                    .into_iter()
-                    .map(|k| PyPartitionKey::Single { key: vec![k] })
-                    .collect())
-            }
+            Self::TimeWindow { .. } => Ok(self
+                .enumerate_single_dim_keys_capped(cap)?
+                .into_iter()
+                .map(|k| PyPartitionKey::Single { key: vec![k] })
+                .collect()),
             Self::Multi { dimensions } => {
                 let mut dim_keys: Vec<(String, Vec<String>)> = Vec::new();
                 for (name, def) in dimensions {
@@ -348,17 +323,22 @@ impl PartitionsDefinition {
 
     /// Single-dimension variant of [`get_partition_keys_capped`].
     pub fn enumerate_single_dim_keys_capped(&self, cap: civil::DateTime) -> PyResult<Vec<String>> {
-        self.get_partition_keys_capped(cap)?
-            .into_iter()
-            .map(|pk| match pk {
-                PyPartitionKey::Single { mut key } => Ok(key.remove(0)),
-                PyPartitionKey::Multi { .. } | PyPartitionKey::Set { .. } => {
-                    Err(PartitionDefinitionError::new_err(
-                        "enumerate_single_dim_keys called on a non-single-dimension definition",
-                    ))
-                }
-            })
-            .collect()
+        match self {
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => {
+                let capped_end = Some(match end {
+                    Some(e) => (*e).min(cap),
+                    None => cap,
+                });
+                enumerate_time_windows(cron_schedule, interval_seconds, start, &capped_end, fmt)
+            }
+            _ => self.enumerate_single_dim_keys(),
+        }
     }
 
     /// A window `[offset, offset+limit)` of keys without materializing the full set.
@@ -383,44 +363,13 @@ impl PartitionsDefinition {
                 Ok(keys.into_iter().map(single).collect())
             }
             Self::Multi { dimensions } => {
-                let n = dimensions.len();
-                let by_place = dimensions
-                    .iter()
-                    .map(|(_, def)| def.keys_by_place())
-                    .collect::<PyResult<Vec<_>>>()?;
-                let sizes: Vec<usize> = by_place
-                    .iter()
-                    .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
-                    .collect();
-                let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
-                let end = offset.saturating_add(limit).min(total);
-                if offset >= end {
-                    return Ok(Vec::new());
-                }
-                let mut strides = vec![1usize; n];
-                for i in (0..n.saturating_sub(1)).rev() {
-                    strides[i] = strides[i + 1].saturating_mul(sizes[i + 1]);
-                }
-                let mut out = Vec::with_capacity(end - offset);
-                for k in offset..end {
-                    let mut rem = k;
-                    let mut combo: HashMap<String, Vec<String>> = HashMap::new();
-                    for (i, (name, _)) in dimensions.iter().enumerate() {
-                        let idx_i = rem / strides[i];
-                        rem %= strides[i];
-                        let key = by_place[i]
-                            .as_ref()
-                            .and_then(|keys| keys.get(idx_i))
-                            .ok_or_else(|| {
-                                PartitionDefinitionError::new_err(format!(
-                                    "dimension '{name}' has no key at index {idx_i}"
-                                ))
-                            })?;
-                        combo.insert(name.clone(), vec![key]);
-                    }
-                    out.push(PyPartitionKey::Multi { keys: combo });
-                }
-                Ok(out)
+                multi_window(dimensions, offset, limit, |values| PyPartitionKey::Multi {
+                    keys: dimensions
+                        .iter()
+                        .zip(values)
+                        .map(|((name, _), value)| (name.clone(), vec![value.to_string()]))
+                        .collect(),
+                })
             }
             Self::Dynamic { .. } => Ok(self
                 .get_partition_keys()?
@@ -428,6 +377,42 @@ impl PartitionsDefinition {
                 .skip(offset)
                 .take(limit)
                 .collect()),
+        }
+    }
+
+    /// The window `[offset, offset+limit)` of keys as the UI shows them: a key
+    /// with more dimensions as `dim=value|dim=value`, its dimensions in the
+    /// order of their names.
+    pub(crate) fn display_keys_window(&self, offset: usize, limit: usize) -> PyResult<Vec<String>> {
+        match self {
+            Self::Static { .. } | Self::TimeWindow { .. } => Ok(self
+                .keys_by_place()?
+                .map(|keys| keys.window(offset, limit))
+                .unwrap_or_default()),
+            Self::Multi { dimensions } => {
+                let mut by_name: Vec<usize> = (0..dimensions.len()).collect();
+                by_name.sort_by_key(|&i| &dimensions[i].0);
+
+                multi_window(dimensions, offset, limit, |values| {
+                    let len = by_name
+                        .iter()
+                        .map(|&i| dimensions[i].0.len() + values[i].len() + 2)
+                        .sum();
+                    let mut text = String::with_capacity(len);
+                    for (n, &i) in by_name.iter().enumerate() {
+                        if n > 0 {
+                            text.push('|');
+                        }
+                        text.push_str(&dimensions[i].0);
+                        text.push('=');
+                        text.push_str(values[i]);
+                    }
+                    text
+                })
+            }
+            Self::Dynamic { .. } => Err(PyNotImplementedError::new_err(
+                "Cannot enumerate dynamic partition keys",
+            )),
         }
     }
 
@@ -616,19 +601,7 @@ impl PartitionsDefinition {
     /// Check if a partition key is valid for this definition.
     pub fn validate_partition_key(&self, key: &PyPartitionKey) -> PyResult<bool> {
         match (self, key) {
-            (Self::Static { keys: valid_keys }, PyPartitionKey::Single { key }) => {
-                Ok(!key.is_empty() && key.iter().all(|k| valid_keys.contains(k)))
-            }
-            (
-                Self::TimeWindow {
-                    cron_schedule,
-                    interval_seconds,
-                    start,
-                    end,
-                    fmt,
-                },
-                PyPartitionKey::Single { key },
-            ) => validate_time_window_key(key, cron_schedule, interval_seconds, start, end, fmt),
+            (_, PyPartitionKey::Single { key }) => self.validate_values(key),
             (Self::Multi { dimensions }, PyPartitionKey::Multi { keys }) => {
                 if keys.len() != dimensions.len() {
                     return Ok(false);
@@ -636,16 +609,8 @@ impl PartitionsDefinition {
                 for (dim_name, dim_def) in dimensions {
                     match keys.get(dim_name) {
                         Some(vals) => {
-                            if vals.is_empty() {
+                            if !dim_def.validate_values(vals)? {
                                 return Ok(false);
-                            }
-                            for val in vals {
-                                let single_key = PyPartitionKey::Single {
-                                    key: vec![val.clone()],
-                                };
-                                if !dim_def.validate_partition_key(&single_key)? {
-                                    return Ok(false);
-                                }
                             }
                         }
                         None => return Ok(false),
@@ -653,7 +618,6 @@ impl PartitionsDefinition {
                 }
                 Ok(true)
             }
-            (Self::Dynamic { .. }, PyPartitionKey::Single { key }) => Ok(!key.is_empty()),
             (_, PyPartitionKey::Set { keys }) => {
                 if keys.is_empty() {
                     return Ok(false);
@@ -666,6 +630,25 @@ impl PartitionsDefinition {
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    /// Whether `values` is a non-empty list of keys of this single-dimension
+    /// definition: the values of a `Single` key or of one dimension.
+    pub(crate) fn validate_values(&self, values: &[String]) -> PyResult<bool> {
+        match self {
+            Self::Static { keys } => {
+                Ok(!values.is_empty() && values.iter().all(|k| keys.contains(k)))
+            }
+            Self::TimeWindow {
+                cron_schedule,
+                interval_seconds,
+                start,
+                end,
+                fmt,
+            } => validate_time_window_key(values, cron_schedule, interval_seconds, start, end, fmt),
+            Self::Dynamic { .. } => Ok(!values.is_empty()),
+            Self::Multi { .. } => Ok(false),
         }
     }
 
@@ -753,10 +736,7 @@ impl PartitionsDefinition {
     fn valid_values(&self, values: &[String]) -> PyResult<Vec<String>> {
         let mut valid = Vec::new();
         for value in values {
-            let single = PyPartitionKey::Single {
-                key: vec![value.clone()],
-            };
-            if self.validate_partition_key(&single)? {
+            if self.validate_values(std::slice::from_ref(value))? {
                 valid.push(value.clone());
             }
         }
@@ -766,10 +746,7 @@ impl PartitionsDefinition {
     /// The first of `values` that is not a key of this definition.
     fn rejected_value<'a>(&self, values: &'a [String]) -> PyResult<Option<&'a String>> {
         for value in values {
-            let single = PyPartitionKey::Single {
-                key: vec![value.clone()],
-            };
-            if !self.validate_partition_key(&single)? {
+            if !self.validate_values(std::slice::from_ref(value))? {
                 return Ok(Some(value));
             }
         }
@@ -1187,6 +1164,70 @@ impl PartitionsDefinition {
     fn __eq__(&self, other: &Self) -> bool {
         self == other
     }
+}
+
+/// The keys `[offset, offset+limit)` of a definition with `dimensions`, each
+/// built by `key` from its values in the order of the dimensions. Each value
+/// is read once.
+fn multi_window<T>(
+    dimensions: &[(String, PartitionsDefinition)],
+    offset: usize,
+    limit: usize,
+    mut key: impl FnMut(&[&str]) -> T,
+) -> PyResult<Vec<T>> {
+    let by_place = dimensions
+        .iter()
+        .map(|(_, def)| def.keys_by_place())
+        .collect::<PyResult<Vec<_>>>()?;
+    let sizes: Vec<usize> = by_place
+        .iter()
+        .map(|keys| keys.as_ref().map_or(0, KeysByPlace::len))
+        .collect();
+    let total = sizes.iter().fold(1usize, |acc, &s| acc.saturating_mul(s));
+    let end = offset.saturating_add(limit).min(total);
+    if offset >= end {
+        return Ok(Vec::new());
+    }
+
+    let mut strides = vec![1usize; sizes.len()];
+    for i in (0..sizes.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1].saturating_mul(sizes[i + 1]);
+    }
+
+    // The values of each dimension in the window, from its value at `offset` on.
+    let values: Vec<Vec<String>> = by_place
+        .iter()
+        .zip(&sizes)
+        .zip(&strides)
+        .map(|((keys, &size), &stride)| {
+            let Some(keys) = keys else {
+                return Vec::new();
+            };
+            let first = offset / stride;
+            let count = ((end - 1) / stride - first + 1).min(size);
+            let mut values = keys.window(first % size, count);
+            values.extend(keys.window(0, count - values.len()));
+            values
+        })
+        .collect();
+
+    let mut row = Vec::with_capacity(dimensions.len());
+    (offset..end)
+        .map(|k| {
+            row.clear();
+            for (i, (name, _)) in dimensions.iter().enumerate() {
+                let place = (k / strides[i] - offset / strides[i]) % sizes[i];
+                let value = values[i].get(place).ok_or_else(|| {
+                    PartitionDefinitionError::new_err(format!(
+                        "dimension '{name}' has no key at index {}",
+                        k / strides[i] % sizes[i]
+                    ))
+                })?;
+                row.push(value.as_str());
+            }
+            Ok(key(&row))
+        })
+        .collect()
 }
 
 /// Compute the cartesian product of dimension keys.

@@ -1,4 +1,4 @@
-use surrealdb::types::{Error as SurrealError, Kind, SurrealValue, Value};
+use surrealdb::types::{Error as SurrealError, Kind, Object, SurrealValue, Value};
 
 use super::{LaunchedBy, default_code_location_id};
 
@@ -114,22 +114,22 @@ impl SurrealValue for BackfillStrategy {
     }
 
     fn from_value(value: Value) -> std::result::Result<Self, SurrealError> {
-        let map = <std::collections::BTreeMap<String, Value>>::from_value(value)?;
+        let mut map = Object::from_value(value)?;
         let variant = map
-            .get("variant")
-            .and_then(|v| String::from_value(v.clone()).ok())
+            .remove("variant")
+            .and_then(|v| String::from_value(v).ok())
             .unwrap_or_default();
         match variant.as_str() {
             "SingleRun" => Ok(Self::SingleRun),
             "PerDimension" => {
                 let multi_run = map
-                    .get("multi_run")
-                    .map(|v| Vec::<String>::from_value(v.clone()))
+                    .remove("multi_run")
+                    .map(Vec::<String>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 let single_run = map
-                    .get("single_run")
-                    .map(|v| Vec::<String>::from_value(v.clone()))
+                    .remove("single_run")
+                    .map(Vec::<String>::from_value)
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::PerDimension {

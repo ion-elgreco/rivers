@@ -167,12 +167,12 @@ struct RolloutStatus<T> {
 fn rollout_status<T: Template>(
     cl: &CodeLocation,
     rollout: &Rollout<T>,
-    prior_serving: Option<T>,
+    prior_serving: Option<&T>,
     apply_failure: Option<&str>,
 ) -> RolloutStatus<T> {
     let serving = match &rollout.template {
         Some(template) if rollout.complete => Some(template.clone()),
-        _ => prior_serving,
+        _ => prior_serving.cloned(),
     };
     let desired = cl.spec.replicas;
     let ready =
@@ -249,19 +249,24 @@ pub(super) fn git_status(
     let rollout = rollout_status(
         cl,
         &update.rollout,
-        prior.and_then(|s| s.run_source.clone()),
+        prior.and_then(|s| s.run_source.as_ref()),
         update.apply_failure.as_deref(),
     );
     let serving = rollout.serving;
     let mut status = CodeLocationStatus {
+        phase: Some(rollout.phase),
+        observed_generation: cl.metadata.generation,
         resolved_image: serving.as_ref().map(|t| t.runtime_image.clone()),
         grpc_endpoint: (!rollout.failed).then_some(update.endpoint),
+        last_reconciled: Some(now.clone()),
         ready_replicas: update.rollout.ready_replicas.filter(|_| !rollout.failed),
+        message: None,
+        conditions: Vec::new(),
         source: serving.as_ref().map(source_display),
         resolved_commit: serving.as_ref().map(|t| t.git.commit.clone()),
         resolved_ref: serving.as_ref().and_then(|t| t.git.r#ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
         run_source: serving,
-        ..next_status(cl, rollout.phase, now)
     };
     match update.resolution {
         Some(GitResolution::ImageResolved {
@@ -401,7 +406,7 @@ pub(super) fn image_status(
     let prior = cl.status.as_ref();
     let prior_serving = prior
         .filter(|s| !is_git_status(s))
-        .and_then(|s| s.resolved_image.clone());
+        .and_then(|s| s.resolved_image.as_ref());
     let rollout = rollout_status(cl, &update.rollout, prior_serving, None);
     let mut status = CodeLocationStatus {
         phase: Some(rollout.phase),
@@ -522,13 +527,10 @@ pub(super) async fn patch_status(
     cl: &CodeLocation,
     status: &CodeLocationStatus,
 ) -> Result<(), kube_client::Error> {
-    let unchanged = cl.status.as_ref().is_some_and(|prior| {
-        *status
-            == CodeLocationStatus {
-                last_reconciled: status.last_reconciled.clone(),
-                ..prior.clone()
-            }
-    });
+    let unchanged = cl
+        .status
+        .as_ref()
+        .is_some_and(|prior| same_but_last_reconciled(status, prior));
     if unchanged {
         return Ok(());
     }
@@ -547,20 +549,36 @@ pub(super) async fn patch_status(
     Ok(())
 }
 
-/// `cl`'s status for a pass at `at` in `phase`. It keeps what the prior
-/// status says the pods run (`resolvedImage`, `source` and the git fields)
-/// until the pass sets these; the pass sets the other fields anew.
-fn next_status(cl: &CodeLocation, phase: CodeLocationPhase, at: &str) -> CodeLocationStatus {
-    CodeLocationStatus {
-        phase: Some(phase),
-        observed_generation: cl.metadata.generation,
-        last_reconciled: Some(at.to_string()),
-        grpc_endpoint: None,
-        ready_replicas: None,
-        message: None,
-        conditions: Vec::new(),
-        ..cl.status.clone().unwrap_or_default()
-    }
+/// Whether every field of `status` but `lastReconciled` is as `prior` has it.
+fn same_but_last_reconciled(status: &CodeLocationStatus, prior: &CodeLocationStatus) -> bool {
+    // No `..`: a new status field must be compared here.
+    let CodeLocationStatus {
+        phase,
+        observed_generation,
+        resolved_image,
+        grpc_endpoint,
+        last_reconciled: _,
+        ready_replicas,
+        message,
+        conditions,
+        source,
+        resolved_commit,
+        resolved_ref,
+        last_fetched_at,
+        run_source,
+    } = status;
+    *phase == prior.phase
+        && *observed_generation == prior.observed_generation
+        && *resolved_image == prior.resolved_image
+        && *grpc_endpoint == prior.grpc_endpoint
+        && *ready_replicas == prior.ready_replicas
+        && *message == prior.message
+        && *conditions == prior.conditions
+        && *source == prior.source
+        && *resolved_commit == prior.resolved_commit
+        && *resolved_ref == prior.resolved_ref
+        && *last_fetched_at == prior.last_fetched_at
+        && *run_source == prior.run_source
 }
 
 /// Why a pass resolved nothing for the pods to run.
@@ -615,8 +633,19 @@ fn unresolved_status(
     let now = at.to_string();
     let prior = cl.status.as_ref();
     let mut status = CodeLocationStatus {
+        phase: Some(phase),
+        observed_generation: cl.metadata.generation,
+        resolved_image: prior.and_then(|s| s.resolved_image.clone()),
+        grpc_endpoint: None,
+        last_reconciled: Some(now.clone()),
+        ready_replicas: None,
         message: Some(message),
-        ..next_status(cl, phase, &now)
+        conditions: Vec::new(),
+        source: prior.and_then(|s| s.source.clone()),
+        resolved_commit: prior.and_then(|s| s.resolved_commit.clone()),
+        resolved_ref: prior.and_then(|s| s.resolved_ref.clone()),
+        last_fetched_at: prior.and_then(|s| s.last_fetched_at.clone()),
+        run_source: prior.and_then(|s| s.run_source.clone()),
     };
     push_condition(
         &mut status,
@@ -723,5 +752,62 @@ mod tests {
             "v1.2.3@9f3c1ab"
         );
         assert_eq!(source_display(&at(None)), "9f3c1ab (pinned)");
+    }
+
+    #[test]
+    fn same_but_last_reconciled_sees_every_other_field() {
+        let prior: CodeLocationStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Ready",
+            "observedGeneration": 7,
+            "resolvedImage": "ghcr.io/acme/rivers-runtime@sha256:aaaa",
+            "grpcEndpoint": "x.y.svc.cluster.local:3001",
+            "lastReconciled": "2026-11-17T10:00:00Z",
+            "readyReplicas": 1,
+            "message": "rolling out",
+            "conditions": [{
+                "type": CONDITION_DEPLOYMENT_AVAILABLE,
+                "status": "True",
+                "lastTransitionTime": "2026-11-17T09:00:00Z",
+                "reason": REASON_MIN_REPLICAS,
+            }],
+            "source": "main@9f3c1ab",
+            "resolvedCommit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+            "resolvedRef": "refs/heads/main",
+            "lastFetchedAt": "2026-11-17T09:59:00Z",
+            "runSource": {
+                "git": {
+                    "url": "https://forge.example/r.git",
+                    "commit": "9f3c1ab8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8",
+                },
+                "dependencies": { "mode": "auto" },
+                "runtimeImage": "ghcr.io/acme/rivers-runtime@sha256:aaaa",
+            },
+        }))
+        .unwrap();
+        let later = CodeLocationStatus {
+            last_reconciled: Some("2026-11-17T10:00:30Z".into()),
+            ..prior.clone()
+        };
+        assert!(same_but_last_reconciled(&later, &prior));
+
+        let changes: [fn(&mut CodeLocationStatus); 12] = [
+            |s| s.phase = Some(CodeLocationPhase::Failed),
+            |s| s.observed_generation = Some(8),
+            |s| s.resolved_image = None,
+            |s| s.grpc_endpoint = None,
+            |s| s.ready_replicas = Some(0),
+            |s| s.message = None,
+            |s| s.conditions[0].status = "False".into(),
+            |s| s.source = None,
+            |s| s.resolved_commit = None,
+            |s| s.resolved_ref = None,
+            |s| s.last_fetched_at = None,
+            |s| s.run_source = None,
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut status = later.clone();
+            change(&mut status);
+            assert!(!same_but_last_reconciled(&status, &prior), "change {i}");
+        }
     }
 }

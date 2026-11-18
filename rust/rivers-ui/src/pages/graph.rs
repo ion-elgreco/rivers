@@ -192,8 +192,9 @@ pub fn GraphPage() -> impl IntoView {
     let topology_value = crate::helpers::resource_value(topology);
     let graph_asset_names = Memo::new(move |_| {
         topology_value
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|t| {
                 t.nodes
                     .iter()
@@ -207,8 +208,9 @@ pub fn GraphPage() -> impl IntoView {
     // Task nodes can be selected for lineage tracing but never materialized.
     let task_node_names = Memo::new(move |_| {
         topology_value
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|t| {
                 t.nodes
                     .iter()
@@ -223,8 +225,9 @@ pub fn GraphPage() -> impl IntoView {
     // lineage, never materialized here.
     let remote_nodes = Memo::new(move |_| {
         topology_value
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|t| t.remote_nodes())
             .unwrap_or_default()
     });
@@ -233,8 +236,9 @@ pub fn GraphPage() -> impl IntoView {
     // node needs no request; until the topology is here, ask.
     let no_remote_nodes = Memo::new(move |_| {
         topology_value
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .is_some_and(|t| t.nodes.iter().all(|n| n.remote.is_none()))
     });
     let remote_statuses = Resource::new(
@@ -335,10 +339,12 @@ pub fn GraphPage() -> impl IntoView {
 
     let ancestor_keys = Signal::derive(move || {
         lineage
-            .get()
-            .flatten()
+            .read()
+            .as_ref()
+            .and_then(Option::as_ref)
             .map(|(anc, _)| {
-                anc.into_iter()
+                anc.iter()
+                    .cloned()
                     .collect::<std::collections::HashSet<String>>()
             })
             .unwrap_or_default()
@@ -346,10 +352,12 @@ pub fn GraphPage() -> impl IntoView {
 
     let descendant_keys = Signal::derive(move || {
         lineage
-            .get()
-            .flatten()
+            .read()
+            .as_ref()
+            .and_then(Option::as_ref)
             .map(|(_, desc)| {
-                desc.into_iter()
+                desc.iter()
+                    .cloned()
                     .collect::<std::collections::HashSet<String>>()
             })
             .unwrap_or_default()
@@ -367,8 +375,9 @@ pub fn GraphPage() -> impl IntoView {
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let dialog_verb = RwSignal::new(Option::<crate::types::AssetActionInfo>::None);
     let dialog_destructive = RwSignal::new(false);
-    let materialize_picker = Signal::derive(move || {
-        partition_picker_for_assets(&mat_targets.get(), &asset_info_by_key.get())
+    let materialize_picker = Memo::new(move |_| {
+        asset_info_by_key
+            .with(|defs| mat_targets.with(|keys| partition_picker_for_assets(keys, defs)))
     });
     let dialog_asset_keys = Signal::derive(move || mat_targets.get());
     // One opener for both flows — `None` verb materializes. The task-node
@@ -377,12 +386,13 @@ pub fn GraphPage() -> impl IntoView {
     type DialogVerb = Option<crate::types::AssetActionInfo>;
     let open_dialog: Callback<(Vec<String>, DialogVerb, bool)> = Callback::new(
         move |(keys, verb, destructive): (Vec<String>, DialogVerb, bool)| {
-            let tasks = task_node_names.get_untracked();
-            let remotes = remote_nodes.get_untracked();
-            let keys: Vec<String> = keys
-                .into_iter()
-                .filter(|k| !tasks.contains(k) && !remotes.contains_key(k))
-                .collect();
+            let keys: Vec<String> = task_node_names.with_untracked(|tasks| {
+                remote_nodes.with_untracked(|remotes| {
+                    keys.into_iter()
+                        .filter(|k| !tasks.contains(k) && !remotes.contains_key(k))
+                        .collect()
+                })
+            });
             if keys.is_empty() {
                 return;
             }
@@ -401,37 +411,39 @@ pub fn GraphPage() -> impl IntoView {
     );
 
     // Filter options come from the whole graph, not the filtered layout.
-    let all_kinds = Signal::derive(move || {
-        topology
-            .get()
-            .and_then(|r| r.ok())
+    let all_kinds = Memo::new(move |_| {
+        topology_value
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|t| {
-                let mut kinds: Vec<String> = t.nodes.iter().map(|n| n.kind.clone()).collect();
-                kinds.sort();
-                kinds.dedup();
-                kinds
+                let mut kinds = std::collections::BTreeSet::new();
+                kinds.extend(t.nodes.iter().map(|n| n.kind.as_str()));
+                kinds.into_iter().map(str::to_owned).collect::<Vec<_>>()
             })
             .unwrap_or_default()
     });
 
-    let all_groups_list = Signal::derive(move || {
-        topology
-            .get()
-            .and_then(|r| r.ok())
+    let all_groups_list = Memo::new(move |_| {
+        topology_value
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|t| {
-                let mut groups: Vec<String> =
-                    t.nodes.iter().filter_map(|n| n.group.clone()).collect();
-                groups.sort();
-                groups.dedup();
-                groups
+                let mut groups = std::collections::BTreeSet::new();
+                groups.extend(t.nodes.iter().filter_map(|n| n.group.as_deref()));
+                groups.into_iter().map(str::to_owned).collect::<Vec<_>>()
             })
             .unwrap_or_default()
     });
 
+    // Derives, not memos: read inside the `<Transition>`, they make it wait
+    // for the resources, so the server renders the node statuses.
     let materialized_keys = Signal::derive(move || {
         all_assets
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|records| {
                 records
                     .iter()
@@ -444,8 +456,9 @@ pub fn GraphPage() -> impl IntoView {
 
     let stale_keys = Signal::derive(move || {
         all_assets
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|records| {
                 records
                     .iter()
@@ -465,8 +478,9 @@ pub fn GraphPage() -> impl IntoView {
 
     let external_keys = Signal::derive(move || {
         assets_info
-            .get()
-            .and_then(|r| r.ok())
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
             .map(|infos| {
                 infos
                     .iter()
@@ -543,18 +557,18 @@ pub fn GraphPage() -> impl IntoView {
         <div class="filter-bar">
             {
                 let kind_options = Signal::derive(move || {
-                    all_kinds.get().into_iter().map(|k| SelectOption {
+                    all_kinds.with(|kinds| kinds.iter().map(|k| SelectOption {
                         label: k.clone(),
-                        value: k,
+                        value: k.clone(),
                         enabled: true,
-                    }).collect::<Vec<_>>()
+                    }).collect::<Vec<_>>())
                 });
                 let group_options = Signal::derive(move || {
-                    all_groups_list.get().into_iter().map(|g| SelectOption {
+                    all_groups_list.with(|groups| groups.iter().map(|g| SelectOption {
                         label: g.clone(),
-                        value: g,
+                        value: g.clone(),
                         enabled: true,
-                    }).collect::<Vec<_>>()
+                    }).collect::<Vec<_>>())
                 });
                 let toggle_kind_cb: Callback<String> = Callback::new({
                     let set_fk = set_filter_kind.clone();
@@ -702,8 +716,7 @@ pub fn GraphPage() -> impl IntoView {
                                     <DagGraph
                                         layout=layout_result
                                         on_node_click=Callback::new(move |(name, additive): (String, bool)| {
-                                            let ga = graph_asset_names.get_untracked();
-                                            if !additive && ga.contains(&name) {
+                                            if !additive && graph_asset_names.with_untracked(|ga| ga.contains(&name)) {
                                                 set_expanded_graphs.update(|set| {
                                                     if !set.remove(&name) {
                                                         set.insert(name.clone());
@@ -766,7 +779,7 @@ pub fn GraphPage() -> impl IntoView {
                         let name_for_mat = node_name.clone();
                         let name_for_ctx_label = node_name.clone();
                         let name_for_detail = node_name.clone();
-                        let is_remote = remote_nodes.get_untracked().contains_key(&node_name);
+                        let is_remote = remote_nodes.with_untracked(|r| r.contains_key(&node_name));
                         view! {
                             <div class="context-menu" style=format!("left: {x}px; top: {y}px")>
                                 {(!is_remote).then(|| view! {
@@ -836,8 +849,8 @@ pub fn GraphPage() -> impl IntoView {
                 // More than one node selected → summarize the selection instead of
                 // one asset's detail, so it's obvious what a materialize would cover.
                 if sel.len() > 1 {
-                    let tasks = task_node_names.get();
-                    let remotes = remote_nodes.get();
+                    let tasks = task_node_names.read();
+                    let remotes = remote_nodes.read();
                     let mat_keys: Vec<String> = sel
                         .iter()
                         .filter(|k| !tasks.contains(*k) && !remotes.contains_key(*k))
@@ -898,7 +911,7 @@ pub fn GraphPage() -> impl IntoView {
                             })}
 
                             <div class="dag-sidebar-footer">
-                                {sorted_verbs(common_actions(&mat_keys, &asset_info_by_key.get())).into_iter().map(|act| {
+                                {sorted_verbs(asset_info_by_key.with(|defs| common_actions(&mat_keys, defs))).into_iter().map(|act| {
                                     let destructive = act.is_destructive();
                                     let label = format!("{}…", crate::helpers::verb_label(&act.name));
                                     let keys = mat_keys.clone();
@@ -929,13 +942,19 @@ pub fn GraphPage() -> impl IntoView {
 
                 let node_name = sel[0].clone();
                 {
-                    let topo = topology.get().and_then(|r| r.ok());
-                    let (upstream, downstream): (Vec<String>, Vec<String>) = topo
+                    let (upstream, downstream): (Vec<String>, Vec<String>) = topology
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
                         .map(|t| (t.direct_upstream(&node_name), t.direct_downstream(&node_name)))
                         .unwrap_or_default();
 
-                    if let Some(remote) = remote_nodes.get().get(&node_name).cloned() {
-                        let owner_status = remote_status_by_node.get().remove(&node_name);
+                    if let Some(remote) = remote_nodes.with(|r| r.get(&node_name).cloned()) {
+                        let owner_status = remote_statuses
+                            .read()
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .and_then(|statuses| statuses.get(&node_name).cloned());
                         return Some(view! {
                             <div class="dag-selected-sidebar">
                                 <div class="dag-sidebar-header">
@@ -996,7 +1015,7 @@ pub fn GraphPage() -> impl IntoView {
                                             let (lns, lnm) = loc.get();
                                             let href = loc_path(&lns, &lnm, &format!("assets/{}", record.asset_key));
                                             let mat_key = record.asset_key.clone();
-                                            let is_task = task_node_names.get().contains(&record.asset_key);
+                                            let is_task = task_node_names.with(|t| t.contains(&record.asset_key));
                                             let status_kind = crate::helpers::stale_status_kind(&record.stale_status);
                                             // The relative-time piece is emitted as a reactive
                                             // `<RelTimeOpt>` so it ticks live.
@@ -1009,10 +1028,9 @@ pub fn GraphPage() -> impl IntoView {
                                             let tags = record.tags.clone();
                                             let ups = upstream.clone();
                                             let downs = downstream.clone();
-                                            let node_verbs = common_actions(
-                                                std::slice::from_ref(&record.asset_key),
-                                                &asset_info_by_key.get(),
-                                            );
+                                            let node_verbs = asset_info_by_key.with(|defs| {
+                                                common_actions(std::slice::from_ref(&record.asset_key), defs)
+                                            });
                                             let key_for_actions = record.asset_key.clone();
                                             view! {
                                                 <div class="dag-sidebar-header">

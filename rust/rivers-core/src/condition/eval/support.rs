@@ -8,7 +8,7 @@ use crate::storage::{NamedPartitions, PartitionKey};
 use super::super::node::ConditionNode;
 use super::super::partition::{PartitionEvalContext, PartitionSelection};
 use super::super::state::{EvalContext, EvalNodeResult, NodeStatus};
-use super::DepScope;
+use super::{DepScope, count_nodes};
 
 /// The (data version, materialized ts) baseline `DataVersionChanged` compares
 /// against: in a dep pivot, the ROOT's per-dep baseline (so one asset's fire
@@ -71,11 +71,12 @@ pub(crate) fn collect_dep_latch<V>(scope: &mut DepScope<V>, dep_key: &str, local
             marks.remove(idx);
         }
     }
-    scope
-        .acc
-        .entry(dep_key.to_string())
-        .or_default()
-        .extend(local);
+    match scope.acc.get_mut(dep_key) {
+        Some(slot) => slot.extend(local),
+        None => {
+            scope.acc.insert(dep_key.to_owned(), local);
+        }
+    }
 }
 
 /// Merge latches bridged out of the unpartitioned bool fallback (`from_bool`: true → `All`).
@@ -87,8 +88,18 @@ pub(crate) fn collect_bridged_latch(
     if local.is_empty() {
         return;
     }
-    let slot = scope.acc.entry(dep_key.to_string()).or_default();
-    let marks = scope.bridged.entry(dep_key.to_string()).or_default();
+    // A dep missing from `acc` has no `bridged` marks either.
+    let Some(slot) = scope.acc.get_mut(dep_key) else {
+        scope
+            .bridged
+            .insert(dep_key.to_owned(), local.keys().copied().collect());
+        scope.acc.insert(dep_key.to_owned(), local);
+        return;
+    };
+    let marks = match scope.bridged.get_mut(dep_key) {
+        Some(marks) => marks,
+        None => scope.bridged.entry(dep_key.to_owned()).or_default(),
+    };
     for (idx, sel) in local {
         match slot.entry(idx) {
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -97,8 +108,8 @@ pub(crate) fn collect_bridged_latch(
             }
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 if marks.contains(&idx) {
-                    let merged = e.get().union(&sel);
-                    e.insert(merged);
+                    let slot = e.get_mut();
+                    *slot = std::mem::replace(slot, PartitionSelection::Empty).union(sel);
                 }
             }
         }
@@ -120,21 +131,20 @@ pub(crate) fn select_in_universe(
 
 /// Previous-tick selection for stateful node `my_idx`: the per-dep latch when
 /// pivoting into a dep (`cur_prev`), otherwise the asset's own state.
-pub(crate) fn prev_partition_latch(
-    dep_selections: &DepScope<PartitionSelection>,
-    ctx: &EvalContext,
+pub(crate) fn prev_partition_latch<'a>(
+    dep_selections: &DepScope<'a, PartitionSelection>,
+    ctx: &'a EvalContext,
     my_idx: u32,
-) -> PartitionSelection {
+) -> &'a PartitionSelection {
     match dep_selections.cur_prev {
-        Some(map) => map.get(&my_idx).cloned(),
+        Some(map) => map.get(&my_idx),
         None => ctx
             .prev_state
             .partition_state
             .as_ref()
-            .and_then(|ps| ps.previous_selections.get(&my_idx))
-            .cloned(),
+            .and_then(|ps| ps.previous_selections.get(&my_idx)),
     }
-    .unwrap_or(PartitionSelection::Empty)
+    .unwrap_or(&PartitionSelection::Empty)
 }
 
 /// Build a skipped tree for a subtree that was not evaluated due to short-circuiting.
@@ -151,7 +161,7 @@ pub(crate) fn build_skipped_subtree(node: &ConditionNode, counter: &mut u32) -> 
     );
     let children = if is_dep_aggregate {
         for child in node.children() {
-            let _ = build_skipped_subtree(child, counter);
+            count_nodes(child, counter);
         }
         Vec::new()
     } else {

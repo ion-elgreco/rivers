@@ -634,10 +634,11 @@ fn will_be_requested_carries_the_upstream_fired_selection() {
     )]);
 
     // Upstream's own condition fired for 'a' only, earlier this tick.
-    let requested = HashMap::from([(
-        "up".to_string(),
+    let fired = Fired::new(vec![(
+        "up",
         PartitionSelection::Keys(HashSet::from([pa.clone()])),
     )]);
+    let requested = fired.view();
 
     let mut ctx = make_ctx("down", &down, &records, &deps);
     let partition_asset_names = slotted_parts(partition_asset_names);
@@ -916,7 +917,7 @@ fn test_any_deps_in_progress() {
     let b = make_materialized_record("b", 100);
     let records = HashMap::from([("a".to_string(), a), ("b".to_string(), b.clone())]);
     let deps = HashMap::from([("b".to_string(), vec!["a".to_string()])]);
-    let in_progress = HashSet::from(["a".to_string()]);
+    let in_progress = HashSet::from(["a"]);
     let ctx = EvalContext {
         target_key: "b",
         root_key: "b",

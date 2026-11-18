@@ -37,6 +37,9 @@ pub struct PyJob {
     pub(crate) executor: Option<Executor>,
     /// Job-level retry default; assets with their own policy keep it.
     retry: Option<RetryRef>,
+    /// Retry policy for the steps whose node sets none: `retry`, else the
+    /// repository default. Set by `set_default_retry`.
+    default_retry: Option<RetryPolicy>,
     /// The verb this job executes. `None` means materialize; when
     /// set, the plan is built with `ExecutionPlan::for_action`.
     pub(crate) action: Option<String>,
@@ -47,7 +50,7 @@ pub struct PyJob {
     synthetic: bool,
     // Set after validation by CodeRepository:
     plan: Option<ExecutionPlan>,
-    node_map: Option<HashMap<String, ResolvedNode>>,
+    node_map: Option<Arc<HashMap<String, ResolvedNode>>>,
     /// Storage scoped to the owning code location, set by `CodeRepository`
     /// during resolve. `None` for unresolved jobs. Used by `run_record` (which
     /// short-circuits when this is None) and `execute_run` for materialization.
@@ -131,6 +134,7 @@ impl PyJob {
             node_names,
             executor,
             retry: None,
+            default_retry: None,
             action: None,
             allow_incomplete_deps,
             synthetic: false,
@@ -195,28 +199,15 @@ impl PyJob {
         Ok(())
     }
 
-    /// Nearest-wins retry fill over this job's node subset: a node keeps its
-    /// own policy; otherwise the job's; otherwise `fallback` (the repo default).
-    pub(crate) fn fill_retry_defaults(&mut self, fallback: Option<&RetryPolicy>) {
-        let default = self
+    /// Nearest-wins retry default for this job's steps: a node keeps its own
+    /// policy; otherwise the job's; otherwise `fallback` (the repo default).
+    pub(crate) fn set_default_retry(&mut self, fallback: Option<&RetryPolicy>) {
+        self.default_retry = self
             .retry
             .as_ref()
             .and_then(|r| r.as_inline())
-            .cloned()
-            .or_else(|| fallback.cloned());
-        let Some(policy) = default else { return };
-        if let Some(map) = &mut self.node_map {
-            for node in map.values_mut() {
-                let slot = match node {
-                    ResolvedNode::Asset(a) => &mut a.retry,
-                    ResolvedNode::Task(t) => &mut t.retry,
-                    ResolvedNode::BashTask(b) => &mut b.retry,
-                };
-                if slot.is_none() {
-                    *slot = Some(policy.clone());
-                }
-            }
-        }
+            .or(fallback)
+            .cloned();
     }
 
     /// Validate the job's nodes against the repository graph and build the execution plan.
@@ -334,40 +325,35 @@ impl PyJob {
 
         // Build node_map subset (include external/incomplete deps for load_input).
         // Skip virtual collect steps — they don't have ResolvedNode entries.
-        // The two `clone_ref` loops are the only GIL-bound work left in this
-        // function — acquire once and do them together.
-        let subset = Python::attach(|py| {
-            let mut subset: HashMap<String, ResolvedNode> = HashMap::new();
-            for name in &self.node_names {
-                if let Some(node) = repo_node_map.get(name) {
-                    subset.insert(name.clone(), node.clone_ref(py));
+        let mut subset: HashMap<String, ResolvedNode> = HashMap::new();
+        for name in &self.node_names {
+            if let Some(node) = repo_node_map.get(name) {
+                subset.insert(name.clone(), node.clone());
+            }
+        }
+        // Include deps not in the job that have io_handlers (external
+        // and remote assets, or allow_incomplete_deps). Lineage-only deps
+        // load nothing.
+        for name in &self.node_names {
+            let node_idx = match name_to_idx.get(name.as_str()) {
+                Some(&idx) => idx,
+                None => continue, // virtual collect step — not in the graph
+            };
+            let node = repo_node_map.get(name.as_str());
+            for dep_idx in graph.neighbors_directed(node_idx, Direction::Outgoing) {
+                let dep_name = &graph[dep_idx].name;
+                let loads_data = !node.is_some_and(|n| n.is_lineage_dep(dep_name));
+                if !subset.contains_key(dep_name.as_str())
+                    && let Some(dep_node) = repo_node_map.get(dep_name.as_str())
+                    && (dep_node.is_external()
+                        || dep_node.is_remote()
+                        || (self.allow_incomplete_deps && loads_data))
+                {
+                    subset.insert(dep_name.clone(), dep_node.clone());
                 }
             }
-            // Include deps not in the job that have io_handlers (external
-            // and remote assets, or allow_incomplete_deps). Lineage-only deps
-            // load nothing.
-            for name in &self.node_names {
-                let node_idx = match name_to_idx.get(name.as_str()) {
-                    Some(&idx) => idx,
-                    None => continue, // virtual collect step — not in the graph
-                };
-                let node = repo_node_map.get(name.as_str());
-                for dep_idx in graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                    let dep_name = &graph[dep_idx].name;
-                    let loads_data = !node.is_some_and(|n| n.is_lineage_dep(dep_name));
-                    if !subset.contains_key(dep_name.as_str())
-                        && let Some(dep_node) = repo_node_map.get(dep_name.as_str())
-                        && (dep_node.is_external()
-                            || dep_node.is_remote()
-                            || (self.allow_incomplete_deps && loads_data))
-                    {
-                        subset.insert(dep_name.clone(), dep_node.clone_ref(py));
-                    }
-                }
-            }
-            subset
-        });
-        self.node_map = Some(subset);
+        }
+        self.node_map = Some(Arc::new(subset));
 
         Ok(())
     }
@@ -434,17 +420,12 @@ impl PyJob {
             ordering.unwrap_or_default(),
         ));
 
-        let subset = Python::attach(|py| {
-            self.node_names
-                .iter()
-                .filter_map(|n| {
-                    repo_node_map
-                        .get(n)
-                        .map(|node| (n.clone(), node.clone_ref(py)))
-                })
-                .collect()
-        });
-        self.node_map = Some(subset);
+        let subset = self
+            .node_names
+            .iter()
+            .filter_map(|n| repo_node_map.get(n).map(|node| (n.clone(), node.clone())))
+            .collect();
+        self.node_map = Some(Arc::new(subset));
         Ok(())
     }
 }
@@ -656,7 +637,7 @@ impl PyJob {
         if let Some(action) = self.action.as_deref() {
             crate::repository::validate_partition_in_map(
                 node_map,
-                plan.all_asset_names().iter().map(String::as_str),
+                plan.asset_names(),
                 partition_key.as_ref(),
                 Some(action),
             )?;
@@ -676,6 +657,7 @@ impl PyJob {
                 storage,
                 resources: &self.resources,
                 retries: &self.retries,
+                default_retry: self.default_retry.as_ref(),
                 io_handler_registry: &registry,
                 job_name: self.record_name(),
                 run_id,
@@ -698,7 +680,11 @@ impl PyJob {
 
     fn validated_parts(
         &self,
-    ) -> PyResult<(&ExecutionPlan, &HashMap<String, ResolvedNode>, &Executor)> {
+    ) -> PyResult<(
+        &ExecutionPlan,
+        &Arc<HashMap<String, ResolvedNode>>,
+        &Executor,
+    )> {
         let (plan, node_map) = self
             .plan
             .as_ref()

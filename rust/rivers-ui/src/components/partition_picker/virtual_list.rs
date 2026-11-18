@@ -442,12 +442,18 @@ pub(super) fn VirtualPartitionList(
                                 let base = scroll_top.get();
                                 // Borrow the cache/selection (no per-tick clone);
                                 // membership via a set built once per render.
-                                let sel_keys: HashSet<String> = match selection {
-                                    PagedSelection::Keys(keys) => keys.get().into_iter().collect(),
-                                    PagedSelection::Spans { .. } => HashSet::new(),
+                                let sel_vec = match selection {
+                                    PagedSelection::Keys(keys) => Some(keys.read()),
+                                    PagedSelection::Spans { .. } => None,
                                 };
+                                let sel_keys: HashSet<&str> = sel_vec
+                                    .as_deref()
+                                    .map_or(&[][..], Vec::as_slice)
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect();
                                 let sel_spans = match selection {
-                                    PagedSelection::Spans { spans, .. } => Some(spans.get()),
+                                    PagedSelection::Spans { spans, .. } => Some(spans.read()),
                                     PagedSelection::Keys(_) => None,
                                 };
                                 pages.with(|pgs| {
@@ -467,7 +473,7 @@ pub(super) fn VirtualPartitionList(
                                                     let at = *at;
                                                     let is_sel = match &sel_spans {
                                                         Some(spans) => spans.contains(at),
-                                                        None => sel_keys.contains(key),
+                                                        None => sel_keys.contains(key.as_str()),
                                                     };
                                                     let key = key.clone();
                                                     let k = key.clone();
