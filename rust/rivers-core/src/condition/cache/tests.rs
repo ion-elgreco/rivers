@@ -1325,7 +1325,7 @@ async fn initial_load_shares_one_runs_names_and_tags() {
     storage
         .register_assets(
             &cl,
-            &[
+            vec![
                 rec_with_run("events", Some("r1"), 1000),
                 rec_with_run("rollup", Some("r1"), 1000),
             ],
