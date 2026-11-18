@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn domain_match_uses_the_last_at_and_the_whole_domain() {
         let allow = Allowlists {
-            domains: vec!["example.com".into(), "examplé.org".into()],
+            domains: vec!["example.com".into(), "élan.org".into()],
             ..Default::default()
         };
         assert!(!allow.permits(&id(Some("jane"), &[])));
@@ -120,8 +120,8 @@ mod tests {
         assert!(!allow.permits(&id(Some("jane@example.com@other.org"), &[])));
         assert!(!allow.permits(&id(Some("jane@sub.example.com"), &[])));
         assert!(!allow.permits(&id(Some("jane@notexample.com"), &[])));
-        assert!(allow.permits(&id(Some("jane@EXAMPLé.ORG"), &[])));
-        assert!(!allow.permits(&id(Some("jane@examplÉ.org"), &[])));
+        assert!(allow.permits(&id(Some("jane@éLAN.ORG"), &[])));
+        assert!(!allow.permits(&id(Some("jane@Élan.org"), &[])));
     }
 
     #[test]
