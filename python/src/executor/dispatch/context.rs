@@ -5,6 +5,7 @@
 //! can express their dependency narrowly (e.g. an IO helper takes `&Repo`,
 //! a state-mutating helper takes `&mut RunState`).
 use std::collections::{HashMap, HashSet};
+use std::iter::repeat_n;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -380,17 +381,21 @@ impl<'a> BatchContext<'a> {
         input_versions: Vec<(String, String)>,
         ts: i64,
     ) {
+        let metadata = ops::metadata_json(metadata);
         match self.scope.partition_key {
             Some(pk) => {
-                for member in self.surviving_members(step_name, pk, ts) {
+                let members = self.surviving_members(step_name, pk, ts);
+                // `repeat_n` moves the last copy: a one-member key copies nothing.
+                let copies = repeat_n((metadata, data_version, input_versions), members.len());
+                for (member, (metadata, dv, inputs)) in members.into_iter().zip(copies) {
                     ops::emit_materialization(
                         self.sink.writer,
                         self.scope.run_id,
                         step_name,
                         &Some(member),
                         metadata,
-                        data_version.clone(),
-                        input_versions.clone(),
+                        dv,
+                        inputs,
                         ts,
                     );
                 }

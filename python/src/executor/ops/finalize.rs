@@ -336,20 +336,9 @@ pub(crate) fn emit_log_output(
     }
 }
 
-/// `input_data_versions` carries `(dep_name, data_version)` pairs captured at
-/// read time by the executor — not looked up from storage after the fact.
-fn emit_event(
-    writer: &EventWriter,
-    run_id: &str,
-    step_name: &str,
-    partition_key: &Option<PyPartitionKey>,
-    output_metadata: &[(String, MetadataValue)],
-    event_type: EventType,
-    input_data_versions: Vec<(String, String)>,
-    ts: i64,
-) {
-    let pk = partition_key.as_ref().map(|k| k.into());
-    let metadata: Vec<(String, String)> = output_metadata
+/// Each metadata value as JSON, the form an event stores.
+pub(crate) fn metadata_json(metadata: &[(String, MetadataValue)]) -> Vec<(String, String)> {
+    metadata
         .iter()
         .map(|(k, v)| {
             (
@@ -357,7 +346,22 @@ fn emit_event(
                 serde_json::to_string(v).unwrap_or_else(|_| format!("{:?}", v)),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// `input_data_versions` carries `(dep_name, data_version)` pairs captured at
+/// read time by the executor — not looked up from storage after the fact.
+fn emit_event(
+    writer: &EventWriter,
+    run_id: &str,
+    step_name: &str,
+    partition_key: &Option<PyPartitionKey>,
+    metadata: Vec<(String, String)>,
+    event_type: EventType,
+    input_data_versions: Vec<(String, String)>,
+    ts: i64,
+) {
+    let pk = partition_key.as_ref().map(|k| k.into());
     writer.emit(EventRecord {
         code_location_id: String::new(),
         event_type,
@@ -370,12 +374,13 @@ fn emit_event(
     });
 }
 
+/// `metadata` comes from [`metadata_json`], once for all members of a key.
 pub(crate) fn emit_materialization(
     writer: &EventWriter,
     run_id: &str,
     step_name: &str,
     partition_key: &Option<PyPartitionKey>,
-    output_metadata: &[(String, MetadataValue)],
+    metadata: Vec<(String, String)>,
     data_version: Option<String>,
     input_data_versions: Vec<(String, String)>,
     ts: i64,
@@ -385,7 +390,7 @@ pub(crate) fn emit_materialization(
         run_id,
         step_name,
         partition_key,
-        output_metadata,
+        metadata,
         EventType::Materialization { data_version },
         input_data_versions,
         ts,
@@ -406,7 +411,7 @@ pub(crate) fn emit_observation(
         run_id,
         step_name,
         partition_key,
-        output_metadata,
+        metadata_json(output_metadata),
         EventType::Observation { data_version },
         vec![],
         ts,
@@ -434,7 +439,7 @@ pub(crate) fn emit_action_completed(
         run_id,
         step_name,
         partition_key,
-        &entries,
+        metadata_json(&entries),
         EventType::ActionCompleted,
         vec![],
         ts,
@@ -454,12 +459,12 @@ pub(crate) fn emit_deletion(
         run_id,
         step_name,
         partition_key,
-        &[(
+        metadata_json(&[(
             "action".to_string(),
             MetadataValue::Text {
                 value: action.to_string(),
             },
-        )],
+        )]),
         EventType::Deletion,
         vec![],
         ts,

@@ -108,6 +108,63 @@ class TestSingleRunStrategy:
         assert result.completed == 3
         assert len(calls) == 1
 
+    def test_single_run_members_share_one_materialization(self, executor_env, is_async):
+        """Every member of the batched key gets a Materialization with the
+        step's metadata, data version and input versions."""
+        executor, io_factory = executor_env
+        pd = _static_pd(["a", "b", "c"])
+        metadata = {
+            "rows": 3,
+            "preview": rs.MetadataValue.md("| id |\n|---:|\n| 1 |\n"),
+            "uri": rs.MetadataValue.url("https://example.com/orders"),
+        }
+
+        if is_async:
+
+            @rs.Asset(partitions_def=pd, io_handler=io_factory())
+            async def asset() -> rs.Output:
+                await asyncio.sleep(0)
+                return rs.Output(1, metadata=metadata, data_version="v1")
+        else:
+
+            @rs.Asset(partitions_def=pd, io_handler=io_factory())
+            def asset() -> rs.Output:
+                return rs.Output(1, metadata=metadata, data_version="v1")
+
+        # A second step, so the parallel executor runs the steps in workers.
+        @rs.Asset(partitions_def=pd, io_handler=io_factory())
+        def sibling() -> int:
+            return 1
+
+        repo = rs.CodeRepository(assets=[asset, sibling], default_executor=executor)
+        result = repo.backfill(
+            selection=["asset", "sibling"],
+            partition_keys=[rs.PartitionKey.single(k) for k in ("a", "b", "c")],
+            strategy=rs.BackfillStrategy.single_run(),
+        )
+        assert result.completed == 3
+
+        events = repo.storage.get_events_for_asset("asset")
+        materializations = sorted(
+            (e for e in events if e.event_type == "Materialization"),
+            key=lambda e: str(e.partition_key),
+        )
+        assert [str(e.partition_key) for e in materializations] == ["a", "b", "c"]
+        first, *rest = materializations
+        # The IO handler's own entries (path, size, ...) follow the step's.
+        assert first.metadata[:3] == [
+            ("rows", '{"Int":{"value":3}}'),
+            ("preview", '{"Markdown":{"value":"| id |\\n|---:|\\n| 1 |\\n"}}'),
+            ("uri", '{"Url":{"value":"https://example.com/orders"}}'),
+        ]
+        assert first.data_version == "v1"
+        for e in rest:
+            assert (e.metadata, e.data_version, e.input_data_versions) == (
+                first.metadata,
+                first.data_version,
+                first.input_data_versions,
+            )
+
 
 # ---------------------------------------------------------------------------
 # PerDimension strategy
