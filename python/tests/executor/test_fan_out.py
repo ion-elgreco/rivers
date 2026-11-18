@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import uuid
 
 import obstore.store
 import pytest
@@ -74,14 +75,18 @@ class PidTrackingIOHandler(rs.PickleIOHandler):
 
 
 class PartitionLoggingIOHandler(rs.PickleIOHandler):
-    """PickleIOHandler that records asset_name + partition keys on each load_input call."""
+    """PickleIOHandler that records asset_name + partition keys on each load_input call.
 
-    log_path: str
+    Each load writes its own file in `log_dir`: on Windows, appends to one file
+    from several worker processes can overwrite each other.
+    """
+
+    log_dir: str
 
     def load_input(self, context):
         keys = [str(k) for k in context.partition.keys] if context.partition else []
-        with open(self.log_path, "a") as f:
-            f.write(f"{context.asset_name}:{','.join(keys)}\n")
+        with open(os.path.join(self.log_dir, uuid.uuid4().hex), "w") as f:
+            f.write(f"{context.asset_name}:{','.join(keys)}")
         return super().load_input(context)
 
 
@@ -884,7 +889,8 @@ class TestParallelGraphAssets:
         executor, _, _ = executor_env
         store = obstore.store.LocalStore(str(tmp_path / "store"), mkdir=True)
         log = tmp_path / "loads"
-        pio = PartitionLoggingIOHandler(store=store, log_path=str(log))
+        log.mkdir()
+        pio = PartitionLoggingIOHandler(store=store, log_dir=str(log))
         pdef = rs.PartitionsDefinition.static_(["p1", "p2"])
 
         @rs.Asset(io_handler=pio, partitions_def=pdef)
@@ -911,7 +917,8 @@ class TestParallelGraphAssets:
         result = repo.materialize(partition_key=rs.PartitionKey.single("p2"))
         assert result.success
 
-        loads = [line for line in log.read_text().splitlines() if "double__" in line]
+        loads = [p.read_text() for p in log.iterdir()]
+        loads = [line for line in loads if "double__" in line]
         assert len(loads) == 6, loads
         assert all(line.endswith(":p2") for line in loads), loads
 
