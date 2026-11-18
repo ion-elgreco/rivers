@@ -128,9 +128,10 @@ impl StorageBackend for SurrealStorage {
     }
 
     async fn store_events(&self, events: &[EventRecord]) -> Result<Vec<String>> {
-        let events: Vec<EventWithId> = events.iter().cloned().map(EventWithId::new).collect();
-        self.store_events_with_ids(&events).await?;
-        Ok(events.iter().map(|e| record_id_str(&e.id)).collect())
+        let ids: Vec<RecordId> = events.iter().map(|_| new_event_record_id()).collect();
+        let batch: Vec<(&EventRecord, &RecordId)> = events.iter().zip(&ids).collect();
+        self.store_with_ids(&batch).await?;
+        Ok(ids.iter().map(record_id_str).collect())
     }
 
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = logs.len()))]
@@ -1197,18 +1198,25 @@ impl StorageBackend for SurrealStorage {
 impl EventStore for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(count = batch.len()))]
     async fn store_events_with_ids(&self, batch: &[EventWithId]) -> Result<()> {
+        let batch: Vec<(&EventRecord, &RecordId)> =
+            batch.iter().map(|e| (&e.event, &e.id)).collect();
+        self.store_with_ids(&batch).await
+    }
+}
+
+impl SurrealStorage {
+    async fn store_with_ids(&self, batch: &[(&EventRecord, &RecordId)]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        let event_ids: Vec<String> = batch.iter().map(|e| record_id_str(&e.id)).collect();
-        let events: Vec<&EventRecord> = batch.iter().map(|e| &e.event).collect();
+        let event_ids: Vec<String> = batch.iter().map(|&(_, id)| record_id_str(id)).collect();
         retry::with_retry(&self.retry_config, || async {
         // The ids come with the events: one consolidation conflict replays
         // the whole batch, and so does a send of the batch again; INSERT
         // IGNORE needs the same record ids to turn the re-insert into a no-op.
         let rows: Vec<DbEventWrite> = batch
             .iter()
-            .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+            .map(|&(event, id)| DbEventWrite::from_event(event, id.clone()))
             .collect();
         self.db
             .query("INSERT IGNORE INTO events $rows RETURN NONE")
@@ -1233,7 +1241,7 @@ impl EventStore for SurrealStorage {
         > = std::collections::HashMap::new();
         let mut built_by: HashMap<(&str, &str), Vec<(&PartitionKey, &str)>> = HashMap::new();
 
-        for (idx, (event, event_id)) in events.iter().zip(event_ids.iter()).enumerate() {
+        for (idx, (&(event, _), event_id)) in batch.iter().zip(event_ids.iter()).enumerate() {
             let Some(asset_key) = &event.asset_key else {
                 continue;
             };
@@ -1243,7 +1251,7 @@ impl EventStore for SurrealStorage {
             let cl = event.code_location_id.as_str();
             let key = (cl, asset_key.as_str());
             let newest = |held: Option<&usize>| {
-                held.is_none_or(|&i| events[i].timestamp <= event.timestamp)
+                held.is_none_or(|&i| batch[i].0.timestamp <= event.timestamp)
             };
             if newest(latest_mat.get(&key)) {
                 latest_mat.insert(key, idx);
@@ -1279,7 +1287,7 @@ impl EventStore for SurrealStorage {
         // One `assets` row update per materialized asset (newest event wins).
         let update_run_ids: Vec<String> = latest_mat
             .values()
-            .map(|&idx| events[idx].run_id.as_str())
+            .map(|&idx| batch[idx].0.run_id.as_str())
             .collect::<HashSet<&str>>()
             .into_iter()
             .map(str::to_owned)
@@ -1296,9 +1304,9 @@ impl EventStore for SurrealStorage {
             parts_by_asset.entry((cl, ak)).or_default().push(row);
         }
         for (&(cl, asset_key), &idx) in &latest_mat {
-            let event = &events[idx];
+            let event = batch[idx].0;
             let event_id = &event_ids[idx];
-            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| &events[i]);
+            let idv_event = latest_idv.get(&(cl, asset_key)).map(|&i| batch[i].0);
             let idv = idv_event.map(|e| e.input_data_versions.as_slice());
             let provenance_timestamp = idv_event.map_or(event.timestamp, |e| e.timestamp);
             // A co-drained real materialize (the `idv` entry) legitimately
@@ -1333,7 +1341,7 @@ impl EventStore for SurrealStorage {
         // purge over a date range lands thousands of them in one drain.
         let mut part_deletes: HashMap<(&str, &str), Vec<(PartitionKey, i64)>> = HashMap::new();
         let mut whole_deletes: HashMap<(&str, &str), (&EventRecord, &String)> = HashMap::new();
-        for (&event, event_id) in events.iter().zip(event_ids.iter()) {
+        for (&(event, _), event_id) in batch.iter().zip(event_ids.iter()) {
             let cl = event.code_location_id.as_str();
             if let Some(asset_key) = &event.asset_key
                 && event.event_type.is_observation() {
@@ -1379,17 +1387,17 @@ impl EventStore for SurrealStorage {
 
         // The failures last: each is compared with the materializations and
         // deletions above.
-        let failure_runs: Vec<String> = events
+        let failure_runs: Vec<String> = batch
             .iter()
-            .filter(|event| keyed_failure(event).is_some())
-            .map(|event| event.run_id.as_str())
+            .filter(|(event, _)| keyed_failure(event).is_some())
+            .map(|(event, _)| event.run_id.as_str())
             .collect::<HashSet<&str>>()
             .into_iter()
             .map(str::to_owned)
             .collect();
         let action_failure_runs = self.action_run_ids(failure_runs).await?;
         let mut failures: HashMap<(&str, &str), Vec<(PartitionKey, i64, &str)>> = HashMap::new();
-        for &event in &events {
+        for &(event, _) in batch {
             let Some((asset_key, partition_key)) = keyed_failure(event) else {
                 continue;
             };
