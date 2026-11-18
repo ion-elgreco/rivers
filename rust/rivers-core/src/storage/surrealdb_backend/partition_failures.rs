@@ -700,11 +700,13 @@ impl SurrealStorage {
         else {
             return Ok(());
         };
-        let built = materialized_by_runs(&self.db, None, std::slice::from_ref(&run.run_id)).await?;
+        let built = materialized_by_runs(&self.db, None, &[run.run_id.as_str()]).await?;
         let members = partition_key.members();
+        let mut probe = (String::new(), run.run_id.clone());
 
         for asset_key in &run.node_names {
-            let done = built.get(&(asset_key.clone(), run.run_id.clone()));
+            probe.0.clone_from(asset_key);
+            let done = built.get(&probe);
             let failures: Vec<(PartitionKey, i64, &str)> = members
                 .iter()
                 .filter(|member| done.is_none_or(|done| !done.contains(*member)))
@@ -1131,8 +1133,9 @@ pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures
         .filter(|run| run.status == "Failure" && run.action.is_none())
         .filter(|run| run.partition_key.is_some())
         .collect();
-    let failed_run_ids: Vec<String> = failed_runs.iter().map(|run| run.run_id.clone()).collect();
+    let failed_run_ids: Vec<&str> = failed_runs.iter().map(|run| run.run_id.as_str()).collect();
     let built = materialized_by_runs(db, None, &failed_run_ids).await?;
+    let mut probe = (String::new(), String::new());
 
     for run in failed_runs {
         let Some(partition_key) = run
@@ -1143,8 +1146,10 @@ pub(super) async fn derive_failures(db: &Surreal<Any>) -> Result<DerivedFailures
         };
         let at = run.end_time.unwrap_or(run.start_time);
         let members = partition_key.members();
+        probe.1.clone_from(&run.run_id);
         for asset_key in &run.node_names {
-            let done = built.get(&(asset_key.clone(), run.run_id.clone()));
+            probe.0.clone_from(asset_key);
+            let done = built.get(&probe);
             let of_asset = failures
                 .entry((run.code_location_id.clone(), asset_key.clone()))
                 .or_default();
@@ -1239,7 +1244,7 @@ fn stored_key(value: Value, unknown: &mut usize) -> Option<PartitionKey> {
 async fn materialized_by_runs(
     db: &Surreal<Any>,
     asset_key: Option<&str>,
-    run_ids: &[String],
+    run_ids: &[&str],
 ) -> Result<HashMap<AssetOf, HashSet<PartitionKey>>> {
     #[derive(Debug, SurrealValue)]
     struct BuiltByRun {
@@ -1260,7 +1265,8 @@ async fn materialized_by_runs(
 
     let mut built: HashMap<AssetOf, HashSet<PartitionKey>> = HashMap::new();
     for runs in run_ids.chunks(RUNS_PER_QUERY) {
-        let mut query = db.query(sql.as_str()).bind(("runs", runs.to_vec()));
+        let runs: Vec<String> = runs.iter().map(|run_id| run_id.to_string()).collect();
+        let mut query = db.query(sql.as_str()).bind(("runs", runs));
         if let Some(asset_key) = asset_key {
             query = query.bind(("asset_key", asset_key.to_string()));
         }
@@ -1288,11 +1294,11 @@ async fn not_built_by<'a>(
     run_id: &str,
     failures: &'a [(PartitionKey, i64, &'a str)],
 ) -> Result<Vec<&'a (PartitionKey, i64, &'a str)>> {
-    let built = materialized_by_runs(db, Some(asset_key), &[run_id.to_string()]).await?;
-    let done = built.get(&(asset_key.to_string(), run_id.to_string()));
+    let built = materialized_by_runs(db, Some(asset_key), &[run_id]).await?;
+    let done = built.into_values().next().unwrap_or_default();
     Ok(failures
         .iter()
-        .filter(|(key, _, _)| done.is_none_or(|done| !done.contains(key)))
+        .filter(|(key, _, _)| !done.contains(key))
         .collect())
 }
 
