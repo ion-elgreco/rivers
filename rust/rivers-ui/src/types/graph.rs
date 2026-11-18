@@ -144,6 +144,19 @@ impl GraphTopology {
             .collect()
     }
 
+    /// [`Self::direct_upstream`] and [`Self::direct_downstream`] of every
+    /// node, in one pass over the edges. A node without edges is absent.
+    pub fn direct_lineage(&self) -> std::collections::HashMap<&str, (Vec<&str>, Vec<&str>)> {
+        let mut lineage: std::collections::HashMap<&str, (Vec<&str>, Vec<&str>)> =
+            std::collections::HashMap::with_capacity(self.nodes.len());
+        for (from, to) in &self.edges {
+            let (from, to) = (from.as_str(), to.as_str());
+            lineage.entry(from).or_default().0.push(to);
+            lineage.entry(to).or_default().1.push(from);
+        }
+        lineage
+    }
+
     /// Each remote node, by its name here.
     pub fn remote_nodes(&self) -> std::collections::HashMap<String, RemoteNode> {
         self.nodes
@@ -466,5 +479,29 @@ mod topology_tests {
         // summary consumes raw_data: raw_data upstream, no downstream.
         assert_eq!(topo.direct_upstream("summary"), vec!["raw_data"]);
         assert!(topo.direct_downstream("summary").is_empty());
+    }
+
+    #[test]
+    fn direct_lineage_matches_the_one_node_lookups() {
+        let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let topo = GraphTopology {
+            nodes: ["a", "b", "c", "d", "lone"].map(node).into(),
+            edges: vec![
+                edge("b", "a"),
+                edge("c", "b"),
+                edge("c", "a"),
+                edge("d", "c"),
+                edge("d", "a"),
+                edge("a", "a"),
+            ],
+        };
+
+        let lineage = topo.direct_lineage();
+        for n in &topo.nodes {
+            let (up, down) = lineage.get(n.name.as_str()).cloned().unwrap_or_default();
+            assert_eq!(up, topo.direct_upstream(&n.name), "{}", n.name);
+            assert_eq!(down, topo.direct_downstream(&n.name), "{}", n.name);
+        }
+        assert!(!lineage.contains_key("lone"));
     }
 }
