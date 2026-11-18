@@ -388,9 +388,7 @@ impl Executor {
 
                 // For namespaced tasks (graph/task), check the parent graph asset's
                 // NODE_EXECUTOR first, then EXECUTOR, then default.
-                let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-                let mut metadata_cache: HashMap<String, Option<HashMap<String, String>>> =
-                    HashMap::new();
+                let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
                 for &step_idx in level {
                     let step = &plan.steps[step_idx];
                     let lookup_name = if step.name.contains('/') {
@@ -398,13 +396,9 @@ impl Executor {
                     } else {
                         step.name.as_str()
                     };
-                    if !metadata_cache.contains_key(lookup_name) {
-                        let meta = node_map.get(lookup_name).and_then(|n| n.metadata().cloned());
-                        metadata_cache.insert(lookup_name.to_string(), meta);
-                    }
-                    let executor_key = metadata_cache
+                    let executor_key = node_map
                         .get(lookup_name)
-                        .and_then(|m| m.as_ref())
+                        .and_then(|n| n.metadata())
                         .and_then(|m| {
                             if step.name.contains('/') {
                                 m.get(metadata_keys::NODE_EXECUTOR)
@@ -413,12 +407,11 @@ impl Executor {
                                 m.get(metadata_keys::EXECUTOR)
                             }
                         })
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_EXECUTOR_KEY.to_string());
+                        .map_or(DEFAULT_EXECUTOR_KEY, String::as_str);
                     groups.entry(executor_key).or_default().push(step_idx);
                 }
 
-                for (executor_key, step_indices) in &groups {
+                for (&executor_key, step_indices) in &groups {
                     let executor = if executor_key == DEFAULT_EXECUTOR_KEY {
                         self.clone()
                     } else {
