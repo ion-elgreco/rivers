@@ -264,6 +264,77 @@ async fn run_logs_roundtrip() {
     storage.store_run_logs(&[]).await.unwrap();
 }
 
+/// `get_step_tracebacks` returns the tracebacks of one step's rows at one
+/// time, in `get_run_logs` order, read off the run's index.
+#[tokio::test]
+async fn step_tracebacks_match_the_run_logs_rows() {
+    let storage = make_storage().await;
+    let log = |run: &str, step: &str, at: i64, traceback: Option<&str>| LogRecord {
+        code_location_id: "default".into(),
+        run_id: run.into(),
+        step_key: step.into(),
+        timestamp: at,
+        stdout: traceback.is_none().then(|| "out".to_string()),
+        stderr: None,
+        logs: None,
+        traceback: traceback.map(String::from),
+    };
+    let mut rows = vec![
+        log("run-1", "a", 10, None),
+        log("run-1", "a", 20, Some("a later")),
+        log("run-1", "b", 10, Some("b")),
+        log("run-2", "a", 10, Some("other run")),
+    ];
+    for i in 0..8 {
+        rows.push(log("run-1", "a", 10, Some(&format!("a {i}"))));
+        rows.push(log("run-1", "a", 10, None));
+    }
+    storage.store_run_logs(&rows).await.unwrap();
+
+    let in_run_logs_order: Vec<String> = storage
+        .get_run_logs("run-1")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.step_key == "a" && l.timestamp == 10)
+        .filter_map(|l| l.traceback)
+        .collect();
+    assert_eq!(in_run_logs_order.len(), 8);
+    assert_eq!(
+        storage.get_step_tracebacks("run-1", "a", 10).await.unwrap(),
+        in_run_logs_order
+    );
+
+    let tracebacks = async |run: &str, step: &str, at: i64| {
+        storage.get_step_tracebacks(run, step, at).await.unwrap()
+    };
+    assert_eq!(tracebacks("run-1", "a", 20).await, ["a later"]);
+    assert_eq!(tracebacks("run-1", "b", 10).await, ["b"]);
+    assert_eq!(tracebacks("run-2", "a", 10).await, ["other run"]);
+    assert!(tracebacks("run-1", "a", 15).await.is_empty());
+    assert!(tracebacks("run-1", "c", 10).await.is_empty());
+    assert!(tracebacks("missing", "a", 10).await.is_empty());
+
+    let plan: Vec<serde_json::Value> = storage
+        .db
+        .query(format!(
+            "{} EXPLAIN",
+            super::super::backend::STEP_TRACEBACKS
+        ))
+        .bind(("id", "run-1".to_string()))
+        .bind(("step", "a".to_string()))
+        .bind(("at", 10))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let plan = serde_json::to_string(&plan).unwrap();
+    assert!(
+        plan.contains("idx_run_logs_run"),
+        "should scan idx_run_logs_run: {plan}"
+    );
+}
+
 /// The asset-events page must scan `idx_events_loc_asset_ts`, not sort every matching event.
 #[tokio::test]
 async fn asset_events_page_uses_ordering_index() {

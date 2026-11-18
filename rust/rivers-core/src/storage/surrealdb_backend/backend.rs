@@ -16,6 +16,10 @@ use crate::storage::{
 use super::partition_failures::{RunChange, StoredStatus, keyed_failure};
 use super::*;
 
+pub(super) const STEP_TRACEBACKS: &str = "SELECT VALUE traceback FROM run_logs \
+     WHERE run_id = $id AND step_key = $step AND timestamp = $at AND traceback != NONE \
+     ORDER BY id ASC";
+
 impl StorageBackend for SurrealStorage {
     #[tracing::instrument(skip_all, target = "rivers::storage", fields(cl = %event.code_location_id, asset_key = event.asset_key))]
     async fn store_event(&self, event: &EventRecord) -> Result<String> {
@@ -157,6 +161,25 @@ impl StorageBackend for SurrealStorage {
                 .await?;
             let rows: Vec<DbStoredRunLog> = result.take(0)?;
             Ok(rows.into_iter().map(|l| l.into_stored_log()).collect())
+        })
+        .await
+    }
+
+    async fn get_step_tracebacks(
+        &self,
+        run_id: &str,
+        step_key: &str,
+        timestamp: i64,
+    ) -> Result<Vec<String>> {
+        retry::with_retry(&self.retry_config, || async {
+            let mut result = self
+                .db
+                .query(STEP_TRACEBACKS)
+                .bind(("id", run_id.to_string()))
+                .bind(("step", step_key.to_string()))
+                .bind(("at", timestamp))
+                .await?;
+            Ok(result.take(0)?)
         })
         .await
     }

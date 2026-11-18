@@ -81,15 +81,13 @@ pub async fn get_step_traceback(
 ) -> Result<Option<Traceback>, ServerFnError> {
     use rivers_core::storage::StorageBackend;
     let state = expect_context::<crate::state::AppState>();
-    let logs: Vec<RunLog> = state
+    Ok(state
         .storage
-        .get_run_logs(&run_id)
+        .get_step_tracebacks(&run_id, &step_key, at)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?
-        .into_iter()
-        .map(Into::into)
-        .collect();
-    Ok(crate::types::traceback_for(&logs, &step_key, at).cloned())
+        .iter()
+        .find_map(|json| serde_json::from_str(json).ok()))
 }
 
 /// A page of a run's structured (non-log) events, optionally scoped to one

@@ -489,6 +489,15 @@ pub trait StorageBackend: PerCodeLocationStorage {
     fn store_run_logs(&self, logs: &[LogRecord]) -> impl Future<Output = Result<()>> + Send;
     fn get_run_logs(&self, run_id: &str) -> impl Future<Output = Result<Vec<StoredLog>>> + Send;
 
+    /// The stored traceback JSON of each of `step_key`'s rows at `timestamp`
+    /// in the run, in [`Self::get_run_logs`] order. Rows without one are left out.
+    fn get_step_tracebacks(
+        &self,
+        run_id: &str,
+        step_key: &str,
+        timestamp: i64,
+    ) -> impl Future<Output = Result<Vec<String>>> + Send;
+
     /// Every terminal step among `asset_keys` inside `run_ids`, in one query.
     ///
     /// Takes both as sets because the caller asks about many assets at once. A
