@@ -25,7 +25,7 @@ use crate::server_fns::automation::get_jobs;
 use crate::server_fns::mutations::execute_job;
 use crate::server_fns::overview::get_assets_info;
 use crate::server_fns::runs::get_runs_page;
-use crate::types::{AssetActionInfo, AssetDefinitionInfo, RunFilter};
+use crate::types::{AssetActionInfo, RunFilter};
 
 #[component]
 pub fn JobDetailPage() -> impl IntoView {
@@ -96,65 +96,60 @@ pub fn JobDetailPage() -> impl IntoView {
         crate::components::config_editor::use_launch_resources(loc, show_dialog.into());
     let navigate = leptos_router::hooks::use_navigate();
 
-    // The job, resolved against its assets' declarations: the verb it runs
-    // (if any) and the partition picker that verb allows. `None` until the
-    // job's definition has loaded: with no verb to show, Execute waits.
     let jobs_value = crate::helpers::resource_value(jobs);
     let assets_info_value = crate::helpers::resource_value(assets_info);
-    // The dialog's config editor reads the job's assets and their schemas.
-    let job_assets = Signal::derive(move || {
-        let current = name();
-        jobs_value
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-            .into_iter()
-            .find(|j| j.name == current)
-            .map(|j| j.asset_selection)
-            .unwrap_or_default()
-    });
     let asset_info_by_key = crate::helpers::definitions_by_key(assets_info_value);
-    let job_launch = Memo::new(
-        move |_| -> Option<(Option<AssetActionInfo>, JobPartitionPicker)> {
-            let current = name();
-            let Some(Ok(jobs_list)) = jobs_value.get() else {
-                return None;
-            };
-            let job = jobs_list.into_iter().find(|j| j.name == current)?;
-            let infos = assets_info_value
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
-            let by_key: std::collections::HashMap<String, AssetDefinitionInfo> = infos
-                .into_iter()
-                .map(|i| (i.asset_key.clone(), i))
-                .collect();
-            let verb = job_verb(job.action.as_deref(), &job.asset_selection, &by_key);
-            let picker = job_partition_picker(verb.as_ref(), &job.asset_selection, &by_key);
-            Some((verb, picker))
-        },
-    );
-    // `JobPartitionPicker::None` means there's nothing for the dialog to
-    // show — skip it and submit directly.
-    let job_picker = Signal::derive(move || {
-        job_launch
-            .get()
-            .map_or(JobPartitionPicker::None, |(_, picker)| picker)
+    // The dialog's config editor reads the job's assets and their schemas.
+    let job_assets = Memo::new(move |_| {
+        let current = name();
+        jobs_value.with(|jobs| {
+            jobs.as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|jobs| jobs.iter().find(|j| j.name == current))
+                .map(|j| j.asset_selection.clone())
+                .unwrap_or_default()
+        })
     });
-    let job_verb_signal = Signal::derive(move || job_launch.get().and_then(|(verb, _)| verb));
+    // The verb the job runs (if any), resolved against its assets'
+    // declarations. `None` until the job's definition has loaded: with no
+    // verb to show, Execute waits.
+    let job_launch = Memo::new(move |_| -> Option<Option<AssetActionInfo>> {
+        let current = name();
+        jobs_value.with(|jobs| {
+            let jobs = jobs.as_ref()?.as_ref().ok()?;
+            let job = jobs.iter().find(|j| j.name == current)?;
+            Some(
+                asset_info_by_key
+                    .with(|defs| job_verb(job.action.as_deref(), &job.asset_selection, defs)),
+            )
+        })
+    });
+    let job_verb_signal = Signal::derive(move || job_launch.get().flatten());
+    // The partition picker that verb allows. `JobPartitionPicker::None` means
+    // there's nothing for the dialog to show — skip it and submit directly.
+    let job_picker = Memo::new(move |_| {
+        job_launch.with(|verb| {
+            let verb = verb.as_ref().and_then(Option::as_ref);
+            job_assets.with(|assets| {
+                asset_info_by_key.with(|defs| job_partition_picker(verb, assets, defs))
+            })
+        })
+    });
     // The dialog picks partitions and edits config; a job needing neither
     // runs on the click.
     let job_opens_dialog = Signal::derive(move || {
-        !matches!(job_picker.get(), JobPartitionPicker::None)
+        job_picker.with(|p| !matches!(p, JobPartitionPicker::None))
             || asset_info_by_key.with(|defs| {
-                crate::components::config_editor::launch_takes_config(
-                    &job_assets.get(),
-                    defs,
-                    job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
-                )
+                job_assets.with(|assets| {
+                    crate::components::config_editor::launch_takes_config(
+                        assets,
+                        defs,
+                        job_verb_signal.get().as_ref().map(|v| v.name.as_str()),
+                    )
+                })
             })
     });
-    let job_loaded = Signal::derive(move || job_launch.get().is_some());
+    let job_loaded = Signal::derive(move || job_launch.with(Option::is_some));
     let exec_armed = use_confirm_armed(move || params.track());
 
     let dialog_job_name: Signal<String> = Signal::derive(name);
@@ -167,7 +162,7 @@ pub fn JobDetailPage() -> impl IntoView {
     });
 
     let on_execute = move |_| {
-        let Some((verb, _)) = job_launch.get() else {
+        let Some(verb) = job_launch.get() else {
             return;
         };
         if job_opens_dialog.get() {
