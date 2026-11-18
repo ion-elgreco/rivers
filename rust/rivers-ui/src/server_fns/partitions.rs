@@ -406,7 +406,12 @@ mod read {
                 return Arc::clone(found);
             }
 
-            let mut in_order = self.states.keys_of(dimension);
+            let mut in_order: Vec<String> = self
+                .states
+                .keys_of(dimension)
+                .into_iter()
+                .map(String::from)
+                .collect();
             if !dynamic_name.is_empty() {
                 in_order.sort_unstable();
             }

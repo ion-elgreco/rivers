@@ -169,6 +169,16 @@ impl Block {
         self.dims.iter().any(|(of, _)| of == name)
     }
 
+    /// The values of dimension `name`, when no value repeats.
+    fn distinct_values(&self, name: &str) -> Option<&[String]> {
+        let at = self.dims.iter().position(|(of, _)| of == name)?;
+        let values = &self.dims[at].1;
+        self.sorted[at]
+            .windows(2)
+            .all(|pair| values[pair[0] as usize] != values[pair[1] as usize])
+            .then_some(values)
+    }
+
     /// The partitions of the block in `range` whose values on the
     /// dimensions of `pinned` are those values.
     fn count_in(&self, range: &KeyRange, pinned: &[(String, String)]) -> u64 {
@@ -412,19 +422,23 @@ impl BackfillStates {
 
     /// The distinct values of `dimension` among the requested keys, in the
     /// requested order. The empty name gives the keys of one dimension.
-    pub fn keys_of(&self, dimension: &str) -> Vec<String> {
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut keys = Vec::new();
-        for block in &self.blocks {
-            let Some((_, values)) = block.dims.iter().find(|(name, _)| name == dimension) else {
-                continue;
-            };
-            for value in values {
-                if seen.insert(value) {
-                    keys.push(value.clone());
-                }
-            }
+    pub fn keys_of(&self, dimension: &str) -> Vec<&str> {
+        let mut holding = self.blocks.iter().filter(|block| block.has(dimension));
+        if let (Some(block), None) = (holding.next(), holding.next())
+            && let Some(values) = block.distinct_values(dimension)
+        {
+            return values.iter().map(String::as_str).collect();
         }
+
+        let values = || {
+            self.blocks
+                .iter()
+                .filter_map(|block| block.dims.iter().find(|(name, _)| name == dimension))
+                .flat_map(|(_, values)| values.iter().map(String::as_str))
+        };
+        let mut unseen: HashSet<&str> = values().collect();
+        let mut keys = Vec::with_capacity(unseen.len());
+        keys.extend(values().filter(|value| unseen.remove(value)));
         keys
     }
 
@@ -992,6 +1006,23 @@ mod tests {
                 counted(1, 1, 0, 0),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_keys_of_a_dimension_are_its_distinct_values_in_the_requested_order() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let requested = [
+            single(&["d", "b", "d", "a"]),
+            single(&["b", "e"]),
+            multi(&[("date", &["2", "1"]), ("region", &["eu", "us", "eu"])]),
+        ];
+        started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
+
+        let states = read_states(&storage).await;
+        assert_eq!(states.keys_of(""), ["d", "b", "a", "e"]);
+        assert_eq!(states.keys_of("date"), ["2", "1"]);
+        assert_eq!(states.keys_of("region"), ["eu", "us"]);
+        assert!(states.keys_of("zone").is_empty());
     }
 
     #[tokio::test]
