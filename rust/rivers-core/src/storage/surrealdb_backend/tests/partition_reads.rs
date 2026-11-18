@@ -535,6 +535,53 @@ async fn storage_with_failures() -> SurrealStorage {
     storage
 }
 
+#[tokio::test]
+async fn failures_in_bounds_are_the_failures_from_the_lower_key_to_the_upper() {
+    let storage = storage_with_failures().await;
+    let read = |first: &str, last: &str, limit: u64| {
+        let bounds = PartitionBounds::of_keys(first, last);
+        let storage = &storage;
+        async move {
+            storage
+                .get_partition_failures(DEFAULT_CODE_LOCATION_ID, "plain", Some(&bounds), limit)
+                .await
+                .unwrap()
+        }
+    };
+    let keys = |failures: Vec<PartitionFailure>| -> Vec<PartitionKey> {
+        failures.into_iter().map(|failed| failed.key).collect()
+    };
+
+    let at_keys = read("p03", "p05", 10).await;
+    let between_keys = read("p025", "p055", 10).await;
+    let first = read("p00", "p00", 10).await;
+    let last = read("p09", "p99", 10).await;
+    let after_the_last = read("p10", "p99", 10).await;
+    let before_the_first = read("a", "p", 10).await;
+    let capped = read("p00", "p09", 2).await;
+
+    let failure = |key: &str, has_row| PartitionFailure {
+        key: single(key),
+        failed_at: 200,
+        run_id: "r1".to_string(),
+        has_row,
+    };
+    assert_eq!(
+        at_keys,
+        vec![
+            failure("p03", false),
+            failure("p04", true),
+            failure("p05", false)
+        ]
+    );
+    assert_eq!(keys(between_keys), ["p03", "p04", "p05"].map(single));
+    assert_eq!(keys(first), [single("p00")]);
+    assert_eq!(keys(last), [single("p09")]);
+    assert!(after_the_last.is_empty());
+    assert!(before_the_first.is_empty());
+    assert_eq!(capped.len(), 2);
+}
+
 /// The plan of `statement`, with the keys from `p03` to `p07`, the key `p04`
 /// and the run `r1`.
 async fn plan_of(storage: &SurrealStorage, statement: &str) -> serde_json::Value {

@@ -48,13 +48,14 @@ impl FailedPartitions {
         let partitions = match count.failed {
             0 => Some(Vec::new()),
             failed if failed <= FAILURES_READ_AT_ONCE => {
-                let mut partitions = storage
-                    .get_partition_failures(asset_key, None, FAILURES_READ_AT_ONCE)
-                    .await?;
-                if let Some(bounds) = bounds {
-                    partitions
-                        .retain(|failed| bounds.iter().any(|bounds| bounds.contains(&failed.key)));
-                }
+                let mut partitions = match bounds {
+                    Some(bounds) => Self::read_in(storage, asset_key, bounds).await?,
+                    None => {
+                        storage
+                            .get_partition_failures(asset_key, None, FAILURES_READ_AT_ONCE)
+                            .await?
+                    }
+                };
                 partitions.sort_by(|a, b| stored_order(&a.key, &b.key));
                 Some(partitions)
             }
@@ -62,6 +63,37 @@ impl FailedPartitions {
         };
 
         Ok(Self { count, partitions })
+    }
+
+    /// The failed partitions in one of `bounds`, of an asset with at most
+    /// [`FAILURES_READ_AT_ONCE`]. One read from the lowest key of the bounds
+    /// to the highest: a read per bounds costs more than the rows of a page.
+    async fn read_in<S: StorageBackend>(
+        storage: &ScopedStorage<'_, S>,
+        asset_key: &str,
+        bounds: &[PartitionBounds],
+    ) -> Result<Vec<PartitionFailure>> {
+        let lower = bounds
+            .iter()
+            .map(|bounds| &bounds.lower)
+            .min_by(|a, b| stored_order(a, b));
+        let upper = bounds
+            .iter()
+            .map(|bounds| &bounds.upper)
+            .max_by(|a, b| stored_order(a, b));
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            return Ok(Vec::new());
+        };
+        let around = PartitionBounds {
+            lower: lower.clone(),
+            upper: upper.clone(),
+        };
+
+        let mut partitions = storage
+            .get_partition_failures(asset_key, Some(&around), FAILURES_READ_AT_ONCE)
+            .await?;
+        partitions.retain(|failed| bounds.iter().any(|bounds| bounds.contains(&failed.key)));
+        Ok(partitions)
     }
 
     /// All the failed partitions of the asset.
@@ -549,6 +581,42 @@ mod tests {
         let states: Vec<PartitionState> = rows.iter().map(|row| row.state).collect();
         assert_eq!(states, vec![Materialized, Failed]);
         assert_eq!(of_zone_c.count().failed, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_partitions_between_the_bounds_are_left_out() {
+        let events: Vec<EventRecord> = (0..6)
+            .map(|i| failure("plain", single(&format!("p{i}")), 200))
+            .collect();
+        let storage = storage_with("plain", &events).await;
+        let ctx = CodeLocationContext::default_for_tests();
+        let scoped = storage.for_code_location(&ctx);
+        let read = |bounds: Vec<PartitionBounds>| {
+            let scoped = &scoped;
+            async move {
+                let failed = FailedPartitions::read(scoped, "plain", Some(&bounds))
+                    .await
+                    .unwrap();
+                assert_eq!(failed.count().failed, 6);
+                failed
+                    .partitions
+                    .unwrap()
+                    .into_iter()
+                    .map(|failed| failed.key)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let scattered = read(vec![
+            PartitionBounds::of_keys("p4", "p5"),
+            PartitionBounds::of_keys("p0", "p0"),
+            PartitionBounds::of_keys("p0", "p1"),
+        ])
+        .await;
+        let none = read(vec![]).await;
+
+        assert_eq!(scattered, ["p0", "p1", "p4", "p5"].map(single));
+        assert!(none.is_empty());
     }
 
     #[test]
