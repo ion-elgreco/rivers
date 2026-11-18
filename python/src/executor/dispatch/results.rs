@@ -347,8 +347,8 @@ pub(crate) fn process_step_result(
 
     // Action runs: the verb ran against existing data — no output iteration,
     // no hooks. The runtime report decides what lands on the timeline.
-    if let Some(verb) = ctx.scope.plan.action.clone() {
-        handle_action_result(py, ctx, step, step_name, &verb, step_result, failures);
+    if let Some(verb) = ctx.scope.plan.action.as_deref() {
+        handle_action_result(py, ctx, step, step_name, verb, step_result, failures);
         return;
     }
 
@@ -383,10 +383,7 @@ pub(crate) fn process_step_result(
             ctx.repo.io_handler_registry,
         ) {
             Ok(_) => wrote_graph = Some(graph_name.clone()),
-            Err(e) => {
-                let gn = graph_name.clone();
-                ctx.record_failure_no_hooks(&gn, e, failures);
-            }
+            Err(e) => ctx.record_failure_no_hooks(graph_name, e, failures),
         }
     }
 

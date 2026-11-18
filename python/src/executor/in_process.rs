@@ -91,10 +91,7 @@ pub(crate) fn resolve_in_memory_collect_overrides(
                 inst.input_overrides = overrides;
                 resolved.push(inst);
             }
-            Err((_msg, e)) => {
-                let name = step.name.clone();
-                ctx.record_failure_no_hooks(&name, e, failures);
-            }
+            Err((_msg, e)) => ctx.record_failure_no_hooks(&step.name, e, failures),
         }
     }
     resolved

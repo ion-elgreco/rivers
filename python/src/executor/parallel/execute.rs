@@ -209,11 +209,10 @@ impl ParallelBackend {
         failures: &mut Vec<(String, PyErr)>,
     ) -> Option<PreparedStep> {
         let step = &ctx.scope.plan.steps[instance.idx];
-        let step_name = step.name.clone();
         let node = ctx
             .repo
             .node_map
-            .get(&step_name)
+            .get(&step.name)
             .expect("step must be in node_map");
 
         let func = node
@@ -237,7 +236,7 @@ impl ParallelBackend {
             ) {
                 Ok(ov) => ov,
                 Err(e) => {
-                    ctx.record_failure_no_hooks(&step_name, e, failures);
+                    ctx.record_failure_no_hooks(&step.name, e, failures);
                     return None;
                 }
             };
@@ -256,7 +255,7 @@ impl ParallelBackend {
             .repo
             .config_overrides
             .as_ref()
-            .and_then(|m| m.get(&step_name))
+            .and_then(|m| m.get(&step.name))
             .map(|obj| obj.bind(py).cast::<PyDict>())
             .transpose()
             .ok()
@@ -264,7 +263,7 @@ impl ParallelBackend {
 
         let worker_meta = match resolve_worker_args(
             py,
-            &step_name,
+            &step.name,
             &func,
             ctx.repo.node_map,
             ctx.scope.partition_key,
@@ -278,14 +277,14 @@ impl ParallelBackend {
         ) {
             Ok(a) => a,
             Err(e) => {
-                ctx.record_failure_no_hooks(&step_name, e, failures);
+                ctx.record_failure_no_hooks(&step.name, e, failures);
                 return None;
             }
         };
 
         let graph = if instance.fan_out.is_none()
             && step.outputs.is_empty()
-            && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step_name)
+            && let Some(graph_name) = ctx.repo.graph_nodes.final_nodes.get(&step.name)
             && let Some(graph_node) = ctx.repo.node_map.get(graph_name)
         {
             Some((graph_name.as_str(), graph_node))
@@ -296,7 +295,7 @@ impl ParallelBackend {
         let submit_args = match build_worker_submit_args(
             py,
             func,
-            &step_name,
+            &step.name,
             instance_arg,
             node,
             ctx.scope.partition_key,
@@ -309,7 +308,7 @@ impl ParallelBackend {
         ) {
             Ok(a) => a,
             Err(e) => {
-                ctx.record_failure_no_hooks(&step_name, e, failures);
+                ctx.record_failure_no_hooks(&step.name, e, failures);
                 return None;
             }
         };
