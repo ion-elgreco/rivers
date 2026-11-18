@@ -37,7 +37,7 @@ pub struct PyAssetExecutionContext {
     #[pyo3(get)]
     pub output_selection: Vec<String>,
     #[pyo3(get)]
-    pub partition: Option<PartitionContext>,
+    pub partition: Option<Py<PartitionContext>>,
     /// Pydantic config instance (set via `AssetExecutionContext[Config]` generic).
     pub config_instance: Option<Py<PyAny>>,
     /// Accumulated output metadata (last-wins on duplicate keys).
@@ -57,7 +57,7 @@ impl PyAssetExecutionContext {
         group: Option<String>,
         code_version: Option<String>,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         is_multi_asset: bool,
         output_selection: Vec<String>,
     ) -> Self {
@@ -113,7 +113,7 @@ impl PyAssetExecutionContext {
         group: Option<String>,
         code_version: Option<String>,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         is_multi_asset: bool,
         output_selection: Vec<String>,
         config: Option<Py<PyAny>>,
@@ -141,7 +141,7 @@ impl PyAssetExecutionContext {
         let valid = self
             .partition
             .as_ref()
-            .map(|p| p.keys.contains(&partition_key))
+            .map(|p| p.get().contains(&partition_key))
             .unwrap_or(false);
         if !valid {
             return Err(ExecutionError::new_err(format!(
@@ -198,7 +198,7 @@ impl PyAssetExecutionContext {
     /// The single partition key string. Raises for non-partitioned or multi-key assets.
     #[getter]
     fn partition_key(&self) -> PyResult<String> {
-        match &self.partition {
+        match self.partition.as_ref().map(Py::get) {
             Some(ctx) => {
                 if ctx.key_count() > 1 {
                     return Err(PartitionValidationError::new_err(
@@ -225,7 +225,7 @@ impl PyAssetExecutionContext {
     #[getter]
     fn partition_time_window(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match &self.partition {
-            Some(ctx) => ctx.time_window(py),
+            Some(ctx) => ctx.get().time_window(py),
             None => Ok(None),
         }
     }

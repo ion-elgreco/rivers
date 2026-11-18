@@ -162,10 +162,9 @@ impl ParallelBackend {
         io_handler_ref: &Py<PyAny>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         let metadata = mapped_node.metadata();
-        // Shared by every spec: `PartitionContext` is frozen, and the worker
-        // extracts its own copy for each input context.
+        // Shared by every spec: `PartitionContext` is frozen.
         let partition =
-            ops::build_partition_context(mapped_node, partition_key)?.into_pyobject(py)?;
+            ops::build_partition_context(py, mapped_node, partition_key)?.into_pyobject(py)?;
 
         let specs = pyo3::types::PyList::empty(py);
         for key in keys {

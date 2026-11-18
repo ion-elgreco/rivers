@@ -5,43 +5,60 @@ use pyo3::types::{PyDict, PyTuple};
 use super::definition::PartitionsDefinition;
 use super::key::PyPartitionKey;
 
-#[pyclass(
-    name = "PartitionContext",
-    frozen,
-    from_py_object,
-    module = "rivers._core"
-)]
-#[derive(Clone, Debug)]
+#[pyclass(name = "PartitionContext", frozen, module = "rivers._core")]
+#[derive(Debug)]
 pub struct PartitionContext {
     /// The partition key(s) being processed. Single-element for normal
     /// materialization and MultiRun backfills; multiple for SingleRun/PerDimension.
     #[pyo3(get)]
-    pub keys: Vec<PyPartitionKey>,
+    pub keys: Vec<Py<PyPartitionKey>>,
     #[pyo3(get)]
-    pub definition: PartitionsDefinition,
+    pub definition: Py<PartitionsDefinition>,
 }
 
 impl PartitionContext {
-    pub fn new(key: PyPartitionKey, definition: PartitionsDefinition) -> Self {
-        Self {
-            keys: vec![key],
-            definition,
-        }
+    pub fn new(
+        py: Python<'_>,
+        key: PyPartitionKey,
+        definition: PartitionsDefinition,
+    ) -> PyResult<Py<Self>> {
+        Self::new_multi(py, vec![key], definition)
     }
 
-    pub fn new_multi(keys: Vec<PyPartitionKey>, definition: PartitionsDefinition) -> Self {
-        Self { keys, definition }
+    pub fn new_multi(
+        py: Python<'_>,
+        keys: Vec<PyPartitionKey>,
+        definition: PartitionsDefinition,
+    ) -> PyResult<Py<Self>> {
+        // Not `collect`: an in-place collect keeps the buffer of `keys`, sized for
+        // `PyPartitionKey`, not for a pointer.
+        let mut py_keys = Vec::with_capacity(keys.len());
+        for key in keys {
+            py_keys.push(key.into_pyobject(py)?.unbind());
+        }
+        let definition = definition.into_pyobject(py)?.unbind();
+        Py::new(
+            py,
+            Self {
+                keys: py_keys,
+                definition,
+            },
+        )
     }
 
     /// Convenience: get the first partition key.
     /// Use `keys` directly when handling backfills with multiple keys.
     pub fn first_key(&self) -> &PyPartitionKey {
-        &self.keys[0]
+        self.keys[0].get()
     }
 
     /// Number of partition keys in this context (>1 for batched backfill runs).
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn contains(&self, key: &PyPartitionKey) -> bool {
+        self.keys.iter().any(|k| k.get() == key)
     }
 
     /// For TimeWindow partitions, return the (start, end) datetimes of this window.
@@ -50,9 +67,9 @@ impl PartitionContext {
         if self.keys.len() != 1 {
             return Ok(None);
         }
-        match &self.keys[0] {
+        match self.first_key() {
             PyPartitionKey::Single { key } if key.len() == 1 => {
-                match self.definition.compute_time_window(&key[0])? {
+                match self.definition.get().compute_time_window(&key[0])? {
                     Some((ws, we)) => {
                         let start_py = ws.into_pyobject(py)?.into_any().unbind();
                         let end_py = we.into_pyobject(py)?.into_any().unbind();
@@ -71,7 +88,10 @@ impl PartitionContext {
 impl PartitionContext {
     #[new]
     #[pyo3(signature = (keys, definition))]
-    fn py_new(keys: Vec<PyPartitionKey>, definition: PartitionsDefinition) -> PyResult<Self> {
+    fn py_new(
+        keys: Vec<Py<PyPartitionKey>>,
+        definition: Py<PartitionsDefinition>,
+    ) -> PyResult<Self> {
         if keys.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "PartitionContext keys must not be empty",
@@ -86,8 +106,8 @@ impl PartitionContext {
     // Keeping for backward compat during the transition; remove once all
     // downstream code (IO handlers, tests, user assets) is migrated to `keys`.
     #[getter]
-    fn key(&self) -> PyPartitionKey {
-        self.keys[0].clone()
+    fn key(&self, py: Python<'_>) -> Py<PyPartitionKey> {
+        self.keys[0].clone_ref(py)
     }
 
     #[pyo3(name = "time_window")]
@@ -101,24 +121,18 @@ impl PartitionContext {
             .getattr("_reconstruct_partition_context")?
             .unbind();
         let data = PyDict::new(py);
-        let keys_py: Vec<Py<PyPartitionKey>> = self
-            .keys
-            .iter()
-            .map(|k| Py::new(py, k.clone()))
-            .collect::<PyResult<_>>()?;
-        data.set_item("keys", keys_py)?;
-        let def_py = Py::new(py, self.definition.clone())?;
-        data.set_item("definition", def_py)?;
+        data.set_item("keys", &self.keys)?;
+        data.set_item("definition", &self.definition)?;
         let args = PyTuple::new(py, [data.into_any()])?;
         Ok((reconstruct, args.unbind().into_any()))
     }
 
     fn __repr__(&self) -> String {
-        let keys_repr: Vec<String> = self.keys.iter().map(|k| k.__repr__()).collect();
+        let keys_repr: Vec<String> = self.keys.iter().map(|k| k.get().__repr__()).collect();
         format!(
             "PartitionContext(keys=[{}], definition={})",
             keys_repr.join(", "),
-            self.definition.__repr__()
+            self.definition.get().__repr__()
         )
     }
 }

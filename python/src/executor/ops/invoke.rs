@@ -52,7 +52,7 @@ pub(crate) fn build_step_args(
     run_id: &str,
     config_out: &mut Option<Py<PyAny>>,
 ) -> PyResult<BuiltStepArgs> {
-    let mut partition = build_partition_context(node, partition_key)?;
+    let mut partition = build_partition_context(py, node, partition_key)?;
     let func = node.callable(py)?;
     let return_hint = extract_return_hint(py, &func)?;
 
@@ -477,7 +477,7 @@ pub(crate) fn execute_action_step(
                     node.group(),
                     None,
                     node.metadata().cloned(),
-                    super::build_partition_context(node, partition_key)?,
+                    super::build_partition_context(py, node, partition_key)?,
                     false,
                     vec![],
                 )
@@ -489,7 +489,7 @@ pub(crate) fn execute_action_step(
                 (&func, Vec::new())
             }
         } else {
-            let partition = super::build_partition_context(node, partition_key)?;
+            let partition = super::build_partition_context(py, node, partition_key)?;
             // First parameter is the context; the rest are resources injected
             // by name — the same rule materialize functions use.
             let params = enumerate_params(py, &func)?;

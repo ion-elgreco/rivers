@@ -455,7 +455,7 @@ impl PyCodeRepository {
             NodeNotFoundError::new_err(format!("Node '{}' not found in repository", name))
         })?;
         let handler = state.io_handler_registry.for_output(py, node);
-        let partition = crate::executor::ops::build_partition_context(node, &partition_key)?;
+        let partition = crate::executor::ops::build_partition_context(py, node, &partition_key)?;
         let (asset_name, code_location) = crate::executor::ops::upstream_source(&name, node);
         let ctx = crate::context::io::PyInputContext {
             asset_name,

@@ -131,7 +131,7 @@ pub(crate) fn load_fan_out_source(
 ) -> PyResult<Py<PyAny>> {
     let io_handler = registry.for_output(py, source_node);
 
-    let partition = super::build_partition_context(source_node, partition_key)?;
+    let partition = super::build_partition_context(py, source_node, partition_key)?;
 
     let ctx = PyInputContext::new(
         source_name.to_string(),
@@ -205,7 +205,7 @@ pub(crate) struct MappedResultsIter {
     index: AtomicUsize,
     io_handler: Py<PyAny>,
     metadata: Option<HashMap<String, String>>,
-    partition: Option<PartitionContext>,
+    partition: Option<Py<PartitionContext>>,
 }
 
 impl MappedResultsIter {
@@ -218,7 +218,7 @@ impl MappedResultsIter {
         registry: &IOHandlerRegistry,
     ) -> PyResult<Self> {
         let io_handler = registry.for_output(py, mapped_node);
-        let partition = super::build_partition_context(mapped_node, partition_key)?;
+        let partition = super::build_partition_context(py, mapped_node, partition_key)?;
         Ok(Self {
             mapped_step: mapped_step.to_string(),
             keys,
@@ -247,7 +247,7 @@ impl MappedResultsIter {
                 instance_name,
                 "collect_stream".to_string(),
                 self.metadata.clone(),
-                self.partition.clone(),
+                self.partition.as_ref().map(|p| p.clone_ref(py)),
                 None,
                 None,
             ),

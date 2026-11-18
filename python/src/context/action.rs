@@ -27,7 +27,7 @@ pub struct PyActionContext {
     #[pyo3(get)]
     pub asset_metadata: Option<HashMap<String, String>>,
     #[pyo3(get)]
-    pub partition: Option<PartitionContext>,
+    pub partition: Option<Py<PartitionContext>>,
     /// The asset's resolved IO handler — the action's config bag (same
     /// storage options / URIs the write path uses). None when the asset has
     /// no handler and no repository default exists.
@@ -48,7 +48,7 @@ impl PyActionContext {
         action: String,
         run_id: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         io_handler: Option<Py<PyAny>>,
         config: Option<Py<PyAny>>,
     ) -> Self {
@@ -81,7 +81,7 @@ impl PyActionContext {
         action: String,
         run_id: String,
         asset_metadata: Option<HashMap<String, String>>,
-        partition: Option<PartitionContext>,
+        partition: Option<Py<PartitionContext>>,
         io_handler: Option<Py<PyAny>>,
         config: Option<Py<PyAny>>,
     ) -> Self {
@@ -106,7 +106,7 @@ impl PyActionContext {
     /// multi-key batches, matching `AssetExecutionContext.partition_key`.
     #[getter]
     fn partition_key(&self) -> PyResult<String> {
-        match &self.partition {
+        match self.partition.as_ref().map(Py::get) {
             Some(ctx) => {
                 if ctx.key_count() > 1 {
                     return Err(PartitionValidationError::new_err(
@@ -137,7 +137,7 @@ impl PyActionContext {
         let valid = self
             .partition
             .as_ref()
-            .map(|p| p.keys.contains(&partition_key))
+            .map(|p| p.get().contains(&partition_key))
             .unwrap_or(false);
         if !valid {
             return Err(ExecutionError::new_err(format!(
@@ -156,7 +156,7 @@ impl PyActionContext {
     #[getter]
     fn partition_time_window(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match &self.partition {
-            Some(ctx) => ctx.time_window(py),
+            Some(ctx) => ctx.get().time_window(py),
             None => Ok(None),
         }
     }
