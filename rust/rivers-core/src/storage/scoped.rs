@@ -565,23 +565,31 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
         topology: Option<&GraphTopology>,
     ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
         let Some(topology) = topology else {
-            return Ok(crate::staleness::compute_staleness(records, &[]));
+            return Ok(crate::staleness::compute_staleness(records, []));
         };
-        let remote: HashSet<&str> = topology.remotes().map(|(name, _)| name).collect();
-        if remote.is_empty() {
-            return Ok(crate::staleness::compute_staleness(
-                records,
-                &topology.edges,
-            ));
+        self.staleness_over(records, topology.remotes().collect(), &topology.edges)
+            .await
+    }
+
+    /// [`Self::staleness_for`] over the `remotes` and `edges` of a topology.
+    async fn staleness_over<'t>(
+        &self,
+        records: &[AssetRecord],
+        remotes: Vec<(&'t str, &'t RemoteRef)>,
+        edges: impl IntoIterator<Item = &'t (String, String)>,
+    ) -> Result<HashMap<String, (StaleStatus, Vec<StaleCause>)>> {
+        if remotes.is_empty() {
+            return Ok(crate::staleness::compute_staleness(records, edges));
         }
 
-        let remote_records = self.remote_upstream_records(topology).await?;
+        let remote_records = self.remote_upstream_records(&remotes).await?;
+        let remote: HashSet<&str> = remotes.iter().map(|&(name, _)| name).collect();
         // A row of a remote's name is left from when the asset was local.
         let owned = records
             .iter()
             .filter(|record| !remote.contains(record.asset_key.as_str()));
         let mut staleness =
-            crate::staleness::compute_staleness(owned.chain(&remote_records), &topology.edges);
+            crate::staleness::compute_staleness(owned.chain(&remote_records), edges);
         staleness.retain(|key, _| !remote.contains(key.as_str()));
         Ok(staleness)
     }
@@ -599,29 +607,31 @@ impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
             return self.staleness_for(&records, None).await;
         };
 
-        let (owned, upstream) = crate::staleness::upstream_of(keys, topology);
-        let records = self.get_asset_records_by_keys(&owned).await?;
-        let mut staleness = self.staleness_for(&records, Some(&upstream)).await?;
+        let upstream = crate::staleness::upstream_of(keys, topology);
+        let records = self.get_asset_records_by_keys(&upstream.owned).await?;
+        let mut staleness = self
+            .staleness_over(&records, upstream.remotes, upstream.edges)
+            .await?;
         staleness.retain(|key, _| keys.contains(key));
         Ok(staleness)
     }
 
-    /// The owner's record of each remote node in `topology`, under the local
-    /// name (see [`crate::staleness::remote_input_record`]). A remote whose
-    /// owner is not registered, or has no such asset, has none.
+    /// The owner's record of each of `remotes` (as [`GraphTopology::remotes`]
+    /// gives them), under the local name (see
+    /// [`crate::staleness::remote_input_record`]). A remote whose owner is
+    /// not registered, or has no such asset, has none.
     pub async fn remote_upstream_records(
         &self,
-        topology: &GraphTopology,
+        remotes: &[(&str, &RemoteRef)],
     ) -> Result<Vec<AssetRecord>> {
-        let remotes: Vec<(&str, &RemoteRef)> = topology.remotes().collect();
         let locations: Vec<&LocationRef> = remotes
             .iter()
             .map(|(_, remote)| &remote.code_location)
             .collect();
         let identities = super::resolve_code_locations(self.backend, locations).await?;
         let resolved: Vec<(&str, &str, &String)> = remotes
-            .into_iter()
-            .filter_map(|(local, remote)| {
+            .iter()
+            .filter_map(|&(local, remote)| {
                 let identity = identities.get(&remote.code_location)?.as_deref()?;
                 Some((local, identity, &remote.asset_key))
             })

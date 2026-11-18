@@ -750,7 +750,7 @@ mod remote_staleness {
         let ctx = CodeLocationContext::new("analytics");
         let records = storage
             .for_code_location(&ctx)
-            .remote_upstream_records(&topology)
+            .remote_upstream_records(&topology.remotes().collect::<Vec<_>>())
             .await
             .unwrap();
 
