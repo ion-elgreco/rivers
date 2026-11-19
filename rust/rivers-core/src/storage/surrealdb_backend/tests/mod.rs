@@ -17,6 +17,7 @@ mod consolidation;
 mod coverage;
 mod crud;
 mod directory;
+mod event_write_contention;
 mod executor_patterns;
 mod failure_rows;
 mod holds;
