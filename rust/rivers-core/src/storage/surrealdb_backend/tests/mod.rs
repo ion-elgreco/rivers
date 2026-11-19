@@ -22,6 +22,7 @@ mod executor_patterns;
 mod failure_rows;
 mod holds;
 mod isolation;
+mod live_queries;
 mod message_limit;
 mod observations;
 mod partition_reads;

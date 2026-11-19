@@ -914,6 +914,7 @@ async fn test_v14_moves_a_backfill_in_progress_to_one_outcome_per_run() {
 
     let storage = SurrealStorage {
         db: db.clone(),
+        live: None,
         retry_config: Default::default(),
         backend_kind: SurrealBackendKind::Memory,
         runtime: None,
