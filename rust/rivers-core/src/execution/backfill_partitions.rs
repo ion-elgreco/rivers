@@ -366,13 +366,23 @@ impl BackfillStates {
         let numbers = RunNumbers::new(&backfill.strategy, &requested);
 
         if backfill.planned_runs == 0 {
-            let members: Vec<PartitionKey> =
-                requested.iter().flat_map(PartitionKey::members).collect();
-            let outcomes = storage
-                .get_backfill_partition_outcomes(id, &members)
-                .await?
-                .into_iter()
-                .collect();
+            // No plan: the backfill ended before outcomes were kept per run,
+            // or it has not started. Only the first has outcomes to read.
+            let ended = backfill.completed_partitions
+                + backfill.failed_partitions
+                + backfill.canceled_partitions;
+            let outcomes = if ended == 0 {
+                HashMap::new()
+            } else {
+                let members: Vec<PartitionKey> =
+                    requested.iter().flat_map(PartitionKey::members).collect();
+                storage
+                    .get_backfill_partition_outcomes(id, &members)
+                    .await?
+                    .into_iter()
+                    .collect()
+            };
+
             return Ok(Self {
                 requested,
                 blocks,
@@ -656,6 +666,8 @@ mod tests {
         LaunchedBy, RunRecord, RunStatus, UnstartedBackfillRun, default_code_location_id,
     };
 
+    use std::time::Duration;
+
     use BackfillPartitionState::{Canceled, Completed, Failed, Pending};
 
     fn single(values: &[&str]) -> PartitionKey {
@@ -678,12 +690,12 @@ mod tests {
         }
     }
 
-    /// Store backfill `bf` for `requested` and start it with its plan.
-    async fn started_backfill(
+    /// Store backfill `bf` for `requested`. It has not started.
+    async fn requested_backfill(
         storage: &SurrealStorage,
-        strategy: BackfillStrategy,
+        strategy: &BackfillStrategy,
         requested: &[PartitionKey],
-    ) -> Vec<PartitionKey> {
+    ) {
         let record = BackfillRecord {
             backfill_id: "bf".to_string(),
             code_location_id: default_code_location_id(),
@@ -708,6 +720,15 @@ mod tests {
             config: None,
         };
         storage.create_backfill(&record, requested).await.unwrap();
+    }
+
+    /// Store backfill `bf` for `requested` and start it with its plan.
+    async fn started_backfill(
+        storage: &SurrealStorage,
+        strategy: BackfillStrategy,
+        requested: &[PartitionKey],
+    ) -> Vec<PartitionKey> {
+        requested_backfill(storage, &strategy, requested).await;
 
         let plan = crate::execution::backfill::plan_runs(&strategy, requested);
         assert!(storage.start_backfill("bf", plan.len()).await.unwrap());
@@ -867,6 +888,39 @@ mod tests {
             page(&storage, 5, 10).await,
             vec![cell("h2", "z3", Canceled)]
         );
+    }
+
+    /// The showcase backfill before it starts: 265 zones over half a year
+    /// of hours.
+    #[tokio::test]
+    async fn a_backfill_that_has_not_started_reads_no_partition_one_by_one() {
+        let storage = SurrealStorage::new_memory().await.unwrap();
+        let hours: Vec<String> = (0..4_368).map(|hour| format!("h{hour:04}")).collect();
+        let zones: Vec<String> = (0..265).map(|zone| format!("z{zone:03}")).collect();
+        let hours: Vec<&str> = hours.iter().map(String::as_str).collect();
+        let zones: Vec<&str> = zones.iter().map(String::as_str).collect();
+        let requested = [multi(&[("hour", &hours), ("zone", &zones)])];
+        let strategy = BackfillStrategy::PerDimension {
+            multi_run: vec!["zone".to_string()],
+            single_run: vec!["hour".to_string()],
+        };
+        requested_backfill(&storage, &strategy, &requested).await;
+
+        let states = tokio::time::timeout(Duration::from_secs(10), read_states(&storage))
+            .await
+            .expect("the read took the time of a read of each partition");
+
+        assert_eq!(states.total(), 1_157_520);
+        assert_eq!(
+            states.counts_in(&[range(&[], "hour", "h0000", "h4367")]),
+            vec![counted(1_157_520, 0, 0, 0)]
+        );
+        let last: Vec<(String, BackfillPartitionState)> = states
+            .page(1_157_519, 10)
+            .into_iter()
+            .map(|(partition, outcome)| (partition.to_display(), outcome.state))
+            .collect();
+        assert_eq!(last, vec![("hour=h4367|zone=z264".to_string(), Pending)]);
     }
 
     #[tokio::test]
