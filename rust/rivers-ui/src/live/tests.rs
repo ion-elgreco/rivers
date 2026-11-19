@@ -1219,6 +1219,41 @@ async fn channel_loop_backs_off_on_subscribe_error() {
     );
 }
 
+/// A table under a heavy write load: the database ends each live query as
+/// soon as it opens, and the query waits up to 30 s to open again. Its
+/// channel ticks once a second for that time.
+#[tokio::test(start_paused = true)]
+async fn channel_loop_ticks_each_second_while_the_live_query_is_down() {
+    let subscribe = || async { Ok::<_, anyhow::Error>(futures_util::stream::empty::<()>()) };
+    let shutdown = CancellationToken::new();
+    let shutdown_t = shutdown.clone();
+    let (tx, mut rx) = broadcast::channel::<&'static str>(64);
+    let metrics = LiveMetrics::new();
+    let handle = tokio::spawn(async move {
+        channel_loop(subscribe, shutdown_t, tx, "runs", None, metrics).await;
+    });
+
+    let started = tokio::time::Instant::now();
+    let window = Duration::from_secs(120);
+    let mut ticked_at = vec![Duration::ZERO];
+    while let Ok(Ok(_)) = tokio::time::timeout_at(started + window, rx.recv()).await {
+        ticked_at.push(started.elapsed());
+    }
+    ticked_at.push(window);
+    shutdown.cancel();
+    let _ = timeout(Duration::from_secs(1), handle).await;
+
+    let longest_gap = ticked_at
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap();
+    assert!(
+        longest_gap <= Duration::from_secs(1),
+        "{longest_gap:?} without a tick; ticks at {ticked_at:?}"
+    );
+}
+
 /// Shutdown cancellation must break the loop promptly even when the
 /// stream is actively yielding — the while-let guards `shutdown` on
 /// every iteration. Uses a never-ending stream so the only way out
