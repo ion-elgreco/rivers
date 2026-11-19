@@ -24,6 +24,27 @@ pub(super) const CLEAR_DELETED_ASSET: &str = "\
      WHERE code_location_id = $cl AND asset_key = $asset_key \
      AND has_row = true AND built_at <= $ts;";
 
+/// Change the hold row of an asset, in a transaction that deletes its
+/// partition rows or writes its failure rows. Such a transaction and a
+/// materialization write different rows, and each reads rows that the other
+/// writes: left alone, both commit and neither sees the other. A
+/// materialization reads the hold row ([`UPSERT_ASSET_PARTITIONS`]), so the
+/// change stops each one that began before it committed. Two transactions
+/// that change the row stop each other.
+///
+/// The change does not stop this transaction when a materialization commits
+/// first. The writer therefore brings its rows in line once more after its
+/// commit, in a second transaction that changes the row again: that one sees
+/// each materialization that the first did not see. A materialization that
+/// begins after the first commit sees what the first wrote. A writer that
+/// stops between the two leaves the rows of such a materialization until its
+/// change runs again.
+///
+/// The row has the id `[code_location_id, asset_key]`; the first change
+/// makes it.
+pub(super) const CHANGE_HOLD: &str = "\
+     UPSERT type::record('asset_holds', [$cl, $asset_key]) SET changes += 1 RETURN NONE; ";
+
 /// Roll an `assets` row's data forward to a materialization event.
 pub(super) const MATERIALIZE_ASSET_DATA: &str = "UPDATE assets SET last_event_id = $event_id, last_run_id = $run_id, last_timestamp = $timestamp, last_data_version = $data_version WHERE code_location_id = $cl AND asset_key = $asset_key";
 
@@ -53,20 +74,6 @@ pub(super) const MATERIALIZATION_IS_NEWER: &str =
 /// real materialization landing after it still records its provenance.
 pub(super) const PROVENANCE_IS_NEWER: &str = "AND last_provenance_timestamp <= $provenance_timestamp AND last_deletion_timestamp < $provenance_timestamp";
 
-/// Starts `delete_partitions`' changes: write the `assets` row and put it
-/// back. A materialization that adds partition rows writes that row too.
-/// Without it, the two write different rows (the tombstone, the partition
-/// row), so both commit from snapshots that miss each other, and the older
-/// partition row outlives the newer deletion. Now one fails and retries. An
-/// UPDATE that changes nothing writes nothing, hence the placeholder.
-pub(super) const HOLD_FOR_PARTITION_DELETIONS: &str = "\
-     LET $held = (SELECT VALUE last_event_id FROM assets \
-         WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
-     UPDATE assets SET last_event_id = 'partition deletion' \
-         WHERE code_location_id = $cl AND asset_key = $asset_key; \
-     UPDATE assets SET last_event_id = $held \
-         WHERE code_location_id = $cl AND asset_key = $asset_key; ";
-
 /// Ends `delete_partitions`' changes: record the tombstones at each key's
 /// newest deletion time. The tombstone outlives the Deletion event: failure
 /// supersession reads it, and deleting the run must not undo the deletion. A
@@ -78,32 +85,31 @@ pub(super) const RECORD_PARTITION_TOMBSTONES: &str = "\
 /// Upsert `asset_partitions` rows on the UNIQUE index — one row per
 /// partition, newest event wins. A key deleted at or after its event, alone or
 /// with its whole asset, keeps no row. Always rides one transaction with the
-/// asset-row update above so the two never disagree under a concurrent
-/// whole-asset deletion. `$oldest` is the oldest event time in `$rows`.
+/// asset-row update above, so a concurrent whole-asset deletion sees both or
+/// neither. `$oldest` is the oldest event time in `$rows`.
 ///
 /// The `assets` row is read before its update: its `last_timestamp` bounds
 /// every partition row's, so a batch no older than it takes the plain upsert.
-/// Only an older batch pays for the per-row time check. Its row update may
-/// write nothing, so it writes the `assets` row and puts it back. A concurrent
-/// deletion, of the whole asset or of partitions, writes that row too: one of
-/// the two then fails to commit and retries, and the deletion cannot miss this
-/// batch's new rows.
+/// Only an older batch pays for the per-row time check.
+///
+/// The batch first reads the hold row of the asset `FOR UPDATE`: it fails to
+/// commit, and runs again, when a deletion or a write of failure rows changed
+/// that row after the batch began ([`CHANGE_HOLD`]). Batches only read the
+/// row, so batches of other partitions do not stop each other. The row need
+/// not exist.
 ///
 /// The keys' tombstones are read with an UPDATE that sets nothing, not a
 /// SELECT: only UPDATE and DELETE look up the object-valued `partition_key` on
 /// the UNIQUE index. A SELECT reads every tombstone of the asset. A DELETE
 /// gets that lookup only from a plain param, hence `$deleted_key`.
 pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
-     LET $asset = (SELECT last_timestamp, last_deletion_timestamp, last_event_id FROM assets \
+     SELECT VALUE changes FROM type::record('asset_holds', [$cl, $asset_key]) FOR UPDATE; \
+     LET $asset = (SELECT last_timestamp, last_deletion_timestamp FROM assets \
          WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
      LET $live = IF $asset.last_deletion_timestamp >= $oldest { \
          $rows[WHERE last_timestamp > $asset.last_deletion_timestamp] \
      } ELSE { $rows }; \
      IF $asset.last_timestamp > $oldest { \
-         UPDATE assets SET last_event_id = $event_id \
-             WHERE code_location_id = $cl AND asset_key = $asset_key; \
-         UPDATE assets SET last_event_id = $asset.last_event_id \
-             WHERE code_location_id = $cl AND asset_key = $asset_key; \
          INSERT INTO asset_partitions $live ON DUPLICATE KEY UPDATE \
          last_event_id = IF last_timestamp > $input.last_timestamp \
              THEN last_event_id ELSE $input.last_event_id END, \
@@ -129,17 +135,6 @@ pub(super) const UPSERT_ASSET_PARTITIONS: &str = "\
              AND last_timestamp <= $deletion.timestamp; \
          }; \
      }";
-
-/// Starts a write of failure rows in a transaction: write the `assets` row
-/// and put it back, as a materialization and a deletion of the asset do. Of
-/// two that run at the same time, one then fails to commit and retries.
-pub(super) const HOLD_ASSET_FOR_FAILURES: &str = "\
-     LET $asset = (SELECT last_event_id FROM assets \
-         WHERE code_location_id = $cl AND asset_key = $asset_key)[0]; \
-     UPDATE assets SET last_event_id = 'partition failure' \
-         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; \
-     UPDATE assets SET last_event_id = $asset.last_event_id \
-         WHERE code_location_id = $cl AND asset_key = $asset_key RETURN NONE; ";
 
 /// The time of the latest deletion of an asset, and whether the asset has
 /// partition tombstones.

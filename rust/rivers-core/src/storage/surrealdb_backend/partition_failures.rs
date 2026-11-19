@@ -30,9 +30,8 @@ use super::partition_reads::{
 };
 use super::*;
 
-/// Partitions that one transaction writes. A short transaction holds the
-/// asset row for less time, and loses less work to a conflict: at about 50 µs
-/// per partition, 250 hold it for about 15 ms.
+/// Partitions that one transaction writes. A short transaction loses less
+/// work to a conflict: at about 50 µs per partition, 250 take about 15 ms.
 const FAILURES_PER_TRANSACTION: usize = 250;
 
 /// Up to this many keys are read one by one. The rows of more keys are read
@@ -277,15 +276,15 @@ struct Deletions {
     tombstones: bool,
 }
 
-/// In `txn`: the deletions of the asset. `hold`: first write the `assets` row
-/// and put it back (see [`HOLD_ASSET_FOR_FAILURES`]).
+/// In `txn`: the deletions of the asset. `hold`: first change the hold row
+/// of the asset (see [`CHANGE_HOLD`]).
 async fn deletions_of(
     txn: &Transaction<Any>,
     cl: &str,
     asset_key: &str,
     hold: bool,
 ) -> Result<Deletions> {
-    let hold = if hold { HOLD_ASSET_FOR_FAILURES } else { "" };
+    let hold = if hold { CHANGE_HOLD } else { "" };
     let mut result = txn
         .query(format!("{hold}{DELETIONS_OF_ASSET}"))
         .bind(("cl", cl.to_string()))
@@ -297,7 +296,7 @@ async fn deletions_of(
     deletions.context("the deletions of the asset return no row")
 }
 
-/// In `txn`: hold the asset row, and read the deletions of the asset.
+/// In `txn`: change the hold row of the asset, and read its deletions.
 async fn hold_asset(txn: &Transaction<Any>, cl: &str, asset_key: &str) -> Result<Deletions> {
     deletions_of(txn, cl, asset_key, true).await
 }
@@ -320,7 +319,7 @@ async fn deleted_at_of(
         .collect())
 }
 
-/// In `txn`, which holds the asset row: write each of `failures` (in the
+/// In `txn`, which changed the hold row: write each of `failures` (in the
 /// order of the store) that is newer than the partition's materialization,
 /// its deletion and the deletion of the asset. `run_end`: the failures are
 /// the end of their run in failure, else keyed step failures.
@@ -399,12 +398,11 @@ async fn write_failures(
     Ok(())
 }
 
-/// In `txn`, which holds the asset row: give each failure by run of `keys`
-/// (in the order of the store) the failure that `change` gives for it, keep
-/// those that are newer than the partition's materialization and deletions,
-/// and give each partition the failure row of the latest of them, or none.
-/// `deletions`: of the asset, when the transaction read them. Returns whether
-/// a row changed.
+/// In `txn`: give each failure by run of `keys` (in the order of the store)
+/// the failure that `change` gives for it, keep those that are newer than the
+/// partition's materialization and deletions, and give each partition the
+/// failure row of the latest of them, or none. `deletions`: of the asset,
+/// when the transaction read them. Returns whether a row changed.
 async fn refresh_partitions(
     txn: &Transaction<Any>,
     cl: &str,
@@ -657,8 +655,9 @@ impl SurrealStorage {
                 let txn = self.db.clone().begin().await?;
                 let deletions = hold_asset(&txn, cl, asset_key).await?;
 
-                // Read while the asset row is held: a materialization that
-                // commits after this makes the transaction retry.
+                // A materialization of the run that commits after this read
+                // does not stop the transaction: the check after the commit
+                // takes it in.
                 let chunk = match failed_run {
                     Some(run_id) => not_built_by(&self.db, asset_key, run_id, chunk).await?,
                     None => chunk.iter().collect(),
@@ -669,8 +668,59 @@ impl SurrealStorage {
                 Ok(())
             })
             .await?;
+
+            let mut keys: Vec<PartitionKey> = chunk.iter().map(|(key, _, _)| key.clone()).collect();
+            keys.dedup();
+            self.check_failures_again(cl, asset_key, &keys, failed_run)
+                .await?;
         }
         Ok(())
+    }
+
+    /// The failure rows of `keys` (each once, in the order of the store)
+    /// once more, after a change of them committed: it takes in what a
+    /// materialization committed while that change ran. `failed_run`: as in
+    /// [`Self::record_partition_failures`].
+    pub(super) async fn check_failures_again(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        keys: &[PartitionKey],
+        failed_run: Option<&str>,
+    ) -> Result<()> {
+        retry::with_retry(&self.retry_config.contended_batch(), || async {
+            let built = match failed_run {
+                Some(run_id) => materialized_by_runs(&self.db, Some(asset_key), &[run_id])
+                    .await?
+                    .into_values()
+                    .next()
+                    .unwrap_or_default(),
+                None => HashSet::new(),
+            };
+
+            let txn = self.db.clone().begin().await?;
+            let deletions = hold_asset(&txn, cl, asset_key).await?;
+            let changed = refresh_partitions(&txn, cl, asset_key, Some(deletions), keys, |row| {
+                let failure = row.failure();
+                let built_by_run =
+                    failed_run == Some(row.run_id.as_str()) && built.contains(&row.partition_key);
+                match built_by_run {
+                    true => RunFailure {
+                        run_failed_at: None,
+                        ..failure
+                    },
+                    false => failure,
+                }
+            })
+            .await?;
+            if changed {
+                txn.commit().await?;
+            } else {
+                txn.cancel().await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// The run `run_id`, with the columns that its failures need.
@@ -739,7 +789,8 @@ impl SurrealStorage {
     /// Bring the failure rows of the partitions of the run `run_id` in line
     /// with `change`. The failures by the run that change are read once;
     /// their keys then go in the order of the store, at most
-    /// [`FAILURES_PER_TRANSACTION`] of one asset per transaction. A failure
+    /// [`FAILURES_PER_TRANSACTION`] of one asset per transaction, and are
+    /// checked once more after a transaction that changed a row. A failure
     /// by the run that comes in after the read comes from an event after the
     /// change.
     pub(super) async fn repair_failures_of_run(
@@ -781,7 +832,7 @@ impl SurrealStorage {
         for ((cl, asset_key), mut keys) in keys_of {
             keys.sort_by(stored_order);
             for chunk in keys.chunks(FAILURES_PER_TRANSACTION) {
-                retry::with_retry(&retry_config, || async {
+                let changed = retry::with_retry(&retry_config, || async {
                     let txn = self.db.clone().begin().await?;
                     let deletions = hold_asset(&txn, &cl, &asset_key).await?;
                     let changed =
@@ -794,9 +845,14 @@ impl SurrealStorage {
                     } else {
                         txn.cancel().await?;
                     }
-                    Ok(())
+                    Ok(changed)
                 })
                 .await?;
+
+                if changed {
+                    self.check_failures_again(&cl, &asset_key, chunk, None)
+                        .await?;
+                }
             }
         }
         Ok(())

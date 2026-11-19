@@ -14,14 +14,14 @@ use crate::storage::{PartitionFailure, retry, stored_order};
 
 const CL: &str = DEFAULT_CODE_LOCATION_ID;
 
-fn single(key: &str) -> PartitionKey {
+pub(super) fn single(key: &str) -> PartitionKey {
     PartitionKey::Single {
         keys: vec![key.to_string()],
     }
 }
 
 /// One key that names each of `keys`.
-fn keys(keys: &[&str]) -> PartitionKey {
+pub(super) fn keys(keys: &[&str]) -> PartitionKey {
     PartitionKey::Single {
         keys: keys.iter().map(|key| key.to_string()).collect(),
     }
@@ -46,20 +46,25 @@ fn event(
     }
 }
 
-fn built(asset: &str, run_id: &str, key: &str, at: i64) -> EventRecord {
+pub(super) fn built(asset: &str, run_id: &str, key: &str, at: i64) -> EventRecord {
     let event_type = EventType::Materialization { data_version: None };
     event(asset, run_id, event_type, Some(single(key)), at)
 }
 
-fn failed(asset: &str, run_id: &str, key: PartitionKey, at: i64) -> EventRecord {
+pub(super) fn failed(asset: &str, run_id: &str, key: PartitionKey, at: i64) -> EventRecord {
     event(asset, run_id, EventType::StepFailure, Some(key), at)
 }
 
-fn deleted(asset: &str, key: Option<&str>, at: i64) -> EventRecord {
+pub(super) fn deleted(asset: &str, key: Option<&str>, at: i64) -> EventRecord {
     event(asset, "deleter", EventType::Deletion, key.map(single), at)
 }
 
-fn run(id: &str, status: RunStatus, partition: Option<PartitionKey>, assets: &[&str]) -> RunRecord {
+pub(super) fn run(
+    id: &str,
+    status: RunStatus,
+    partition: Option<PartitionKey>,
+    assets: &[&str],
+) -> RunRecord {
     RunRecord {
         run_id: id.to_string(),
         code_location_id: CL.to_string(),
@@ -79,7 +84,7 @@ fn run(id: &str, status: RunStatus, partition: Option<PartitionKey>, assets: &[&
     }
 }
 
-fn failure(key: &str, failed_at: i64, run_id: &str, has_row: bool) -> PartitionFailure {
+pub(super) fn failure(key: &str, failed_at: i64, run_id: &str, has_row: bool) -> PartitionFailure {
     PartitionFailure {
         key: single(key),
         failed_at,
@@ -89,7 +94,7 @@ fn failure(key: &str, failed_at: i64, run_id: &str, has_row: bool) -> PartitionF
 }
 
 /// The failure rows of `asset`, in the order of the store.
-async fn rows(storage: &SurrealStorage, asset: &str) -> Vec<PartitionFailure> {
+pub(super) async fn rows(storage: &SurrealStorage, asset: &str) -> Vec<PartitionFailure> {
     let mut rows = storage
         .get_partition_failures(CL, asset, None, 1_000_000)
         .await
@@ -764,10 +769,10 @@ async fn a_batch_sent_again_after_a_stopped_attempt_stores_each_event_once() {
 }
 
 /// A small generator of numbers, the same on every run of the test.
-struct Numbers(u64);
+pub(super) struct Numbers(pub(super) u64);
 
 impl Numbers {
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -945,7 +950,7 @@ async fn the_rows_follow_the_failures_of_the_events_and_the_runs() {
 
 /// A store on disk, which sees every conflict of two writers, with retries
 /// quick enough for many writers of one asset.
-async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> {
+pub(super) async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> {
     let retry = retry::StorageRetryConfig {
         max_retries: 50,
         initial_backoff: std::time::Duration::from_millis(1),
@@ -964,7 +969,7 @@ async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> {
 }
 
 /// Start all of `writes` at the same time, and wait for them.
-async fn race(writes: Vec<BoxFuture<'static, ()>>) {
+pub(super) async fn race(writes: Vec<BoxFuture<'static, ()>>) {
     let barrier = Arc::new(tokio::sync::Barrier::new(writes.len()));
     let tasks: Vec<_> = writes
         .into_iter()
@@ -1076,10 +1081,68 @@ async fn a_run_deleted_while_older_failures_come_in_leaves_the_derived_rows() {
     }
 }
 
+/// A run is deleted while late materializations of another failed run come
+/// in for its partitions: that run fails only the partitions that it did not
+/// materialize. The deletion and such a materialization write other rows, so
+/// neither stops the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_deleted_while_late_materializations_come_in_leaves_the_derived_rows() {
+    let temp_dir = test_temp_dir::test_temp_dir!();
+    let storage = store_on_disk(temp_dir.as_path_untracked()).await;
+    let members: Vec<String> = (0..32).map(|i| format!("k{i:02}")).collect();
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    let mut numbers = Numbers(11);
+
+    for round in 0..30 {
+        let asset = format!("a{round}");
+        let (late, deleted_run) = (format!("l{round}"), format!("d{round}"));
+        register(&storage, &[asset.as_str()]).await;
+        let first: Vec<EventRecord> = members
+            .iter()
+            .map(|member| built(&asset, "first", member, 280))
+            .collect();
+        storage.store_events(&first).await.unwrap();
+        for (run_id, end) in [(&late, 300), (&deleted_run, 400)] {
+            let started = run(run_id, RunStatus::Started, Some(keys(&members)), &[&asset]);
+            storage.create_run(&started).await.unwrap();
+            storage
+                .update_run_status(run_id, RunStatus::Failure, Some(end))
+                .await
+                .unwrap();
+        }
+
+        // The run that stays materializes every other partition, at a random
+        // point of the deletion.
+        let mut writes: Vec<BoxFuture<'static, ()>> = members
+            .iter()
+            .step_by(2)
+            .map(|member| {
+                let storage = storage.clone();
+                let event = built(&asset, &late, member, 250);
+                let delay = std::time::Duration::from_micros(numbers.below(10_000) as u64);
+                async move {
+                    tokio::time::sleep(delay).await;
+                    storage.store_event(&event).await.unwrap();
+                }
+                .boxed()
+            })
+            .collect();
+        let deleting = storage.clone();
+        writes
+            .push(async move { assert!(deleting.delete_run(&deleted_run).await.unwrap()) }.boxed());
+        race(writes).await;
+
+        assert_eq!(
+            assert_derived(&storage, &asset, &format!("round {round}")).await,
+            16
+        );
+    }
+}
+
 /// A run is deleted while another run keeps materializing other partitions
 /// of the same asset, which has many failed partitions: the deletion
-/// finishes. A deletion that derived the failures of the whole asset while
-/// it held the asset row started again on each materialization.
+/// finishes. A deletion that derived the failures of the whole asset in one
+/// transaction started again on each materialization.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_deleted_while_other_partitions_are_materialized_finishes() {
     use std::sync::atomic::{AtomicBool, Ordering};
