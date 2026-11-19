@@ -70,6 +70,7 @@ The reader/writer split lets a write-breaking migration for newer writers run **
 | 14 | A backfill keeps its requested keys in pages and its progress in one row per run | 14, 14 |
 | 15 | A run records when it began to execute | 14, 14 |
 | 16 | The failed partitions of each asset, and their failures by run, are stored in tables of their own; the migration fills them from the events | 14, 16 |
+| 17 | Each asset gets a hold row: runs that materialize partitions of one asset at the same time no longer stop each other | 14, 17 |
 
 An **uninitialized** store (no stamp) is bootstrapped by whichever process opens it first — the UI included — so a fresh deployment shows an empty UI without waiting for a code location.
 
