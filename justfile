@@ -91,7 +91,8 @@ test-dev: _runtime-bin
     RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest {{ xdist }} -m "not serial and not spark_test" python/
     RIVERS_RUNTIME_BIN='{{ runtime_bin }}' uv run --no-sync pytest -m "serial and not spark_test" python/
 
-# Run the tests that need a SurrealDB server: only a server has a message limit.
+# Run the tests that need a SurrealDB server: only a server has a message limit
+# and a queue of live-query notifications.
 # Starts a server in Docker on a free port and removes it at the end.
 test-server:
     #!/usr/bin/env bash
@@ -106,7 +107,7 @@ test-server:
         sleep 0.5
     done
     export RIVERS_TEST_SURREAL_ENDPOINT="ws://127.0.0.1:${port}"
-    cargo test --profile {{ profile }} -p rivers-core --lib message_limit
+    cargo test --profile {{ profile }} -p rivers-core --lib -- message_limit live_queries
     uv run --no-sync pytest python/tests/backfill/test_backfill_message_limit.py
 
 # Run all Rust workspace tests.

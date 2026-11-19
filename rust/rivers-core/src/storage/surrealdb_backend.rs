@@ -155,10 +155,19 @@ impl StoreWrittenBySurrealDb3 {
 
 pub struct SurrealStorage {
     db: Surreal<Any>,
+    live: Option<LiveConnection>,
     retry_config: super::retry::StorageRetryConfig,
     backend_kind: SurrealBackendKind,
     /// Tokio runtime that hosts the router task when constructed via a `*_blocking` constructor.
     runtime: Option<tokio::runtime::Runtime>,
+}
+
+/// A remote store's connection for its live queries, opened by the first
+/// one. A server ends a connection that has more notifications queued than it
+/// allows (100 by default), and fails the queries that run on it.
+struct LiveConnection {
+    config: SurrealConnectConfig,
+    db: tokio::sync::OnceCell<Surreal<Any>>,
 }
 
 impl Drop for SurrealStorage {
@@ -282,6 +291,7 @@ impl SurrealStorage {
         );
         Ok(Self {
             db,
+            live: None,
             retry_config,
             backend_kind: SurrealBackendKind::Embedded {
                 path: path.to_string(),
@@ -331,6 +341,7 @@ impl SurrealStorage {
         );
         Ok(Self {
             db,
+            live: None,
             retry_config,
             backend_kind: SurrealBackendKind::Memory,
             runtime: None,
@@ -361,79 +372,41 @@ impl SurrealStorage {
         retry_config: super::retry::StorageRetryConfig,
         cap: Capability,
     ) -> Result<Self> {
-        let SurrealConnectConfig {
-            endpoint,
-            namespace,
-            database,
-            credentials,
-            max_message_size,
-        } = config;
         let started = std::time::Instant::now();
         tracing::info!(
             backend = "remote",
-            endpoint = %endpoint,
-            ns = %namespace,
-            db = %database,
-            authenticated = credentials.is_some(),
-            max_message_size,
+            endpoint = %config.endpoint,
+            ns = %config.namespace,
+            db = %config.database,
+            authenticated = config.credentials.is_some(),
+            max_message_size = config.max_message_size,
             max_retries = retry_config.max_retries,
             max_backoff_ms = retry_config.max_backoff.as_millis() as u64,
             "opening surreal storage"
         );
         let db = super::retry::with_retry(&retry_config, || async {
-            tracing::debug!(endpoint = %endpoint, "connecting remote surrealdb");
-            let mut sdk_config = surrealdb::opt::Config::new();
-            if let Some(bytes) = max_message_size {
-                sdk_config = sdk_config
-                    .websocket(surrealdb::opt::WebsocketConfig::new().max_message_size(bytes))
-                    .context("invalid max_message_size")?;
-            }
-
-            let db = any::connect((endpoint.clone(), sdk_config))
-                .await
-                .context("failed to connect to remote SurrealDB")?;
-            if let Some(creds) = credentials.clone() {
-                match creds {
-                    SurrealCredentials::Database { username, password } => {
-                        tracing::debug!(
-                            ns = %namespace,
-                            db = %database,
-                            username = %username,
-                            "authenticating (database scope)"
-                        );
-                        db.signin(surrealdb::opt::auth::Database {
-                            namespace: namespace.clone(),
-                            database: database.clone(),
-                            username,
-                            password,
-                        })
-                        .await
-                        .context("SurrealDB signin failed")?;
-                    }
-                }
-            }
-            tracing::debug!(
-                ns = %namespace,
-                db = %database,
-                "selecting namespace/database"
-            );
-            db.use_ns(&namespace).use_db(&database).await?;
+            let db = connect_remote(&config).await?;
             migration::ensure_compatible(&db, cap).await?;
             Ok(db)
         })
         .await?;
         tracing::info!(
             backend = "remote",
-            endpoint = %endpoint,
+            endpoint = %config.endpoint,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "surreal storage opened"
         );
+        let backend_kind = SurrealBackendKind::Remote {
+            endpoint: config.endpoint.clone(),
+        };
         Ok(Self {
             db,
+            live: Some(LiveConnection {
+                config,
+                db: tokio::sync::OnceCell::new(),
+            }),
             retry_config,
-            backend_kind: SurrealBackendKind::Remote {
-                endpoint: endpoint.to_string(),
-            },
+            backend_kind,
             runtime: None,
         })
     }
@@ -462,6 +435,16 @@ impl SurrealStorage {
         Ok(storage)
     }
 
+    /// The connection that live queries run on.
+    async fn live_db(&self) -> Result<&Surreal<Any>> {
+        let Some(live) = &self.live else {
+            return Ok(&self.db);
+        };
+        live.db
+            .get_or_try_init(|| connect_remote(&live.config))
+            .await
+    }
+
     /// Subscribe to change notifications on `table` via a SurrealDB LIVE
     /// query. Each change yields `()`; only the record id travels with it.
     pub async fn subscribe_table(&self, table: &str) -> Result<LiveTable> {
@@ -469,10 +452,8 @@ impl SurrealStorage {
         use std::sync::Arc;
         use surrealdb::Notification;
         use surrealdb::types::{Action, Uuid, Value};
-        let mut response = self
-            .db
-            .query(format!("LIVE SELECT id FROM {table}"))
-            .await?;
+        let db = self.live_db().await?;
+        let mut response = db.query(format!("LIVE SELECT id FROM {table}")).await?;
         let id = response
             .take::<Option<Uuid>>(0)?
             .context("LIVE SELECT returned no query id")?;
@@ -503,10 +484,55 @@ impl SurrealStorage {
             .boxed();
         Ok(LiveTable {
             changes,
-            db: self.db.clone(),
+            db: db.clone(),
             id,
         })
     }
+}
+
+/// Open a connection to the server of `config`, signed in and with its
+/// database selected.
+async fn connect_remote(config: &SurrealConnectConfig) -> Result<Surreal<Any>> {
+    tracing::debug!(endpoint = %config.endpoint, "connecting remote surrealdb");
+    let mut sdk_config = surrealdb::opt::Config::new();
+    if let Some(bytes) = config.max_message_size {
+        sdk_config = sdk_config
+            .websocket(surrealdb::opt::WebsocketConfig::new().max_message_size(bytes))
+            .context("invalid max_message_size")?;
+    }
+
+    let db = any::connect((config.endpoint.clone(), sdk_config))
+        .await
+        .context("failed to connect to remote SurrealDB")?;
+    if let Some(creds) = config.credentials.clone() {
+        match creds {
+            SurrealCredentials::Database { username, password } => {
+                tracing::debug!(
+                    ns = %config.namespace,
+                    db = %config.database,
+                    username = %username,
+                    "authenticating (database scope)"
+                );
+                db.signin(surrealdb::opt::auth::Database {
+                    namespace: config.namespace.clone(),
+                    database: config.database.clone(),
+                    username,
+                    password,
+                })
+                .await
+                .context("SurrealDB signin failed")?;
+            }
+        }
+    }
+    tracing::debug!(
+        ns = %config.namespace,
+        db = %config.database,
+        "selecting namespace/database"
+    );
+    db.use_ns(&config.namespace)
+        .use_db(&config.database)
+        .await?;
+    Ok(db)
 }
 
 /// A table's live query. [`LiveTable::close`] ends it on the session that
