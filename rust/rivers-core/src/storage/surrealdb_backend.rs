@@ -627,29 +627,45 @@ impl SurrealStorage {
                     .await?;
             }
             None => {
-                // `last_timestamp` is cleared with the rest: downstream reads
-                // it as "this dependency produced something new", so leaving it
-                // to advance would make deleting an asset trigger a
-                // materialization from data that no longer exists. The event id
-                // still points at the deletion so timelines resolve. One
-                // transaction, not separate statements: without it each statement
-                // commits on its own, and a concurrent materialization can land
-                // between them — leaving the asset row and its partition rows
-                // disagreeing. A conflict aborts the whole transaction and the
-                // caller's retry re-applies all of it. An unset time is NONE,
-                // which sorts below every number.
-                self.db
-                    .query(format!(
-                        "BEGIN TRANSACTION; {CLEAR_DELETED_ASSET} COMMIT TRANSACTION;"
-                    ))
-                    .bind(("cl", cl.to_string()))
-                    .bind(("asset_key", asset_key.to_string()))
-                    .bind(("event_id", event_id.to_string()))
-                    .bind(("ts", event.timestamp))
-                    .await?
-                    .check()?;
+                for _ in 0..2 {
+                    self.clear_deleted_asset(cl, asset_key, event_id, event.timestamp)
+                        .await?;
+                }
             }
         }
+        Ok(())
+    }
+
+    /// One transaction of the deletion of a whole asset at `ts`. The deletion
+    /// runs it twice: the second one removes a partition row that a
+    /// materialization committed while the first ran.
+    async fn clear_deleted_asset(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        event_id: &str,
+        ts: i64,
+    ) -> Result<()> {
+        // `last_timestamp` is cleared with the rest: downstream reads it as
+        // "this dependency produced something new", so leaving it to advance
+        // would make deleting an asset trigger a materialization from data
+        // that no longer exists. The event id still points at the deletion so
+        // timelines resolve. One transaction, not separate statements: without
+        // it each statement commits on its own, and a concurrent
+        // materialization can land between them — leaving the asset row and
+        // its partition rows disagreeing. A conflict aborts the whole
+        // transaction and the caller's retry re-applies all of it. An unset
+        // time is NONE, which sorts below every number.
+        self.db
+            .query(format!(
+                "BEGIN TRANSACTION; {CHANGE_HOLD}{CLEAR_DELETED_ASSET} COMMIT TRANSACTION;"
+            ))
+            .bind(("cl", cl.to_string()))
+            .bind(("asset_key", asset_key.to_string()))
+            .bind(("event_id", event_id.to_string()))
+            .bind(("ts", ts))
+            .await?
+            .check()?;
         Ok(())
     }
 
@@ -662,12 +678,28 @@ impl SurrealStorage {
         asset_key: &str,
         deletions: Vec<(PartitionKey, i64)>,
     ) -> Result<()> {
+        for _ in 0..2 {
+            self.delete_partitions_once(cl, asset_key, &deletions)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One transaction of [`Self::delete_partitions`], which runs it twice:
+    /// the second one removes a partition row that a materialization
+    /// committed while the first ran.
+    async fn delete_partitions_once(
+        &self,
+        cl: &str,
+        asset_key: &str,
+        deletions: &[(PartitionKey, i64)],
+    ) -> Result<()> {
         let mut newest: HashMap<PartitionKey, i64> = HashMap::new();
         for (pk, ts) in deletions {
             newest
-                .entry(pk)
-                .and_modify(|t| *t = (*t).max(ts))
-                .or_insert(ts);
+                .entry(pk.clone())
+                .and_modify(|t| *t = (*t).max(*ts))
+                .or_insert(*ts);
         }
         let mut by_time: HashMap<i64, Vec<&PartitionKey>> = HashMap::new();
         for (pk, ts) in &newest {
@@ -677,17 +709,10 @@ impl SurrealStorage {
         let Some(range) = partition_failures::key_range(newest.keys()) else {
             return Ok(());
         };
-        // One DELETE per deletion time, not a FOR loop, which costs more. The
-        // members of one delete step share a time, so this is one statement.
-        let mut body = String::from(HOLD_FOR_PARTITION_DELETIONS);
-        for i in 0..by_time.len() {
-            body.push_str(&format!(
-                "DELETE FROM asset_partitions WHERE code_location_id = $cl \
-                 AND asset_key = $asset_key AND partition_key IN $keys_{i} \
-                 AND last_timestamp <= $deleted_at_{i}; "
-            ));
-        }
-        body.push_str(RECORD_PARTITION_TOMBSTONES);
+        let body = format!(
+            "{CHANGE_HOLD}{}",
+            partition_deletion_statements(by_time.len())
+        );
         let bind = DeletionParams {
             cl,
             asset_key,
@@ -701,8 +726,8 @@ impl SurrealStorage {
             partition_failures::failure_rows_guard()
         );
 
-        // The writers of failures, materializations and deletions of one
-        // asset all write its `assets` row, so all but one lose each commit.
+        // The deletions and the writers of failure rows of one asset all
+        // change its hold row, so all but one lose each commit.
         let retry_config = self.retry_config.contended_batch();
         let applied = super::retry::with_retry(&retry_config, || {
             partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str())))
@@ -847,12 +872,11 @@ impl SurrealStorage {
             };
             format!("{update_sql}; {provenance_sql} {PROVENANCE_IS_NEWER}")
         };
-        // The asset row and its partition rows commit together — a concurrent
-        // whole-asset deletion lands wholly before or wholly after this
-        // materialization, never between the two. The partition upsert reads
-        // the asset row first, so it runs before the row's update. The data
-        // and provenance updates commit together too: no reader sees new data
-        // with the provenance of the materialization it replaced.
+        // The asset row and its partition rows commit together: a concurrent
+        // whole-asset deletion sees both or neither. The partition upsert
+        // reads the asset row first, so it runs before the row's update. The
+        // data and provenance updates commit together too: no reader sees new
+        // data with the provenance of the materialization it replaced.
         let range = partition_failures::key_range(parts.iter().map(|p| &p.partition_key));
         let (guard, body) = match range {
             Some(_) => (
@@ -874,8 +898,8 @@ impl SurrealStorage {
             range,
         };
 
-        // Runs that write one asset at the same time all write its `assets`
-        // row, so all but one lose each commit.
+        // The transaction loses its commit to a deletion or a write of
+        // failure rows of the asset, and to a run that writes the same rows.
         let retry_config = self.retry_config.contended_batch();
         let applied = super::retry::with_retry(&retry_config, || async {
             partition_failures::run_guarded(bind.bind(self.db.query(sql.as_str()))).await
@@ -943,6 +967,23 @@ impl MaterializationParams<'_> {
         }
         query
     }
+}
+
+/// The statements that delete the partition rows of `times` deletion times
+/// and record the tombstones. One DELETE per deletion time, not a FOR loop,
+/// which costs more. The members of one delete step share a time, so this is
+/// one statement.
+fn partition_deletion_statements(times: usize) -> String {
+    let mut statements = String::new();
+    for i in 0..times {
+        statements.push_str(&format!(
+            "DELETE FROM asset_partitions WHERE code_location_id = $cl \
+             AND asset_key = $asset_key AND partition_key IN $keys_{i} \
+             AND last_timestamp <= $deleted_at_{i}; "
+        ));
+    }
+    statements.push_str(RECORD_PARTITION_TOMBSTONES);
+    statements
 }
 
 /// The parameters of the statements of `delete_partitions`.

@@ -1294,10 +1294,9 @@ impl SurrealStorage {
             .collect();
         let action_ids = self.action_run_ids(update_run_ids).await?;
         // Each asset's partition rows commit in one transaction with its
-        // `assets` row update — a concurrent whole-asset deletion lands
-        // wholly before or wholly after, never between the two. Every
-        // partition row comes from a materialization event, so its asset is
-        // always in `latest_mat`.
+        // `assets` row update: a concurrent whole-asset deletion sees both or
+        // neither. Every partition row comes from a materialization event, so
+        // its asset is always in `latest_mat`.
         let mut parts_by_asset: std::collections::HashMap<(&str, &str), Vec<DbAssetPartitionWrite>> =
             std::collections::HashMap::new();
         for ((cl, ak, _), row) in part_rows {

@@ -19,6 +19,7 @@ mod crud;
 mod directory;
 mod executor_patterns;
 mod failure_rows;
+mod holds;
 mod isolation;
 mod message_limit;
 mod observations;

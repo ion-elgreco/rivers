@@ -360,10 +360,11 @@ async fn a_late_materialization_does_not_undo_a_newer_asset_deletion() {
 }
 
 /// A whole-asset deletion and an older materialization of a new partition,
-/// in flight together: neither snapshot holds the other's writes. They must
-/// still serialize, so no partition row outlives the newer deletion. The
-/// deletion's transaction stays open across the materialization to pin that
-/// interleaving; a failed commit is retried as `with_retry` would.
+/// in flight together: neither snapshot holds the other's writes, and the
+/// hold row does not stop the deletion. The deletion once more removes the
+/// row, so no partition row outlives the newer deletion. The deletion's
+/// transaction stays open across the materialization to pin that
+/// interleaving.
 #[tokio::test]
 async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
     let temp_dir = test_temp_dir::test_temp_dir!();
@@ -386,7 +387,7 @@ async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
 
         let deletion = del_at(&key, 200, None);
         let tx = storage.db.clone().begin().await.unwrap();
-        tx.query(CLEAR_DELETED_ASSET)
+        tx.query(format!("{CHANGE_HOLD}{CLEAR_DELETED_ASSET}"))
             .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
             .bind(("asset_key", key.clone()))
             .bind(("event_id", "deletion".to_string()))
@@ -420,13 +421,19 @@ async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
             "batched={batched}: the older materialization changed the asset row"
         );
 
-        if let Err(e) = tx.commit().await {
-            assert!(
-                retry::is_transient_surrealdb_error(&e),
-                "batched={batched}: {e}"
-            );
-            storage.store_event(&deletion).await.unwrap();
-        }
+        tx.commit().await.unwrap();
+        assert_eq!(
+            storage
+                .get_materialized_partitions(DEFAULT_CODE_LOCATION_ID, &key)
+                .await
+                .unwrap(),
+            vec![p0.clone()],
+            "batched={batched}: the deletion saw the row of the materialization"
+        );
+        storage
+            .clear_deleted_asset(DEFAULT_CODE_LOCATION_ID, &key, "deletion", 200)
+            .await
+            .unwrap();
 
         assert_eq!(
             read_writes(&storage, &key, &p0).await,
@@ -519,8 +526,7 @@ async fn a_concurrent_partition_deletion_leaves_no_older_partition_row() {
     }
 }
 
-/// A partition deletion writes the `assets` row only to conflict with a
-/// concurrent materialization: it leaves the row as it found it.
+/// A partition deletion leaves the `assets` row as it found it.
 #[tokio::test]
 async fn a_partition_deletion_leaves_the_asset_row_as_it_found_it() {
     let storage = make_storage().await;
@@ -1009,10 +1015,11 @@ async fn concurrent_observations_stay_consistent() {
     }
 }
 
-/// Runs that write partitions of one asset at the same time all write its
-/// `assets` row, so all but one lose each commit. A lost race is not a sick
-/// store: it must not use up the attempts kept for one, or a batch of events
-/// stays without its partition rows. This store keeps no such attempts.
+/// Runs that write partitions of one asset at the same time lose a commit
+/// when two of them write its `assets` row, each with the newest data that
+/// it saw. A lost race is not a sick store: it must not use up the attempts
+/// kept for one, or a batch of events stays without its partition rows. This
+/// store keeps no such attempts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_batches_of_one_asset_all_get_their_partition_rows() {
     const RUNS: usize = 4;
