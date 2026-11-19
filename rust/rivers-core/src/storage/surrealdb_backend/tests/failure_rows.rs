@@ -949,14 +949,15 @@ async fn the_rows_follow_the_failures_of_the_events_and_the_runs() {
 }
 
 /// A store on disk, which sees every conflict of two writers, with retries
-/// quick enough for many writers of one asset.
+/// quick enough for many writers of one asset. A write gives up by time: with
+/// waits this short, a number of attempts is gone in half a second.
 pub(super) async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> {
     let retry = retry::StorageRetryConfig {
-        max_retries: 50,
+        max_retries: u32::MAX,
         initial_backoff: std::time::Duration::from_millis(1),
         max_backoff: std::time::Duration::from_millis(5),
         backoff_multiplier: 1.0,
-        max_elapsed: None,
+        max_elapsed: Some(std::time::Duration::from_secs(60)),
     };
     let storage = SurrealStorage::new_embedded_with_retry(
         dir.to_str().unwrap(),
