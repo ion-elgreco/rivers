@@ -1291,6 +1291,32 @@ async fn test_v16_stores_the_failed_partitions_that_the_events_give() {
     assert!(check_compatibility(stamps, Capability::ReadWrite, 15).is_err());
 }
 
+/// V17 adds the hold rows of the assets. A V16 writer neither reads nor
+/// changes them, so it may not write; a V16 reader is not stopped.
+#[tokio::test]
+async fn test_v17_adds_the_hold_rows_and_stops_older_writers() {
+    let storage = SurrealStorage::new_memory().await.unwrap();
+
+    // A read of the hold row of an asset that has none.
+    let txn = storage.db.clone().begin().await.unwrap();
+    let changes: Vec<i64> = txn
+        .query("SELECT VALUE changes FROM asset_holds:['cl', 'orders'] FOR UPDATE")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert_eq!(changes, Vec::<i64>::new());
+
+    let stamps = stamps_at(&storage.db, 17).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (17, 14, 17)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 16).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 16).is_err());
+}
+
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
 /// fills at create time, so live pre-V5 slot rows must be backfilled: the
 /// conflict clause reads a missing `exclusive` as NONE (falsy), which would

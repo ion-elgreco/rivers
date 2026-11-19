@@ -587,6 +587,19 @@ database. The migration fills the tables from the stored events and runs; on
 a store with many failed partitions it takes longer than the earlier
 migrations.
 
+### Upgrading to schema version 17
+
+Schema version 17 adds a hold row per asset and raises the writer floor:
+every `CodeLocation` image must run the new rivers. An older UI still reads
+the database. Runs that materialize partitions of one asset at the same time
+no longer stop each other; a deletion or a failure of the asset still stops
+the materializations that run at that moment, and they try again.
+
+A `CodeLocation` on an older rivers that still runs after the migration does
+not use the hold row. Stop it, or let its runs end, before you migrate: a
+deletion or a failure that it writes does not stop the materializations of
+the new rivers, and a deleted partition can then keep its row.
+
 ## Uninstall
 
 ```sh
