@@ -5,7 +5,8 @@
 //! - A **channel** is a named group of tables whose notifications are
 //!   treated as equivalent triggers by the UI (see [`LIVE_CHANNELS`]).
 //! - One background task per `(channel, table)` pair holds the LIVE query
-//!   open, reconnecting with exponential backoff (250 ms → 30 s).
+//!   open, reconnecting with exponential backoff (250 ms → 30 s). While a
+//!   query waits to open again, its channel ticks once a second.
 //! - All tasks share one [`broadcast::Sender<&'static str>`]; the SSE
 //!   handler subscribes, filters by client-requested channels, and emits
 //!   `event: {channel}-changed\ndata: 1` events.
@@ -225,6 +226,8 @@ impl LiveStream for rivers_core::storage::surrealdb_backend::LiveTable {
 /// with `channel_name`, reconnects with exponential backoff on subscribe
 /// failure or stream end, and emits one synthetic tick on every reconnect
 /// after the first so clients catch up on anything missed during the gap.
+/// A query that was open ticks once a second while it waits to open again
+/// (see [`wait_to_reopen`]).
 ///
 /// Decoupled from [`SurrealStorage`] (subscribe is a closure) so tests can
 /// drive it with a deterministic mock stream.
@@ -281,9 +284,9 @@ async fn channel_loop<F, Fut, S>(
                     backoff_ms,
                     "live broadcaster: subscribe failed, retrying after backoff"
                 );
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
-                    _ = shutdown.cancelled() => break,
+                let tick = (!first_attempt).then_some((&tx, channel_name));
+                if !wait_to_reopen(backoff_ms, tick, &shutdown).await {
+                    break;
                 }
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
@@ -326,9 +329,42 @@ async fn channel_loop<F, Fut, S>(
             backoff_ms,
             "live query stream ended, reconnecting"
         );
+        if !wait_to_reopen(backoff_ms, Some((&tx, channel_name)), &shutdown).await {
+            break;
+        }
+    }
+}
+
+/// How often a channel ticks while one of its live queries is down.
+const DOWN_TICK_MS: u64 = 1_000;
+
+/// Wait `backoff_ms` before a live query opens again. `false` if `shutdown`
+/// fires first.
+///
+/// The query misses every change of that time, and a database under a heavy
+/// write load ends each query as soon as it opens. So `tick` names a channel
+/// to tick once a second: its pages refetch as they do on a change.
+async fn wait_to_reopen(
+    backoff_ms: u64,
+    tick: Option<(&broadcast::Sender<&'static str>, &'static str)>,
+    shutdown: &CancellationToken,
+) -> bool {
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let reopen_at = Instant::now() + Duration::from_millis(backoff_ms);
+    loop {
+        let next_tick = Instant::now() + Duration::from_millis(DOWN_TICK_MS);
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
-            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep_until(reopen_at.min(next_tick)) => {}
+            _ = shutdown.cancelled() => return false,
+        }
+        if Instant::now() >= reopen_at {
+            return true;
+        }
+
+        if let Some((tx, channel_name)) = tick {
+            let _ = tx.send(channel_name);
         }
     }
 }
