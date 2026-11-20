@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import socket
 import time
 
@@ -23,10 +24,19 @@ def wait_for(predicate, timeout: float, what: str) -> None:
 
 
 def free_port() -> int:
-    """A loopback TCP port that was free a moment ago, for a server a test starts."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    """A loopback TCP port that was free a moment ago, for a server a test starts.
+
+    The port is below the ports that the OS gives to a socket that asks for
+    any port, so no such socket takes it before the server starts.
+    """
+    while True:
+        port = 20000 + secrets.randbelow(12768)
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
 
 
 def wait_for_runs(storage, min_count: int = 1, timeout: float = 10.0, status=None):
