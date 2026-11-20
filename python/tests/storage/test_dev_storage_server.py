@@ -6,6 +6,10 @@ import rivers as rs
 from rivers._core import DevHost
 from rivers._core.storage import Storage
 
+# A new store on disk syncs each commit of its migrations: close to a minute
+# on a Windows runner.
+pytestmark = pytest.mark.timeout(180)
+
 
 @rs.Asset(name="served")
 def served() -> int:
