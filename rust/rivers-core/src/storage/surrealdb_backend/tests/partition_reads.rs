@@ -159,7 +159,7 @@ fn each_statement_of_a_keyed_read_has_a_parameter_of_its_own() {
 /// them all.
 #[tokio::test]
 async fn partition_timestamps_of_a_key_are_read_by_the_whole_index() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     register(&storage, &["trips"]).await;
     storage
         .store_events(&[materialization("trips", "r1", cell("00:00", "a"), 100)])
@@ -288,8 +288,7 @@ fn operators(plan: &serde_json::Value, found: &mut Vec<String>) {
 }
 
 /// `trips` has three zones for most hours; `2024-06-30T01:00` has one.
-async fn storage_with_trips() -> SurrealStorage {
-    let storage = make_storage().await;
+async fn storage_with_trips<S: StorageBackend>(storage: S) -> S {
     register(&storage, &["trips", "other", "plain"]).await;
     let mut events = Vec::new();
     for hour in [
@@ -327,7 +326,7 @@ fn hours(first: &str, last: &str) -> PartitionBounds {
 
 #[tokio::test]
 async fn count_in_bounds_counts_the_rows_of_each_run_of_keys() {
-    let storage = storage_with_trips().await;
+    let storage = storage_with_trips(make_storage().await).await;
     let hour = ("hour".to_string(), "2024-06-30T00:00".to_string());
 
     let counts = storage
@@ -465,7 +464,7 @@ async fn count_in_bounds_reads_more_bounds_than_one_query_holds() {
 /// a page that counts a few hundred runs of keys.
 #[tokio::test]
 async fn count_in_bounds_is_counted_on_the_index() {
-    let storage = storage_with_trips().await;
+    let storage = storage_with_trips(make_surreal().await).await;
     let bounds = hours("2024-06-30T00:00", "2024-06-30T01:00");
 
     let plan: Vec<serde_json::Value> = storage
@@ -490,7 +489,7 @@ async fn count_in_bounds_is_counted_on_the_index() {
 
 #[tokio::test]
 async fn rows_in_bounds_are_read_through_the_index() {
-    let storage = storage_with_trips().await;
+    let storage = storage_with_trips(make_surreal().await).await;
     let bounds = hours("2024-06-30T00:00", "2024-06-30T01:00");
 
     let plan: Vec<serde_json::Value> = storage
@@ -520,8 +519,7 @@ async fn rows_in_bounds_are_read_through_the_index() {
 }
 
 /// `plain` has failure rows of `p00` to `p09`; the even ones have a row.
-async fn storage_with_failures() -> SurrealStorage {
-    let storage = make_storage().await;
+async fn storage_with_failures<S: StorageBackend>(storage: S) -> S {
     register(&storage, &["plain"]).await;
     let mut events = Vec::new();
     for i in 0..10 {
@@ -537,7 +535,7 @@ async fn storage_with_failures() -> SurrealStorage {
 
 #[tokio::test]
 async fn failures_in_bounds_are_the_failures_from_the_lower_key_to_the_upper() {
-    let storage = storage_with_failures().await;
+    let storage = storage_with_failures(make_storage().await).await;
     let read = |first: &str, last: &str, limit: u64| {
         let bounds = PartitionBounds::of_keys(first, last);
         let storage = &storage;
@@ -608,7 +606,7 @@ async fn plan_of(storage: &SurrealStorage, statement: &str) -> serde_json::Value
 /// from the indexes of the failure rows, and read no row.
 #[tokio::test]
 async fn failure_counts_are_counted_on_the_index() {
-    let storage = storage_with_failures().await;
+    let storage = storage_with_failures(make_surreal().await).await;
 
     for statement in COUNT_FAILURES
         .split(';')
@@ -629,7 +627,7 @@ async fn failure_counts_are_counted_on_the_index() {
 /// every failure row of the asset.
 #[tokio::test]
 async fn reads_of_keys_go_through_the_index_of_the_keys() {
-    let storage = storage_with_failures().await;
+    let storage = storage_with_failures(make_surreal().await).await;
     let range = ["'p03'", "'p07'"];
     let key = ["'p04'"];
 

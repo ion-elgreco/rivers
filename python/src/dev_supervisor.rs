@@ -27,7 +27,7 @@ const ENV_MODULE: &str = "RIVERS_MODULE";
 const ENV_REPO_VAR: &str = "RIVERS_DEV_REPO_VAR";
 const ENV_HOST: &str = "RIVERS_DEV_HOST";
 const ENV_GRPC_PORT: &str = "RIVERS_DEV_GRPC_PORT";
-const ENV_ENDPOINT: &str = "RIVERS_SURREAL_ENDPOINT";
+const ENV_STORAGE_URL: &str = rivers_k8s::env::ENV_STORAGE_URL;
 const ENV_NO_DAEMON: &str = "RIVERS_DEV_NO_DAEMON";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -42,7 +42,7 @@ pub(crate) struct ChildSpec {
     pub repo_var: String,
     pub host: String,
     pub grpc_port: u16,
-    pub endpoint: String,
+    pub storage_url: String,
     pub no_daemon: bool,
 }
 
@@ -242,7 +242,7 @@ impl Supervisor {
             .env(ENV_REPO_VAR, &spec.repo_var)
             .env(ENV_HOST, &spec.host)
             .env(ENV_GRPC_PORT, spec.grpc_port.to_string())
-            .env(ENV_ENDPOINT, &spec.endpoint)
+            .env(ENV_STORAGE_URL, &spec.storage_url)
             .env(ENV_NO_DAEMON, if spec.no_daemon { "1" } else { "0" });
         // Its own session: the terminal's Ctrl-C reaches only this process,
         // which then stops the children once, in order.
@@ -399,7 +399,7 @@ pub fn serve_dev_code_location(py: Python<'_>) -> PyResult<()> {
     let grpc_port: u16 = env(ENV_GRPC_PORT)?
         .parse()
         .map_err(|e| PyRuntimeError::new_err(format!("{ENV_GRPC_PORT}: {e}")))?;
-    let endpoint = env(ENV_ENDPOINT)?;
+    let storage_url = env(ENV_STORAGE_URL)?;
     let no_daemon = env(ENV_NO_DAEMON)? == "1";
 
     // The module lives in the working directory, as for `rivers dev`.
@@ -413,7 +413,7 @@ pub fn serve_dev_code_location(py: Python<'_>) -> PyResult<()> {
     let storage = core
         .getattr("storage")?
         .getattr("Storage")?
-        .call_method1("connect", (&endpoint,))?;
+        .call_method1("open", (&storage_url,))?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("storage", &storage)?;
     repo.call_method("resolve", (), Some(&kwargs))?;

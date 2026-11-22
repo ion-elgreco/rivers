@@ -867,7 +867,7 @@ class DevHost:
     Example::
 
         host = DevHost(".rivers/storage/")
-        storage = Storage.connect(host.endpoint)
+        storage = Storage.open(host.url)
         host.start_code_location(sys.executable, "pipeline", "repo", "127.0.0.1", 3001, False)
         host.start_ui(storage, "127.0.0.1", 3000)
         host.run()  # until Ctrl-C; the UI reloads the code location
@@ -875,28 +875,28 @@ class DevHost:
         host.stop()
     """
 
-    def __init__(
-        self, storage_path: str | None = None, endpoint: str | None = None
-    ) -> None:
+    def __init__(self, storage_path: str | None = None, url: str | None = None) -> None:
         """Start the host.
 
         Args:
             storage_path: Directory of the embedded SurrealKV store, served on a
                 loopback ``ws://`` port for the UI and the code location.
-            endpoint: An external SurrealDB server to use instead; nothing is
-                served then, and ``storage_path`` is ignored.
+            url: A storage URL to use instead; ``storage_path`` is ignored. A
+                ``surrealkv://`` store is served like a path; a server
+                (``ws://``, ``postgres://``, ...) is used as it is.
 
         Raises:
-            ValueError: Neither a storage path nor an endpoint was given.
+            ValueError: Neither a storage path nor a URL was given, the URL is
+                not valid, or it names an in-memory store.
             RuntimeError: The embedded server did not start, or this build of
                 rivers has no embedded server.
         """
         ...
 
     @property
-    def endpoint(self) -> str:
-        """The SurrealDB endpoint of this session: the embedded server's
-        ``ws://127.0.0.1:<port>``, or the external one."""
+    def url(self) -> str:
+        """The storage URL of this session: the embedded server's
+        ``ws://127.0.0.1:<port>``, or the server it was given."""
         ...
 
     def start_code_location(

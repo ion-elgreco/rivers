@@ -734,7 +734,7 @@ mod tests {
         CancelBackfillRequest, CancelBackfillResponse, GetPartitionKeysRequest,
         GetPartitionKeysResponse,
     };
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use rivers_core::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
         StorageBackend,
@@ -882,7 +882,7 @@ mod tests {
     async fn a_backfill_is_canceled_by_the_code_location_that_owns_it() {
         let fake = FakeLocation::default();
         let endpoint = spawn_fake(fake.clone()).await;
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let storage = Arc::new(AnyStorage::new_memory().await.unwrap());
         storage
             .create_backfill(&backfill("owner-id"), &[])
             .await

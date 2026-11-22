@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::RunRecord;
+use crate::storage::{PerCodeLocationStorage, RunRecord};
 
 fn mk_run(run_id: &str, status: RunStatus, assets: &[&str], ts: i64) -> RunRecord {
     RunRecord {
@@ -41,10 +41,7 @@ fn rec_with_run(asset: &str, last_run_id: Option<&str>, ts: i64) -> AssetRecord 
 
 /// Register `assets` the way `resolve()` does: definition rows, no history.
 /// A whole-asset deletion's time lives on this row.
-async fn register_blank(
-    storage: &crate::storage::surrealdb_backend::SurrealStorage,
-    assets: &[&str],
-) {
+async fn register_blank(storage: &crate::storage::any::AnyStorage, assets: &[&str]) {
     let ctx = crate::storage::CodeLocationContext::new(crate::storage::default_code_location_id());
     let records: Vec<AssetRecord> = assets
         .iter()
@@ -177,9 +174,9 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
     // applied off that late terminal read: that skipped its effects forever,
     // leaving last_run_asset_names[source] at r0's joint names, which kept
     // LastRunIncludesTarget true and permanently suppressed eager() downstream.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let ctx = crate::storage::CodeLocationContext::new(cl.clone());
 
@@ -198,13 +195,7 @@ async fn initial_load_run_completing_mid_load_is_not_lost() {
         nodes: vec![node("source"), node("processed")],
         edges: vec![("processed".to_string(), "source".to_string())],
     };
-    storage
-        .kv_set(
-            &crate::graph_topology_key(&cl),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
-        .await
-        .unwrap();
+    storage.set_graph_topology(&cl, &topo, &[]).await.unwrap();
 
     let run =
         |run_id: &str, status: RunStatus, names: &[&str], start: i64, end: Option<i64>| RunRecord {
@@ -339,9 +330,9 @@ fn partition_keyed_success_clears_unpartitioned_asset_floor() {
 /// vanished; the pending grace-period eviction owns that case.
 #[tokio::test]
 async fn deleted_tracked_run_clears_in_progress_guard() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let mut cache = AssetConditionCache::new(cl.clone());
 
@@ -438,9 +429,9 @@ fn action_runs_are_not_materialization_attempts() {
 /// touched keys re-checked by key and evicted when the row is gone.
 #[tokio::test]
 async fn deleted_partition_evicted_from_partition_status() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -498,9 +489,9 @@ async fn deleted_partition_evicted_from_partition_status() {
 /// cancel-mid-delete leaves rows gone while the run ends Canceled.
 #[tokio::test]
 async fn canceled_delete_still_evicts_deleted_partitions() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -561,9 +552,9 @@ async fn canceled_delete_still_evicts_deleted_partitions() {
 /// them all, while a partition materialized after the deletion stays.
 #[tokio::test]
 async fn keyless_delete_evicts_every_cached_partition() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -636,9 +627,9 @@ async fn keyless_delete_evicts_every_cached_partition() {
 /// cached partitions alone — only a whole-asset deletion triggers the reload.
 #[tokio::test]
 async fn keyless_action_without_deletion_keeps_cached_partitions() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
 
     storage
@@ -676,12 +667,12 @@ async fn keyless_action_without_deletion_keeps_cached_partitions() {
 /// on_cron on every targeted partition for its whole run.
 #[tokio::test]
 async fn action_backfills_are_not_in_flight() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let backfill = |id: &str, asset: &str, action: Option<&str>| BackfillRecord {
         code_location_id: cl.clone(),
@@ -728,12 +719,12 @@ async fn action_backfills_are_not_in_flight() {
 /// one time and keeps them while the backfill is live.
 #[tokio::test]
 async fn backfill_keys_are_read_once() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy, LaunchedBy,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let backfill = |id: &str| BackfillRecord {
         code_location_id: cl.clone(),
@@ -836,9 +827,9 @@ fn deletion_event(
 /// eviction only a completed action run can drive — must not be lost.
 #[tokio::test]
 async fn action_completion_survives_cursor_passing_it() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -897,9 +888,9 @@ async fn action_completion_survives_cursor_passing_it() {
 /// completion must still arrive.
 #[tokio::test]
 async fn action_completion_survives_daemon_restart() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -1008,13 +999,11 @@ fn tick_tag_values(
 
 /// Storage where r1 materialized `events` at `slot` (each of its keys)
 /// together with `rollup`, tagged team=data.
-async fn events_built_with_rollup(
-    slot: &Option<PartitionKey>,
-) -> crate::storage::surrealdb_backend::SurrealStorage {
+async fn events_built_with_rollup(slot: &Option<PartitionKey>) -> crate::storage::any::AnyStorage {
     use crate::storage::PerCodeLocationStorage;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
         .register_assets(&cl, vec![rec_with_run("events", None, 0)])
@@ -1039,7 +1028,7 @@ async fn events_built_with_rollup(
 /// Run r2: verb `verb` on `events` at `slot`, tagged team=merge, which reports
 /// `materialized()` or completes without a materialization.
 async fn run_verb_on_events(
-    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    storage: &crate::storage::any::AnyStorage,
     verb: &str,
     slot: &Option<PartitionKey>,
     materialized: bool,
@@ -1173,7 +1162,7 @@ fn team(value: &str) -> Vec<(String, String)> {
 /// Run `run_id` on `events` over `pk`, tagged team=`run_id`, whose
 /// Materializations cover exactly the `materialized` keys.
 async fn run_on_events(
-    storage: &crate::storage::surrealdb_backend::SurrealStorage,
+    storage: &crate::storage::any::AnyStorage,
     run_id: &str,
     action: Option<&str>,
     status: RunStatus,
@@ -1318,9 +1307,9 @@ async fn a_run_is_the_last_run_of_only_the_partitions_it_materialized() {
 #[tokio::test]
 async fn initial_load_shares_one_runs_names_and_tags() {
     use crate::storage::PerCodeLocationStorage;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
         .register_assets(
@@ -1392,9 +1381,7 @@ async fn a_verb_run_includes_only_the_targets_it_built_after_the_asset() {
             ),
         ] {
             let case = format!("{case}, {slot:?}");
-            let storage = crate::storage::surrealdb_backend::SurrealStorage::new_memory()
-                .await
-                .unwrap();
+            let storage = crate::storage::any::AnyStorage::new_memory().await.unwrap();
             register_blank(&storage, &["events", "rollup"]).await;
             let mut built = mk_run("r1", RunStatus::Success, &["events", "rollup"], 1_000);
             built.partition_key = slot.clone();
@@ -1442,9 +1429,9 @@ async fn a_verb_run_includes_only_the_targets_it_built_after_the_asset() {
 #[tokio::test]
 async fn completed_delete_clears_last_run_maps_in_steady_state() {
     use crate::storage::PerCodeLocationStorage;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
         .register_assets(&cl, vec![rec_with_run("events", None, 0)])
@@ -1531,9 +1518,9 @@ async fn completed_delete_clears_last_run_maps_in_steady_state() {
 /// rebuilt. A deletion supersedes a failure like a newer materialization.
 #[tokio::test]
 async fn deleted_partition_does_not_resurrect_as_failed() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -1581,9 +1568,9 @@ async fn deleted_partition_does_not_resurrect_as_failed() {
 /// run after every restart.
 #[tokio::test]
 async fn deleted_asset_does_not_resurrect_failure_floor() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     register_blank(&storage, &["report"]).await;
 
@@ -1641,9 +1628,9 @@ async fn deleted_asset_does_not_resurrect_failure_floor() {
 /// every rebuild.
 #[tokio::test]
 async fn deleting_the_delete_run_keeps_deletion_supersession() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     let single = |k: &str| PartitionKey::Single {
         keys: vec![k.to_string()],
@@ -1719,9 +1706,9 @@ async fn deleting_the_delete_run_keeps_deletion_supersession() {
 #[tokio::test]
 async fn completed_delete_clears_failure_floor_in_steady_state() {
     use crate::storage::PerCodeLocationStorage;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = crate::storage::default_code_location_id();
     storage
         .register_assets(&cl, vec![rec_with_run("events", None, 0)])
@@ -1800,7 +1787,7 @@ async fn completed_delete_clears_failure_floor_in_steady_state() {
 #[tokio::test]
 async fn a_failed_run_does_not_floor_an_asset_it_materialized_after_it_moved() {
     use crate::storage::EventType;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
     let cl = crate::storage::default_code_location_id();
     let event = |event_type, asset: &str, run_id: &str, ts| crate::storage::EventRecord {
@@ -1823,7 +1810,7 @@ async fn a_failed_run_does_not_floor_an_asset_it_materialized_after_it_moved() {
         )
     };
     for case in ["whole-asset delete", "rebuilt by another run"] {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         register_blank(&storage, &["X", "Y"]).await;
         storage
             .create_run(&mk_run("r0", RunStatus::Success, &["X", "Y"], 10))

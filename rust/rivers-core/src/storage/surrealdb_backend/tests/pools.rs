@@ -129,42 +129,14 @@ async fn test_get_pool_info_with_slots_and_pending() {
         ("run2", "step_b", 3, future_ns),
         ("run3", "step_c", 1, past_ns), // expired
     ] {
-        let resp = storage
-            .db
-            .query(
-                "INSERT INTO concurrency_slots { \
-                         pool_key: $pool_key, run_id: $run_id, step_key: $step_key, \
-                         slots_consumed: $slots, claimed_at: $now, \
-                         lease_expires_at: $expires, last_heartbeat: $now \
-                     }",
-            )
-            .bind(("pool_key", "database".to_string()))
-            .bind(("run_id", run_id.to_string()))
-            .bind(("step_key", step_key.to_string()))
-            .bind(("slots", slots))
-            .bind(("now", now_ns))
-            .bind(("expires", expires))
-            .await
-            .unwrap();
-        resp.check().unwrap();
+        insert_slot(
+            &storage, "database", run_id, step_key, slots, now_ns, expires,
+        )
+        .await;
     }
 
     // Insert pending step
-    let resp = storage
-        .db
-        .query(
-            "INSERT INTO pending_steps { \
-                     pool_key: $pool_key, run_id: $run_id, step_key: $step_key, \
-                     priority: 0, enqueued_at: $now, block_reason: 'PoolFull' \
-                 }",
-        )
-        .bind(("pool_key", "database".to_string()))
-        .bind(("run_id", "run4".to_string()))
-        .bind(("step_key", "step_d".to_string()))
-        .bind(("now", now_ns))
-        .await
-        .unwrap();
-    resp.check().unwrap();
+    insert_pending_step(&storage, "database", "run4", "step_d", now_ns).await;
 
     let info = storage
         .get_pool_info(crate::storage::DEFAULT_CODE_LOCATION_ID, "database")
@@ -421,11 +393,7 @@ fn claim_transaction_skips_capacity_lets_for_asset_pools() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn set_pool_limit_survives_same_key_contention() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .expect("failed to create embedded storage"),
-    );
+    let storage = std::sync::Arc::new(make_disk_storage(temp_dir.as_path_untracked()).await);
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(50));
     let mut handles = Vec::new();

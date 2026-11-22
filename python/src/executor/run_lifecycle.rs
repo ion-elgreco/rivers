@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionPlan;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
     LaunchedBy, PartitionKey, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
 };
@@ -45,7 +45,7 @@ pub(crate) struct RunPlanArgs<'a> {
     pub plan: &'a ExecutionPlan,
     pub node_map: &'a Arc<HashMap<String, ResolvedNode>>,
     pub executor: &'a Executor,
-    pub storage: &'a ScopedStorageHandle<SurrealStorage>,
+    pub storage: &'a ScopedStorageHandle<AnyStorage>,
     pub resources: &'a HashMap<String, ResourceVariant>,
     pub retries: &'a HashMap<String, rivers_core::execution::retry::RetryPolicy>,
     /// Retry policy for the steps whose node sets none.
@@ -196,7 +196,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
 
 fn finalize_status(
     py: Python,
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
     run_id: &str,
     success: bool,
 ) -> PyResult<RunStatus> {

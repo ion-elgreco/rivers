@@ -405,12 +405,8 @@ async fn setup_storage_bench<S: StorageBackend>(storage: &S, n_assets: usize) ->
             .collect(),
         edges,
     };
-    let json = serde_json::to_vec(&topology).unwrap();
     storage
-        .kv_set(
-            &crate::graph_topology_key(crate::storage::DEFAULT_CODE_LOCATION_ID),
-            &json,
-        )
+        .set_graph_topology(crate::storage::DEFAULT_CODE_LOCATION_ID, &topology, &[])
         .await
         .unwrap();
 
@@ -580,9 +576,7 @@ async fn bench_cache_tick<S: StorageBackend>(
 async fn bench_condition_cache_memory() {
     eprintln!("\n== Benchmark B: Condition cache + eval (in-memory storage) ==\n");
 
-    let storage = crate::storage::surrealdb_backend::SurrealStorage::new_memory()
-        .await
-        .unwrap();
+    let storage = crate::storage::any::AnyStorage::new_memory().await.unwrap();
 
     let keys_100 = setup_storage_bench(&storage, 100).await;
     bench_cache_tick("memory_100", &storage, &keys_100, 0).await;
@@ -598,11 +592,10 @@ async fn bench_condition_cache_embedded() {
     // Unique per-run dir: embedded SurrealKV takes an exclusive single-process
     // lock, so a fixed path collides across concurrent `cargo test` runs.
     let tmp = test_temp_dir::test_temp_dir!();
-    let storage = crate::storage::surrealdb_backend::SurrealStorage::new_embedded(
-        tmp.as_path_untracked().to_str().unwrap(),
-    )
-    .await
-    .unwrap();
+    let storage =
+        crate::storage::any::AnyStorage::new_embedded(tmp.as_path_untracked().to_str().unwrap())
+            .await
+            .unwrap();
 
     let keys_100 = setup_storage_bench(&storage, 100).await;
     bench_cache_tick("embedded_100", &storage, &keys_100, 0).await;

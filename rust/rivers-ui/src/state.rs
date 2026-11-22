@@ -10,7 +10,7 @@ use rivers_core::assets::graph::GraphTopology;
 #[cfg(feature = "ssr")]
 use rivers_core::assets::partitions_fingerprint::KeyComparisons;
 #[cfg(feature = "ssr")]
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 #[cfg(feature = "ssr")]
 use std::sync::Arc;
 #[cfg(feature = "ssr")]
@@ -28,7 +28,7 @@ use crate::types::CodeLocationEntry;
 #[cfg(feature = "ssr")]
 #[derive(Clone)]
 pub struct AppState {
-    pub storage: Arc<SurrealStorage>,
+    pub storage: Arc<AnyStorage>,
     /// Synthetic-only override. When `Some`, every per-CL graph server
     /// function returns this fixed topology instead of reading per-CL keys
     /// from storage — used by `rivers dev --synthetic` and benchmark fixtures.

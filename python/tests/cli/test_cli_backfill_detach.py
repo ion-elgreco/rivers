@@ -105,8 +105,8 @@ def test_detach_records_a_backfill_that_the_daemon_runs(resolved_tmp_path, monke
 
 @pytest.mark.parametrize(
     "storage_args",
-    [[], ["--memory"], ["--memory", "--storage-path", "store"]],
-    ids=["scratch", "memory", "memory-over-path"],
+    [[], ["--memory"], ["--storage-url", "mem://"]],
+    ids=["scratch", "memory", "memory-url"],
 )
 def test_detach_needs_a_store_that_a_daemon_reads(resolved_tmp_path, storage_args):
     module = f"defs_detach_refused_{len(storage_args)}"

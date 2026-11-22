@@ -62,7 +62,7 @@ static SLOTS: Mutex<[Option<Slot>; 2]> = Mutex::new([const { None }; 2]);
 fn replace_handle(svc: Service, slot: Slot) {
     if let Some(prev) = SLOTS.lock().unwrap()[svc as usize].replace(slot) {
         // Cooperative shutdown: the task observes the cancel token and
-        // drains itself (subdaemons join, Arc<SurrealStorage> clones drop).
+        // drains itself (subdaemons join, Arc<AnyStorage> clones drop).
         prev.cancel.cancel();
     }
 }

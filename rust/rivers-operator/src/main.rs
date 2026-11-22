@@ -18,7 +18,8 @@ use kube_client::{Api, Client};
 use kube_runtime::Controller;
 use kube_runtime::watcher::Config as WatcherConfig;
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::migration::Capability;
 use rivers_k8s::crd::code_location::CodeLocation;
 use rivers_k8s::crd::run::Run;
 use tracing_subscriber::EnvFilter;
@@ -63,17 +64,16 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::try_default().await?;
     let namespace = rivers_k8s::env::detect_namespace();
-    let surreal_config = rivers_k8s::env::detect_surreal_connect_config();
+    let storage_url = rivers_k8s::env::detect_storage_url()?;
+    let storage_pod_cfg = rivers_k8s::env::StoragePodConfig::from_env()?;
 
     tracing::info!(
         %namespace,
-        endpoint = %surreal_config.endpoint,
-        surreal_ns = %surreal_config.namespace,
-        surreal_db = %surreal_config.database,
-        authenticated = surreal_config.credentials.is_some(),
-        "connecting to SurrealDB"
+        backend = storage_url.backend_name(),
+        location = %storage_url.redacted(),
+        "connecting to storage"
     );
-    let storage = Arc::new(SurrealStorage::connect(surreal_config).await?);
+    let storage = Arc::new(AnyStorage::open(storage_url, Capability::ReadWrite).await?);
     if let Err(error) = storage
         .record_component("operator", true, rivers_core::util::now_ts())
         .await
@@ -87,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
 
-    let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
     let otel_pod_cfg = rivers_k8s::env::OtelPodConfig::from_env();
     let config_file_cfg = rivers_k8s::env::ConfigFilePodConfig::from_env();
 
@@ -101,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         storage: storage.clone(),
         directory: directory_state.clone(),
         workspace: workspace_cfg.clone(),
-        surreal_pod_cfg: surreal_pod_cfg.clone(),
+        storage_pod_cfg: storage_pod_cfg.clone(),
         otel_pod_cfg: otel_pod_cfg.clone(),
         config_file_cfg: config_file_cfg.clone(),
     });
@@ -151,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         leader: leader.clone(),
         code_location_service_account: std::env::var(CODE_LOCATION_SA_ENV)
             .unwrap_or_else(|_| DEFAULT_CODE_LOCATION_SA.to_string()),
-        surreal_pod_cfg: surreal_pod_cfg.clone(),
+        storage_pod_cfg: storage_pod_cfg.clone(),
         otel_pod_cfg: otel_pod_cfg.clone(),
         config_file_cfg: config_file_cfg.clone(),
     });

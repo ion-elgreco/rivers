@@ -55,6 +55,7 @@ For the optional suites:
 
 ```bash
 just test-helm                   # Helm chart unit tests
+just test-postgres               # rivers-core tests and the PostgreSQL Python tests, on a PostgreSQL server in Docker
 just wasm-test                   # rivers-ui browser tests (headless chrome)
 just k8s-up && just k8s-test     # K8s integration tests (creates a k3d cluster)
 just k8s-down                    # tear it down when you're done
@@ -73,7 +74,7 @@ just demo 1k               # same, but with a 1000-node synthetic graph
 
 ```text
 rust/
-  rivers-core/      Pure Rust core: graph, execution plan, storage (SurrealDB + RocksDB)
+  rivers-core/      Pure Rust core: graph, execution plan, storage (SurrealDB, PostgreSQL)
   rivers-api/       gRPC proto + generated code (shared between Python server and UI)
   rivers-ui/        Leptos + Axum web UI (SSR + WASM hydration)
   rivers-operator/  Kubernetes operator
@@ -104,7 +105,7 @@ Run `just pre-commit` before pushing to format the Python tree and run the type 
 
 1. Fork the repo and branch off `main`.
 2. Make your changes; add tests; run `just test` and `just pre-commit`.
-3. If you touched Rust, run `just test-rust`. If you touched the Helm chart, run `just test-helm`.
+3. If you touched Rust, run `just test-rust`. If you touched storage, run `just test-postgres`. If you touched the Helm chart, run `just test-helm`.
 4. If you touched a public API, update the `.pyi` stubs and the `docs/` pages.
 5. Sign off every commit (see [Contributor License Agreement](#contributor-license-agreement) below).
 6. Open a PR. The PR template asks for a description and any related issues — please fill it in.

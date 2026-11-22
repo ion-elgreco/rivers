@@ -1,6 +1,7 @@
 """CLI tests for configuration strategies."""
 
 import importlib
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,6 +9,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from rivers._core.storage import Storage
 from rivers.cli import app
 from rivers.testing import memory_storage
 
@@ -139,6 +141,7 @@ class TestDefaultConfigValues:
         assert cfg.storage == StorageConfig()
         assert cfg.storage.path == ".rivers/storage/"
         assert cfg.storage.endpoint is None
+        assert cfg.storage.url is None
         assert cfg.server == ServerConfig()
         assert cfg.server.host == "127.0.0.1"
         assert cfg.server.port == 3000
@@ -214,6 +217,13 @@ class TestEnvSettings:
         cfg = RiversConfig()
         assert cfg.storage.endpoint == "http://localhost:8000"
 
+    def test_nested_env_var_sets_storage_url(self, tmp_path, monkeypatch):
+        """``RIVERS_STORAGE_URL`` is mapped to ``cfg.storage.url``."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("RIVERS_STORAGE_URL", "postgres://db/rivers")
+        cfg = RiversConfig()
+        assert cfg.storage.url == "postgres://db/rivers"
+
     def test_top_level_collision_env_var_is_ignored(self, tmp_path, monkeypatch):
         """Bare top-level names like ``RIVERS_MODULE`` are filtered out."""
         monkeypatch.chdir(tmp_path)
@@ -278,14 +288,19 @@ class TestRiversToml:
         assert cfg.server.grpc_port == 8081
 
     def test_reads_storage_config(self, resolved_tmp_path):
-        """Storage path and remote endpoint are loaded from ``[storage]``."""
+        """Storage path, remote endpoint and URL are loaded from ``[storage]``."""
         _make_rivers_toml(
             resolved_tmp_path,
-            storage={"path": "/data/storage", "endpoint": "http://db:8000"},
+            storage={
+                "path": "/data/storage",
+                "endpoint": "http://db:8000",
+                "url": "postgres://db/rivers",
+            },
         )
         cfg = RiversConfig()
         assert cfg.storage.path == "/data/storage"
         assert cfg.storage.endpoint == "http://db:8000"
+        assert cfg.storage.url == "postgres://db/rivers"
 
     def test_reads_daemon_no_daemon(self, resolved_tmp_path):
         """The ``no_daemon`` boolean flag is loaded from ``[daemon]``."""
@@ -507,8 +522,6 @@ class TestFromCli:
             host="0.0.0.0",
             port=4000,
             grpc_port=4001,
-            storage_path="/tmp/store",
-            surreal_endpoint="ws://db:8000",
             no_daemon=True,
             synthetic="1k",
         )
@@ -517,8 +530,6 @@ class TestFromCli:
         assert cfg.server.host == "0.0.0.0"
         assert cfg.server.port == 4000
         assert cfg.server.grpc_port == 4001
-        assert cfg.storage.path == "/tmp/store"
-        assert cfg.storage.endpoint == "ws://db:8000"
         assert cfg.daemon.no_daemon is True
         assert cfg.synthetic.size == "1k"
 
@@ -603,7 +614,7 @@ class TestDefaultMap:
     def test_holds_the_configured_values_per_command(self, write_config):
         write_config(
             module={"path": "m", "repo_var": "r"},
-            storage={"path": "s", "endpoint": "ws://e"},
+            storage={"path": "s", "endpoint": "ws://e", "url": "postgres://u"},
         )
         default_map = self._default_map()
 
@@ -612,12 +623,14 @@ class TestDefaultMap:
             "repo_var": "r",
             "storage_path": "s",
             "surreal_endpoint": "ws://e",
+            "storage_url": "postgres://u",
         }
         assert default_map["pools"]["list"] == {"storage_path": "s"}
         assert default_map["queue"]["list"] == {"storage_path": "s"}
         assert default_map["db"]["migrate"] == {
             "storage_path": "s",
             "surreal_endpoint": "ws://e",
+            "storage_url": "postgres://u",
         }
 
     def test_model_defaults_stay_out(self, write_config):
@@ -655,8 +668,24 @@ def opened(monkeypatch):
 
         return staticmethod(open_store)
 
-    kinds = ("embedded", "connect", "_scratch", "migrate_embedded", "migrate_remote")
-    stub = type("_Storage", (), {kind: record(kind) for kind in kinds})
+    kinds = (
+        "memory",
+        "embedded",
+        "connect",
+        "open",
+        "_scratch",
+        "migrate_embedded",
+        "migrate_remote",
+        "migrate",
+    )
+    stub = type(
+        "_Storage",
+        (),
+        {
+            **{kind: record(kind) for kind in kinds},
+            "redact_url": staticmethod(Storage.redact_url),
+        },
+    )
     for module in ("_common", "pools", "run_queue", "db"):
         monkeypatch.setattr(f"rivers.cli.{module}.Storage", stub)
     return calls
@@ -722,6 +751,163 @@ class TestRootConfig:
         assert result.exit_code == 0, result.output
         assert opened == [("migrate_remote", env or "ws://from_config")]
 
+    @pytest.mark.parametrize(
+        ("command", "kind"),
+        [(["materialize"], "open"), (["db", "migrate"], "migrate")],
+    )
+    def test_storage_url_beats_endpoint_and_path(
+        self, write_config, repo_module, opened, command, kind
+    ):
+        write_config(
+            module={"path": repo_module, "repo_var": "pipeline"},
+            storage={
+                "path": "store",
+                "endpoint": "ws://from_config",
+                "url": "postgres://rivers:secret@db/rivers",
+            },
+        )
+
+        result = runner.invoke(app, command)
+
+        assert result.exit_code == 0, result.output
+        assert opened == [(kind, "postgres://rivers:secret@db/rivers")]
+        if command == ["db", "migrate"]:
+            # The only command here that prints its store.
+            assert "(postgres://rivers:***@db/rivers)" in result.output
+            assert "secret" not in result.output
+
+    @pytest.mark.parametrize("via", ["flag", "env"])
+    @pytest.mark.parametrize(
+        ("command", "kind"),
+        [(["materialize"], "connect"), (["db", "migrate"], "migrate_remote")],
+    )
+    def test_an_endpoint_of_a_stronger_source_beats_the_url_of_the_config(
+        self, write_config, repo_module, monkeypatch, opened, command, kind, via
+    ):
+        write_config(
+            module={"path": repo_module, "repo_var": "pipeline"},
+            storage={"url": "postgres://rivers:secret@db/rivers"},
+        )
+        args = list(command)
+        if via == "flag":
+            args += ["--surreal-endpoint", "ws://chosen:8000"]
+        else:
+            monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", "ws://chosen:8000")
+
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.output
+        assert opened == [(kind, "ws://chosen:8000")]
+
+    def test_a_config_value_from_the_environment_beats_the_config_file(
+        self, write_config, repo_module, monkeypatch, opened
+    ):
+        """``RIVERS_STORAGE_PATH`` reaches the command as a configured value,
+        like a key of the file: it is still the stronger source."""
+        write_config(
+            module={"path": repo_module, "repo_var": "pipeline"},
+            storage={"url": "postgres://rivers:secret@db/rivers"},
+        )
+        monkeypatch.setenv("RIVERS_STORAGE_PATH", "from_env")
+
+        result = runner.invoke(app, ["materialize"])
+
+        assert result.exit_code == 0, result.output
+        assert opened == [("embedded", "from_env")]
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            (["--memory"], ("memory", None)),
+            (["--storage-url", "mem://"], ("memory", None)),
+            (["--storage-path", "from_flag"], ("embedded", "from_flag")),
+        ],
+        ids=["memory", "memory-url", "path"],
+    )
+    def test_a_flag_beats_the_url_of_the_environment(
+        self, repo_module, monkeypatch, opened, args, expected
+    ):
+        monkeypatch.setenv("RIVERS_STORAGE_URL", "postgres://rivers:secret@db/rivers")
+
+        result = runner.invoke(
+            app, ["materialize", repo_module, "--repo-var", "pipeline", *args]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert opened == [expected]
+
+    @pytest.mark.parametrize(
+        ("args", "flags"),
+        [
+            (
+                [
+                    "--storage-url",
+                    "postgres://db/rivers",
+                    "--surreal-endpoint",
+                    "ws://e",
+                ],
+                "--storage-url and --surreal-endpoint",
+            ),
+            (["--memory", "--storage-path", "store"], "--storage-path and --memory"),
+        ],
+        ids=["url-and-endpoint", "path-and-memory"],
+    )
+    def test_two_flags_that_name_different_stores_are_refused(
+        self, repo_module, opened, args, flags
+    ):
+        result = runner.invoke(
+            app, ["materialize", repo_module, "--repo-var", "pipeline", *args]
+        )
+
+        assert result.exit_code == 2, result.output
+        assert f"{flags} name different stores; pass one of them" in _error_text(
+            result.output
+        )
+        assert opened == []
+
+    def test_two_flags_that_name_the_same_store_are_accepted(self, repo_module, opened):
+        result = runner.invoke(
+            app,
+            [
+                "materialize",
+                repo_module,
+                "--repo-var",
+                "pipeline",
+                "--storage-url",
+                "ws://e:8000",
+                "--surreal-endpoint",
+                "ws://e:8000",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert opened == [("open", "ws://e:8000")]
+
+    @pytest.mark.parametrize("via", ["flag", "env"])
+    def test_storage_url_option_beats_config(
+        self, write_config, monkeypatch, opened, via
+    ):
+        write_config(storage={"endpoint": "ws://from_config", "url": "postgres://cfg"})
+        args = ["db", "migrate"]
+        if via == "flag":
+            args += ["--storage-url", "postgres://from_option"]
+        else:
+            monkeypatch.setenv("RIVERS_STORAGE_URL", "postgres://from_option")
+
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.output
+        assert opened == [("migrate", "postgres://from_option")]
+
+    def test_help_does_not_show_a_configured_storage_url(self, write_config):
+        write_config(storage={"url": "postgres://rivers:secret@db/rivers"})
+
+        result = runner.invoke(app, ["materialize", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "--storage-url" in result.output
+        assert "secret" not in result.output
+
     @pytest.mark.parametrize("via", ["flag", "env"])
     def test_explicit_config_path(self, resolved_tmp_path, monkeypatch, opened, via):
         explicit = _make_rivers_toml(
@@ -742,3 +928,60 @@ class TestRootConfig:
     def test_missing_config_file_fails(self, resolved_tmp_path):
         result = runner.invoke(app, ["--config", "missing.toml", "pools", "list"])
         assert isinstance(result.exception, FileNotFoundError)
+
+
+PG_URL = "postgres://rivers:secret@db/rivers"
+
+
+def _error_text(output: str) -> str:
+    """The text of a usage error, without the box and the line breaks."""
+    return " ".join(re.sub(r"[│╭╮╰╯─]", " ", output).split())
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["materialize", "m"],
+        ["run-action", "m", "purge"],
+        ["backfill", "m", "-p", "p1"],
+        ["backfill-status", "b", "m"],
+        ["backfill-cancel", "b", "m"],
+        ["dev", "m"],
+        ["serve", "m"],
+        ["execute", "m", "--run-id", "r"],
+        ["execute-step", "m", "--step-key", "s", "--run-id", "r"],
+        ["db", "status"],
+        ["db", "migrate"],
+    ],
+    ids=lambda args: "-".join(args[:2]),
+)
+def test_every_command_refuses_a_url_that_is_not_a_surrealdb_endpoint(opened, args):
+    result = runner.invoke(app, [*args, "--surreal-endpoint", PG_URL])
+
+    assert result.exit_code == 2, result.output
+    assert (
+        "--surreal-endpoint takes a SurrealDB server (ws://, wss://, http:// or "
+        "https://), not postgres://rivers:***@db/rivers; pass any other storage URL "
+        "with --storage-url"
+    ) in _error_text(result.output)
+    assert "secret" not in result.output
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("via", "name"),
+    [("env", "RIVERS_SURREAL_ENDPOINT"), ("config", "[storage] endpoint")],
+)
+def test_the_refusal_names_the_setting_of_the_endpoint(
+    write_config, monkeypatch, opened, via, name
+):
+    if via == "env":
+        monkeypatch.setenv("RIVERS_SURREAL_ENDPOINT", PG_URL)
+    else:
+        write_config(storage={"endpoint": PG_URL})
+
+    result = runner.invoke(app, ["db", "status"])
+
+    assert result.exit_code == 2, result.output
+    assert f"{name} takes a SurrealDB server" in _error_text(result.output)
+    assert opened == []

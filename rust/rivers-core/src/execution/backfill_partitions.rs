@@ -660,7 +660,7 @@ fn partitions_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillStatus, BackfillStrategy, EventRecord, EventType,
         LaunchedBy, RunRecord, RunStatus, UnstartedBackfillRun, default_code_location_id,
@@ -692,7 +692,7 @@ mod tests {
 
     /// Store backfill `bf` for `requested`. It has not started.
     async fn requested_backfill(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         strategy: &BackfillStrategy,
         requested: &[PartitionKey],
     ) {
@@ -724,7 +724,7 @@ mod tests {
 
     /// Store backfill `bf` for `requested` and start it with its plan.
     async fn started_backfill(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         strategy: BackfillStrategy,
         requested: &[PartitionKey],
     ) -> Vec<PartitionKey> {
@@ -737,7 +737,7 @@ mod tests {
 
     /// Link run `run_number` of the plan and end it with `status`.
     async fn ended_run(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         plan: &[PartitionKey],
         run_number: usize,
         status: RunStatus,
@@ -794,13 +794,13 @@ mod tests {
             .unwrap();
     }
 
-    async fn read_states(storage: &SurrealStorage) -> BackfillStates {
+    async fn read_states(storage: &AnyStorage) -> BackfillStates {
         let backfill = storage.get_backfill("bf").await.unwrap().unwrap();
         BackfillStates::read(storage, &backfill).await.unwrap()
     }
 
     async fn page(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         offset: u64,
         limit: u64,
     ) -> Vec<(String, BackfillPartitionState)> {
@@ -836,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_partition_takes_the_outcome_of_its_run() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [multi(&[
             ("zone", &["z1", "z2", "z3"]),
             ("hour", &["h1", "h2"]),
@@ -894,7 +894,7 @@ mod tests {
     /// of hours.
     #[tokio::test]
     async fn a_backfill_that_has_not_started_reads_no_partition_one_by_one() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let hours: Vec<String> = (0..4_368).map(|hour| format!("h{hour:04}")).collect();
         let zones: Vec<String> = (0..265).map(|zone| format!("z{zone:03}")).collect();
         let hours: Vec<&str> = hours.iter().map(String::as_str).collect();
@@ -925,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_per_partition_reads_the_runs_of_the_page() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [single(&["a", "b"]), single(&["c", "d"])];
         let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
         assert_eq!(plan.len(), 4);
@@ -953,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_run_gives_its_outcome_to_each_partition() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [single(&["a", "b", "c"])];
         let plan = started_backfill(&storage, BackfillStrategy::SingleRun, &requested).await;
         assert_eq!(plan.len(), 1);
@@ -973,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_per_zone_counts_the_rows_of_an_outline() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [multi(&[
             ("hour", &["h1", "h2", "h3", "h4"]),
             ("zone", &["z1", "z2", "z3"]),
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_per_partition_counts_each_run_that_ended() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         // Keys out of the order of their text, in two requested keys.
         let requested = [single(&["d", "b"]), single(&["a", "c"])];
         let plan = started_backfill(&storage, BackfillStrategy::MultiRun, &requested).await;
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_keys_of_a_dimension_are_its_distinct_values_in_the_requested_order() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [
             single(&["d", "b", "d", "a"]),
             single(&["b", "e"]),
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_run_counts_every_partition_with_the_ones_that_failed_alone() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [single(&["a", "b", "c"])];
         let plan = started_backfill(&storage, BackfillStrategy::SingleRun, &requested).await;
 
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_partition_names_its_run_and_a_key_outside_the_backfill_has_none() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let requested = [multi(&[("hour", &["h1", "h2"]), ("zone", &["z1", "z2"])])];
         let strategy = BackfillStrategy::PerDimension {
             multi_run: vec!["zone".to_string()],

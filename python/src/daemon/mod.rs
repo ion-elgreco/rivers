@@ -14,7 +14,7 @@ use jiff::Timestamp;
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
 use rivers_core::run_backend::{RunBackend, RunHealthStatus};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::PyEvalMode;
@@ -110,7 +110,7 @@ const STOPPED: u8 = 3;
 
 struct AutomationDaemon {
     repo: Py<PyCodeRepository>,
-    storage: DetachOnClose<Arc<SurrealStorage>>,
+    storage: DetachOnClose<Arc<AnyStorage>>,
     cancel: CancellationToken,
     /// Cancelled when the spawned `daemon_main_loop` task fully exits
     /// (after every subdaemon has joined and in-flight runs are drained).
@@ -131,11 +131,7 @@ struct AutomationDaemon {
 }
 
 impl AutomationDaemon {
-    fn new(
-        repo: Py<PyCodeRepository>,
-        storage: Arc<SurrealStorage>,
-        is_memory_storage: bool,
-    ) -> Self {
+    fn new(repo: Py<PyCodeRepository>, storage: Arc<AnyStorage>, is_memory_storage: bool) -> Self {
         Self {
             repo,
             storage: DetachOnClose::new(storage),
@@ -408,7 +404,7 @@ struct DaemonLoopConfig {
     >,
     remote_deps: Vec<rivers_core::condition::RemoteDep>,
     repo: Arc<Py<PyCodeRepository>>,
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     cancel: CancellationToken,
     scheduling_stopped: CancellationToken,
     loky_executor: Option<Arc<Py<PyAny>>>,

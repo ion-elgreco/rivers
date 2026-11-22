@@ -3,6 +3,7 @@
 
 use jiff::civil::date;
 
+use super::backfills::link_rows;
 use super::*;
 use crate::execution::backfill::plan_runs;
 use crate::execution::backfill_spans::with_spans;
@@ -103,23 +104,12 @@ async fn test_queued_backfill_runs_keep_their_span_keys() {
         assert_eq!(events[0].partition_key.as_ref(), Some(key));
     }
 
-    #[derive(SurrealValue)]
-    struct Link {
-        run_id: String,
-        member_count: i64,
-    }
-    let mut links: Vec<Link> = storage
-        .db
-        .query("SELECT run_id, member_count FROM backfill_runs WHERE backfill_id = 'bf'")
+    let mut links: Vec<(String, i64)> = link_rows(&storage, "bf")
         .await
-        .unwrap()
-        .take(0)
-        .unwrap();
-    links.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-    let links: Vec<(String, i64)> = links
         .into_iter()
-        .map(|link| (link.run_id, link.member_count))
+        .map(|(run_id, _, member_count)| (run_id, member_count))
         .collect();
+    links.sort();
     assert_eq!(
         links,
         vec![

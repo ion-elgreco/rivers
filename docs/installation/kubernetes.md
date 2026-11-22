@@ -38,7 +38,9 @@ kubectl -n rivers rollout status deploy/rivers-ui
 !!! note
     The `rivers` chart bundles a SurrealDB subchart by default. To point
     rivers at an external SurrealDB, set `surrealdb.enabled=false` and
-    `surrealdb.endpoint=wss://surreal.example.com:8000`.
+    `surrealdb.endpoint=wss://surreal.example.com:8000`. To use a PostgreSQL
+    server instead, see
+    [PostgreSQL as the storage backend](#postgresql-as-the-storage-backend).
 
 ## Reach the UI
 
@@ -376,6 +378,108 @@ removes the footgun by always requiring auth for the bundled path.
 of them when using embedded storage. Set them in your shell when pointing
 `rivers dev` at an authenticated remote SurrealDB.
 
+## PostgreSQL as the storage backend
+
+rivers can keep its data in a PostgreSQL server that you run, in place of
+SurrealDB. The chart does not deploy PostgreSQL. SurrealDB stays the default,
+and it is the only backend that runs embedded, so `rivers dev` on a laptop
+uses SurrealDB unless you give it a storage URL.
+
+Choose PostgreSQL when you already operate a PostgreSQL server (for example
+a managed database service) and want the rivers data in it, with the backups,
+access control and monitoring you have for it. Choose it also when many runs
+write at the same time: PostgreSQL takes more writers at the same time than
+SurrealDB.
+
+In one test, a backfill of 1,157,520 partitions in 265 runs on a Kubernetes
+cluster on one 16-core machine took:
+
+| Runs at the same time | SurrealDB 4  | PostgreSQL 18 |
+|-----------------------|--------------|---------------|
+| 8                     | 132 to 142 s | 77 s          |
+| 16                    | 147 s        | 52 s          |
+| 32                    | not measured | 47 s          |
+
+Each database ran in the cluster with a CPU limit of 16. PostgreSQL ran with
+`fsync` and `synchronous_commit` on, and used 1.2 CPUs on average with 8 runs
+and 2.5 CPUs with 32 runs.
+
+**The URL.** rivers connects with one storage URL:
+
+```text
+postgres://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
+```
+
+Options such as `sslmode` go in the query string. rivers creates its tables
+when it first opens the database, in the current schema of the connection
+(`public`, unless the `search_path` of `USER` names another), so `USER` needs
+the right to create tables there. rivers logs the URL only with its password
+replaced by `***`.
+
+**The server.** rivers needs PostgreSQL 15 or newer. Each rivers process
+(the operator, a code-location pod, a run pod, a step pod of the Kubernetes
+executor) opens at most 8 connections and closes one that has no work for
+60 seconds. The UI server opens at most 8, and 16 more that listen for
+changes. Set `max_connections` of the server for the number of runs that you
+run at the same time. Do not put a connection pooler
+in transaction mode between rivers and the server: the UI server listens for
+notifications, and a migration holds a lock for its session.
+
+**The Secret.** The URL holds a password, so the chart takes it only from a
+Secret that you create. Set `surrealdb.enabled=false` too: the install fails
+while the bundled SurrealDB is enabled, or when `surrealdb.endpoint` is also
+set.
+
+```sh
+kubectl -n rivers create secret generic rivers-postgresql \
+  --from-literal=url='postgres://rivers:...@db.example.com:5432/rivers?sslmode=require'
+```
+
+```yaml
+surrealdb:
+  enabled: false
+postgresql:
+  existingSecret: rivers-postgresql
+  secretKey: url  # the default
+```
+
+The operator, the UI and the migration Job read the URL from that Secret.
+The operator gives each code-location and run pod the URL as a
+`secretKeyRef` to the same Secret, never as a plain value, and a run pod does
+the same for its step pods. So the URL is in no pod spec, pod argument or
+`Run` resource. The chart then renders no
+SurrealDB Secret, user Job or `wait-for-surreal` init container. The operator
+does not start when the URL in the Secret is not a PostgreSQL URL.
+
+**Migration.** A PostgreSQL database has the same schema versions and
+floors as SurrealDB (see
+[Schema versioning](../api-reference/storage.md#schema-versioning-migration)),
+and the same [upgrade](#upgrade) steps apply. The migration Job runs
+`rivers db migrate` against the URL. To run the commands by hand, use the
+new rivers version on a machine that can reach the server, and pass the URL
+in the env var rather than as an argument, which other users of the machine
+can see:
+
+```sh
+export RIVERS_STORAGE_URL='postgres://rivers:...@db.example.com:5432/rivers?sslmode=require'
+rivers db status
+rivers db migrate
+```
+
+rivers does not copy data between SurrealDB and PostgreSQL. A new
+PostgreSQL install starts with an empty database.
+
+**Differences from SurrealDB.** rivers works the same on the two backends.
+Two limits come from PostgreSQL:
+
+- PostgreSQL text cannot hold a NUL byte (`\0`). rivers stores a NUL byte in
+  a log line or in the metadata of an event as the replacement character
+  `U+FFFD`. A NUL byte in other text (a run tag, a run config, a dynamic
+  partition key, a sensor cursor) fails the write.
+- The code location id, the asset key and the partition key of one partition
+  must fit together in one PostgreSQL index row (about 2,700 bytes). The keys
+  of time, static and dynamic partitions are far below this limit.
+
 ## UI authentication
 
 The UI ships unauthenticated (`ui.auth.mode: none`). Before exposing it via
@@ -457,7 +561,7 @@ riversToml:
 ```
 
 - The file replaces a `rivers.toml` in the image or in the git source. `[tool.rivers]` in the image's `pyproject.toml` still applies below it.
-- The operator passes the module and the SurrealDB endpoint to each pod, so `[module] path` and `[storage]` have no effect there. `[module] repo_var` does.
+- The operator passes the module and the storage location to each pod, in arguments and env vars, which win over the file (see [Which store a command opens](../api-reference/cli.md#which-store-a-command-opens)). So `[module] path` and `[storage]` have no effect there. `[module] repo_var` does.
 - A variable in `CodeLocation.spec.env` overrides the file. To make one code location use its own file, set `RIVERS_CONFIG` there to a path in the image.
 - A changed value restarts the code-location pods on `helm upgrade`. A run pod that is in progress does not read the file again; step pods that start later get the changed file.
 
@@ -469,7 +573,7 @@ With an empty `riversToml` (the default), the chart creates no ConfigMap and the
 | ------- | ----------------- | --------------------------------------------- |
 | `3000`  | `rivers-ui`       | Web UI (HTTP + Server-Sent Events)            |
 | `3001`  | CodeLocation Pod  | gRPC — UI write paths (materialize, trigger)  |
-| `8000`  | SurrealDB         | Storage backend (WebSocket protocol)          |
+| `8000`  | SurrealDB         | Storage backend (WebSocket protocol); not used with PostgreSQL |
 | `9443`  | `rivers-operator` | Admission webhook (HTTPS)                     |
 | `50052` | `rivers-operator` | `CodeLocationRegistry` gRPC — UI discovery    |
 
@@ -599,6 +703,16 @@ A `CodeLocation` on an older rivers that still runs after the migration does
 not use the hold row. Stop it, or let its runs end, before you migrate: a
 deletion or a failure that it writes does not stop the materializations of
 the new rivers, and a deleted partition can then keep its row.
+
+### `Run` resources without `spec.surrealEndpoint`
+
+A `Run` no longer has the `spec.surrealEndpoint` field. The operator gives
+each run pod its own storage settings, as it does for the code-location pods.
+A `Run` that still holds the field is read without it.
+
+Install the new CRDs only after you upgrade the `rivers` chart. An older
+operator reads the endpoint `ws://surrealdb.rivers.svc:8000` for a `Run` that
+does not hold the field.
 
 ## Uninstall
 

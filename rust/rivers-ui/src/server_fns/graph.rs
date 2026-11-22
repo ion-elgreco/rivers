@@ -302,7 +302,7 @@ mod tests {
     use rivers_core::assets::graph::{GraphTopology, NodeKind, TopologyNode};
     use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
     use rivers_core::assets::remote::{LocationRef, RemoteRef};
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use rivers_core::storage::{CodeLocationContext, StorageBackend};
 
     use crate::code_location_registry::Registry;
@@ -344,7 +344,7 @@ mod tests {
     /// `nodes` as the topology of `identity`, with a key row for each list
     /// of `keys`.
     async fn write(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         identity: &str,
         nodes: Vec<TopologyNode>,
         keys: &[&[&str]],
@@ -386,7 +386,7 @@ mod tests {
         ]
     }
 
-    fn state(storage: &Arc<SurrealStorage>) -> AppState {
+    fn state(storage: &Arc<AnyStorage>) -> AppState {
         AppState {
             storage: Arc::clone(storage),
             graph: None,
@@ -428,7 +428,7 @@ mod tests {
     /// static keys.
     #[tokio::test]
     async fn remote_nodes_carry_the_drift_against_the_owners_definitions() {
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let storage = Arc::new(AnyStorage::new_memory().await.unwrap());
         write(
             &storage,
             "wh-id",
@@ -469,7 +469,7 @@ mod tests {
 
     /// Registers `key` in `identity`; materializes it when `dv` is set.
     async fn asset(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         identity: &str,
         key: &str,
         code_version: Option<&str>,
@@ -528,7 +528,7 @@ mod tests {
     async fn remote_nodes_get_the_owners_status() {
         use crate::types::StaleStatus;
 
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let storage = Arc::new(AnyStorage::new_memory().await.unwrap());
         let edge = |from: &str, to: &str| (from.to_string(), to.to_string());
         let mut nodes = warehouse();
         nodes.push(TopologyNode::new("seed", NodeKind::Asset));
@@ -591,7 +591,7 @@ mod tests {
     /// rows missing.
     #[tokio::test]
     async fn the_answer_of_a_key_comparison_is_kept() {
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let storage = Arc::new(AnyStorage::new_memory().await.unwrap());
         write(
             &storage,
             "wh-id",

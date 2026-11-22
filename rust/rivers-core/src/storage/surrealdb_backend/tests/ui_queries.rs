@@ -444,12 +444,8 @@ async fn test_input_versions_from_event_not_storage() {
         ],
         edges: vec![("downstream".to_string(), "upstream".to_string())],
     };
-    let topo_json = serde_json::to_vec(&topology).unwrap();
     storage
-        .kv_set(
-            &crate::graph_topology_key(crate::storage::DEFAULT_CODE_LOCATION_ID),
-            &topo_json,
-        )
+        .set_graph_topology(crate::storage::DEFAULT_CODE_LOCATION_ID, &topology, &[])
         .await
         .unwrap();
 
@@ -552,7 +548,7 @@ mod remote_staleness {
     }
 
     async fn materialize(
-        storage: &SurrealStorage,
+        storage: &impl StorageBackend,
         identity: &str,
         asset: &str,
         dv: &str,
@@ -575,14 +571,14 @@ mod remote_staleness {
             .unwrap();
     }
 
-    async fn register_as(storage: &SurrealStorage, identity: &str, keys: &[&str]) {
+    async fn register_as(storage: &impl PerCodeLocationStorage, identity: &str, keys: &[&str]) {
         let records: Vec<AssetRecord> = keys.iter().map(|k| make_asset_record(k)).collect();
         storage.register_assets(identity, records).await.unwrap();
     }
 
     /// `analytics` reads `raw_orders` of `warehouse` as `orders`, and
     /// `ghost` of a location that never registered.
-    async fn setup() -> SurrealStorage {
+    async fn setup() -> AnyStorage {
         let storage = make_storage().await;
         storage
             .upsert_code_location_registration(
@@ -617,7 +613,7 @@ mod remote_staleness {
     }
 
     async fn staleness(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
     ) -> HashMap<String, (StaleStatus, Vec<crate::storage::StaleCause>)> {
         let ctx = CodeLocationContext::new("analytics");
         storage

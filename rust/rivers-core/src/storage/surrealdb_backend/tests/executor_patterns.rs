@@ -282,18 +282,16 @@ async fn test_coordinator_gc_frees_crashed_slots() {
     // Claim with very short lease (1 nanosecond — already expired)
     let now_ns = now_nanos();
     let expired_lease = now_ns - 1_000_000_000; // 1 second in the past
-    storage
-        .db
-        .query(
-            "CREATE concurrency_slots SET \
-                 pool_key = 'db', run_id = 'crashed_run', step_key = 'step_x', \
-                 slots_consumed = 1, claimed_at = $now, \
-                 lease_expires_at = $exp, last_heartbeat = $now",
-        )
-        .bind(("now", now_ns))
-        .bind(("exp", expired_lease))
-        .await
-        .unwrap();
+    insert_slot(
+        &storage,
+        "db",
+        "crashed_run",
+        "step_x",
+        1,
+        now_ns,
+        expired_lease,
+    )
+    .await;
 
     // Pool shows 0 claimed (expired excluded from capacity check)
     let info = storage
@@ -310,6 +308,20 @@ async fn test_coordinator_gc_frees_crashed_slots() {
 // -----------------------------------------------------------------------
 // Coordinator tick overhead stress test
 // -----------------------------------------------------------------------
+
+/// Remove every run, slot row and waiting step.
+async fn clear_runs_and_slots(storage: &AnyStorage) {
+    match storage {
+        AnyStorage::Surreal(surreal) => {
+            surreal
+                .db
+                .query("DELETE FROM runs; DELETE FROM concurrency_slots; DELETE FROM pending_steps")
+                .await
+                .unwrap();
+        }
+        AnyStorage::Postgres(postgres) => postgres.clear_runs_and_slots().await.unwrap(),
+    }
+}
 
 /// Simulates a full coordinator tick cycle at various queue/run sizes and measures wall-clock time.
 #[tokio::test]
@@ -341,11 +353,7 @@ async fn coordinator_tick_stress() {
 
     for &(n_in_progress, n_queued, n_slots) in scenarios {
         // Clean slate per scenario
-        storage
-            .db
-            .query("DELETE FROM runs; DELETE FROM concurrency_slots; DELETE FROM pending_steps")
-            .await
-            .unwrap();
+        clear_runs_and_slots(&storage).await;
 
         let now = now_nanos();
         let lease_exp = now + 300_000_000_000i64; // 5 min from now
@@ -404,21 +412,9 @@ async fn coordinator_tick_stress() {
         // Create active pool slots
         for i in 0..n_slots {
             let pool = ["db", "api", "gpu", "cpu", "net"][i % 5];
-            storage
-                .db
-                .query(
-                    "CREATE concurrency_slots SET \
-                     pool_key = $pool, run_id = $rid, step_key = $sk, \
-                     slots_consumed = 1, claimed_at = $now, \
-                     lease_expires_at = $exp, last_heartbeat = $now",
-                )
-                .bind(("pool", pool))
-                .bind(("rid", format!("ip-{}", i % n_in_progress.max(1))))
-                .bind(("sk", format!("step_{i}")))
-                .bind(("now", now))
-                .bind(("exp", lease_exp))
-                .await
-                .unwrap();
+            let run_id = format!("ip-{}", i % n_in_progress.max(1));
+            let step_key = format!("step_{i}");
+            insert_slot(&storage, pool, &run_id, &step_key, 1, now, lease_exp).await;
         }
 
         // Warm up

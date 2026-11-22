@@ -110,6 +110,30 @@ test-server:
     cargo test --profile {{ profile }} -p rivers-core --lib -- message_limit live_queries
     uv run --no-sync pytest python/tests/backfill/test_backfill_message_limit.py
 
+# Run the tests on PostgreSQL: the rivers-core tests take their stores from a
+# PostgreSQL server, then the Python tests that open a PostgreSQL store.
+# Starts a server in Docker on a free port and removes it at the end. The
+# server does not sync to disk: it holds test data only.
+test-postgres:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name="rivers-test-postgres-$$"
+    docker run -d --name "$name" -e POSTGRES_PASSWORD=rivers -e POSTGRES_DB=rivers \
+        -p 127.0.0.1::5432 postgres:18-alpine \
+        -c max_connections=1000 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
+    trap 'docker rm -f "$name" >/dev/null' EXIT
+    port="$(docker port "$name" 5432/tcp | cut -d: -f2)"
+    # Over TCP: the server that sets up the database listens on its socket only.
+    for _ in $(seq 120); do
+        docker exec "$name" pg_isready -q -h 127.0.0.1 -U postgres -d rivers && break
+        sleep 0.5
+    done
+    docker exec "$name" pg_isready -q -h 127.0.0.1 -U postgres -d rivers \
+        || { echo "PostgreSQL did not start" >&2; exit 1; }
+    export RIVERS_TEST_POSTGRES_URL="postgres://postgres:rivers@127.0.0.1:${port}/rivers"
+    cargo test --profile {{ profile }} -p rivers-core --lib
+    uv run --no-sync pytest python/tests/storage/test_postgres.py python/tests/cli/test_cli_postgres.py
+
 # Run all Rust workspace tests.
 # - `wasm-dev` is a prerequisite so rivers-ui's `include_bytes!("../pkg/...")`
 #   can resolve when the crate is built with `ssr`.

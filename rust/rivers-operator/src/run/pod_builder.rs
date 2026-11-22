@@ -33,7 +33,7 @@ fn run_workspace_pieces(
 /// spec: its `env` is forwarded onto the pod so `secretKeyRef` /
 /// `configMapKeyRef` / `fieldRef` semantics are preserved, and in git mode
 /// it sizes the workspace.
-/// `surreal_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
+/// `storage_pod_cfg` carries the SurrealDB scope + auth-secret coordinates
 /// stamped on every rivers pod — sourced from the operator's own env, so the
 /// auth-secret coordinates the run pod re-emits onto step pods stay
 /// consistent with the operator's view. The pod is owned by the Run CR so
@@ -44,7 +44,7 @@ pub fn build_executor_pod(
     run_id: &str,
     resume: bool,
     cl_spec: &CodeLocationSpec,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     config_file_cfg: &rivers_k8s::env::ConfigFilePodConfig,
     workspace_cfg: &WorkspaceConfig,
@@ -89,7 +89,7 @@ pub fn build_executor_pod(
                 command: Some(graft.command),
                 working_dir: graft.working_dir,
                 volume_mounts: config_file_cfg.with_mount(graft.volume_mounts),
-                args: Some(build_execute_args(spec, run_id, resume)),
+                args: Some(build_execute_args(spec, run_id, resume, storage_pod_cfg)),
                 resources: Some(ResourceRequirements {
                     requests: Some(BTreeMap::from([
                         ("cpu".to_string(), Quantity(spec.run_resources.cpu.clone())),
@@ -157,11 +157,7 @@ pub fn build_executor_pod(
                             ..Default::default()
                         },
                     ];
-                    // Endpoint comes from RunSpec; scope + auth coords from operator state.
-                    env.extend(rivers_k8s::env::build_surreal_pod_env(
-                        &spec.surreal_endpoint,
-                        surreal_pod_cfg,
-                    ));
+                    env.extend(rivers_k8s::env::build_storage_pod_env(storage_pod_cfg));
                     env.extend(graft.env);
                     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
                     env.extend(rivers_k8s::env::build_config_file_env(config_file_cfg));
@@ -179,15 +175,19 @@ fn build_execute_args(
     spec: &rivers_k8s::crd::run::RunSpec,
     run_id: &str,
     resume: bool,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
 ) -> Vec<String> {
     let mut args = vec![
         "execute".to_string(),
         spec.module.clone(),
         "--run-id".to_string(),
         run_id.to_string(),
-        "--surreal-endpoint".to_string(),
-        spec.surreal_endpoint.clone(),
     ];
+    // A storage URL reaches the pod as `RIVERS_STORAGE_URL` from its Secret,
+    // never as an argument: it can hold a password.
+    if let rivers_k8s::env::StoragePodConfig::Surreal(surreal) = storage_pod_cfg {
+        args.extend(["--surreal-endpoint".to_string(), surreal.endpoint.clone()]);
+    }
 
     args.extend(["--target".to_string(), spec.target.clone()]);
 
@@ -223,7 +223,6 @@ mod tests {
             image: "registry.example.com/my-repo:latest".to_string(),
             module: "my_project.definitions".to_string(),
             target: "my_job".to_string(),
-            surreal_endpoint: "ws://surrealdb.rivers.svc:8000".to_string(),
             executor: Executor::Kubernetes,
             parameters: None,
             partition_key: None,
@@ -257,7 +256,7 @@ mod tests {
                 env: cl_env.to_vec(),
                 ..Default::default()
             },
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             &WorkspaceConfig::default(),
@@ -303,7 +302,7 @@ mod tests {
                 "run-123",
                 false,
                 &CodeLocationSpec::default(),
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 &WorkspaceConfig {
@@ -362,7 +361,7 @@ mod tests {
             "run-123",
             false,
             &CodeLocationSpec::default(),
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             &shared,
@@ -403,7 +402,7 @@ mod tests {
             "run-123",
             false,
             &CodeLocationSpec::default(),
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             &WorkspaceConfig::default(), // shared_enabled: false
@@ -430,7 +429,7 @@ mod tests {
                 "run-123",
                 false,
                 &git_code_location(workspace_size).spec,
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 &WorkspaceConfig::default(), // fallback, sizeLimit 2Gi
@@ -452,7 +451,7 @@ mod tests {
             "run-123",
             false,
             &git_code_location(Some("10Gi")).spec,
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             &WorkspaceConfig {
@@ -480,7 +479,7 @@ mod tests {
                 "run-123",
                 false,
                 &CodeLocationSpec::default(),
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 &WorkspaceConfig {
@@ -590,7 +589,7 @@ mod tests {
                     worker_cpu: "1".to_string(),
                     worker_memory: "2Gi".to_string(),
                     module: run.spec.module.clone(),
-                    surreal_pod_cfg: Default::default(),
+                    storage_pod_cfg: Default::default(),
                     otel_pod_cfg: Default::default(),
                     config_file_cfg: Default::default(),
                     run_id: "run-123".to_string(),
@@ -662,7 +661,7 @@ mod tests {
             "run-123",
             false,
             &CodeLocationSpec::default(),
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
                 headers_secret_name: "otel-headers".to_string(),
@@ -830,14 +829,15 @@ mod tests {
     }
 
     #[test]
-    fn executor_pod_takes_the_runs_surreal_endpoint_and_the_operators_scope() {
+    fn executor_pod_takes_the_surreal_endpoint_and_the_scope_of_the_operator() {
         let run = test_run();
-        let surreal = rivers_k8s::env::SurrealPodConfig {
-            endpoint: "ws://operator-only:8000".to_string(),
-            namespace: "team-ns".to_string(),
-            database: "team-db".to_string(),
-            ..Default::default()
-        };
+        let surreal =
+            rivers_k8s::env::StoragePodConfig::Surreal(rivers_k8s::env::SurrealPodConfig {
+                endpoint: "ws://operator-only:8000".to_string(),
+                namespace: "team-ns".to_string(),
+                database: "team-db".to_string(),
+                ..Default::default()
+            });
         let pod = build_executor_pod(
             &run,
             "test-pod",
@@ -849,7 +849,8 @@ mod tests {
             &Default::default(),
             &WorkspaceConfig::default(),
         );
-        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let container = pod.spec.unwrap().containers.remove(0);
+        let env = container.env.unwrap();
         let value = |name: &str| {
             env.iter()
                 .find(|e| e.name == name)
@@ -858,8 +859,11 @@ mod tests {
 
         assert_eq!(
             value(rivers_k8s::env::ENV_SURREAL_ENDPOINT).as_deref(),
-            Some("ws://surrealdb.rivers.svc:8000")
+            Some("ws://operator-only:8000")
         );
+        let args = container.args.unwrap();
+        let flag = args.iter().position(|a| a == "--surreal-endpoint").unwrap();
+        assert_eq!(args[flag + 1], "ws://operator-only:8000");
         assert_eq!(
             value(rivers_k8s::env::ENV_SURREAL_NAMESPACE).as_deref(),
             Some("team-ns")
@@ -867,6 +871,53 @@ mod tests {
         assert_eq!(
             value(rivers_k8s::env::ENV_SURREAL_DATABASE).as_deref(),
             Some("team-db")
+        );
+    }
+
+    #[test]
+    fn executor_pod_reads_the_storage_url_from_its_secret_only() {
+        let run = test_run();
+        let storage =
+            rivers_k8s::env::StoragePodConfig::UrlSecret(rivers_k8s::env::StorageUrlSecretRef {
+                name: "rivers-postgresql".to_string(),
+                key: "url".to_string(),
+            });
+        let pod = build_executor_pod(
+            &run,
+            "test-pod",
+            "run-123",
+            false,
+            &CodeLocationSpec::default(),
+            &storage,
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
+            &WorkspaceConfig::default(),
+        );
+        let container = &pod.spec.unwrap().containers[0];
+        let env = container.env.clone().unwrap();
+        let url = env
+            .iter()
+            .find(|e| e.name == rivers_k8s::env::ENV_STORAGE_URL)
+            .unwrap();
+        assert!(url.value.is_none(), "the URL must not be a plain value");
+        let secret = url
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .unwrap();
+        assert_eq!(
+            (secret.name.as_str(), secret.key.as_str()),
+            ("rivers-postgresql", "url")
+        );
+        assert!(
+            env.iter()
+                .all(|e| e.name != rivers_k8s::env::ENV_SURREAL_ENDPOINT),
+            "{env:?}"
+        );
+        let args = container.args.as_ref().unwrap();
+        assert!(
+            !args.contains(&"--surreal-endpoint".to_string()),
+            "{args:?}"
         );
     }
 
@@ -922,7 +973,7 @@ mod tests {
                 env: cl_env,
                 ..Default::default()
             },
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
                 ..Default::default()

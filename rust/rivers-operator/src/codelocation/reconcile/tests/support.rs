@@ -278,7 +278,7 @@ pub(crate) async fn reconcile_in(
         code_location_service_account: "rivers-code-location".into(),
         workspace,
         runs,
-        surreal_pod_cfg: Default::default(),
+        storage_pod_cfg: Default::default(),
         otel_pod_cfg: Default::default(),
         config_file_cfg: Default::default(),
     };

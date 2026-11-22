@@ -2,7 +2,43 @@
 
 ## `Storage`
 
-SurrealDB-backed storage for events, runs, asset records, and key-value data.
+Storage for events, runs, asset records, and key-value data.
+
+rivers has two storage backends:
+
+- **SurrealDB**, the default. It runs embedded (SurrealKV on local disk), in memory, or as a server.
+- **PostgreSQL**. It runs as a server only, so local development uses embedded SurrealDB.
+
+Both backends have the same API. The rivers-core storage tests run against both.
+
+### `Storage.open(url)`
+
+Open the store that a storage URL names. The scheme selects the backend.
+
+```python
+storage = rs.Storage.open("surrealkv://.rivers/storage")            # embedded SurrealDB
+storage = rs.Storage.open("ws://surrealdb:8000")                    # SurrealDB server
+storage = rs.Storage.open(os.environ["RIVERS_STORAGE_URL"])         # e.g. postgres://rivers:...@db/rivers
+```
+
+| Scheme | Backend |
+|--------|---------|
+| `surrealkv://<path>` | Embedded SurrealDB at that path. The directory is created if it does not exist. |
+| `mem://` | In-memory SurrealDB. The data is lost when the process exits. |
+| `ws://`, `wss://`, `http://`, `https://` | SurrealDB server |
+| `postgres://`, `postgresql://` | PostgreSQL server. The URL holds the user, the password and the database, in the form that PostgreSQL clients accept. |
+
+A SurrealDB server URL holds no namespace, database or credentials. These come from the `RIVERS_SURREAL_*` env vars, as for `Storage.connect`. A URL without a scheme, or with an unknown scheme, raises `StorageError`.
+
+A PostgreSQL store creates its schema when it is opened for the first time.
+
+### `Storage.redact_url(url)`
+
+Returns `url` with its password replaced by `***`, in the user part and in a query parameter whose name ends with `password`. Any text is accepted. rivers logs and prints storage URLs only in this form.
+
+```python
+rs.Storage.redact_url("postgres://rivers:secret@db/rivers")  # "postgres://rivers:***@db/rivers"
+```
 
 ### `Storage.memory()`
 
@@ -40,6 +76,8 @@ Each parameter resolves via: explicit kwarg → `RIVERS_SURREAL_*` env var → d
 | `max_message_size` | `int \| None` | `None` | Largest message, in bytes, that the connection sends or accepts. `None` keeps the default of 64 MiB. A SurrealDB server accepts 128 MiB by default. Not read from an env var. |
 
 When `username` and `password` both resolve to non-empty values, they authenticate as a database-scoped user against `namespace` / `database` — matching a `DEFINE USER ... ON DATABASE` definition.
+
+A PostgreSQL URL holds its credentials, so PostgreSQL has no counterpart of this method: use `Storage.open`.
 
 ## Schema versioning & migration
 
@@ -79,13 +117,14 @@ An **uninitialized** store (no stamp) is bootstrapped by whichever process opens
 Applies pending schema migrations, bringing the database to the running build's schema version. Idempotent (a no-op when already current), and serialized across processes by a short-lived lease so two openers can't migrate the same store at once. Run it after upgrading rivers when a code location or the UI reports that the database needs migration.
 
 ```bash
-rivers db migrate                              # embedded (--storage-path, default .rivers/storage/)
-rivers db migrate --surreal-endpoint ws://surrealdb:8000   # remote
+rivers db migrate                                             # embedded (--storage-path, default .rivers/storage/)
+rivers db migrate --surreal-endpoint ws://surrealdb:8000      # SurrealDB server
+rivers db migrate                                             # the storage URL in RIVERS_STORAGE_URL
 ```
 
 In K8s, run it by hand or with the chart's [migration Job](../installation/kubernetes.md#upgrade). `rivers dev` instead offers to migrate interactively when it finds the database behind the build.
 
-A migration that raises a floor stops each process on an older build. For a remote database, `rivers db migrate` first reads the builds that the code locations recorded. If the migration stops one of them, the command changes nothing, lists them, and exits with code 1. The operator and the UI are listed but never block: their records are from their last start, and a chart upgrade replaces them. `--force` migrates anyway. An embedded store has one owner process, so it has no check.
+A migration that raises a floor stops each process on an older build. For a storage server, `rivers db migrate` first reads the builds that the code locations recorded. If the migration stops one of them, the command changes nothing, lists them, and exits with code 1. The operator and the UI are listed but never block: their records are from their last start, and a chart upgrade replaces them. `--force` migrates anyway. An embedded store has one owner process, so it has no check.
 
 ### `rivers db status`
 
@@ -93,6 +132,7 @@ Shows the schema stamp of the database, the schema version and floors of this bu
 
 ```bash
 rivers db status --surreal-endpoint ws://surrealdb:8000
+rivers db status                                  # the storage URL in RIVERS_STORAGE_URL
 ```
 
 ```text
@@ -121,18 +161,19 @@ rivers builds at schema version 13 and later embed SurrealDB 4, which stores dat
 
 Back up the store first. `rivers dev` offers the conversion when it finds such a store.
 
-### `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
+### `Storage.migrate(url, *, force=False)` / `Storage.migrate_embedded(path)` / `Storage.migrate_remote(endpoint, ...)`
 
-The programmatic form of `rivers db migrate` — open-migrate-close. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`. It raises `MigrationBlockedError` (a `StorageError`) when the migration stops a code location; `force=True` migrates anyway.
+The programmatic form of `rivers db migrate` — open-migrate-close. `migrate` takes any storage URL, as `Storage.open` does. `migrate_remote` takes the same `username` / `password` / `namespace` / `database` resolution as `Storage.connect`. For a server, `migrate` and `migrate_remote` raise `MigrationBlockedError` (a `StorageError`) when the migration stops a code location; `force=True` migrates anyway.
 
 ```python
+rs.Storage.migrate(os.environ["RIVERS_STORAGE_URL"])
 rs.Storage.migrate_embedded(".rivers/storage")
 rs.Storage.migrate_remote("ws://surrealdb.rivers.svc.cluster.local:8000")
 ```
 
-### `Storage.schema_status_embedded(path)` / `Storage.schema_status_remote(endpoint, ...)`
+### `Storage.schema_status(url)` / `Storage.schema_status_embedded(path)` / `Storage.schema_status_remote(endpoint, ...)`
 
-The programmatic form of `rivers db status`. Returns a `SchemaStatus`:
+The programmatic form of `rivers db status`. `schema_status` takes any storage URL. Returns a `SchemaStatus`:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -144,7 +185,7 @@ A `ProcessStatus` has `name`, `code_location`, `writes`, `schema_version`, `rive
 
 ### `storage.type`
 
-Returns a `StorageType` enum (`StorageType.Memory`, `StorageType.Embedded`, or `StorageType.Remote`).
+Returns a `StorageType` enum: `StorageType.Memory`, `StorageType.Embedded`, `StorageType.Remote` (a SurrealDB server), or `StorageType.Postgres` (a PostgreSQL server).
 
 ## Sync Methods
 

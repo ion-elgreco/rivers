@@ -1,3 +1,5 @@
+import obstore.store
+
 import rivers as rs
 from rivers.exceptions import ConfigurationError
 
@@ -526,3 +528,34 @@ def test_cross_executor_parity_diamond(tmp_path):
     ip_result = build_and_run(rs.Executor.in_process(), None)
     par_result = build_and_run(rs.Executor.parallel(max_workers=2), handler)
     assert ip_result == par_result == 23
+
+
+def test_kubernetes_executor_refuses_storage_settings_its_step_pods_cannot_follow(
+    monkeypatch, tmp_path
+):
+    """Step pods read the storage URL from the Secret of the run pod. With the
+    Secret named but no URL in this pod, they would open another store: the
+    step fails before a pod starts, and says which setting is missing."""
+    monkeypatch.delenv("RIVERS_STORAGE_URL", raising=False)
+    monkeypatch.setenv("RIVERS_STORAGE_URL_SECRET_NAME", "rivers-postgresql")
+    monkeypatch.setenv("RIVERS_STORAGE_URL_SECRET_KEY", "url")
+
+    store = obstore.store.LocalStore(str(tmp_path), mkdir=True)
+
+    @rs.Asset(io_handler=rs.PickleIOHandler(store=store))
+    def k8s_step() -> int:
+        return 1
+
+    repo = rs.CodeRepository(
+        assets=[k8s_step],
+        default_executor=rs.Executor.kubernetes("img:latest", namespace="ns"),
+    )
+    result = repo.materialize(raise_on_error=False)
+
+    assert not result.success
+    [(name, message)] = result.failed_assets
+    assert name == "k8s_step"
+    assert (
+        "RIVERS_STORAGE_URL_SECRET_NAME and RIVERS_STORAGE_URL_SECRET_KEY are set, "
+        "but RIVERS_STORAGE_URL is not"
+    ) in str(message)

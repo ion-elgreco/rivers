@@ -13,7 +13,7 @@ use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey
 use crate::runtime::io_rt;
 use rivers_core::assets::graph::NodeRef;
 use rivers_core::assets::remote::RemoteRef;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{BackfillRecord, PartitionKey, StorageBackend};
 
 use super::handle::{JobSummary, ResolvedState};
@@ -517,7 +517,7 @@ pub(super) fn validate_backfill_strategy(
 /// that are NOT registered. Storage failures propagate — an unreachable
 /// store says nothing about whether a key is retired.
 pub(super) async fn unregistered_dynamic_keys(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     code_location_id: &str,
     checks: &[DynamicKeyCheck],
 ) -> PyResult<Vec<(String, String, String)>> {
@@ -538,7 +538,7 @@ pub(super) async fn unregistered_dynamic_keys(
 }
 
 pub(super) async fn verify_dynamic_partition_keys(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     code_location_id: &str,
     checks: &[DynamicKeyCheck],
 ) -> PyResult<()> {

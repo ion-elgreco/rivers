@@ -5,15 +5,19 @@ import typer
 from rivers.cli._app import app
 from rivers.cli._common import (
     _CODE_LOCATION_ID_OPT,
+    _STORAGE_URL_OPT,
+    _SURREAL_ENDPOINT_OPT,
     _load_repo,
     _parse_strategy,
     _split_names,
     _warn_if_destructive_on_scratch,
 )
+from rivers.cli.config import decide_storage
 
 
 @app.command()
 def backfill(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
     assets: str | None = typer.Option(
@@ -50,30 +54,29 @@ def backfill(
         None,
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Backfill partitions for selected assets."""
     from rivers import PartitionKey, PartitionKeyRange
 
-    kept_store = surreal_endpoint is not None or (
-        storage_path is not None and not memory
+    store = decide_storage(
+        ctx,
+        url=storage_url,
+        endpoint=surreal_endpoint,
+        path=storage_path,
+        memory=memory,
     )
-    if detach and not dry_run and not kept_store:
+    if detach and not dry_run and not store.kept:
         typer.echo(
-            "Error: --detach leaves the backfill to a daemon; pass "
+            "Error: --detach leaves the backfill to a daemon; pass --storage-url, "
             "--surreal-endpoint or --storage-path, the store that daemon reads",
             err=True,
         )
         raise typer.Exit(1)
 
-    repo_obj = _load_repo(
-        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
-    )
+    repo_obj = _load_repo(module, repo_var, store, code_location_id)
 
     selection = _split_names(assets)
 
@@ -102,9 +105,7 @@ def backfill(
     resolved_strategy = _parse_strategy(strategy)
 
     if action is not None:
-        _warn_if_destructive_on_scratch(
-            repo_obj, action, selection, memory, storage_path, surreal_endpoint
-        )
+        _warn_if_destructive_on_scratch(repo_obj, action, selection, store)
 
     result = repo_obj.backfill(
         selection=selection,
@@ -136,6 +137,7 @@ def backfill(
 
 @app.command(name="backfill-status")
 def backfill_status(
+    ctx: typer.Context,
     backfill_id: str = typer.Argument(help="Backfill ID to check"),
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
@@ -144,17 +146,19 @@ def backfill_status(
         None,
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Check status of a backfill."""
-    repo_obj = _load_repo(
-        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    store = decide_storage(
+        ctx,
+        url=storage_url,
+        endpoint=surreal_endpoint,
+        path=storage_path,
+        memory=memory,
     )
+    repo_obj = _load_repo(module, repo_var, store, code_location_id)
     status = repo_obj.get_backfill(backfill_id)
     if status is None:
         typer.echo(f"Backfill '{backfill_id}' not found", err=True)
@@ -178,6 +182,7 @@ def _format_backfill_status(status) -> str:
 
 @app.command(name="backfill-cancel")
 def backfill_cancel(
+    ctx: typer.Context,
     backfill_id: str = typer.Argument(help="Backfill ID to cancel"),
     module: str = typer.Argument(help="Python module path"),
     repo_var: str = typer.Option("repo", help="Variable name of CodeRepository"),
@@ -186,17 +191,19 @@ def backfill_cancel(
         None,
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Cancel a running backfill."""
-    repo_obj = _load_repo(
-        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    store = decide_storage(
+        ctx,
+        url=storage_url,
+        endpoint=surreal_endpoint,
+        path=storage_path,
+        memory=memory,
     )
+    repo_obj = _load_repo(module, repo_var, store, code_location_id)
     success = repo_obj.cancel_backfill(backfill_id)
     if success:
         typer.echo(

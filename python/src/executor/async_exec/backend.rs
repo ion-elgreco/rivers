@@ -6,7 +6,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use rivers_core::execution::plan::ExecutionStep;
 use rivers_core::storage::ScopedStorageHandle;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -39,7 +39,7 @@ struct SharedStepContext {
     resources: HashMap<String, ResourceVariant>,
     config_overrides: Option<HashMap<String, Py<PyAny>>>,
     io_handler_registry: IOHandlerRegistry,
-    storage: ScopedStorageHandle<SurrealStorage>,
+    storage: ScopedStorageHandle<AnyStorage>,
     run_id: String,
     /// The verb every step executes when this batch belongs to an action run.
     action: Option<String>,

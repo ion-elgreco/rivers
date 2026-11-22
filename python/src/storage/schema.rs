@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use rivers_core::storage::surrealdb_backend::{BUILD_STAMPS, ProcessStatus, SchemaStatus};
+use rivers_core::storage::migration::{BUILD_STAMPS, ProcessStatus, SchemaStatus};
 
 #[pyclass(name = "ProcessStatus", frozen, get_all, module = "rivers._core")]
 #[derive(Clone)]

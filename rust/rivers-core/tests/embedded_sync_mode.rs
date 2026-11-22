@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 
 /// The log SurrealKV writes as it opens a store, which names its sync mode.
 #[derive(Clone, Default)]
@@ -44,7 +44,7 @@ mod sync_mode {
         let dir = test_temp_dir::test_temp_dir!();
 
         let scratch = dir.as_path_untracked().join("scratch");
-        drop(SurrealStorage::new_scratch_blocking(scratch.to_str().unwrap()).unwrap());
+        drop(AnyStorage::new_scratch_blocking(scratch.to_str().unwrap()).unwrap());
         assert!(log.take().contains("Sync mode: never"));
 
         let embedded = dir.as_path_untracked().join("embedded");
@@ -54,7 +54,7 @@ mod sync_mode {
             .unwrap();
         drop(
             runtime
-                .block_on(SurrealStorage::new_embedded(embedded.to_str().unwrap()))
+                .block_on(AnyStorage::new_embedded(embedded.to_str().unwrap()))
                 .unwrap(),
         );
         assert!(log.take().contains("Sync mode: every transaction commit"));

@@ -114,6 +114,53 @@ def test_dev_takes_a_code_location_id_and_no_ui(resolved_tmp_path, monkeypatch):
     assert os.environ["RIVERS_CODE_LOCATION_ID"] == "analytics"
 
 
+@pytest.mark.parametrize(
+    ("args", "env", "config", "expected"),
+    [
+        (
+            ["--surreal-endpoint", "ws://chosen:8000"],
+            {},
+            'url = "postgres://rivers:secret@db/rivers"',
+            (".rivers/storage/", "ws://chosen:8000", None),
+        ),
+        (
+            ["--storage-path", "chosen"],
+            {"RIVERS_STORAGE_URL": "postgres://rivers:secret@db/rivers"},
+            "",
+            ("chosen", None, None),
+        ),
+        (
+            [],
+            {"RIVERS_SURREAL_ENDPOINT": "ws://chosen:8000"},
+            'url = "postgres://rivers:secret@db/rivers"',
+            (".rivers/storage/", "ws://chosen:8000", None),
+        ),
+    ],
+    ids=["flag-over-config", "flag-over-env", "env-over-config"],
+)
+def test_dev_hands_the_host_the_store_of_the_strongest_source(
+    resolved_tmp_path, monkeypatch, args, env, config, expected
+):
+    (resolved_tmp_path / "dev_seam_mod.py").write_text(REPO_MODULE)
+    (resolved_tmp_path / "rivers.toml").write_text(f"[storage]\n{config}\n")
+    for name in ("RIVERS_DEPLOYMENT", "RIVERS_MODULE"):
+        monkeypatch.setenv(name, "")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    served = {}
+    monkeypatch.setattr(
+        rivers.cli.server,
+        "_serve_dev",
+        lambda cfg, module, ui: served.update(cfg=cfg),
+    )
+
+    result = runner.invoke(app, ["dev", "dev_seam_mod", *args])
+
+    assert result.exit_code == 0, result.output
+    storage = served["cfg"].storage
+    assert (storage.path, storage.endpoint, storage.url) == expected
+
+
 @pytest.mark.parametrize("via", ["flag", "env"])
 def test_dev_reads_config_from_explicit_path(resolved_tmp_path, monkeypatch, via):
     """``--config`` and ``RIVERS_CONFIG`` both load a rivers.toml outside the walk-up."""

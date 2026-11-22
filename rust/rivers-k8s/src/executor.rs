@@ -17,12 +17,11 @@ pub struct K8sStepExecutorConfig {
     pub worker_cpu: String,
     pub worker_memory: String,
     pub module: String,
-    /// SurrealDB endpoint, scope and auth-secret coordinates stamped on the
-    /// step pod. `auth_secret` is read by coordinate (not by value) so the
-    /// step Job's `valueFrom.secretKeyRef` references the same Secret the
-    /// rest of the rivers pods use — the run pod never holds the password
-    /// in memory.
-    pub surreal_pod_cfg: crate::env::SurrealPodConfig,
+    /// Where the step pod finds storage. Secrets are read by coordinate (not
+    /// by value) so the step Job's `valueFrom.secretKeyRef` references the
+    /// same Secret the rest of the rivers pods use — the run pod never holds
+    /// the password in memory.
+    pub storage_pod_cfg: crate::env::StoragePodConfig,
     pub otel_pod_cfg: crate::env::OtelPodConfig,
     pub config_file_cfg: crate::env::ConfigFilePodConfig,
     pub run_id: String,
@@ -333,10 +332,7 @@ fn build_job_inner(
                                     ..Default::default()
                                 },
                             ];
-                            env.extend(crate::env::build_surreal_pod_env(
-                                &config.surreal_pod_cfg.endpoint,
-                                &config.surreal_pod_cfg,
-                            ));
+                            env.extend(crate::env::build_storage_pod_env(&config.storage_pod_cfg));
                             env.extend(graft.env);
                             env.extend(crate::env::build_otel_pod_env(&config.otel_pod_cfg));
                             env.extend(crate::env::build_config_file_env(&config.config_file_cfg));
@@ -365,10 +361,10 @@ mod tests {
             worker_cpu: "1".to_string(),
             worker_memory: "2Gi".to_string(),
             module: "my_project.definitions".to_string(),
-            surreal_pod_cfg: crate::env::SurrealPodConfig {
+            storage_pod_cfg: crate::env::StoragePodConfig::Surreal(crate::env::SurrealPodConfig {
                 endpoint: "ws://surrealdb:8000".to_string(),
                 ..Default::default()
-            },
+            }),
             otel_pod_cfg: crate::env::OtelPodConfig::default(),
             config_file_cfg: crate::env::ConfigFilePodConfig::default(),
             run_id: "abc-123".to_string(),
@@ -742,6 +738,33 @@ mod tests {
         let result = sanitize_k8s_label(&long);
         assert!(result.len() <= 63);
         assert!(result.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+
+    #[test]
+    fn step_pod_reads_the_storage_url_from_the_secret_of_its_run() {
+        let config = K8sStepExecutorConfig {
+            storage_pod_cfg: crate::env::StoragePodConfig::UrlSecret(
+                crate::env::StorageUrlSecretRef {
+                    name: "rivers-postgresql".to_string(),
+                    key: "url".to_string(),
+                },
+            ),
+            ..test_config()
+        };
+        let job = build_step_job(&config, "my_step");
+        let env = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        assert_eq!(
+            crate::env::env_secret_ref(&env, crate::env::ENV_STORAGE_URL),
+            Some(("rivers-postgresql".to_string(), "url".to_string()))
+        );
+        assert!(
+            env.iter()
+                .all(|e| e.name != crate::env::ENV_SURREAL_ENDPOINT),
+            "{env:?}"
+        );
     }
 
     #[test]

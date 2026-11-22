@@ -360,7 +360,7 @@ mod tests {
     use super::*;
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::assets::remote::{LocationRef, RemoteRef};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use jiff::civil::date;
 
     thread_local! {
@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// One key row of `identity` per list of `keys`, and no other.
-    async fn key_rows(storage: &SurrealStorage, identity: &str, keys: &[&[&str]]) {
+    async fn key_rows(storage: &AnyStorage, identity: &str, keys: &[&[&str]]) {
         let key_lists: Vec<KeyList> = keys
             .iter()
             .map(|keys| KeyList::new(keys.iter().copied()))
@@ -455,7 +455,7 @@ mod tests {
 
     async fn settle(
         comparisons: &KeyComparisons,
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         check: DriftCheck,
     ) -> PartitionDrift {
         let consumer = CodeLocationContext::new("analytics");
@@ -793,7 +793,7 @@ mod tests {
     /// Equal definitions need no key row: none exists here.
     #[tokio::test]
     async fn equal_definitions_are_the_same_without_key_rows() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let comparisons = KeyComparisons::default();
         let multi = || {
             PartitionsFingerprint::multi([
@@ -820,7 +820,7 @@ mod tests {
     /// the counts decide, with no key row stored.
     #[tokio::test]
     async fn a_different_set_of_no_more_keys_is_incompatible_without_key_rows() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let comparisons = KeyComparisons::default();
         let multi = |regions: &[&str]| {
             PartitionsFingerprint::multi([
@@ -846,7 +846,7 @@ mod tests {
     /// With more owner keys, the key rows of both code locations decide.
     #[tokio::test]
     async fn an_owner_with_more_keys_is_decided_by_the_key_rows() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let mirror = statics(&["eu", "us"]);
         let added = statics(&["apac", "eu", "us"]);
         let replaced = statics(&["apac", "eu", "uk"]);
@@ -901,7 +901,7 @@ mod tests {
     /// key row, here because none is left.
     #[tokio::test]
     async fn a_compared_pair_is_not_read_again() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let mirror = statics(&["eu", "us"]);
         let owner = statics(&["apac", "eu", "us"]);
         key_rows(&storage, "analytics", &[&["eu", "us"]]).await;

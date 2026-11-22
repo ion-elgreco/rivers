@@ -91,7 +91,7 @@ pub struct Context {
     /// Read once from the operator's own env at startup. When `auth_secret`
     /// is set, `RIVERS_SURREAL_USERNAME` / `_PASSWORD` are emitted via
     /// `valueFrom.secretKeyRef`; otherwise pods connect unauthenticated.
-    pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
+    pub storage_pod_cfg: rivers_k8s::env::StoragePodConfig,
     pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
     pub config_file_cfg: rivers_k8s::env::ConfigFilePodConfig,
 }
@@ -160,7 +160,7 @@ pub async fn reconcile(cl: Arc<CodeLocation>, ctx: Arc<Context>) -> Result<Actio
         &cl,
         &resolved_image,
         &ctx.code_location_service_account,
-        &ctx.surreal_pod_cfg,
+        &ctx.storage_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,
         None,

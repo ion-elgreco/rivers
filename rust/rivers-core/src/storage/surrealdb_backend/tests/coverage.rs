@@ -922,19 +922,27 @@ async fn test_get_partition_timestamps_for_keys_skips_null_timestamps() {
     }
 
     // Legacy/foreign writer shape: the row exists with no timestamp.
-    storage
-        .db
-        .query(
-            "UPDATE asset_partitions SET last_timestamp = NONE \
-                 WHERE code_location_id = $cl AND asset_key = 'asset' \
-                 AND partition_key = $pk",
-        )
-        .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
-        .bind(("pk", single("p1")))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    match &storage {
+        AnyStorage::Surreal(surreal) => {
+            surreal
+                .db
+                .query(
+                    "UPDATE asset_partitions SET last_timestamp = NONE \
+                         WHERE code_location_id = $cl AND asset_key = 'asset' \
+                         AND partition_key = $pk",
+                )
+                .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
+                .bind(("pk", single("p1")))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        AnyStorage::Postgres(postgres) => postgres
+            .clear_partition_time(DEFAULT_CODE_LOCATION_ID, "asset", &single("p1"))
+            .await
+            .unwrap(),
+    }
 
     let timestamps = storage
         .get_partition_timestamps_for_keys(
@@ -1363,9 +1371,7 @@ async fn a_failed_run_does_not_fail_the_partitions_it_materialized_after_they_mo
         "rebuilt by another run",
     ] {
         let temp = test_temp_dir::test_temp_dir!();
-        let storage = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
-            .await
-            .unwrap();
+        let storage = make_disk_storage(temp.as_path_untracked()).await;
         register(&storage, &["raw", "clean"]).await;
 
         let joint = PartitionKey::Single {
@@ -1810,7 +1816,7 @@ async fn test_get_failed_partitions_ignores_action_runs() {
 
 #[tokio::test]
 async fn test_new_memory_schema_tables() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
 
     // Verify all 8 tables exist by querying INFO FOR DB
     let mut result = storage.db.query("INFO FOR DB").await.unwrap();
@@ -1836,7 +1842,7 @@ async fn test_new_memory_schema_tables() {
 
 #[tokio::test]
 async fn test_new_memory_schema_indexes() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
 
     let mut result = storage.db.query("INFO FOR TABLE events").await.unwrap();
     let info: Option<serde_json::Value> = result.take(0).unwrap();
@@ -2047,11 +2053,15 @@ async fn test_backfill_crud() {
         requested
     );
     assert_eq!(r.launched_by, record.launched_by, "provenance roundtrips");
+}
 
-    // A row created without launched_by (a v2 writer) gets the V3 DDL
-    // default and must deserialize back to the struct default. The
-    // genuinely-absent pre-V3 read path is covered by the migration-order
-    // test `test_v3_backfill_launched_by_defaults_for_legacy_rows`.
+/// A row created without launched_by (a v2 writer) gets the V3 DDL default
+/// and must deserialize back to the struct default. The genuinely-absent
+/// pre-V3 read path is covered by the migration-order test
+/// `test_v3_backfill_launched_by_defaults_for_legacy_rows`.
+#[tokio::test]
+async fn test_backfill_row_without_launched_by_reads_the_default() {
+    let storage = make_surreal().await;
     storage
             .db
             .query("CREATE backfills CONTENT { backfill_id: 'bf-old', code_location_id: 'default', status: 'Requested', strategy: { kind: 'MultiRun' }, failure_policy: 'Continue', asset_selection: [], max_concurrency: 1, tags: [], create_time: 1, end_time: NONE, error: NONE }")

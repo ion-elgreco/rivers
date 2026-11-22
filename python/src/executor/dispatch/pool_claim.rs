@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
     AssetScope, ConcurrencyClaimStatus, DEFAULT_LEASE_DURATION_SECS, EventRecord, EventType,
     ScopedStorageHandle, StorageBackend,
@@ -59,7 +59,7 @@ impl std::error::Error for ClaimCancelled {}
 /// and the renewal task is aborted via `AbortOnDrop` — without this, the task
 /// would keep running and hold a sender clone, blocking `EventWriter::flush`.
 pub(crate) struct PoolGuard {
-    storage: ScopedStorageHandle<SurrealStorage>,
+    storage: ScopedStorageHandle<AnyStorage>,
     run_id: Arc<str>,
     step_key: Arc<str>,
     renewal: AbortOnDrop,
@@ -86,7 +86,7 @@ impl Drop for AbortOnDrop {
 impl PoolGuard {
     /// Async acquire: claim slots and start background lease renewal.
     pub async fn acquire(
-        storage: &ScopedStorageHandle<SurrealStorage>,
+        storage: &ScopedStorageHandle<AnyStorage>,
         pools: &[(String, u32)],
         scope: Option<&AssetScope>,
         run_id: &str,
@@ -100,7 +100,7 @@ impl PoolGuard {
     /// Blocking acquire: claim slots (GIL released) and start background lease renewal.
     pub fn acquire_blocking(
         py: Python,
-        storage: &ScopedStorageHandle<SurrealStorage>,
+        storage: &ScopedStorageHandle<AnyStorage>,
         pools: &[(String, u32)],
         scope: Option<&AssetScope>,
         run_id: &str,
@@ -119,7 +119,7 @@ impl PoolGuard {
     /// Lets a caller run free steps first and come back to busy ones.
     pub fn try_acquire_blocking(
         py: Python,
-        storage: &ScopedStorageHandle<SurrealStorage>,
+        storage: &ScopedStorageHandle<AnyStorage>,
         pools: &[(String, u32)],
         scope: Option<&AssetScope>,
         run_id: &str,
@@ -153,7 +153,7 @@ impl PoolGuard {
 
     /// Keep the slots just claimed: renew their lease until release.
     fn hold(
-        storage: &ScopedStorageHandle<SurrealStorage>,
+        storage: &ScopedStorageHandle<AnyStorage>,
         run_id: &str,
         step_key: &str,
         events: mpsc::UnboundedSender<WriterMsg>,
@@ -222,7 +222,7 @@ impl PoolGuard {
 }
 
 async fn claim_async_poll(
-    storage: &ScopedStorageHandle<SurrealStorage>,
+    storage: &ScopedStorageHandle<AnyStorage>,
     pools: &[(String, u32)],
     scope: Option<&AssetScope>,
     run_id: &str,
@@ -335,7 +335,7 @@ fn rand_jitter(attempt: u32, max_jitter: Duration) -> Duration {
 }
 
 fn spawn_lease_renewal(
-    storage: ScopedStorageHandle<SurrealStorage>,
+    storage: ScopedStorageHandle<AnyStorage>,
     run_id: Arc<str>,
     step_key: Arc<str>,
     events: mpsc::UnboundedSender<WriterMsg>,

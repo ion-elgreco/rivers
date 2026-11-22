@@ -16,7 +16,7 @@ Dagster's daemon, schedulers, sensors, partition logic, and execution planning r
 | Daemon (schedules, sensors, automation conditions, run queue, backfills) | Python | Compiled Rust |
 | Web UI server | Python + JavaScript bundle (Dagit / Webserver) | Rust (Axum + Leptos SSR + WASM hydration) |
 | Kubernetes integration | `dagster-k8s` launcher | Native Rust operator (`kube-rs`) with CRDs |
-| Storage backend | Python ORM over PostgreSQL/MySQL/SQLite | SurrealDB v4 (embedded SurrealKV locally; SurrealDB server for production) |
+| Storage backend | Python ORM over PostgreSQL/MySQL/SQLite | SurrealDB v4 (embedded SurrealKV locally; SurrealDB server for production), or PostgreSQL |
 | Python interpreter on the control plane | Yes (everywhere) | **No** — Python only runs inside user code |
 
 Plan times stay sub-millisecond on graphs with thousands of nodes; the daemon ticks evaluate automation conditions in Rust without holding the GIL.
@@ -95,6 +95,8 @@ rivers uses **SurrealDB v3** as its storage backend, with three modes:
 - **In-memory** — `Storage.memory()`. Zero setup, ephemeral; ideal for tests and short-lived scripts.
 - **Local / single-node** — `Storage.embedded(path)`. Embedded SurrealKV, same binary, no external process.
 - **HA / production** — `Storage.connect("ws://...")`. SurrealDB server backed by TiKV. Horizontal scale-out for reads and writes.
+
+A deployment can also keep its data in a PostgreSQL server that it already runs: `Storage.open("postgres://...")`. See [PostgreSQL as the storage backend](../installation/kubernetes.md#postgresql-as-the-storage-backend).
 
 Dagster's storage layer is a Python ORM over relational databases (SQLite for dev, PostgreSQL/MySQL for prod). rivers' Rust storage layer is async and provides typed access to runs, events, asset records, dynamic partitions, ticks, pools, and KV state from one transactional store.
 

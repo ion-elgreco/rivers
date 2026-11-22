@@ -1,7 +1,7 @@
-//! PyStorage — Python wrapper for the SurrealDB storage backend.
+//! PyStorage — Python wrapper for the storage backends.
 //!
 //! `PyStorage` holds a [`ScopedStorageHandle`] that bundles the underlying
-//! `Arc<SurrealStorage>` with a [`CodeLocationContext`] (sourced from
+//! `Arc<AnyStorage>` with a [`CodeLocationContext`] (sourced from
 //! `RIVERS_CODE_LOCATION_ID`), so per-CL query methods don't need a CL
 //! argument from Python. Each query is exposed twice: a sync method that
 //! releases the GIL while awaiting the async storage call, and an
@@ -19,7 +19,9 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 
 use crate::errors::StorageError;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::migration::Capability;
+use rivers_core::storage::url::{StorageUrl, redact_password};
 use rivers_core::storage::{
     CodeLocationContext, LaunchedBy, RunStatus, ScopedStorage, ScopedStorageHandle,
     StaleCauseCategory, StaleStatus, StorageBackend,
@@ -29,9 +31,8 @@ use crate::partitions::PyPartitionKey;
 use crate::runtime::io_rt;
 
 pub(crate) fn to_py_err(e: anyhow::Error) -> PyErr {
-    use rivers_core::storage::surrealdb_backend::{
-        MigrationBlocked, SchemaMigrationNeeded, StoreWrittenBySurrealDb3,
-    };
+    use rivers_core::storage::migration::{MigrationBlocked, SchemaMigrationNeeded};
+    use rivers_core::storage::surrealdb_backend::StoreWrittenBySurrealDb3;
     // The "database is behind this build" cases get a distinct exception (a
     // StorageError subclass) so the `rivers dev` prompt can offer the migration
     // by type rather than by message text. anyhow searches the chain.
@@ -44,7 +45,9 @@ pub(crate) fn to_py_err(e: anyhow::Error) -> PyErr {
     if let Some(m) = e.downcast_ref::<MigrationBlocked>() {
         return crate::errors::MigrationBlockedError::new_err(m.to_string());
     }
-    StorageError::new_err(format!("{e}"))
+    // The causes too: "connecting to PostgreSQL at ..." alone does not say
+    // why. No cause holds a password: the URL in the context is redacted.
+    StorageError::new_err(format!("{e:#}"))
 }
 
 /// Resolve a remote connect config from kwargs → `RIVERS_SURREAL_*` env → default,
@@ -89,6 +92,22 @@ fn resolve_remote_config(
     (config, authenticated)
 }
 
+/// Parse a storage URL, with the `RIVERS_SURREAL_*` overlay of
+/// [`rivers_k8s::env::resolve_storage_url`]. Pure (no Python), so callers run
+/// it inside `py.detach`.
+fn parse_storage_url(url: &str) -> PyResult<StorageUrl> {
+    rivers_k8s::env::resolve_storage_url(url).map_err(|e| StorageError::new_err(format!("{e:#}")))
+}
+
+/// An embedded store opens in a directory that exists.
+fn create_store_dir(url: &StorageUrl) -> PyResult<()> {
+    if let StorageUrl::SurrealEmbedded { path } = url {
+        std::fs::create_dir_all(path)
+            .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
+    }
+    Ok(())
+}
+
 fn parse_run_status(s: &str) -> PyResult<RunStatus> {
     match s {
         "Queued" => Ok(RunStatus::Queued),
@@ -118,20 +137,32 @@ pub enum PyStorageType {
     Memory,
     Embedded,
     Remote,
+    Postgres,
+}
+
+impl From<&StorageUrl> for PyStorageType {
+    fn from(url: &StorageUrl) -> Self {
+        match url {
+            StorageUrl::SurrealMemory => Self::Memory,
+            StorageUrl::SurrealEmbedded { .. } => Self::Embedded,
+            StorageUrl::SurrealRemote(_) => Self::Remote,
+            StorageUrl::Postgres { .. } => Self::Postgres,
+        }
+    }
 }
 
 pub(crate) trait HoldsStorage {
-    fn storage(&self) -> &Arc<SurrealStorage>;
+    fn storage(&self) -> &Arc<AnyStorage>;
 }
 
-impl HoldsStorage for Arc<SurrealStorage> {
-    fn storage(&self) -> &Arc<SurrealStorage> {
+impl HoldsStorage for Arc<AnyStorage> {
+    fn storage(&self) -> &Arc<AnyStorage> {
         self
     }
 }
 
-impl HoldsStorage for ScopedStorageHandle<SurrealStorage> {
-    fn storage(&self) -> &Arc<SurrealStorage> {
+impl HoldsStorage for ScopedStorageHandle<AnyStorage> {
+    fn storage(&self) -> &Arc<AnyStorage> {
         self.backend()
     }
 }
@@ -172,16 +203,16 @@ impl<H: HoldsStorage> Drop for DetachOnClose<H> {
     }
 }
 
-/// SurrealDB-backed storage exposed to Python.
+/// Storage exposed to Python.
 ///
-/// Bundles the SurrealDB connection (`Arc<SurrealStorage>`) with a stable
+/// Bundles the storage connection (`Arc<AnyStorage>`) with a stable
 /// [`CodeLocationContext`] (set at construction from `RIVERS_CODE_LOCATION_ID`,
 /// or [`DEFAULT_CODE_LOCATION_ID`] for tests) into a single
 /// [`ScopedStorageHandle`]. Per-CL storage queries are scoped through this
 /// context so the Python API stays free of CL identity arguments.
 #[pyclass(name = "Storage", frozen, module = "rivers._core")]
 pub struct PyStorage {
-    pub(crate) handle: DetachOnClose<ScopedStorageHandle<SurrealStorage>>,
+    pub(crate) handle: DetachOnClose<ScopedStorageHandle<AnyStorage>>,
     pub(crate) storage_type: PyStorageType,
 }
 
@@ -193,12 +224,12 @@ impl PyStorage {
     /// Borrow the per-CL [`ScopedStorage`] wrapper for sync calls. Use
     /// [`Self::handle`] when you need an owned handle to move into a spawned
     /// task or async closure.
-    pub(crate) fn scoped(&self) -> ScopedStorage<'_, SurrealStorage> {
+    pub(crate) fn scoped(&self) -> ScopedStorage<'_, AnyStorage> {
         self.handle.scoped()
     }
 
     /// Borrow the underlying backend `Arc` for unscoped (UUID-keyed) calls.
-    pub(crate) fn backend(&self) -> &Arc<SurrealStorage> {
+    pub(crate) fn backend(&self) -> &Arc<AnyStorage> {
         self.handle.backend()
     }
 
@@ -206,7 +237,7 @@ impl PyStorage {
         CodeLocationContext::new(rivers_k8s::env::current_code_location_id())
     }
 
-    fn from_storage(storage: SurrealStorage, storage_type: PyStorageType) -> Self {
+    fn from_storage(storage: AnyStorage, storage_type: PyStorageType) -> Self {
         Self {
             handle: DetachOnClose::new(ScopedStorageHandle::new(
                 Arc::new(storage),
@@ -231,7 +262,7 @@ impl PyStorage {
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
         let storage = py.detach(|| {
             io_rt()
-                .block_on(SurrealStorage::new_embedded(path))
+                .block_on(AnyStorage::new_embedded(path))
                 .map_err(to_py_err)
         })?;
         tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready");
@@ -243,7 +274,7 @@ impl PyStorage {
     fn memory(py: Python<'_>) -> PyResult<Self> {
         let storage = py.detach(|| {
             io_rt()
-                .block_on(SurrealStorage::new_memory())
+                .block_on(AnyStorage::new_memory())
                 .map_err(to_py_err)
         })?;
         tracing::info!(target: "rivers::storage", backend = "memory", "storage ready");
@@ -264,8 +295,7 @@ impl PyStorage {
     fn _test_embedded(py: Python<'_>, path: &str) -> PyResult<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
-        let storage =
-            py.detach(|| SurrealStorage::new_scratch_blocking(path).map_err(to_py_err))?;
+        let storage = py.detach(|| AnyStorage::new_scratch_blocking(path).map_err(to_py_err))?;
         tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "storage ready (own runtime)");
         Ok(Self::from_storage(storage, PyStorageType::Embedded))
     }
@@ -277,16 +307,28 @@ impl PyStorage {
     fn _scratch(py: Python<'_>, path: &str) -> PyResult<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
-        let storage =
-            py.detach(|| SurrealStorage::new_scratch_blocking(path).map_err(to_py_err))?;
+        let storage = py.detach(|| AnyStorage::new_scratch_blocking(path).map_err(to_py_err))?;
         tracing::info!(target: "rivers::storage", backend = "embedded", path = %path, "scratch storage ready");
         Ok(Self::from_storage(storage, PyStorageType::Embedded))
+    }
+
+    /// Test-only: a new, empty schema in the PostgreSQL database at `url`, as
+    /// the URL that opens it. The URL holds the password of `url`.
+    #[staticmethod]
+    fn _postgres_test_url(py: Python<'_>, url: &str) -> PyResult<String> {
+        py.detach(|| {
+            io_rt()
+                .block_on(rivers_core::storage::postgres_backend::create_test_schema(
+                    url,
+                ))
+                .map_err(to_py_err)
+        })
     }
 
     /// Test-only: in-memory counterpart of [`_test_embedded`](Self::_test_embedded).
     #[staticmethod]
     fn _test_memory(py: Python<'_>) -> PyResult<Self> {
-        let storage = py.detach(|| SurrealStorage::new_memory_blocking().map_err(to_py_err))?;
+        let storage = py.detach(|| AnyStorage::new_memory_blocking().map_err(to_py_err))?;
         tracing::info!(target: "rivers::storage", backend = "memory", "storage ready (test runtime)");
         Ok(Self::from_storage(storage, PyStorageType::Memory))
     }
@@ -331,18 +373,86 @@ impl PyStorage {
                 resolve_remote_config(endpoint_owned, username, password, namespace, database);
             config.max_message_size = max_message_size;
             let storage = io_rt()
-                .block_on(SurrealStorage::connect(config))
+                .block_on(AnyStorage::connect(config))
                 .map_err(to_py_err)?;
             Ok((storage, authenticated))
         })?;
         tracing::info!(
             target: "rivers::storage",
             backend = "remote",
-            endpoint = %endpoint,
+            endpoint = %redact_password(endpoint),
             authenticated,
             "storage ready"
         );
         Ok(Self::from_storage(storage, PyStorageType::Remote))
+    }
+
+    /// Open the store that `url` names; its scheme selects the backend. A
+    /// SurrealDB server takes namespace, database and credentials from the
+    /// `RIVERS_SURREAL_*` env vars, as [`connect`](Self::connect) does.
+    #[staticmethod]
+    fn open(py: Python<'_>, url: &str) -> PyResult<Self> {
+        let (storage, kind, backend, location) = py.detach(|| -> PyResult<_> {
+            let url = parse_storage_url(url)?;
+            create_store_dir(&url)?;
+            let (kind, backend, location) = (
+                PyStorageType::from(&url),
+                url.backend_name(),
+                url.redacted(),
+            );
+            let storage = io_rt()
+                .block_on(AnyStorage::open(url, Capability::ReadWrite))
+                .map_err(to_py_err)?;
+            Ok((storage, kind, backend, location))
+        })?;
+        tracing::info!(target: "rivers::storage", backend, location = %location, "storage ready");
+        Ok(Self::from_storage(storage, kind))
+    }
+
+    /// Migrate the store that `url` names to this build's schema version.
+    /// Backs `rivers db migrate`; idempotent. Unless `force`, a migration of
+    /// a server that stops a process that uses the database is refused.
+    #[staticmethod]
+    #[pyo3(signature = (url, *, force=false))]
+    fn migrate(py: Python<'_>, url: &str, force: bool) -> PyResult<()> {
+        let (backend, location) = py.detach(|| -> PyResult<_> {
+            let url = parse_storage_url(url)?;
+            create_store_dir(&url)?;
+            let (backend, location) = (url.backend_name(), url.redacted());
+            io_rt()
+                .block_on(AnyStorage::migrate(url, force))
+                .map_err(to_py_err)?;
+            Ok((backend, location))
+        })?;
+        tracing::info!(target: "rivers::storage", backend, location = %location, "storage schema migrated");
+        Ok(())
+    }
+
+    /// The schema stamps of the store that `url` names, and the processes
+    /// that use it with what a migration to this build does to each. Backs
+    /// `rivers db status`; the store is not changed.
+    #[staticmethod]
+    fn schema_status(py: Python<'_>, url: &str) -> PyResult<PySchemaStatus> {
+        let status = py.detach(|| -> PyResult<_> {
+            let url = parse_storage_url(url)?;
+            if let StorageUrl::SurrealEmbedded { path } = &url
+                && !std::path::Path::new(path).is_dir()
+            {
+                return Err(StorageError::new_err(format!("no storage at {path}")));
+            }
+            let storage = io_rt()
+                .block_on(AnyStorage::open(url, Capability::Inspect))
+                .map_err(to_py_err)?;
+            io_rt().block_on(storage.schema_status()).map_err(to_py_err)
+        })?;
+        Ok(status.into())
+    }
+
+    /// `url` with its password (in the user part or a query parameter)
+    /// replaced by `***`: safe to print. Any text is accepted.
+    #[staticmethod]
+    fn redact_url(url: &str) -> String {
+        redact_password(url)
     }
 
     /// Apply pending storage schema migrations to an embedded database, bringing
@@ -350,12 +460,11 @@ impl PyStorage {
     /// idempotent. The migrating connection is opened and dropped immediately.
     #[staticmethod]
     fn migrate_embedded(py: Python<'_>, path: &str) -> PyResult<()> {
-        use rivers_core::storage::surrealdb_backend::Capability;
         std::fs::create_dir_all(path)
             .map_err(|e| StorageError::new_err(format!("Failed to create storage dir: {e}")))?;
         py.detach(|| {
             io_rt()
-                .block_on(SurrealStorage::new_embedded_with_capability(
+                .block_on(AnyStorage::new_embedded_with_capability(
                     path,
                     Capability::Migrate,
                 ))
@@ -384,11 +493,11 @@ impl PyStorage {
             let (config, authenticated) =
                 resolve_remote_config(endpoint_owned, username, password, namespace, database);
             io_rt()
-                .block_on(SurrealStorage::migrate_remote(config, force))
+                .block_on(AnyStorage::migrate_remote(config, force))
                 .map_err(to_py_err)?;
             Ok(authenticated)
         })?;
-        tracing::info!(target: "rivers::storage", backend = "remote", endpoint = %endpoint, authenticated, "storage schema migrated");
+        tracing::info!(target: "rivers::storage", backend = "remote", endpoint = %redact_password(endpoint), authenticated, "storage schema migrated");
         Ok(())
     }
 
@@ -397,13 +506,12 @@ impl PyStorage {
     /// `rivers db status`; the store is not changed.
     #[staticmethod]
     fn schema_status_embedded(py: Python<'_>, path: &str) -> PyResult<PySchemaStatus> {
-        use rivers_core::storage::surrealdb_backend::Capability;
         if !std::path::Path::new(path).is_dir() {
             return Err(StorageError::new_err(format!("no storage at {path}")));
         }
 
         py.detach(|| {
-            let storage = io_rt().block_on(SurrealStorage::new_embedded_with_capability(
+            let storage = io_rt().block_on(AnyStorage::new_embedded_with_capability(
                 path,
                 Capability::Inspect,
             ))?;
@@ -425,13 +533,12 @@ impl PyStorage {
         namespace: Option<String>,
         database: Option<String>,
     ) -> PyResult<PySchemaStatus> {
-        use rivers_core::storage::surrealdb_backend::Capability;
         let endpoint = endpoint.to_string();
 
         py.detach(|| {
             let (config, _) =
                 resolve_remote_config(endpoint, username, password, namespace, database);
-            let storage = io_rt().block_on(SurrealStorage::connect_with_capability(
+            let storage = io_rt().block_on(AnyStorage::connect_with_capability(
                 config,
                 Capability::Inspect,
             ))?;

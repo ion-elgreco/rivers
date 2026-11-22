@@ -4,7 +4,7 @@ use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use super::StorageBackend;
-use super::surrealdb_backend::SCHEMA_VERSION;
+use super::migration::SCHEMA_VERSION;
 use crate::assets::graph::GraphTopology;
 use crate::assets::remote::LocationRef;
 

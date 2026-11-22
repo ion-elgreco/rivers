@@ -15,6 +15,7 @@ import typer
 
 from rivers._core import code_location_ref
 from rivers._core.storage import Storage
+from rivers.cli.config import StorageChoice
 from rivers.exceptions import SchemaMigrationNeededError
 
 T = TypeVar("T")
@@ -71,13 +72,46 @@ _CODE_LOCATION_ID_OPT = typer.Option(
 )
 
 
+_STORAGE_URL_OPT = typer.Option(
+    None,
+    envvar="RIVERS_STORAGE_URL",
+    # A value from the config would show in --help, password and all.
+    show_default=False,
+    help="Storage URL; the scheme selects the backend, e.g. "
+    "postgres://user@host/db or ws://host:8000",
+)
+
+_SURREAL_ENDPOINT_OPT = typer.Option(
+    None,
+    envvar="RIVERS_SURREAL_ENDPOINT",
+    help="SurrealDB server endpoint, e.g. ws://host:8000",
+)
+
+
+def _open_server(store: StorageChoice) -> Storage | None:
+    """Open the store of a storage URL or a SurrealDB endpoint; ``None`` for
+    any other choice."""
+    if store.url is not None:
+        return Storage.open(store.url)
+    if store.endpoint is not None:
+        return Storage.connect(store.endpoint)
+    return None
+
+
+def _export_storage(store: StorageChoice) -> None:
+    """Point the processes and pods that this process starts at its store."""
+    os.environ.pop("RIVERS_STORAGE_URL", None)
+    os.environ.pop("RIVERS_SURREAL_ENDPOINT", None)
+    if store.url is not None:
+        os.environ["RIVERS_STORAGE_URL"] = store.url
+    elif store.endpoint is not None:
+        os.environ["RIVERS_SURREAL_ENDPOINT"] = store.endpoint
+
+
 def _create_storage(
-    memory: bool,
-    storage_path: str | None,
-    surreal_endpoint: str | None,
-    code_location_id: str | None = None,
+    store: StorageChoice, code_location_id: str | None = None
 ) -> tuple[Storage, str | None]:
-    """Create storage backend based on CLI flags.
+    """Open the store a command chose.
 
     The storage and ``resolve()`` read the code location from the
     environment. Also returns the scratch store's directory, which the caller
@@ -85,19 +119,20 @@ def _create_storage(
     """
     if code_location_id is not None:
         os.environ["RIVERS_CODE_LOCATION_ID"] = code_location_id
-    if surreal_endpoint is not None:
-        if not code_location_id:
+    if store.in_memory:
+        return Storage.memory(), None
+    if store.path is not None:
+        return Storage.embedded(store.path), None
+    shared = _open_server(store)
+    if shared is not None:
+        if store.server and not code_location_id:
             typer.echo(
                 "Warning: without --code-location-id, runs, asset state and pool "
                 "claims go to code location 'default', which a deployed code "
                 "location does not read.",
                 err=True,
             )
-        return Storage.connect(surreal_endpoint), None
-    if memory:
-        return Storage.memory(), None
-    if storage_path is not None:
-        return Storage.embedded(storage_path), None
+        return shared, None
     scratch = tempfile.mkdtemp(prefix="rivers-scratch-")
     return Storage._scratch(scratch), scratch  # type: ignore[attr-defined]
 
@@ -128,16 +163,11 @@ def _open_or_prompt_migrate(
 
 
 def _warn_if_destructive_on_scratch(
-    repo_obj,
-    verb: str,
-    selection: list[str] | None,
-    memory: bool,
-    storage_path: str | None,
-    surreal_endpoint: str | None,
+    repo_obj, verb: str, selection: list[str] | None, store: StorageChoice
 ) -> None:
     """Warn when a verb that clears materialization state keeps its state and
     pool claims in a store that is gone at exit (the scratch store or memory)."""
-    if surreal_endpoint is not None or (storage_path is not None and not memory):
+    if store.kept:
         return
     from rivers import MultiAsset, Outcome
 
@@ -153,8 +183,8 @@ def _warn_if_destructive_on_scratch(
         ):
             typer.echo(
                 f"Warning: '{verb}' is destructive, but its state and pool claims go "
-                "to a scratch store that is removed at exit; pass --surreal-endpoint "
-                "to record them in shared storage.",
+                "to a scratch store that is removed at exit; pass --storage-url or "
+                "--surreal-endpoint to record them in shared storage.",
                 err=True,
             )
             return
@@ -163,9 +193,7 @@ def _warn_if_destructive_on_scratch(
 def _load_repo(
     module: str,
     repo_var: str,
-    memory: bool,
-    storage_path: str | None,
-    surreal_endpoint: str | None,
+    store: StorageChoice,
     code_location_id: str | None,
 ):
     """Load and resolve a CodeRepository from a module."""
@@ -182,9 +210,7 @@ def _load_repo(
         typer.echo(f"Error: '{repo_var}' is not a CodeRepository", err=True)
         raise typer.Exit(1)
 
-    storage, scratch = _create_storage(
-        memory, storage_path, surreal_endpoint, code_location_id
-    )
+    storage, scratch = _create_storage(store, code_location_id)
     repo_obj.resolve(storage=storage)
     if scratch is not None:
         atexit.register(_remove_scratch, repo_obj, scratch)

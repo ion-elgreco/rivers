@@ -16,7 +16,7 @@ use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 use rivers_core::assets::graph::to_topology;
 use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use rivers_core::repo::CodeRepository;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 
 use super::resolved_node::unshared;
 use super::*;
@@ -330,7 +330,7 @@ impl PyCodeRepository {
         py: Python,
         node_map: &HashMap<String, ResolvedNode>,
         resolved_graph: &rivers_core::assets::graph::AssetGraph,
-        storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+        storage_handle: &rivers_core::storage::ScopedStorageHandle<AnyStorage>,
     ) -> PyResult<rivers_core::assets::graph::GraphTopology> {
         py.detach(|| {
             let mut topology = to_topology(resolved_graph);
@@ -395,7 +395,7 @@ impl PyCodeRepository {
         &self,
         py: Python,
         node_map: &HashMap<String, ResolvedNode>,
-        storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+        storage_handle: &rivers_core::storage::ScopedStorageHandle<AnyStorage>,
     ) -> PyResult<()> {
         const DEFAULT_LEASE_DURATION_SECS: u32 = 300;
 
@@ -516,7 +516,7 @@ impl PyCodeRepository {
         } else {
             let storage = py.detach(|| {
                 io_rt()
-                    .block_on(SurrealStorage::new_memory())
+                    .block_on(AnyStorage::new_memory())
                     .map(Arc::new)
                     .map_err(|e| {
                         ConfigurationError::new_err(format!("Failed to init storage: {e}"))
@@ -687,7 +687,7 @@ impl PyCodeRepository {
 /// refer to it by `namespace/name`, with the remote assets it consumes. A
 /// failure leaves `resolve()` intact.
 fn register_code_location(
-    storage_handle: &rivers_core::storage::ScopedStorageHandle<SurrealStorage>,
+    storage_handle: &rivers_core::storage::ScopedStorageHandle<AnyStorage>,
     topology: &rivers_core::assets::graph::GraphTopology,
 ) {
     use rivers_core::storage::{CodeLocationDirectoryEntry, RemoteConsumer, StorageBackend};

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use rivers_core::condition::{ConditionPass, EvalResultRow, PendingDispatch, PendingDispatchEntry};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ConditionEvalRecord, ScopedStorageHandle, TickRecord};
 
 use crate::daemon::dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
@@ -16,7 +16,7 @@ pub(in crate::daemon) struct ConditionTickEngine {
     pub(super) pass: ConditionPass,
 
     pub(super) code_location_id: String,
-    pub(super) storage: ScopedStorageHandle<SurrealStorage>,
+    pub(super) storage: ScopedStorageHandle<AnyStorage>,
     /// Shared with the schedule/sensor path.
     pub(super) run_dispatcher: Arc<RunDispatcherKind>,
     pub(super) backfill_dispatcher: Arc<BackfillDispatcherKind>,

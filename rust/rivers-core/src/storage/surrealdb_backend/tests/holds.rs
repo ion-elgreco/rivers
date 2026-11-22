@@ -90,7 +90,17 @@ async fn begin_materialization(
 
 /// The row of each partition of `asset`: its key, run and time, in the order
 /// of the store.
-async fn partition_rows(storage: &SurrealStorage, asset: &str) -> Vec<(PartitionKey, String, i64)> {
+async fn partition_rows(storage: &AnyStorage, asset: &str) -> Vec<(PartitionKey, String, i64)> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal_partition_rows(surreal, asset).await,
+        AnyStorage::Postgres(postgres) => postgres.partition_rows(CL, asset).await.unwrap(),
+    }
+}
+
+async fn surreal_partition_rows(
+    storage: &SurrealStorage,
+    asset: &str,
+) -> Vec<(PartitionKey, String, i64)> {
     let mut rows: Vec<(PartitionKey, String, i64)> = storage
         .db
         .query(
@@ -155,7 +165,7 @@ async fn materialized(storage: &SurrealStorage, asset: &str) -> Vec<PartitionKey
 
 #[tokio::test]
 async fn deletions_and_failures_change_the_hold_row_and_materializations_do_not() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     register(&storage, &["a"]).await;
 
     storage
@@ -259,7 +269,7 @@ async fn a_change_of_the_hold_row_stops_a_materialization_that_began_before_it()
 
 #[tokio::test]
 async fn an_asset_deletion_done_once_more_removes_the_row_it_did_not_see() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     register(&storage, &["a"]).await;
     storage
         .store_event(&built("a", "r1", "p1", 300))
@@ -287,7 +297,7 @@ async fn an_asset_deletion_done_once_more_removes_the_row_it_did_not_see() {
 #[tokio::test]
 async fn partition_deletions_done_once_more_remove_the_rows_they_did_not_see() {
     for with_failure in [false, true] {
-        let storage = make_storage().await;
+        let storage = make_surreal().await;
         register(&storage, &["a"]).await;
         if with_failure {
             storage
@@ -323,7 +333,7 @@ async fn partition_deletions_done_once_more_remove_the_rows_they_did_not_see() {
 
 #[tokio::test]
 async fn failures_checked_once_more_take_in_the_rows_their_write_did_not_see() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     register(&storage, &["a"]).await;
     storage
         .store_events(&[
@@ -400,7 +410,7 @@ async fn a_deletion_and_failures_checked_once_more_stop_each_other() {
 /// written: the run does not fail the partition that it materialized.
 #[tokio::test]
 async fn the_end_of_a_run_checked_once_more_does_not_fail_what_the_run_materialized() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     register(&storage, &["a"]).await;
     let failing = run("r3", RunStatus::Started, Some(keys(&["p5", "p6"])), &["a"]);
     storage.create_run(&failing).await.unwrap();
@@ -453,7 +463,7 @@ async fn materializations_of_other_partitions_do_not_stop_each_other() {
     }
 
     assert_eq!(
-        partition_rows(&storage, "a").await,
+        surreal_partition_rows(&storage, "a").await,
         [
             row("p-newest", "newest", 300),
             row("p-older", "older", 100),
@@ -487,7 +497,7 @@ async fn of_two_materializations_of_one_partition_at_the_same_time_one_tries_aga
         .unwrap();
 
     assert_eq!(
-        partition_rows(&storage, "a").await,
+        surreal_partition_rows(&storage, "a").await,
         [row("p0", "newest", 300), row("p1", "r2", 200)]
     );
 }
@@ -531,7 +541,7 @@ async fn a_partition_deletion_leaves_no_older_row_that_committed_while_it_ran() 
         .unwrap();
     deletion.commit().await.unwrap();
     assert_eq!(
-        partition_rows(&storage, "a").await,
+        surreal_partition_rows(&storage, "a").await,
         [row("p0", "newest", 300), row("p1", "r1", 100)]
     );
 
@@ -541,7 +551,7 @@ async fn a_partition_deletion_leaves_no_older_row_that_committed_while_it_ran() 
         .unwrap();
 
     assert_eq!(
-        partition_rows(&storage, "a").await,
+        surreal_partition_rows(&storage, "a").await,
         [row("p0", "newest", 300)]
     );
 }
@@ -559,7 +569,7 @@ async fn older_materializations_that_come_in_during_a_deletion_leave_no_row() {
 
     for round in 0..30 {
         let asset = format!("a{round}");
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
         storage
             .store_event(&built(&asset, "newest", "z", 1_000))
             .await
@@ -617,7 +627,7 @@ async fn racing_materializations_and_deletions_leave_the_rows_that_the_events_gi
 
     for round in 0..40 {
         let asset = format!("a{round}");
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
 
         // Distinct times: three per key, and one of the asset.
         let mut times: Vec<i64> = (1..=3 * names.len() as i64 + 1).map(|t| 100 + t).collect();
