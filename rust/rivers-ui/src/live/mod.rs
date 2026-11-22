@@ -1,5 +1,6 @@
-//! Server-side plumbing for live updates: one SurrealDB LIVE query per
-//! table, fanned out into a single broadcast channel tagged by channel
+//! Server-side plumbing for live updates: one live query per table (a
+//! SurrealDB `LIVE` query, or a PostgreSQL `LISTEN` that the triggers of the
+//! table notify), fanned out into a single broadcast channel tagged by channel
 //! name, exposed as a single `/api/events?channels=…` SSE endpoint.
 //!
 //! - A **channel** is a named group of tables whose notifications are
@@ -11,9 +12,9 @@
 //!   handler subscribes, filters by client-requested channels, and emits
 //!   `event: {channel}-changed\ndata: 1` events.
 //!
-//! **Write guarantee.** Every process writes to the one SurrealDB the UI
-//! reads (the embedded server of `rivers dev`, or a shared remote SurrealDB
-//! in K8s), so the live queries here see every mutation regardless of which
+//! **Write guarantee.** Every process writes to the one store the UI reads
+//! (the embedded server of `rivers dev`, or a shared SurrealDB or PostgreSQL
+//! server in K8s), so the live queries here see every mutation regardless of which
 //! process wrote it. A change with no table behind it (a reloaded code
 //! location) is ticked in-process through [`kick`].
 
@@ -41,7 +42,7 @@ pub struct LiveChannel {
 
 /// Every channel a page can subscribe to. The `name` is what clients pass
 /// in `?channels=…`; `event_name` is `"{name}-changed"` pre-computed once;
-/// `tables` are the SurrealDB tables whose LIVE queries feed this channel.
+/// `tables` are the tables whose live queries feed this channel.
 pub const LIVE_CHANNELS: &[LiveChannel] = &[
     LiveChannel {
         name: "runs",
