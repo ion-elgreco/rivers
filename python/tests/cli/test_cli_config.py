@@ -905,8 +905,8 @@ class TestRootConfig:
         result = runner.invoke(app, ["materialize", "--help"])
 
         assert result.exit_code == 0, result.output
-        assert "--storage-url" in result.output
-        assert "secret" not in result.output
+        assert "--storage-url" in _plain(result.output)
+        assert "secret" not in _plain(result.output)
 
     @pytest.mark.parametrize("via", ["flag", "env"])
     def test_explicit_config_path(self, resolved_tmp_path, monkeypatch, opened, via):
@@ -933,9 +933,14 @@ class TestRootConfig:
 PG_URL = "postgres://rivers:secret@db/rivers"
 
 
+def _plain(output: str) -> str:
+    """The output without the styles that a terminal gets (GitHub Actions forces them)."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+
 def _error_text(output: str) -> str:
-    """The text of a usage error, without the box and the line breaks."""
-    return " ".join(re.sub(r"[│╭╮╰╯─]", " ", output).split())
+    """The text of a usage error, without the styles, the box and the line breaks."""
+    return " ".join(re.sub(r"[│╭╮╰╯─]", " ", _plain(output)).split())
 
 
 @pytest.mark.parametrize(
@@ -964,7 +969,7 @@ def test_every_command_refuses_a_url_that_is_not_a_surrealdb_endpoint(opened, ar
         "https://), not postgres://rivers:***@db/rivers; pass any other storage URL "
         "with --storage-url"
     ) in _error_text(result.output)
-    assert "secret" not in result.output
+    assert "secret" not in _plain(result.output)
     assert opened == []
 
 
