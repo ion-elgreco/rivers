@@ -81,7 +81,7 @@ mod read {
         BackfillCounts, BackfillPartitionState, BackfillStates, KeyRange, PartitionOutcome,
     };
     use rivers_core::execution::partition_outline::{self as keys, KeyGroup};
-    use rivers_core::storage::surrealdb_backend::SurrealStorage;
+    use rivers_core::storage::any::AnyStorage;
     use rivers_core::storage::{
         CodeLocationContext, PartitionBounds, PartitionKey, ScopedStorage, StorageBackend,
     };
@@ -489,7 +489,7 @@ mod read {
         loc_name: &str,
         asset_key: &str,
         read: impl AsyncFnOnce(
-            &Outline<'_, SurrealStorage, CodeLocationServiceClient<Channel>>,
+            &Outline<'_, AnyStorage, CodeLocationServiceClient<Channel>>,
         ) -> Result<T>,
     ) -> Result<T, ServerFnError> {
         let ctx = crate::server_fns::resolve_identity(loc_ns, loc_name).await?;
@@ -517,7 +517,7 @@ mod read {
     pub(super) async fn of_backfill<T>(
         backfill_id: &str,
         read: impl AsyncFnOnce(
-            &Outline<'_, SurrealStorage, CodeLocationServiceClient<Channel>>,
+            &Outline<'_, AnyStorage, CodeLocationServiceClient<Channel>>,
         ) -> Result<T>,
     ) -> Result<T, ServerFnError> {
         let state = expect_context::<crate::state::AppState>();
@@ -1481,8 +1481,8 @@ mod read {
         }
 
         /// A store with the asset `asset` and `events` of it.
-        async fn store_with(events: &[EventRecord]) -> SurrealStorage {
-            let storage = SurrealStorage::new_memory().await.unwrap();
+        async fn store_with(events: &[EventRecord]) -> AnyStorage {
+            let storage = AnyStorage::new_memory().await.unwrap();
             let asset = AssetRecord {
                 code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
                 asset_key: "asset".to_string(),
@@ -1508,9 +1508,9 @@ mod read {
         }
 
         fn outline<'a>(
-            storage: &'a ScopedStorage<'a, SurrealStorage>,
+            storage: &'a ScopedStorage<'a, AnyStorage>,
             source: Option<Definition>,
-        ) -> Outline<'a, SurrealStorage, Definition> {
+        ) -> Outline<'a, AnyStorage, Definition> {
             Outline {
                 storage,
                 source,
@@ -1968,7 +1968,7 @@ mod read {
         /// Store backfill `bf` of `asset` for `requested` and start it.
         /// Returns the key of each run of its plan.
         async fn started_backfill(
-            storage: &SurrealStorage,
+            storage: &AnyStorage,
             strategy: BackfillStrategy,
             requested: &[PartitionKey],
         ) -> Vec<PartitionKey> {
@@ -2005,7 +2005,7 @@ mod read {
         /// Run `run-<n>` of the plan ends with `status`, with a step failure
         /// for each of `failed`.
         async fn ended_run(
-            storage: &SurrealStorage,
+            storage: &AnyStorage,
             plan: &[PartitionKey],
             run_number: usize,
             status: RunStatus,
@@ -2053,10 +2053,10 @@ mod read {
         }
 
         async fn backfill_outline<'a>(
-            storage: &'a ScopedStorage<'a, SurrealStorage>,
-            base: &SurrealStorage,
+            storage: &'a ScopedStorage<'a, AnyStorage>,
+            base: &AnyStorage,
             source: Option<Definition>,
-        ) -> Outline<'a, SurrealStorage, Definition> {
+        ) -> Outline<'a, AnyStorage, Definition> {
             let record = base.get_backfill("bf").await.unwrap().unwrap();
             let states = BackfillStates::read(base, &record).await.unwrap();
             Outline {

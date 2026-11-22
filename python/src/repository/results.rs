@@ -7,7 +7,7 @@ use crate::executor::ops::now_ts;
 use crate::partitions::PyPartitionKey;
 use crate::runtime::{io_rt, rt};
 use crate::storage::{DetachOnClose, PyLaunchedBy};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{RunStatus, StorageBackend};
 
 #[pyclass(name = "RunResult", frozen, get_all, module = "rivers._core")]
@@ -35,7 +35,7 @@ impl PyRunResult {
 pub struct PyRunHandle {
     #[pyo3(get)]
     pub(crate) run_id: String,
-    pub(super) storage: DetachOnClose<Arc<SurrealStorage>>,
+    pub(super) storage: DetachOnClose<Arc<AnyStorage>>,
 }
 
 #[pymethods]

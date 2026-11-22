@@ -12,11 +12,15 @@ from rivers._core.storage import Storage
 from rivers.cli._app import app
 from rivers.cli._common import (
     _CODE_LOCATION_ID_OPT,
+    _STORAGE_URL_OPT,
+    _SURREAL_ENDPOINT_OPT,
     _check_code_location_ref,
     _cleanup_storage,
+    _export_storage,
     _open_or_prompt_migrate,
+    _open_server,
 )
-from rivers.cli.config import RiversConfig
+from rivers.cli.config import RiversConfig, StorageConfig, decide_storage
 
 
 @app.command()
@@ -33,9 +37,8 @@ def dev(
     port: int | None = typer.Option(None, help="Port to bind to"),
     grpc_port: int | None = typer.Option(None, help="Port for gRPC backend server"),
     storage_path: str | None = typer.Option(None, help="Path for embedded storage"),
-    surreal_endpoint: str | None = typer.Option(
-        None, help="Remote SurrealDB endpoint (overrides --storage-path)"
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     no_daemon: bool | None = typer.Option(
         None, help="Disable schedule/sensor automation daemon"
     ),
@@ -55,9 +58,12 @@ def dev(
     up: press the reload button in the UI.
 
     To run a second code location against the same storage, start another
-    ``rivers dev`` with ``--surreal-endpoint`` set to the storage endpoint the
-    first one prints, its own ``--code-location-id`` and ``--grpc-port``.
+    ``rivers dev`` with ``--storage-url`` set to the storage URL the first one
+    prints, its own ``--code-location-id`` and ``--grpc-port``.
     """
+    store = decide_storage(
+        ctx, url=storage_url, endpoint=surreal_endpoint, path=storage_path
+    )
     cfg = RiversConfig.from_cli(
         config=ctx.obj,
         module=module,
@@ -65,10 +71,13 @@ def dev(
         host=host,
         port=port,
         grpc_port=grpc_port,
-        storage_path=storage_path,
-        surreal_endpoint=surreal_endpoint,
         no_daemon=no_daemon,
         synthetic=synthetic,
+    )
+    cfg.storage = StorageConfig(
+        endpoint=store.endpoint,
+        url=store.url,
+        **({"path": store.path} if store.path else {}),
     )
 
     os.environ["RIVERS_DEPLOYMENT"] = "dev"
@@ -107,20 +116,23 @@ def _serve_dev(cfg: RiversConfig, module: str, *, ui: bool = True) -> None:
     """Run the dev host: storage server, web UI, and the supervised code location."""
     from rivers._core import DevHost
 
+    url = cfg.storage.url or cfg.storage.endpoint
     # A store SurrealDB 3 wrote is converted before the server can serve it.
     host = _open_or_prompt_migrate(
-        lambda: DevHost(cfg.storage.path, cfg.storage.endpoint),
-        lambda: Storage.migrate_embedded(cfg.storage.path),
+        lambda: DevHost(cfg.storage.path, url),
+        lambda: (
+            Storage.migrate(url) if url else Storage.migrate_embedded(cfg.storage.path)
+        ),
     )
-    os.environ["RIVERS_SURREAL_ENDPOINT"] = host.endpoint
-    if cfg.storage.endpoint is None:
+    os.environ["RIVERS_STORAGE_URL"] = host.url
+    if url is None:
         atexit.register(_cleanup_storage, cfg.storage.path)
-    typer.echo(f"Storage: {host.endpoint}")
+    typer.echo(f"Storage: {Storage.redact_url(host.url)}")
 
     try:
         storage = _open_or_prompt_migrate(
-            lambda: Storage.connect(host.endpoint),
-            lambda: Storage.migrate_remote(host.endpoint),
+            lambda: Storage.open(host.url),
+            lambda: Storage.migrate(host.url),
         )
         # The UI comes up while the code location imports and resolves.
         if ui:
@@ -147,30 +159,34 @@ def _serve_dev(cfg: RiversConfig, module: str, *, ui: bool = True) -> None:
 
 @app.command()
 def serve(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
     ),
     host: str = typer.Option("0.0.0.0", help="Host to bind to"),
     grpc_port: int = typer.Option(3001, help="Port for gRPC backend server"),
-    surreal_endpoint: str = typer.Option(
-        ..., envvar="RIVERS_SURREAL_ENDPOINT", help="Remote SurrealDB endpoint"
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     no_daemon: bool = typer.Option(
         False, help="Disable schedule/sensor automation daemon"
     ),
 ) -> None:
     """Start rivers code location server for Kubernetes deployment.
 
-    Connects to a remote SurrealDB instance, starts the gRPC backend, and runs
-    the automation daemon. Designed to run inside a K8s code-location pod.
+    Connects to a storage server, starts the gRPC backend, and runs the
+    automation daemon. Designed to run inside a K8s code-location pod.
     """
+    store = decide_storage(ctx, url=storage_url, endpoint=surreal_endpoint)
     os.environ["RIVERS_MODULE"] = module
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
-    os.environ["RIVERS_SURREAL_ENDPOINT"] = surreal_endpoint
+    _export_storage(store)
     _check_code_location_ref()
 
-    storage = Storage.connect(surreal_endpoint)
+    storage = _open_server(store)
+    if storage is None:
+        typer.echo("Error: pass --storage-url or --surreal-endpoint", err=True)
+        raise typer.Exit(1)
 
     sys.path.insert(0, ".")
     repo_obj = _import_repo(module, repo_var)

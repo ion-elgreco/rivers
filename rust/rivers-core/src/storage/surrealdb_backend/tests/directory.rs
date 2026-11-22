@@ -113,7 +113,7 @@ async fn code_location_directory_wire_format() {
 /// materialization.
 #[tokio::test]
 async fn code_location_directory_range_uses_kv_index() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     for (namespace, name) in [("team", "wh"), ("team", "analytics"), ("dev", "default")] {
         storage
             .upsert_code_location_registration(
@@ -429,7 +429,7 @@ async fn delete_needs_the_same_identity() {
 /// nothing.
 #[tokio::test]
 async fn compare_and_set_leaves_a_changed_entry() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     let wh = loc("team", "wh");
     let key = crate::code_location_directory_key(&wh);
     storage
@@ -474,11 +474,7 @@ async fn compare_and_set_leaves_a_changed_entry() {
 #[tokio::test]
 async fn concurrent_writers_lose_no_update() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-            .await
-            .unwrap(),
-    );
+    let storage = std::sync::Arc::new(make_disk_storage(temp_dir.as_path_untracked()).await);
     let wh = loc("team", "wh");
     storage
         .upsert_code_location_registration(&wh, CodeLocationDirectoryEntry::new("uuid-1"))

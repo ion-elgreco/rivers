@@ -981,9 +981,9 @@ fn test_data_version_changed_baselines_unconditioned_dep() {
 /// forever and automation never rebuilt it.
 #[tokio::test]
 async fn deleted_asset_reads_missing_again() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = DEFAULT_CODE_LOCATION_ID.to_string();
     let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
     let scoped = storage.for_code_location(&ctx_cl);
@@ -1054,9 +1054,9 @@ async fn deleted_asset_reads_missing_again() {
 /// materialization from data that no longer exists.
 #[tokio::test]
 async fn deleted_asset_does_not_read_newly_updated_downstream() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let cl = DEFAULT_CODE_LOCATION_ID.to_string();
     let ctx_cl = crate::storage::CodeLocationContext::new(cl.clone());
     let scoped = storage.for_code_location(&ctx_cl);

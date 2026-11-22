@@ -7,7 +7,7 @@ use std::time::Duration;
 use kube_client::ResourceExt;
 use rivers_core::assets::remote::LocationRef;
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::util::now_ts;
 use rivers_k8s::crd::code_location::CodeLocation;
 
@@ -22,12 +22,12 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
 pub struct DirectoryGc {
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     leader: LeaderGate,
 }
 
 impl DirectoryGc {
-    pub fn new(storage: Arc<SurrealStorage>, leader: LeaderGate) -> Self {
+    pub fn new(storage: Arc<AnyStorage>, leader: LeaderGate) -> Self {
         Self { storage, leader }
     }
 
@@ -128,10 +128,7 @@ mod tests {
     }
 
     async fn gc(leader: LeaderGate) -> DirectoryGc {
-        DirectoryGc::new(
-            Arc::new(SurrealStorage::new_memory().await.unwrap()),
-            leader,
-        )
+        DirectoryGc::new(Arc::new(AnyStorage::new_memory().await.unwrap()), leader)
     }
 
     async fn register(

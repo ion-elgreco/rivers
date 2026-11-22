@@ -169,6 +169,38 @@ pub fn is_unique_index_violation(e: &anyhow::Error) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `e` is a PostgreSQL error that a new attempt can pass.
+///
+/// By SQLSTATE: `40001` is a serialization failure, `40P01` a deadlock that
+/// the server broke, and `55P03` a lock that was not available in time.
+pub fn is_transient_postgres_error(e: &sqlx::Error) -> bool {
+    matches!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("40001" | "40P01" | "55P03")
+    )
+}
+
+/// [`with_retry_if`]'s predicate for the PostgreSQL backend. Walks the anyhow
+/// chain so context wrappers don't hide the underlying `sqlx::Error`.
+pub fn postgres_should_retry(e: &anyhow::Error) -> bool {
+    e.chain()
+        .find_map(|x| x.downcast_ref::<sqlx::Error>())
+        .map(is_transient_postgres_error)
+        .unwrap_or(false)
+}
+
+/// True if the error is PostgreSQL's unique violation (`23505`).
+pub fn is_postgres_unique_violation(e: &anyhow::Error) -> bool {
+    e.chain()
+        .find_map(|x| x.downcast_ref::<sqlx::Error>())
+        .and_then(|s| {
+            s.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c == "23505")
+        })
+        .unwrap_or(false)
+}
+
 /// Retry an async storage operation on transient SurrealDB errors. See
 /// [`with_retry_if`] for a custom predicate.
 pub async fn with_retry<F, Fut, T>(config: &StorageRetryConfig, f: F) -> Result<T>

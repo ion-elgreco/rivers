@@ -47,6 +47,20 @@ def storage():
     return _memory_storage_factory()
 
 
+# Read at import: the CLI tests remove every RIVERS_* variable around each test.
+_POSTGRES_URL = os.environ.get("RIVERS_TEST_POSTGRES_URL")
+
+
+@pytest.fixture
+def postgres_url():
+    """The URL of a new, empty schema in the PostgreSQL database that
+    ``RIVERS_TEST_POSTGRES_URL`` names; skips the test without that variable.
+    The URL holds the password: never print it."""
+    if not _POSTGRES_URL:
+        pytest.skip("RIVERS_TEST_POSTGRES_URL is not set")
+    return rs.Storage._postgres_test_url(_POSTGRES_URL)  # type: ignore[attr-defined]
+
+
 _CODE_LOCATION_ENV = (
     "RIVERS_CODE_LOCATION_ID",
     "RIVERS_CODE_LOCATION_NAME",

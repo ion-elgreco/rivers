@@ -125,7 +125,7 @@ pub async fn handle_executor_failure(
         run_id,
         true,
         &cl.spec,
-        &ctx.surreal_pod_cfg,
+        &ctx.storage_pod_cfg,
         &ctx.otel_pod_cfg,
         &ctx.config_file_cfg,
         &ctx.workspace,
@@ -163,7 +163,7 @@ mod tests {
     use crate::run::test_helpers::*;
 
     async fn seed_step_events(
-        storage: &rivers_core::storage::surrealdb_backend::SurrealStorage,
+        storage: &rivers_core::storage::any::AnyStorage,
         run_id: &str,
         completed: u32,
         total: u32,

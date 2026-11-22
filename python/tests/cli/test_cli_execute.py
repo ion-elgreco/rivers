@@ -8,6 +8,7 @@ test that does).
 
 import time
 from datetime import datetime
+from uuid import uuid4
 
 import pytest
 import rivers as rs
@@ -31,9 +32,10 @@ repo = rs.CodeRepository(assets=[tiny])
 """
 
 
-def _cloud_env(monkeypatch, path):
-    """Point `Storage.connect` at an embedded store and satisfy the cloud-mode
-    env contract, so the command runs without a remote SurrealDB."""
+def _cloud_env(monkeypatch, path, opened=None):
+    """Point `Storage.connect` and `Storage.open` at an embedded store and
+    satisfy the cloud-mode env contract, so the command runs without a storage
+    server. Each open is appended to `opened`."""
     import importlib
 
     # The command imports the definitions module off `sys.path.insert(0, ".")`.
@@ -42,9 +44,18 @@ def _cloud_env(monkeypatch, path):
     importlib.invalidate_caches()
     monkeypatch.setenv("RIVERS_CODE_LOCATION_ID", "default")
     store = embedded_storage(str(path))
+
+    def opener(kind):
+        def open_store(target):
+            if opened is not None:
+                opened.append((kind, target))
+            return store
+
+        return staticmethod(open_store)
+
     monkeypatch.setattr(
-        "rivers.cli.run.Storage",
-        type("_S", (), {"connect": staticmethod(lambda *a, **k: store)}),
+        "rivers.cli._common.Storage",
+        type("_S", (), {kind: opener(kind) for kind in ("connect", "open")}),
     )
     return store
 
@@ -72,6 +83,151 @@ def test_execute_without_a_run_record_fails_loudly(resolved_tmp_path, monkeypatc
     )
     assert result.exit_code == 1, result.output
     assert "no run record for 'no-such-run'" in result.output
+
+
+URL = "postgres://rivers:secret@db/rivers"
+
+
+@pytest.mark.parametrize(
+    ("args", "env", "expected"),
+    [
+        (["--storage-url", URL], {}, ("open", URL)),
+        ([], {"RIVERS_STORAGE_URL": URL}, ("open", URL)),
+        (["--surreal-endpoint", "ws://db:8000"], {}, ("connect", "ws://db:8000")),
+        (
+            ["--surreal-endpoint", "ws://db:8000"],
+            {"RIVERS_STORAGE_URL": URL},
+            ("connect", "ws://db:8000"),
+        ),
+    ],
+    ids=["url-flag", "url-env", "endpoint", "flag-beats-env"],
+)
+def test_execute_opens_the_store_it_is_given(
+    resolved_tmp_path, monkeypatch, args, env, expected
+):
+    # Its own module per case: each resolves the repository on another store.
+    module = f"defs_exec_store_{uuid4().hex[:8]}"
+    (resolved_tmp_path / f"{module}.py").write_text(REPO_MODULE)
+    opened = []
+    _cloud_env(monkeypatch, resolved_tmp_path / "storage", opened)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    result = runner.invoke(app, ["execute", module, "--run-id", "no-such-run", *args])
+
+    assert "no run record for 'no-such-run'" in result.output
+    assert opened == [expected]
+
+
+def test_execute_needs_a_store(resolved_tmp_path, monkeypatch):
+    (resolved_tmp_path / "defs_exec_nostore.py").write_text(REPO_MODULE)
+    _cloud_env(monkeypatch, resolved_tmp_path / "storage")
+    monkeypatch.delenv("RIVERS_STORAGE_URL", raising=False)
+
+    result = runner.invoke(app, ["execute", "defs_exec_nostore", "--run-id", "r"])
+
+    assert result.exit_code == 1
+    assert "pass --storage-url or --surreal-endpoint" in result.output
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"RIVERS_STORAGE_URL": URL}, ("open", URL)),
+        ({"RIVERS_SURREAL_ENDPOINT": "ws://db:8000"}, ("connect", "ws://db:8000")),
+        (
+            {"RIVERS_STORAGE_URL": URL, "RIVERS_SURREAL_ENDPOINT": "ws://db:8000"},
+            ("open", URL),
+        ),
+        ({}, None),
+    ],
+    ids=["url", "endpoint", "url-beats-endpoint", "neither"],
+)
+def test_execute_step_opens_the_store_of_its_env(
+    resolved_tmp_path, monkeypatch, env, expected
+):
+    module = f"defs_step_store_{uuid4().hex[:8]}"
+    (resolved_tmp_path / f"{module}.py").write_text(REPO_MODULE)
+    opened = []
+    _cloud_env(monkeypatch, resolved_tmp_path / "storage", opened)
+    for name in ("RIVERS_STORAGE_URL", "RIVERS_SURREAL_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    result = runner.invoke(
+        app,
+        ["execute-step", module, "--step-key", "tiny", "--run-id", "absent"],
+    )
+
+    assert result.exit_code == 1
+    if expected is None:
+        assert "RIVERS_STORAGE_URL or RIVERS_SURREAL_ENDPOINT" in result.output
+        assert opened == []
+    else:
+        assert "no run record for 'absent'" in result.output
+        assert opened == [expected]
+
+
+@pytest.mark.parametrize(
+    ("env", "config", "expected"),
+    [
+        (
+            {"RIVERS_SURREAL_ENDPOINT": "ws://cluster:8000"},
+            'url = "postgres://rivers:secret@image/rivers"',
+            ("connect", "ws://cluster:8000"),
+        ),
+        (
+            {"RIVERS_STORAGE_URL": URL},
+            'endpoint = "ws://image:8000"',
+            ("open", URL),
+        ),
+    ],
+    ids=["surrealdb", "postgresql"],
+)
+@pytest.mark.parametrize("command", ["serve", "execute", "execute-step"])
+def test_a_pod_opens_the_store_of_its_env_over_the_config_file(
+    resolved_tmp_path, monkeypatch, command, env, config, expected
+):
+    """The operator names the store of each pod by env var, and points
+    RIVERS_CONFIG at a rivers.toml that may name another. Every pod of a run
+    must open the operator's store: else run records and step events go to
+    different stores."""
+    module = f"defs_pod_store_{uuid4().hex[:8]}"
+    (resolved_tmp_path / f"{module}.py").write_text(REPO_MODULE)
+    config_file = resolved_tmp_path / "image.toml"
+    config_file.write_text(f"[storage]\n{config}\n")
+    opened = []
+    _cloud_env(monkeypatch, resolved_tmp_path / "storage", opened)
+    for name in ("RIVERS_MODULE", "RIVERS_DEPLOYMENT", "RIVERS_RUN_ID"):
+        monkeypatch.setenv(name, "")
+    for name, value in {"RIVERS_CONFIG": str(config_file), **env}.items():
+        monkeypatch.setenv(name, value)
+    served = []
+    monkeypatch.setattr(
+        "rivers.cli.server._serve_code_location", lambda *args: served.append(args)
+    )
+
+    args = {
+        "serve": ["serve", module],
+        "execute": ["execute", module, "--run-id", "absent"],
+        "execute-step": [
+            "execute-step",
+            module,
+            "--step-key",
+            "tiny",
+            "--run-id",
+            "absent",
+        ],
+    }[command]
+    result = runner.invoke(app, args)
+
+    assert opened == [expected], result.output
+    if command == "serve":
+        assert result.exit_code == 0, result.output
+        assert len(served) == 1
+    else:
+        assert "no run record for 'absent'" in result.output
 
 
 ACTION_REPO_MODULE = """

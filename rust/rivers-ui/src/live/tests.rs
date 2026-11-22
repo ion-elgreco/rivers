@@ -218,7 +218,7 @@ async fn axum_graceful_shutdown_completes_with_open_sse_client() {
     use tokio::net::{TcpListener, TcpStream};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
             .unwrap(),
     );
@@ -313,7 +313,7 @@ fn live_channels_event_names_match_name_changed_contract() {
 
 /// Full-path integration test over HTTP: verifies that a write to any
 /// channel's table is **perceived as an SSE event** by a subscribed
-/// client — `SurrealStorage` (in-memory) → `spawn_live_broadcasters` →
+/// client — `AnyStorage` (in-memory) → `spawn_live_broadcasters` →
 /// `/api/events` Axum route → raw TCP SSE client → `event: {X}-changed`
 /// + `data: 1` on the wire.
 ///
@@ -346,9 +346,9 @@ async fn every_channel_delivers_sse_events_over_http() {
 
     // 1. In-memory storage + broadcaster + minimal Axum router.
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
-            .expect("build in-memory SurrealStorage"),
+            .expect("build in-memory AnyStorage"),
     );
     let shutdown = CancellationToken::new();
     let (tx, _metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
@@ -640,9 +640,9 @@ async fn metrics_advance_after_write() {
     use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus, StorageBackend};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
-            .expect("build in-memory SurrealStorage"),
+            .expect("build in-memory AnyStorage"),
     );
     let shutdown = CancellationToken::new();
     let (_tx, metrics, _tasks) = spawn_live_broadcasters(storage.clone(), shutdown.clone());
@@ -736,7 +736,7 @@ async fn multiple_sse_clients_receive_same_event() {
     use tokio::net::{TcpListener, TcpStream};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
             .unwrap(),
     );
@@ -850,7 +850,7 @@ async fn sse_client_isolation_across_channels() {
     use tokio::net::{TcpListener, TcpStream};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
             .unwrap(),
     );
@@ -999,7 +999,7 @@ async fn debug_live_http_endpoint_serves_valid_json() {
     use tokio::net::{TcpListener, TcpStream};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
             .unwrap(),
     );
@@ -1297,7 +1297,7 @@ async fn kick_ticks_the_channel_for_subscribers() {
     use std::time::{Duration, Instant};
 
     let storage = Arc::new(
-        rivers_core::storage::surrealdb_backend::SurrealStorage::new_memory()
+        rivers_core::storage::any::AnyStorage::new_memory()
             .await
             .unwrap(),
     );

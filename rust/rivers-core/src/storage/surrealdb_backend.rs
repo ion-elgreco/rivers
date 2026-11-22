@@ -11,10 +11,8 @@ use surrealdb::types::{Bytes, RecordId, SurrealValue};
 use super::{EventRecord, PartitionKey, StorageBackend, stored_order};
 
 mod migration;
-pub use migration::{
-    BUILD_STAMPS, Capability, MigrationBlocked, ProcessStatus, SCHEMA_VERSION,
-    SchemaMigrationNeeded, SchemaStamps, SchemaStatus,
-};
+use super::migration::{Capability, SCHEMA_VERSION};
+use super::url::redact_password;
 
 mod backend;
 mod backfill_runs;
@@ -51,7 +49,7 @@ impl SurrealBackendKind {
             }
             SurrealBackendKind::Memory => "SurrealDB (In-Memory)".to_string(),
             SurrealBackendKind::Remote { endpoint } => {
-                format!("SurrealDB (Remote: {endpoint})")
+                format!("SurrealDB (Remote: {})", redact_password(endpoint))
             }
         }
     }
@@ -375,7 +373,7 @@ impl SurrealStorage {
         let started = std::time::Instant::now();
         tracing::info!(
             backend = "remote",
-            endpoint = %config.endpoint,
+            endpoint = %redact_password(&config.endpoint),
             ns = %config.namespace,
             db = %config.database,
             authenticated = config.credentials.is_some(),
@@ -392,7 +390,7 @@ impl SurrealStorage {
         .await?;
         tracing::info!(
             backend = "remote",
-            endpoint = %config.endpoint,
+            endpoint = %redact_password(&config.endpoint),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "surreal storage opened"
         );
@@ -493,7 +491,7 @@ impl SurrealStorage {
 /// Open a connection to the server of `config`, signed in and with its
 /// database selected.
 async fn connect_remote(config: &SurrealConnectConfig) -> Result<Surreal<Any>> {
-    tracing::debug!(endpoint = %config.endpoint, "connecting remote surrealdb");
+    tracing::debug!(endpoint = %redact_password(&config.endpoint), "connecting remote surrealdb");
     let mut sdk_config = surrealdb::opt::Config::new();
     if let Some(bytes) = config.max_message_size {
         sdk_config = sdk_config
@@ -575,7 +573,9 @@ impl futures_util::Stream for LiveTable {
     }
 }
 
-fn record_id_str(id: &RecordId) -> String {
+/// A record id as the text that leaves the storage API. Callers compare ids
+/// in this form, so each backend gives the same one.
+pub(super) fn record_id_str(id: &RecordId) -> String {
     format!("{}:{:?}", id.table.as_str(), id.key)
 }
 

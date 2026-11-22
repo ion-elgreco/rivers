@@ -13,6 +13,13 @@ This page lists user-settable env vars that rivers itself reads. Variables consu
 | `RIVERS_CODE_LOCATION_NAMESPACE` | `dev` outside Kubernetes | The namespace in the code location's `namespace/name`, the name other code locations use to refer to it. The operator sets it on rivers pods to the namespace of the `CodeLocation`. Under `RIVERS_DEPLOYMENT=cloud` without it, rivers uses the pod's namespace. |
 | `RIVERS_CODE_LOCATION_GRPC_ENDPOINT` | unset | The gRPC endpoint that a serving code location writes to the code location directory, where the UI and other processes find it. The operator sets it on code-location pods to the address of the `CodeLocation`'s Service, `<name>-grpc.<namespace>.svc.cluster.local:<grpcPort>`. Without it, the code location writes `http://<host>:<grpc-port>`, with `127.0.0.1` for a wildcard host. |
 
+## Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RIVERS_STORAGE_URL` | unset | The storage URL; the scheme selects the backend (see [`Storage.open`](storage.md#storageopenurl)). Read by the [CLI](cli.md#storage-flags) as `--storage-url`, by the operator and by the `rivers-ui` binary. It wins over `RIVERS_SURREAL_ENDPOINT`; a storage flag on the command line wins over it (see [Which store a command opens](cli.md#which-store-a-command-opens)). A PostgreSQL URL holds a password: give it to pods only from a Secret. |
+| `RIVERS_STORAGE_URL_SECRET_NAME`, `RIVERS_STORAGE_URL_SECRET_KEY` | unset | The Secret and the key in it that hold `RIVERS_STORAGE_URL`. The operator, and a run pod that uses the Kubernetes step executor, give the pods they start `RIVERS_STORAGE_URL` as a `secretKeyRef` to this Secret, never as a value. Set both or neither, together with a PostgreSQL URL in `RIVERS_STORAGE_URL`. With other settings the operator does not start, and the Kubernetes executor fails each step before it starts a pod: `RIVERS_STORAGE_URL` without them, them without `RIVERS_STORAGE_URL`, or a URL that is not a PostgreSQL URL (a SurrealDB server goes in `RIVERS_SURREAL_ENDPOINT`). |
+
 ## Daemon and automation
 
 | Variable | Default | Description |

@@ -57,6 +57,36 @@ fn key_lists<'a>(lists: &[&[&'a str]]) -> Vec<crate::assets::partitions_fingerpr
 
 /// The keys of `identity`'s key rows, by digest.
 async fn stored_key_rows(
+    storage: &AnyStorage,
+    identity: &str,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal_key_rows(surreal, identity).await,
+        AnyStorage::Postgres(postgres) => postgres.key_lists(identity).await.unwrap(),
+    }
+}
+
+/// Write `keys` over the stored key row `digest` of `identity`.
+async fn overwrite_key_row(storage: &AnyStorage, identity: &str, digest: &str, keys: &[&str]) {
+    match storage {
+        AnyStorage::Surreal(surreal) => {
+            let value = serde_json::to_vec(keys).unwrap();
+            surreal
+                .kv_set(&crate::partition_keys_key(identity, digest), &value)
+                .await
+                .unwrap();
+        }
+        AnyStorage::Postgres(postgres) => {
+            let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+            postgres
+                .overwrite_key_list(identity, digest, &keys)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn surreal_key_rows(
     storage: &SurrealStorage,
     identity: &str,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -82,17 +112,15 @@ async fn stored_key_rows(
 
 /// A topology write keeps one key row per distinct static key list: it
 /// writes the new ones, leaves the stored ones as they are, and deletes the
-/// ones the topology no longer names, of this code location only. Embedded
-/// storage, for the transaction.
+/// ones the topology no longer names, of this code location only. A store
+/// that sees every conflict, for the transaction.
 #[tokio::test]
 async fn set_graph_topology_keeps_one_key_row_per_list() {
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::assets::partitions_fingerprint::KeyList;
 
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .unwrap();
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let (cl, cl_x) = (
         crate::storage::CodeLocationContext::new("cl"),
         crate::storage::CodeLocationContext::new("cl:x"),
@@ -149,11 +177,7 @@ async fn set_graph_topology_keeps_one_key_row_per_list() {
         None
     );
 
-    let marker = br#"["kept as it was"]"#;
-    storage
-        .kv_set(&crate::partition_keys_key("cl", &digest(regions)), marker)
-        .await
-        .unwrap();
+    overwrite_key_row(&storage, "cl", &digest(regions), &["kept as it was"]).await;
     storage
         .for_code_location(&cl)
         .set_graph_topology(&topology(&["stores"]), &key_lists(&[regions]))
@@ -220,7 +244,7 @@ async fn a_key_row_deleted_during_the_write_fails_the_transaction() {
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), KEY_ROWS_CHANGED);
-    assert!(stored_key_rows(&storage, "cl").await.is_empty());
+    assert!(surreal_key_rows(&storage, "cl").await.is_empty());
     assert!(
         storage
             .for_code_location(&ctx)
@@ -235,7 +259,7 @@ async fn a_key_row_deleted_during_the_write_fails_the_transaction() {
         .await
         .unwrap();
     assert_eq!(
-        stored_key_rows(&storage, "cl")
+        surreal_key_rows(&storage, "cl")
             .await
             .into_values()
             .collect::<Vec<_>>(),
@@ -247,7 +271,7 @@ async fn a_key_row_deleted_during_the_write_fails_the_transaction() {
 /// `idx_kv_key`.
 #[tokio::test]
 async fn key_rows_range_scan_the_kv_index() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     for key in [
         "graph_topology:cl",
         "partition_keys:cl:x",

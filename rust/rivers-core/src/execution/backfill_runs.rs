@@ -37,7 +37,7 @@ pub async fn backfill_runs_page<S: StorageBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillStatus, BackfillStrategy, LaunchedBy, PartitionKey,
         RunStatus, default_code_location_id,
@@ -71,7 +71,7 @@ mod tests {
     /// their start time, and their ids are random.
     #[tokio::test]
     async fn runs_with_one_start_time_come_in_the_order_of_their_links() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let plan = [
             planned_run("run-e", "d1"),
             planned_run("run-a", "d2"),

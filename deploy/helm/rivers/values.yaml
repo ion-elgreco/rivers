@@ -1,6 +1,14 @@
 global:
   namespace: rivers
 
+# An external PostgreSQL server as the storage backend, in place of SurrealDB.
+# Set `existingSecret` to a Secret that holds the storage URL
+# (postgres://user:password@host:5432/dbname) under `secretKey`. Also set
+# `surrealdb.enabled: false`; the install fails otherwise.
+postgresql:
+  existingSecret: ""
+  secretKey: url
+
 surrealdb:
   # Install the bundled SurrealDB subchart
   # (https://github.com/surrealdb/helm-charts). Set to false to point rivers

@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::PerCodeLocationStorage;
 
 #[tokio::test]
 async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
@@ -6,10 +7,10 @@ async fn test_stale_eval_state_with_live_queued_run_does_not_redispatch() {
     // the daemon died before persisting eval state. On restart with the stale
     // (pre-fire) latches, the live queued run must suppress a re-dispatch.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let rec_a = make_record("a"); // missing → eager's missing arm fires
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
@@ -87,10 +88,10 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
     // for assets that actually dispatched, and the failure forces a retry
     // evaluation on the next tick even with no new upstream changes.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -110,10 +111,7 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
         edges: vec![("dst".to_string(), "raw".to_string())],
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
+        .set_graph_topology(DEFAULT_CODE_LOCATION_ID, &topo, &[])
         .await
         .unwrap();
 
@@ -232,10 +230,10 @@ async fn test_initial_evaluation_fires_once_not_per_restart() {
     // first evaluation tick (fresh eval state) and NOT again after a normal
     // restart with intact persisted state.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -304,10 +302,10 @@ async fn test_initial_load_derives_failure_floor_from_run_history() {
     // from persisted eval-state. A failure outranked by a newer
     // materialization must NOT floor.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -400,10 +398,10 @@ async fn test_initial_load_ignores_failed_action_runs() {
     // restart initial_load rebuilds the floor from run history and must reach
     // the same answer, or a failed action latches ExecutionFailed forever.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -466,10 +464,10 @@ async fn test_materializing_action_triggers_downstream_eager() {
     // state and after a restart.
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{EventRecord, EventType};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -478,13 +476,13 @@ async fn test_materializing_action_triggers_downstream_eager() {
         .unwrap();
     let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&GraphTopology {
+        .set_graph_topology(
+            DEFAULT_CODE_LOCATION_ID,
+            &GraphTopology {
                 nodes: vec![node("events"), node("rollup")],
                 edges: vec![("rollup".to_string(), "events".to_string())],
-            })
-            .unwrap(),
+            },
+            &[],
         )
         .await
         .unwrap();
@@ -583,7 +581,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
     // a restart agree.
     use crate::assets::graph::{NodeKind, TopologyNode};
     use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{EventRecord, EventType};
 
     let node = |name: &str| TopologyNode::new(name, NodeKind::Asset);
@@ -638,7 +636,7 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
             &[],
         ),
     ] {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
         storage
             .for_code_location(&ctx)
@@ -646,13 +644,13 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
             .await
             .unwrap();
         storage
-            .kv_set(
-                &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-                &serde_json::to_vec(&GraphTopology {
+            .set_graph_topology(
+                DEFAULT_CODE_LOCATION_ID,
+                &GraphTopology {
                     nodes: vec![node("events"), node("daily_summary")],
                     edges: vec![("daily_summary".to_string(), "events".to_string())],
-                })
-                .unwrap(),
+                },
+                &[],
             )
             .await
             .unwrap();
@@ -722,13 +720,11 @@ async fn test_verb_run_requests_downstream_it_did_not_build_after_dep() {
 
 /// Storage + cache fixture for the live-action-run tests: one asset `a` and a
 /// `Started` run carrying `action`, created before the caller's first refresh.
-async fn storage_with_live_action_run(
-    action: Option<&str>,
-) -> crate::storage::surrealdb_backend::SurrealStorage {
-    use crate::storage::surrealdb_backend::SurrealStorage;
+async fn storage_with_live_action_run(action: Option<&str>) -> crate::storage::any::AnyStorage {
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -817,10 +813,10 @@ async fn test_steady_state_refresh_ignores_live_action_runs() {
     // InProgressChange::Push for every non-terminal run and must apply the same
     // guard initial_load does, or the answer flips depending on whether the
     // action started before or after the daemon did.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -871,12 +867,12 @@ async fn test_recover_pending_dispatch_clears_is_initial() {
     // tick re-fires InitialEvaluation for every recovered asset (double-dispatch).
     use crate::condition::pass::recover_pending_dispatch;
     use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     // The run the intent references, so recovery sees dispatch evidence.
     storage
@@ -939,12 +935,12 @@ async fn test_recover_pending_dispatch_skips_stale_intent() {
     // regress last_materialized_timestamp and spuriously re-fire).
     use crate::condition::pass::recover_pending_dispatch;
     use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .create_run(&RunRecord {
@@ -1017,12 +1013,12 @@ async fn test_recover_pending_dispatch_restores_handled_keys() {
     use crate::condition::partition::PartitionState;
     use crate::condition::pass::recover_pending_dispatch;
     use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .create_run(&RunRecord {
@@ -1094,13 +1090,13 @@ async fn test_recover_pending_dispatch_backfill_id_no_false_match() {
     // consume the trigger.
     use crate::condition::pass::recover_pending_dispatch;
     use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy,
         DEFAULT_CODE_LOCATION_ID, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     // An UNRELATED backfill covering "a", created within the crash window; the
     // tick's own backfill ("bf-real") never dispatched.
@@ -1181,12 +1177,12 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
     // trigger doesn't re-fire and double-materialize.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass, recover_pending_dispatch};
     use crate::condition::state::PendingDispatch;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -1205,10 +1201,7 @@ async fn test_crash_after_dispatch_recovers_latches_from_intent() {
         edges: vec![("dst".to_string(), "raw".to_string())],
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
+        .set_graph_topology(DEFAULT_CODE_LOCATION_ID, &topo, &[])
         .await
         .unwrap();
 
@@ -1372,12 +1365,12 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
     // — the next tick re-fires as the retry.
     use crate::condition::pass::{AssetConditionInfo, ConditionPass, recover_pending_dispatch};
     use crate::condition::state::{PendingDispatch, PendingDispatchEntry};
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, ScopedStorageHandle, StorageBackend,
     };
 
-    let storage = std::sync::Arc::new(SurrealStorage::new_memory().await.unwrap());
+    let storage = std::sync::Arc::new(AnyStorage::new_memory().await.unwrap());
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -1396,10 +1389,7 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
         edges: vec![("dst".to_string(), "raw".to_string())],
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
+        .set_graph_topology(DEFAULT_CODE_LOCATION_ID, &topo, &[])
         .await
         .unwrap();
 
@@ -1522,12 +1512,9 @@ async fn test_crash_before_dispatch_leaves_trigger_armed() {
 }
 
 /// Helper: memory-backed storage with asset `a` registered and an initialized cache.
-async fn pending_test_setup() -> (
-    crate::storage::surrealdb_backend::SurrealStorage,
-    AssetConditionCache,
-) {
-    use crate::storage::surrealdb_backend::SurrealStorage;
-    let storage = SurrealStorage::new_memory().await.unwrap();
+async fn pending_test_setup() -> (crate::storage::any::AnyStorage, AssetConditionCache) {
+    use crate::storage::any::AnyStorage;
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -1782,12 +1769,12 @@ async fn test_initial_load_does_not_floor_asset_materialized_in_failed_joint_run
     // A joint run R=[x,y] fails on y but x materialized (its last_run_id → R). On restart,
     // initial_load rebuilds floors from last_run_id; since last_run_id is written only by
     // materializations, an asset whose last_run_id names a failed run materialized in it and must not be floored.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,

@@ -43,6 +43,44 @@ async fn test_enqueue_backfill_runs_links_atomically() {
     }
 }
 
+/// A batch sent again, as after an attempt whose answer was lost, adds no
+/// link, run or event.
+#[tokio::test]
+async fn test_enqueue_backfill_runs_sent_again_adds_nothing() {
+    let storage = make_storage().await;
+    storage
+        .create_backfill(&make_backfill("bf1", BackfillStatus::InProgress, 100), &[])
+        .await
+        .unwrap();
+    let mut records = vec![
+        minimal_run("bf1-r1", RunStatus::Queued),
+        minimal_run("bf1-r2", RunStatus::Queued),
+    ];
+    records[0].partition_key = Some(keys(&["a"]));
+    records[1].partition_key = Some(keys(&["b", "c", "d"]));
+
+    for _ in 0..2 {
+        assert!(
+            storage
+                .enqueue_backfill_runs(&records, "bf1")
+                .await
+                .unwrap()
+        );
+    }
+
+    assert_eq!(
+        link_rows(&storage, "bf1").await,
+        vec![("bf1-r1".to_string(), 0, 1), ("bf1-r2".to_string(), 1, 3)]
+    );
+    for run_id in ["bf1-r1", "bf1-r2"] {
+        let (_, total) = storage
+            .get_run_structured_events_page(run_id, None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "{run_id} has one RunQueued event");
+    }
+}
+
 #[tokio::test]
 async fn test_enqueue_backfill_runs_sweeps_batch_after_cancel() {
     let storage = make_storage().await;
@@ -242,12 +280,6 @@ async fn test_start_backfill_only_from_requested() {
 
 // ── backfill rows ──
 
-async fn embedded_storage(temp_dir: &test_temp_dir::TestTempDir) -> SurrealStorage {
-    SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage")
-}
-
 fn key(k: &str) -> PartitionKey {
     keys(&[k])
 }
@@ -272,14 +304,18 @@ fn unstarted(
 }
 
 /// `(run_id, run_number, member_count)` of the links of a backfill, in link order.
-async fn link_rows(storage: &SurrealStorage, backfill_id: &str) -> Vec<(String, i64, i64)> {
+pub(super) async fn link_rows(storage: &AnyStorage, backfill_id: &str) -> Vec<(String, i64, i64)> {
     #[derive(SurrealValue)]
     struct Row {
         run_id: String,
         run_number: i64,
         member_count: i64,
     }
-    let rows: Vec<Row> = storage
+    let surreal = match storage {
+        AnyStorage::Surreal(surreal) => surreal,
+        AnyStorage::Postgres(postgres) => return postgres.link_rows(backfill_id).await.unwrap(),
+    };
+    let rows: Vec<Row> = surreal
         .db
         .query(
             "SELECT run_id, run_number, member_count, linked_at FROM backfill_runs \
@@ -295,8 +331,64 @@ async fn link_rows(storage: &SurrealStorage, backfill_id: &str) -> Vec<(String, 
         .collect()
 }
 
+/// The keys, run ids and counts that the stored backfill rows hold.
+async fn backfill_row_fields(storage: &AnyStorage) -> Vec<serde_json::Value> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal
+            .db
+            .query(
+                "SELECT VALUE [partition_keys, run_ids, completed_partitions, \
+                 failed_partitions, canceled_partitions] FROM backfills",
+            )
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap(),
+        AnyStorage::Postgres(postgres) => postgres
+            .backfill_row_fields(&[
+                "partition_keys",
+                "run_ids",
+                "completed_partitions",
+                "failed_partitions",
+                "canceled_partitions",
+            ])
+            .await
+            .unwrap(),
+    }
+}
+
+/// The numbers of the pages of the requested keys of backfill `bf`.
+async fn key_pages(storage: &AnyStorage) -> Vec<i64> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal
+            .db
+            .query(
+                "SELECT VALUE page FROM backfill_key_pages WHERE backfill_id = 'bf' ORDER BY page",
+            )
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap(),
+        AnyStorage::Postgres(postgres) => postgres.key_pages("bf").await.unwrap(),
+    }
+}
+
+/// The outcome of each run of every backfill.
+async fn run_outcomes(storage: &AnyStorage) -> Vec<String> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal
+            .db
+            .query("SELECT VALUE outcome FROM backfill_run_outcomes")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap(),
+        AnyStorage::Postgres(postgres) => postgres.run_outcomes().await.unwrap(),
+    }
+}
+
 /// `(completed, failed, canceled)` partitions of backfill `bf`.
-async fn counts(storage: &SurrealStorage) -> (u64, u64, u64) {
+async fn counts(storage: &impl StorageBackend) -> (u64, u64, u64) {
     let bf = storage.get_backfill("bf").await.unwrap().unwrap();
     (
         bf.completed_partitions,
@@ -308,7 +400,7 @@ async fn counts(storage: &SurrealStorage) -> (u64, u64, u64) {
 /// An `InProgress` backfill `bf` requested for `requested`, planned as
 /// `planned_runs` runs.
 async fn in_progress_backfill(
-    storage: &SurrealStorage,
+    storage: &impl StorageBackend,
     requested: &[PartitionKey],
     planned_runs: u64,
 ) {
@@ -319,7 +411,7 @@ async fn in_progress_backfill(
 
 /// Link run `run_number` of backfill `bf` and create it over `run_keys`.
 async fn backfill_child(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     run_id: &str,
     run_number: usize,
     run_keys: &[&str],
@@ -339,7 +431,7 @@ async fn backfill_child(
     storage.create_run(&run).await.unwrap();
 }
 
-async fn step_failure(storage: &SurrealStorage, run_id: &str, asset: &str, partition: &str) {
+async fn step_failure(storage: &impl StorageBackend, run_id: &str, asset: &str, partition: &str) {
     storage
         .store_event(&EventRecord {
             code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
@@ -358,7 +450,7 @@ async fn step_failure(storage: &SurrealStorage, run_id: &str, asset: &str, parti
 #[tokio::test]
 async fn test_backfill_row_holds_no_keys_runs_or_counts() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let requested = vec![key("a"), keys(&["b", "c"])];
     in_progress_backfill(&storage, &requested, 2).await;
 
@@ -381,23 +473,14 @@ async fn test_backfill_row_holds_no_keys_runs_or_counts() {
     assert_eq!(read.run_ids, vec!["r2", "r1"], "link order, once each");
     assert_eq!(storage.get_backfill_keys("bf").await.unwrap(), requested);
 
-    let row: Vec<serde_json::Value> = storage
-        .db
-        .query(
-            "SELECT VALUE [partition_keys, run_ids, completed_partitions, \
-             failed_partitions, canceled_partitions] FROM backfills",
-        )
-        .await
-        .unwrap()
-        .take(0)
-        .unwrap();
+    let row = backfill_row_fields(&storage).await;
     assert_eq!(row, vec![serde_json::json!([null, null, null, null, null])]);
 }
 
 #[tokio::test]
 async fn test_requested_keys_are_stored_in_pages() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     // 40 keys of about 26 KiB each: more than one page of 256 KiB.
     let requested: Vec<PartitionKey> = (0..40)
         .map(|k| PartitionKey::Single {
@@ -416,13 +499,7 @@ async fn test_requested_keys_are_stored_in_pages() {
     let read = storage.get_backfill("bf").await.unwrap().unwrap();
     assert_eq!(read.num_partitions, 80_000);
 
-    let pages: Vec<i64> = storage
-        .db
-        .query("SELECT VALUE page FROM backfill_key_pages WHERE backfill_id = 'bf' ORDER BY page")
-        .await
-        .unwrap()
-        .take(0)
-        .unwrap();
+    let pages = key_pages(&storage).await;
     assert!(pages.len() > 1, "the keys take more than one page");
     assert_eq!(pages, (0..pages.len() as i64).collect::<Vec<_>>());
     assert!(
@@ -435,9 +512,21 @@ async fn test_requested_keys_are_stored_in_pages() {
 }
 
 #[tokio::test]
+async fn test_a_second_create_of_a_backfill_keeps_its_keys() {
+    let storage = make_storage().await;
+    let requested = vec![key("a"), keys(&["b", "c"])];
+    let bf = make_backfill("bf", BackfillStatus::Requested, 1);
+    storage.create_backfill(&bf, &requested).await.unwrap();
+
+    storage.create_backfill(&bf, &[key("x")]).await.unwrap();
+
+    assert_eq!(storage.get_backfill_keys("bf").await.unwrap(), requested);
+}
+
+#[tokio::test]
 async fn test_link_backfill_run_needs_a_live_backfill() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     storage
         .create_backfill(
             &make_backfill("requested", BackfillStatus::Requested, 1),
@@ -518,7 +607,7 @@ async fn test_backfill_lists_read_each_backfills_own_progress() {
 
 #[tokio::test]
 async fn test_rows_per_partition_of_an_older_backfill_count_one_partition_each() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     let mut bf = make_backfill("bf", BackfillStatus::CompletedFailed, 1);
     bf.end_time = Some(2);
     storage
@@ -548,7 +637,7 @@ async fn test_rows_per_partition_of_an_older_backfill_count_one_partition_each()
 #[tokio::test]
 async fn test_try_complete_backfill_waits_for_open_planned_runs() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b", "c", "d"])], 4).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     backfill_child(&storage, "rb", 1, &["b"], RunStatus::Started).await;
@@ -570,7 +659,7 @@ async fn test_try_complete_backfill_waits_for_open_planned_runs() {
 #[tokio::test]
 async fn test_try_complete_backfill_completes_once_every_planned_run_ended() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b", "c"])], 2).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     backfill_child(&storage, "rbc", 1, &["b", "c"], RunStatus::Started).await;
@@ -603,7 +692,7 @@ async fn test_try_complete_backfill_completes_once_every_planned_run_ended() {
 #[tokio::test]
 async fn test_try_complete_backfill_counts_planned_runs_that_never_started() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b", "c", "d"])], 4).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     storage
@@ -633,7 +722,7 @@ async fn test_try_complete_backfill_counts_planned_runs_that_never_started() {
 #[tokio::test]
 async fn test_try_complete_backfill_is_canceled_when_no_run_failed() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b"])], 2).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     backfill_child(&storage, "rb", 1, &["b"], RunStatus::Queued).await;
@@ -653,7 +742,7 @@ async fn test_try_complete_backfill_is_canceled_when_no_run_failed() {
 #[tokio::test]
 async fn test_a_planned_run_that_has_an_outcome_keeps_it() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a"])], 1).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     storage
@@ -672,7 +761,7 @@ async fn test_a_planned_run_that_has_an_outcome_keeps_it() {
 #[tokio::test]
 async fn test_runs_that_end_after_a_cancel_leave_the_backfill_canceled() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b"])], 2).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     backfill_child(&storage, "rb", 1, &["b"], RunStatus::Started).await;
@@ -701,7 +790,7 @@ async fn test_runs_that_end_after_a_cancel_leave_the_backfill_canceled() {
 #[tokio::test]
 async fn test_finished_backfill_run_records_its_outcome() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b", "c", "d"])], 3).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
     backfill_child(&storage, "rb", 1, &["b"], RunStatus::Started).await;
@@ -734,7 +823,7 @@ async fn test_finished_backfill_run_records_its_outcome() {
 #[tokio::test]
 async fn test_finished_backfill_run_keeps_its_latest_outcome() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a"])], 1).await;
     backfill_child(&storage, "ra", 0, &["a"], RunStatus::Started).await;
 
@@ -755,7 +844,7 @@ async fn test_finished_backfill_run_keeps_its_latest_outcome() {
 #[tokio::test]
 async fn test_successful_run_counts_the_partitions_it_failed_one_by_one() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     in_progress_backfill(&storage, &[keys(&["a", "b", "c", "d"])], 2).await;
     backfill_child(&storage, "rabc", 0, &["a", "b", "c"], RunStatus::Started).await;
     backfill_child(&storage, "rd", 1, &["d"], RunStatus::Started).await;
@@ -787,7 +876,7 @@ async fn test_successful_run_counts_the_partitions_it_failed_one_by_one() {
 #[tokio::test]
 async fn test_finished_run_writes_no_outcome_outside_a_backfill() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = embedded_storage(&temp_dir).await;
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let mut orphan = minimal_run("orphan", RunStatus::Started);
     orphan.partition_key = Some(key("a"));
     orphan.launched_by = LaunchedBy::Backfill {
@@ -806,14 +895,7 @@ async fn test_finished_run_writes_no_outcome_outside_a_backfill() {
         let run = storage.get_run(run_id).await.unwrap().unwrap();
         assert_eq!((run.status, run.end_time), (RunStatus::Success, Some(2)));
     }
-    let rows: Vec<serde_json::Value> = storage
-        .db
-        .query("SELECT VALUE outcome FROM backfill_run_outcomes")
-        .await
-        .unwrap()
-        .take(0)
-        .unwrap();
-    assert!(rows.is_empty());
+    assert!(run_outcomes(&storage).await.is_empty());
 }
 
 #[tokio::test]
@@ -940,7 +1022,7 @@ async fn test_partition_page_of_an_older_backfill_reads_its_rows_per_partition()
         BackfillCounts, BackfillPartitionState, BackfillStates, KeyRange,
     };
 
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     let requested = [key("a"), key("b"), key("c"), key("d")];
     storage
         .create_backfill(

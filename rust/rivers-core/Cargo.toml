@@ -19,6 +19,13 @@ petgraph.workspace = true
 refinery-core = { version = "0.10", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+# PostgreSQL backend. rustls as surrealdb uses; `json` carries the jsonb columns.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "json",
+] }
 surrealdb = { version = "4.0.0", default-features = false, features = ["kv-surrealkv", "kv-mem", "protocol-ws", "rustls"] }
 time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

@@ -15,6 +15,8 @@ class StorageType(enum.IntEnum):
     """SurrealDB+SurrealKV embedded in the process — single-process access only."""
     Remote = ...
     """SurrealDB server / TiKV — supports multi-process access."""
+    Postgres = ...
+    """PostgreSQL server — supports multi-process access."""
 
 class RunStatus(enum.IntEnum):
     """Lifecycle status of a run. ``RunRecord.status`` holds the same names as strings."""
@@ -301,14 +303,71 @@ class ConcurrencyClaimStatus:
 class Storage:
     """Persistent storage backend — events, runs, assets, ticks, KV, pools, queue.
 
-    Construct via the static factories (:meth:`memory`, :meth:`embedded`,
-    :meth:`connect`); the underlying SurrealDB connection is shared across
-    rivers components.
+    Construct via the static factories (:meth:`open`, :meth:`memory`,
+    :meth:`embedded`, :meth:`connect`); the underlying connection is shared
+    across rivers components.
     """
 
     @property
     def type(self) -> StorageType:
         """Backend variant — see :class:`StorageType`."""
+        ...
+
+    @staticmethod
+    def open(url: str) -> Storage:
+        """Open the store that ``url`` names; its scheme selects the backend.
+
+        ``surrealkv://<path>`` is an embedded store, ``mem://`` an in-memory
+        one, ``ws://``, ``wss://``, ``http://`` and ``https://`` a SurrealDB
+        server, ``postgres://`` and ``postgresql://`` a PostgreSQL server.
+
+        A SurrealDB server URL names no namespace, database or credentials:
+        they come from the ``RIVERS_SURREAL_*`` env vars, as for
+        :meth:`connect`.
+
+        Raises:
+            StorageError: The URL is not valid, or the store does not open.
+        """
+        ...
+
+    @staticmethod
+    def migrate(url: str, *, force: bool = False) -> None:
+        """Migrate the store that ``url`` names to this build's schema version.
+
+        The URL form of :meth:`migrate_embedded` and :meth:`migrate_remote`.
+        Idempotent. Backs ``rivers db migrate --storage-url``.
+
+        Args:
+            url: A storage URL, as for :meth:`open`.
+            force: Migrate a server even when the migration stops a code
+                location.
+
+        Raises:
+            MigrationBlockedError: the migration stops a code location that
+                uses the database, and ``force`` is not set. Nothing is changed.
+        """
+        ...
+
+    @staticmethod
+    def schema_status(url: str) -> SchemaStatus:
+        """The schema stamps of the store that ``url`` names and the processes
+        that use it. Backs ``rivers db status --storage-url``.
+
+        The store is not changed: it is neither migrated nor initialized.
+
+        Raises:
+            StorageError: there is no store at a ``surrealkv://`` path.
+        """
+        ...
+
+    @staticmethod
+    def redact_url(url: str) -> str:
+        """``url`` with its password replaced by ``***``: safe to print.
+
+        Both forms of the password are replaced: the one in the user part and
+        the value of a query parameter whose name ends with ``password``. Any
+        text is accepted, also one that is not a valid storage URL.
+        """
         ...
 
     @staticmethod

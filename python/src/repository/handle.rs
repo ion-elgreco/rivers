@@ -13,7 +13,7 @@ use crate::job::PyJob;
 use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey};
 use crate::storage::{DetachOnClose, PyStorageType};
 use rivers_core::repo::CodeRepository;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
     BackfillFailurePolicy, BackfillRecord, BackfillStatus, LaunchedBy, PartitionKey, RunRecord,
     RunStatus, StorageBackend, tag_keys,
@@ -87,7 +87,7 @@ pub(crate) struct ResolvedState {
     pub(crate) jobs_info: HashMap<String, JobSummary>,
     pub(crate) sensors_info: HashMap<String, SensorSummary>,
     pub(crate) schedules_info: HashMap<String, ScheduleSummary>,
-    pub(crate) storage: DetachOnClose<Arc<SurrealStorage>>,
+    pub(crate) storage: DetachOnClose<Arc<AnyStorage>>,
     pub(crate) storage_type: PyStorageType,
     pub(crate) resources: HashMap<String, ResourceVariant>,
     pub(crate) io_handler_registry: crate::assets::io_handler_registry::IOHandlerRegistry,

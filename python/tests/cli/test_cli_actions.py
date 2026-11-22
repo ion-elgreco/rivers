@@ -271,8 +271,8 @@ CODE_LOCATION_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 PURGE_WARNING = (
     "Warning: 'purge' is destructive, but its state and pool claims go to a "
-    "scratch store that is removed at exit; pass --surreal-endpoint to record "
-    "them in shared storage."
+    "scratch store that is removed at exit; pass --storage-url or "
+    "--surreal-endpoint to record them in shared storage."
 )
 DEFAULT_SCOPE_WARNING = (
     "Warning: without --code-location-id, runs, asset state and pool claims go "
@@ -568,10 +568,11 @@ def test_a_command_without_a_storage_flag_leaves_a_kept_store_alone(
     [
         ("purge", [], [PURGE_WARNING]),
         ("purge", ["--memory"], [PURGE_WARNING]),
+        ("purge", ["--storage-url", "mem://"], [PURGE_WARNING]),
         ("purge", ["--storage-path", "kept_db"], []),
         ("touch", [], []),
     ],
-    ids=["scratch", "memory", "storage-path", "not-destructive"],
+    ids=["scratch", "memory", "memory-url", "storage-path", "not-destructive"],
 )
 def test_a_destructive_verb_on_a_scratch_store_warns(
     resolved_tmp_path, command, verb, storage_args, warnings

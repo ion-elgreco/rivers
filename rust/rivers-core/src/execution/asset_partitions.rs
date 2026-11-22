@@ -341,7 +341,7 @@ fn rows_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         AssetRecord, CodeLocationContext, DEFAULT_CODE_LOCATION_ID, EventRecord, EventType,
     };
@@ -385,8 +385,8 @@ mod tests {
         event(asset, EventType::StepFailure, partition, at)
     }
 
-    async fn storage_with(asset: &str, events: &[EventRecord]) -> SurrealStorage {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+    async fn storage_with(asset: &str, events: &[EventRecord]) -> AnyStorage {
+        let storage = AnyStorage::new_memory().await.unwrap();
         let record = AssetRecord {
             code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
             asset_key: asset.to_string(),
@@ -414,14 +414,14 @@ mod tests {
     }
 
     /// The storage of `asset` after one drain of `events`.
-    async fn storage_with_drain(asset: &str, events: &[EventRecord]) -> SurrealStorage {
+    async fn storage_with_drain(asset: &str, events: &[EventRecord]) -> AnyStorage {
         let storage = storage_with(asset, &[]).await;
         storage.store_events(events).await.unwrap();
         storage
     }
 
     async fn failed_and_scoped(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         asset: &str,
     ) -> (FailedPartitions, CodeLocationContext) {
         let ctx = CodeLocationContext::default_for_tests();
@@ -433,7 +433,7 @@ mod tests {
 
     /// `00:00|b` was materialized and failed later, `00:00|c` failed only,
     /// `01:00|a` failed and was materialized again.
-    async fn trips() -> SurrealStorage {
+    async fn trips() -> AnyStorage {
         storage_with(
             "trips",
             &[

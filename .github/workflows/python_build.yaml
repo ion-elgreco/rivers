@@ -74,6 +74,23 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    services:
+      # The rivers-core tests run a second time with their stores on this
+      # server. It holds test data only, so it does not sync to disk.
+      postgres:
+        image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+        env:
+          POSTGRES_PASSWORD: rivers
+          POSTGRES_DB: rivers
+          POSTGRES_INITDB_ARGS: --set max_connections=1000 --set fsync=off --set synchronous_commit=off --set full_page_writes=off
+        ports:
+          - 5432:5432
+        # Over TCP: the server that sets up the database listens on its socket only.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d rivers"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,6 +105,13 @@ jobs:
         env:
           HANG_TIMEOUT_SECS: "600"
         run: .github/scripts/hang-watchdog.sh just test-rust
+
+      - name: Run rivers-core tests on PostgreSQL
+        working-directory: .
+        env:
+          HANG_TIMEOUT_SECS: "600"
+          RIVERS_TEST_POSTGRES_URL: postgres://postgres:rivers@localhost:5432/rivers
+        run: .github/scripts/hang-watchdog.sh cargo test --profile ci -p rivers-core --lib
 
       - name: Upload hung test stacks
         if: failure()
@@ -159,6 +183,23 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      # One leg also runs the tests that open a PostgreSQL store; the other
+      # legs skip them.
+      - name: Start PostgreSQL
+        if: matrix.runner == 'ubuntu-latest' && matrix.python-version == '3.13'
+        run: |
+          docker run -d --name rivers-postgres -e POSTGRES_PASSWORD=rivers -e POSTGRES_DB=rivers \
+            -p 127.0.0.1:5432:5432 \
+            postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+            -c max_connections=1000 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+          for _ in $(seq 120); do
+            docker exec rivers-postgres pg_isready -q -h 127.0.0.1 -U postgres -d rivers && break
+            sleep 0.5
+          done
+          docker exec rivers-postgres pg_isready -q -h 127.0.0.1 -U postgres -d rivers \
+            || { echo "PostgreSQL did not start" >&2; exit 1; }
+          echo "RIVERS_TEST_POSTGRES_URL=postgres://postgres:rivers@127.0.0.1:5432/rivers" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: just ${{ endsWith(matrix.python-version, 't') && 'test-ft' || 'test' }}

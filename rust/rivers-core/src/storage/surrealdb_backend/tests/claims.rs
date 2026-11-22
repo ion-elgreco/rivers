@@ -102,7 +102,7 @@ async fn test_sentinel_write_write_conflict() {
 
 #[tokio::test]
 async fn test_claim_check_statement_index() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     let pool_names = ["a", "b", "c", "d", "e"];
     for name in &pool_names {
         storage
@@ -313,7 +313,7 @@ async fn test_claim_and_release_then_reclaim() {
 /// Claim `pool` for `(run, step)` with the given scope, asserting the
 /// storage call itself succeeded, and return whether it got in.
 async fn claim_scoped(
-    storage: &SurrealStorage,
+    storage: &impl PerCodeLocationStorage,
     pool: &str,
     run: &str,
     step: &str,
@@ -512,7 +512,7 @@ async fn test_asset_scope_concurrent_exclusive_claims_admit_one() {
     for i in 0..8 {
         let s = storage.clone();
         tasks.push(tokio::spawn(async move {
-            claim_scoped(&s, pool, &format!("r{i}"), "del", Some(&["p1"]), true).await
+            claim_scoped(&*s, pool, &format!("r{i}"), "del", Some(&["p1"]), true).await
         }));
     }
     let mut claimed = 0;
@@ -685,24 +685,42 @@ struct HeldSlot {
 
 /// Every slot row `(run, step)` holds, by pool. `partitions` is a set in
 /// storage and comes back as a sorted array.
-async fn held_slots(storage: &SurrealStorage, run: &str, step: &str) -> Vec<HeldSlot> {
-    storage
-        .db
-        .query(
-            "SELECT pool_key, slots_consumed, claimed_at, lease_expires_at, exclusive, \
-                     IF partitions IS NONE THEN NONE ELSE array::sort(<array> partitions) END \
-                         AS partitions \
-                 FROM concurrency_slots \
-                 WHERE run_id = $run_id AND step_key = $step_key ORDER BY pool_key",
-        )
-        .bind(("run_id", run.to_string()))
-        .bind(("step_key", step.to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap()
-        .take(0)
-        .unwrap()
+async fn held_slots(storage: &AnyStorage, run: &str, step: &str) -> Vec<HeldSlot> {
+    match storage {
+        AnyStorage::Surreal(surreal) => surreal
+            .db
+            .query(
+                "SELECT pool_key, slots_consumed, claimed_at, lease_expires_at, exclusive, \
+                         IF partitions IS NONE THEN NONE ELSE array::sort(<array> partitions) END \
+                             AS partitions \
+                     FROM concurrency_slots \
+                     WHERE run_id = $run_id AND step_key = $step_key ORDER BY pool_key",
+            )
+            .bind(("run_id", run.to_string()))
+            .bind(("step_key", step.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap(),
+        AnyStorage::Postgres(postgres) => postgres
+            .held_slots(run, step)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(
+                |(pool_key, slots, claimed_at, lease_expires_at, partitions, exclusive)| HeldSlot {
+                    pool_key,
+                    slots_consumed: u32::try_from(slots).unwrap(),
+                    claimed_at,
+                    lease_expires_at,
+                    partitions,
+                    exclusive,
+                },
+            )
+            .collect(),
+    }
 }
 
 /// A step that runs again under its run and step key (a Kubernetes retry
@@ -713,9 +731,7 @@ async fn held_slots(storage: &SurrealStorage, run: &str, step: &str) -> Vec<Held
 #[tokio::test]
 async fn test_asset_pool_reclaim_by_same_step_takes_over_its_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
         partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
@@ -805,9 +821,7 @@ async fn test_asset_pool_reclaim_by_same_step_takes_over_its_slot() {
 #[tokio::test]
 async fn test_user_pool_reclaim_by_same_step_takes_over_its_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
     let pools = [("db".to_string(), 1)];
@@ -852,9 +866,7 @@ async fn test_user_pool_reclaim_by_same_step_takes_over_its_slot() {
 #[tokio::test]
 async fn test_multi_pool_reclaim_by_same_step_takes_over_every_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     storage.set_pool_limit(cl, "db", 2, 300).await.unwrap();
     storage
@@ -946,9 +958,7 @@ async fn claim_transaction_count(
 #[tokio::test]
 async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = |partitions: Option<&[&str]>, exclusive| AssetScope {
         partitions: partitions.map(|p| p.iter().map(|s| s.to_string()).collect()),
@@ -993,11 +1003,13 @@ async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
             matches!(status, ConcurrencyClaimStatus::Pending { .. }),
             "case {i}: {status:?}"
         );
-        assert_eq!(
-            claim_transaction_count(&storage, &pools, &[0], &run, "orders", Some(mine)).await,
-            0,
-            "case {i}: the transaction claimed nothing; the leftover row is not its claim"
-        );
+        if let AnyStorage::Surreal(surreal) = &storage {
+            assert_eq!(
+                claim_transaction_count(surreal, &pools, &[0], &run, "orders", Some(mine)).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+        }
         assert_eq!(
             held_slots(&storage, &run, "orders").await,
             killed,
@@ -1042,9 +1054,7 @@ async fn test_asset_pool_reclaim_by_same_step_waits_for_another_runs_claim() {
 #[tokio::test]
 async fn test_user_pool_reclaim_by_same_step_does_not_wait_for_its_old_lease() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let scope = AssetScope {
         partitions: Some(vec!["p1".to_string()]),
@@ -1139,9 +1149,7 @@ async fn test_user_pool_reclaim_by_same_step_does_not_wait_for_its_old_lease() {
 #[tokio::test]
 async fn test_user_pool_reclaim_by_same_step_waits_for_another_steps_slot() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     // (the killed attempt's lease, the re-run step, the other holder)
     let cases = [
@@ -1191,11 +1199,13 @@ async fn test_user_pool_reclaim_by_same_step_waits_for_another_steps_slot() {
             ),
             other => panic!("case {i}: expected Pending on the full pool, got {other:?}"),
         }
-        assert_eq!(
-            claim_transaction_count(&storage, &pools, &[], run, step, None).await,
-            0,
-            "case {i}: the transaction claimed nothing; the leftover row is not its claim"
-        );
+        if let AnyStorage::Surreal(surreal) = &storage {
+            assert_eq!(
+                claim_transaction_count(surreal, &pools, &[], run, step, None).await,
+                0,
+                "case {i}: the transaction claimed nothing; the leftover row is not its claim"
+            );
+        }
         assert_eq!(held_slots(&storage, run, step).await, killed, "case {i}");
 
         storage

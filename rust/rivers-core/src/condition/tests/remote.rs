@@ -6,7 +6,8 @@ use crate::assets::graph::{NodeKind, TopologyNode};
 use crate::assets::remote::LocationRef;
 use crate::condition::cache::RemoteDep;
 use crate::condition::pass::{AssetConditionInfo, ConditionPass};
-use crate::storage::surrealdb_backend::SurrealStorage;
+use crate::storage::PerCodeLocationStorage;
+use crate::storage::any::AnyStorage;
 use crate::storage::{CodeLocationContext, CodeLocationDirectoryEntry, EventRecord, EventType};
 
 const SEC: i64 = 1_000_000_000;
@@ -49,7 +50,7 @@ fn pass_with(
     )
 }
 
-async fn register(storage: &SurrealStorage, identity: &str, records: Vec<AssetRecord>) {
+async fn register(storage: &AnyStorage, identity: &str, records: Vec<AssetRecord>) {
     let records: Vec<AssetRecord> = records
         .into_iter()
         .map(|mut r| {
@@ -64,7 +65,7 @@ async fn register(storage: &SurrealStorage, identity: &str, records: Vec<AssetRe
         .unwrap();
 }
 
-async fn register_warehouse(storage: &SurrealStorage, identity: &str) {
+async fn register_warehouse(storage: &AnyStorage, identity: &str) {
     storage
         .upsert_code_location_registration(&warehouse(), CodeLocationDirectoryEntry::new(identity))
         .await
@@ -72,7 +73,7 @@ async fn register_warehouse(storage: &SurrealStorage, identity: &str) {
 }
 
 /// This location's graph, as `(downstream, upstream)` edges.
-async fn set_edges(storage: &SurrealStorage, edges: &[(&str, &str)]) {
+async fn set_edges(storage: &AnyStorage, edges: &[(&str, &str)]) {
     let names: HashSet<&str> = edges.iter().flat_map(|(down, up)| [*down, *up]).collect();
     let topology = GraphTopology {
         nodes: names
@@ -85,16 +86,13 @@ async fn set_edges(storage: &SurrealStorage, edges: &[(&str, &str)]) {
             .collect(),
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topology).unwrap(),
-        )
+        .set_graph_topology(DEFAULT_CODE_LOCATION_ID, &topology, &[])
         .await
         .unwrap();
 }
 
 async fn materialize(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     identity: &str,
     asset: &str,
     run_id: &str,
@@ -147,7 +145,7 @@ fn run(
 
 #[tokio::test]
 async fn unregistered_location_blocks_eager_until_it_registers() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -190,7 +188,7 @@ async fn unregistered_location_blocks_eager_until_it_registers() {
 
 #[tokio::test]
 async fn resolved_location_supplies_the_owners_record_under_the_local_name() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register_warehouse(&storage, "wh").await;
     register(
         &storage,
@@ -220,7 +218,7 @@ async fn resolved_location_supplies_the_owners_record_under_the_local_name() {
 
 #[tokio::test]
 async fn location_registering_later_resolves_after_the_retry_wait() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
     cache.refresh(&storage, 0).await.unwrap();
 
@@ -241,7 +239,7 @@ async fn location_registering_later_resolves_after_the_retry_wait() {
 
 #[tokio::test]
 async fn identity_change_reloads_the_location() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         "wh-1",
@@ -277,7 +275,7 @@ async fn identity_change_reloads_the_location() {
 
 #[tokio::test]
 async fn two_local_names_can_bind_one_key() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register_warehouse(&storage, "wh").await;
     register(
         &storage,
@@ -300,7 +298,7 @@ async fn two_local_names_can_bind_one_key() {
 
 #[tokio::test]
 async fn partitioned_remote_takes_the_owners_partition_status() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register_warehouse(&storage, "wh").await;
     register(&storage, "wh", vec![make_record("events")]).await;
     materialize(
@@ -352,7 +350,7 @@ async fn partitioned_remote_takes_the_owners_partition_status() {
 
 #[tokio::test]
 async fn unregistered_partitioned_remote_has_no_materialized_partitions() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut cache = cache_with(vec![remote("orders", "events")]);
     cache.set_partitioned_assets(vec!["orders".into()]);
     cache.refresh(&storage, 0).await.unwrap();
@@ -366,7 +364,7 @@ async fn neither_the_owners_runs_nor_a_left_over_local_row_hide_an_update() {
     // `summary`, and a row `orders` is left here from when the asset was
     // local. Neither may make `orders`' last run "include" `summary`, which
     // would hide the owner's update from `any_deps_updated`.
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut left_over = make_materialized_record("orders", 500);
     left_over.last_run_id = Some("run-local".into());
     register(
@@ -424,7 +422,7 @@ async fn neither_the_owners_runs_nor_a_left_over_local_row_hide_an_update() {
 }
 
 /// `warehouse` registered as `wh`, owning `records`.
-async fn warehouse_owning(storage: &SurrealStorage, records: Vec<AssetRecord>) {
+async fn warehouse_owning(storage: &AnyStorage, records: Vec<AssetRecord>) {
     register_warehouse(storage, "wh").await;
     register(storage, "wh", records).await;
 }
@@ -438,7 +436,7 @@ fn in_progress(cache: &AssetConditionCache) -> HashSet<&str> {
 
 #[tokio::test]
 async fn owners_run_is_in_progress_only_for_the_bound_local_until_it_ends() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -487,7 +485,7 @@ async fn owners_run_is_in_progress_only_for_the_bound_local_until_it_ends() {
 
 #[tokio::test]
 async fn owners_run_that_ended_between_ticks_moves_the_record() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(
         &storage,
         vec![make_materialized_record("raw_orders", 1_000)],
@@ -515,7 +513,7 @@ async fn owners_run_that_ended_between_ticks_moves_the_record() {
 
 #[tokio::test]
 async fn deleted_owner_run_stops_counting_as_in_progress() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(
         &storage,
         vec![make_materialized_record("raw_orders", 1_000)],
@@ -549,7 +547,7 @@ async fn deleted_owner_run_stops_counting_as_in_progress() {
 
 #[tokio::test]
 async fn live_run_at_load_is_in_progress() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(
         &storage,
         vec![make_materialized_record("raw_orders", 1_000)],
@@ -592,7 +590,7 @@ async fn live_run_at_load_is_in_progress() {
 
 #[tokio::test]
 async fn owners_failed_run_sets_no_floor_on_same_named_local_assets() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -626,7 +624,7 @@ async fn owners_failed_run_sets_no_floor_on_same_named_local_assets() {
 
 #[tokio::test]
 async fn owners_observation_updates_the_record() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(&storage, vec![make_record("raw_orders")]).await;
     let mut cache = cache_with(vec![remote("orders", "raw_orders")]);
     cache.refresh(&storage, 0).await.unwrap();
@@ -657,7 +655,7 @@ async fn owners_observation_updates_the_record() {
 
 #[tokio::test]
 async fn owners_keyed_live_run_marks_the_partition_in_progress() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(&storage, vec![make_record("events")]).await;
     let mut cache = cache_with(vec![remote("orders", "events")]);
     cache.set_partitioned_assets(vec!["orders".into()]);
@@ -694,7 +692,7 @@ async fn owners_keyed_live_run_marks_the_partition_in_progress() {
 
 #[tokio::test]
 async fn eager_waits_for_the_owners_run_then_fires() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -775,7 +773,7 @@ fn planned_keys(plan: &crate::condition::pass::MaterializationPlan) -> HashSet<S
 async fn eager_maps_the_previous_day_onto_the_owners_partitions() {
     use crate::condition::pass::{PartitionInfo, PartitionUniverse};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -867,7 +865,7 @@ fn failed(cache: &AssetConditionCache) -> HashSet<&str> {
 
 #[tokio::test]
 async fn execution_failed_follows_the_owners_runs() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     register(
         &storage,
         DEFAULT_CODE_LOCATION_ID,
@@ -926,7 +924,7 @@ async fn execution_failed_follows_the_owners_runs() {
 
 #[tokio::test]
 async fn owner_failure_floors_its_key_at_load() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(
         &storage,
         vec![make_materialized_record("raw_orders", 1_000)],
@@ -955,7 +953,7 @@ async fn owner_failure_floors_its_key_at_load() {
 
 #[tokio::test]
 async fn owner_failure_that_materialized_the_key_sets_no_floor() {
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     warehouse_owning(
         &storage,
         vec![make_materialized_record("raw_orders", 1_000)],
@@ -1016,14 +1014,14 @@ mod drift {
     }
 
     /// The warehouse's topology: `owned`, each with its definition.
-    async fn owner_topology(storage: &SurrealStorage, owned: &[(&str, PartitionsFingerprint)]) {
+    async fn owner_topology(storage: &AnyStorage, owned: &[(&str, PartitionsFingerprint)]) {
         write_topology(storage, "wh", owned, &[]).await;
     }
 
     /// `nodes` as the topology of `identity`, each with its definition, and
     /// a key row for each list of `keys`.
     async fn write_topology(
-        storage: &SurrealStorage,
+        storage: &AnyStorage,
         identity: &str,
         nodes: &[(&str, PartitionsFingerprint)],
         keys: &[&[&str]],
@@ -1053,7 +1051,7 @@ mod drift {
     /// code locations decide, once.
     #[tokio::test]
     async fn an_owner_with_more_static_keys_is_compared_by_its_key_rows_once() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(
             &storage,
             vec![
@@ -1119,7 +1117,7 @@ mod drift {
 
     #[tokio::test]
     async fn incompatible_drift_pauses_eager_until_the_definitions_match() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         register(
             &storage,
             DEFAULT_CODE_LOCATION_ID,
@@ -1184,7 +1182,7 @@ mod drift {
 
     #[tokio::test]
     async fn an_updated_mirror_reads_the_owners_record() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(
             &storage,
             vec![make_materialized_record("raw_orders", 1_000)],
@@ -1203,7 +1201,7 @@ mod drift {
 
     #[tokio::test]
     async fn compatible_drift_changes_nothing() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(
             &storage,
             vec![make_materialized_record("raw_orders", 1_000)],
@@ -1228,7 +1226,7 @@ mod drift {
 
     #[tokio::test]
     async fn an_interval_start_moved_off_the_mirrors_grid_counts_as_missing() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(
             &storage,
             vec![make_materialized_record("raw_orders", 1_000)],
@@ -1258,7 +1256,7 @@ mod drift {
 
     #[tokio::test]
     async fn a_key_missing_from_the_owners_topology_counts_as_missing() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(
             &storage,
             vec![make_materialized_record("raw_orders", 1_000)],
@@ -1274,7 +1272,7 @@ mod drift {
 
     #[tokio::test]
     async fn paused_partitioned_remote_has_no_partitions() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(&storage, vec![make_record("events")]).await;
         materialize(
             &storage,
@@ -1312,7 +1310,7 @@ mod drift {
     /// at load and on a later re-read; a paused one between them has none.
     #[tokio::test]
     async fn every_unpaused_local_takes_the_partition_status() {
-        let storage = SurrealStorage::new_memory().await.unwrap();
+        let storage = AnyStorage::new_memory().await.unwrap();
         warehouse_owning(&storage, vec![make_record("events")]).await;
         materialize(
             &storage,

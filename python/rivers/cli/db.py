@@ -6,6 +6,8 @@ import typer
 
 from rivers._core.storage import ProcessStatus, SchemaStatus, Storage
 from rivers.cli._app import db_app
+from rivers.cli._common import _STORAGE_URL_OPT, _SURREAL_ENDPOINT_OPT
+from rivers.cli.config import decide_storage
 from rivers.exceptions import MigrationBlockedError
 
 
@@ -80,16 +82,30 @@ def _status_lines(status: SchemaStatus, now_ns: int) -> list[str]:
     return lines
 
 
+def _migrate_or_list_stopped(migrate, status) -> None:
+    """Run ``migrate``; when it would stop a code location, list those and exit."""
+    try:
+        migrate()
+    except MigrationBlockedError:
+        stopped = [process for process in status().processes if process.stops]
+        for line in _process_table(stopped, time.time_ns()):
+            typer.echo(line, err=True)
+        typer.echo(
+            "\nNot migrated: the migration stops the code locations above. "
+            "Update them to a newer rivers, or migrate with --force.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+
 @db_app.command("status")
 def db_status(
+    ctx: typer.Context,
     storage_path: str = typer.Option(
         ".rivers/storage/", help="Path for embedded storage"
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
 ) -> None:
     """Show the storage schema version and what a migration stops.
 
@@ -97,10 +113,15 @@ def db_status(
     build it runs. A migration to this build stops the code locations it
     marks. The database is not changed.
     """
-    if surreal_endpoint:
-        status = Storage.schema_status_remote(surreal_endpoint)
+    store = decide_storage(
+        ctx, url=storage_url, endpoint=surreal_endpoint, path=storage_path
+    )
+    if store.url:
+        status = Storage.schema_status(store.url)
+    elif store.endpoint:
+        status = Storage.schema_status_remote(store.endpoint)
     else:
-        status = Storage.schema_status_embedded(storage_path)
+        status = Storage.schema_status_embedded(store.path or storage_path)
 
     for line in _status_lines(status, time.time_ns()):
         typer.echo(line)
@@ -108,14 +129,12 @@ def db_status(
 
 @db_app.command("migrate")
 def db_migrate(
+    ctx: typer.Context,
     storage_path: str = typer.Option(
         ".rivers/storage/", help="Path for embedded storage"
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     force: bool = typer.Option(
         False,
         "--force",
@@ -129,24 +148,26 @@ def db_migrate(
     database is already current. Run this after upgrading rivers when a code
     location or the UI reports that the database needs migration.
 
-    A migration of a remote database that stops a code location is refused.
+    A migration of a storage server that stops a code location is refused.
     `rivers db status` lists them; `--force` migrates.
     """
-    target = surreal_endpoint or storage_path
-    if surreal_endpoint:
-        try:
-            Storage.migrate_remote(surreal_endpoint, force=force)
-        except MigrationBlockedError:
-            status = Storage.schema_status_remote(surreal_endpoint)
-            stopped = [process for process in status.processes if process.stops]
-            for line in _process_table(stopped, time.time_ns()):
-                typer.echo(line, err=True)
-            typer.echo(
-                "\nNot migrated: the migration stops the code locations above. "
-                "Update them to a newer rivers, or migrate with --force.",
-                err=True,
-            )
-            raise typer.Exit(1) from None
+    store = decide_storage(
+        ctx, url=storage_url, endpoint=surreal_endpoint, path=storage_path
+    )
+    if url := store.url:
+        _migrate_or_list_stopped(
+            lambda: Storage.migrate(url, force=force),
+            lambda: Storage.schema_status(url),
+        )
+        target = Storage.redact_url(url)
+    elif endpoint := store.endpoint:
+        _migrate_or_list_stopped(
+            lambda: Storage.migrate_remote(endpoint, force=force),
+            lambda: Storage.schema_status_remote(endpoint),
+        )
+        target = Storage.redact_url(endpoint)
     else:
-        Storage.migrate_embedded(storage_path)
+        path = store.path or storage_path
+        Storage.migrate_embedded(path)
+        target = path
     typer.echo(f"Storage schema is up to date ({target}).")

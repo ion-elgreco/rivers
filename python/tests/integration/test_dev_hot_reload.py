@@ -385,7 +385,7 @@ def test_the_child_entry_reports_a_missing_module(tmp_path):
             "RIVERS_DEV_REPO_VAR": "repo",
             "RIVERS_DEV_HOST": "127.0.0.1",
             "RIVERS_DEV_GRPC_PORT": str(free_port()),
-            "RIVERS_SURREAL_ENDPOINT": "ws://127.0.0.1:1",
+            "RIVERS_STORAGE_URL": "ws://127.0.0.1:1",
             "RIVERS_DEV_NO_DAEMON": "1",
         }
     )

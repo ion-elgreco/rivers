@@ -9,6 +9,8 @@ from typer.testing import CliRunner
 import rivers as rs
 from rivers.cli import app
 from rivers.cli._common import _cleanup_storage, _create_storage
+from rivers.cli.config import StorageChoice
+from rivers.exceptions import StorageError
 
 runner = CliRunner()
 
@@ -325,6 +327,92 @@ def test_embedded_storage_persists_data(tmp_path: Path):
     assert Path(path).exists()
 
 
+def test_open_a_memory_url():
+    storage = rs.Storage.open("mem://")
+    assert storage.type == rs.StorageType.Memory
+    storage.kv_set("key", b"value")
+    assert storage.kv_get("key") == b"value"
+
+
+def test_open_a_surrealkv_url(tmp_path: Path):
+    path = tmp_path / "db"
+    storage = rs.Storage.open(f"surrealkv://{path}")
+    assert storage.type == rs.StorageType.Embedded
+    storage.kv_set("key", b"value")
+    assert storage.kv_get("key") == b"value"
+    assert path.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("/var/lib/rivers", "no scheme"),
+        ("mysql://db/rivers", "unknown scheme"),
+        ("mem://localhost", "takes no address"),
+    ],
+)
+def test_open_refuses_a_bad_url(url, message):
+    with pytest.raises(StorageError, match=message):
+        rs.Storage.open(url)
+
+
+def test_a_bad_url_error_hides_the_password():
+    with pytest.raises(StorageError, match="unknown scheme") as error:
+        rs.Storage.open("postgress://rivers:secret@db/rivers")
+    assert "secret" not in str(error.value)
+
+
+def test_a_storage_error_shows_its_cause():
+    with pytest.raises(StorageError) as error:
+        rs.Storage.open("postgres://rivers:secret@db:no-port/rivers")
+    message = str(error.value)
+    assert message.startswith(
+        "parsing the PostgreSQL URL postgres://rivers:***@db:no-port/rivers: "
+    ), message
+    assert "port" in message.split(": ", 1)[1], message
+    assert "secret" not in message
+
+
+def test_migrate_a_surrealkv_url(tmp_path: Path):
+    rs.Storage.migrate(f"surrealkv://{tmp_path / 'db'}")
+    assert (tmp_path / "db").is_dir()
+
+
+def test_schema_status_of_a_surrealkv_url(tmp_path: Path):
+    (tmp_path / "db").mkdir()
+    status = rs.Storage.schema_status(f"surrealkv://{tmp_path / 'db'}")
+    assert status.version is None
+    assert status.processes == []
+
+
+def test_schema_status_of_a_surrealkv_url_needs_a_store(tmp_path: Path):
+    with pytest.raises(StorageError, match="no storage at"):
+        rs.Storage.schema_status(f"surrealkv://{tmp_path / 'missing'}")
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize(
+    ("url", "redacted"),
+    [
+        (
+            "postgres://rivers:secret@db:5432/rivers",
+            "postgres://rivers:***@db:5432/rivers",
+        ),
+        (
+            "postgres://rivers@db/rivers?sslmode=require&password=secret",
+            "postgres://rivers@db/rivers?sslmode=require&password=***",
+        ),
+        ("postgres://db/rivers", "postgres://db/rivers"),
+        ("ws://surrealdb:8000", "ws://surrealdb:8000"),
+        ("surrealkv://.rivers/storage", "surrealkv://.rivers/storage"),
+        ("rivers:secret@db:5432", "rivers:***@db:5432"),
+        ("mysql://rivers:secret@db/rivers", "mysql://rivers:***@db/rivers"),
+    ],
+)
+def test_redact_url_hides_only_the_password(url, redacted):
+    assert rs.Storage.redact_url(url) == redacted
+
+
 def test_cleanup_storage_removes_directory(tmp_path: Path):
     """_cleanup_storage removes the storage directory."""
     storage_path = tmp_path / ".rivers" / "storage"
@@ -366,21 +454,20 @@ def test_cleanup_storage_noop_if_missing(tmp_path: Path):
     _cleanup_storage(str(tmp_path / "nonexistent"))  # Should not raise
 
 
-def test_create_storage_memory():
-    """_create_storage with memory=True returns in-memory storage."""
-    storage, scratch = _create_storage(
-        memory=True, storage_path="unused", surreal_endpoint=None
-    )
+@pytest.mark.parametrize(
+    "store",
+    [StorageChoice(memory=True), StorageChoice(url="mem://")],
+    ids=["flag", "url"],
+)
+def test_create_storage_memory(store):
+    storage, scratch = _create_storage(store)
     assert storage.type == rs.StorageType.Memory
     assert scratch is None
 
 
 def test_create_storage_embedded(tmp_path: Path):
-    """_create_storage with memory=False returns embedded storage."""
     path = str(tmp_path / "db")
-    storage, scratch = _create_storage(
-        memory=False, storage_path=path, surreal_endpoint=None
-    )
+    storage, scratch = _create_storage(StorageChoice(path=path))
     assert storage.type == rs.StorageType.Embedded
     assert Path(path).exists()
     assert scratch is None
@@ -391,9 +478,7 @@ def test_scratch_store_closes_when_the_repository_releases_it(tmp_path, monkeypa
     open, so the repository's release must close it: the same path then
     opens again in this process."""
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    storage, scratch = _create_storage(
-        memory=False, storage_path=None, surreal_endpoint=None
-    )
+    storage, scratch = _create_storage(StorageChoice())
     assert Path(scratch).parent == tmp_path
     storage.kv_set("kept", b"value")
 

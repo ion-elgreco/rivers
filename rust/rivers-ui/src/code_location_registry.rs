@@ -20,7 +20,7 @@ use rivers_api::rivers::code_location_registry_service_client::CodeLocationRegis
 use rivers_api::rivers::code_location_service_client::CodeLocationServiceClient;
 use rivers_api::rivers::{CodeLocationEvent, WatchCodeLocationsRequest};
 use rivers_core::assets::remote::LocationRef;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{CodeLocationDirectoryEntry, StorageBackend};
 use rivers_core::util::now_ts;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ pub enum Registry {
 impl Registry {
     /// Read the code location directory in `storage`. `own` is the code
     /// location this process hosts, listed `Pending` until it reports in.
-    pub fn storage(storage: Arc<SurrealStorage>, own: Option<OwnLocation>) -> Self {
+    pub fn storage(storage: Arc<AnyStorage>, own: Option<OwnLocation>) -> Self {
         Self::Storage(Arc::new(StorageRegistry {
             storage,
             own,
@@ -174,7 +174,7 @@ pub struct OwnLocation {
 
 /// The code location directory in storage, cached for [`STORAGE_REFRESH`].
 pub struct StorageRegistry {
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     own: Option<OwnLocation>,
     cache: Mutex<Option<(Instant, Arc<[CodeLocationEntry]>)>>,
 }
@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_registry_looks_up_seeded_entries() {
-        let storage = Arc::new(SurrealStorage::new_memory().await.unwrap());
+        let storage = Arc::new(AnyStorage::new_memory().await.unwrap());
         storage
             .upsert_code_location_registration(
                 &dev("warehouse"),

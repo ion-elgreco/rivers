@@ -94,7 +94,7 @@ def test_invalid_namespace_or_name_stops_the_command_at_start(
     if command == "serve":
         # A real store, so a check that runs late fails late, not at connect.
         host = DevHost(str(resolved_tmp_path / "serve-storage"))
-        Storage.connect(host.endpoint)
+        Storage.open(host.url)
         args = [
             "serve",
             "serving_mod",
@@ -103,7 +103,7 @@ def test_invalid_namespace_or_name_stops_the_command_at_start(
             "--grpc-port",
             str(free_port()),
             "--surreal-endpoint",
-            host.endpoint,
+            host.url,
             "--no-daemon",
         ]
     else:

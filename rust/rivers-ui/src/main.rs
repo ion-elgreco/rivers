@@ -6,9 +6,12 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use rivers_core::storage::StorageBackend;
-use rivers_core::storage::surrealdb_backend::{Capability, SurrealStorage};
+use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::migration::Capability;
+use rivers_core::storage::url::{StorageUrl, redact_password};
 use rivers_ui::code_location_registry::Registry;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -20,10 +23,15 @@ struct Args {
     #[arg(long, default_value = ".rivers/storage/")]
     storage_path: String,
 
-    /// Connect to a remote SurrealDB instead of embedded storage.
-    /// When set, --storage-path is ignored.
+    /// Connect to a SurrealDB server instead of embedded storage.
     #[arg(long)]
     surreal_endpoint: Option<String>,
+
+    /// Storage URL; its scheme selects the backend (`postgres://`, `ws://`,
+    /// `surrealkv://`). Pass it as the env var, so that its password is not
+    /// in process lists.
+    #[arg(long, env = "RIVERS_STORAGE_URL", hide_env_values = true)]
+    storage_url: Option<String>,
 
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -57,8 +65,78 @@ fn main() {
         .block_on(serve());
 }
 
+/// The store to open. The source decides first: the command line, then the
+/// environment, then the default. Within one source the URL wins over the
+/// endpoint, and the endpoint over the path. A SurrealDB URL takes namespace,
+/// database and credentials from the `RIVERS_SURREAL_*` env vars that the
+/// operator stamps on every rivers pod.
+fn storage_location(
+    args: &Args,
+    url_on_command_line: bool,
+    path_on_command_line: bool,
+) -> Result<StorageUrl, String> {
+    let resolve =
+        |raw: &str| rivers_k8s::env::resolve_storage_url(raw).map_err(|e| format!("{e:#}"));
+    let endpoint = match args.surreal_endpoint.as_deref() {
+        None => None,
+        Some(raw) => match resolve(raw) {
+            Ok(url @ StorageUrl::SurrealRemote(_)) => Some((raw.to_string(), url)),
+            _ => {
+                return Err(format!(
+                    "--surreal-endpoint takes a SurrealDB server (ws://, wss://, http:// or \
+                     https://), not {}; pass any other storage URL with --storage-url",
+                    redact_password(raw)
+                ));
+            }
+        },
+    };
+    let url = match args.storage_url.as_deref() {
+        None => None,
+        Some(raw) => Some((raw.to_string(), resolve(raw)?)),
+    };
+    let path = (
+        format!("surrealkv://{}", args.storage_path),
+        StorageUrl::SurrealEmbedded {
+            path: args.storage_path.clone(),
+        },
+    );
+
+    let on_command_line: Vec<_> = [
+        ("--storage-url", url.clone().filter(|_| url_on_command_line)),
+        ("--surreal-endpoint", endpoint),
+        (
+            "--storage-path",
+            Some(path.clone()).filter(|_| path_on_command_line),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(flag, setting)| Some((flag, setting?)))
+    .collect();
+    if let [(flag, (location, chosen)), rest @ ..] = on_command_line.as_slice() {
+        if let Some((other, _)) = rest.iter().find(|(_, (other, _))| other != location) {
+            return Err(format!(
+                "{flag} and {other} name different stores; pass one of them"
+            ));
+        }
+        return Ok(chosen.clone());
+    }
+    Ok(url.map_or(path.1, |(_, url)| url))
+}
+
 async fn serve() {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let on_command_line = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let url = storage_location(
+        &args,
+        on_command_line("storage_url"),
+        on_command_line("storage_path"),
+    )
+    .unwrap_or_else(|msg| {
+        Args::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, msg)
+            .exit()
+    });
 
     // Default filter mirrors the Python crate (`python/src/lib.rs`) so the
     // standalone UI binary surfaces the same `rivers::*` events that the
@@ -75,47 +153,29 @@ async fn serve() {
         .compact()
         .init();
 
-    let storage = Arc::new(if let Some(ref endpoint) = args.surreal_endpoint {
-        // Build the connect config from the same env vars the operator stamps
-        // on every rivers pod. CLI flag wins for the endpoint (so a developer
-        // can `cargo run` against a local SurrealDB without setting envs);
-        // namespace/database/credentials always come from env.
-        let mut config = rivers_k8s::env::detect_surreal_connect_config();
-        config.endpoint = endpoint.clone();
-        let authenticated = config.credentials.is_some();
-        // The production UI is a read-only storage consumer; writes go through
-        // gRPC to code locations. Open `Read` so a write-breaking migration for
-        // newer writers does not lock the UI out.
-        let storage = SurrealStorage::connect_with_capability(config, Capability::Read)
-            .await
-            .expect("Failed to connect to remote SurrealDB");
-        if let Err(error) = storage
+    let backend = url.backend_name();
+    let location = url.redacted();
+    let remote = url.is_remote();
+    // The production UI is a read-only storage consumer; writes go through
+    // gRPC to code locations. Open `Read` so a write-breaking migration for
+    // newer writers does not lock the UI out.
+    let storage = AnyStorage::open(url, Capability::Read)
+        .await
+        .expect("Failed to open storage");
+    if remote
+        && let Err(error) = storage
             .record_component("ui", false, rivers_core::util::now_ts())
             .await
-        {
-            tracing::warn!(%error, "could not record the UI's build in storage");
-        }
-        tracing::info!(
-            target: "rivers::storage",
-            backend = "remote",
-            endpoint = %endpoint,
-            authenticated,
-            "storage ready"
-        );
-        storage
-    } else {
-        let storage =
-            SurrealStorage::new_embedded_with_capability(&args.storage_path, Capability::Read)
-                .await
-                .expect("Failed to open embedded storage");
-        tracing::info!(
-            target: "rivers::storage",
-            backend = "embedded",
-            path = %args.storage_path,
-            "storage ready"
-        );
-        storage
-    });
+    {
+        tracing::warn!(%error, "could not record the UI's build in storage");
+    }
+    tracing::info!(
+        target: "rivers::storage",
+        backend,
+        %location,
+        "storage ready"
+    );
+    let storage = Arc::new(storage);
 
     // Synthetic mode is a developer override that pins a fixed graph for
     // every code location. In production the standalone UI is multi-CL
@@ -163,4 +223,78 @@ async fn serve() {
     )
     .await
     .expect("Server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "postgres://rivers:secret@db/rivers";
+
+    /// `env_url`: a `RIVERS_STORAGE_URL` from the environment.
+    fn location(cli: &[&str], env_url: Option<&str>) -> Result<StorageUrl, String> {
+        let matches = Args::command()
+            .try_get_matches_from(std::iter::once("rivers-ui").chain(cli.iter().copied()))
+            .unwrap();
+        let mut args = Args::from_arg_matches(&matches).unwrap();
+        let on_command_line = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        let url_on_command_line = on_command_line("storage_url");
+        if !url_on_command_line {
+            args.storage_url = env_url.map(str::to_string);
+        }
+        storage_location(&args, url_on_command_line, on_command_line("storage_path"))
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_url_of_the_environment() {
+        let endpoint = location(&["--surreal-endpoint", "ws://surrealdb:8000"], Some(URL)).unwrap();
+        assert_eq!(endpoint.redacted(), "ws://surrealdb:8000");
+        let path = location(&["--storage-path", "/data/rivers"], Some(URL)).unwrap();
+        assert_eq!(path.redacted(), "surrealkv:///data/rivers");
+        assert_eq!(
+            location(&[], Some(URL)).unwrap().backend_name(),
+            "PostgreSQL"
+        );
+    }
+
+    #[test]
+    fn within_the_command_line_the_url_wins_unless_the_flags_name_different_stores() {
+        let err = location(
+            &[
+                "--storage-url",
+                URL,
+                "--surreal-endpoint",
+                "ws://surrealdb:8000",
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "--storage-url and --surreal-endpoint name different stores; pass one of them"
+        );
+        let same = location(
+            &[
+                "--storage-url",
+                "ws://surrealdb:8000",
+                "--surreal-endpoint",
+                "ws://surrealdb:8000",
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(same.redacted(), "ws://surrealdb:8000");
+    }
+
+    #[test]
+    fn the_endpoint_takes_only_a_surrealdb_server() {
+        let err = location(&["--surreal-endpoint", URL], None).unwrap_err();
+        assert!(
+            err.contains("--surreal-endpoint takes a SurrealDB server"),
+            "{err}"
+        );
+        assert!(err.contains("postgres://rivers:***@db/rivers"), "{err}");
+        assert!(err.contains("--storage-url"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+    }
 }

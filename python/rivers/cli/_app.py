@@ -2,7 +2,7 @@ from pathlib import Path
 
 import typer
 
-from rivers.cli.config import RiversConfig
+from rivers.cli.config import SETTING_NAMES, RiversConfig
 
 app = typer.Typer(name="rivers", help="rivers orchestration CLI")
 pools_app = typer.Typer(name="pools", help="Inspect and manage concurrency pools")
@@ -26,4 +26,6 @@ def _load_config(
         return
 
     ctx.obj = config
-    ctx.default_map = RiversConfig.from_cli(config=config).default_map(ctx.command)
+    cfg = RiversConfig.from_cli(config=config)
+    ctx.default_map = cfg.default_map(ctx.command)
+    ctx.meta[SETTING_NAMES] = cfg.setting_names()

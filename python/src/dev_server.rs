@@ -1,6 +1,6 @@
 //! Host side of `rivers dev`: the embedded SurrealDB server that the UI and
-//! the code-location child connect to over loopback, the UI server, and the
-//! supervisor of the code-location child.
+//! the code-location child connect to over loopback (or the storage server
+//! they share), the UI server, and the supervisor of the code-location child.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,6 +8,7 @@ use std::time::Duration;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rivers_core::storage::surrealdb_backend::StoreWrittenBySurrealDb3;
+use rivers_core::storage::url::StorageUrl;
 use tokio_util::sync::CancellationToken;
 
 use crate::dev_supervisor::{ChildSpec, Outcome, Supervisor};
@@ -32,55 +33,63 @@ pub struct PyDevHost {
     storage: Mutex<Option<storage_server::StorageServer>>,
     ui: Mutex<Option<UiServer>>,
     supervisor: Mutex<Option<Supervisor>>,
-    /// Where every process of this session finds storage: the embedded
-    /// server, or the external one the host was pointed at.
-    endpoint: String,
+    /// Where every process of this session finds storage, as a storage URL:
+    /// the embedded server, or the server the host was pointed at.
+    url: String,
+}
+
+impl PyDevHost {
+    fn new_with(storage: Option<storage_server::StorageServer>, url: String) -> Self {
+        Self {
+            storage: Mutex::new(storage),
+            ui: Mutex::new(None),
+            supervisor: Mutex::new(None),
+            url,
+        }
+    }
 }
 
 #[pymethods]
 impl PyDevHost {
-    /// An `endpoint` wins over a `storage_path`: nothing is served then.
+    /// A `url` wins over a `storage_path`. Only a local store is served: a
+    /// `surrealkv://` URL like a path; a server is used as it is.
     #[new]
-    #[pyo3(signature = (storage_path=None, endpoint=None))]
-    fn new(
-        py: Python<'_>,
-        storage_path: Option<String>,
-        endpoint: Option<String>,
-    ) -> PyResult<Self> {
-        let (storage, endpoint) = match (endpoint, storage_path) {
-            (Some(endpoint), _) => (None, endpoint),
-            (None, None) => {
-                return Err(PyValueError::new_err(
-                    "pass a storage path to serve, or the endpoint of a SurrealDB server",
-                ));
-            }
-            (None, Some(path)) => {
-                std::fs::create_dir_all(&path).map_err(|e| {
-                    PyRuntimeError::new_err(format!("failed to create storage dir: {e}"))
-                })?;
-                let (server, addr) = py.detach(|| storage_server::start(&path)).map_err(|e| {
-                    if e.is::<StoreWrittenBySurrealDb3>() {
-                        return crate::storage::to_py_err(e);
-                    }
-                    PyRuntimeError::new_err(format!(
-                        "embedded storage server failed to start: {e:#}"
-                    ))
-                })?;
-                (Some(server), format!("ws://{addr}"))
-            }
+    #[pyo3(signature = (storage_path=None, url=None))]
+    fn new(py: Python<'_>, storage_path: Option<String>, url: Option<String>) -> PyResult<Self> {
+        let path = match url {
+            None => storage_path,
+            Some(raw) => match raw.parse::<StorageUrl>() {
+                Ok(StorageUrl::SurrealEmbedded { path }) => Some(path),
+                Ok(StorageUrl::SurrealMemory) => {
+                    return Err(PyValueError::new_err(
+                        "the code location of rivers dev runs in another process, which cannot \
+                         reach an in-memory store; pass a path or the URL of a server",
+                    ));
+                }
+                Ok(StorageUrl::SurrealRemote(_) | StorageUrl::Postgres { .. }) => {
+                    return Ok(Self::new_with(None, raw));
+                }
+                Err(e) => return Err(PyValueError::new_err(format!("{e:#}"))),
+            },
         };
-        Ok(Self {
-            storage: Mutex::new(storage),
-            ui: Mutex::new(None),
-            supervisor: Mutex::new(None),
-            endpoint,
-        })
+        let path = path.ok_or_else(|| {
+            PyValueError::new_err("pass a storage path to serve, or the URL of a storage server")
+        })?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create storage dir: {e}")))?;
+        let (server, addr) = py.detach(|| storage_server::start(&path)).map_err(|e| {
+            if e.is::<StoreWrittenBySurrealDb3>() {
+                return crate::storage::to_py_err(e);
+            }
+            PyRuntimeError::new_err(format!("embedded storage server failed to start: {e:#}"))
+        })?;
+        Ok(Self::new_with(Some(server), format!("ws://{addr}")))
     }
 
-    /// The SurrealDB endpoint of this session.
+    /// The storage URL of this session.
     #[getter]
-    fn endpoint(&self) -> String {
-        self.endpoint.clone()
+    fn url(&self) -> String {
+        self.url.clone()
     }
 
     #[pyo3(signature = (storage, host, port, synthetic=None))]
@@ -151,7 +160,7 @@ impl PyDevHost {
             repo_var,
             host,
             grpc_port,
-            endpoint: self.endpoint.clone(),
+            storage_url: self.url.clone(),
             no_daemon,
         });
         let outcome = py.detach(|| rt().block_on(supervisor.start()));
@@ -399,8 +408,6 @@ mod storage_server {
     }
 
     pub(super) fn start(_path: &str) -> Result<(StorageServer, SocketAddr)> {
-        anyhow::bail!(
-            "this build of rivers has no embedded storage server; pass --surreal-endpoint"
-        )
+        anyhow::bail!("this build of rivers has no embedded storage server; pass --storage-url")
     }
 }

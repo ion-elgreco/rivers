@@ -1,14 +1,15 @@
 use super::*;
+use crate::storage::PerCodeLocationStorage;
 
 #[tokio::test]
 async fn test_cache_detects_in_progress_completion_as_change() {
     // a → b, both materialized; a run re-materializes a. Tick 1 detects Started (a in-progress);
     // Tick 2 a completes → cache.refresh must return true so b's eval isn't skipped.
 
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
 
     // Register assets
     let rec_a = make_materialized_record("a", 1000);
@@ -31,10 +32,7 @@ async fn test_cache_detects_in_progress_completion_as_change() {
         edges: vec![("b".to_string(), "a".to_string())],
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(crate::storage::DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
+        .set_graph_topology(crate::storage::DEFAULT_CODE_LOCATION_ID, &topo, &[])
         .await
         .unwrap();
 
@@ -130,13 +128,13 @@ async fn test_cache_keeps_sibling_backfill_runs_in_progress_on_partial_completio
     // completes, refresh must clear only that run — wiping the whole asset reopens
     // the dispatch gate for still-running siblings.
 
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
         StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
 
     // Downstream asset with a baseline materialization.
@@ -238,10 +236,10 @@ async fn test_observation_committing_after_load_is_still_seen() {
     // observation stamped before daemon start whose write commits only after
     // the initial load must still trigger a refresh (re-processing is an
     // idempotent record re-fetch).
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -299,10 +297,10 @@ async fn test_steady_state_observation_cursor_trails_like_initial_load() {
     // V-12: the steady-state refresh observation cursor must trail the newest
     // stamp by 1 (like the run cursor and the initial-load cursor), or a
     // co-timestamped observation committing after a refresh is lost forever.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -365,13 +363,13 @@ async fn test_incremental_partition_refresh_keeps_equal_timestamp_partitions() {
     // row lands in a later refresh with a timestamp EQUAL to the cache's
     // current max must still be picked up — the incremental cursor has to
     // trail the max like the run cursor does, not query strictly past it.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
         StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -495,13 +493,13 @@ async fn test_cache_completion_fallback_skips_still_started_sibling_effects() {
     // siblings — applying a still-running run's effects would record its incomplete
     // tags as that partition's last-run tags prematurely.
 
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, PartitionKey, RunRecord, RunStatus,
         StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let ctx = crate::storage::CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
     storage
         .for_code_location(&ctx)
@@ -586,10 +584,10 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
     // (last_timestamp unchanged). The in-progress check must also detect the
     // Started→Success status change and clear a, or b never fires.
 
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
 
     // Register assets with same timestamp
     let rec_a = make_materialized_record("a", 1000);
@@ -612,10 +610,7 @@ async fn test_cache_clears_in_progress_when_run_succeeds_but_timestamp_unchanged
         edges: vec![("b".to_string(), "a".to_string())],
     };
     storage
-        .kv_set(
-            &crate::graph_topology_key(crate::storage::DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&topo).unwrap(),
-        )
+        .set_graph_topology(crate::storage::DEFAULT_CODE_LOCATION_ID, &topo, &[])
         .await
         .unwrap();
 
@@ -692,12 +687,12 @@ async fn test_step_success_clears_floor_for_lagging_record_in_joint_failed_run()
     // A joint run R=[x,y] fails on y but x materialized (StepSuccess); with x's record
     // write lagging, the step-completion fallback must treat x as materialized-here
     // (no floor) while y (StepFailure) is floored.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -789,12 +784,12 @@ async fn test_failed_joint_run_step_success_records_tick_tags() {
     // materialized its asset, so HasRunWithTags/AllRunsHaveTags must see the
     // run's tags for that asset on the tick it materialized. y (StepFailure)
     // must contribute nothing.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -891,10 +886,10 @@ async fn test_cache_clears_in_progress_when_run_canceled_after_cursor_advanced()
     // A run reported once advances the cursor past its start_time; a later CANCEL changes
     // neither the record nor start_time, so get_runs_since (`>`) never re-delivers it.
     // The cache must re-check tracked in-progress runs by id so a missed terminal transition still clears them.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
 
     let rec_a = make_materialized_record("a", 1000);
     storage
@@ -963,10 +958,10 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
     // registered via register_dispatched_run) must be tracked as in-flight and
     // its completion effects applied, even though the cursor advances past its
     // immutable start_time on first sight.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let rec_a = make_materialized_record("a", 1000);
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
@@ -1051,10 +1046,10 @@ async fn test_queued_run_from_scheduler_is_tracked_and_applies_effects() {
 async fn test_initial_load_tracks_queued_and_not_started_runs() {
     // Runs alive as Queued/NotStarted at daemon restart must be reloaded into
     // in-flight tracking; loading only Started runs re-dispatches their assets.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let recs = vec![
         make_materialized_record("a", 1000),
         make_materialized_record("b", 1000),
@@ -1128,10 +1123,10 @@ async fn test_initial_load_tracks_queued_and_not_started_runs() {
 async fn test_foreign_code_location_observations_do_not_clear_in_flight() {
     // Code locations can share one SurrealDB; another location observing a
     // SAME-NAMED asset must not wipe this location's in-flight run tracking.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{EventRecord, EventType, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let rec_x = make_materialized_record("x", 1000);
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new("cl-a"))
@@ -1193,13 +1188,13 @@ async fn test_backfill_terminal_clears_predispatch_placeholder() {
     // A backfill-shaped dispatch inserts an empty in-flight placeholder; when
     // the backfill ends without any observed sub-run (e.g. canceled before its
     // first wave) the asset must not stay in-flight forever.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         BackfillFailurePolicy, BackfillRecord, BackfillStatus, BackfillStrategy,
         DEFAULT_CODE_LOCATION_ID, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let rec_p = make_materialized_record("P", 1000);
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
@@ -1268,10 +1263,10 @@ async fn test_joint_partitioned_run_updates_unpartitioned_assets_scalar_tags() {
     // A partition-keyed joint run spanning a partitioned and an unpartitioned
     // asset must write the unpartitioned asset's tags into the SCALAR maps the
     // unpartitioned eval path reads — not only into the partition maps.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut rec_p = make_materialized_record("P", 1000);
     rec_p.last_run_id = Some("run-joint".to_string());
     let mut rec_d = make_materialized_record("D", 1000);
@@ -1340,10 +1335,10 @@ async fn test_two_partition_runs_same_asset_both_update_slots() {
     // V-14: when two runs of the SAME partitioned asset (different partitions)
     // complete within one refresh, both partition slots must get their tags —
     // not just the newest run the scalar record.last_run_id credits.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut rec_p = make_materialized_record("P", 1000);
     rec_p.last_run_id = Some("R2".to_string()); // scalar credits only the newest
     storage
@@ -1420,12 +1415,12 @@ async fn test_in_progress_partition_keys_expands_batched_members() {
     // V-15: a run over a batched multi-member key (single_run backfill bundle_keys
     // or a manual multi-key materialize) must mark each MEMBER partition in
     // progress, not the composite key that select_in_universe would drop.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, PartitionKey, RunRecord, RunStatus, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -1476,10 +1471,10 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
     // LastExecutedWithTags reflects the latest run that MATERIALIZED the
     // asset; a later run that failed without materializing it must not
     // overwrite the tags (and must match what a restart rebuilds).
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut rec_a = make_materialized_record("A", 1000);
     rec_a.last_run_id = Some("r1".to_string());
     storage
@@ -1558,10 +1553,10 @@ async fn test_failed_run_does_not_clobber_latest_materializing_tags() {
 async fn test_later_finishing_run_keeps_latest_tags() {
     // Overlapping runs: once the later-finishing materializing run's tags are
     // recorded, an earlier-finishing run applied afterwards must not win.
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{DEFAULT_CODE_LOCATION_ID, RunRecord, RunStatus, StorageBackend};
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     let mut rec_x = make_materialized_record("X", 1000);
     rec_x.last_run_id = Some("run-a".to_string());
     storage
@@ -1629,9 +1624,9 @@ async fn test_later_finishing_run_keeps_latest_tags() {
 }
 
 /// Helper: memory-backed storage with `a` and `b` registered at `ts`, `b` depending on `a`.
-async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealStorage {
-    use crate::storage::surrealdb_backend::SurrealStorage;
-    let storage = SurrealStorage::new_memory().await.unwrap();
+async fn race_test_setup(ts: i64) -> crate::storage::any::AnyStorage {
+    use crate::storage::any::AnyStorage;
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,
@@ -1643,9 +1638,9 @@ async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealS
         .await
         .unwrap();
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&GraphTopology {
+        .set_graph_topology(
+            DEFAULT_CODE_LOCATION_ID,
+            &GraphTopology {
                 nodes: vec![
                     crate::assets::graph::TopologyNode::new(
                         "a",
@@ -1657,8 +1652,8 @@ async fn race_test_setup(ts: i64) -> crate::storage::surrealdb_backend::SurrealS
                     ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
-            })
-            .unwrap(),
+            },
+            &[],
         )
         .await
         .unwrap();
@@ -1719,8 +1714,8 @@ async fn test_cursor_backoff_doesnt_duplicate_in_progress_entries() {
 /// last, as `LastRunIncludesTarget` needs.
 #[tokio::test]
 async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
-    use crate::storage::surrealdb_backend::SurrealStorage;
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    use crate::storage::any::AnyStorage;
+    let storage = AnyStorage::new_memory().await.unwrap();
 
     // Older "manual bulk" run materializes [a,b]; stamp it on both records so initial_load picks up its state.
     storage
@@ -1739,9 +1734,9 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
         .await
         .unwrap();
     storage
-        .kv_set(
-            &crate::graph_topology_key(DEFAULT_CODE_LOCATION_ID),
-            &serde_json::to_vec(&GraphTopology {
+        .set_graph_topology(
+            DEFAULT_CODE_LOCATION_ID,
+            &GraphTopology {
                 nodes: vec![
                     crate::assets::graph::TopologyNode::new(
                         "a",
@@ -1753,8 +1748,8 @@ async fn test_asc_iteration_makes_newest_run_win_per_asset_state() {
                     ),
                 ],
                 edges: vec![("b".to_string(), "a".to_string())],
-            })
-            .unwrap(),
+            },
+            &[],
         )
         .await
         .unwrap();
@@ -1898,12 +1893,12 @@ async fn test_completed_run_invalidates_event_less_partitioned_sibling() {
     // Joint keyed run R=[x,y] over p: x materializes p (R enters completed_run_ids), y dies
     // event-less. The completed_run_ids path handles R and must invalidate y so its partition
     // failure (run-status union) reaches partition_status[y].
-    use crate::storage::surrealdb_backend::SurrealStorage;
+    use crate::storage::any::AnyStorage;
     use crate::storage::{
         DEFAULT_CODE_LOCATION_ID, EventRecord, EventType, RunRecord, RunStatus, StorageBackend,
     };
 
-    let storage = SurrealStorage::new_memory().await.unwrap();
+    let storage = AnyStorage::new_memory().await.unwrap();
     storage
         .for_code_location(&crate::storage::CodeLocationContext::new(
             DEFAULT_CODE_LOCATION_ID,

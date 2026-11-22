@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use rivers_core::storage::ScopedStorageHandle;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use tracing::Instrument;
 
 use super::parse::{extract_sensor_outcome_from_parts, extract_tick_outcome_from_parts};
@@ -50,14 +50,14 @@ pub(crate) struct EvalDispatcher {
     /// `setup()` them before invoking the eval function.
     resources: Arc<HashMap<String, Py<PyAny>>>,
     /// Run-status sensors read finished runs from storage before they call Python.
-    handle: ScopedStorageHandle<SurrealStorage>,
+    handle: ScopedStorageHandle<AnyStorage>,
 }
 
 impl EvalDispatcher {
     pub(crate) fn new(
         loky_executor: Option<Arc<Py<PyAny>>>,
         resources: Arc<HashMap<String, Py<PyAny>>>,
-        handle: ScopedStorageHandle<SurrealStorage>,
+        handle: ScopedStorageHandle<AnyStorage>,
     ) -> Self {
         Self {
             loky_executor,

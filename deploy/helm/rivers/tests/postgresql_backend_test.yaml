@@ -1,0 +1,188 @@
+suite: external PostgreSQL storage
+templates:
+  - templates/operator-deployment.yaml
+  - templates/ui-deployment.yaml
+  - templates/db-migrate-job.yaml
+  - templates/surrealdb-auth-secret.yaml
+  - templates/surrealdb-bootstrap-secret.yaml
+  - templates/surrealdb-setup-secret.yaml
+  - templates/surrealdb-user-job.yaml
+  - templates/NOTES.txt
+release:
+  name: rivers
+  namespace: rivers
+tests:
+  - it: hands the operator the URL as a secretKeyRef, with the Secret coordinates for its pods
+    set:
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+    asserts:
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            valueFrom:
+              secretKeyRef:
+                name: rivers-postgresql
+                key: url
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL_SECRET_NAME
+            value: rivers-postgresql
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL_SECRET_KEY
+            value: url
+      - template: templates/operator-deployment.yaml
+        notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_NAMESPACE
+            value: rivers
+      - template: templates/operator-deployment.yaml
+        notExists:
+          path: spec.template.spec.initContainers
+
+  - it: opens the UI from the URL, without a SurrealDB endpoint or readiness wait
+    set:
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+    asserts:
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_STORAGE_URL
+            valueFrom:
+              secretKeyRef:
+                name: rivers-postgresql
+                key: url
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--surreal-endpoint"
+      - template: templates/ui-deployment.yaml
+        documentIndex: 0
+        notExists:
+          path: spec.template.spec.initContainers
+
+  - it: migrates the database the URL names
+    set:
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+      postgresql.secretKey: dsn
+      migration.enabled: true
+    asserts:
+      - template: templates/db-migrate-job.yaml
+        equal:
+          path: spec.template.spec.containers[0].args
+          value: ["db", "migrate"]
+      - template: templates/db-migrate-job.yaml
+        equal:
+          path: spec.template.spec.containers[0].env
+          value:
+            - name: RIVERS_STORAGE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rivers-postgresql
+                  key: dsn
+            - name: RIVERS_STORAGE_URL_SECRET_NAME
+              value: rivers-postgresql
+            - name: RIVERS_STORAGE_URL_SECRET_KEY
+              value: dsn
+
+  - it: renders no SurrealDB Secret or user Job, even with SurrealDB credentials left in the values
+    set:
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+      surrealdb.auth.username: rivers
+      surrealdb.auth.password: x
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-bootstrap-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-setup-secret.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/surrealdb-user-job.yaml
+        hasDocuments:
+          count: 0
+
+  - it: names the Secret of the URL in the install notes
+    set:
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+    asserts:
+      - template: templates/NOTES.txt
+        matchRegexRaw:
+          pattern: "PostgreSQL server whose URL is in Secret\\s+`rivers-postgresql`, key `url`"
+      - template: templates/NOTES.txt
+        notMatchRegexRaw:
+          pattern: SurrealDB
+
+  # Helm reports the first template that fails. With the UI off, that is the
+  # SurrealDB auth Secret, which checks the storage settings first.
+  - it: fails rather than install the bundled SurrealDB beside PostgreSQL
+    set:
+      ui.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        failedTemplate:
+          errorPattern: "set surrealdb.enabled=false"
+
+  - it: fails when an external SurrealDB endpoint is also set
+    set:
+      ui.enabled: false
+      surrealdb.enabled: false
+      surrealdb.endpoint: ws://surreal.example.com:8000
+      postgresql.existingSecret: rivers-postgresql
+    asserts:
+      - template: templates/surrealdb-auth-secret.yaml
+        failedTemplate:
+          errorPattern: "postgresql.existingSecret and surrealdb.endpoint are mutually exclusive"
+
+  - it: fails on an empty secretKey
+    set:
+      ui.enabled: false
+      surrealdb.enabled: false
+      postgresql.existingSecret: rivers-postgresql
+      postgresql.secretKey: ""
+    asserts:
+      - template: templates/operator-deployment.yaml
+        failedTemplate:
+          errorPattern: "postgresql.secretKey must be set"
+
+  # `helm upgrade --reuse-values` from a release made before the
+  # `postgresql` values: the key is missing.
+  - it: renders a release whose values have no postgresql key
+    set:
+      postgresql: null
+      migration.enabled: true
+    asserts:
+      - template: templates/operator-deployment.yaml
+        notFailedTemplate: {}
+      - template: templates/operator-deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RIVERS_SURREAL_ENDPOINT
+            value: ws://surrealdb.rivers.svc:8000
+      - template: templates/ui-deployment.yaml
+        notFailedTemplate: {}
+      - template: templates/db-migrate-job.yaml
+        notFailedTemplate: {}
+      - template: templates/surrealdb-auth-secret.yaml
+        notFailedTemplate: {}
+      - template: templates/NOTES.txt
+        notFailedTemplate: {}

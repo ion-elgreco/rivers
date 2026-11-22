@@ -29,6 +29,23 @@ ghcr.io/ion-elgreco/rivers-runtime:{{ .Chart.AppVersion }}-py{{ .Values.codeLoca
 {{- end -}}
 {{- end -}}
 
+{{/*
+Non-empty when an external PostgreSQL is the storage backend. Fails on
+settings that would install or point at a SurrealDB beside it. A release
+made before the `postgresql` values has none (`helm upgrade --reuse-values`).
+*/}}
+{{- define "rivers.usePostgres" -}}
+{{- if (.Values.postgresql | default dict).existingSecret -}}
+{{- if .Values.surrealdb.enabled -}}
+{{ fail "postgresql.existingSecret selects PostgreSQL; set surrealdb.enabled=false so the bundled SurrealDB is not installed beside it" }}
+{{- end -}}
+{{- if .Values.surrealdb.endpoint -}}
+{{ fail "postgresql.existingSecret and surrealdb.endpoint are mutually exclusive — pick one storage backend." }}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "rivers.surrealEndpoint" -}}
 {{- if .Values.surrealdb.enabled -}}
 ws://surrealdb.{{ include "rivers.namespace" . }}.svc:{{ .Values.surrealdb.service.port }}
@@ -82,8 +99,10 @@ user supplied creds. Otherwise rivers connects without `signin`, suitable
 for `surreal start --unauthenticated`.
 */}}
 {{- define "rivers.surrealAuthRequested" -}}
+{{- if not (include "rivers.usePostgres" .) -}}
 {{- if or .Values.surrealdb.enabled .Values.surrealdb.auth.existingSecret (and .Values.surrealdb.auth.username .Values.surrealdb.auth.password) -}}
 true
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -201,6 +220,29 @@ downstream are only added when auth is requested.
 - name: RIVERS_SURREAL_AUTH_PASSWORD_KEY
   value: {{ .Values.surrealdb.auth.secretKeys.password | quote }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Storage connection env stamped on every rivers pod. A PostgreSQL URL holds
+its password, so it reaches pods only as a secretKeyRef; the Secret
+coordinates let the operator and run pods hand the same reference on to the
+pods they start.
+*/}}
+{{- define "rivers.storageEnv" -}}
+{{- if include "rivers.usePostgres" . -}}
+{{- $pg := .Values.postgresql -}}
+- name: RIVERS_STORAGE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ $pg.existingSecret }}
+      key: {{ required "postgresql.secretKey must be set when postgresql.existingSecret is" $pg.secretKey | quote }}
+- name: RIVERS_STORAGE_URL_SECRET_NAME
+  value: {{ $pg.existingSecret | quote }}
+- name: RIVERS_STORAGE_URL_SECRET_KEY
+  value: {{ $pg.secretKey | quote }}
+{{- else -}}
+{{ include "rivers.surrealEnv" . }}
+{{- end -}}
 {{- end -}}
 
 {{/*

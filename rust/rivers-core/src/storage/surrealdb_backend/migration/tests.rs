@@ -1,5 +1,8 @@
 use super::super::*;
 use super::*;
+use crate::storage::migration::{
+    BUILD_STAMPS, MIN_READER, MIN_WRITER, MigrationBlocked, SchemaMigrationNeeded, migration_stops,
+};
 use crate::storage::{
     BackfillRecord, BackfillRunOutcome, BackfillStatus, PartitionKey, RunStatus,
     UnstartedBackfillRun,

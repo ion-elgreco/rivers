@@ -58,11 +58,21 @@ def storage(monkeypatch):
     kinds = (
         "schema_status_embedded",
         "schema_status_remote",
+        "schema_status",
         "migrate_embedded",
         "migrate_remote",
+        "migrate",
     )
     monkeypatch.setattr(
-        "rivers.cli.db.Storage", type("_Storage", (), {k: record(k) for k in kinds})
+        "rivers.cli.db.Storage",
+        type(
+            "_Storage",
+            (),
+            {
+                **{k: record(k) for k in kinds},
+                "redact_url": staticmethod(rs.Storage.redact_url),
+            },
+        ),
     )
     monkeypatch.setattr("rivers.cli.db.time.time_ns", lambda: NOW_NS)
     return stub
@@ -134,6 +144,70 @@ def test_status_reads_a_remote_database(storage):
 
     assert result.exit_code == 0, result.output
     assert storage.calls == [("schema_status_remote", "ws://db:8000", {})]
+
+
+URL = "postgres://rivers:secret@db/rivers"
+
+
+@pytest.mark.parametrize("via", ["flag", "env"])
+def test_status_reads_a_storage_url(storage, monkeypatch, via):
+    args = ["db", "status"]
+    if via == "flag":
+        args += ["--storage-url", URL]
+    else:
+        monkeypatch.setenv("RIVERS_STORAGE_URL", URL)
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("schema_status", URL, {})]
+
+
+def test_an_endpoint_flag_wins_over_the_url_of_the_environment(storage, monkeypatch):
+    monkeypatch.setenv("RIVERS_STORAGE_URL", URL)
+
+    result = runner.invoke(app, ["db", "status", "--surreal-endpoint", "ws://db:8000"])
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("schema_status_remote", "ws://db:8000", {})]
+
+
+def test_migrate_a_storage_url(storage):
+    result = runner.invoke(app, ["db", "migrate", "--storage-url", URL])
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("migrate", URL, {"force": False})]
+    assert (
+        "Storage schema is up to date (postgres://rivers:***@db/rivers)."
+        in result.output
+    )
+    assert "secret" not in result.output
+
+
+def test_migrate_a_storage_url_refuses_to_stop_a_process(storage):
+    storage.blocked = True
+    storage.status = _status(
+        processes=[_process("rivers/billing", schema_version=12, stops=True)]
+    )
+
+    result = runner.invoke(app, ["db", "migrate", "--storage-url", URL])
+
+    assert result.exit_code == 1, result.output
+    assert storage.calls == [
+        ("migrate", URL, {"force": False}),
+        ("schema_status", URL, {}),
+    ]
+    assert "rivers/billing  code location  12" in result.output
+    assert "migrate with --force" in result.output
+
+
+def test_migrate_a_storage_url_with_force(storage):
+    storage.blocked = True
+
+    result = runner.invoke(app, ["db", "migrate", "--storage-url", URL, "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert storage.calls == [("migrate", URL, {"force": True})]
 
 
 def test_schema_status_embedded_leaves_an_empty_store_alone(resolved_tmp_path):

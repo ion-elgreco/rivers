@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::execution::plan::{ExecutionPlan, ExecutionStep};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{AssetScope, ScopedStorageHandle};
 use tokio::sync::mpsc;
 
@@ -102,7 +102,7 @@ impl<'a> RunState<'a> {
 /// Event/storage I/O sink — where step lifecycle events go.
 pub(crate) struct EventSink<'a> {
     pub writer: &'a EventWriter,
-    pub storage: &'a ScopedStorageHandle<SurrealStorage>,
+    pub storage: &'a ScopedStorageHandle<AnyStorage>,
 }
 
 /// Resolved repository data + execution scope (read-only deps).

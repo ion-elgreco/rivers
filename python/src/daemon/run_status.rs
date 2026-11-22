@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use rivers_core::sensor::RunStatusCursor;
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{RunStatus, ScopedStorageHandle, StorageBackend};
 
 use super::eval_dispatcher::{build_resource_specs, wait_loky_result};
@@ -26,7 +26,7 @@ pub(crate) struct RunStatusSpec {
 
 /// The runs not handled yet, with their failure detail, and the cursor past them.
 async fn fetch(
-    handle: &ScopedStorageHandle<SurrealStorage>,
+    handle: &ScopedStorageHandle<AnyStorage>,
     spec: &RunStatusSpec,
     cursor: RunStatusCursor,
 ) -> anyhow::Result<(RunStatusCursor, Vec<RunStatusEvent>)> {
@@ -62,7 +62,7 @@ pub(super) async fn evaluate(
     params: &EvalParams,
     spec: &RunStatusSpec,
     cursor: Option<&str>,
-    handle: &ScopedStorageHandle<SurrealStorage>,
+    handle: &ScopedStorageHandle<AnyStorage>,
     loky: Option<&Arc<Py<PyAny>>>,
     resources: &Arc<HashMap<String, Py<PyAny>>>,
 ) -> Result<EvalOutcome, String> {

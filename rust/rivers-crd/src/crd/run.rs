@@ -72,9 +72,6 @@ pub struct RunSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 
-    #[serde(default = "default_surreal_endpoint")]
-    pub surreal_endpoint: String,
-
     /// Which executor backend runs the steps. `kubernetes` (default) launches
     /// per-step pods; `parallel` runs in worker subprocesses inside the
     /// executor pod; `in_process` runs them in-thread (mostly for tests).
@@ -362,9 +359,6 @@ fn preserve_unknown_object_schema(_gen: &mut SchemaGenerator) -> Schema {
 fn default_module() -> String {
     crate::defaults::MODULE.to_string()
 }
-fn default_surreal_endpoint() -> String {
-    crate::defaults::SURREAL_ENDPOINT.to_string()
-}
 fn default_max_restarts() -> u32 {
     crate::defaults::MAX_RESTARTS
 }
@@ -411,7 +405,6 @@ mod tests {
         assert_eq!(spec.image, "my-image:latest");
         assert_eq!(spec.target, "asset_a,asset_b");
         assert_eq!(spec.module, defaults::MODULE);
-        assert_eq!(spec.surreal_endpoint, defaults::SURREAL_ENDPOINT);
         assert_eq!(spec.executor, Executor::Kubernetes);
         assert_eq!(spec.max_restarts, defaults::MAX_RESTARTS);
         assert_eq!(
@@ -431,12 +424,26 @@ mod tests {
     }
 
     #[test]
+    fn a_run_from_before_the_endpoint_field_was_removed_still_reads() {
+        let json = serde_json::json!({
+            "codeLocationRef": { "name": "demo" },
+            "image": "my-image:latest",
+            "target": "asset_a",
+            "surrealEndpoint": "ws://custom:8000"
+        });
+        let spec: RunSpec = serde_json::from_value(json).unwrap();
+
+        assert_eq!(spec.target, "asset_a");
+        let written = serde_json::to_value(&spec).unwrap();
+        assert!(written.get("surrealEndpoint").is_none());
+    }
+
+    #[test]
     fn spec_serializes_as_camel_case() {
         let json = serde_json::json!({
             "codeLocationRef": { "name": "x" },
             "image": "img:v1",
             "target": "*",
-            "surrealEndpoint": "ws://custom:8000",
             "maxRestarts": 5,
             "cancelGracePeriodSeconds": 60,
             "maxConcurrentSteps": 20,
@@ -446,7 +453,6 @@ mod tests {
         });
         let spec: RunSpec = serde_json::from_value(json).unwrap();
 
-        assert_eq!(spec.surreal_endpoint, "ws://custom:8000");
         assert_eq!(spec.max_restarts, 5);
         assert_eq!(spec.cancel_grace_period_seconds, 60);
         assert_eq!(spec.max_concurrent_steps, 20);
@@ -456,9 +462,8 @@ mod tests {
         assert_eq!(spec.code_location_ref.name, "x");
 
         let re_json = serde_json::to_value(&spec).unwrap();
-        assert!(re_json.get("surrealEndpoint").is_some());
         assert!(re_json.get("maxRestarts").is_some());
-        assert!(re_json.get("surreal_endpoint").is_none());
+        assert!(re_json.get("max_restarts").is_none());
         assert!(re_json.get("codeLocationRef").is_some());
     }
 

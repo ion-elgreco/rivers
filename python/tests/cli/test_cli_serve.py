@@ -29,9 +29,10 @@ repo = rs.CodeRepository(assets=[first])
 SERVICE_ENDPOINT = "warehouse-grpc.team-data.svc.cluster.local:3001"
 
 
+@pytest.mark.parametrize("storage_flag", ["--storage-url", "--surreal-endpoint"])
 @pytest.mark.parametrize("from_operator", [True, False], ids=["operator", "bind"])
 def test_serve_writes_its_endpoint_at_start_and_every_10_s(
-    resolved_tmp_path, from_operator
+    resolved_tmp_path, from_operator, storage_flag
 ):
     (resolved_tmp_path / "serve_mod.py").write_text(MODULE)
     port = free_port()
@@ -53,7 +54,7 @@ def test_serve_writes_its_endpoint_at_start_and_every_10_s(
 
     host = DevHost(str(resolved_tmp_path / "storage"))
     # Connected first, so the server finds the store migrated.
-    storage = Storage.connect(host.endpoint)
+    storage = Storage.open(host.url)
     err_path = resolved_tmp_path / "serve.err"
     with open(err_path, "wb") as err:
         server = subprocess.Popen(
@@ -67,8 +68,8 @@ def test_serve_writes_its_endpoint_at_start_and_every_10_s(
                 "127.0.0.1",
                 "--grpc-port",
                 str(port),
-                "--surreal-endpoint",
-                host.endpoint,
+                storage_flag,
+                host.url,
                 "--no-daemon",
             ],
             cwd=resolved_tmp_path,

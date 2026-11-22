@@ -85,7 +85,7 @@ pub fn build_deployment(
     cl: &CodeLocation,
     resolved_image: &str,
     code_location_service_account: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
     config_file_cfg: &rivers_k8s::env::ConfigFilePodConfig,
     workspace: Option<WorkspacePodPieces>,
@@ -108,7 +108,7 @@ pub fn build_deployment(
         &cr_name,
         ns.as_deref().unwrap_or_default(),
         resolved_image,
-        surreal_pod_cfg,
+        storage_pod_cfg,
         otel_pod_cfg,
     );
     env.extend(graft.env);
@@ -162,8 +162,8 @@ pub fn build_deployment(
                         command: Some(graft.command),
                         // `module` is a positional argument to `rivers serve`;
                         // `--grpc-port` is the flag name (not `--port`).
-                        // `--surreal-endpoint` is read from the env we inject
-                        // below via Typer's `envvar="RIVERS_SURREAL_ENDPOINT"`.
+                        // The storage location is read from the env we inject
+                        // below (`RIVERS_STORAGE_URL` or `RIVERS_SURREAL_ENDPOINT`).
                         args: Some(vec![
                             "serve".to_string(),
                             spec.module.clone(),
@@ -280,7 +280,7 @@ fn build_base_env(
     cr_name: &str,
     namespace: &str,
     resolved_image: &str,
-    surreal_pod_cfg: &rivers_k8s::env::SurrealPodConfig,
+    storage_pod_cfg: &rivers_k8s::env::StoragePodConfig,
     otel_pod_cfg: &rivers_k8s::env::OtelPodConfig,
 ) -> Vec<EnvVar> {
     let mut env = vec![
@@ -315,10 +315,7 @@ fn build_base_env(
             ..Default::default()
         },
     ];
-    env.extend(rivers_k8s::env::build_surreal_pod_env(
-        &surreal_pod_cfg.endpoint,
-        surreal_pod_cfg,
-    ));
+    env.extend(rivers_k8s::env::build_storage_pod_env(storage_pod_cfg));
     env.extend(rivers_k8s::env::build_otel_pod_env(otel_pod_cfg));
     env
 }
@@ -428,7 +425,7 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:abc",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             None,
@@ -507,7 +504,7 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:abc",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig {
                 endpoint: "https://otlp.example.com:4317".to_string(),
                 headers_secret_name: "otel-headers".to_string(),
@@ -660,7 +657,7 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:deadbeef",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             None,
@@ -756,7 +753,7 @@ mod tests {
             &cl,
             "img@sha256:a",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             None,
@@ -865,7 +862,7 @@ mod tests {
             &cl,
             "ghcr.io/rt@sha256:1a2b3c4dff",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &otel_endpoint(),
             &Default::default(),
             Some(git_pieces(&cl, shared_volume())),
@@ -991,7 +988,7 @@ mod tests {
             &cl,
             "ghcr.io/rt@sha256:1a2b3c4dff",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             Some(git_pieces(&cl, fallback_volume())),
@@ -1097,7 +1094,7 @@ mod tests {
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &otel_endpoint(),
                 &Default::default(),
                 workspace,
@@ -1214,7 +1211,7 @@ mod tests {
             &cl,
             "ghcr.io/rt@sha256:1a2b3c4dff",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             Some(git_pieces(&cl, shared_volume())),
@@ -1242,7 +1239,7 @@ mod tests {
                 cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 workspace,
@@ -1276,7 +1273,7 @@ mod tests {
                 cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 workspace,
@@ -1313,13 +1310,60 @@ mod tests {
             &cl,
             "ghcr.io/acme/pipeline@sha256:abc",
             "rivers-code-location",
-            &rivers_k8s::env::SurrealPodConfig::default(),
+            &rivers_k8s::env::StoragePodConfig::default(),
             &rivers_k8s::env::OtelPodConfig::default(),
             &Default::default(),
             None,
         );
 
         assert_eq!(d.spec.strategy, None);
+    }
+
+    #[test]
+    fn deployment_reads_the_storage_url_from_its_secret_only() {
+        let cl = make_cl(
+            json!({ "image": "ghcr.io/acme/pipeline", "tag": "v1.0.0" }),
+            "analytics",
+            "team-data",
+            "uid-1234",
+        );
+        let storage =
+            rivers_k8s::env::StoragePodConfig::UrlSecret(rivers_k8s::env::StorageUrlSecretRef {
+                name: "rivers-postgresql".to_string(),
+                key: "url".to_string(),
+            });
+        let d = build_deployment(
+            &cl,
+            "ghcr.io/acme/pipeline@sha256:abc",
+            "rivers-code-location",
+            &storage,
+            &rivers_k8s::env::OtelPodConfig::default(),
+            &Default::default(),
+            None,
+        );
+        let env = serde_json::to_value(&d.spec.template.spec.unwrap().containers[0].env).unwrap();
+        let storage_env: Vec<_> = env
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                let name = e["name"].as_str().unwrap();
+                name.starts_with("RIVERS_STORAGE_") || name.starts_with("RIVERS_SURREAL_")
+            })
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            storage_env,
+            vec![
+                json!({
+                    "name": "RIVERS_STORAGE_URL",
+                    "valueFrom": { "secretKeyRef": { "name": "rivers-postgresql", "key": "url" } },
+                }),
+                json!({ "name": "RIVERS_STORAGE_URL_SECRET_NAME", "value": "rivers-postgresql" }),
+                json!({ "name": "RIVERS_STORAGE_URL_SECRET_KEY", "value": "url" }),
+            ]
+        );
     }
 
     #[test]
@@ -1331,7 +1375,7 @@ mod tests {
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 Some(git_pieces(&cl, volume)),
@@ -1381,7 +1425,7 @@ mod tests {
                 &cl,
                 "ghcr.io/rt@sha256:1a2b3c4dff",
                 "rivers-code-location",
-                &rivers_k8s::env::SurrealPodConfig::default(),
+                &rivers_k8s::env::StoragePodConfig::default(),
                 &rivers_k8s::env::OtelPodConfig::default(),
                 &Default::default(),
                 Some(git_pieces(&cl, volume)),

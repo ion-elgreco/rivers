@@ -19,13 +19,7 @@ async fn race_deletion_against_partitioned_mat(
         max_elapsed: None,
     };
     let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded_with_retry(
-            temp_dir.as_path_untracked().to_str().unwrap(),
-            retry,
-            Capability::ReadWrite,
-        )
-        .await
-        .expect("failed to create embedded storage"),
+        make_disk_storage_with_retry(temp_dir.as_path_untracked(), retry).await,
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let single = |name: &str| PartitionKey::Single {
@@ -168,7 +162,7 @@ fn del_at(asset_key: &str, ts: i64, pk: Option<&PartitionKey>) -> EventRecord {
 /// Commit `events` one call at a time, in the given order, through the
 /// single-event or the batched write path.
 async fn commit_one_by_one(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     asset_key: &str,
     batched: bool,
     events: &[EventRecord],
@@ -187,16 +181,34 @@ async fn commit_one_by_one(
     read_writes(storage, asset_key, &order_key()).await
 }
 
-async fn read_writes(storage: &SurrealStorage, asset_key: &str, pk: &PartitionKey) -> AssetWrites {
-    let cl = DEFAULT_CODE_LOCATION_ID;
-    let pk = pk.clone();
-    let part_row = storage
-        .get_partition_timestamps_for_keys(cl, asset_key, std::slice::from_ref(&pk))
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .map(|(_, ts, run)| (ts, run));
+async fn read_writes(storage: &AnyStorage, asset_key: &str, pk: &PartitionKey) -> AssetWrites {
+    let part_deleted_at = match storage {
+        AnyStorage::Surreal(surreal) => partition_deleted_at(surreal, asset_key, pk).await,
+        AnyStorage::Postgres(postgres) => postgres
+            .partition_deletion_at(DEFAULT_CODE_LOCATION_ID, asset_key, pk)
+            .await
+            .unwrap(),
+    };
+    asset_writes(storage, asset_key, pk, part_deleted_at).await
+}
+
+/// [`read_writes`] of a SurrealDB store, for the tests that keep one of its
+/// transactions open.
+async fn surreal_read_writes(
+    storage: &SurrealStorage,
+    asset_key: &str,
+    pk: &PartitionKey,
+) -> AssetWrites {
+    let part_deleted_at = partition_deleted_at(storage, asset_key, pk).await;
+    asset_writes(storage, asset_key, pk, part_deleted_at).await
+}
+
+/// The time of the tombstone of `pk`.
+async fn partition_deleted_at(
+    storage: &SurrealStorage,
+    asset_key: &str,
+    pk: &PartitionKey,
+) -> Option<i64> {
     let mut result = storage
         .db
         .query(
@@ -204,12 +216,29 @@ async fn read_writes(storage: &SurrealStorage, asset_key: &str, pk: &PartitionKe
                  WHERE code_location_id = $cl AND asset_key = $asset_key \
                  AND partition_key = $pk",
         )
-        .bind(("cl", cl.to_string()))
+        .bind(("cl", DEFAULT_CODE_LOCATION_ID.to_string()))
         .bind(("asset_key", asset_key.to_string()))
-        .bind(("pk", pk))
+        .bind(("pk", pk.clone()))
         .await
         .unwrap();
     let part_deleted_at: Vec<i64> = result.take(0).unwrap();
+    part_deleted_at.first().copied()
+}
+
+async fn asset_writes(
+    storage: &impl PerCodeLocationStorage,
+    asset_key: &str,
+    pk: &PartitionKey,
+    part_deleted_at: Option<i64>,
+) -> AssetWrites {
+    let cl = DEFAULT_CODE_LOCATION_ID;
+    let part_row = storage
+        .get_partition_timestamps_for_keys(cl, asset_key, std::slice::from_ref(pk))
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .map(|(_, ts, run)| (ts, run));
     let record = storage
         .get_asset_record(cl, asset_key)
         .await
@@ -217,7 +246,7 @@ async fn read_writes(storage: &SurrealStorage, asset_key: &str, pk: &PartitionKe
         .unwrap();
     AssetWrites {
         part_row,
-        part_deleted_at: part_deleted_at.first().copied(),
+        part_deleted_at,
         last_run_id: record.last_run_id,
         last_timestamp: record.last_timestamp,
         last_data_version: record.last_data_version,
@@ -436,7 +465,7 @@ async fn a_concurrent_asset_deletion_leaves_no_older_partition_row() {
             .unwrap();
 
         assert_eq!(
-            read_writes(&storage, &key, &p0).await,
+            surreal_read_writes(&storage, &key, &p0).await,
             writes(None, None, None, Some(200)),
             "batched={batched}"
         );
@@ -519,7 +548,7 @@ async fn a_concurrent_partition_deletion_leaves_no_older_partition_row() {
         }
 
         assert_eq!(
-            read_writes(&storage, &key, &p).await,
+            surreal_read_writes(&storage, &key, &p).await,
             writes(None, Some(200), Some(("r0", 100)), None),
             "batched={batched}: the partition row outlived the newer partition deletion"
         );
@@ -677,7 +706,7 @@ fn row(data: Option<(&str, i64)>, built: Option<(&str, Option<&str>, i64)>) -> R
 /// Apply `steps` in order. `batched`: each drain is one `store_events`
 /// call; otherwise its events are stored one `store_event` call at a time.
 async fn apply_steps(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     asset_key: &str,
     batched: bool,
     steps: Vec<Step>,
@@ -710,24 +739,30 @@ async fn apply_steps(
         .await
         .unwrap()
         .unwrap();
-    let mut result = storage
-        .db
-        .query(
-            "SELECT VALUE last_provenance_timestamp FROM assets \
-                 WHERE code_location_id = $cl AND asset_key = $asset_key",
-        )
-        .bind(("cl", cl.to_string()))
-        .bind(("asset_key", asset_key.to_string()))
-        .await
-        .unwrap();
-    let provenance_at: Vec<Option<i64>> = result.take(0).unwrap();
+    let provenance_at = match storage {
+        AnyStorage::Surreal(surreal) => {
+            let mut result = surreal
+                .db
+                .query(
+                    "SELECT VALUE last_provenance_timestamp FROM assets \
+                         WHERE code_location_id = $cl AND asset_key = $asset_key",
+                )
+                .bind(("cl", cl.to_string()))
+                .bind(("asset_key", asset_key.to_string()))
+                .await
+                .unwrap();
+            let provenance_at: Vec<Option<i64>> = result.take(0).unwrap();
+            provenance_at.into_iter().flatten().next()
+        }
+        AnyStorage::Postgres(postgres) => postgres.provenance_at(cl, asset_key).await.unwrap(),
+    };
     RowProvenance {
         last_run_id: record.last_run_id,
         last_timestamp: record.last_timestamp,
         last_data_version: record.last_data_version,
         code_version: record.last_materialization_code_version,
         inputs: record.last_input_data_versions,
-        provenance_at: provenance_at.into_iter().flatten().next(),
+        provenance_at,
     }
 }
 
@@ -740,9 +775,7 @@ async fn apply_steps(
 #[tokio::test]
 async fn provenance_applies_in_event_order_apart_from_the_data() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     for run_id in ["a2", "a4"] {
         let run = RunRecord {
             action: Some("merge".to_string()),
@@ -905,13 +938,11 @@ async fn provenance_applies_in_event_order_apart_from_the_data() {
 async fn conflict_retry_does_not_duplicate_events() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded_with_retry(
-            temp_dir.as_path_untracked().to_str().unwrap(),
+        make_disk_storage_with_retry(
+            temp_dir.as_path_untracked(),
             retry::StorageRetryConfig::default().contended(),
-            Capability::ReadWrite,
         )
-        .await
-        .expect("failed to create embedded storage"),
+        .await,
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     for i in 0..100 {
@@ -956,13 +987,11 @@ async fn conflict_retry_does_not_duplicate_events() {
 async fn concurrent_observations_stay_consistent() {
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded_with_retry(
-            temp_dir.as_path_untracked().to_str().unwrap(),
+        make_disk_storage_with_retry(
+            temp_dir.as_path_untracked(),
             retry::StorageRetryConfig::default().contended(),
-            Capability::ReadWrite,
         )
-        .await
-        .expect("failed to create embedded storage"),
+        .await,
     );
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     for i in 0..100 {
@@ -1028,18 +1057,16 @@ async fn concurrent_batches_of_one_asset_all_get_their_partition_rows() {
 
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = std::sync::Arc::new(
-        SurrealStorage::new_embedded_with_retry(
-            temp_dir.as_path_untracked().to_str().unwrap(),
+        make_disk_storage_with_retry(
+            temp_dir.as_path_untracked(),
             retry::StorageRetryConfig {
                 max_retries: 0,
                 ..Default::default()
             },
-            Capability::ReadWrite,
         )
-        .await
-        .expect("failed to create embedded storage"),
+        .await,
     );
-    register(&storage, &["trips"]).await;
+    register(&*storage, &["trips"]).await;
 
     // The partitions of one run share its zone and one event time.
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RUNS));

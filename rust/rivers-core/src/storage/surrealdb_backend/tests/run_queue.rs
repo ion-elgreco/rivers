@@ -586,7 +586,7 @@ async fn test_delete_run_not_found() {
 
 /// An `InProgress` backfill `id` planned as one run per entry of `runs`: each
 /// run is linked, created `Started` and then moved to its status.
-async fn backfill_with_runs(storage: &SurrealStorage, id: &str, runs: &[(&str, RunStatus)]) {
+async fn backfill_with_runs(storage: &AnyStorage, id: &str, runs: &[(&str, RunStatus)]) {
     let mut bf = mk_isolation_backfill(
         id,
         DEFAULT_CODE_LOCATION_ID,
@@ -788,9 +788,7 @@ async fn test_try_start_run_missing_run_errors() {
 #[tokio::test]
 async fn test_cancel_vs_start_race_settles_consistently() {
     let temp = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp.as_path_untracked().to_str().unwrap())
-        .await
-        .unwrap();
+    let storage = make_disk_storage(temp.as_path_untracked()).await;
     storage
         .create_run(&minimal_run("r1", RunStatus::NotStarted))
         .await

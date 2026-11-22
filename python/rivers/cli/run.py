@@ -6,15 +6,19 @@ import sys
 
 import typer
 
-from rivers._core.storage import Storage
 from rivers.cli._app import app
 from rivers.cli._common import (
     _CODE_LOCATION_ID_OPT,
+    _STORAGE_URL_OPT,
+    _SURREAL_ENDPOINT_OPT,
+    _export_storage,
     _load_repo,
+    _open_server,
     _parse_partition_key,
     _split_names,
     _warn_if_destructive_on_scratch,
 )
+from rivers.cli.config import decide_storage
 
 
 def _run_partition_key(raw: str | None, record):
@@ -30,11 +34,11 @@ def _run_partition_key(raw: str | None, record):
 
 @app.command()
 def execute(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     run_id: str = typer.Option(..., help="Pre-assigned run ID"),
-    surreal_endpoint: str = typer.Option(
-        ..., help="Remote SurrealDB endpoint (e.g. ws://host:8000)"
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
     ),
@@ -53,10 +57,15 @@ def execute(
         False, help="Resume a crashed run, skipping completed steps"
     ),
 ) -> None:
-    """Execute a run against a remote SurrealDB. Designed for K8s executor pods."""
+    """Execute a run against a storage server. Designed for K8s executor pods."""
+    store = decide_storage(ctx, url=storage_url, endpoint=surreal_endpoint)
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
     os.environ["RIVERS_RUN_ID"] = run_id
-    storage = Storage.connect(surreal_endpoint)
+    _export_storage(store)
+    storage = _open_server(store)
+    if storage is None:
+        typer.echo("Error: pass --storage-url or --surreal-endpoint", err=True)
+        raise typer.Exit(1)
 
     sys.path.insert(0, ".")
     try:
@@ -164,6 +173,7 @@ def execute(
 
 @app.command(name="execute-step")
 def execute_step(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     step_key: list[str] = typer.Option(
         ...,
@@ -180,15 +190,20 @@ def execute_step(
     mapping_key: str | None = typer.Option(
         None, help="Mapping key for mapped step instances"
     ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
 ) -> None:
     """Execute a single step within a run. Designed for K8s step pods."""
+    store = decide_storage(ctx, url=storage_url, endpoint=surreal_endpoint)
     os.environ["RIVERS_DEPLOYMENT"] = "cloud"
     os.environ["RIVERS_RUN_ID"] = run_id
-    surreal_endpoint = os.environ.get("RIVERS_SURREAL_ENDPOINT")
-    if not surreal_endpoint:
-        typer.echo("Error: RIVERS_SURREAL_ENDPOINT env var is required", err=True)
+    storage = _open_server(store)
+    if storage is None:
+        typer.echo(
+            "Error: the RIVERS_STORAGE_URL or RIVERS_SURREAL_ENDPOINT env var is required",
+            err=True,
+        )
         raise typer.Exit(1)
-    storage = Storage.connect(surreal_endpoint)
 
     sys.path.insert(0, ".")
     try:
@@ -240,6 +255,7 @@ def execute_step(
 
 @app.command()
 def materialize(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     repo_var: str = typer.Option(
         "repo", help="Variable name of CodeRepository in module"
@@ -252,19 +268,21 @@ def materialize(
         None,
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Materialize all assets in a repository."""
     from rivers import PartitionKey
 
-    repo_obj = _load_repo(
-        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    store = decide_storage(
+        ctx,
+        url=storage_url,
+        endpoint=surreal_endpoint,
+        path=storage_path,
+        memory=memory,
     )
+    repo_obj = _load_repo(module, repo_var, store, code_location_id)
     pk = PartitionKey.single(partition_key) if partition_key else None
     result = repo_obj.materialize(partition_key=pk)
     typer.echo(f"Materialization complete. Assets: {result.materialized_assets}")
@@ -272,6 +290,7 @@ def materialize(
 
 @app.command(name="run-action")
 def run_action(
+    ctx: typer.Context,
     module: str = typer.Argument(help="Python module path containing CodeRepository"),
     action: str = typer.Argument(help="The verb to run, e.g. optimize or delete"),
     repo_var: str = typer.Option(
@@ -291,11 +310,8 @@ def run_action(
         None,
         help="Path for embedded storage (default: a scratch store, removed at exit)",
     ),
-    surreal_endpoint: str | None = typer.Option(
-        None,
-        envvar="RIVERS_SURREAL_ENDPOINT",
-        help="Remote SurrealDB endpoint (overrides --storage-path)",
-    ),
+    storage_url: str | None = _STORAGE_URL_OPT,
+    surreal_endpoint: str | None = _SURREAL_ENDPOINT_OPT,
     code_location_id: str | None = _CODE_LOCATION_ID_OPT,
 ) -> None:
     """Run an asset action (a verb besides materialize) over a selection."""
@@ -309,12 +325,15 @@ def run_action(
             err=True,
         )
         raise typer.Exit(1)
-    repo_obj = _load_repo(
-        module, repo_var, memory, storage_path, surreal_endpoint, code_location_id
+    store = decide_storage(
+        ctx,
+        url=storage_url,
+        endpoint=surreal_endpoint,
+        path=storage_path,
+        memory=memory,
     )
-    _warn_if_destructive_on_scratch(
-        repo_obj, action, selection, memory, storage_path, surreal_endpoint
-    )
+    repo_obj = _load_repo(module, repo_var, store, code_location_id)
+    _warn_if_destructive_on_scratch(repo_obj, action, selection, store)
     pk = PartitionKey.single(partition_key) if partition_key is not None else None
     result = repo_obj.run_action(action, selection=selection, partition_key=pk)
     typer.echo(f"Action '{action}' complete. Run: {result.run_id}")

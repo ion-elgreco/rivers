@@ -219,7 +219,7 @@ mod tests {
             code_location_service_account: "rivers-code-location".into(),
             workspace: WorkspaceConfig::default(),
             runs: kube_runtime::reflector::store().0,
-            surreal_pod_cfg: Default::default(),
+            storage_pod_cfg: Default::default(),
             otel_pod_cfg: Default::default(),
             config_file_cfg: Default::default(),
         }

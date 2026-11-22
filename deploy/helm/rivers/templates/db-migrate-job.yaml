@@ -2,7 +2,7 @@
 Runs `rivers db migrate` on each install and upgrade. A regular Job, not a
 hook, for the reason in surrealdb-user-job.yaml: the operator is not Ready
 until the database is migrated, so a hook after `--wait` never runs. The
-Job retries until SurrealDB and its user exist.
+Job retries until the database (and a bundled SurrealDB's user) exist.
 */ -}}
 {{- if .Values.migration.enabled }}
 apiVersion: batch/v1
@@ -39,7 +39,7 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
-            {{- include "rivers.surrealEnv" . | nindent 12 }}
+            {{- include "rivers.storageEnv" . | nindent 12 }}
           args:
             - "db"
             - "migrate"

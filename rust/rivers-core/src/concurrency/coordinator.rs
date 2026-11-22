@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use crate::concurrency::{RunQueueConfig, TagConcurrencyCounter};
-use crate::storage::surrealdb_backend::SurrealStorage;
+use crate::storage::any::AnyStorage;
 use crate::storage::{
     CoordinatorRunInfo, EventRecord, EventType, RunStatus, ScopedStorageHandle, StorageBackend,
 };
@@ -12,11 +12,11 @@ use crate::util::now_ts;
 pub struct RunQueueCoordinator {
     config: RunQueueConfig,
     /// Scoped so daemons sharing a SurrealDB only dequeue and block their own runs.
-    storage: ScopedStorageHandle<SurrealStorage>,
+    storage: ScopedStorageHandle<AnyStorage>,
 }
 
 impl RunQueueCoordinator {
-    pub fn new(config: RunQueueConfig, storage: ScopedStorageHandle<SurrealStorage>) -> Self {
+    pub fn new(config: RunQueueConfig, storage: ScopedStorageHandle<AnyStorage>) -> Self {
         Self { config, storage }
     }
 
@@ -151,18 +151,15 @@ mod tests {
         CodeLocationContext, DEFAULT_CODE_LOCATION_ID, LaunchedBy, RunRecord, RunStatus,
     };
 
-    async fn make_storage() -> Arc<SurrealStorage> {
+    async fn make_storage() -> Arc<AnyStorage> {
         Arc::new(
-            SurrealStorage::new_memory()
+            AnyStorage::new_memory()
                 .await
                 .expect("failed to create in-memory storage"),
         )
     }
 
-    fn make_coordinator(
-        config: RunQueueConfig,
-        storage: Arc<SurrealStorage>,
-    ) -> RunQueueCoordinator {
+    fn make_coordinator(config: RunQueueConfig, storage: Arc<AnyStorage>) -> RunQueueCoordinator {
         RunQueueCoordinator::new(
             config,
             ScopedStorageHandle::new(storage, CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID)),

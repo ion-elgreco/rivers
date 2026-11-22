@@ -9,7 +9,9 @@ use futures_util::future::BoxFuture;
 
 use super::*;
 use crate::storage::event_batch::{EventStore, EventWithId};
-use crate::storage::surrealdb_backend::partition_failures::{derived_rows, run_failure_rows};
+use crate::storage::surrealdb_backend::partition_failures::{
+    RunFailureRow, derived_rows, run_failure_rows,
+};
 use crate::storage::{PartitionFailure, retry, stored_order};
 
 const CL: &str = DEFAULT_CODE_LOCATION_ID;
@@ -94,7 +96,10 @@ pub(super) fn failure(key: &str, failed_at: i64, run_id: &str, has_row: bool) ->
 }
 
 /// The failure rows of `asset`, in the order of the store.
-pub(super) async fn rows(storage: &SurrealStorage, asset: &str) -> Vec<PartitionFailure> {
+pub(super) async fn rows(
+    storage: &impl PerCodeLocationStorage,
+    asset: &str,
+) -> Vec<PartitionFailure> {
     let mut rows = storage
         .get_partition_failures(CL, asset, None, 1_000_000)
         .await
@@ -105,10 +110,25 @@ pub(super) async fn rows(storage: &SurrealStorage, asset: &str) -> Vec<Partition
 
 /// The rows of `asset` are the failures that the events and the runs give,
 /// and so are its failures by run. Returns how many rows there are.
-async fn assert_derived(storage: &SurrealStorage, asset: &str, step: &str) -> usize {
-    let derived = derived_rows(&storage.db, CL, asset).await.unwrap();
+async fn assert_derived(storage: &AnyStorage, asset: &str, step: &str) -> usize {
+    let (derived, kept, derived_by_run) = match storage {
+        AnyStorage::Surreal(surreal) => {
+            let derived = derived_rows(&surreal.db, CL, asset).await.unwrap();
+            let (kept, by_run) = run_failure_rows(&surreal.db, CL, asset).await.unwrap();
+            let rows = |rows: Vec<RunFailureRow>| -> Vec<_> {
+                rows.into_iter()
+                    .map(|row| (row.key, row.run_id, row.step_failed_at, row.run_failed_at))
+                    .collect()
+            };
+            (derived, rows(kept), rows(by_run))
+        }
+        AnyStorage::Postgres(postgres) => {
+            let derived = postgres.derived_failure_rows(CL, asset).await.unwrap();
+            let (kept, by_run) = postgres.run_failure_rows(CL, asset).await.unwrap();
+            (derived, kept, by_run)
+        }
+    };
     assert_eq!(rows(storage, asset).await, derived, "{step}");
-    let (kept, derived_by_run) = run_failure_rows(&storage.db, CL, asset).await.unwrap();
     assert_eq!(kept, derived_by_run, "{step}: failures by run");
     derived.len()
 }
@@ -438,17 +458,37 @@ async fn a_run_that_ended_otherwise_fails_no_partition() {
     assert_derived(&storage, "a", "after the late failure").await;
 }
 
-/// Write `set` on the run `run_id` as a write of its status does, and stop
-/// there: as if the process stopped before the repair after the status.
-async fn write_status_only(storage: &SurrealStorage, run_id: &str, set: &str) {
-    storage
-        .db
-        .query(format!("UPDATE runs SET {set} WHERE run_id = $run_id"))
-        .bind(("run_id", run_id.to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+/// Write the status or the end of the run `run_id` as a write of its status
+/// does, and stop there: as if the process stopped before the repair after
+/// the status.
+async fn write_status_only(
+    storage: &AnyStorage,
+    run_id: &str,
+    status: Option<&RunStatus>,
+    end_time: Option<i64>,
+) {
+    match storage {
+        AnyStorage::Surreal(surreal) => {
+            let status = status.map(|status| format!("status = '{status:?}'"));
+            let end_time = end_time.map(|end_time| format!("end_time = {end_time}"));
+            let set: Vec<String> = status.into_iter().chain(end_time).collect();
+            surreal
+                .db
+                .query(format!(
+                    "UPDATE runs SET {} WHERE run_id = $run_id",
+                    set.join(", ")
+                ))
+                .bind(("run_id", run_id.to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        AnyStorage::Postgres(postgres) => postgres
+            .write_run_status_only(run_id, status, end_time)
+            .await
+            .unwrap(),
+    }
 }
 
 /// A final status and one that is not final: each writes the status in a
@@ -484,7 +524,7 @@ async fn a_status_written_again_after_a_stop_clears_the_end_in_failure() {
             .unwrap();
         assert_eq!(rows(&storage, "a").await.len(), 2);
 
-        write_status_only(&storage, "r1", &format!("status = '{status:?}'")).await;
+        write_status_only(&storage, "r1", Some(&status), None).await;
         storage
             .update_run_status("r1", status.clone(), None)
             .await
@@ -510,7 +550,7 @@ async fn a_start_again_after_a_stop_clears_the_end_in_failure() {
     assert!(storage.fail_run_if_active("r1", 500).await.unwrap());
     assert_eq!(rows(&storage, "a").await.len(), 1);
 
-    write_status_only(&storage, "r1", "status = 'Started'").await;
+    write_status_only(&storage, "r1", Some(&RunStatus::Started), None).await;
     assert!(storage.try_start_run("r1").await.unwrap());
 
     assert!(rows(&storage, "a").await.is_empty());
@@ -542,7 +582,7 @@ async fn an_earlier_end_written_again_after_a_stop_moves_the_failures() {
         .await
         .unwrap();
 
-    write_status_only(&storage, "r1", "end_time = 400").await;
+    write_status_only(&storage, "r1", None, Some(400)).await;
     storage
         .update_run_status("r1", RunStatus::Failure, Some(400))
         .await
@@ -574,7 +614,7 @@ async fn a_failure_of_a_run_that_ended_otherwise_after_a_stop_clears_the_end_in_
         .unwrap();
     assert_eq!(rows(&storage, "a").await.len(), 1);
 
-    write_status_only(&storage, "r1", "status = 'Success', end_time = 600").await;
+    write_status_only(&storage, "r1", Some(&RunStatus::Success), Some(600)).await;
     assert!(!storage.fail_run_if_active("r1", 700).await.unwrap());
 
     assert!(rows(&storage, "a").await.is_empty());
@@ -716,6 +756,28 @@ async fn failures_of_more_partitions_than_one_transaction_holds() {
     assert_derived(&storage, "a", "after the failure").await;
 }
 
+/// Store the rows of `batch` and nothing else, as an attempt that stopped
+/// before it applied them.
+async fn insert_event_rows(storage: &AnyStorage, batch: &[EventWithId]) {
+    match storage {
+        AnyStorage::Surreal(surreal) => {
+            let inserted: Vec<DbEventWrite> = batch
+                .iter()
+                .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
+                .collect();
+            surreal
+                .db
+                .query("INSERT IGNORE INTO events $rows RETURN NONE")
+                .bind(("rows", inserted))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        AnyStorage::Postgres(postgres) => postgres.insert_event_rows(batch).await.unwrap(),
+    }
+}
+
 /// An attempt that stored the events of a batch and then stopped, and a send
 /// of the same batch again: each event is stored once, and the failures of
 /// the batch take their rows.
@@ -731,19 +793,48 @@ async fn a_batch_sent_again_after_a_stopped_attempt_stores_each_event_once() {
     .into_iter()
     .map(EventWithId::new)
     .collect();
-    let inserted: Vec<DbEventWrite> = batch
-        .iter()
-        .map(|e| DbEventWrite::from_event(&e.event, e.id.clone()))
-        .collect();
-    storage
-        .db
-        .query("INSERT IGNORE INTO events $rows RETURN NONE")
-        .bind(("rows", inserted))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    insert_event_rows(&storage, &batch).await;
 
+    storage.store_events_with_ids(&batch).await.unwrap();
+
+    let mut stored = Vec::new();
+    for run_id in ["r1", "r2"] {
+        for event in storage.get_events_for_run(run_id).await.unwrap() {
+            stored.push((event.run_id, event.timestamp));
+        }
+    }
+    let once: Vec<(String, i64)> = batch
+        .iter()
+        .map(|e| (e.event.run_id.clone(), e.event.timestamp))
+        .collect();
+    assert_eq!(stored, once);
+    assert_eq!(
+        rows(&storage, "a").await,
+        vec![
+            failure("p2", 200, "r2", false),
+            failure("p3", 300, "r2", false),
+            failure("p4", 300, "r2", false)
+        ]
+    );
+    assert_derived(&storage, "a", "after the send again").await;
+}
+
+/// A batch sent twice, as after an attempt whose answer was lost: each event
+/// is stored once, and the failures of the batch take their rows.
+#[tokio::test]
+async fn a_batch_sent_twice_stores_each_event_once() {
+    let storage = make_storage().await;
+    register(&storage, &["a"]).await;
+    let batch: Vec<EventWithId> = [
+        built("a", "r1", "p1", 100),
+        failed("a", "r2", single("p2"), 200),
+        failed("a", "r2", keys(&["p3", "p4"]), 300),
+    ]
+    .into_iter()
+    .map(EventWithId::new)
+    .collect();
+
+    storage.store_events_with_ids(&batch).await.unwrap();
     storage.store_events_with_ids(&batch).await.unwrap();
 
     let mut stored = Vec::new();
@@ -948,10 +1039,11 @@ async fn the_rows_follow_the_failures_of_the_events_and_the_runs() {
     }
 }
 
-/// A store on disk, which sees every conflict of two writers, with retries
-/// quick enough for many writers of one asset. A write gives up by time: with
+/// A store that sees every conflict of two writers (see
+/// [`make_disk_storage`]), with retries quick enough for many writers of one
+/// asset. A write gives up by time: with
 /// waits this short, a number of attempts is gone in half a second.
-pub(super) async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> {
+pub(super) async fn store_on_disk(dir: &std::path::Path) -> Arc<AnyStorage> {
     let retry = retry::StorageRetryConfig {
         max_retries: u32::MAX,
         initial_backoff: std::time::Duration::from_millis(1),
@@ -959,14 +1051,7 @@ pub(super) async fn store_on_disk(dir: &std::path::Path) -> Arc<SurrealStorage> 
         backoff_multiplier: 1.0,
         max_elapsed: Some(std::time::Duration::from_secs(60)),
     };
-    let storage = SurrealStorage::new_embedded_with_retry(
-        dir.to_str().unwrap(),
-        retry,
-        Capability::ReadWrite,
-    )
-    .await
-    .expect("failed to create embedded storage");
-    Arc::new(storage)
+    Arc::new(make_disk_storage_with_retry(dir, retry).await)
 }
 
 /// Start all of `writes` at the same time, and wait for them.
@@ -999,7 +1084,7 @@ async fn a_run_that_fails_while_its_materializations_come_in_leaves_the_derived_
 
     for round in 0..30 {
         let (asset, run_id) = (format!("a{round}"), format!("r{round}"));
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
         let started = run(&run_id, RunStatus::Started, Some(keys(&members)), &[&asset]);
         storage.create_run(&started).await.unwrap();
 
@@ -1049,7 +1134,7 @@ async fn a_run_deleted_while_older_failures_come_in_leaves_the_derived_rows() {
 
     for round in 0..30 {
         let (asset, deleted_run) = (format!("a{round}"), format!("d{round}"));
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
         let ended = run(&deleted_run, RunStatus::Success, None, &[&asset]);
         storage.create_run(&ended).await.unwrap();
         let newer: Vec<EventRecord> = members
@@ -1097,7 +1182,7 @@ async fn a_run_deleted_while_late_materializations_come_in_leaves_the_derived_ro
     for round in 0..30 {
         let asset = format!("a{round}");
         let (late, deleted_run) = (format!("l{round}"), format!("d{round}"));
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
         let first: Vec<EventRecord> = members
             .iter()
             .map(|member| built(&asset, "first", member, 280))
@@ -1150,7 +1235,7 @@ async fn a_run_deleted_while_other_partitions_are_materialized_finishes() {
 
     let temp_dir = test_temp_dir::test_temp_dir!();
     let storage = store_on_disk(temp_dir.as_path_untracked()).await;
-    register(&storage, &["a"]).await;
+    register(&*storage, &["a"]).await;
     let names: Vec<String> = (0..20_000).map(|i| format!("k{i:05}")).collect();
     for (i, chunk) in names.chunks(1_000).enumerate() {
         let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
@@ -1214,7 +1299,7 @@ async fn racing_writers_of_one_asset_leave_the_derived_rows() {
 
     for round in 0..30 {
         let asset = format!("a{round}");
-        register(&storage, &[asset.as_str()]).await;
+        register(&*storage, &[asset.as_str()]).await;
 
         let mut writes = Vec::new();
         for (i, name) in ["k0", "k1", "k2", "k3"].iter().enumerate() {

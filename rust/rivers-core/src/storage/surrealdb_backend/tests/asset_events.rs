@@ -22,7 +22,7 @@ fn typed(asset: &str, event_type: EventType, timestamp: i64) -> EventRecord {
 
 /// Five materializations, two failures and one observation of `orders`, the
 /// step events of their runs, and events of another asset.
-async fn store_orders_events(storage: &SurrealStorage) {
+async fn store_orders_events(storage: &impl StorageBackend) {
     register(storage, &["orders", "other"]).await;
     let materialization = || EventType::Materialization { data_version: None };
     storage
@@ -46,7 +46,7 @@ async fn store_orders_events(storage: &SurrealStorage) {
 
 /// The page of `orders` for `types`: the type and time of each row, and the total.
 async fn page(
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
     types: &[&str],
     offset: u64,
     limit: u64,
@@ -133,7 +133,7 @@ async fn plan_of(storage: &SurrealStorage, statement: &str, types: &[&str]) -> S
 /// The number of its events is counted on the index, without a read of each.
 #[tokio::test]
 async fn asset_events_are_counted_on_the_index() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     store_orders_events(&storage).await;
 
     let count = COUNT_ASSET_EVENTS_OF_TYPE.replace("$type", "$types[0]");
@@ -150,7 +150,7 @@ async fn asset_events_are_counted_on_the_index() {
 /// time order.
 #[tokio::test]
 async fn a_page_of_a_rare_event_type_reads_the_events_of_that_type_only() {
-    let storage = make_storage().await;
+    let storage = make_surreal().await;
     store_orders_events(&storage).await;
 
     let page = ASSET_EVENTS_PAGE_OF_RARE_TYPE.replace("$type", "$types[0]");

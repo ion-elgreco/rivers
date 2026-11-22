@@ -231,9 +231,6 @@ spec:
                 - git
                 - runtimeImage
                 type: object
-              surrealEndpoint:
-                default: ws://surrealdb.rivers.svc:8000
-                type: string
               target:
                 description: Asset or job to materialize/execute.
                 type: string

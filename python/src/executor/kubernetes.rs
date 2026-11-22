@@ -32,11 +32,6 @@ pub(crate) struct KubernetesBackend {
     pub worker_cpu: String,
     pub worker_memory: String,
     pub module: String,
-    /// SurrealDB endpoint, scope, and auth-secret coordinates stamped on
-    /// every step pod. Read once from the run pod's own env (set by the
-    /// operator) so step pods get the same `secretKeyRef` without
-    /// round-tripping the password value through this process.
-    pub surreal_pod_cfg: rivers_k8s::env::SurrealPodConfig,
     pub otel_pod_cfg: rivers_k8s::env::OtelPodConfig,
     pub config_file_cfg: rivers_k8s::env::ConfigFilePodConfig,
     pub run_cr_name: String,
@@ -97,7 +92,6 @@ impl KubernetesBackend {
         worker_memory: String,
     ) -> Self {
         let module = std::env::var("RIVERS_MODULE").unwrap_or_default();
-        let surreal_pod_cfg = rivers_k8s::env::SurrealPodConfig::from_env();
         let otel_pod_cfg = rivers_k8s::env::OtelPodConfig::from_env();
         let config_file_cfg = rivers_k8s::env::ConfigFilePodConfig::from_env();
         let run_cr_name = std::env::var("RIVERS_RUN_CR_NAME").unwrap_or_default();
@@ -112,7 +106,6 @@ impl KubernetesBackend {
             worker_cpu,
             worker_memory,
             module,
-            surreal_pod_cfg,
             otel_pod_cfg,
             config_file_cfg,
             run_cr_name,
@@ -135,6 +128,11 @@ impl KubernetesBackend {
                  env var or pass worker_image to Executor.kubernetes()",
             )
         })?;
+        // Read from the run pod's own env (set by the operator), so step pods
+        // get the same `secretKeyRef` without the password passing through
+        // this process.
+        let storage_pod_cfg = rivers_k8s::env::StoragePodConfig::from_env()
+            .map_err(|e| crate::errors::ConfigurationError::new_err(format!("{e:#}")))?;
         let (client, extra_env) = rt()
             .block_on(async {
                 let client = shared_kube_client().await?;
@@ -151,7 +149,7 @@ impl KubernetesBackend {
             worker_cpu: self.worker_cpu.clone(),
             worker_memory: self.worker_memory.clone(),
             module: self.module.clone(),
-            surreal_pod_cfg: self.surreal_pod_cfg.clone(),
+            storage_pod_cfg,
             otel_pod_cfg: self.otel_pod_cfg.clone(),
             config_file_cfg: self.config_file_cfg.clone(),
             run_id: run_id.to_string(),
@@ -285,7 +283,7 @@ async fn classify_failed_pod(
 async fn poll_step_attempt(
     client: &kube_client::Client,
     namespace: &str,
-    storage: &Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: &Arc<rivers_core::storage::any::AnyStorage>,
     run_id: &str,
     poll_key: &str,
     job_name: &str,
@@ -419,7 +417,7 @@ struct StepJobSpec {
 async fn run_step_with_retries(
     client: kube_client::Client,
     namespace: String,
-    storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: Arc<rivers_core::storage::any::AnyStorage>,
     run_id: String,
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,
@@ -584,7 +582,7 @@ async fn run_step_with_retries(
 async fn run_jobs_to_completion(
     client: kube_client::Client,
     namespace: String,
-    storage: Arc<rivers_core::storage::surrealdb_backend::SurrealStorage>,
+    storage: Arc<rivers_core::storage::any::AnyStorage>,
     run_id: String,
     code_location_id: String,
     config: Arc<rivers_k8s::executor::K8sStepExecutorConfig>,

@@ -20,7 +20,7 @@
 use axum::extract::Query;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
+use rivers_core::storage::any::AnyStorage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,7 +163,7 @@ pub struct ChannelSnapshot {
 /// endpoint reads from, and the tasks: join them after `shutdown` so every
 /// live query is closed while storage is still reachable.
 pub fn spawn_live_broadcasters(
-    storage: Arc<SurrealStorage>,
+    storage: Arc<AnyStorage>,
     shutdown: CancellationToken,
 ) -> (broadcast::Sender<&'static str>, LiveMetrics, JoinSet<()>) {
     let (tx, _rx) = broadcast::channel::<&'static str>(256);
@@ -215,9 +215,9 @@ pub trait LiveStream: futures_core::Stream<Item = ()> + Unpin + Send {
     fn close(self) -> impl std::future::Future<Output = ()> + Send;
 }
 
-impl LiveStream for rivers_core::storage::surrealdb_backend::LiveTable {
+impl LiveStream for rivers_core::storage::any::LiveChanges {
     fn close(self) -> impl std::future::Future<Output = ()> + Send {
-        rivers_core::storage::surrealdb_backend::LiveTable::close(self)
+        rivers_core::storage::any::LiveChanges::close(self)
     }
 }
 
@@ -229,7 +229,7 @@ impl LiveStream for rivers_core::storage::surrealdb_backend::LiveTable {
 /// A query that was open ticks once a second while it waits to open again
 /// (see [`wait_to_reopen`]).
 ///
-/// Decoupled from [`SurrealStorage`] (subscribe is a closure) so tests can
+/// Decoupled from [`AnyStorage`] (subscribe is a closure) so tests can
 /// drive it with a deterministic mock stream.
 ///
 /// - `table`: optional diagnostic tag for tracing; `None` is used by tests

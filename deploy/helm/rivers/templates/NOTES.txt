@@ -42,6 +42,13 @@ For ad-hoc dev (`cargo run -p rivers-operator` against a cluster that
 doesn't have this chart installed), skip the webhook entirely with:
   RIVERS_WEBHOOK_DISABLED=1 cargo run -p rivers-operator
 
+{{ $pg := .Values.postgresql | default dict -}}
+{{ if $pg.existingSecret -}}
+Storage
+-------
+rivers stores its data in the PostgreSQL server whose URL is in Secret
+`{{ $pg.existingSecret }}`, key `{{ $pg.secretKey }}`.
+{{- else -}}
 SurrealDB authentication
 ------------------------
 {{- if .Values.surrealdb.enabled }}
@@ -72,4 +79,5 @@ External SurrealDB without auth: rivers pods connect without `signin`,
 matching `surreal start --unauthenticated`. Provide
 `surrealdb.auth.existingSecret` or inline `auth.username/auth.password` to
 require authenticated connections.
+{{- end }}
 {{- end }}

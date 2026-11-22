@@ -265,7 +265,7 @@ async fn run_logs_roundtrip() {
 }
 
 /// `get_step_tracebacks` returns the tracebacks of one step's rows at one
-/// time, in `get_run_logs` order, read off the run's index.
+/// time, in `get_run_logs` order.
 #[tokio::test]
 async fn step_tracebacks_match_the_run_logs_rows() {
     let storage = make_storage().await;
@@ -314,7 +314,12 @@ async fn step_tracebacks_match_the_run_logs_rows() {
     assert!(tracebacks("run-1", "a", 15).await.is_empty());
     assert!(tracebacks("run-1", "c", 10).await.is_empty());
     assert!(tracebacks("missing", "a", 10).await.is_empty());
+}
 
+/// `get_step_tracebacks` reads off the run's index of the run logs.
+#[tokio::test]
+async fn step_tracebacks_scan_the_run_logs_index() {
+    let storage = make_surreal().await;
     let plan: Vec<serde_json::Value> = storage
         .db
         .query(format!(
@@ -459,9 +464,7 @@ async fn failed_run_materializations_scan_only_those_runs() {
 #[tokio::test]
 async fn test_multi_partition_key_dims_order_canonicalized() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let mk = |dims: Vec<(&str, &str)>| PartitionKey::Multi {
         dims: dims
@@ -504,9 +507,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
     // asset_key) index. Re-resolving a code location must refresh the
     // asset's definition without wiping what it has materialized.
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
 
     let materialized = AssetRecord {
@@ -585,9 +586,7 @@ async fn test_register_assets_upserts_definition_and_keeps_history() {
 #[tokio::test]
 async fn test_partition_row_replaces_on_unique_index() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let pk = PartitionKey::Single {
         keys: vec!["p1".to_string()],
@@ -625,9 +624,7 @@ async fn test_partition_row_replaces_on_unique_index() {
 #[tokio::test]
 async fn test_partition_string_lookup_matches_multi_keys() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let pk = PartitionKey::Multi {
         dims: vec![
@@ -674,9 +671,7 @@ async fn test_partition_string_lookup_matches_multi_keys() {
 #[tokio::test]
 async fn test_partition_string_lookup_prefers_structured_multi() {
     let temp_dir = test_temp_dir::test_temp_dir!();
-    let storage = SurrealStorage::new_embedded(temp_dir.as_path_untracked().to_str().unwrap())
-        .await
-        .expect("failed to create embedded storage");
+    let storage = make_disk_storage(temp_dir.as_path_untracked()).await;
     let cl = crate::storage::DEFAULT_CODE_LOCATION_ID;
     let multi = PartitionKey::Multi {
         dims: vec![
@@ -1426,8 +1421,6 @@ async fn test_run_lifecycle() {
 
 #[tokio::test]
 async fn test_create_run_swallows_duplicate_id_after_retry() {
-    use crate::storage::retry;
-
     let storage = make_storage().await;
     let run = RunRecord {
         run_id: "duplicate_run".to_string(),
@@ -1459,6 +1452,17 @@ async fn test_create_run_swallows_duplicate_id_after_retry() {
     // The row is still the original (no overwrite, no extra row).
     let fetched = storage.get_run("duplicate_run").await.unwrap().unwrap();
     assert_eq!(fetched, run);
+}
+
+/// A direct CREATE of a run that exists is a unique-index violation, which
+/// `create_run` swallows and the retry does not read again on.
+#[tokio::test]
+async fn a_direct_create_of_a_duplicate_run_is_a_unique_index_violation() {
+    use crate::storage::retry;
+
+    let storage = make_surreal().await;
+    let run = minimal_run("duplicate_run", RunStatus::NotStarted);
+    storage.create_run(&run).await.unwrap();
 
     let raw_err = storage
         .db
@@ -1969,7 +1973,7 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
     // Helper: subscribe → brief delay to let the LIVE query register →
     // run the write → assert the stream yields within the deadline.
     async fn expect_yields(
-        storage: &Arc<SurrealStorage>,
+        storage: &Arc<AnyStorage>,
         table: &'static str,
         write: impl std::future::Future<Output = ()>,
     ) {
@@ -2026,16 +2030,29 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
     .await;
 
     expect_yields(&storage, "asset_partitions", async {
-        storage
-            .db
-            .query(
-                "CREATE asset_partitions SET \
-                     asset_key = 'live_asset', \
-                     partition_key = {kind: 'Single', keys: ['2024-01-01']}, \
-                     last_timestamp = 1",
-            )
-            .await
-            .unwrap();
+        match &*storage {
+            AnyStorage::Surreal(surreal) => {
+                surreal
+                    .db
+                    .query(
+                        "CREATE asset_partitions SET \
+                             asset_key = 'live_asset', \
+                             partition_key = {kind: 'Single', keys: ['2024-01-01']}, \
+                             last_timestamp = 1",
+                    )
+                    .await
+                    .unwrap();
+            }
+            AnyStorage::Postgres(postgres) => {
+                let key = PartitionKey::Single {
+                    keys: vec!["2024-01-01".to_string()],
+                };
+                postgres
+                    .insert_partition_row(DEFAULT_CODE_LOCATION_ID, "live_asset", &key, 1)
+                    .await
+                    .unwrap();
+            }
+        }
     })
     .await;
 
@@ -2043,6 +2060,21 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
     expect_yields(&storage, "events", async {
         let ev = make_event("live_asset", "live_runs", 1);
         storage.store_event(&ev).await.unwrap();
+    })
+    .await;
+
+    expect_yields(&storage, "run_logs", async {
+        let log = LogRecord {
+            code_location_id: DEFAULT_CODE_LOCATION_ID.to_string(),
+            run_id: "live_runs".into(),
+            step_key: "s1".into(),
+            timestamp: 1,
+            stdout: Some("out".into()),
+            stderr: None,
+            logs: None,
+            traceback: None,
+        };
+        storage.store_run_logs(&[log]).await.unwrap();
     })
     .await;
 
@@ -2072,6 +2104,39 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
             config: None,
         };
         storage.create_backfill(&bf, &[]).await.unwrap();
+    })
+    .await;
+
+    // A run of a live backfill: its link, then its outcome.
+    storage
+        .create_backfill(
+            &make_backfill("live_bf_runs", BackfillStatus::InProgress, 1),
+            &[],
+        )
+        .await
+        .unwrap();
+    expect_yields(&storage, "backfill_runs", async {
+        assert!(
+            storage
+                .link_backfill_run("live_bf_runs", "live_bf_run", 0, 1)
+                .await
+                .unwrap()
+        );
+    })
+    .await;
+    let mut backfill_run = minimal_run("live_bf_run", RunStatus::Started);
+    backfill_run.partition_key = Some(PartitionKey::Single {
+        keys: vec!["2024-01-01".to_string()],
+    });
+    backfill_run.launched_by = LaunchedBy::Backfill {
+        backfill_id: "live_bf_runs".into(),
+    };
+    storage.create_run(&backfill_run).await.unwrap();
+    expect_yields(&storage, "backfill_run_outcomes", async {
+        storage
+            .update_run_status("live_bf_run", RunStatus::Success, Some(2))
+            .await
+            .unwrap();
     })
     .await;
 
@@ -2135,30 +2200,21 @@ async fn test_subscribe_table_wakes_for_every_live_channel_table() {
     .await;
 
     expect_yields(&storage, "concurrency_slots", async {
-        storage
-            .db
-            .query(
-                "CREATE concurrency_slots SET \
-                     pool_key = 'live_pool', run_id = 'live_runs', step_key = 's1', \
-                     slots_consumed = 1, claimed_at = 1, \
-                     lease_expires_at = 9999999999, last_heartbeat = 1",
-            )
-            .await
-            .unwrap();
+        insert_slot(
+            &storage,
+            "live_pool",
+            "live_runs",
+            "s1",
+            1,
+            1,
+            9_999_999_999,
+        )
+        .await;
     })
     .await;
 
-    // `pending_steps` table — same argument as `concurrency_slots`.
     expect_yields(&storage, "pending_steps", async {
-        storage
-            .db
-            .query(
-                "CREATE pending_steps SET \
-                     pool_key = 'live_pool', run_id = 'live_pending', step_key = 's2', \
-                     priority = 0, enqueued_at = 1, block_reason = 'PoolFull'",
-            )
-            .await
-            .unwrap();
+        insert_pending_step(&storage, "live_pool", "live_pending", "s2", 1).await;
     })
     .await;
 }
@@ -2364,14 +2420,30 @@ async fn test_kv_set_upserts_single_row() {
     storage.kv_set("k", b"v2").await.unwrap();
     storage.kv_set("k", b"v3").await.unwrap();
     assert_eq!(storage.kv_get("k").await.unwrap().unwrap(), b"v3");
-    let mut res = storage
-        .db
-        .query("SELECT * FROM kv WHERE key = $key")
-        .bind(("key", "k".to_string()))
-        .await
-        .unwrap();
-    let rows: Vec<DbKv> = res.take(0).unwrap();
-    assert_eq!(rows.len(), 1, "upsert must keep exactly one row per key");
+    assert_eq!(
+        kv_rows(&storage, "k").await,
+        1,
+        "upsert must keep exactly one row per key"
+    );
+}
+
+/// How many `kv` rows hold `key`.
+async fn kv_rows(storage: &AnyStorage, key: &str) -> usize {
+    match storage {
+        AnyStorage::Surreal(surreal) => {
+            let mut res = surreal
+                .db
+                .query("SELECT * FROM kv WHERE key = $key")
+                .bind(("key", key.to_string()))
+                .await
+                .unwrap();
+            let rows: Vec<DbKv> = res.take(0).unwrap();
+            rows.len()
+        }
+        AnyStorage::Postgres(postgres) => {
+            usize::try_from(postgres.kv_rows(key).await.unwrap()).unwrap()
+        }
+    }
 }
 
 #[tokio::test]

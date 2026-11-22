@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::event_batch::{BATCH_SIZE, EventBatch};
-use rivers_core::storage::surrealdb_backend::SurrealStorage;
 use rivers_core::storage::{EventRecord, LogRecord, ScopedStorageHandle, StorageBackend};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -64,7 +64,7 @@ pub(crate) struct EventWriter {
 }
 
 impl EventWriter {
-    pub(crate) fn new(storage: ScopedStorageHandle<SurrealStorage>) -> Self {
+    pub(crate) fn new(storage: ScopedStorageHandle<AnyStorage>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let code_location_id = storage.code_location_id().to_string();
         let backend = Arc::clone(storage.backend());
@@ -134,7 +134,7 @@ pub(crate) async fn store_now(
         .map_err(|_| anyhow::anyhow!("the event writer has stopped"))?
 }
 
-async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
+async fn flush_logs(storage: &AnyStorage, batch: &mut Vec<LogRecord>) {
     if batch.is_empty() {
         return;
     }
@@ -148,7 +148,7 @@ async fn flush_logs(storage: &SurrealStorage, batch: &mut Vec<LogRecord>) {
 /// did not take.
 async fn batch_writer_loop(
     mut rx: mpsc::UnboundedReceiver<WriterMsg>,
-    storage: &SurrealStorage,
+    storage: &AnyStorage,
 ) -> anyhow::Result<()> {
     let mut events = EventBatch::default();
     let mut logs: Vec<LogRecord> = Vec::new();
