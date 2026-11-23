@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload hung test stacks
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-hang-dumps
           path: hang-dumps/
@@ -179,7 +179,7 @@ jobs:
       # Runner images default to JDK 25 (ubuntu-26.04), which removed the
       # Subject.getSubject that Hadoop calls under Spark.
       - name: Setup Java
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
@@ -272,7 +272,7 @@ jobs:
       # hand-maintained download URLs (the action adds `--locked` when
       # mise.lock exists and verifies its checksums, and caches the tools).
       - name: Install cluster tooling via mise
-        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         env:
           # Tool resolution hits the GitHub API — authenticate to dodge the
           # shared-runner-IP rate limit.
