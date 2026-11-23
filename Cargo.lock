@@ -1716,7 +1716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0097e28936e948e8f759478e1b5ec2e5ca70ab62cf38aaa9bd3aa660023e3fca"
 dependencies = [
  "derive_builder",
- "jiff",
+ "jiff 0.2.46",
  "strum 0.27.2",
 ]
 
@@ -3941,14 +3941,29 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiff"
-version = "0.2.39"
+version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ac703058abac89e5c39b0b879dce2b6b14a4ba36600c7e7e3d0c60a6883ef3c"
+checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
 dependencies = [
- "defmt 1.2.0",
- "jiff-core",
- "jiff-static",
- "jiff-tzdb-platform",
+ "jiff-core 0.1.8",
+ "jiff-static 0.2.46",
+ "jiff-tzdb-platform 0.1.3",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cc767b5763de45e810109520123bb2829a653f3a7ed9be40b2bc4f81158f595"
+dependencies = [
+ "jiff-core 1.0.1",
+ "jiff-static 1.0.0",
+ "jiff-tzdb-platform 1.0.0",
  "js-sys",
  "log",
  "portable-atomic",
@@ -3960,24 +3975,44 @@ dependencies = [
 
 [[package]]
 name = "jiff-core"
-version = "0.1.2"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee43309eb53bafb8c36d35d6e444769c8f8e6206a9fbf7546f5db9d7d4a0e93"
+checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
 dependencies = [
- "defmt 1.2.0",
+ "log",
+]
+
+[[package]]
+name = "jiff-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+dependencies = [
  "log",
 ]
 
 [[package]]
 name = "jiff-static"
-version = "0.2.39"
+version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dc32470c67eb7d0e9ccb74303fa925313dc04cecb1aa048beaa6f391e36a93d"
+checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.8",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "955491488dc99b572ea6d67b172dcd98787d00744b1fb44a5689b4e6413695a6"
+dependencies = [
+ "jiff-core 1.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -3987,12 +4022,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
 
 [[package]]
+name = "jiff-tzdb"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e71a1b68a875a44a33bb7a1dd84392cb77145a3367a552a3cfe6a4f5cf3afc"
+
+[[package]]
 name = "jiff-tzdb-platform"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
- "jiff-tzdb",
+ "jiff-tzdb 0.1.9",
+]
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc65b284afcfa8f6cf189c7274c805505314a7ab975c60e1f548bff56525420e"
+dependencies = [
+ "jiff-tzdb 1.0.0",
 ]
 
 [[package]]
@@ -4132,7 +4182,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab0d13801242174b1f3966907c3f32039f2d6b36c7ce82c61225d66ed5d1eb70"
 dependencies = [
  "base64 0.22.1",
- "jiff",
+ "jiff 0.2.46",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -4190,7 +4240,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
- "jiff",
+ "jiff 0.2.46",
  "jsonpath-rust",
  "k8s-openapi",
  "kube-core",
@@ -4219,7 +4269,7 @@ dependencies = [
  "derive_more",
  "form_urlencoded",
  "http",
- "jiff",
+ "jiff 0.2.46",
  "json-patch",
  "k8s-openapi",
  "schemars 1.2.3",
@@ -6311,7 +6361,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.46",
  "libc",
  "once_cell",
  "portable-atomic",
@@ -6981,7 +7031,7 @@ dependencies = [
  "futures-util",
  "http",
  "humantime",
- "jiff",
+ "jiff 1.0.0",
  "k8s-openapi",
  "kube-client",
  "libc",
@@ -7037,7 +7087,7 @@ dependencies = [
  "anyhow",
  "croner",
  "futures-util",
- "jiff",
+ "jiff 1.0.0",
  "ordermap",
  "petgraph",
  "refinery-core",
@@ -7102,7 +7152,7 @@ dependencies = [
  "gix-packetline",
  "http",
  "http-body-util",
- "jiff",
+ "jiff 1.0.0",
  "json-patch",
  "jsonptr",
  "k8s-openapi",
@@ -7165,7 +7215,7 @@ dependencies = [
  "futures-util",
  "http",
  "ipnet",
- "jiff",
+ "jiff 1.0.0",
  "js-sys",
  "leptos",
  "leptos_axum",
@@ -8056,7 +8106,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.46",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",

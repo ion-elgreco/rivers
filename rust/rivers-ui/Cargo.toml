@@ -124,7 +124,7 @@ jiff.workspace = true
 # `js` routes `Timestamp::now()` through `Date.now()`. The browser bundle
 # never resolves IANA names, so the tzdb bundles stay out of the WASM.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-jiff = { version = "0.2", default-features = false, features = ["std", "serde", "js"] }
+jiff = { version = "1.0", default-features = false, features = ["std", "serde", "js"] }
 
 # Brotli quality 11 of the 5 MB WASM bundle takes 2.5 min on a 0.5 vCPU
 # pod and ~2 s per request via `CompressionLayer` — both unacceptable, so
