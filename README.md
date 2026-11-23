@@ -6,6 +6,10 @@ rivers is a Rust-powered orchestration platform built around data assets. Define
 
 [Documentation](https://orchestrator.rs/docs/) · [Issues](https://github.com/ion-elgreco/rivers/issues) · [Discussions](https://github.com/ion-elgreco/rivers/discussions)
 
+<a href="assets/ui-demo.mp4">
+  <img src="assets/ui-demo.gif" alt="A tour of the rivers UI: lineage, a job run, a partition backfill and automation" width="100%" />
+</a>
+
 ## Key features
 
 - **Asset-based orchestration** — define data assets as Python functions; rivers resolves the dependency graph automatically.
