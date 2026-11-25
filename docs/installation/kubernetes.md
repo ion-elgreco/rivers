@@ -710,6 +710,10 @@ Schema version 18 adds the tables that keep the version of the stored data
 of each asset, and raises no floor: an older `CodeLocation` image and an
 older UI still read and write the database.
 
+An older rivers does not check these versions. Upgrade every `CodeLocation`
+image first, then raise the `schema_version` of an asset in a later deploy
+(see [Asset Migrations](../concepts/migrations.md#rolling-deploys)).
+
 ### `Run` resources without `spec.surrealEndpoint`
 
 A `Run` no longer has the `spec.surrealEndpoint` field. The operator gives

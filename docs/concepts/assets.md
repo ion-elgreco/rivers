@@ -391,6 +391,17 @@ A value that fails the check fails its output with `AssetOutputValidationError`.
 
 Every executor runs the same check. The parallel executor runs it in the worker process.
 
+## Versions of stored data
+
+`schema_version` is the version of the shape of an asset's stored data, `1` by default. When the shape changes, increase it and add a migration to the new version. rivers then holds the runs that write or read the asset until the stored data is at that version:
+
+```python
+@rs.Asset(schema_version=2, migrations=[rs.AssetMigration(to=2, rebuild=True)])
+def daily_totals(orders: pl.DataFrame) -> pl.DataFrame: ...
+```
+
+See [Asset Migrations](migrations.md).
+
 ## Asset metadata
 
 Attach static metadata to an asset via the `metadata` parameter. Metadata serves three purposes:

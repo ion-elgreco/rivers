@@ -81,6 +81,8 @@ A PostgreSQL URL holds its credentials, so PostgreSQL has no counterpart of this
 
 ## Schema versioning & migration
 
+This section is about the schema of rivers' own database. The version of an asset's stored data is the asset's `schema_version`: see [Asset Migrations](../concepts/migrations.md).
+
 Each persistent database carries a **schema stamp** — the schema version it was last migrated to, plus a `min_reader` and `min_writer` floor (the oldest rivers build allowed to read, and to write, that version). Opening a store checks this stamp against the build's schema version and **refuses an incompatible open instead of silently migrating**.
 
 **The open contract** (`floor ≤ build ≤ version`):

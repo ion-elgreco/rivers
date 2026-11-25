@@ -51,6 +51,7 @@ nav:
   - Concepts:
       - Assets: concepts/assets.md
       - Asset Actions: concepts/actions.md
+      - Asset Migrations: concepts/migrations.md
       - Jobs & Executors: concepts/jobs.md
       - Partitions: concepts/partitions.md
       - IO Handlers: concepts/io-handlers.md

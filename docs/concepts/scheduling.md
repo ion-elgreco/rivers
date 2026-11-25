@@ -73,6 +73,8 @@ Unlike schedules and sensors, automation conditions don't go through `RunRequest
 
 A dependency on a [remote asset](assets.md#remote-assets) follows the runs of the code location that owns it, so `eager()` fires when the owner materializes it. See [Automation](assets.md#automation) for the conditions that are false on a remote dependency.
 
+While an asset [migrates](migrations.md), automation leaves it and the assets that read it alone. Their conditions still fire, but no run starts: the tick of each such asset is `Skipped`, with the reason (for example `orders is migrating to version 2`). The condition stays armed and fires again after the migration.
+
 ## Picking between them
 
 The three triggers overlap. A rough decision rule:
@@ -93,6 +95,8 @@ All three triggers are evaluated by the same background process: `AutomationDaem
 4. Persists a tick record (run requests, skip reason, cursor, error) to storage.
 5. Submits any resulting runs through the run queue.
 
+The daemon also runs the [asset migrations](migrations.md) of its code location.
+
 ### Eval modes
 
 `Schedule` and `Sensor` accept an `eval_mode` argument:
@@ -104,8 +108,6 @@ All three triggers are evaluated by the same background process: `AutomationDaem
 | `EvalMode.Subprocess` | Run in a loky subprocess, which rebuilds the resources from their field values, secrets included. Useful when the eval function needs CPU isolation or is unsafe to run alongside the daemon. |
 
 Automation conditions don't have an eval mode — they are evaluated entirely in Rust (no user code runs unless an asset matches and gets launched).
-
-While an asset [migrates](../api-reference/assets.md#assetmigration), automation leaves it and the assets that read it alone. Their conditions still fire, but no run starts: the tick of each such asset is `Skipped`, with the reason (for example `orders is migrating to version 2`). The condition stays armed and fires again after the migration.
 
 ### Cursor and tick history
 
