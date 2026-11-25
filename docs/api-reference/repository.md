@@ -220,6 +220,32 @@ assert result.success
 assert repo.storage.get_run(result.run_id).action == "optimize"
 ```
 
+### `migrate()`
+
+```python
+def migrate(
+    self,
+    selection: list[str] | None = None,
+    raise_on_error: bool = True,
+) -> list[AssetVersionRecord]
+```
+
+Run the pending and failed [asset migrations](assets.md#assetmigration) in this process, for tests and scripts without a daemon. Each migration first waits until no started run writes the asset or reads it. The migrations of the assets that the selection reads run first. A convert runs in this process, and so does a rebuild, also when it is a backfill. The call returns when each selected migration has ended. A daemon that holds a migration keeps it: the call waits until it ends. A call that stops early, for example on Ctrl-C, lets go of its migrations, so that the next call, or a daemon, goes on with them at once.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `selection` | `list[str] \| None` | `None` | Asset names. `None` selects every asset of this code. |
+| `raise_on_error` | `bool` | `True` | At the end, raise `AssetMigrationPendingError` when a selected asset, or an asset that it reads, still waits for a migration (for example after a failed one), and `AssetVersionMismatchError` when its stored data is at a higher version than this code declares. |
+
+Returns the [`AssetVersionRecord`](storage.md#assetversionrecord) of each selected asset, by name.
+
+```python
+repo = rs.CodeRepository(assets=[orders])  # orders declares schema_version=2
+repo.resolve(storage=storage)
+(record,) = repo.migrate(["orders"])
+assert (record.state, record.applied_version) == ("ready", 2)
+```
+
 ### `load_node()`
 
 ```python

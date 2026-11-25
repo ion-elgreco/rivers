@@ -92,11 +92,14 @@ pub(crate) fn plan_run<'a>(
 }
 
 /// `Ok` when the gate lets the run go, else `AssetMigrationPendingError` or
-/// `AssetVersionMismatchError` with the reason.
+/// `AssetVersionMismatchError` with the reason. A wait names
+/// `repo.migrate()`, which migrates without a daemon.
 pub(crate) fn gate_result(gate: VersionGate) -> PyResult<()> {
     match gate {
         VersionGate::Go => Ok(()),
-        VersionGate::Wait(reason) => Err(AssetMigrationPendingError::new_err(reason)),
+        VersionGate::Wait(reason) => Err(AssetMigrationPendingError::new_err(format!(
+            "{reason}; to migrate in this process, call repo.migrate()"
+        ))),
         VersionGate::Refuse(reason) => Err(AssetVersionMismatchError::new_err(reason)),
     }
 }

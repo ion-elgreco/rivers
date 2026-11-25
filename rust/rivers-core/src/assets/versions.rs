@@ -451,6 +451,27 @@ impl CodeVersions {
         self.reads.get(key).map_or(&[], Vec::as_slice)
     }
 
+    /// The assets that this code owns.
+    pub fn assets(&self) -> impl Iterator<Item = &str> {
+        self.declared.keys().map(String::as_str)
+    }
+
+    /// `keys` and each asset that they read, directly or through other
+    /// assets.
+    pub fn with_upstream<'a>(
+        &'a self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> HashSet<&'a str> {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<&str> = keys.into_iter().collect();
+        while let Some(key) = stack.pop() {
+            if seen.insert(key) {
+                stack.extend(self.reads(key).iter().map(String::as_str));
+            }
+        }
+        seen
+    }
+
     /// `key` and the nodes that read it.
     pub fn touching<'a>(&'a self, key: &'a str) -> HashSet<&'a str> {
         self.reads
@@ -974,6 +995,16 @@ mod tests {
             ["customers", "raw"]
         );
         assert!(reads(&["raw"]).is_empty());
+    }
+
+    #[test]
+    fn with_upstream_adds_each_asset_that_the_keys_read() {
+        let code = CodeVersions::new(&graph(), HashMap::new());
+        let mut upstream: Vec<&str> = code.with_upstream(["summary"]).into_iter().collect();
+        upstream.sort_unstable();
+
+        assert_eq!(upstream, ["customers", "orders", "raw", "summary"]);
+        assert_eq!(code.with_upstream(["raw"]), HashSet::from(["raw"]));
     }
 
     #[test]

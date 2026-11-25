@@ -17,7 +17,7 @@ Every class extends Python's built-in `Exception`, and its module is `rivers.exc
 | Class | Raised when |
 |-------|-------------|
 | `AssetDefinitionError` | An `@Asset` definition is invalid (bad signature, conflicting flags, …). |
-| `AssetMigrationPendingError` | A run would write or read an asset whose stored data is not at the version that the code declares: its migration has not finished, or it failed. |
+| `AssetMigrationPendingError` | A run would write or read an asset whose stored data is not at the version that the code declares: its migration has not finished, or it failed. Without a daemon, [`repo.migrate()`](repository.md#migrate) runs the migration. |
 | `AssetNotFoundError` | A referenced asset key does not exist in the repository. |
 | `AssetOutputValidationError` | An asset output fails validation (type, schema, metadata). |
 | `AssetVersionMismatchError` | A run would write an asset whose stored data is at a higher `schema_version` than the code declares. |

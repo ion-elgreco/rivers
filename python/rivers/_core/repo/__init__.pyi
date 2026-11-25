@@ -28,7 +28,7 @@ from rivers._core.partitions import (
 )
 from rivers._core.schedule import Schedule, ScheduleTickResult
 from rivers._core.sensor import Sensor, SensorTickResult
-from rivers._core.storage import LaunchedBy, Storage
+from rivers._core.storage import AssetVersionRecord, LaunchedBy, Storage
 
 T = TypeVar("T")
 
@@ -474,6 +474,39 @@ class CodeRepository:
                 original id (K8s run pods); a fresh id is minted otherwise.
             resume: Skip steps this run already completed, so a crashed action
                 run does not re-apply their side effects.
+        """
+        ...
+
+    def migrate(
+        self,
+        selection: list[str] | None = None,
+        raise_on_error: bool = True,
+    ) -> list[AssetVersionRecord]:
+        """Run the pending and failed asset migrations in this process.
+
+        For tests and scripts without a daemon. Each migration first waits
+        until no started run writes the asset or reads it. The migrations of
+        the assets that the selection reads run first. A convert runs in this
+        process, and so does a rebuild, also as a backfill. Returns when each
+        selected migration has ended. A call that stops early, for example on
+        Ctrl-C, lets go of its migrations, so that the next call, or a daemon,
+        goes on with them at once.
+
+        Args:
+            selection: Asset names (``None`` = every asset of this code).
+            raise_on_error: Raise when a selected asset is not ready at the
+                end, for example after a failed migration.
+
+        Returns:
+            The version records of the selected assets, by name.
+
+        Raises:
+            AssetNotFoundError: The selection names an unknown asset.
+            AssetMigrationPendingError: A selected asset still waits for its
+                migration (only with ``raise_on_error``).
+            AssetVersionMismatchError: The stored data of a selected asset is
+                at a higher version than this code declares (only with
+                ``raise_on_error``).
         """
         ...
 

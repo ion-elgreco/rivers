@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use pyo3::prelude::*;
-use rivers_core::assets::migrations::{MigrationLauncher, MigrationWork};
+use rivers_core::assets::migrations::{MigrationLauncher, MigrationWork, REBUILD_CONCURRENCY};
 use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus};
 
@@ -531,10 +531,6 @@ impl LocalBackfillDispatcher {
         })
     }
 }
-
-/// How many runs of a rebuild backfill run at once, as for the backfills of
-/// automation conditions.
-const REBUILD_CONCURRENCY: u32 = 4;
 
 /// Starts the work of asset migrations through the daemon's run and backfill
 /// dispatchers. Each run and backfill is launched by the migration.

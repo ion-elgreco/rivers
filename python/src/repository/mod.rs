@@ -9,6 +9,7 @@ mod backfill;
 mod graph;
 mod handle;
 mod launch;
+mod migrate;
 mod resolve;
 mod results;
 mod validation;
@@ -429,6 +430,21 @@ impl PyCodeRepository {
                 LaunchedBy::Manual { user: None },
             )
         })
+    }
+
+    /// Run the pending and failed asset migrations of `selection` (every
+    /// asset of this code when `None`) in this process, with the
+    /// migrations of the assets that they read first. Returns the version
+    /// records of the selection.
+    #[pyo3(signature = (selection=None, raise_on_error=true))]
+    #[tracing::instrument(skip_all, target = "rivers::repo", name = "migrate")]
+    fn migrate(
+        &self,
+        py: Python<'_>,
+        selection: Option<Vec<String>>,
+        raise_on_error: bool,
+    ) -> PyResult<Vec<crate::storage::PyAssetVersionRecord>> {
+        py.detach(|| self.migrate_inner(selection, raise_on_error))
     }
 
     /// Walks the registry chain `node.io_handler() → default`. Useful for

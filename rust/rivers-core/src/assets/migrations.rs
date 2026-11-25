@@ -8,6 +8,7 @@
 //! daemon of the same code takes over. Each change of a row is a
 //! compare-and-set on its revision, so two daemons never both move it.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -28,6 +29,10 @@ pub const LEASE_NS: i64 = 60_000_000_000;
 /// How many times [`retry_migration`] reads the row again when another
 /// writer changed it first.
 const RETRY_ATTEMPTS: usize = 10;
+
+/// How many runs of a rebuild backfill run at once, as for the backfills of
+/// automation conditions.
+pub const REBUILD_CONCURRENCY: u32 = 4;
 
 /// The work that moves the stored data of an asset by one version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +69,8 @@ impl MigrationWork {
 /// Starts the work of a migration.
 pub trait MigrationLauncher: Send + Sync {
     /// Start `work`, which moves the stored data of `asset_key` to version
-    /// `to`. `Ok` once its run or backfill has a record.
+    /// `to`. `Ok` once its run or backfill has a record, or once the caller
+    /// of the pass will start the work before its next pass.
     fn launch(
         &self,
         asset_key: &str,
@@ -95,11 +101,26 @@ pub struct MigrationLoop {
     /// The daemon, as the owner of the migrations that it holds.
     owner: String,
     code: Arc<CodeVersions>,
+    /// The assets whose migrations the loop moves: all of the code's when
+    /// `None`.
+    only: Option<HashSet<String>>,
 }
 
 impl MigrationLoop {
     pub fn new(owner: String, code: Arc<CodeVersions>) -> Self {
-        Self { owner, code }
+        Self {
+            owner,
+            code,
+            only: None,
+        }
+    }
+
+    /// The same loop, for the migrations of `keys` only.
+    pub fn only(self, keys: HashSet<String>) -> Self {
+        Self {
+            only: Some(keys),
+            ..self
+        }
     }
 
     /// Move each migration of an asset that this code owns as far as it can
@@ -113,6 +134,11 @@ impl MigrationLoop {
         let rows = storage.scoped().get_asset_versions(None).await?;
         let mut on_its_way = false;
         for row in rows {
+            if let Some(only) = &self.only
+                && !only.contains(&row.asset_key)
+            {
+                continue;
+            }
             let key = row.asset_key.clone();
             match self.advance(storage, launcher, row).await {
                 Ok(moving) => on_its_way |= moving,
@@ -128,6 +154,28 @@ impl MigrationLoop {
             }
         }
         Ok(on_its_way)
+    }
+
+    /// Let go of each migration that this loop holds, so that the next pass
+    /// of any loop takes it on at once: for a loop that stops before its
+    /// migrations end. Each migration stays in its state.
+    pub async fn release<S: StorageBackend>(&self, storage: &ScopedStorageHandle<S>) -> Result<()> {
+        for row in storage.scoped().get_asset_versions(None).await? {
+            if row.owner.as_deref() != Some(self.owner.as_str()) {
+                continue;
+            }
+            let free = AssetVersionRecord {
+                owner: None,
+                lease_expires_at: None,
+                ..row.clone()
+            };
+            // When another writer changed the row, this loop holds it no longer.
+            storage
+                .scoped()
+                .put_asset_version(&free, Some(row.revision))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Move the migration in `row` on until it must wait. `Ok(true)` while it
@@ -1277,6 +1325,42 @@ mod tests {
         };
         assert_eq!(started, [lost]);
         assert_eq!(f.row("orders").await.owner.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn a_released_migration_goes_on_in_the_next_loop_at_once() {
+        let f = Fixture::new().await;
+        f.put(&pending("orders", 1, 2)).await;
+        let declared: &[(&str, &[MigrationKind])] = &[("orders", &[Convert])];
+        let (a, b) = (daemon("a", declared), daemon("b", declared));
+        f.pass(&a).await;
+        let run_id = f.launches.one_run();
+
+        a.release(&f.handle).await.unwrap();
+
+        let free = f.row("orders").await;
+        assert_eq!(
+            (free.state, free.owner, free.lease_expires_at),
+            (AssetVersionState::Running, None, None)
+        );
+        f.end_run(&run_id, RunStatus::Success).await;
+        assert!(!f.pass(&b).await);
+        assert_eq!(f.row("orders").await.applied_version, 2);
+    }
+
+    #[tokio::test]
+    async fn a_loop_for_some_assets_moves_only_their_migrations() {
+        let f = Fixture::new().await;
+        f.put(&pending("raw", 1, 2)).await;
+        f.put(&pending("orders", 1, 2)).await;
+        let declared: &[(&str, &[MigrationKind])] =
+            &[("raw", &[VersionOnly]), ("orders", &[VersionOnly])];
+        let raw_only = daemon("a", declared).only(HashSet::from(["raw".to_string()]));
+
+        assert!(!f.pass(&raw_only).await);
+
+        assert_eq!(f.row("raw").await.state, AssetVersionState::Ready);
+        assert_eq!(f.row("orders").await.state, AssetVersionState::Pending);
     }
 
     #[tokio::test]

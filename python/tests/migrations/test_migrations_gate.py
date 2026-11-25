@@ -14,7 +14,7 @@ from _helpers import EXECUTORS, IP, event_types
 from rivers.exceptions import AssetMigrationPendingError, AssetVersionMismatchError
 
 FORMS = pytest.mark.parametrize("form", ["decorator", "class", "multi", "graph"])
-PENDING = "^orders is migrating to version 2$"
+PENDING = r"^orders is migrating to version 2; to migrate in this process, call repo\.migrate\(\)$"
 REFUSED = "^this code declares orders version 2; the stored data is at version 3$"
 EU = rs.PartitionKey.single("eu")
 
