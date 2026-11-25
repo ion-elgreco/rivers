@@ -105,6 +105,8 @@ All three triggers are evaluated by the same background process: `AutomationDaem
 
 Automation conditions don't have an eval mode — they are evaluated entirely in Rust (no user code runs unless an asset matches and gets launched).
 
+While an asset [migrates](../api-reference/assets.md#assetmigration), automation leaves it and the assets that read it alone. Their conditions still fire, but no run starts: the tick of each such asset is `Skipped`, with the reason (for example `orders is migrating to version 2`). The condition stays armed and fires again after the migration.
+
 ### Cursor and tick history
 
 The daemon persists every tick to storage:

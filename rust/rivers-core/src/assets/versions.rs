@@ -497,6 +497,37 @@ impl CodeVersions {
         asset_version_gate(&run, rows)
     }
 
+    /// The assets of `keys` that automation leaves alone for now, each with
+    /// the reason: a new run of the asset would wait or be refused at the
+    /// gate.
+    pub fn paused<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+        rows: &[AssetVersionRecord],
+    ) -> HashMap<String, String> {
+        // A ready row at the version that this code declares, or of an asset
+        // that this code does not own, holds no run.
+        let rows: Vec<AssetVersionRecord> = rows
+            .iter()
+            .filter(|row| {
+                row.state != AssetVersionState::Ready
+                    || self
+                        .declared(&row.asset_key)
+                        .is_some_and(|declared| declared != row.applied_version)
+            })
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            return HashMap::new();
+        }
+        keys.into_iter()
+            .filter_map(|key| {
+                let gate = self.gate(None, None, &[key.to_string()], &rows);
+                Some((key.to_string(), gate.reason()?.to_string()))
+            })
+            .collect()
+    }
+
     /// [`Self::gate`] over the stored rows, for a new manual run or backfill.
     pub async fn check<S: StorageBackend>(
         &self,
@@ -983,6 +1014,51 @@ mod tests {
             VersionGate::Refuse(
                 "this code declares orders version 2; the stored data is at version 3".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn automation_leaves_a_migrating_asset_and_its_readers_alone() {
+        let code = CodeVersions::new(
+            &graph(),
+            HashMap::from([("orders".to_string(), 2), ("customers".to_string(), 1)]),
+        );
+        let paused = |rows: &[AssetVersionRecord]| {
+            let mut paused: Vec<(String, String)> = code
+                .paused(["orders", "summary", "customers"], rows)
+                .into_iter()
+                .collect();
+            paused.sort();
+            paused
+        };
+        let with_reader = |reason: &str| {
+            vec![
+                ("orders".to_string(), reason.to_string()),
+                ("summary".to_string(), reason.to_string()),
+            ]
+        };
+
+        assert!(paused(&[]).is_empty());
+        assert!(paused(&[versioned("orders", 2, AssetVersionState::Ready)]).is_empty());
+        assert_eq!(
+            paused(&[versioned("orders", 1, AssetVersionState::Running)]),
+            with_reader("orders is migrating to version 2")
+        );
+        let failed = AssetVersionRecord {
+            reason: Some("the warehouse is down".to_string()),
+            ..versioned("orders", 1, AssetVersionState::Failed)
+        };
+        assert_eq!(
+            paused(&[failed]),
+            with_reader("the migration of orders to version 2 failed: the warehouse is down")
+        );
+        // Old code never writes newer data; its readers read it as before.
+        assert_eq!(
+            paused(&[versioned("orders", 3, AssetVersionState::Ready)]),
+            [(
+                "orders".to_string(),
+                "this code declares orders version 2; the stored data is at version 3".to_string()
+            )]
         );
     }
 }

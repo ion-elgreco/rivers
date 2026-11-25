@@ -71,6 +71,17 @@ impl MaterializationPlan {
             && self.multi_partition_backfills.is_empty()
     }
 
+    /// Keep only the assets for which `keep` holds, in each dispatch shape.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.unpartitioned.retain(|asset| keep(asset));
+        self.single_partition_groups.retain(|_, assets| {
+            assets.retain(|asset| keep(asset));
+            !assets.is_empty()
+        });
+        self.multi_partition_backfills
+            .retain(|(asset, _)| keep(asset));
+    }
+
     /// Every asset key this plan dispatches, across all three dispatch shapes.
     pub fn dispatched_asset_keys(&self) -> impl Iterator<Item = &str> {
         self.unpartitioned

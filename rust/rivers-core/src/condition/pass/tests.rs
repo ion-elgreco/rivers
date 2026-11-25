@@ -1732,6 +1732,33 @@ fn test_classify_multi_partition_becomes_backfill() {
     assert_eq!(pks.len(), 2);
 }
 
+#[test]
+fn retain_takes_assets_out_of_each_dispatch_shape() {
+    let mut plan = MaterializationPlan {
+        unpartitioned: vec!["a".into(), "b".into()],
+        single_partition_groups: HashMap::from([
+            (spk("eu"), vec!["a".into(), "c".into()]),
+            (spk("us"), vec!["a".into()]),
+        ]),
+        multi_partition_backfills: vec![
+            ("a".into(), vec![spk("eu"), spk("us")]),
+            ("d".into(), vec![spk("eu")]),
+        ],
+    };
+
+    plan.retain(|asset| asset != "a");
+
+    assert_eq!(plan.unpartitioned, ["b"]);
+    assert_eq!(
+        plan.single_partition_groups,
+        HashMap::from([(spk("eu"), vec!["c".to_string()])])
+    );
+    assert_eq!(
+        plan.multi_partition_backfills,
+        [("d".to_string(), vec![spk("eu")])]
+    );
+}
+
 fn empty_pass() -> ConditionPass {
     ConditionPass::new(
         AssetConditionCache::new("test_cl".into()),

@@ -9,6 +9,8 @@ pub(super) struct AssetOutcome {
     pub(super) run_ids: Vec<String>,
     pub(super) backfill_ids: Vec<String>,
     pub(super) error: Option<String>,
+    /// Why the tick started no run of the asset.
+    pub(super) skip_reason: Option<String>,
 }
 
 /// Buffer for the run/backfill ids contributed by a single tick's materialization fan-out.
@@ -75,6 +77,14 @@ impl ConditionTickHandle {
             .or_default()
             .backfill_ids
             .push(backfill_id.to_string());
+    }
+
+    /// Record that the tick started no run of `asset`, and why.
+    pub(super) fn note_skipped(&mut self, asset: &str, reason: &str) {
+        self.asset_outcomes
+            .entry(asset.to_string())
+            .or_default()
+            .skip_reason = Some(reason.to_string());
     }
 
     /// Record a backfill dispatch failure for `asset`.

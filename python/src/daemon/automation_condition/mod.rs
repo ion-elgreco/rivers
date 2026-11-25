@@ -291,6 +291,8 @@ pub(super) struct ConditionEvalLoopConfig {
     /// Shared with the schedule/sensor loop.
     pub run_dispatcher: Arc<crate::daemon::dispatchers::RunDispatcherKind>,
     pub backfill_dispatcher: Arc<crate::daemon::dispatchers::BackfillDispatcherKind>,
+    /// Tells which assets wait for a migration.
+    pub code_versions: Arc<rivers_core::assets::versions::CodeVersions>,
     pub tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
     pub max_ticks_retained: Option<usize>,
     pub eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
@@ -311,6 +313,7 @@ pub(in crate::daemon) async fn build_condition_engine(
         storage,
         run_dispatcher,
         backfill_dispatcher,
+        code_versions,
         tick_tx,
         max_ticks_retained,
         eval_tx,
@@ -384,6 +387,7 @@ pub(in crate::daemon) async fn build_condition_engine(
         storage,
         run_dispatcher,
         backfill_dispatcher,
+        code_versions,
         tick_tx,
         eval_tx,
         max_ticks_retained,

@@ -570,6 +570,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
             storage: handle.clone(),
             run_dispatcher: Arc::clone(&run_dispatcher),
             backfill_dispatcher: Arc::clone(&backfill_dispatcher),
+            code_versions: Arc::clone(&code_versions),
             tick_tx: tick_tx.clone(),
             max_ticks_retained,
             eval_tx,

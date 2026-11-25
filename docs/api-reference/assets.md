@@ -707,7 +707,8 @@ When code that declares a higher `schema_version` registers, the daemon
 migrates the stored data. It waits until no started run writes the asset or
 reads it, then runs the migrations from the stored version to the declared
 one, in order. An asset that the asset reads migrates first. Meanwhile, runs
-that write or read the asset wait. A rebuild of a partitioned asset is a
+that write or read the asset wait, and automation conditions start no run of
+the asset or its readers. A rebuild of a partitioned asset is a
 backfill over its materialized partitions; a partition that the rebuild does
 not write then holds no data. A failed migration holds the asset and its
 readers.

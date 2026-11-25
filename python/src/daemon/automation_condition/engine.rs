@@ -1,7 +1,10 @@
 //! Per-tick orchestration of automation conditions on the Python side.
 use std::sync::Arc;
 
-use rivers_core::condition::{ConditionPass, EvalResultRow, PendingDispatch, PendingDispatchEntry};
+use rivers_core::assets::versions::CodeVersions;
+use rivers_core::condition::{
+    ConditionPass, EvalResultRow, MaterializationPlan, PendingDispatch, PendingDispatchEntry,
+};
 use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{ConditionEvalRecord, ScopedStorageHandle, TickRecord};
 
@@ -20,6 +23,8 @@ pub(in crate::daemon) struct ConditionTickEngine {
     /// Shared with the schedule/sensor path.
     pub(super) run_dispatcher: Arc<RunDispatcherKind>,
     pub(super) backfill_dispatcher: Arc<BackfillDispatcherKind>,
+    /// Tells which assets wait for a migration.
+    pub(super) code_versions: Arc<CodeVersions>,
     pub(super) tick_tx: tokio::sync::mpsc::UnboundedSender<TickWriteMsg>,
     pub(super) eval_tx: tokio::sync::mpsc::UnboundedSender<ConditionEvalWriteMsg>,
     pub(super) max_ticks_retained: Option<usize>,
@@ -94,6 +99,7 @@ impl ConditionTickEngine {
             && self.pass.has_time_based
             && self.pass.time_based_eval_set.is_some();
         let mut output = self.pass.plan_tick(now, selective);
+        let paused = self.pause_migrating(&mut output.plan).await;
 
         if tracing::enabled!(target: "rivers::dbg::cond", tracing::Level::TRACE) {
             let mut fired: Vec<&str> = Vec::new();
@@ -124,6 +130,9 @@ impl ConditionTickEngine {
                 now,
                 &output.results,
             );
+            for (asset, reason) in &paused {
+                handle.note_skipped(asset, reason);
+            }
             let run_requests = self.prepare_run_requests(&output.plan, &mut handle);
             let backfill_ids_by_asset: std::collections::HashMap<String, String> = output
                 .plan
@@ -201,13 +210,15 @@ impl ConditionTickEngine {
                         automation_type: "AutomationCondition".into(),
                         status: if outcome.error.is_some() {
                             "Failed".into()
+                        } else if outcome.skip_reason.is_some() {
+                            "Skipped".into()
                         } else {
                             "Requested".into()
                         },
                         timestamp: now,
                         run_ids: outcome.run_ids.clone(),
                         backfill_ids: outcome.backfill_ids.clone(),
-                        skip_reason: None,
+                        skip_reason: outcome.skip_reason.clone(),
                         error: outcome.error.clone(),
                         cursor: None,
                     },
@@ -273,6 +284,44 @@ impl ConditionTickEngine {
                 "failed to persist condition eval state; a restart replays this tick's latches"
             ),
         }
+    }
+
+    /// Take out of `plan` each asset that a migration holds: a new run of it
+    /// would wait or be refused at the gate. Its trigger stays armed, so it
+    /// fires again on the next tick. Returns each one with the reason.
+    async fn pause_migrating(&self, plan: &mut MaterializationPlan) -> Vec<(String, String)> {
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        let rows = match self.storage.scoped().get_asset_versions(None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rivers::daemon",
+                    error = %format!("{e:#}"),
+                    "could not read the asset version rows; the gate checks the runs of this tick"
+                );
+                return Vec::new();
+            }
+        };
+        let paused = self
+            .code_versions
+            .paused(plan.dispatched_asset_keys(), &rows);
+        if paused.is_empty() {
+            return Vec::new();
+        }
+        plan.retain(|asset| !paused.contains_key(asset));
+        let mut paused: Vec<(String, String)> = paused.into_iter().collect();
+        paused.sort_unstable();
+        for (asset, reason) in &paused {
+            tracing::debug!(
+                target: "rivers::daemon",
+                asset = %asset,
+                reason = %reason,
+                "automation leaves the asset alone"
+            );
+        }
+        paused
     }
 
     /// Send per-asset `ConditionEvalRecord`s referencing the already-persisted global `tick_id`.

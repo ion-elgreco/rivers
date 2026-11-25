@@ -225,6 +225,47 @@ async fn test_dispatch_failure_preserves_edge_trigger_for_retry() {
 }
 
 #[tokio::test]
+async fn an_asset_taken_out_of_the_plan_fires_again_on_the_next_tick() {
+    // Automation leaves an asset alone while it migrates: the tick takes it
+    // out of the plan, so its trigger stays armed.
+    use crate::condition::pass::{AssetConditionInfo, ConditionPass};
+    use crate::storage::DEFAULT_CODE_LOCATION_ID;
+    use crate::storage::any::AnyStorage;
+
+    let storage = AnyStorage::new_memory().await.unwrap();
+    storage
+        .for_code_location(&crate::storage::CodeLocationContext::new(
+            DEFAULT_CODE_LOCATION_ID,
+        ))
+        .register_assets(vec![make_record("a")])
+        .await
+        .unwrap();
+    let mut pass = ConditionPass::new(
+        AssetConditionCache::new(DEFAULT_CODE_LOCATION_ID.to_string()),
+        ConditionEvalState::default(),
+        vec![AssetConditionInfo {
+            asset_key: "a".to_string(),
+            condition: ConditionNode::on_missing(),
+            partition_info: None,
+            backfill_strategy: None,
+        }],
+        HashMap::new(),
+    );
+    pass.refresh_cache(&storage, 1_000).await.unwrap();
+
+    let mut paused = pass.plan_tick(1_000, false);
+    assert_eq!(paused.plan.unpartitioned, ["a"]);
+    paused.plan.retain(|asset| asset != "a");
+    pass.commit_tick(&mut paused, &HashSet::new(), 1_000);
+
+    assert!(!pass.should_skip(false));
+    let mut resumed = pass.plan_tick(2_000, false);
+    assert_eq!(resumed.plan.unpartitioned, ["a"]);
+    pass.commit_tick(&mut resumed, &HashSet::new(), 2_000);
+    assert!(pass.plan_tick(3_000, false).plan.is_empty());
+}
+
+#[tokio::test]
 async fn test_initial_evaluation_fires_once_not_per_restart() {
     // Pins initial_evaluation()'s documented semantics: it fires on the very
     // first evaluation tick (fresh eval state) and NOT again after a normal
