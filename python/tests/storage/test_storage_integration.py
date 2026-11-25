@@ -799,6 +799,26 @@ async def test_async_get_asset_record():
 
 
 @pytest.mark.asyncio
+async def test_async_get_asset_version():
+    """Async get_asset_version returns the version record of one asset."""
+    storage = rs.Storage.memory()
+
+    @rs.Asset(name="a", schema_version=2)
+    def a() -> int:
+        return 1
+
+    repo = rs.CodeRepository(assets=[a])
+    repo.resolve(storage=storage)
+
+    record = await storage.async_get_asset_version("a")
+    assert record is not None
+    assert (record.asset_key, record.applied_version, record.state) == ("a", 2, "ready")
+
+    missing = await storage.async_get_asset_version("nonexistent")
+    assert missing is None
+
+
+@pytest.mark.asyncio
 async def test_async_get_runs_after_materialize():
     """Async get_runs returns run records after materialization."""
     storage = rs.Storage.memory()

@@ -105,6 +105,39 @@ class AssetRecord:
     pool: list[tuple[str, int]]
     """Concurrency pools and slot counts the asset claims when materializing."""
 
+class AssetVersionRecord:
+    """The version of an asset's stored data, and its migration."""
+
+    asset_key: str
+    """The asset's name."""
+    applied_version: int
+    """The version of the stored data."""
+    partitions: str | None
+    """The partitions definition of the stored data, as JSON. ``None`` if the
+    asset has no partitions."""
+    state: str
+    """``"ready"``, ``"pending"``, ``"draining"``, ``"running"``, ``"failed"``
+    or ``"blocked"``."""
+    target_version: int | None
+    """The version that the migration moves the data to. ``None`` when
+    ``state`` is ``"ready"``."""
+    reason: str | None
+    """Why the state is ``"failed"`` or ``"blocked"``."""
+    started_at: int | None
+    """Nanosecond timestamp at which the migration began to run."""
+    run_id: str | None
+    """The run of the migration."""
+    backfill_id: str | None
+    """The backfill of a rebuild."""
+    owner: str | None
+    """The daemon that runs the migration."""
+    lease_expires_at: int | None
+    """Nanosecond timestamp until which ``owner`` holds the migration."""
+    revision: int
+    """1 for a new record; each write adds 1."""
+    updated_at: int
+    """Nanosecond timestamp of the last write."""
+
 class StoredTick:
     """One persisted schedule / sensor / automation-condition tick."""
 
@@ -502,6 +535,11 @@ class Storage:
         """Return state records for every asset in the catalog."""
         ...
 
+    def get_asset_version(self, asset_key: str) -> AssetVersionRecord | None:
+        """Return the version of the asset's stored data, or ``None`` if the
+        asset never declared a ``schema_version`` above 1."""
+        ...
+
     def compute_staleness(self) -> dict[str, tuple[str, list[StaleCause]]]:
         """Compute current staleness for every asset, keyed by asset_key.
 
@@ -704,6 +742,9 @@ class Storage:
         self, asset_key: str
     ) -> Coroutine[Any, Any, AssetRecord | None]: ...
     def async_get_asset_records(self) -> Coroutine[Any, Any, list[AssetRecord]]: ...
+    def async_get_asset_version(
+        self, asset_key: str
+    ) -> Coroutine[Any, Any, AssetVersionRecord | None]: ...
     def async_get_assets_by_tag(
         self, tag: str
     ) -> Coroutine[Any, Any, list[AssetRecord]]: ...
@@ -737,6 +778,7 @@ class Storage:
 
 __all__ = [
     "AssetRecord",
+    "AssetVersionRecord",
     "BlockReason",
     "ConcurrencyClaimStatus",
     "PoolBlockDetail",

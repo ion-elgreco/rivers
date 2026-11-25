@@ -617,6 +617,22 @@ impl PyStorage {
         })
     }
 
+    /// The version of the asset's stored data; `None` if the asset never
+    /// declared a version above 1.
+    fn get_asset_version(
+        &self,
+        py: Python<'_>,
+        asset_key: &str,
+    ) -> PyResult<Option<PyAssetVersionRecord>> {
+        let asset_keys = [asset_key.to_string()];
+        py.detach(|| {
+            io_rt()
+                .block_on(self.scoped().get_asset_versions(Some(&asset_keys)))
+                .map(|rows| rows.into_iter().next().map(PyAssetVersionRecord::from))
+                .map_err(to_py_err)
+        })
+    }
+
     /// Compute current staleness for every asset in this code location.
     /// Returns a dict mapping asset_key → (status_str, [PyStaleCause]).
     /// `stale_status` is no longer persisted — use this when you need the
@@ -1219,6 +1235,23 @@ impl PyStorage {
         })
     }
 
+    fn async_get_asset_version<'py>(
+        &self,
+        py: Python<'py>,
+        asset_key: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle.clone();
+        let asset_keys = [asset_key.to_string()];
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle
+                .scoped()
+                .get_asset_versions(Some(&asset_keys))
+                .await
+                .map(|rows| rows.into_iter().next().map(PyAssetVersionRecord::from))
+                .map_err(to_py_err)
+        })
+    }
+
     fn async_get_asset_records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let handle = self.handle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1501,6 +1534,7 @@ pub fn register_storage_module(parent_module: &Bound<'_, PyModule>) -> PyResult<
         PyStoredTick,
         PyStaleCause,
         PyAssetRecord,
+        PyAssetVersionRecord,
         PyUserRef,
         PyLaunchedBy,
         PyRunRecord,

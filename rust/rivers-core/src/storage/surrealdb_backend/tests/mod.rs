@@ -36,6 +36,7 @@ mod run_queue;
 mod run_status;
 mod span_keys;
 mod ui_queries;
+mod version_registration;
 
 /// The store under test: PostgreSQL when `RIVERS_TEST_POSTGRES_URL` is set,
 /// else in-memory SurrealDB.

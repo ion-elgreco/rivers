@@ -52,6 +52,8 @@ pub(crate) struct ResolvedAsset {
     pub kinds: Vec<String>,
     pub group: Option<String>,
     pub code_version: Option<String>,
+    /// The version of the stored data that the code declares.
+    pub schema_version: u32,
     pub pool: Vec<(String, u32)>,
     /// Resolved retry policy (registry names collapsed to concrete at resolve()).
     pub retry: Option<RetryPolicy>,
@@ -236,6 +238,12 @@ impl ResolvedAsset {
             Some(sa) => sa.code_version.clone(),
             None => asset.code_version().cloned(),
         };
+        let schema_version = match single_for_output {
+            Some(sa) => sa.schema_version,
+            None => asset.schema_version(),
+        };
+        let schema_version = u32::try_from(schema_version)
+            .expect("the asset's definition keeps schema_version in the range of u32");
         let pool = match single_for_output {
             Some(sa) => sa.pool.clone(),
             None => asset.pool().clone(),
@@ -394,6 +402,7 @@ impl ResolvedAsset {
             kinds,
             group,
             code_version,
+            schema_version,
             pool,
             // resolve_resources_and_handlers resolves this against the
             // repository's `retries`.
@@ -433,6 +442,7 @@ impl ResolvedAsset {
             kinds: self.kinds.clone(),
             group: self.group.clone(),
             code_version: self.code_version.clone(),
+            schema_version: self.schema_version,
             pool: self.pool.clone(),
             retry: self.retry.clone(),
             compute: self.compute.clone(),

@@ -15,6 +15,7 @@ use crate::runtime::{io_rt, rt};
 use crate::storage::{DetachOnClose, PyStorage, PyStorageType};
 use rivers_core::assets::graph::to_topology;
 use rivers_core::assets::partitions_fingerprint::{KeyList, PartitionsFingerprint};
+use rivers_core::assets::versions::register_asset_versions;
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::any::AnyStorage;
 
@@ -325,6 +326,8 @@ impl PyCodeRepository {
             .unbind())
     }
 
+    /// Record the asset versions that the code declares, then replace the
+    /// stored topology with the code's.
     fn persist_topology(
         &self,
         py: Python,
@@ -377,6 +380,22 @@ impl PyCodeRepository {
                     topo_node.parent_graph = Some(parent.clone());
                 }
             }
+
+            // The stored topology still describes the stored data.
+            let declared: Vec<(&str, u32)> = node_map
+                .iter()
+                .filter_map(|(name, node)| match node {
+                    ResolvedNode::Asset(asset) => Some((name.as_str(), asset.schema_version)),
+                    _ => None,
+                })
+                .collect();
+            io_rt()
+                .block_on(register_asset_versions(
+                    &storage_handle.scoped(),
+                    &declared,
+                    &topology,
+                ))
+                .map_err(crate::storage::to_py_err)?;
 
             let _ = io_rt().block_on(
                 storage_handle

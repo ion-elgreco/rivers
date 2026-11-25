@@ -200,6 +200,7 @@ All query methods block the calling thread until the result is ready.
 | `get_latest_materialization(asset_key, partition=None)` | `StoredEvent \| None` |
 | `get_asset_record(asset_key)` | `AssetRecord \| None` |
 | `get_asset_records()` | `list[AssetRecord]` |
+| `get_asset_version(asset_key)` | `AssetVersionRecord \| None` |
 | `compute_staleness()` | `dict[str, tuple[str, list[StaleCause]]]` |
 | `get_assets_by_tag(tag)` | `list[AssetRecord]` |
 | `get_assets_by_kind(kind)` | `list[AssetRecord]` |
@@ -252,6 +253,7 @@ asyncio.run(main())
 | `async_get_latest_materialization(asset_key, partition=None)` | `StoredEvent \| None` |
 | `async_get_asset_record(asset_key)` | `AssetRecord \| None` |
 | `async_get_asset_records()` | `list[AssetRecord]` |
+| `async_get_asset_version(asset_key)` | `AssetVersionRecord \| None` |
 | `async_get_assets_by_tag(tag)` | `list[AssetRecord]` |
 | `async_get_assets_by_kind(kind)` | `list[AssetRecord]` |
 | `async_get_assets_by_group(group)` | `list[AssetRecord]` |
@@ -324,6 +326,28 @@ machine. The run page in the UI shows it.
 
 !!! note
     Staleness is no longer persisted on `AssetRecord`. Call [`Storage.compute_staleness()`](#compute_staleness) to get the live `(status, causes)` per asset.
+
+### `AssetVersionRecord`
+
+The version of an asset's stored data. Only an asset that declares a `schema_version` above 1 has one: `get_asset_version` returns `None` for the others.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `asset_key` | `str` | The asset's name. |
+| `applied_version` | `int` | The version of the stored data. |
+| `partitions` | `str \| None` | The partitions definition of the stored data, as JSON. `None` if the asset has no partitions. |
+| `state` | `str` | `"ready"`, `"pending"`, `"draining"`, `"running"`, `"failed"` or `"blocked"`. |
+| `target_version` | `int \| None` | The version that the migration moves the data to. `None` when `state` is `"ready"`. |
+| `reason` | `str \| None` | Why the state is `"failed"` or `"blocked"`. |
+| `started_at` | `int \| None` | Nanosecond timestamp at which the migration began to run. |
+| `run_id` | `str \| None` | The run of the migration. |
+| `backfill_id` | `str \| None` | The backfill of a rebuild. |
+| `owner` | `str \| None` | The daemon that runs the migration. |
+| `lease_expires_at` | `int \| None` | Nanosecond timestamp until which `owner` holds the migration. |
+| `revision` | `int` | 1 for a new record; each write adds 1. |
+| `updated_at` | `int` | Nanosecond timestamp of the last write. |
+
+When a code location registers, an asset whose code declares a higher version than `applied_version` gets `state` `"pending"`. Stored data written before the asset declared a version is at version 1; an asset without stored data starts at its declared version.
 
 ### `StaleCause`
 

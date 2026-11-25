@@ -100,6 +100,7 @@ from rivers._core.sensor import (
 )
 from rivers._core.storage import (
     AssetRecord,
+    AssetVersionRecord,
     LaunchedBy,
     RunRecord,
     RunStatus,
@@ -168,6 +169,7 @@ __all__ = [
     "PartitionContext",
     "PartitionMapping",
     "AssetRecord",
+    "AssetVersionRecord",
     "BaseIOHandler",
     "InMemoryIOHandler",
     "PickleIOHandler",

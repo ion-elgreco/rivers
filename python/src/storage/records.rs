@@ -1,7 +1,8 @@
 use pyo3::prelude::*;
 
 use rivers_core::storage::{
-    AssetRecord, LaunchedBy, RunRecord, RunStatus, StoredEvent, StoredLog, StoredTick,
+    AssetRecord, AssetVersionRecord, LaunchedBy, RunRecord, RunStatus, StoredEvent, StoredLog,
+    StoredTick,
 };
 
 use crate::partitions::PyPartitionKey;
@@ -179,6 +180,46 @@ impl From<AssetRecord> for PyAssetRecord {
             last_materialization_code_version: r.last_materialization_code_version,
             last_input_data_versions: r.last_input_data_versions,
             pool: r.pool,
+        }
+    }
+}
+
+/// The version of an asset's stored data — Python mirror of
+/// `rivers_core::storage::AssetVersionRecord`.
+#[pyclass(name = "AssetVersionRecord", frozen, get_all, module = "rivers._core")]
+#[derive(Clone)]
+pub struct PyAssetVersionRecord {
+    pub asset_key: String,
+    pub applied_version: u32,
+    pub partitions: Option<String>,
+    pub state: String,
+    pub target_version: Option<u32>,
+    pub reason: Option<String>,
+    pub started_at: Option<i64>,
+    pub run_id: Option<String>,
+    pub backfill_id: Option<String>,
+    pub owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub revision: u64,
+    pub updated_at: i64,
+}
+
+impl From<AssetVersionRecord> for PyAssetVersionRecord {
+    fn from(r: AssetVersionRecord) -> Self {
+        Self {
+            asset_key: r.asset_key,
+            applied_version: r.applied_version,
+            partitions: r.partitions,
+            state: r.state.as_str().to_string(),
+            target_version: r.target_version,
+            reason: r.reason,
+            started_at: r.started_at,
+            run_id: r.run_id,
+            backfill_id: r.backfill_id,
+            owner: r.owner,
+            lease_expires_at: r.lease_expires_at,
+            revision: r.revision,
+            updated_at: r.updated_at,
         }
     }
 }
