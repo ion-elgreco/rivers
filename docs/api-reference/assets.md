@@ -703,10 +703,21 @@ def orders() -> pl.DataFrame: ...
 | `"rebuild"` | `AssetMigration(to=2, rebuild=True)` | Runs the asset's own function again, as a backfill. |
 | `"version_only"` | `AssetMigration(to=2)` | Only records the version: the new data arrives through normal materializations. |
 
-The first parameter of a convert function is the migration context. Later
-parameters are resources, injected by name, as for actions. The function can be
-sync or async. A retry runs the whole function again, so the function must be
-safe to run twice.
+The first parameter of a convert function is the
+[`MigrationContext`](context.md#migrationcontext). Later parameters are
+resources, injected by name, as for actions. The function can be sync or async.
+A retry runs the whole function again, so the function must be safe to run
+twice.
+
+A convert runs once, as the built-in `migrate` action of the asset, in the run
+that its migration starts. That run covers the whole asset, also when the asset
+has partitions. What the function returns tells rivers whether readers must
+read the asset again:
+
+| Return | Result |
+|--------|--------|
+| `None` or `ActionResult.unchanged()` | Readers stay up to date. |
+| `ActionResult.materialized()` | Each materialized partition (or the unpartitioned asset) gets a new data version, so its readers become stale. |
 
 **Parameters:**
 

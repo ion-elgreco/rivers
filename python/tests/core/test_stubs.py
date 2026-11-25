@@ -37,6 +37,7 @@ EXPECTED_TYPES = {
     "load_typed_str": "str",
     "class_repo": "CodeRepository",
     "ctx.config": "TuneConfig | None",
+    "ctx.from_version": "int",
 }
 
 

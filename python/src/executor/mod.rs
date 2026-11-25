@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod event_writer;
 pub mod in_process;
 pub mod kubernetes;
+pub(crate) mod migrate;
 pub mod ops;
 pub mod parallel;
 mod remote;

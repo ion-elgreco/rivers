@@ -211,8 +211,11 @@ impl PyAssetAction {
     }
 }
 
+/// The built-in verb that runs the convert of an asset migration.
+pub(crate) const MIGRATE: &str = "migrate";
+
 /// Verbs with built-in meaning that user actions may not claim.
-pub(crate) const RESERVED_ACTION_NAMES: [&str; 3] = ["materialize", "observe", "compose"];
+pub(crate) const RESERVED_ACTION_NAMES: [&str; 4] = ["materialize", "observe", "compose", MIGRATE];
 
 /// One action resolved at `resolve()` — the per-output table that executors,
 /// planners, and the gRPC projection all read. Not a live view: actions are
@@ -228,6 +231,9 @@ pub(crate) struct ResolvedAction {
     pub partitioning: PyActionPartitioning,
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
     pub description: Option<String>,
+    /// For the built-in `migrate`: the version that the convert moves the
+    /// stored data to. Set when a run binds the convert, at its start.
+    pub converts_to: Option<u32>,
 }
 
 impl ResolvedAction {
@@ -243,6 +249,24 @@ impl ResolvedAction {
             partitioning: a.partitioning,
             retry: a.retry.clone(),
             description: a.description.clone(),
+            converts_to: None,
+        }
+    }
+
+    /// The built-in `migrate` of an asset with converts, before a run binds
+    /// one. Shared: the asset version gate keeps other work away.
+    pub(crate) fn migrate() -> Self {
+        Self {
+            name: MIGRATE.to_string(),
+            func: None,
+            is_async: false,
+            exclusive: false,
+            ordering: ActionOrdering::UpstreamFirst,
+            outcome: ActionOutcome::MayMaterialize,
+            partitioning: PyActionPartitioning::Keyless,
+            retry: None,
+            description: None,
+            converts_to: None,
         }
     }
 
@@ -257,6 +281,7 @@ impl ResolvedAction {
             partitioning: self.partitioning,
             retry: self.retry.clone(),
             description: self.description.clone(),
+            converts_to: self.converts_to,
         }
     }
 }

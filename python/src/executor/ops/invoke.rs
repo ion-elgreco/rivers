@@ -21,8 +21,8 @@ use crate::result_types;
 use super::StepResult;
 use super::annotations::{
     enumerate_params, extract_config_from_annotation, extract_return_hint, get_annotations,
-    is_action_context_annotation, is_context_annotation, is_task_context_annotation,
-    resolve_annotation, validate_return_type,
+    is_action_context_annotation, is_context_annotation, is_migration_context_annotation,
+    is_task_context_annotation, resolve_annotation, validate_return_type,
 };
 use super::io::{build_partition_context, load_self_dependency, load_upstream_input};
 
@@ -490,13 +490,22 @@ pub(crate) fn execute_action_step(
             }
         } else {
             let partition = super::build_partition_context(py, node, partition_key)?;
+            // A convert bound by a run of `migrate` takes a `MigrationContext`.
+            let context_name = match action.converts_to {
+                Some(_) => "MigrationContext",
+                None => "ActionContext",
+            };
+            let is_context = |annotation: &Bound<PyAny>| match action.converts_to {
+                Some(_) => is_migration_context_annotation(py, annotation),
+                None => is_action_context_annotation(py, annotation),
+            };
             // First parameter is the context; the rest are resources injected
             // by name — the same rule materialize functions use.
             let params = enumerate_params(py, &func)?;
             let config_instance = match params.first() {
                 Some((param, Some(annotation))) => {
                     match resolve_annotation(py, &func, annotation) {
-                        Ok(a) if is_action_context_annotation(py, &a) => {
+                        Ok(a) if is_context(&a) => {
                             extract_config_from_annotation(py, &a, overrides_dict)?
                         }
                         Ok(_) => None,
@@ -514,35 +523,48 @@ pub(crate) fn execute_action_step(
                 }
                 _ => None,
             };
-            let ctx = crate::context::action::PyActionContext::new(
-                step.name.clone(),
-                verb.to_string(),
-                run_id.to_string(),
-                node.metadata().cloned(),
-                partition,
-                handler,
-                config_instance,
-            );
+            let ctx = match action.converts_to {
+                Some(to) => Py::new(
+                    py,
+                    crate::context::migration::PyMigrationContext::new(
+                        step.name.clone(),
+                        run_id.to_string(),
+                        to,
+                        node.metadata().cloned(),
+                        handler,
+                        config_instance,
+                    ),
+                )?
+                .into_any(),
+                None => Py::new(
+                    py,
+                    crate::context::action::PyActionContext::new(
+                        step.name.clone(),
+                        verb.to_string(),
+                        run_id.to_string(),
+                        node.metadata().cloned(),
+                        partition,
+                        handler,
+                        config_instance,
+                    ),
+                )?
+                .into_any(),
+            };
             let mut args: Vec<Py<PyAny>> = Vec::new();
             if let Some((first_name, _)) = params.first()
                 && resources.contains_key(first_name)
             {
                 return Err(ConfigurationError::new_err(format!(
                     "Action '{}' on asset '{}': the first parameter is always the \
-                     ActionContext, but '{}' names a resource — move it after the \
-                     context",
-                    verb, step.name, first_name
+                     {}, but '{}' names a resource — move it after the context",
+                    verb, step.name, context_name, first_name
                 )));
             }
             if !params.is_empty() {
-                let ctx_py = Py::new(py, ctx)?.into_any();
-                action_ctx = Some(ctx_py.clone_ref(py));
-                args.push(ctx_py);
+                action_ctx = Some(ctx.clone_ref(py));
+                args.push(ctx);
                 for (param_name, annotation) in params.iter().skip(1) {
-                    if annotation
-                        .as_ref()
-                        .is_some_and(|a| is_action_context_annotation(py, a))
-                    {
+                    if annotation.as_ref().is_some_and(&is_context) {
                         return Err(ExecutionError::new_err(format!(
                             "Context must be the first parameter of action '{}' on asset '{}'",
                             verb, step.name

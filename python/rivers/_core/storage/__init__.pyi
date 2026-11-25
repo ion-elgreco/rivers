@@ -680,6 +680,17 @@ class Storage:
         """(Internal) create a run record directly — test helper."""
         ...
 
+    def _put_asset_version(
+        self,
+        asset_key: str,
+        state: str,
+        applied_version: int,
+        target_version: int | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        """(Internal) set the state of an asset's version record, as a migration does — test helper."""
+        ...
+
     def _stored_keys(self, run_id: str) -> tuple[str | None, list[tuple[str, str]]]:
         """(Internal) the partition key of a run and of its keyed events, as storage holds them — test helper.
 

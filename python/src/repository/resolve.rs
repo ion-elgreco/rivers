@@ -302,6 +302,16 @@ impl PyCodeRepository {
                         .retry_for_output(a.output_name.as_deref())
                         .cloned();
                     a.retry = Self::resolve_retry_ref(r, &self.raw_retries, "asset", &a.name)?;
+                    for m in &mut a.migrations {
+                        let kind = format!("migration to version {} of asset", m.to);
+                        m.retry = Self::resolve_retry_ref(
+                            m.retry.take(),
+                            &self.raw_retries,
+                            &kind,
+                            &a.name,
+                        )?
+                        .map(rivers_core::execution::retry::RetryRef::Inline);
+                    }
                 }
                 ResolvedNode::Task(t) => {
                     let t = unshared(t);

@@ -188,7 +188,9 @@ class Orders(rs.Asset):
 
     @rs.migration(to=2, breaking=False, description="add currency")
     @classmethod
-    def add_currency(cls, ctx) -> None: ...
+    def add_currency(cls, ctx: rs.MigrationContext[TuneConfig]) -> None:
+        reveal_type(ctx.config)
+        reveal_type(ctx.from_version)
 
     @rs.action(outcome=rs.Outcome.Unchanged)
     @classmethod

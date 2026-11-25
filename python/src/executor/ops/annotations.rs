@@ -33,6 +33,11 @@ pub(crate) fn is_action_context_annotation(py: Python, annotation: &Bound<PyAny>
     annotation_is(annotation, action_ctx.as_any())
 }
 
+pub(crate) fn is_migration_context_annotation(py: Python, annotation: &Bound<PyAny>) -> bool {
+    let migration_ctx = crate::context::migration::PyMigrationContext::type_object(py);
+    annotation_is(annotation, migration_ctx.as_any())
+}
+
 pub(crate) fn get_annotations<'py>(
     py: Python<'py>,
     func: &Py<PyAny>,

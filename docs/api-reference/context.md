@@ -195,6 +195,44 @@ The key must be in `ctx.partition.keys`. Marked keys are peeled out of the `Dele
 
 ---
 
+## `MigrationContext`
+
+The context that the convert of an [asset migration](assets.md#assetmigration)
+receives. The convert changes the asset's stored data from `from_version` to
+`to_version`. It receives no upstream inputs.
+
+### Usage
+
+The **first parameter is always the context**; parameters after it are
+resources injected by name. Annotate it as `MigrationContext[Config]` to
+receive an instance of `Config` with its default values.
+
+```python
+def add_currency(ctx: rs.MigrationContext, warehouse: DuckDBResource) -> None:
+    with warehouse.get_connection() as con:
+        con.execute(f"ALTER TABLE {ctx.asset_name} ADD COLUMN currency TEXT DEFAULT 'EUR'")
+```
+
+To unit-test a convert, build a context by hand and call the function with it:
+`rs.MigrationContext(asset_name="orders", to_version=2, io_handler=...)`
+(`run_id` defaults to `""`; everything else to `None`). A `to_version` below 2
+raises `ValueError`.
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `asset_name` | `str` | Asset whose stored data the convert changes. |
+| `run_id` | `str` | Run that the migration started for the convert. |
+| `from_version` | `int` | Version of the stored data before the convert: `to_version - 1`. |
+| `to_version` | `int` | Version of the stored data after the convert. |
+| `io_handler` | `Any` | The asset's resolved IO handler: where its stored data is. |
+| `asset_metadata` | `dict[str, str] \| None` | Per-asset metadata that IO resolution honors. |
+| `config` | `ConfigT \| None` | Typed config from a `MigrationContext[Config]` annotation; `None` without one. |
+| `log` | `logging.Logger` | Logger named `code-repo.migrations.<asset_name>`. |
+
+---
+
 ## Detection rules
 
 Both context types follow the same injection rules:

@@ -497,12 +497,13 @@ fn handle_action_result(
     // report produces, so a batched run can complete the keys it handled.
     stash_failed_partitions(ctx, step, step_result.failed_partitions.clone());
 
-    let outcome = ctx
-        .repo
-        .node_map
-        .get(&step.name)
-        .and_then(|n| n.find_action(verb))
-        .map(|a| a.outcome);
+    let node = ctx.repo.node_map.get(&step.name);
+    let action = node.and_then(|n| n.find_action(verb));
+    let outcome = action.map(|a| a.outcome);
+    // A keyless convert changes the stored data of every partition.
+    let converts_partitions = action.is_some_and(|a| a.converts_to.is_some())
+        && ctx.scope.partition_key.is_none()
+        && node.is_some_and(|n| n.partitions_def().is_some());
 
     if outcome == Some(ActionOutcome::Observe) {
         py.detach(|| handle_observation_result(ctx, step_name, &step_result));
@@ -569,13 +570,49 @@ fn handle_action_result(
                 return;
             }
             let final_dv = data_version.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            ctx.emit_materialization(
-                step_name,
-                &metadata,
-                Some(final_dv.clone()),
-                Vec::new(),
-                now_ts(),
-            );
+            if converts_partitions {
+                let keys = py.detach(|| {
+                    crate::runtime::io_rt().block_on(
+                        ctx.sink
+                            .storage
+                            .scoped()
+                            .get_materialized_partitions(step_name),
+                    )
+                });
+                match keys {
+                    Ok(keys) => ctx.emit_materialization_of_keys(
+                        step_name,
+                        keys,
+                        &metadata,
+                        &final_dv,
+                        now_ts(),
+                    ),
+                    Err(e) => {
+                        let event_names = vec![step_name.to_string()];
+                        handle_failure(
+                            py,
+                            ctx,
+                            step,
+                            step_name,
+                            &event_names,
+                            ExecutionError::new_err(format!(
+                                "cannot read the materialized partitions of {step_name}: {e}"
+                            )),
+                            None,
+                            failures,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                ctx.emit_materialization(
+                    step_name,
+                    &metadata,
+                    Some(final_dv.clone()),
+                    Vec::new(),
+                    now_ts(),
+                );
+            }
             ctx.state
                 .record_data_version(step_name.to_string(), final_dv);
             ctx.emit_success(step_name);

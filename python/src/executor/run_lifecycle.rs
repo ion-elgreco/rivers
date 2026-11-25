@@ -137,10 +137,19 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
             launched_by.backfill_id(),
         )
     });
+    let recorded = matches!(args.init, RunInit::Existing { .. });
     if let Some(gated) = &gated {
-        let recorded = matches!(args.init, RunInit::Existing { .. });
         py.detach(|| version_gate::check_run(args.storage, gated, recorded))?;
     }
+    let converts = super::migrate::bind_converts(
+        py,
+        args.plan,
+        applied.node_map,
+        args.storage,
+        &args.run_id,
+        recorded,
+    )?;
+    let node_map = converts.as_ref().unwrap_or(applied.node_map);
 
     let (started, stored_key) = py.detach(|| -> PyResult<(bool, Option<PartitionKey>)> {
         match args.init {
@@ -204,7 +213,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
     let failures = applied.executor.execute_plan(
         py,
         args.plan,
-        applied.node_map,
+        node_map,
         &args.partition_key,
         stored_key.as_ref(),
         args.storage,

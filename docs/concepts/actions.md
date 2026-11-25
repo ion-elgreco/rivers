@@ -240,7 +240,7 @@ same two spellings asset-level retry accepts.
 ## Conventional verbs
 
 Verb names are free-form — behavior keys off the declared `outcome`, never the name
-(`materialize`, `observe`, and `compose` are reserved). For the common maintenance
+(`materialize`, `observe`, `compose`, and `migrate` are reserved). For the common maintenance
 verbs, use these declarations so a verb behaves the way its name promises:
 
 | Verb | Declaration |

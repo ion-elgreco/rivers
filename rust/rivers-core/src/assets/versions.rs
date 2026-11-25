@@ -336,6 +336,30 @@ fn is_migration_work(run: &GatedRun<'_>, row: &AssetVersionRecord) -> bool {
             .is_some_and(|id| row.backfill_id.as_deref() == Some(id))
 }
 
+/// The version that the convert run `run_id` moves the stored data of `key`
+/// to: the one after the applied version, when `row` is a running migration
+/// that started this run. A convert runs only for its migration, so that a
+/// stale or manual run never converts the data twice.
+pub fn convert_version(
+    key: &str,
+    row: Option<&AssetVersionRecord>,
+    run_id: &str,
+) -> std::result::Result<u32, String> {
+    row.filter(|row| {
+        row.state == AssetVersionState::Running
+            && row.run_id.as_deref() == Some(run_id)
+            && row
+                .target_version
+                .is_some_and(|target| target > row.applied_version)
+    })
+    .map(|row| row.applied_version + 1)
+    .ok_or_else(|| {
+        format!(
+            "no migration of {key} started this run; the migrate action runs only for a migration"
+        )
+    })
+}
+
 /// [`asset_version_gate`] over the stored rows of the run's assets.
 pub async fn check_asset_versions<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
@@ -693,6 +717,48 @@ mod tests {
             asset_version_gate(&new_backfill, &[pending]),
             wait("orders is migrating to version 3")
         );
+    }
+
+    #[test]
+    fn a_convert_runs_the_next_version_of_the_migration_that_started_it() {
+        let running = AssetVersionRecord {
+            target_version: Some(4),
+            run_id: Some("run-1".to_string()),
+            ..row(2, AssetVersionState::Running)
+        };
+
+        assert_eq!(convert_version("orders", Some(&running), "run-1"), Ok(3));
+    }
+
+    #[test]
+    fn no_other_run_converts_the_data() {
+        let refused = Err(
+            "no migration of orders started this run; the migrate action runs only for a migration"
+                .to_string(),
+        );
+        let running = AssetVersionRecord {
+            run_id: Some("run-1".to_string()),
+            ..versioned("orders", 2, AssetVersionState::Running)
+        };
+        // The run id is set when the migration starts to run.
+        let draining = AssetVersionRecord {
+            run_id: Some("run-1".to_string()),
+            ..versioned("orders", 2, AssetVersionState::Draining)
+        };
+        let done = AssetVersionRecord {
+            target_version: Some(2),
+            ..running.clone()
+        };
+
+        assert_eq!(convert_version("orders", None, "run-1"), refused);
+        assert_eq!(convert_version("orders", Some(&running), "run-2"), refused);
+        for row in [
+            draining,
+            done,
+            versioned("orders", 2, AssetVersionState::Ready),
+        ] {
+            assert_eq!(convert_version("orders", Some(&row), "run-1"), refused);
+        }
     }
 
     #[test]

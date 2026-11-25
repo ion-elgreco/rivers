@@ -89,6 +89,8 @@ pub(crate) struct ResolvedAsset {
     /// place the external `observe` synthetic exists; executors, planners,
     /// and the gRPC projection all read it.
     pub actions: Vec<crate::assets::action::ResolvedAction>,
+    /// The migrations of this output's stored data.
+    pub migrations: Vec<crate::assets::migration::ResolvedMigration>,
     /// This output's IO handler and per-input handlers.
     pub io_handler: Option<IOHandler>,
     pub input_io_handlers: HashMap<String, IOHandler>,
@@ -352,7 +354,13 @@ impl ResolvedAsset {
             _ => None,
         };
 
-        let actions: Vec<crate::assets::action::ResolvedAction> = match kind {
+        let migrations: Vec<crate::assets::migration::ResolvedMigration> = single_for_output
+            .map_or(asset.migrations(), |sa| &sa.migrations)
+            .iter()
+            .map(|m| crate::assets::migration::ResolvedMigration::new(py, m.get()))
+            .collect();
+
+        let mut actions: Vec<crate::assets::action::ResolvedAction> = match kind {
             // Externals carry only the built-in observe, which is never
             // exclusive and is async iff the observe function is.
             AssetKind::External => match &observe_fn {
@@ -368,6 +376,7 @@ impl ResolvedAsset {
                     partitioning: crate::assets::action::PyActionPartitioning::Optional,
                     retry: None,
                     description: Some("Record an observation of external data".to_string()),
+                    converts_to: None,
                 }],
                 None => Vec::new(),
             },
@@ -380,6 +389,9 @@ impl ResolvedAsset {
                     .collect()
             }
         };
+        if migrations.iter().any(|m| m.func.is_some()) {
+            actions.push(crate::assets::action::ResolvedAction::migrate());
+        }
 
         let io_handler = asset_output_io_handler(asset, &output_name).map(|h| h.clone_ref(py));
         let input_io_handlers = asset
@@ -421,6 +433,7 @@ impl ResolvedAsset {
             observe_fn,
             automation_condition,
             actions,
+            migrations,
             io_handler,
             input_io_handlers,
             output_type_hint,
@@ -459,6 +472,7 @@ impl ResolvedAsset {
             observe_fn: self.observe_fn.as_ref().map(|f| f.clone_ref(py)),
             automation_condition: self.automation_condition.clone(),
             actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+            migrations: self.migrations.iter().map(|m| m.clone_ref(py)).collect(),
             io_handler: self.io_handler.as_ref().map(|h| h.clone_ref(py)),
             input_io_handlers: self
                 .input_io_handlers
@@ -469,6 +483,30 @@ impl ResolvedAsset {
             lineage_deps: self.lineage_deps.clone(),
             remote: self.remote.clone(),
         }
+    }
+
+    /// Whether this code has a convert to version `to`.
+    pub(crate) fn has_convert(&self, to: u32) -> bool {
+        self.migrations
+            .iter()
+            .any(|m| m.to == to && m.func.is_some())
+    }
+
+    /// A copy whose built-in `migrate` runs the convert to version `to`;
+    /// `None` when this code has no convert to that version.
+    pub(crate) fn with_convert(&self, py: Python, to: u32) -> Option<Self> {
+        let convert = self.migrations.iter().find(|m| m.to == to)?;
+        let func = convert.func.as_ref()?;
+        let mut bound = self.clone_ref(py);
+        let migrate = bound
+            .actions
+            .iter_mut()
+            .find(|a| a.name == crate::assets::action::MIGRATE)?;
+        migrate.func = Some(func.clone_ref(py));
+        migrate.is_async = convert.is_async;
+        migrate.retry = convert.retry.clone();
+        migrate.converts_to = Some(to);
+        Some(bound)
     }
 }
 
@@ -666,12 +704,14 @@ impl ResolvedNode {
     }
 
     /// `(name, outcome, exclusive, partitioning, description)` for every
-    /// action this node supports — the gRPC `ActionInfo` projection.
+    /// action this node supports — the gRPC `ActionInfo` projection. Not the
+    /// built-in `migrate`: it runs only for a migration.
     pub(crate) fn list_actions(&self) -> Vec<(String, String, bool, String, Option<String>)> {
         match self {
             ResolvedNode::Asset(node) => node
                 .actions
                 .iter()
+                .filter(|a| a.name != crate::assets::action::MIGRATE)
                 .map(|a| {
                     (
                         a.name.clone(),

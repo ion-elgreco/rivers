@@ -30,6 +30,7 @@ use single_asset::PySingleAsset;
 
 use crate::context::action::PyActionContext;
 use crate::context::asset::PyAssetExecutionContext;
+use crate::context::migration::PyMigrationContext;
 
 use pyo3::prelude::*;
 
@@ -53,6 +54,7 @@ pub fn register_asset_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()
         PyActionContext as "ActionContext",
         PyActionResult as "ActionResult",
         PyAssetMigration as "AssetMigration",
+        PyMigrationContext as "MigrationContext",
     ], fns [
         class_form::action,
         class_form::migration,

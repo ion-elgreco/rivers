@@ -1055,6 +1055,48 @@ impl PyStorage {
         })
     }
 
+    /// Set the state of an asset's version record, as a migration does (test
+    /// helper). Not part of the public API.
+    #[pyo3(name = "_put_asset_version", signature = (asset_key, state, applied_version, target_version=None, run_id=None))]
+    fn put_asset_version(
+        &self,
+        py: Python<'_>,
+        asset_key: &str,
+        state: &str,
+        applied_version: u32,
+        target_version: Option<u32>,
+        run_id: Option<String>,
+    ) -> PyResult<()> {
+        use rivers_core::storage::{AssetVersionRecord, AssetVersionState};
+        let state = AssetVersionState::parse(state).map_err(to_py_err)?;
+        let asset_keys = [asset_key.to_string()];
+        py.detach(|| {
+            io_rt()
+                .block_on(async {
+                    let scoped = self.scoped();
+                    let Some(current) = scoped.get_asset_versions(Some(&asset_keys)).await?.pop()
+                    else {
+                        anyhow::bail!("{asset_key} has no version record");
+                    };
+                    let record = AssetVersionRecord {
+                        state,
+                        applied_version,
+                        target_version,
+                        run_id,
+                        ..current.clone()
+                    };
+                    if !scoped
+                        .put_asset_version(&record, Some(current.revision))
+                        .await?
+                    {
+                        anyhow::bail!("the version record of {asset_key} changed meanwhile");
+                    }
+                    anyhow::Ok(())
+                })
+                .map_err(to_py_err)
+        })
+    }
+
     /// The partition key of a run, and of each of its events that has one
     /// (with the event type), as text in the form that storage holds: a span
     /// of time windows shows as `first..last` (test helper). Not part of the

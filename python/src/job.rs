@@ -20,7 +20,7 @@ use crate::config::ResourceVariant;
 use crate::config::run_config::{checked_run_config, run_config_to_json};
 use crate::errors::{ConfigurationError, ExecutionError, GraphValidationError, NodeNotFoundError};
 use crate::executor::run_lifecycle::{RunInit, RunPlanArgs, run_plan};
-use crate::executor::version_gate;
+use crate::executor::{migrate, version_gate};
 
 use crate::assets::decorator::PyAsset;
 use crate::executor::Executor;
@@ -684,7 +684,8 @@ impl PyJob {
     }
 
     /// Raise when the asset version gate holds or refuses a new run of this
-    /// job. Blocks: call it without the GIL.
+    /// job, or when the run is a convert that no migration started. Blocks:
+    /// call it without the GIL.
     pub(crate) fn check_asset_versions(
         &self,
         run_id: &str,
@@ -696,7 +697,10 @@ impl PyJob {
             .as_deref()
             .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
         let run = version_gate::plan_run(plan, node_map, run_id, launched_by.backfill_id());
-        version_gate::check_run(storage, &run, false)
+        version_gate::check_run(storage, &run, false)?;
+        migrate::convert_versions(plan, node_map, storage, run_id)?
+            .map(drop)
+            .map_err(ExecutionError::new_err)
     }
 
     fn validated_parts(

@@ -413,6 +413,31 @@ impl<'a> BatchContext<'a> {
         }
     }
 
+    /// One `Materialization` for each of `keys`, all with `data_version`: a
+    /// keyless convert that changed the stored data of every partition.
+    pub(crate) fn emit_materialization_of_keys(
+        &self,
+        step_name: &str,
+        keys: Vec<rivers_core::storage::PartitionKey>,
+        metadata: &[(String, MetadataValue)],
+        data_version: &str,
+        ts: i64,
+    ) {
+        let metadata = ops::metadata_json(metadata);
+        for key in &keys {
+            ops::emit_materialization(
+                self.sink.writer,
+                self.scope.run_id,
+                step_name,
+                &Some(PyPartitionKey::from(key)),
+                metadata.clone(),
+                Some(data_version.to_string()),
+                Vec::new(),
+                ts,
+            );
+        }
+    }
+
     /// Attempts of an action step that a crash cut off mid-run: begun, but
     /// ended by neither a StepRetry nor a StepFailure. Each spent a try.
     pub(crate) fn resumed_cut_offs(&self, name: &str) -> u32 {

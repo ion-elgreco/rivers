@@ -790,6 +790,53 @@ class AssetMigration:
         """
         ...
 
+class MigrationContext(Generic[ConfigT]):
+    """Context injected into a convert function as its first parameter.
+
+    The convert runs once, as the built-in ``migrate`` action of the asset,
+    and changes the stored data from ``from_version`` to ``to_version``. It
+    receives no upstream inputs. The ``io_handler`` is the asset's resolved
+    handler: where its stored data is. Parameters after the context are
+    resources, injected by name.
+
+    Return ``None`` or ``rs.ActionResult.unchanged()`` when readers can read
+    the converted data as before. Return ``rs.ActionResult.materialized()``
+    when the data changed for readers: each materialized partition gets a new
+    data version, so its readers become stale.
+
+    Annotate the parameter as ``rs.MigrationContext[MyConfig]`` to receive an
+    instance of ``MyConfig`` with its default values.
+    """
+
+    asset_name: str
+    run_id: str
+    from_version: int
+    """The version of the stored data before the convert: ``to_version - 1``."""
+    to_version: int
+    asset_metadata: dict[str, str] | None
+    io_handler: Any
+    config: ConfigT | None
+
+    def __init__(
+        self,
+        asset_name: str,
+        to_version: int,
+        run_id: str = "",
+        asset_metadata: dict[str, str] | None = None,
+        io_handler: Any = None,
+        config: ConfigT | None = None,
+    ) -> None:
+        """Build a context by hand — to call a convert function directly in a
+        unit test. Runs build their own.
+
+        Raises:
+            ValueError: ``to_version`` is less than 2.
+        """
+        ...
+
+    @property
+    def log(self) -> logging.Logger: ...
+
 class ActionContext(Generic[ConfigT]):
     """Context injected into action functions as their first parameter.
 

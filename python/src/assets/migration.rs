@@ -204,6 +204,36 @@ pub fn _reconstruct_asset_migration(
     })
 }
 
+/// One migration of an output, resolved at `resolve()`.
+pub(crate) struct ResolvedMigration {
+    pub to: u32,
+    /// The convert function; `None` for a rebuild or a version-only migration.
+    pub func: Option<Py<PyAny>>,
+    pub is_async: bool,
+    /// A named policy becomes inline at resolve.
+    pub retry: Option<RetryRef>,
+}
+
+impl ResolvedMigration {
+    pub(crate) fn new(py: Python, m: &PyAssetMigration) -> Self {
+        Self {
+            to: u32::try_from(m.to).expect("check_migrations keeps `to` in the range of u32"),
+            func: m.func.as_ref().map(|f| f.clone_ref(py)),
+            is_async: m.is_async,
+            retry: m.retry.clone(),
+        }
+    }
+
+    pub(crate) fn clone_ref(&self, py: Python) -> Self {
+        Self {
+            to: self.to,
+            func: self.func.as_ref().map(|f| f.clone_ref(py)),
+            is_async: self.is_async,
+            retry: self.retry.clone(),
+        }
+    }
+}
+
 /// Check the declared version of `asset` (an asset or a multi-asset output)
 /// and its migrations.
 pub(crate) fn check_migrations(
