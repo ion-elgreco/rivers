@@ -76,6 +76,10 @@ impl PerCodeLocationStorage for PostgresStorage {
         fn get_graph_topology(code_location_id: &str) -> Result<Option<crate::assets::graph::GraphTopology>>;
         fn set_graph_topology(code_location_id: &str, topology: &crate::assets::graph::GraphTopology, key_lists: &[crate::assets::partitions_fingerprint::KeyList<'_>]) -> Result<()>;
         fn get_partition_keys(code_location_id: &str, digest: &str) -> Result<Option<Vec<String>>>;
+        fn get_asset_versions(code_location_id: &str, asset_keys: Option<&[String]>) -> Result<Vec<AssetVersionRecord>>;
+        fn put_asset_version(code_location_id: &str, record: &AssetVersionRecord, expected_revision: Option<u64>) -> Result<bool>;
+        fn add_asset_version_history(code_location_id: &str, entry: &AssetVersionHistoryEntry) -> Result<()>;
+        fn get_asset_version_history(code_location_id: &str, asset_key: &str) -> Result<Vec<AssetVersionHistoryEntry>>;
     }
 }
 

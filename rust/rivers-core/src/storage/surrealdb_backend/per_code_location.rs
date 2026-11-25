@@ -5,10 +5,10 @@ use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::storage::retry;
 use crate::storage::{
-    AssetRecord, AssetScope, BackfillRecord, BackfillStatus, ConcurrencyClaimStatus,
-    CoordinatorRunInfo, FailureCount, PartitionBounds, PartitionFailure, PartitionKey,
-    PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder,
-    StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
+    AssetRecord, AssetScope, AssetVersionHistoryEntry, AssetVersionRecord, BackfillRecord,
+    BackfillStatus, ConcurrencyClaimStatus, CoordinatorRunInfo, FailureCount, PartitionBounds,
+    PartitionFailure, PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord,
+    RunStatus, SlotHolder, StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
 };
 
 use super::partition_keys::KEY_ROWS_CHANGED;
@@ -1232,6 +1232,43 @@ impl PerCodeLocationStorage for SurrealStorage {
         digest: &str,
     ) -> Result<Option<Vec<String>>> {
         self.kv_get_json(&crate::partition_keys_key(code_location_id, digest))
+            .await
+    }
+
+    async fn get_asset_versions(
+        &self,
+        code_location_id: &str,
+        asset_keys: Option<&[String]>,
+    ) -> Result<Vec<AssetVersionRecord>> {
+        self.select_asset_versions(code_location_id, asset_keys)
+            .await
+    }
+
+    async fn put_asset_version(
+        &self,
+        code_location_id: &str,
+        record: &AssetVersionRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<bool> {
+        self.write_asset_version(code_location_id, record, expected_revision)
+            .await
+    }
+
+    async fn add_asset_version_history(
+        &self,
+        code_location_id: &str,
+        entry: &AssetVersionHistoryEntry,
+    ) -> Result<()> {
+        self.upsert_asset_version_history(code_location_id, entry)
+            .await
+    }
+
+    async fn get_asset_version_history(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> Result<Vec<AssetVersionHistoryEntry>> {
+        self.select_asset_version_history(code_location_id, asset_key)
             .await
     }
 }

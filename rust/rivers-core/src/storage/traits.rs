@@ -6,13 +6,14 @@ use anyhow::Result;
 use crate::assets::remote::LocationRef;
 
 use super::{
-    AssetRecord, AssetScope, BackfillRecord, BackfillRunOutcome, BackfillStatus,
-    CodeLocationDirectoryEntry, ComponentRecord, ConcurrencyClaimStatus, ConditionEvalRecord,
-    ConditionTickRecord, CoordinatorRunInfo, DEFAULT_CODE_LOCATION_ID, EndedBackfillRun,
-    EventRecord, FailureCount, LogRecord, PartitionBounds, PartitionFailure, PartitionKey,
-    PoolInfo, PoolLimit, RunOutcome, RunProgress, RunRecord, RunStatus, ScopedStorage, SlotHolder,
-    SortOrder, StepAttempts, StepOutcome, StoredConditionEval, StoredConditionTick, StoredEvent,
-    StoredLog, StoredTick, TickRecord, UnstartedBackfillRun,
+    AssetRecord, AssetScope, AssetVersionHistoryEntry, AssetVersionRecord, BackfillRecord,
+    BackfillRunOutcome, BackfillStatus, CodeLocationDirectoryEntry, ComponentRecord,
+    ConcurrencyClaimStatus, ConditionEvalRecord, ConditionTickRecord, CoordinatorRunInfo,
+    DEFAULT_CODE_LOCATION_ID, EndedBackfillRun, EventRecord, FailureCount, LogRecord,
+    PartitionBounds, PartitionFailure, PartitionKey, PoolInfo, PoolLimit, RunOutcome, RunProgress,
+    RunRecord, RunStatus, ScopedStorage, SlotHolder, SortOrder, StepAttempts, StepOutcome,
+    StoredConditionEval, StoredConditionTick, StoredEvent, StoredLog, StoredTick, TickRecord,
+    UnstartedBackfillRun,
 };
 
 /// A code-location identity bound for the lifetime of a logical operation.
@@ -459,6 +460,39 @@ pub(crate) trait PerCodeLocationStorage: Send + Sync {
         code_location_id: &str,
         digest: &str,
     ) -> impl Future<Output = Result<Option<Vec<String>>>> + Send;
+
+    /// The version rows of this CL's `asset_keys` (`None`: of all its
+    /// assets), by asset key. An asset without a row is left out.
+    fn get_asset_versions(
+        &self,
+        code_location_id: &str,
+        asset_keys: Option<&[String]>,
+    ) -> impl Future<Output = Result<Vec<AssetVersionRecord>>> + Send;
+
+    /// Write the version row of `record.asset_key` if its revision is still
+    /// `expected_revision` (`None`: if it has no row). Returns whether it
+    /// wrote. A write that loses a race returns `false`, not an error.
+    fn put_asset_version(
+        &self,
+        code_location_id: &str,
+        record: &AssetVersionRecord,
+        expected_revision: Option<u64>,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Record a version that the stored data of an asset reached. An entry
+    /// of a recorded version replaces it.
+    fn add_asset_version_history(
+        &self,
+        code_location_id: &str,
+        entry: &AssetVersionHistoryEntry,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The versions that the stored data of an asset reached, oldest first.
+    fn get_asset_version_history(
+        &self,
+        code_location_id: &str,
+        asset_key: &str,
+    ) -> impl Future<Output = Result<Vec<AssetVersionHistoryEntry>>> + Send;
 }
 
 #[allow(private_bounds)]

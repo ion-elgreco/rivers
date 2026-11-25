@@ -25,6 +25,7 @@ mod probes;
 mod test_schema;
 mod traits;
 
+mod asset_versions;
 mod assets;
 mod automation;
 mod backfills;

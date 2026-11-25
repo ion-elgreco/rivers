@@ -7,8 +7,8 @@ async fn a_new_schema_gets_the_tables_and_the_stamps() {
     };
     let storage = PostgresStorage::connect_test_schema(&url).await.unwrap();
 
-    let stamps = storage.schema_stamps().await.unwrap().unwrap();
-    assert_eq!(stamps.version, super::super::migration::SCHEMA_VERSION);
+    let stamps = storage.schema_stamps().await.unwrap();
+    assert_eq!(stamps, Some(super::super::migration::BUILD_STAMPS));
 
     let tables: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema()",

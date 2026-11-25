@@ -1321,6 +1321,59 @@ async fn test_v17_adds_the_hold_rows_and_stops_older_writers() {
     assert!(check_compatibility(stamps, Capability::ReadWrite, 16).is_err());
 }
 
+/// V18 adds the version rows of the assets and their history to a store at
+/// V17. No older build reads or writes them, so a V17 build still reads and
+/// writes.
+#[tokio::test]
+async fn test_v18_adds_the_asset_version_tables_and_keeps_the_floors() {
+    let db = any::connect("mem://").await.unwrap();
+    db.use_ns(DEFAULT_NAMESPACE)
+        .use_db(DEFAULT_DATABASE)
+        .await
+        .unwrap();
+    let through_v17: Vec<Migration> = embedded_migrations().into_iter().take(17).collect();
+    apply_migrations(&db, &through_v17).await.unwrap();
+    assert_eq!(
+        read_schema_stamps(&db).await.unwrap().map(|s| s.version),
+        Some(17)
+    );
+
+    apply_migrations(&db, &embedded_migrations()).await.unwrap();
+
+    let info: Option<serde_json::Value> = db
+        .query("INFO FOR DB")
+        .await
+        .unwrap()
+        .check()
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let tables = defined_names(info, "tables");
+    for table in ["asset_versions", "asset_version_history"] {
+        assert!(tables.iter().any(|t| t == table), "{table} in {tables:?}");
+    }
+    db.query(
+        "CREATE asset_versions:['cl', 'orders'] CONTENT { code_location_id: 'cl', \
+             asset_key: 'orders', applied_version: 1, state: 'ready', revision: 1, \
+             updated_at: 1 }; \
+         CREATE asset_version_history:['cl', 'orders', 2] CONTENT { code_location_id: 'cl', \
+             asset_key: 'orders', version: 2, kind: 'convert', breaking: true, \
+             finished_at: 1 };",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let stamps = stamps_at(&db, 18).await;
+    assert_eq!(
+        (stamps.version, stamps.min_reader, stamps.min_writer),
+        (18, 14, 17)
+    );
+    assert!(check_compatibility(stamps, Capability::Read, 17).is_ok());
+    assert!(check_compatibility(stamps, Capability::ReadWrite, 17).is_ok());
+}
+
 /// V5 adds `exclusive`/`partitions` to a SCHEMAFULL table. `DEFAULT` only
 /// fills at create time, so live pre-V5 slot rows must be backfilled: the
 /// conflict clause reads a missing `exclusive` as NONE (falsy), which would

@@ -14,6 +14,7 @@ mod migration;
 use super::migration::{Capability, SCHEMA_VERSION};
 use super::url::redact_password;
 
+mod asset_versions;
 mod backend;
 mod backfill_runs;
 mod backfills;

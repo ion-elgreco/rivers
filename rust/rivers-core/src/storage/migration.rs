@@ -9,7 +9,7 @@ use super::StorageBackend;
 
 /// Highest embedded migration version. Each backend embeds its migrations up to
 /// this version; a test of each backend pins it to that max.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// The floors the [`SCHEMA_VERSION`] migration records; a test pins them to it.
 pub const MIN_READER: u32 = 14;

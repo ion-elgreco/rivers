@@ -7,11 +7,11 @@ use crate::assets::graph::GraphTopology;
 use crate::assets::remote::{LocationRef, RemoteRef};
 
 use super::{
-    AssetRecord, AssetScope, BackfillRecord, BackfillStatus, CodeLocationContext,
-    ConcurrencyClaimStatus, CoordinatorRunInfo, FailureCount, PartitionBounds, PartitionFailure,
-    PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit, RunRecord, RunStatus, SlotHolder,
-    SortOrder, StaleCause, StaleStatus, StorageBackend, StoredConditionEval, StoredConditionTick,
-    StoredEvent, StoredTick,
+    AssetRecord, AssetScope, AssetVersionHistoryEntry, AssetVersionRecord, BackfillRecord,
+    BackfillStatus, CodeLocationContext, ConcurrencyClaimStatus, CoordinatorRunInfo, FailureCount,
+    PartitionBounds, PartitionFailure, PartitionKey, PerCodeLocationStorage, PoolInfo, PoolLimit,
+    RunRecord, RunStatus, SlotHolder, SortOrder, StaleCause, StaleStatus, StorageBackend,
+    StoredConditionEval, StoredConditionTick, StoredEvent, StoredTick,
 };
 
 /// A backend reference pre-bound to a [`CodeLocationContext`].
@@ -542,6 +542,40 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
     pub async fn get_partition_keys(&self, digest: &str) -> Result<Option<Vec<String>>> {
         self.backend
             .get_partition_keys(self.code_location_id, digest)
+            .await
+    }
+
+    pub async fn get_asset_versions(
+        &self,
+        asset_keys: Option<&[String]>,
+    ) -> Result<Vec<AssetVersionRecord>> {
+        self.backend
+            .get_asset_versions(self.code_location_id, asset_keys)
+            .await
+    }
+
+    pub async fn put_asset_version(
+        &self,
+        record: &AssetVersionRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<bool> {
+        self.backend
+            .put_asset_version(self.code_location_id, record, expected_revision)
+            .await
+    }
+
+    pub async fn add_asset_version_history(&self, entry: &AssetVersionHistoryEntry) -> Result<()> {
+        self.backend
+            .add_asset_version_history(self.code_location_id, entry)
+            .await
+    }
+
+    pub async fn get_asset_version_history(
+        &self,
+        asset_key: &str,
+    ) -> Result<Vec<AssetVersionHistoryEntry>> {
+        self.backend
+            .get_asset_version_history(self.code_location_id, asset_key)
             .await
     }
 }

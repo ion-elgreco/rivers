@@ -14,6 +14,7 @@ use super::*;
 use crate::assets::graph::GraphTopology;
 
 mod asset_events;
+mod asset_versions;
 mod backfills;
 mod claims;
 mod consolidation;

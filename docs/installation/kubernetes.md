@@ -704,6 +704,12 @@ not use the hold row. Stop it, or let its runs end, before you migrate: a
 deletion or a failure that it writes does not stop the materializations of
 the new rivers, and a deleted partition can then keep its row.
 
+### Upgrading to schema version 18
+
+Schema version 18 adds the tables that keep the version of the stored data
+of each asset, and raises no floor: an older `CodeLocation` image and an
+older UI still read and write the database.
+
 ### `Run` resources without `spec.surrealEndpoint`
 
 A `Run` no longer has the `spec.surrealEndpoint` field. The operator gives

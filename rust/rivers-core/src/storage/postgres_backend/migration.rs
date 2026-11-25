@@ -109,6 +109,11 @@ fn embedded_migrations() -> Vec<Migration> {
     vec![
         Migration::unapplied("V17__base", V17_BASE)
             .expect("V17__base migration name is well-formed"),
+        Migration::unapplied(
+            "V18__asset_versions",
+            include_str!("migrations/V18__asset_versions.sql"),
+        )
+        .expect("V18__asset_versions migration name is well-formed"),
     ]
 }
 
@@ -254,5 +259,57 @@ mod tests {
 
         let error = migrate_to_current(storage.pool()).await.unwrap_err();
         assert!(error.to_string().contains("cannot migrate"), "{error:#}");
+    }
+
+    /// V18 adds the version rows of the assets and their history to a schema
+    /// at V17. No older build reads or writes them, so a V17 build still
+    /// reads and writes.
+    #[tokio::test]
+    async fn test_v18_adds_the_asset_version_tables_and_keeps_the_floors() {
+        let Some(url) = super::super::PostgresStorage::test_url() else {
+            return;
+        };
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let schema = super::super::test_schema::TestSchema::create(options.clone())
+            .await
+            .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(options.options([("search_path", schema.name())]))
+            .await
+            .unwrap();
+        PgMigrate { pool: pool.clone() }
+            .migrate(
+                &embedded_migrations(),
+                true,
+                false,
+                false,
+                Target::Version(17),
+                REFINERY_HISTORY_TABLE,
+            )
+            .await
+            .unwrap();
+        let v17 = read_schema_stamps(&pool).await.unwrap();
+        assert_eq!(v17.map(|s| s.version), Some(17));
+
+        migrate_to_current(&pool).await.unwrap();
+
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name LIKE 'asset_version%' \
+             ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, ["asset_version_history", "asset_versions"]);
+
+        let stamps = read_schema_stamps(&pool).await.unwrap().unwrap();
+        assert_eq!(
+            (stamps.version, stamps.min_reader, stamps.min_writer),
+            (18, 14, 17)
+        );
+        assert!(check_compatibility(stamps, Capability::Read, 17).is_ok());
+        assert!(check_compatibility(stamps, Capability::ReadWrite, 17).is_ok());
+        pool.close().await;
     }
 }

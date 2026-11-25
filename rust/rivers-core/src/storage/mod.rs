@@ -9,6 +9,7 @@ pub mod surrealdb_backend;
 pub mod url;
 
 mod asset;
+mod asset_version;
 mod backfill;
 mod directory;
 mod event;
@@ -24,6 +25,7 @@ mod tick;
 mod traits;
 
 pub use asset::*;
+pub use asset_version::*;
 pub use backfill::*;
 pub use directory::*;
 pub use event::*;

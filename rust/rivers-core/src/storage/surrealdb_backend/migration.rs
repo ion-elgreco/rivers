@@ -187,6 +187,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("migrations/V17__asset_holds.surql"),
         )
         .expect("V17__asset_holds migration name is well-formed"),
+        Migration::unapplied(
+            "V18__asset_versions",
+            include_str!("migrations/V18__asset_versions.surql"),
+        )
+        .expect("V18__asset_versions migration name is well-formed"),
     ]
 }
 
