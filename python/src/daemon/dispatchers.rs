@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use pyo3::prelude::*;
+use rivers_core::assets::migrations::{MigrationLauncher, MigrationWork};
 use rivers_core::storage::any::AnyStorage;
-use rivers_core::storage::{RunRecord, RunStatus};
+use rivers_core::storage::{LaunchedBy, RunRecord, RunStatus};
 
-use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData};
+use super::types::{BackfillRequestData, MaterializationRequestData, RunRequestData, RunType};
+use crate::assets::action::MIGRATE;
 use crate::gil_threads::GilThreads;
 use crate::partitions::PyPartitionKey;
 use crate::repository::{PyBackfillResult, PyCodeRepository, RepoHandle, priority_from_tags};
@@ -527,5 +529,67 @@ impl LocalBackfillDispatcher {
             errors,
             failed_targets,
         })
+    }
+}
+
+/// How many runs of a rebuild backfill run at once, as for the backfills of
+/// automation conditions.
+const REBUILD_CONCURRENCY: u32 = 4;
+
+/// Starts the work of asset migrations through the daemon's run and backfill
+/// dispatchers. Each run and backfill is launched by the migration.
+pub(crate) struct MigrationDispatcher {
+    runs: Arc<RunDispatcherKind>,
+    backfills: Arc<BackfillDispatcherKind>,
+}
+
+impl MigrationDispatcher {
+    pub(crate) fn new(
+        runs: Arc<RunDispatcherKind>,
+        backfills: Arc<BackfillDispatcherKind>,
+    ) -> Self {
+        Self { runs, backfills }
+    }
+}
+
+impl MigrationLauncher for MigrationDispatcher {
+    async fn launch(&self, asset_key: &str, to: u32, work: MigrationWork) -> anyhow::Result<()> {
+        let launched_by = LaunchedBy::Migration {
+            asset_key: asset_key.to_string(),
+            to_version: to,
+        };
+        let (run_id, action) = match work {
+            MigrationWork::Convert { run_id } => (run_id, Some(MIGRATE.to_string())),
+            MigrationWork::RebuildRun { run_id } => (run_id, None),
+            MigrationWork::RebuildBackfill { backfill_id, keys } => {
+                let request = BackfillRequestData {
+                    target: RunType::Materialization(vec![asset_key.to_string()]),
+                    partition_keys: Some(keys.iter().map(PyPartitionKey::from).collect()),
+                    partition_range: None,
+                    strategy: None,
+                    failure_policy: None,
+                    max_concurrency: REBUILD_CONCURRENCY,
+                    tags: None,
+                    dry_run: false,
+                    backfill_id: Some(backfill_id),
+                    launched_by,
+                    action: None,
+                    config: None,
+                };
+                let outcome = self.backfills.dispatch(vec![request]).await?;
+                return outcome.errors.into_iter().next().map_or(Ok(()), Err);
+            }
+        };
+        let request = MaterializationRequestData {
+            run_id,
+            asset_selection: vec![asset_key.to_string()],
+            partition_key: None,
+            tags: Vec::new(),
+            launched_by,
+            action,
+            config: None,
+        };
+        let outcome = self.runs.dispatch_materialization(&[request]).await?;
+        outcome.errors.into_iter().next().map_or(Ok(()), Err)
     }
 }

@@ -2,6 +2,7 @@
 the reason, and fails a queued run that the gate refuses."""
 
 import contextlib
+import threading
 
 import rivers as rs
 from _polling import wait_for_run_terminal
@@ -40,20 +41,33 @@ def _daemon(repo, storage):
 
 
 def test_the_queue_holds_the_runs_of_a_migrating_asset(storage):
+    converting = threading.Event()
+    release = threading.Event()
+
+    def add_currency(ctx: rs.MigrationContext) -> None:
+        converting.set()
+        release.wait(30)
+
     assert _repo(storage).materialize().success
-    repo = _repo(storage, schema_version=2)
+    migration = rs.AssetMigration(to=2)(add_currency)
+    repo = _repo(storage, schema_version=2, migrations=[migration])
     held = repo._submit_run(["orders"]).run_id
     other = repo._submit_run(["customers"]).run_id
 
     with _daemon(repo, storage):
-        # One tick sees both runs, in the order they were queued.
-        assert wait_for_run_terminal(storage, other).status == "Success"
-
-    run = storage.get_run(held)
-    assert (run.status, run.block_reason) == (
-        "Queued",
-        "orders is migrating to version 2",
-    )
+        try:
+            assert converting.wait(30)
+            # One tick sees both runs, in the order they were queued.
+            assert wait_for_run_terminal(storage, other).status == "Success"
+            run = storage.get_run(held)
+            assert (run.status, run.block_reason) == (
+                "Queued",
+                "orders is migrating to version 2",
+            )
+        finally:
+            release.set()
+        # The run goes once the migration has ended.
+        assert wait_for_run_terminal(storage, held, timeout=30).status == "Success"
 
 
 def test_the_queue_fails_the_runs_of_old_code(storage):

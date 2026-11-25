@@ -1097,6 +1097,43 @@ impl PyStorage {
         })
     }
 
+    /// The versions that the stored data of an asset reached, oldest first,
+    /// each as `(version, kind, run_id, backfill_id, filled, failed)` (test
+    /// helper). Not part of the public API.
+    #[pyo3(name = "_asset_version_history")]
+    #[allow(clippy::type_complexity)]
+    fn asset_version_history(
+        &self,
+        py: Python<'_>,
+        asset_key: &str,
+    ) -> PyResult<
+        Vec<(
+            u32,
+            &'static str,
+            Option<String>,
+            Option<String>,
+            Option<u64>,
+            Option<u64>,
+        )>,
+    > {
+        let history = py
+            .detach(|| io_rt().block_on(self.scoped().get_asset_version_history(asset_key)))
+            .map_err(to_py_err)?;
+        Ok(history
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.version,
+                    entry.kind.as_str(),
+                    entry.run_id,
+                    entry.backfill_id,
+                    entry.filled,
+                    entry.failed,
+                )
+            })
+            .collect())
+    }
+
     /// The partition key of a run, and of each of its events that has one
     /// (with the event type), as text in the form that storage holds: a span
     /// of time windows shows as `first..last` (test helper). Not part of the

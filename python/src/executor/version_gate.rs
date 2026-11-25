@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use rivers_core::assets::graph::AssetGraph;
-use rivers_core::assets::versions::{CodeVersions, GatedRun, VersionGate, check_asset_versions};
+use rivers_core::assets::versions::{
+    CodeVersions, DeclaredMigration, GatedRun, VersionGate, check_asset_versions,
+};
 use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::execution::plan::ExecutionPlan;
 use rivers_core::storage::ScopedStorageHandle;
@@ -25,8 +27,8 @@ fn declared_version(node: &ResolvedNode) -> Option<u32> {
     }
 }
 
-/// The versions that the code of `node_map` declares, for the gate of a run
-/// that is known by the assets that it writes.
+/// The versions and migrations that the code of `node_map` declares, for the
+/// gate and the migration loop.
 pub(crate) fn code_versions(
     node_map: &HashMap<String, ResolvedNode>,
     graph: &AssetGraph,
@@ -35,7 +37,32 @@ pub(crate) fn code_versions(
         .iter()
         .filter_map(|(name, node)| Some((name.clone(), declared_version(node)?)))
         .collect();
-    CodeVersions::new(graph, declared)
+    let mut migrations = HashMap::new();
+    let mut partitioned = HashSet::new();
+    for (name, node) in node_map {
+        let ResolvedNode::Asset(asset) = node else {
+            continue;
+        };
+        if asset.remote.is_some() {
+            continue;
+        }
+        if node.partitions_def().is_some() {
+            partitioned.insert(name.clone());
+        }
+        let steps: Vec<DeclaredMigration> = asset
+            .migrations
+            .iter()
+            .map(|m| DeclaredMigration {
+                to: m.to,
+                kind: m.kind,
+                breaking: m.breaking,
+            })
+            .collect();
+        if !steps.is_empty() {
+            migrations.insert(name.clone(), steps);
+        }
+    }
+    CodeVersions::new(graph, declared).with_migrations(migrations, partitioned)
 }
 
 /// The run of `plan` as the gate sees it: the assets that the plan writes and

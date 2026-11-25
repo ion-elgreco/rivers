@@ -26,7 +26,7 @@ pub struct PyAssetMigration {
 }
 
 impl PyAssetMigration {
-    fn kind(&self) -> MigrationKind {
+    pub(crate) fn kind(&self) -> MigrationKind {
         match (&self.func, self.rebuild) {
             (Some(_), _) => MigrationKind::Convert,
             (None, true) => MigrationKind::Rebuild,
@@ -207,6 +207,8 @@ pub fn _reconstruct_asset_migration(
 /// One migration of an output, resolved at `resolve()`.
 pub(crate) struct ResolvedMigration {
     pub to: u32,
+    pub kind: MigrationKind,
+    pub breaking: bool,
     /// The convert function; `None` for a rebuild or a version-only migration.
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
@@ -218,6 +220,8 @@ impl ResolvedMigration {
     pub(crate) fn new(py: Python, m: &PyAssetMigration) -> Self {
         Self {
             to: u32::try_from(m.to).expect("check_migrations keeps `to` in the range of u32"),
+            kind: m.kind(),
+            breaking: m.breaking,
             func: m.func.as_ref().map(|f| f.clone_ref(py)),
             is_async: m.is_async,
             retry: m.retry.clone(),
@@ -227,6 +231,8 @@ impl ResolvedMigration {
     pub(crate) fn clone_ref(&self, py: Python) -> Self {
         Self {
             to: self.to,
+            kind: self.kind,
+            breaking: self.breaking,
             func: self.func.as_ref().map(|f| f.clone_ref(py)),
             is_async: self.is_async,
             retry: self.retry.clone(),

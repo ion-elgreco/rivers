@@ -272,6 +272,15 @@ pub fn launched_by_display(
             Some(short_id(backfill_id, 8)),
         ),
         LaunchedBy::Condition => ("✦", "var(--accent)", "condition", None),
+        LaunchedBy::Migration {
+            asset_key,
+            to_version,
+        } => (
+            "⇡",
+            "var(--accent)",
+            "migration",
+            Some(format!("{asset_key} to version {to_version}")),
+        ),
     }
 }
 

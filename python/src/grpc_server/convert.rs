@@ -103,6 +103,7 @@ pub(super) fn launched_by_to_proto(
         LaunchedBy::Sensor { name } => ("sensor".to_string(), Some(name), None),
         LaunchedBy::Backfill { backfill_id } => ("backfill".to_string(), Some(backfill_id), None),
         LaunchedBy::Condition => ("condition".to_string(), None, None),
+        LaunchedBy::Migration { asset_key, .. } => ("migration".to_string(), Some(asset_key), None),
     }
 }
 

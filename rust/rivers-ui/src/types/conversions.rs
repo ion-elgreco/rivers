@@ -70,6 +70,13 @@ impl From<rivers_core::storage::LaunchedBy> for LaunchedBy {
                 Self::Backfill { backfill_id }
             }
             rivers_core::storage::LaunchedBy::Condition => Self::Condition,
+            rivers_core::storage::LaunchedBy::Migration {
+                asset_key,
+                to_version,
+            } => Self::Migration {
+                asset_key,
+                to_version,
+            },
         }
     }
 }

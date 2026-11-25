@@ -9,7 +9,9 @@ use anyhow::{Result, bail};
 use petgraph::Direction;
 
 use super::graph::{AssetGraph, GraphTopology, NodeKind};
-use crate::storage::{AssetVersionRecord, AssetVersionState, ScopedStorage, StorageBackend};
+use crate::storage::{
+    AssetVersionRecord, AssetVersionState, MigrationKind, ScopedStorage, StorageBackend,
+};
 
 /// How many times registration reads a version row again when another
 /// writer changed it first.
@@ -373,13 +375,25 @@ pub async fn check_asset_versions<S: StorageBackend>(
     Ok(asset_version_gate(run, &rows))
 }
 
-/// What the gate needs from the code of a code location, for a run that is
-/// known by the assets that it writes: the version that the code declares
-/// for each asset that it owns, and the assets that each node reads.
+/// A migration that the code declares: the step of an asset's stored data
+/// to version `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredMigration {
+    pub to: u32,
+    pub kind: MigrationKind,
+    /// Readers of the version before cannot read the new data.
+    pub breaking: bool,
+}
+
+/// What the gate and the migration loop need from the code of a code
+/// location: the version that the code declares for each asset that it
+/// owns, the assets that each node reads, and the migrations of each asset.
 #[derive(Debug, Default)]
 pub struct CodeVersions {
     declared: HashMap<String, u32>,
     reads: HashMap<String, Vec<String>>,
+    migrations: HashMap<String, Vec<DeclaredMigration>>,
+    partitioned: HashSet<String>,
 }
 
 impl CodeVersions {
@@ -392,7 +406,59 @@ impl CodeVersions {
                 (name.clone(), read_assets(graph, std::slice::from_ref(name)))
             })
             .collect();
-        Self { declared, reads }
+        Self {
+            declared,
+            reads,
+            ..Self::default()
+        }
+    }
+
+    /// The same, with the migrations of each asset and the assets that have
+    /// partitions.
+    pub fn with_migrations(
+        self,
+        migrations: HashMap<String, Vec<DeclaredMigration>>,
+        partitioned: HashSet<String>,
+    ) -> Self {
+        Self {
+            migrations,
+            partitioned,
+            ..self
+        }
+    }
+
+    /// The version that the code declares for `key`: `None` for an asset
+    /// that it does not own.
+    pub fn declared(&self, key: &str) -> Option<u32> {
+        self.declared.get(key).copied()
+    }
+
+    /// The migration of `key` to version `to`.
+    pub fn migration(&self, key: &str, to: u32) -> Option<DeclaredMigration> {
+        self.migrations
+            .get(key)?
+            .iter()
+            .find(|migration| migration.to == to)
+            .copied()
+    }
+
+    pub fn is_partitioned(&self, key: &str) -> bool {
+        self.partitioned.contains(key)
+    }
+
+    /// The assets that `key` reads: its inputs and deps.
+    pub fn reads(&self, key: &str) -> &[String] {
+        self.reads.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// `key` and the nodes that read it.
+    pub fn touching<'a>(&'a self, key: &'a str) -> HashSet<&'a str> {
+        self.reads
+            .iter()
+            .filter(|(_, reads)| reads.iter().any(|read| read == key))
+            .map(|(name, _)| name.as_str())
+            .chain([key])
+            .collect()
     }
 
     /// Whether a run that writes `writes` may run against `rows`: the run

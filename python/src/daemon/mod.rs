@@ -51,8 +51,8 @@ use eval_dispatcher::EvalDispatcher;
 use schedule::ScheduleInfo;
 use sensors::SensorInfo;
 use subdaemons::{
-    spawn_backfill_monitor, spawn_backfill_pickup_loop, spawn_run_queue_coordinator,
-    spawn_schedule_sensor_loop,
+    migration_pass, spawn_asset_migration_loop, spawn_backfill_monitor, spawn_backfill_pickup_loop,
+    spawn_run_queue_coordinator, spawn_schedule_sensor_loop,
 };
 
 pub(crate) use parse::{
@@ -534,6 +534,25 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         loky_executor,
         resources,
         handle.clone(),
+    ));
+
+    // Before the dispatching loops: a migration that waits drains first, and
+    // automation leaves its assets alone.
+    let migrations = rivers_core::assets::migrations::MigrationLoop::new(
+        uuid::Uuid::new_v4().to_string(),
+        Arc::clone(&code_versions),
+    );
+    let migration_launcher = dispatchers::MigrationDispatcher::new(
+        Arc::clone(&run_dispatcher),
+        Arc::clone(&backfill_dispatcher),
+    );
+    let on_its_way = migration_pass(&migrations, &migration_launcher, &handle).await;
+    handles.push(spawn_asset_migration_loop(
+        migrations,
+        migration_launcher,
+        handle.clone(),
+        on_its_way,
+        cancel.clone(),
     ));
 
     if !asset_conditions.is_empty() {

@@ -198,9 +198,16 @@ class LaunchedBy:
     def condition(cls) -> "LaunchedBy":
         """Run was launched by an automation condition."""
         ...
+
+    @classmethod
+    def migration(cls, asset_key: str, to_version: int) -> "LaunchedBy":
+        """Run or backfill was launched by the migration of the stored data
+        of ``asset_key`` to ``to_version``: its convert or its rebuild."""
+        ...
     @property
     def kind(self) -> str:
-        """One of "manual", "schedule", "sensor", "backfill", "condition"."""
+        """One of "manual", "schedule", "sensor", "backfill", "condition",
+        "migration"."""
 
     @property
     def name(self) -> str | None:
@@ -209,6 +216,16 @@ class LaunchedBy:
     @property
     def backfill_id(self) -> str | None:
         """Backfill id; None for other variants."""
+
+    @property
+    def asset_key(self) -> str | None:
+        """The asset whose migration launched the run; None for other
+        variants."""
+
+    @property
+    def to_version(self) -> int | None:
+        """The version that the migration moves the stored data to; None for
+        other variants."""
 
     @property
     def user(self) -> UserRef | None:
@@ -689,6 +706,12 @@ class Storage:
         run_id: str | None = None,
     ) -> None:
         """(Internal) set the state of an asset's version record, as a migration does — test helper."""
+        ...
+
+    def _asset_version_history(
+        self, asset_key: str
+    ) -> list[tuple[int, str, str | None, str | None, int | None, int | None]]:
+        """(Internal) the versions that an asset's stored data reached, as ``(version, kind, run_id, backfill_id, filled, failed)`` — test helper."""
         ...
 
     def _stored_keys(self, run_id: str) -> tuple[str | None, list[tuple[str, str]]]:

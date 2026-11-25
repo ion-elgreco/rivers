@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use pyo3::prelude::*;
+use rivers_core::assets::migrations::MigrationLoop;
 use rivers_core::assets::versions::CodeVersions;
 use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::run_backend::RunHealthStatus;
@@ -13,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::RunBackendKind;
 use super::automation_entry::AutomationEntry;
-use super::dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
+use super::dispatchers::{BackfillDispatcherKind, MigrationDispatcher, RunDispatcherKind};
 use super::eval_dispatcher::{DueEval, EvalDispatcher};
 use super::tick_processing::process_tick_result;
 use super::types::{TickResult, TickWriteMsg};
@@ -92,6 +93,55 @@ pub(crate) fn spawn_backfill_pickup_loop(
                 });
             }
         }
+    })
+}
+
+/// How often the migration loop looks at the migrations: while one is on its
+/// way, and while none is.
+const MIGRATION_BUSY_INTERVAL: Duration = Duration::from_secs(1);
+const MIGRATION_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Asset migration loop (RFC-048): moves each migration of this code
+/// location on. `daemon_main_loop` runs the first pass, `first`, before the
+/// dispatching loops start.
+pub(crate) fn spawn_asset_migration_loop(
+    migrations: MigrationLoop,
+    launcher: MigrationDispatcher,
+    handle: ScopedStorageHandle<AnyStorage>,
+    first: bool,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut on_its_way = first;
+        loop {
+            let interval = if on_its_way {
+                MIGRATION_BUSY_INTERVAL
+            } else {
+                MIGRATION_IDLE_INTERVAL
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            on_its_way = migration_pass(&migrations, &launcher, &handle).await;
+        }
+    })
+}
+
+/// One pass of the migration loop. `true` while a migration is on its way.
+pub(crate) async fn migration_pass(
+    migrations: &MigrationLoop,
+    launcher: &MigrationDispatcher,
+    handle: &ScopedStorageHandle<AnyStorage>,
+) -> bool {
+    migrations.pass(handle, launcher).await.unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "rivers::migrations",
+            error = %format!("{e:#}"),
+            "failed to read the asset versions"
+        );
+        true
     })
 }
 

@@ -703,6 +703,15 @@ def orders() -> pl.DataFrame: ...
 | `"rebuild"` | `AssetMigration(to=2, rebuild=True)` | Runs the asset's own function again, as a backfill. |
 | `"version_only"` | `AssetMigration(to=2)` | Only records the version: the new data arrives through normal materializations. |
 
+When code that declares a higher `schema_version` registers, the daemon
+migrates the stored data. It waits until no started run writes the asset or
+reads it, then runs the migrations from the stored version to the declared
+one, in order. An asset that the asset reads migrates first. Meanwhile, runs
+that write or read the asset wait. A rebuild of a partitioned asset is a
+backfill over its materialized partitions; a partition that the rebuild does
+not write then holds no data. A failed migration holds the asset and its
+readers.
+
 The first parameter of a convert function is the
 [`MigrationContext`](context.md#migrationcontext). Later parameters are
 resources, injected by name, as for actions. The function can be sync or async.

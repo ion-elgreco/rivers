@@ -49,6 +49,10 @@ pub enum LaunchedBy {
         backfill_id: String,
     },
     Condition,
+    Migration {
+        asset_key: String,
+        to_version: u32,
+    },
 }
 
 impl Default for LaunchedBy {

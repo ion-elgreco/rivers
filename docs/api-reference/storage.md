@@ -391,14 +391,21 @@ rs.LaunchedBy.schedule("nightly")
 rs.LaunchedBy.sensor("file_sensor")
 rs.LaunchedBy.backfill("bf-2024-q1")
 rs.LaunchedBy.condition()
+rs.LaunchedBy.migration("orders", 3)
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `kind` | `str` | One of `"manual"`, `"schedule"`, `"sensor"`, `"backfill"`, `"condition"`. |
+| `kind` | `str` | One of `"manual"`, `"schedule"`, `"sensor"`, `"backfill"`, `"condition"`, `"migration"`. |
 | `name` | `str \| None` | Schedule or sensor name (else `None`). |
 | `backfill_id` | `str \| None` | Backfill id (else `None`). |
 | `user` | `UserRef \| None` | Acting user on a manual launch from the authenticated UI (else `None`). |
+| `asset_key` | `str \| None` | The asset whose migration launched the run or the backfill (else `None`). |
+| `to_version` | `int \| None` | The version that the migration moves the stored data to (else `None`). |
+
+The daemon launches the convert run and the rebuild of an
+[asset migration](assets.md#assetmigration) with `migration` as their origin.
+The runs of a rebuild backfill have `backfill` as their origin.
 
 The `user` is populated by the authenticated web UI, which stamps the session
 identity onto the launch and carries it end-to-end onto the run's (and

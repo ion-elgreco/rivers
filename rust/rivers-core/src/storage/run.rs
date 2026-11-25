@@ -100,6 +100,9 @@ pub enum LaunchedBy {
     Backfill { backfill_id: String },
     /// Spawned by the automation condition evaluation loop.
     Condition,
+    /// Spawned by the migration of the stored data of `asset_key` to
+    /// `to_version`: its convert, or its rebuild.
+    Migration { asset_key: String, to_version: u32 },
 }
 
 impl Default for LaunchedBy {
@@ -148,6 +151,14 @@ impl SurrealValue for LaunchedBy {
             Self::Condition => {
                 map.insert("kind".to_string(), "condition".to_string().into_value());
             }
+            Self::Migration {
+                asset_key,
+                to_version,
+            } => {
+                map.insert("kind".to_string(), "migration".to_string().into_value());
+                map.insert("asset_key".to_string(), asset_key.into_value());
+                map.insert("to_version".to_string(), i64::from(to_version).into_value());
+            }
         }
         Value::Object(map.into())
     }
@@ -192,6 +203,25 @@ impl SurrealValue for LaunchedBy {
                 Ok(Self::Backfill { backfill_id })
             }
             "condition" => Ok(Self::Condition),
+            "migration" => {
+                let asset_key = map
+                    .remove("asset_key")
+                    .map(String::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let to_version = map
+                    .remove("to_version")
+                    .map(i64::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let to_version = u32::try_from(to_version).map_err(|_| {
+                    SurrealError::internal(format!("to_version {to_version} is out of range"))
+                })?;
+                Ok(Self::Migration {
+                    asset_key,
+                    to_version,
+                })
+            }
             other => Err(SurrealError::internal(format!(
                 "unknown LaunchedBy kind: {other}"
             ))),
@@ -408,6 +438,23 @@ mod tests {
         let launched = LaunchedBy::Manual { user: Some(user()) };
         let back = LaunchedBy::from_value(launched.clone().into_value()).unwrap();
         assert_eq!(back, launched);
+    }
+
+    #[test]
+    fn a_migration_roundtrips_in_both_stores() {
+        let launched = LaunchedBy::Migration {
+            asset_key: "orders".into(),
+            to_version: 3,
+        };
+        let back = LaunchedBy::from_value(launched.clone().into_value()).unwrap();
+        assert_eq!(back, launched);
+
+        let json = serde_json::to_string(&launched).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"migration","asset_key":"orders","to_version":3}"#
+        );
+        assert_eq!(serde_json::from_str::<LaunchedBy>(&json).unwrap(), launched);
     }
 
     #[test]

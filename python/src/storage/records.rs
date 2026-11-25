@@ -270,9 +270,10 @@ impl PyUserRef {
 /// Origin of a run — Python mirror of `rivers_core::storage::LaunchedBy`.
 ///
 /// Variants are discriminated by `.kind`; carried payloads are exposed as
-/// `.name` (schedule / sensor), `.backfill_id` (backfill), and `.user`
-/// (manual runs launched through an authenticated UI session), each `None`
-/// for variants that don't carry them. Use the classmethod constructors
+/// `.name` (schedule / sensor), `.backfill_id` (backfill), `.user` (manual
+/// runs launched through an authenticated UI session), and `.asset_key` and
+/// `.to_version` (migration), each `None` for variants that don't carry
+/// them. Use the classmethod constructors
 /// (`LaunchedBy.manual()`, `LaunchedBy.schedule("daily")`, …) to build values.
 #[pyclass(name = "LaunchedBy", frozen, module = "rivers._core")]
 #[derive(Clone, Debug)]
@@ -317,6 +318,20 @@ impl PyLaunchedBy {
         }
     }
 
+    #[classmethod]
+    fn migration(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        asset_key: String,
+        to_version: u32,
+    ) -> Self {
+        Self {
+            inner: LaunchedBy::Migration {
+                asset_key,
+                to_version,
+            },
+        }
+    }
+
     #[getter]
     fn kind(&self) -> &'static str {
         match self.inner {
@@ -325,6 +340,7 @@ impl PyLaunchedBy {
             LaunchedBy::Sensor { .. } => "sensor",
             LaunchedBy::Backfill { .. } => "backfill",
             LaunchedBy::Condition => "condition",
+            LaunchedBy::Migration { .. } => "migration",
         }
     }
 
@@ -339,6 +355,24 @@ impl PyLaunchedBy {
     #[getter]
     fn backfill_id(&self) -> Option<&str> {
         self.inner.backfill_id()
+    }
+
+    /// The asset whose migration launched the run.
+    #[getter]
+    fn asset_key(&self) -> Option<&str> {
+        match &self.inner {
+            LaunchedBy::Migration { asset_key, .. } => Some(asset_key.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The version that the migration moves the stored data to.
+    #[getter]
+    fn to_version(&self) -> Option<u32> {
+        match self.inner {
+            LaunchedBy::Migration { to_version, .. } => Some(to_version),
+            _ => None,
+        }
     }
 
     #[getter]
@@ -363,6 +397,10 @@ impl PyLaunchedBy {
                 format!("LaunchedBy.backfill({backfill_id:?})")
             }
             LaunchedBy::Condition => "LaunchedBy.condition()".to_string(),
+            LaunchedBy::Migration {
+                asset_key,
+                to_version,
+            } => format!("LaunchedBy.migration({asset_key:?}, {to_version})"),
         }
     }
 
@@ -389,6 +427,14 @@ impl PyLaunchedBy {
                 backfill_id.hash(&mut h);
             }
             LaunchedBy::Condition => 4u8.hash(&mut h),
+            LaunchedBy::Migration {
+                asset_key,
+                to_version,
+            } => {
+                5u8.hash(&mut h);
+                asset_key.hash(&mut h);
+                to_version.hash(&mut h);
+            }
         }
         h.finish() as isize
     }
