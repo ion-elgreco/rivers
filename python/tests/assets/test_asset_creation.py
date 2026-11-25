@@ -208,7 +208,10 @@ def test_multi_asset_name_derived():
     assert isinstance(foo, rs.MultiAsset)
     assert not isinstance(foo, rs.SingleAsset)
     assert foo._name == "foo"
-    assert foo.output_defs == defs
+    assert foo.output_defs == [
+        rs.AssetDef("foo", schema_version=1),
+        rs.AssetDef("bar", schema_version=1),
+    ]
 
 
 def test_multi_asset_with_values():

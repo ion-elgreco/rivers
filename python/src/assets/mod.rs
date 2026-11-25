@@ -8,6 +8,7 @@ pub mod external_asset;
 pub mod graph_asset;
 pub mod io_handler;
 pub mod io_handler_registry;
+pub mod migration;
 pub mod multi_asset;
 pub mod remote_asset;
 pub mod self_dependency;
@@ -21,6 +22,7 @@ use decorator::{AssetDef, PyAsset};
 use dep_def::DepDef;
 use external_asset::PyExternalAsset;
 use graph_asset::PyGraphAsset;
+use migration::PyAssetMigration;
 use multi_asset::PyMultiAsset;
 use remote_asset::PyRemoteAsset;
 use self_dependency::PySelfDependency;
@@ -50,8 +52,10 @@ pub fn register_asset_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()
         PyActionPartitioning as "ActionPartitioning",
         PyActionContext as "ActionContext",
         PyActionResult as "ActionResult",
+        PyAssetMigration as "AssetMigration",
     ], fns [
         class_form::action,
+        class_form::migration,
         class_form::desugar,
         class_form::is_asset_class,
         class_form::node_names,

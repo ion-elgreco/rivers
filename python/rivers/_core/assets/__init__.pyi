@@ -2,7 +2,17 @@
 
 import datetime
 import logging
-from typing import Any, Callable, Generic, List, Optional, Type, TypeVar, overload
+from typing import (
+    Any,
+    Callable,
+    Generic,
+    List,
+    Literal,
+    Optional,
+    Type,
+    TypeVar,
+    overload,
+)
 
 from rivers._core import Compute, IOHandler, MetadataValue, RetryPolicy
 from rivers._core.automation import AutomationCondition
@@ -56,6 +66,8 @@ class Asset:
         retry: "RetryPolicy | str | None" = ...,
         compute: Compute | None = ...,
         actions: list["AssetAction"] | None = ...,
+        schema_version: int = ...,
+        migrations: list["AssetMigration"] | None = ...,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
     # @overload
     def __new__(
@@ -78,6 +90,8 @@ class Asset:
         retry: "RetryPolicy | str | None" = None,
         compute: Compute | None = None,
         actions: list["AssetAction"] | None = None,
+        schema_version: int = 1,
+        migrations: list["AssetMigration"] | None = None,
     ) -> Callable[[Callable[..., Any]], "SingleAsset"]: ...
 
     # from_multi: used as decorator (no wraps) or direct call (with wraps)
@@ -100,6 +114,8 @@ class Asset:
         compute: Compute | None = None,
         retry: "RetryPolicy | str | None" = None,
         actions: list["AssetAction"] | None = None,
+        schema_version: int = 1,
+        migrations: list["AssetMigration"] | None = None,
     ) -> "MultiAsset": ...
     @classmethod
     @overload
@@ -120,6 +136,8 @@ class Asset:
         compute: Compute | None = None,
         retry: "RetryPolicy | str | None" = None,
         actions: list["AssetAction"] | None = None,
+        schema_version: int = 1,
+        migrations: list["AssetMigration"] | None = None,
     ) -> Callable[[Callable[..., Any]], "MultiAsset"]: ...
 
     # from_graph: used as decorator (no wraps) or direct call (with wraps)
@@ -142,6 +160,8 @@ class Asset:
         automation_condition: AutomationCondition | None = None,
         retry: "RetryPolicy | str | None" = None,
         actions: list["AssetAction"] | None = None,
+        schema_version: int = 1,
+        migrations: list["AssetMigration"] | None = None,
     ) -> "GraphAsset": ...
     @classmethod
     @overload
@@ -162,6 +182,8 @@ class Asset:
         automation_condition: AutomationCondition | None = None,
         retry: "RetryPolicy | str | None" = None,
         actions: list["AssetAction"] | None = None,
+        schema_version: int = 1,
+        migrations: list["AssetMigration"] | None = None,
     ) -> Callable[[Callable[..., Any]], "GraphAsset"]: ...
 
     # external: used as decorator (no wraps) or direct call (with wraps)
@@ -319,6 +341,21 @@ class Asset:
     ``None`` for multi-assets — their verbs live per output on the
     ``output_defs`` entries (``AssetDef.actions``).
     """
+    schema_version: int
+    """Version of the asset's stored data, ``1`` unless declared.
+
+    Raise it together with an :class:`AssetMigration` to the new version. A
+    multi-asset's value is the version of each output that declares none.
+    External and remote assets read as ``1``.
+    """
+    migrations: list["AssetMigration"] | None
+    """Migrations of the asset's stored data, mirroring the decorator's
+    ``migrations=``.
+
+    Declaration-time input: a class body may list them; ``@rs.migration``
+    bodies register themselves. ``None`` for multi-assets — their migrations
+    live per output on the ``output_defs`` entries (``AssetDef.migrations``).
+    """
 
     @property
     def observe_fn(self) -> Callable | None:
@@ -438,6 +475,10 @@ class AssetDef:
     pool: list[tuple[str, int]]
     actions: list["AssetAction"]
     """Per-output actions — a multi-asset's verbs live here, on its outputs."""
+    schema_version: int | None
+    """Version of the output's stored data; ``None`` takes the multi-asset's."""
+    migrations: list["AssetMigration"]
+    """Per-output migrations, merged with the multi-asset's own."""
     type_hint: Any
     """Type of the output's value, checked like a return hint and passed to
     the IO handler as ``OutputContext.type_hint``."""
@@ -458,6 +499,8 @@ class AssetDef:
         deps: list["DepDef"] = ...,
         actions: list["AssetAction"] | None = ...,
         type_hint: Any = ...,
+        schema_version: int | None = ...,
+        migrations: list["AssetMigration"] | None = ...,
     ) -> None:
         """Build an asset definition shared between multi-asset outputs and deps.
 
@@ -471,6 +514,10 @@ class AssetDef:
         pandera ``DataFrame[Model]``. rivers checks each value that the output
         gets against it, as it checks a return hint. ``Materialization`` and
         ``Observation`` outputs have no value and are not checked.
+
+        ``schema_version`` defaults to the multi-asset's own. ``migrations``
+        merge with the multi-asset's ``migrations=``: a migration here
+        replaces a top-level one to the same version.
 
         Raises:
             AssetDefinitionError: ``type_hint`` is a string.
@@ -693,6 +740,56 @@ class AssetAction:
     ) -> None: ...
     def __call__(self, func: Callable[..., Any]) -> "AssetAction": ...
 
+class AssetMigration:
+    """One step of an asset's stored data from version ``to - 1`` to ``to``.
+
+    Add one to ``migrations=[...]`` each time the asset's ``schema_version``
+    increases, with ``to`` set to the new version. A function makes it a
+    convert, which runs once to change the stored data; ``rebuild=True`` runs
+    the asset's own function again, as a backfill; with neither, the step only
+    records the version. Apply as a decorator to bind the function::
+
+        add_currency = rs.AssetMigration(to=2, breaking=False)(_add_currency)
+
+    The function's first parameter is the migration context; later parameters
+    are resources, injected by name. It may be sync or async. A retry runs the
+    whole function again, so it must be safe to run twice.
+    """
+
+    to: int
+    breaking: bool
+    """Readers written for the version before cannot read the new data."""
+    rebuild: bool
+    description: str | None
+    kind: Literal["convert", "rebuild", "version_only"]
+    """``convert`` with a function, ``rebuild`` with ``rebuild=True``, else
+    ``version_only``."""
+
+    def __init__(
+        self,
+        to: int,
+        *,
+        breaking: bool = True,
+        rebuild: bool = False,
+        retry: "RetryPolicy | str | None" = None,
+        description: str | None = None,
+    ) -> None:
+        """Declare the step to version ``to``.
+
+        The asset checks ``to`` against its ``schema_version``. Only a convert
+        takes ``retry``: a rebuild runs with the asset's own.
+        """
+        ...
+
+    def __call__(self, func: Callable[..., Any]) -> "AssetMigration":
+        """Return a convert that runs ``func``.
+
+        Raises:
+            AssetDefinitionError: The migration already has a function, or it
+                is a rebuild.
+        """
+        ...
+
 class ActionContext(Generic[ConfigT]):
     """Context injected into action functions as their first parameter.
 
@@ -791,6 +888,19 @@ def action(
     partitioning: "ActionPartitioning | None" = ...,
 ) -> Callable[[_F], _F]:
     """Mark a classmethod in an asset class body as an action."""
+
+def migration(
+    *,
+    to: int,
+    breaking: bool = ...,
+    retry: "RetryPolicy | str | None" = ...,
+    description: str | None = ...,
+) -> Callable[[_F], _F]:
+    """Mark a classmethod in an asset class body as a migration's function.
+
+    A rebuild or a version-only migration has no function: list it in the
+    class's ``migrations = [...]``.
+    """
 
 def desugar(cls: type) -> Asset:
     """Translate a class-form asset into the equivalent decorator-form object."""

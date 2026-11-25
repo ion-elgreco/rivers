@@ -6,10 +6,15 @@
 //! resolution path, one executor. Mixins are plain classes never listed in
 //! `assets`. This module must never grow execution knowledge.
 
+mod migrations;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyType};
 
 use crate::errors::AssetDefinitionError;
+
+use migrations::collect_migrations;
+pub(crate) use migrations::migration;
 
 use super::action::PyAssetAction;
 use super::decorator::{AssetDef, PyAsset};
@@ -22,7 +27,14 @@ const ACTION_META_ATTR: &str = "__rivers_action_meta__";
 
 // Computed by desugar; every other constructor keyword is forwarded 1:1 from a
 // class attribute of the same name.
-const NON_CONFIG_PARAMS: &[&str] = &["cls", "wraps", "name", "output_defs", "actions"];
+const NON_CONFIG_PARAMS: &[&str] = &[
+    "cls",
+    "wraps",
+    "name",
+    "output_defs",
+    "actions",
+    "migrations",
+];
 
 /// Forwardable config keys, derived from the constructor's own signature so
 /// new decorator parameters reach the class form without a list to maintain.
@@ -133,11 +145,12 @@ fn declarable_keys(py: Python<'_>) -> PyResult<Vec<String>> {
 /// TypeError for the same typo.
 ///
 /// Only plain data values are checked; see [`is_config_shaped`].
-const MISSPELLED_KEYS: [(&str, &str); 9] = [
+const MISSPELLED_KEYS: [(&str, &str); 10] = [
     ("action", "actions"),
     ("automation", "automation_condition"),
     ("backfill", "backfill_strategy"),
     ("kind", "kinds"),
+    ("migration", "migrations"),
     ("partition_def", "partitions_def"),
     ("partitions", "partitions_def"),
     ("pools", "pool"),
@@ -150,7 +163,7 @@ const MISSPELLED_KEYS: [(&str, &str); 9] = [
 /// of these names — only a plain data value reads as a mistyped declaration.
 fn is_config_shaped(val: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(!val.is_instance_of::<AssetDef>()
-        && action_meta(val)?.is_none()
+        && marker_meta(val, ACTION_META_ATTR)?.is_none()
         && !is_classmethod_or_static(val)?
         && !val.is_callable())
 }
@@ -276,8 +289,12 @@ pub(crate) fn action(
     meta.set_item("retry", retry)?;
     meta.set_item("description", description)?;
     meta.set_item("partitioning", partitioning)?;
-    let meta: Py<PyDict> = meta.unbind();
+    marker(py, ACTION_META_ATTR, meta.unbind())
+}
 
+/// A decorator that sets `meta` as `attr` on the function it decorates, or on
+/// the function inside a classmethod.
+fn marker(py: Python<'_>, attr: &'static str, meta: Py<PyDict>) -> PyResult<Py<PyAny>> {
     let deco = PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
         let py = args.py();
         let f = args.get_item(0)?;
@@ -286,16 +303,16 @@ pub(crate) fn action(
         } else {
             f.clone()
         };
-        target.setattr(ACTION_META_ATTR, meta.bind(py))?;
+        target.setattr(attr, meta.bind(py))?;
         Ok::<Py<PyAny>, PyErr>(f.unbind())
     })?;
     Ok(deco.into_any().unbind())
 }
 
-/// The @rs.action metadata on a class-body attribute, or None.
-fn action_meta<'py>(val: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
+/// The metadata that a marker set as `attr` on a class-body attribute, or None.
+fn marker_meta<'py>(val: &Bound<'py, PyAny>, attr: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
     let f = val.getattr("__func__").unwrap_or_else(|_| val.clone());
-    match f.getattr(ACTION_META_ATTR) {
+    match f.getattr(attr) {
         Ok(meta) => Ok(Some(meta)),
         Err(_) => Ok(None),
     }
@@ -322,7 +339,7 @@ fn collect_actions<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<Bound<'py, PyA
             .try_iter()?
         {
             let (attr, val): (String, Bound<PyAny>) = item?.extract()?;
-            let (verb, entry) = if let Some(meta) = action_meta(&val)? {
+            let (verb, entry) = if let Some(meta) = marker_meta(&val, ACTION_META_ATTR)? {
                 if !is_classmethod_or_static(&val)? {
                     return Err(definition_error(format!(
                         "{}.{attr}: @rs.action bodies must be defined with @classmethod",
@@ -604,6 +621,7 @@ fn desugar_single(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let cfg = collect_config(cls, ctor.as_any())?;
     cfg.set_item("name", asset_name(cls)?)?;
     cfg.set_item("actions", collect_actions(cls)?)?;
+    cfg.set_item("migrations", collect_migrations(cls)?)?;
     let factory = ctor.call((), Some(&cfg))?;
     Ok(factory.call1((f,))?.unbind())
 }
@@ -636,6 +654,7 @@ fn desugar_multi(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     cfg.set_item("output_defs", output_defs)?;
     cfg.set_item("name", asset_name(cls)?)?;
     cfg.set_item("actions", collect_actions(cls)?)?;
+    cfg.set_item("migrations", collect_migrations(cls)?)?;
     let factory = ctor.call((), Some(&cfg))?;
     Ok(factory.call1((f,))?.unbind())
 }
@@ -654,6 +673,7 @@ fn desugar_graph(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let cfg = collect_config(cls, &ctor)?;
     cfg.set_item("name", asset_name(cls)?)?;
     cfg.set_item("actions", collect_actions(cls)?)?;
+    cfg.set_item("migrations", collect_migrations(cls)?)?;
     let factory = ctor.call((), Some(&cfg))?;
     Ok(factory.call1((f,))?.unbind())
 }
@@ -677,6 +697,12 @@ fn desugar_external(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
             "{}: external assets support no user-defined actions — \
              rivers only observes this data; model data you operate on as a \
              regular asset",
+            type_name(cls)?
+        )));
+    }
+    if !collect_migrations(cls)?.is_empty() {
+        return Err(definition_error(format!(
+            "{}: external assets take no migrations — rivers does not own their data",
             type_name(cls)?
         )));
     }

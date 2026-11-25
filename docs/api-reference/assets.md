@@ -62,6 +62,8 @@ Outside a graph body, `orders()` raises `AssetDefinitionError`. `etl()` also rai
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for this asset's step, or the name of a policy registered in `CodeRepository(retries=...)`. See [Retries & Compute](retries.md). |
 | `compute` | `Compute \| None` | `None` | Per-asset compute (Kubernetes executor). See [Retries & Compute](retries.md#compute). |
 | `actions` | `list[AssetAction] \| None` | `None` | Verbs that can be run against this asset besides materialize. See [`AssetAction`](#assetaction) and [Actions](../concepts/actions.md). |
+| `schema_version` | `int` | `1` | Version of the asset's stored data. Increase it when the stored data changes shape, and add a migration to the new version. Must be 1 or more. |
+| `migrations` | `list[AssetMigration] \| None` | `None` | Steps that bring the stored data to a newer version, at most one per version. See [`AssetMigration`](#assetmigration). |
 
 **Properties:**
 
@@ -80,6 +82,8 @@ Outside a graph body, `orders()` raises `AssetDefinitionError`. `etl()` also rai
 | `pool` | `list[tuple[str, int]]` | Normalized pool membership: `(pool_key, slots)` pairs. |
 | `pool_slots` | `dict[str, int]` | Slots claimed per pool — the normalized form of the `pool_slots=` declaration. |
 | `deps` | `list[DepDef]` | Lineage-only dependencies from `deps=`. Input deps become function parameters and are not repeated here. |
+| `schema_version` | `int` | Declared version of the stored data. Always `1` for external and remote assets. |
+| `migrations` | `list[AssetMigration] \| None` | Declared migrations, or `None` when there are none. Always `None` for a multi-asset: each output keeps its own, on `output_defs`. |
 | `observe_fn` | `Callable \| None` | Observation function (external assets only). |
 | `is_async` | `bool` | True when the wrapped function is a coroutine function. |
 | `is_single` | `bool` | True for `SingleAsset`. |
@@ -114,6 +118,8 @@ Because a multi-asset executes as **one step with many outputs**, some shared pa
 | `compute` | Compute for the whole step (one pod), so it is declared here, not per output. |
 | `retry` | The step retries as one unit, so the policy is declared here, not per output. See [Retries & Compute](retries.md). |
 | `actions` | Registered on **every** output. Merged with each output's own `AssetDef(actions=...)`, which overrides a top-level action of the same name. An action plan has one step per output. See [`AssetAction`](#assetaction). |
+| `schema_version` | The version of each output that does not set its own `AssetDef(schema_version=...)`. |
+| `migrations` | Merged into **every** output's own `AssetDef(migrations=...)`, which overrides a top-level migration to the same version. Each output checks its merged list against its own `schema_version`. |
 
 #### Top-level `partitions_def`
 
@@ -173,6 +179,8 @@ def my_pipeline():
 | `node_io_handler` | `BaseIOHandler \| str \| None` | `None` | IO handler for internal tasks. Falls back to `io_handler`, then default. |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for the graph asset's own step. Internal tasks are independent steps — they carry their own `Task(retry=)` policies. See [Retries & Compute](retries.md). |
 | `actions` | `list[AssetAction] \| None` | `None` | Verbs that can be run against the graph asset. See [`AssetAction`](#assetaction). |
+| `schema_version` | `int` | `1` | Version of the graph asset's stored output. Internal tasks have no version. |
+| `migrations` | `list[AssetMigration] \| None` | `None` | Migrations of the graph asset's stored output. See [`AssetMigration`](#assetmigration). |
 
 `deps` is inherited from `Asset` — partition mappings, IO handler overrides, and metadata overrides are propagated to internal tasks.
 
@@ -329,10 +337,14 @@ rs.AssetDef(
 | `deps` | `list[DepDef]` | `[]` |
 | `actions` | `list[AssetAction] \| None` | `None` |
 | `type_hint` | `Any` | `None` |
+| `schema_version` | `int \| None` | `None` — the multi-asset's `schema_version` |
+| `migrations` | `list[AssetMigration] \| None` | `None` |
 
 `type_hint` is the type of the output's value, for example `int` or a pandera `DataFrame[Model]`. rivers checks each value of the output against it, the same way as a [return annotation](../concepts/assets.md#return-type-checks), and passes it to the IO handler as `OutputContext.type_hint`. A string is not a type: `AssetDef(type_hint="int")` raises `AssetDefinitionError`.
 
 A multi-asset retries as one unit: every output that sets `retry` must set the same policy (checked at `resolve()`). Step compute is declared on `Asset.from_multi(compute=...)`, not per output.
+
+Each output has its own stored data, so it has its own `schema_version` and `migrations`. `from_multi()` merges the top-level `migrations` into each output's list, and sets the top-level `schema_version` on each output without one. Read the result on `MultiAsset.output_defs`.
 
 ### `AssetDef.input()`
 
@@ -659,3 +671,100 @@ defaults to the method name.
 A reusable `AssetAction` can also be assigned as a class attribute
 (`optimize = delta_optimize`), which participates in MRO so a subclass can
 override a base's verb. See [Class-form assets](../guides/class-assets.md).
+
+## `AssetMigration`
+
+One step of an asset's stored data from version `to - 1` to version `to`.
+Increase the asset's `schema_version` when the shape of its stored data
+changes, and add one migration to each new version. Attach via
+`migrations=[...]` on `Asset`, `Asset.from_multi()`, `Asset.from_graph()`, or
+`AssetDef`, or declare one inline in a class body with
+[`@migration`](#migration).
+
+```python
+def _add_currency(ctx, warehouse: DuckDBResource) -> None:
+    with warehouse.get_connection() as con:
+        con.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'EUR'")
+
+
+@rs.Asset(
+    schema_version=3,
+    migrations=[
+        rs.AssetMigration(to=2, breaking=False)(_add_currency),
+        rs.AssetMigration(to=3, rebuild=True, description="totals include tax"),
+    ],
+)
+def orders() -> pl.DataFrame: ...
+```
+
+| Kind | Declaration | What it does |
+|------|-------------|--------------|
+| `"convert"` | `AssetMigration(to=2)(fn)` | Runs `fn` once to change the stored data. |
+| `"rebuild"` | `AssetMigration(to=2, rebuild=True)` | Runs the asset's own function again, as a backfill. |
+| `"version_only"` | `AssetMigration(to=2)` | Only records the version: the new data arrives through normal materializations. |
+
+The first parameter of a convert function is the migration context. Later
+parameters are resources, injected by name, as for actions. The function can be
+sync or async. A retry runs the whole function again, so the function must be
+safe to run twice.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `to` | `int` | required | The version that the migration makes. From 2 to the asset's `schema_version`, one migration per version. |
+| `breaking` | `bool` | `True` | Readers written for an older version cannot read the new data. |
+| `rebuild` | `bool` | `False` | Run the asset's own function again. A rebuild takes no function of its own. |
+| `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for a convert function, or the name of a policy registered in `CodeRepository(retries=...)`. A rebuild uses the asset's own policy. See [Retries & Compute](retries.md). |
+| `description` | `str \| None` | `None` | What the migration changes. |
+
+Applying the instance to a function (`AssetMigration(...)(fn)`) returns a new
+convert with `fn` as its function. The instance itself does not change.
+Applying a function to a migration that has one, or to a rebuild, raises
+`AssetDefinitionError`.
+
+**Properties:** `to`, `breaking`, `rebuild`, `description`, and `kind`: one of
+`"convert"`, `"rebuild"`, or `"version_only"`.
+
+When you define the asset, these raise `AssetDefinitionError` with the asset's
+name in the message:
+
+- `schema_version` below 1.
+- A migration whose `to` is not between 2 and `schema_version`.
+- Two migrations to one version. For a multi-asset output, the check runs on
+  the merged list.
+- `retry` on a migration without a function.
+
+`Asset.external()` and `Asset.remote()` take no `schema_version` and no
+`migrations`, because rivers does not own their data. In an `ExternalAsset`
+class body, they raise `AssetDefinitionError`.
+
+## `@migration`
+
+Declare a convert inside a class-form asset body. The decorated classmethod
+becomes the migration's function.
+
+```python
+class Orders(rs.Asset):
+    schema_version = 3
+    migrations = [rs.AssetMigration(to=3, rebuild=True, description="totals include tax")]
+
+    @classmethod
+    def materialize(cls) -> pl.DataFrame: ...
+
+    @rs.migration(to=2, breaking=False)
+    @classmethod
+    def add_currency(cls, ctx, warehouse: DuckDBResource) -> None:
+        with warehouse.get_connection() as con:
+            con.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'EUR'")
+```
+
+**Parameters:** `to`, `breaking`, `retry`, `description`: the same set that
+[`AssetMigration`](#assetmigration) takes. A rebuild or a version-only
+migration has no function, so list it in `migrations = [...]`.
+
+A prebuilt `AssetMigration` can also be assigned as a class attribute. rivers
+collects migrations across the MRO: a subclass's migration to a version
+overrides a base class's migration to that version. Two migrations to one
+version in one class body raise `AssetDefinitionError`. See
+[Class-form assets](../guides/class-assets.md).

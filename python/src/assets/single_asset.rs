@@ -45,6 +45,9 @@ pub struct SingleAsset {
     /// A multi-asset output's `AssetDef.type_hint`. A single asset's type is
     /// its function's return hint.
     pub type_hint: Option<Py<PyAny>>,
+    /// The version of the stored data, and the migrations that reach it.
+    pub schema_version: i64,
+    pub migrations: Vec<Py<super::migration::PyAssetMigration>>,
 }
 
 impl SingleAsset {
@@ -80,6 +83,8 @@ impl SingleAsset {
             compute: self.compute.clone(),
             actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
             type_hint: self.type_hint.as_ref().map(|h| h.clone_ref(py)),
+            schema_version: self.schema_version,
+            migrations: self.migrations.iter().map(|m| m.clone_ref(py)).collect(),
         }
     }
 }

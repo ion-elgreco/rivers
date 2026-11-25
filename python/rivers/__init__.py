@@ -49,6 +49,7 @@ from rivers._core.assets import (
     AssetAction,
     AssetDef,
     AssetExecutionContext,
+    AssetMigration,
     DepDef,
     ExternalAsset,
     GraphAsset,
@@ -58,6 +59,7 @@ from rivers._core.assets import (
     SelfDependency,
     SingleAsset,
     action,
+    migration,
 )
 from rivers._core.automation import AutomationCondition
 from rivers._core.executor import Executor
@@ -120,6 +122,8 @@ __all__ = [
     "ActionPartitioning",
     "ActionResult",
     "AssetAction",
+    "AssetMigration",
+    "migration",
     "Outcome",
     "AssetDef",
     "Asset",

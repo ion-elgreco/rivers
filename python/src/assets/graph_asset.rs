@@ -51,6 +51,9 @@ pub struct GraphAsset {
     /// Named actions on the graph's persisted output. Actions never
     /// re-run the composition; internal task intermediates are not targets.
     pub actions: Vec<Py<super::action::PyAssetAction>>,
+    /// The version of the persisted output, and the migrations that reach it.
+    pub schema_version: i64,
+    pub migrations: Vec<Py<super::migration::PyAssetMigration>>,
 }
 
 impl GraphAsset {
@@ -85,6 +88,8 @@ impl GraphAsset {
             invocation_order: self.invocation_order.clone(),
             final_node: self.final_node.clone(),
             actions: self.actions.iter().map(|a| a.clone_ref(py)).collect(),
+            schema_version: self.schema_version,
+            migrations: self.migrations.iter().map(|m| m.clone_ref(py)).collect(),
         }
     }
 }

@@ -15,6 +15,7 @@ use super::dep_def::DepDef;
 use super::external_asset::{ExternalAsset, PyExternalAsset};
 use super::graph_asset::{GraphAsset, PyGraphAsset};
 use super::io_handler::IOHandler;
+use super::migration::{PyAssetMigration, check_migrations};
 use super::multi_asset::{MultiAsset, PyMultiAsset};
 use super::remote_asset::{PyRemoteAsset, RemoteAsset};
 use super::single_asset::{PySingleAsset, SingleAsset};
@@ -194,6 +195,62 @@ impl Asset {
             Asset::Single(a) => a.code_version.as_ref(),
             Asset::Graph(a) => a.code_version.as_ref(),
             Asset::Multi(_) | Asset::External(_) | Asset::Remote(_) => None,
+        }
+    }
+
+    /// A multi-asset's is the version of the outputs that declare none.
+    /// External and remote assets declare none: rivers does not own their data.
+    pub fn schema_version(&self) -> i64 {
+        match self {
+            Asset::Single(a) => a.schema_version,
+            Asset::Multi(a) => a.schema_version,
+            Asset::Graph(a) => a.schema_version,
+            Asset::External(_) | Asset::Remote(_) => 1,
+        }
+    }
+
+    /// Migrations of the asset itself. Multi-assets carry them per output.
+    pub fn migrations(&self) -> &[Py<PyAssetMigration>] {
+        match self {
+            Asset::Single(a) => &a.migrations,
+            Asset::Graph(a) => &a.migrations,
+            Asset::Multi(_) | Asset::External(_) | Asset::Remote(_) => &[],
+        }
+    }
+
+    /// Checked once the asset has a name, so that the message names it: a
+    /// decorator without `name=` is checked when it wraps its function.
+    fn check_versions(&self) -> PyResult<()> {
+        match self {
+            Asset::Single(SingleAsset {
+                name: Some(name),
+                schema_version,
+                migrations,
+                ..
+            })
+            | Asset::Graph(GraphAsset {
+                name: Some(name),
+                schema_version,
+                migrations,
+                ..
+            }) => check_migrations(name, *schema_version, migrations),
+            Asset::Multi(MultiAsset {
+                name: Some(name),
+                schema_version,
+                assets,
+                ..
+            }) => {
+                check_migrations(name, *schema_version, &[])?;
+                for output in assets {
+                    let output_name = output
+                        .name
+                        .as_deref()
+                        .expect("from_multi outputs are named");
+                    check_migrations(output_name, output.schema_version, &output.migrations)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -471,6 +528,8 @@ impl PyAsset {
 
     /// A new Python object of the subclass that matches the kind of `inner`.
     fn new_object(py: Python<'_>, inner: Asset) -> PyResult<Py<PyAny>> {
+        inner.check_versions()?;
+
         let base = |inner| PyClassInitializer::from(Self { inner });
         Ok(match inner {
             Asset::Single(_) => Py::new(py, base(inner).add_subclass(PySingleAsset))?.into_any(),
@@ -512,6 +571,8 @@ impl PyAsset {
         retry = None,
         compute = None,
         actions = None,
+        schema_version = 1,
+        migrations = None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::new_ret_no_self)]
     fn new<'py>(
@@ -534,6 +595,8 @@ impl PyAsset {
         retry: Option<Bound<'py, PyAny>>,
         compute: Option<crate::compute::PyCompute>,
         actions: Option<Vec<Py<super::action::PyAssetAction>>>,
+        schema_version: i64,
+        migrations: Option<Vec<Py<PyAssetMigration>>>,
     ) -> PyResult<Py<PyAny>> {
         let actions = actions.unwrap_or_default();
         let py = cls.py();
@@ -576,6 +639,8 @@ impl PyAsset {
             compute: compute.map(|c| c.inner),
             actions,
             type_hint: None,
+            schema_version,
+            migrations: migrations.unwrap_or_default(),
         });
         Self::new_object(py, py_asset)
     }
@@ -609,6 +674,8 @@ impl PyAsset {
         compute = None,
         retry = None,
         actions = None,
+        schema_version = 1,
+        migrations = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_multi(
@@ -628,8 +695,11 @@ impl PyAsset {
         compute: Option<crate::compute::PyCompute>,
         retry: Option<Bound<'_, PyAny>>,
         actions: Option<Vec<Py<super::action::PyAssetAction>>>,
+        schema_version: i64,
+        migrations: Option<Vec<Py<PyAssetMigration>>>,
     ) -> PyResult<Py<PyAny>> {
         let actions = actions.unwrap_or_default();
+        let migrations = migrations.unwrap_or_default();
         let py = cls.py();
         let handler = io_handler;
         let top_level_deps: Vec<&DepDef> = deps.iter().map(|d| d.get()).collect();
@@ -670,7 +740,8 @@ impl PyAsset {
                 collect_output_deps(py, &mut pd, &def, &def_name)?;
 
             validate_actions(&def.actions, &def_name)?;
-            let output_actions = merge_output_actions(py, &actions, &def.actions);
+            let output_actions = merge_output(py, &actions, &def.actions, |a| a.get().name.clone());
+            let output_migrations = merge_output(py, &migrations, &def.migrations, |m| m.get().to);
 
             py_assets.push(SingleAsset {
                 wraps: None,
@@ -701,6 +772,8 @@ impl PyAsset {
                 compute: None,
                 actions: output_actions,
                 type_hint: def.type_hint,
+                schema_version: def.schema_version.unwrap_or(schema_version),
+                migrations: output_migrations,
             });
         }
 
@@ -740,6 +813,7 @@ impl PyAsset {
             backfill_strategy: None,
             compute: compute.map(|c| c.inner),
             retry: crate::retry::extract_retry_ref(retry)?,
+            schema_version,
         });
         Self::new_object(py, py_asset)
     }
@@ -766,6 +840,8 @@ impl PyAsset {
         automation_condition = None,
         retry = None,
         actions = None,
+        schema_version = 1,
+        migrations = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_graph(
@@ -785,6 +861,8 @@ impl PyAsset {
         automation_condition: Option<PyAutomationCondition>,
         retry: Option<Bound<'_, PyAny>>,
         actions: Option<Vec<Py<super::action::PyAssetAction>>>,
+        schema_version: i64,
+        migrations: Option<Vec<Py<PyAssetMigration>>>,
     ) -> PyResult<Py<PyAny>> {
         let actions = actions.unwrap_or_default();
         let py = cls.py();
@@ -821,6 +899,8 @@ impl PyAsset {
             invocations: Vec::new(),
             invocation_order: Vec::new(),
             final_node: None,
+            schema_version,
+            migrations: migrations.unwrap_or_default(),
         };
 
         if let Some(ref func) = wraps {
@@ -1176,6 +1256,19 @@ impl PyAsset {
     #[getter]
     fn code_version(&self) -> Option<&String> {
         self.inner.code_version()
+    }
+
+    /// The declared version of the asset's stored data.
+    #[getter]
+    fn schema_version(&self) -> i64 {
+        self.inner.schema_version()
+    }
+
+    /// Migrations declared on this asset; `None` when it declares none.
+    #[getter]
+    fn migrations(&self) -> Option<&[Py<PyAssetMigration>]> {
+        let migrations = self.inner.migrations();
+        (!migrations.is_empty()).then_some(migrations)
     }
 
     /// The definition object, or the `partition_defs` registry name string.

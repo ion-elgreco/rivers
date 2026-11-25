@@ -31,6 +31,32 @@ def named():
 reveal_type(named)  # noqa: F821
 
 
+# Migrations: a convert, a rebuild and a version-only step
+def _add_currency(ctx) -> None:
+    pass
+
+
+mig = rs.AssetMigration(to=2, breaking=False)
+reveal_type(mig)
+bound_mig = mig(_add_currency)
+reveal_type(bound_mig)
+
+
+@rs.Asset(
+    schema_version=4,
+    migrations=[
+        bound_mig,
+        rs.AssetMigration(to=3, rebuild=True),
+        rs.AssetMigration(to=4, description="new readers only"),
+    ],
+)
+def versioned():
+    return 1
+
+
+reveal_type(versioned)
+
+
 # from_graph decorator
 @rs.Asset
 def inner():
@@ -153,10 +179,16 @@ class Orders(rs.Asset):
     pool_slots = 2
     retry = "default"
     compute = None
+    schema_version = 3
+    migrations = [rs.AssetMigration(to=3, rebuild=True)]
 
     @classmethod
     def materialize(cls, ctx: rs.AssetExecutionContext) -> int:
         return 1
+
+    @rs.migration(to=2, breaking=False, description="add currency")
+    @classmethod
+    def add_currency(cls, ctx) -> None: ...
 
     @rs.action(outcome=rs.Outcome.Unchanged)
     @classmethod
@@ -170,7 +202,9 @@ class Orders(rs.Asset):
 
 class Ingest(rs.MultiAsset):
     io_handler = DuckHandler()
-    customers = rs.AssetDef()
+    customers = rs.AssetDef(
+        schema_version=2, migrations=[rs.AssetMigration(to=2, rebuild=True)]
+    )
     orders = rs.AssetDef()
 
     @classmethod

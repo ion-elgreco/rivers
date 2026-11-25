@@ -194,20 +194,21 @@ pub(super) fn validate_actions(actions: &[Py<PyAssetAction>], asset_desc: &str) 
     Ok(())
 }
 
-/// Per-output actions for one multi-asset output: top-level actions plus the
-/// output's own, the latter overriding same-name entries.
-pub(super) fn merge_output_actions(
+/// The actions or migrations of one multi-asset output: the top-level ones
+/// plus the output's own, an output's entry overriding a top-level one with
+/// the same key.
+pub(super) fn merge_output<T, K: Eq + std::hash::Hash>(
     py: Python,
-    top_level: &[Py<PyAssetAction>],
-    per_def: &[Py<PyAssetAction>],
-) -> Vec<Py<PyAssetAction>> {
-    let def_names: std::collections::HashSet<String> =
-        per_def.iter().map(|a| a.get().name.clone()).collect();
+    top_level: &[Py<T>],
+    per_def: &[Py<T>],
+    key: impl Fn(&Py<T>) -> K,
+) -> Vec<Py<T>> {
+    let def_keys: HashSet<K> = per_def.iter().map(&key).collect();
     top_level
         .iter()
-        .filter(|a| !def_names.contains(&a.get().name))
-        .chain(per_def.iter())
-        .map(|a| a.clone_ref(py))
+        .filter(|e| !def_keys.contains(&key(e)))
+        .chain(per_def)
+        .map(|e| e.clone_ref(py))
         .collect()
 }
 

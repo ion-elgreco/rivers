@@ -31,6 +31,8 @@ class Bad(rs.Asset):
     hooks = "hook"  # EXPECT-ERROR
     automation_condition = "cond"  # EXPECT-ERROR
     actions = "compact"  # EXPECT-ERROR
+    schema_version = "2"  # EXPECT-ERROR
+    migrations = "rebuild"  # EXPECT-ERROR
 
     @classmethod
     def materialize(cls) -> int:

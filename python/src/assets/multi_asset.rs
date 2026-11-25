@@ -38,6 +38,9 @@ pub struct MultiAsset {
     /// Retry policy for the step — a multi-asset retries as one unit, so this
     /// lives on the multi-asset, not per output.
     pub retry: Option<rivers_core::execution::retry::RetryRef>,
+    /// The version of every output that declares none. Migrations live per
+    /// output only: `from_multi` merges the top-level ones into each output.
+    pub schema_version: i64,
 }
 
 impl MultiAsset {
@@ -66,6 +69,7 @@ impl MultiAsset {
             backfill_strategy: self.backfill_strategy.clone(),
             compute: self.compute.clone(),
             retry: self.retry.clone(),
+            schema_version: self.schema_version,
         }
     }
 }
@@ -100,6 +104,8 @@ impl PyMultiAsset {
                     deps: Vec::new(),
                     actions: a.actions.iter().map(|x| x.clone_ref(py)).collect(),
                     type_hint: a.type_hint.as_ref().map(|h| h.clone_ref(py)),
+                    schema_version: Some(a.schema_version),
+                    migrations: a.migrations.iter().map(|m| m.clone_ref(py)).collect(),
                 })
                 .collect(),
             _ => Vec::new(),

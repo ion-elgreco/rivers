@@ -193,6 +193,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
+        assets::migration::_reconstruct_asset_migration,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
         assets::dep_def::_reconstruct_dep_def,
         m
     )?)?;

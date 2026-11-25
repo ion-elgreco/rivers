@@ -44,6 +44,8 @@ no difference. Use whichever reads better; mix them freely in one repository.
   silent drop.
 - **Actions** are `@rs.action` classmethods in the body, or an `actions = [...]` list of
   `AssetAction` objects, mirroring the decorator's `actions=` argument.
+- **Migrations** are `@rs.migration` classmethods in the body, or a `migrations = [...]`
+  list of `AssetMigration` objects, mirroring the decorator's `migrations=` argument.
 - **Dependencies** are `materialize` parameters, exactly as in the decorator form.
 - **Registration is explicit** — `CodeRepository(assets=[Orders])`. Desugaring happens
   there, not at class creation, so defining a class has no import-time side effects.

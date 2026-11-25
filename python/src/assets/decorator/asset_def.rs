@@ -6,6 +6,7 @@ use pyo3::types::{PyDict, PyString, PyTuple};
 use crate::assets::action::PyAssetAction;
 use crate::assets::dep_def::DepDef;
 use crate::assets::io_handler::IOHandler;
+use crate::assets::migration::PyAssetMigration;
 use crate::errors::AssetDefinitionError;
 use crate::partitions::PartitionsDefRef;
 use crate::partitions::mapping::{PartitionMapping, PartitionMappingDict};
@@ -182,6 +183,12 @@ pub struct AssetDef {
     /// The type of the output's value, checked like a return hint.
     #[pyo3(get)]
     pub type_hint: Option<Py<PyAny>>,
+    /// Unset takes the multi-asset's `schema_version`.
+    #[pyo3(get, set)]
+    pub schema_version: Option<i64>,
+    /// Merged with the multi-asset's top-level `migrations=` at build time;
+    /// a per-output migration overrides a top-level one to the same version.
+    pub migrations: Vec<Py<PyAssetMigration>>,
 }
 
 /// A string hint is rejected: rivers has no module globals to evaluate it in.
@@ -231,6 +238,8 @@ impl AssetDef {
             deps: def.deps.iter().map(|d| d.clone_ref(py)).collect(),
             actions: def.actions.iter().map(|a| a.clone_ref(py)).collect(),
             type_hint: def.type_hint.as_ref().map(|h| h.clone_ref(py)),
+            schema_version: def.schema_version,
+            migrations: def.migrations.iter().map(|m| m.clone_ref(py)).collect(),
         })
     }
 
@@ -262,6 +271,7 @@ impl AssetDef {
             && a.kinds.0 == b.kinds.0
             && a.group == b.group
             && a.code_version == b.code_version
+            && a.schema_version == b.schema_version
             && a.metadata == b.metadata
             && a.pool == b.pool
             && PartitionsDefRef::opt_eq(&a.partitions_def, &b.partitions_def)
@@ -296,6 +306,8 @@ impl AssetDef {
             deps,
             actions,
             type_hint,
+            schema_version,
+            migrations,
         } = self;
         let kwargs = PyDict::new(py);
         kwargs.set_item("name", name)?;
@@ -318,6 +330,8 @@ impl AssetDef {
         kwargs.set_item("deps", deps)?;
         kwargs.set_item("actions", actions)?;
         kwargs.set_item("type_hint", type_hint)?;
+        kwargs.set_item("schema_version", schema_version)?;
+        kwargs.set_item("migrations", migrations)?;
         Ok((PyTuple::empty(py), kwargs))
     }
 
@@ -341,6 +355,8 @@ impl AssetDef {
         deps = vec![],
         actions = None,
         type_hint = None,
+        schema_version = None,
+        migrations = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -359,6 +375,8 @@ impl AssetDef {
         deps: Vec<Py<DepDef>>,
         actions: Option<Vec<Py<PyAssetAction>>>,
         type_hint: Option<Bound<'py, PyAny>>,
+        schema_version: Option<i64>,
+        migrations: Option<Vec<Py<PyAssetMigration>>>,
     ) -> PyResult<Self> {
         let actions = actions.unwrap_or_default();
         let pool = normalize_pool(pool, pool_slots)?;
@@ -377,6 +395,8 @@ impl AssetDef {
             deps,
             actions,
             type_hint,
+            schema_version,
+            migrations: migrations.unwrap_or_default(),
         })
     }
 
@@ -396,6 +416,12 @@ impl AssetDef {
     #[getter]
     fn actions(&self, py: Python) -> Vec<Py<PyAssetAction>> {
         self.actions.iter().map(|a| a.clone_ref(py)).collect()
+    }
+
+    /// Per-output migrations (the `migrations=` argument).
+    #[getter]
+    fn migrations(&self, py: Python) -> Vec<Py<PyAssetMigration>> {
+        self.migrations.iter().map(|m| m.clone_ref(py)).collect()
     }
 
     /// The definition object, or the `partition_defs` registry name string.
