@@ -134,7 +134,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
             args.plan,
             applied.node_map,
             &args.run_id,
-            version_gate::backfill_of(&launched_by),
+            launched_by.backfill_id(),
         )
     });
     if let Some(gated) = &gated {

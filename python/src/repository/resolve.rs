@@ -568,6 +568,10 @@ impl PyCodeRepository {
             .graph
             .as_ref()
             .expect("graph resolved by build_and_validate");
+        let code_versions = Arc::new(crate::executor::version_gate::code_versions(
+            &node_map,
+            resolved_graph,
+        ));
         // Daemon pod will never set this env var
         let register_catalog = std::env::var("RIVERS_RUN_ID").is_err();
         if register_catalog {
@@ -695,6 +699,7 @@ impl PyCodeRepository {
             composition_order,
             run_backend,
             code_location_id,
+            code_versions,
         });
         self.state.replace(py, Some(Arc::clone(&state)));
 

@@ -280,6 +280,7 @@ mod tests {
             start_time: 1000,
             action: None,
             config: None,
+            launched_by: Default::default(),
         }
     }
 

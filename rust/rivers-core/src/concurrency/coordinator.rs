@@ -1,7 +1,10 @@
 //! Run queue coordinator — one dequeue cycle per tick.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
+use crate::assets::versions::{CodeVersions, VersionGate};
 use crate::concurrency::{RunQueueConfig, TagConcurrencyCounter};
 use crate::storage::any::AnyStorage;
 use crate::storage::{
@@ -13,11 +16,21 @@ pub struct RunQueueCoordinator {
     config: RunQueueConfig,
     /// Scoped so daemons sharing a SurrealDB only dequeue and block their own runs.
     storage: ScopedStorageHandle<AnyStorage>,
+    /// The versions that the code declares, for the asset version gate.
+    versions: Arc<CodeVersions>,
 }
 
 impl RunQueueCoordinator {
-    pub fn new(config: RunQueueConfig, storage: ScopedStorageHandle<AnyStorage>) -> Self {
-        Self { config, storage }
+    pub fn new(
+        config: RunQueueConfig,
+        storage: ScopedStorageHandle<AnyStorage>,
+        versions: Arc<CodeVersions>,
+    ) -> Self {
+        Self {
+            config,
+            storage,
+            versions,
+        }
     }
 
     pub fn config(&self) -> &RunQueueConfig {
@@ -74,11 +87,57 @@ impl RunQueueCoordinator {
                 .then(a.start_time.cmp(&b.start_time))
         });
 
+        // One read of the asset version rows for all the queued runs.
+        let versions = if queued.is_empty() {
+            Vec::new()
+        } else {
+            scoped.get_asset_versions(None).await?
+        };
+
         let mut to_launch: Vec<CoordinatorRunInfo> = Vec::new();
 
         for run in queued {
             if to_launch.len() >= slots_available {
                 break;
+            }
+            let gate = self.versions.gate(
+                Some(&run.run_id),
+                run.launched_by.backfill_id(),
+                &run.node_names,
+                &versions,
+            );
+            match gate {
+                VersionGate::Go => {}
+                VersionGate::Wait(reason) => {
+                    tracing::debug!(
+                        target: "rivers::coordinator",
+                        run_id = %run.run_id,
+                        reason = %reason,
+                        "run held for an asset migration"
+                    );
+                    let _ = self
+                        .storage
+                        .backend()
+                        .update_run_block_reason(&run.run_id, Some(&reason))
+                        .await;
+                    continue;
+                }
+                VersionGate::Refuse(reason) => {
+                    tracing::warn!(
+                        target: "rivers::coordinator",
+                        run_id = %run.run_id,
+                        reason = %reason,
+                        "run refused: its code is older than the stored data"
+                    );
+                    fail_unlaunched_run(
+                        self.storage.backend(),
+                        &run.code_location_id,
+                        &run.run_id,
+                        &reason,
+                    )
+                    .await;
+                    continue;
+                }
             }
             if let Some(reason) = counter.is_blocked(&run) {
                 tracing::debug!(
@@ -141,14 +200,68 @@ impl RunQueueCoordinator {
     }
 }
 
+/// Mark a run that never reached execution `Failure` and persist the reason as
+/// a `RunLaunchFailed` event. Shared by the queue coordinator, its start-timeout
+/// sweep, the direct dispatcher's launch-error path and the asset version gate.
+pub async fn fail_unlaunched_run(
+    storage: &AnyStorage,
+    code_location_id: &str,
+    run_id: &str,
+    error: &str,
+) {
+    // Event first: the terminal status is what readers poll on, so writing it
+    // last means anyone who sees `Failure` already sees the reason.
+    if let Err(e) = storage
+        .store_event(&EventRecord {
+            code_location_id: code_location_id.to_string(),
+            event_type: EventType::RunLaunchFailed,
+            asset_key: None,
+            run_id: run_id.to_string(),
+            partition_key: None,
+            timestamp: now_ts(),
+            metadata: vec![("error".to_string(), error.to_string())],
+            input_data_versions: vec![],
+        })
+        .await
+    {
+        tracing::warn!(
+            target: "rivers::coordinator",
+            run_id = %run_id,
+            error = %e,
+            "failed to persist RunLaunchFailed event"
+        );
+    }
+    match storage.fail_run_if_active(run_id, now_ts()).await {
+        Err(e) => {
+            tracing::error!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                error = %e,
+                "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
+            );
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "rivers::coordinator",
+                run_id = %run_id,
+                "launch error for an already-terminal run — leaving its status"
+            );
+        }
+        Ok(true) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::assets::graph::AssetGraph;
+    use crate::assets::versions::first_version_row;
     use crate::concurrency::TagConcurrencyLimit;
     use crate::storage::{
-        CodeLocationContext, DEFAULT_CODE_LOCATION_ID, LaunchedBy, RunRecord, RunStatus,
+        AssetVersionRecord, AssetVersionState, CodeLocationContext, DEFAULT_CODE_LOCATION_ID,
+        LaunchedBy, RunRecord, RunStatus,
     };
 
     async fn make_storage() -> Arc<AnyStorage> {
@@ -163,6 +276,7 @@ mod tests {
         RunQueueCoordinator::new(
             config,
             ScopedStorageHandle::new(storage, CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID)),
+            Arc::default(),
         )
     }
 
@@ -505,6 +619,7 @@ mod tests {
         let coord_a = RunQueueCoordinator::new(
             RunQueueConfig::default(),
             ScopedStorageHandle::new(storage.clone(), CodeLocationContext::new("cl-a")),
+            Arc::default(),
         );
         let launched_a = coord_a.tick().await.unwrap();
         assert_eq!(launched_a.len(), 1);
@@ -518,6 +633,7 @@ mod tests {
         let coord_b = RunQueueCoordinator::new(
             RunQueueConfig::default(),
             ScopedStorageHandle::new(storage.clone(), CodeLocationContext::new("cl-b")),
+            Arc::default(),
         );
         let launched_b = coord_b.tick().await.unwrap();
         assert_eq!(launched_b.len(), 1);
@@ -557,6 +673,7 @@ mod tests {
                 ..RunQueueConfig::default()
             },
             ScopedStorageHandle::new(storage.clone(), CodeLocationContext::new("cl-a")),
+            Arc::default(),
         );
         let launched = coord_a.tick().await.unwrap();
         assert!(launched.is_empty());
@@ -572,5 +689,122 @@ mod tests {
         // CL-B's queued run is NOT touched.
         let b_after = storage.get_run("b-q").await.unwrap().unwrap();
         assert_eq!(b_after.block_reason, None);
+    }
+
+    /// A queued run of `node_names`, launched by `launched_by`.
+    fn queued_run_of(id: &str, node_names: &[&str], launched_by: LaunchedBy) -> RunRecord {
+        RunRecord {
+            node_names: node_names.iter().map(|name| name.to_string()).collect(),
+            launched_by,
+            ..queued_run(id, 0, 0, vec![])
+        }
+    }
+
+    /// A coordinator for code that declares `declared` and has no edges.
+    fn versioned_coordinator(
+        storage: Arc<AnyStorage>,
+        declared: &[(&str, u32)],
+    ) -> RunQueueCoordinator {
+        let declared = declared
+            .iter()
+            .map(|&(key, version)| (key.to_string(), version))
+            .collect();
+        RunQueueCoordinator::new(
+            RunQueueConfig::default(),
+            ScopedStorageHandle::new(storage, CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID)),
+            Arc::new(CodeVersions::new(&AssetGraph::new(), declared)),
+        )
+    }
+
+    async fn put_version(storage: &AnyStorage, row: &AssetVersionRecord) {
+        let ctx = CodeLocationContext::new(DEFAULT_CODE_LOCATION_ID);
+        let scoped = storage.for_code_location(&ctx);
+        assert!(scoped.put_asset_version(row, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_migration_holds_the_queued_runs_of_its_asset() {
+        let storage = make_storage().await;
+        put_version(
+            &storage,
+            &first_version_row(DEFAULT_CODE_LOCATION_ID, "orders", 2, true, None),
+        )
+        .await;
+        for (id, asset) in [("orders-run", "orders"), ("customers-run", "customers")] {
+            let run = queued_run_of(id, &[asset], LaunchedBy::default());
+            storage.create_run(&run).await.unwrap();
+        }
+
+        let launched = versioned_coordinator(storage.clone(), &[("orders", 2)])
+            .tick()
+            .await
+            .unwrap();
+
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].run_id, "customers-run");
+        let held = storage.get_run("orders-run").await.unwrap().unwrap();
+        assert_eq!(held.status, RunStatus::Queued);
+        assert_eq!(
+            held.block_reason.as_deref(),
+            Some("orders is migrating to version 2")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_runs_of_the_rebuild_of_a_migration_go() {
+        let storage = make_storage().await;
+        let rebuilding = AssetVersionRecord {
+            state: AssetVersionState::Running,
+            backfill_id: Some("rebuild-1".to_string()),
+            ..first_version_row(DEFAULT_CODE_LOCATION_ID, "orders", 2, true, None)
+        };
+        put_version(&storage, &rebuilding).await;
+        let rebuild = LaunchedBy::Backfill {
+            backfill_id: "rebuild-1".to_string(),
+        };
+        let run = queued_run_of("rebuild-run", &["orders"], rebuild.clone());
+        storage.create_run(&run).await.unwrap();
+
+        let launched = versioned_coordinator(storage, &[("orders", 2)])
+            .tick()
+            .await
+            .unwrap();
+
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].launched_by, rebuild);
+    }
+
+    #[tokio::test]
+    async fn old_code_fails_its_queued_runs_with_the_reason() {
+        let storage = make_storage().await;
+        put_version(
+            &storage,
+            &first_version_row(DEFAULT_CODE_LOCATION_ID, "orders", 3, false, None),
+        )
+        .await;
+        let run = queued_run_of("old-run", &["orders"], LaunchedBy::default());
+        storage.create_run(&run).await.unwrap();
+
+        let launched = versioned_coordinator(storage.clone(), &[("orders", 2)])
+            .tick()
+            .await
+            .unwrap();
+
+        assert!(launched.is_empty());
+        let run = storage.get_run("old-run").await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failure);
+        let events = storage.get_events_for_run("old-run").await.unwrap();
+        let reasons: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == EventType::RunLaunchFailed)
+            .map(|event| event.metadata.clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            [vec![(
+                "error".to_string(),
+                "this code declares orders version 2; the stored data is at version 3".to_string()
+            )]]
+        );
     }
 }

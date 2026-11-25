@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use pyo3::prelude::*;
+use rivers_core::assets::versions::CodeVersions;
+use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::run_backend::RunHealthStatus;
 use rivers_core::storage::any::AnyStorage;
-use rivers_core::storage::{
-    EventRecord, EventType, RunStatus, ScopedStorageHandle, StorageBackend,
-};
+use rivers_core::storage::{RunStatus, ScopedStorageHandle, StorageBackend};
 use tokio_util::sync::CancellationToken;
 
 use super::RunBackendKind;
@@ -99,6 +99,7 @@ pub(crate) fn spawn_backfill_pickup_loop(
 pub(crate) fn spawn_run_queue_coordinator(
     rq_config: rivers_core::concurrency::RunQueueConfig,
     handle: ScopedStorageHandle<AnyStorage>,
+    code_versions: Arc<CodeVersions>,
     run_backend: Arc<RunBackendKind>,
     repo: Arc<Py<PyCodeRepository>>,
     cancel: CancellationToken,
@@ -107,7 +108,8 @@ pub(crate) fn spawn_run_queue_coordinator(
     let start_timeout = rq_config.start_timeout;
     let storage = Arc::clone(handle.backend());
     let sweep_handle = handle.clone();
-    let coordinator = rivers_core::concurrency::RunQueueCoordinator::new(rq_config, handle);
+    let coordinator =
+        rivers_core::concurrency::RunQueueCoordinator::new(rq_config, handle, code_versions);
     let is_k8s = matches!(*run_backend, RunBackendKind::Kubernetes(_));
 
     tracing::info!(
@@ -283,57 +285,6 @@ async fn sweep_stalled_not_started(
             // a transient backend error — leave for a later pass.
             _ => {}
         }
-    }
-}
-
-/// Mark a run that never reached execution `Failure` and persist the reason as
-/// a `RunLaunchFailed` event. Shared by the queue coordinator's start-timeout
-/// sweep and the direct dispatcher's launch-error path.
-pub(crate) async fn fail_unlaunched_run(
-    storage: &AnyStorage,
-    code_location_id: &str,
-    run_id: &str,
-    error: &str,
-) {
-    // Event first: the terminal status is what readers poll on, so writing it
-    // last means anyone who sees `Failure` already sees the reason.
-    if let Err(e) = storage
-        .store_event(&EventRecord {
-            code_location_id: code_location_id.to_string(),
-            event_type: EventType::RunLaunchFailed,
-            asset_key: None,
-            run_id: run_id.to_string(),
-            partition_key: None,
-            timestamp: now_ts(),
-            metadata: vec![("error".to_string(), error.to_string())],
-            input_data_versions: vec![],
-        })
-        .await
-    {
-        tracing::warn!(
-            target: "rivers::coordinator",
-            run_id = %run_id,
-            error = %e,
-            "failed to persist RunLaunchFailed event"
-        );
-    }
-    match storage.fail_run_if_active(run_id, now_ts()).await {
-        Err(e) => {
-            tracing::error!(
-                target: "rivers::coordinator",
-                run_id = %run_id,
-                error = %e,
-                "failed to fail-out an unlaunched run; it will read as in-flight until the next sweep"
-            );
-        }
-        Ok(false) => {
-            tracing::info!(
-                target: "rivers::coordinator",
-                run_id = %run_id,
-                "launch error for an already-terminal run — leaving its status"
-            );
-        }
-        Ok(true) => {}
     }
 }
 

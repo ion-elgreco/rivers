@@ -5,21 +5,37 @@
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
-use rivers_core::assets::versions::{GatedRun, VersionGate, check_asset_versions};
+use rivers_core::assets::graph::AssetGraph;
+use rivers_core::assets::versions::{CodeVersions, GatedRun, VersionGate, check_asset_versions};
+use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::execution::plan::ExecutionPlan;
+use rivers_core::storage::ScopedStorageHandle;
 use rivers_core::storage::any::AnyStorage;
-use rivers_core::storage::{LaunchedBy, ScopedStorageHandle};
 
 use crate::errors::{AssetMigrationPendingError, AssetVersionMismatchError};
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::io_rt;
 
-/// The backfill that a run of `launched_by` is part of.
-pub(crate) fn backfill_of(launched_by: &LaunchedBy) -> Option<&str> {
-    match launched_by {
-        LaunchedBy::Backfill { backfill_id } => Some(backfill_id),
+/// The version that `node` declares: `None` for a node that is not an asset
+/// of this code location.
+fn declared_version(node: &ResolvedNode) -> Option<u32> {
+    match node {
+        ResolvedNode::Asset(asset) if asset.remote.is_none() => Some(asset.schema_version),
         _ => None,
     }
+}
+
+/// The versions that the code of `node_map` declares, for the gate of a run
+/// that is known by the assets that it writes.
+pub(crate) fn code_versions(
+    node_map: &HashMap<String, ResolvedNode>,
+    graph: &AssetGraph,
+) -> CodeVersions {
+    let declared = node_map
+        .iter()
+        .filter_map(|(name, node)| Some((name.clone(), declared_version(node)?)))
+        .collect();
+    CodeVersions::new(graph, declared)
 }
 
 /// The run of `plan` as the gate sees it: the assets that the plan writes and
@@ -39,36 +55,26 @@ pub(crate) fn plan_run<'a>(
         .map(String::as_str)
         .filter(|dep| !writes.contains(dep))
         .collect();
+    let declared = |name: &'a str| (name, node_map.get(name).and_then(declared_version));
     GatedRun {
         run_id: Some(run_id),
         backfill_id,
-        writes: declared_versions(writes, node_map),
-        reads: declared_versions(reads, node_map),
+        writes: writes.into_iter().map(declared).collect(),
+        reads: reads.into_iter().map(declared).collect(),
     }
 }
 
-/// Each of `names` with the version that `node_map` declares for it: `None`
-/// for a node that is not an asset of this code location.
-pub(crate) fn declared_versions<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-    node_map: &HashMap<String, ResolvedNode>,
-) -> Vec<(&'a str, Option<u32>)> {
-    names
-        .into_iter()
-        .map(|name| {
-            let declared = match node_map.get(name) {
-                Some(ResolvedNode::Asset(asset)) if asset.remote.is_none() => {
-                    Some(asset.schema_version)
-                }
-                _ => None,
-            };
-            (name, declared)
-        })
-        .collect()
+/// `Ok` when the gate lets the run go, else `AssetMigrationPendingError` or
+/// `AssetVersionMismatchError` with the reason.
+pub(crate) fn gate_result(gate: VersionGate) -> PyResult<()> {
+    match gate {
+        VersionGate::Go => Ok(()),
+        VersionGate::Wait(reason) => Err(AssetMigrationPendingError::new_err(reason)),
+        VersionGate::Refuse(reason) => Err(AssetVersionMismatchError::new_err(reason)),
+    }
 }
 
-/// Raise when the gate holds or refuses `run`: `AssetMigrationPendingError`
-/// or `AssetVersionMismatchError`. Before that, a run that has a record
+/// [`gate_result`] for `run`. Before it raises, a run that has a record
 /// (`recorded`) fails with the reason. Blocks: call it without the GIL.
 pub(crate) fn check_run(
     storage: &ScopedStorageHandle<AnyStorage>,
@@ -78,22 +84,13 @@ pub(crate) fn check_run(
     let gate = io_rt()
         .block_on(check_asset_versions(&storage.scoped(), run))
         .map_err(crate::storage::to_py_err)?;
-    let (reason, pending) = match gate {
-        VersionGate::Go => return Ok(()),
-        VersionGate::Wait(reason) => (reason, true),
-        VersionGate::Refuse(reason) => (reason, false),
-    };
-    if recorded && let Some(run_id) = run.run_id {
-        io_rt().block_on(crate::daemon::fail_unlaunched_run(
+    if recorded && let (Some(run_id), Some(reason)) = (run.run_id, gate.reason()) {
+        io_rt().block_on(fail_unlaunched_run(
             storage.backend(),
             storage.code_location_id(),
             run_id,
-            &reason,
+            reason,
         ));
     }
-    Err(if pending {
-        AssetMigrationPendingError::new_err(reason)
-    } else {
-        AssetVersionMismatchError::new_err(reason)
-    })
+    gate_result(gate)
 }

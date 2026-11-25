@@ -124,6 +124,7 @@ Runs carry tags (key-value pairs). Tag concurrency limits restrict how many runs
 - **Config:** `TagConcurrencyLimit(key="env", value="prod", limit=2)` — at most 2 runs tagged `env:prod`
 - **Per-unique-value mode:** `TagConcurrencyLimit(key="tenant", per_unique_value=True, limit=1)` — at most 1 run per distinct tenant value
 - Blocked runs stay `Queued` and are re-evaluated on the next tick.
+- Before the tag limits, the coordinator checks the asset versions of each run. A run that writes or reads an asset that is migrating stays `Queued`, with a block reason such as "orders is migrating to version 2". A run whose code declares a lower `schema_version` than the stored data fails with a `RunLaunchFailed` event.
 
 ### 3. Executor Step Parallelism (Per-Run Step Cap)
 
@@ -205,7 +206,7 @@ Every concurrency lifecycle transition emits a storage event through the EventWr
 | `StepSlotRenewed` | PoolGuard lease renewal task | — |
 | `StepSlotReleased` | PoolGuard release | — |
 
-**Block reasons** are persisted on `RunRecord.block_reason` by the coordinator when a queued run is blocked by global run limits or tag concurrency limits. Cleared on dequeue.
+**Block reasons** are persisted on `RunRecord.block_reason` by the coordinator when a queued run is blocked by global run limits, tag concurrency limits or an asset migration. Cleared on dequeue.
 
 ## CLI Commands (Phase 3b)
 

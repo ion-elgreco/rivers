@@ -12,11 +12,12 @@ use crate::executor::ops::now_ts;
 use crate::job::PyJob;
 use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey};
 use crate::storage::{DetachOnClose, PyStorageType};
+use rivers_core::assets::versions::{CodeVersions, VersionGate};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
-    BackfillFailurePolicy, BackfillRecord, BackfillStatus, LaunchedBy, PartitionKey, RunRecord,
-    RunStatus, StorageBackend, tag_keys,
+    BackfillFailurePolicy, BackfillRecord, BackfillStatus, CodeLocationContext, LaunchedBy,
+    PartitionKey, RunRecord, RunStatus, StorageBackend, tag_keys,
 };
 
 use super::resolved_node::ResolvedNode;
@@ -99,6 +100,27 @@ pub(crate) struct ResolvedState {
     pub(crate) composition_order: HashMap<String, usize>,
     pub(crate) run_backend: Arc<crate::daemon::RunBackendKind>,
     pub(crate) code_location_id: String,
+    /// The versions that the code declares, for the asset version gate.
+    pub(crate) code_versions: Arc<CodeVersions>,
+}
+
+impl ResolvedState {
+    /// The asset version gate for a new manual run, or a run of the new
+    /// backfill `backfill_id`, that writes `selection`.
+    pub(crate) async fn asset_version_gate(
+        &self,
+        backfill_id: Option<&str>,
+        selection: &[String],
+    ) -> anyhow::Result<VersionGate> {
+        let ctx = CodeLocationContext::new(self.code_location_id.as_str());
+        self.code_versions
+            .check(
+                &self.storage.for_code_location(&ctx),
+                backfill_id,
+                selection,
+            )
+            .await
+    }
 }
 
 /// The [`ResolvedState`] a repository shares with its [`RepoHandle`]s. A
@@ -176,8 +198,13 @@ impl RepoHandle {
         let Some(state) = self.state.get() else {
             return;
         };
-        crate::daemon::fail_unlaunched_run(&state.storage, &state.code_location_id, run_id, reason)
-            .await;
+        rivers_core::concurrency::fail_unlaunched_run(
+            &state.storage,
+            &state.code_location_id,
+            run_id,
+            reason,
+        )
+        .await;
     }
 
     /// Look up a user-defined job's asset selection. `None` if the repo
@@ -514,6 +541,15 @@ impl RepoHandle {
         let state = self.resolved()?;
         resolve_selection(&state.node_map, asset_names)?;
         ensure_materializable(&state.node_map, asset_names)
+    }
+
+    /// The asset version gate for a new manual run that writes `selection`.
+    /// GIL-free.
+    pub(crate) async fn asset_version_gate(&self, selection: &[String]) -> PyResult<VersionGate> {
+        self.resolved()?
+            .asset_version_gate(None, selection)
+            .await
+            .map_err(crate::storage::to_py_err)
     }
 
     /// GIL-free. Used by gRPC `materialize` to expand empty selection

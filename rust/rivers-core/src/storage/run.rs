@@ -108,6 +108,16 @@ impl Default for LaunchedBy {
     }
 }
 
+impl LaunchedBy {
+    /// The backfill that the run is part of.
+    pub fn backfill_id(&self) -> Option<&str> {
+        match self {
+            Self::Backfill { backfill_id } => Some(backfill_id),
+            _ => None,
+        }
+    }
+}
+
 impl SurrealValue for LaunchedBy {
     fn kind_of() -> Kind {
         <std::collections::HashMap<String, Value>>::kind_of()
@@ -280,6 +290,11 @@ pub struct CoordinatorRunInfo {
     /// See [`RunRecord::config`] — the backend applies this document.
     #[serde(default)]
     pub config: Option<String>,
+    /// See [`RunRecord::launched_by`]. The asset version gate lets the runs
+    /// of a migration's own backfill through.
+    #[serde(default)]
+    #[surreal(default)]
+    pub launched_by: LaunchedBy,
 }
 
 impl crate::concurrency::Tagged for CoordinatorRunInfo {

@@ -164,6 +164,44 @@ impl CodeLocationImpl {
             issues.join("; ")
         )))
     }
+
+    /// FAILED_PRECONDITION with the reason when the asset version gate holds
+    /// or refuses a new manual run that writes `selection`.
+    #[allow(clippy::result_large_err)]
+    async fn check_asset_versions(&self, selection: &[String]) -> Result<(), Status> {
+        let gate = self
+            .handle
+            .asset_version_gate(selection)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        match gate.reason() {
+            Some(reason) => Err(Status::failed_precondition(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::check_asset_versions`] for the runs of a new manual backfill.
+    /// A dry run starts no run.
+    #[allow(clippy::result_large_err)]
+    async fn check_backfill_versions(
+        &self,
+        request: &crate::daemon::BackfillRequestData,
+    ) -> Result<(), Status> {
+        if request.dry_run {
+            return Ok(());
+        }
+        let assets = match &request.target {
+            crate::daemon::RunType::Job(name) => {
+                self.handle.job_asset_names(name).unwrap_or_default()
+            }
+            crate::daemon::RunType::Materialization(selection) if selection.is_empty() => self
+                .handle
+                .asset_names()
+                .map_err(|e| Status::internal(e.to_string()))?,
+            crate::daemon::RunType::Materialization(selection) => selection.clone(),
+        };
+        self.check_asset_versions(&assets).await
+    }
 }
 
 #[tonic::async_trait]
@@ -235,6 +273,7 @@ impl CodeLocationService for CodeLocationImpl {
         let config = self
             .launch_config(req.config, &asset_selection, None)
             .await?;
+        self.check_asset_versions(&asset_selection).await?;
 
         let mat_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -291,6 +330,7 @@ impl CodeLocationService for CodeLocationImpl {
         let config = self
             .launch_config(req.config, &job_assets, shown.as_deref())
             .await?;
+        self.check_asset_versions(&job_assets).await?;
         let run_request = crate::daemon::RunRequestData {
             run_key: None,
             tags: None,
@@ -348,6 +388,14 @@ impl CodeLocationService for CodeLocationImpl {
             };
             *rerun.config_mut() = config;
         }
+        let selection = match &rerun {
+            crate::daemon::RunRerunRequest::Job(r) => {
+                let job = r.job_name.as_deref().unwrap_or_default();
+                self.handle.job_asset_names(job).unwrap_or_default()
+            }
+            crate::daemon::RunRerunRequest::Materialization(m) => m.asset_selection.clone(),
+        };
+        self.check_asset_versions(&selection).await?;
 
         let status = self.run_dispatcher.mode_label().to_string();
         let run_id = match rerun {
@@ -782,6 +830,7 @@ impl CodeLocationService for CodeLocationImpl {
         let config = self
             .launch_config(req.config, &asset_selection, Some(&req.action))
             .await?;
+        self.check_asset_versions(&asset_selection).await?;
 
         let action_request = crate::daemon::MaterializationRequestData {
             run_id: uuid::Uuid::new_v4().to_string(),
@@ -895,6 +944,7 @@ impl CodeLocationService for CodeLocationImpl {
             action,
             config,
         };
+        self.check_backfill_versions(&backfill_request).await?;
 
         let mut outcome = self
             .backfill_dispatcher
@@ -935,6 +985,7 @@ impl CodeLocationService for CodeLocationImpl {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.check_backfill_versions(&backfill_request).await?;
 
         let mut outcome = self
             .backfill_dispatcher
@@ -970,6 +1021,7 @@ impl CodeLocationService for CodeLocationImpl {
             .build_rerun_request(&req.backfill_id, req.dry_run, manual_launch(req.user))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.check_backfill_versions(&backfill_request).await?;
 
         let mut outcome = self
             .backfill_dispatcher

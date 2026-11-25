@@ -39,7 +39,7 @@ impl PostgresStorage {
 
         let rows = sqlx::query(
             "SELECT run_id, code_location_id, tags, node_names, job_name, priority, \
-                 start_time, action, config, status \
+                 start_time, action, config, launched_by, status \
              FROM runs WHERE code_location_id = $1 \
              AND status IN ('Queued', 'NotStarted', 'Started')",
         )
@@ -60,6 +60,7 @@ impl PostgresStorage {
                 start_time: row.try_get("start_time")?,
                 action: row.try_get("action")?,
                 config: row.try_get("config")?,
+                launched_by: from_json(row.try_get("launched_by")?)?,
             };
             if row.try_get::<&str, _>("status")? == "Queued" {
                 queued.push(info);

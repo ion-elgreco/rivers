@@ -50,7 +50,6 @@ pub(crate) use dispatchers::{BackfillDispatcherKind, RunDispatcherKind};
 use eval_dispatcher::EvalDispatcher;
 use schedule::ScheduleInfo;
 use sensors::SensorInfo;
-pub(crate) use subdaemons::fail_unlaunched_run;
 use subdaemons::{
     spawn_backfill_monitor, spawn_backfill_pickup_loop, spawn_run_queue_coordinator,
     spawn_schedule_sensor_loop,
@@ -441,7 +440,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         run_queue_config,
     } = config;
 
-    let (run_backend, code_location_id, repo_handle, gil_threads) = {
+    let (run_backend, code_location_id, code_versions, repo_handle, gil_threads) = {
         let repo_ref = repo.get();
         let handle = repo_ref.handle();
         let gil_threads = repo_ref.gil_threads.clone();
@@ -452,6 +451,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         (
             s.run_backend.clone(),
             s.code_location_id.clone(),
+            Arc::clone(&s.code_versions),
             handle,
             gil_threads,
         )
@@ -577,6 +577,7 @@ async fn daemon_main_loop(config: DaemonLoopConfig) {
         handles.push(spawn_run_queue_coordinator(
             rq_config,
             handle.clone(),
+            code_versions,
             Arc::clone(&run_backend),
             Arc::clone(&repo),
             cancel.clone(),

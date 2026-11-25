@@ -695,12 +695,7 @@ impl PyJob {
             .storage
             .as_deref()
             .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
-        let run = version_gate::plan_run(
-            plan,
-            node_map,
-            run_id,
-            version_gate::backfill_of(launched_by),
-        );
+        let run = version_gate::plan_run(plan, node_map, run_id, launched_by.backfill_id());
         version_gate::check_run(storage, &run, false)
     }
 

@@ -211,6 +211,16 @@ pub enum VersionGate {
     Refuse(String),
 }
 
+impl VersionGate {
+    /// Why the gate holds or refuses the run.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Go => None,
+            Self::Wait(reason) | Self::Refuse(reason) => Some(reason),
+        }
+    }
+}
+
 /// A run as the gate sees it. Each asset comes with the version that the
 /// run's code declares for it: `None` for an asset that the code does not
 /// own.
@@ -339,10 +349,80 @@ pub async fn check_asset_versions<S: StorageBackend>(
     Ok(asset_version_gate(run, &rows))
 }
 
+/// What the gate needs from the code of a code location, for a run that is
+/// known by the assets that it writes: the version that the code declares
+/// for each asset that it owns, and the assets that each node reads.
+#[derive(Debug, Default)]
+pub struct CodeVersions {
+    declared: HashMap<String, u32>,
+    reads: HashMap<String, Vec<String>>,
+}
+
+impl CodeVersions {
+    /// `declared` holds the version of each asset that the code owns.
+    pub fn new(graph: &AssetGraph, declared: HashMap<String, u32>) -> Self {
+        let reads = graph
+            .node_indices()
+            .map(|idx| {
+                let name = &graph[idx].name;
+                (name.clone(), read_assets(graph, std::slice::from_ref(name)))
+            })
+            .collect();
+        Self { declared, reads }
+    }
+
+    /// Whether a run that writes `writes` may run against `rows`: the run
+    /// `run_id`, or a run of the backfill `backfill_id`.
+    pub fn gate(
+        &self,
+        run_id: Option<&str>,
+        backfill_id: Option<&str>,
+        writes: &[String],
+        rows: &[AssetVersionRecord],
+    ) -> VersionGate {
+        if rows.is_empty() {
+            return VersionGate::Go;
+        }
+        let written: HashSet<&str> = writes.iter().map(String::as_str).collect();
+        let reads: HashSet<&str> = writes
+            .iter()
+            .filter_map(|name| self.reads.get(name))
+            .flatten()
+            .map(String::as_str)
+            .filter(|name| !written.contains(name))
+            .collect();
+        let declared = |name: &str| self.declared.get(name).copied();
+        let run = GatedRun {
+            run_id,
+            backfill_id,
+            writes: written
+                .into_iter()
+                .map(|name| (name, declared(name)))
+                .collect(),
+            reads: reads
+                .into_iter()
+                .map(|name| (name, declared(name)))
+                .collect(),
+        };
+        asset_version_gate(&run, rows)
+    }
+
+    /// [`Self::gate`] over the stored rows, for a new manual run or backfill.
+    pub async fn check<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorage<'_, S>,
+        backfill_id: Option<&str>,
+        writes: &[String],
+    ) -> Result<VersionGate> {
+        let rows = storage.get_asset_versions(None).await?;
+        Ok(self.gate(None, backfill_id, writes, &rows))
+    }
+}
+
 /// The assets that the nodes `writes` read: the inputs and deps of each,
 /// through tasks, which store nothing. `writes` are left out, and so is a
 /// name that is not in `graph`.
-pub fn read_assets(graph: &AssetGraph, writes: &[String]) -> Vec<String> {
+fn read_assets(graph: &AssetGraph, writes: &[String]) -> Vec<String> {
     let index: HashMap<&str, _> = graph
         .node_indices()
         .map(|idx| (graph[idx].name.as_str(), idx))
@@ -731,5 +811,46 @@ mod tests {
             ["customers", "raw"]
         );
         assert!(reads(&["raw"]).is_empty());
+    }
+
+    #[test]
+    fn code_versions_gate_a_run_by_the_assets_that_it_writes() {
+        let code = CodeVersions::new(
+            &graph(),
+            HashMap::from([("orders".to_string(), 2), ("raw".to_string(), 2)]),
+        );
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let raw = versioned("raw", 1, AssetVersionState::Pending);
+
+        assert_eq!(
+            code.gate(Some("run-1"), None, &names(&["orders"]), &[]),
+            VersionGate::Go
+        );
+        // `orders` reads `raw` in its task; `summary` does not read `raw`.
+        let held = code.gate(Some("run-1"), None, &names(&["orders"]), &[raw.clone()]);
+        assert_eq!(held, wait("raw is migrating to version 2"));
+        assert_eq!(held.reason(), Some("raw is migrating to version 2"));
+        let summary = code.gate(Some("run-1"), None, &names(&["summary"]), &[raw.clone()]);
+        assert_eq!(summary, VersionGate::Go);
+        // The runs of the migration's rebuild go.
+        let rebuilding = AssetVersionRecord {
+            backfill_id: Some("backfill-1".to_string()),
+            ..raw
+        };
+        let rebuild = code.gate(
+            Some("run-2"),
+            Some("backfill-1"),
+            &names(&["raw", "orders"]),
+            &[rebuilding],
+        );
+        assert_eq!(rebuild, VersionGate::Go);
+        // The declared versions come from the code.
+        let newer = versioned("orders", 3, AssetVersionState::Ready);
+        assert_eq!(
+            code.gate(None, None, &names(&["orders"]), &[newer]),
+            VersionGate::Refuse(
+                "this code declares orders version 2; the stored data is at version 3".to_string()
+            )
+        );
     }
 }

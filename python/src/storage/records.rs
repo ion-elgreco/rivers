@@ -338,10 +338,7 @@ impl PyLaunchedBy {
 
     #[getter]
     fn backfill_id(&self) -> Option<&str> {
-        match &self.inner {
-            LaunchedBy::Backfill { backfill_id } => Some(backfill_id.as_str()),
-            _ => None,
-        }
+        self.inner.backfill_id()
     }
 
     #[getter]
