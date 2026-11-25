@@ -21,6 +21,7 @@ use rivers_core::storage::{
 
 use super::Executor;
 use super::ops::now_ts;
+use super::version_gate;
 use crate::assets::io_handler_registry::IOHandlerRegistry;
 use crate::config::ResourceVariant;
 use crate::config::run_config::{RunResources, parse_run_config};
@@ -36,9 +37,20 @@ pub(crate) enum RunInit {
     Create { launched_by: LaunchedBy },
     /// The record already exists (created by `Job::create_run` or by the queue
     /// dequeuer); transition its status to `Started` — unless it was canceled
-    /// while waiting, in which case the run is skipped. `stored_key` is the
-    /// partition key as the record holds it.
-    Existing { stored_key: Option<PartitionKey> },
+    /// while waiting, in which case the run is skipped. `stored_key` and
+    /// `launched_by` are as the record holds them.
+    Existing {
+        stored_key: Option<PartitionKey>,
+        launched_by: LaunchedBy,
+    },
+}
+
+impl RunInit {
+    fn launched_by(&self) -> &LaunchedBy {
+        match self {
+            Self::Create { launched_by } | Self::Existing { launched_by, .. } => launched_by,
+        }
+    }
 }
 
 pub(crate) struct RunPlanArgs<'a> {
@@ -114,6 +126,21 @@ pub(crate) fn run_plan(py: Python, args: RunPlanArgs) -> PyResult<PyRunResult> {
 
 fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRunResult> {
     let node_names = args.plan.all_asset_names();
+    let launched_by = args.init.launched_by().clone();
+    // A step pod runs a step of a run that its run pod started: the gate let
+    // that run in, and a migration's drain waits for it to end.
+    let gated = (!super::in_step_pod()).then(|| {
+        version_gate::plan_run(
+            args.plan,
+            applied.node_map,
+            &args.run_id,
+            version_gate::backfill_of(&launched_by),
+        )
+    });
+    if let Some(gated) = &gated {
+        let recorded = matches!(args.init, RunInit::Existing { .. });
+        py.detach(|| version_gate::check_run(args.storage, gated, recorded))?;
+    }
 
     let (started, stored_key) = py.detach(|| -> PyResult<(bool, Option<PartitionKey>)> {
         match args.init {
@@ -144,7 +171,7 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
                     })?;
                 Ok((true, None))
             }
-            RunInit::Existing { stored_key } => {
+            RunInit::Existing { stored_key, .. } => {
                 let started = io_rt()
                     .block_on(args.storage.backend().try_start_run(&args.run_id))
                     .map_err(|e| {
@@ -167,6 +194,11 @@ fn drive(py: Python, args: RunPlanArgs, applied: &Applied<'_>) -> PyResult<PyRun
             node_names,
             vec![],
         ));
+    }
+    // A migration that began after the first check holds the run as well:
+    // its drain may have read the started runs before this one started.
+    if let Some(gated) = &gated {
+        py.detach(|| version_gate::check_run(args.storage, gated, true))?;
     }
 
     let failures = applied.executor.execute_plan(

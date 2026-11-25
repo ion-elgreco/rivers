@@ -15,6 +15,7 @@ pub mod parallel;
 mod remote;
 pub(crate) mod run_lifecycle;
 pub(crate) mod traceback;
+pub(crate) mod version_gate;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -3,11 +3,21 @@
 class AssetDefinitionError(Exception):
     """Raised when an ``@Asset`` definition is invalid (bad signature, conflicting flags, ...)."""
 
+class AssetMigrationPendingError(Exception):
+    """Raised when a run would write or read an asset whose stored data is
+    not at the version that the code declares: its migration has not
+    finished, or it failed. The message gives the reason."""
+
 class AssetNotFoundError(Exception):
     """Raised when a referenced asset key does not exist in the repository."""
 
 class AssetOutputValidationError(Exception):
     """Raised when an asset output fails validation (type, schema, metadata)."""
+
+class AssetVersionMismatchError(Exception):
+    """Raised when a run would write an asset whose stored data is at a
+    higher version than the code declares: the code is older than the
+    data."""
 
 class ConfigurationError(Exception):
     """Raised when user configuration (resources, run config) cannot be resolved."""

@@ -6,8 +6,10 @@ extension. Catch ``rivers.exceptions.X`` rather than reaching into ``_core``.
 
 from rivers._core.exceptions import (
     AssetDefinitionError,
+    AssetMigrationPendingError,
     AssetNotFoundError,
     AssetOutputValidationError,
+    AssetVersionMismatchError,
     ConfigurationError,
     ExecutionError,
     GraphValidationError,
@@ -26,8 +28,10 @@ from rivers._core.exceptions import (
 
 __all__ = [
     "AssetDefinitionError",
+    "AssetMigrationPendingError",
     "AssetNotFoundError",
     "AssetOutputValidationError",
+    "AssetVersionMismatchError",
     "ConfigurationError",
     "ExecutionError",
     "GraphValidationError",

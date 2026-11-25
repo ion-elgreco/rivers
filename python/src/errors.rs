@@ -11,12 +11,22 @@ create_exception!(
 );
 create_exception!(
     rivers.exceptions,
+    AssetMigrationPendingError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
     AssetNotFoundError,
     pyo3::exceptions::PyException
 );
 create_exception!(
     rivers.exceptions,
     AssetOutputValidationError,
+    pyo3::exceptions::PyException
+);
+create_exception!(
+    rivers.exceptions,
+    AssetVersionMismatchError,
     pyo3::exceptions::PyException
 );
 create_exception!(
@@ -102,10 +112,18 @@ pub fn register_exceptions(parent_module: &Bound<'_, PyModule>) -> PyResult<()> 
         "AssetDefinitionError",
         py.get_type::<AssetDefinitionError>(),
     )?;
+    child.add(
+        "AssetMigrationPendingError",
+        py.get_type::<AssetMigrationPendingError>(),
+    )?;
     child.add("AssetNotFoundError", py.get_type::<AssetNotFoundError>())?;
     child.add(
         "AssetOutputValidationError",
         py.get_type::<AssetOutputValidationError>(),
+    )?;
+    child.add(
+        "AssetVersionMismatchError",
+        py.get_type::<AssetVersionMismatchError>(),
     )?;
     child.add("ConfigurationError", py.get_type::<ConfigurationError>())?;
     child.add("ExecutionError", py.get_type::<ExecutionError>())?;

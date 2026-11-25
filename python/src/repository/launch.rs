@@ -110,9 +110,17 @@ impl PyCodeRepository {
             }
             None => (uuid::Uuid::new_v4().to_string(), None),
         };
-        let (run_id, stored_key, tags, config) = match existing {
-            Some(run) => (run_id, run.partition_key, tags.unwrap_or_default(), config),
+        let (run_id, stored_key, tags, config, launched_by) = match existing {
+            Some(run) => (
+                run_id,
+                run.partition_key,
+                tags.unwrap_or_default(),
+                config,
+                run.launched_by,
+            ),
             None => {
+                // A new run that the gate holds or refuses gets no record.
+                synthetic_job.check_asset_versions(&run_id, &launched_by)?;
                 let record = io_rt().block_on(create_materialization_run(
                     state,
                     synthetic_job.asset_names(),
@@ -128,6 +136,7 @@ impl PyCodeRepository {
                     record.partition_key,
                     record.tags,
                     record.config,
+                    record.launched_by,
                 )
             }
         };
@@ -136,7 +145,10 @@ impl PyCodeRepository {
             synthetic_job.run_inner(
                 py,
                 run_id,
-                crate::executor::run_lifecycle::RunInit::Existing { stored_key },
+                crate::executor::run_lifecycle::RunInit::Existing {
+                    stored_key,
+                    launched_by,
+                },
                 partition_key,
                 tags,
                 config,

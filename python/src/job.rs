@@ -20,6 +20,7 @@ use crate::config::ResourceVariant;
 use crate::config::run_config::{checked_run_config, run_config_to_json};
 use crate::errors::{ConfigurationError, ExecutionError, GraphValidationError, NodeNotFoundError};
 use crate::executor::run_lifecycle::{RunInit, RunPlanArgs, run_plan};
+use crate::executor::version_gate;
 
 use crate::assets::decorator::PyAsset;
 use crate::executor::Executor;
@@ -587,15 +588,19 @@ impl PyJob {
             .storage
             .as_deref()
             .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
-        let stored_key = py
+        let (stored_key, launched_by) = py
             .detach(|| io_rt().block_on(storage.backend().get_run(run_id)))
             .map_err(|e| ExecutionError::new_err(format!("Failed to load run: {e}")))?
-            .and_then(|run| run.partition_key);
+            .map(|run| (run.partition_key, run.launched_by))
+            .unwrap_or_default();
 
         self.run_inner(
             py,
             run_id.to_string(),
-            RunInit::Existing { stored_key },
+            RunInit::Existing {
+                stored_key,
+                launched_by,
+            },
             partition_key,
             Vec::new(),
             config,
@@ -676,6 +681,27 @@ impl PyJob {
             .as_ref()
             .map(|p| p.all_asset_names())
             .unwrap_or_default()
+    }
+
+    /// Raise when the asset version gate holds or refuses a new run of this
+    /// job. Blocks: call it without the GIL.
+    pub(crate) fn check_asset_versions(
+        &self,
+        run_id: &str,
+        launched_by: &LaunchedBy,
+    ) -> PyResult<()> {
+        let (plan, node_map, _) = self.validated_parts()?;
+        let storage = self
+            .storage
+            .as_deref()
+            .ok_or_else(|| ExecutionError::new_err("Job has no storage configured."))?;
+        let run = version_gate::plan_run(
+            plan,
+            node_map,
+            run_id,
+            version_gate::backfill_of(launched_by),
+        );
+        version_gate::check_run(storage, &run, false)
     }
 
     fn validated_parts(

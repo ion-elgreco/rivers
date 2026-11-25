@@ -5,13 +5,15 @@ use pyo3::prelude::*;
 use crate::config::run_config::checked_run_config;
 use crate::errors::{AssetNotFoundError, ExecutionError};
 use crate::executor::ops::now_ts;
+use crate::executor::version_gate;
 use crate::job::PyJob;
 use crate::partitions::{PyBackfillStrategy, PyPartitionKey, PyPartitionKeyRange};
 use crate::runtime::{io_rt, rt};
+use rivers_core::assets::versions::{GatedRun, read_assets};
 use rivers_core::execution::backfill_spans::{DimensionGrid, with_spans};
 use rivers_core::storage::{
-    BackfillFailurePolicy, BackfillRecord, BackfillRunOutcome, BackfillStatus, LaunchedBy,
-    PartitionKey, StorageBackend, UnstartedBackfillRun, tag_keys,
+    BackfillFailurePolicy, BackfillRecord, BackfillRunOutcome, BackfillStatus, CodeLocationContext,
+    LaunchedBy, PartitionKey, ScopedStorageHandle, StorageBackend, UnstartedBackfillRun, tag_keys,
 };
 
 use super::*;
@@ -67,6 +69,35 @@ fn time_grids(state: &ResolvedState, selection: &[String]) -> Vec<DimensionGrid>
         .map(|(_, def)| def.time_grids())
         .find(|grids| !grids.is_empty())
         .unwrap_or_default()
+}
+
+/// Raise when the asset version gate holds or refuses the runs of a new
+/// backfill of `selection`. Blocks: call it without the GIL.
+fn check_asset_versions(
+    state: &ResolvedState,
+    selection: &[String],
+    backfill_id: &str,
+) -> PyResult<()> {
+    let graph = state
+        .inner_repo
+        .graph
+        .as_ref()
+        .ok_or_else(|| ExecutionError::new_err("Graph not resolved"))?;
+    let reads = read_assets(graph, selection);
+    let run = GatedRun {
+        run_id: None,
+        backfill_id: Some(backfill_id),
+        writes: version_gate::declared_versions(
+            selection.iter().map(String::as_str),
+            &state.node_map,
+        ),
+        reads: version_gate::declared_versions(reads.iter().map(String::as_str), &state.node_map),
+    };
+    let storage = ScopedStorageHandle::new(
+        Arc::clone(&*state.storage),
+        CodeLocationContext::new(state.code_location_id.clone()),
+    );
+    version_gate::check_run(&storage, &run, false)
 }
 
 /// Plan the runs of a `Requested` backfill and move it to `InProgress`.
@@ -278,6 +309,11 @@ impl PyCodeRepository {
         }
 
         let backfill_id = preminted_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // A manual backfill that the gate holds or refuses gets no record. The
+        // runs of an automation backfill wait in the run queue instead.
+        if matches!(launched_by, LaunchedBy::Manual { .. }) {
+            check_asset_versions(state, &selection, &backfill_id)?;
+        }
         let fp = match failure_policy {
             "stop_on_failure" => BackfillFailurePolicy::StopOnFailure,
             _ => BackfillFailurePolicy::Continue,
