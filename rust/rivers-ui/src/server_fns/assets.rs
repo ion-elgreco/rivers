@@ -7,7 +7,7 @@
 
 use leptos::prelude::*;
 
-use crate::types::{AssetRecord, EventsPage, StoredEvent};
+use crate::types::{AssetMigration, AssetRecord, EventsPage, StoredEvent};
 
 #[server]
 pub async fn get_assets(
@@ -165,4 +165,87 @@ pub async fn get_dynamic_partitions(
         .get_dynamic_partitions(&name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// The migrations of the stored data of this location's assets that have not
+/// ended. Of one that drains: the started runs that it waits for, and the
+/// assets that it reads which migrate first.
+#[server]
+pub async fn get_asset_migrations(
+    loc_ns: String,
+    loc_name: String,
+) -> Result<Vec<AssetMigration>, ServerFnError> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use rivers_core::assets::graph::from_topology;
+    use rivers_core::assets::migrations::drain_runs;
+    use rivers_core::assets::versions::CodeVersions;
+    use rivers_core::storage::{AssetVersionState, ScopedStorageHandle};
+
+    use crate::types::MigrationState;
+
+    let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
+    let state = expect_context::<crate::state::AppState>();
+    let handle = ScopedStorageHandle::new(Arc::clone(&state.storage), ctx);
+    let failed = |e: anyhow::Error| ServerFnError::new(e.to_string());
+    let rows: Vec<_> = handle
+        .scoped()
+        .get_asset_versions(None)
+        .await
+        .map_err(failed)?
+        .into_iter()
+        .filter(|row| row.state != AssetVersionState::Ready)
+        .collect();
+    let code = if rows
+        .iter()
+        .any(|row| row.state == AssetVersionState::Draining)
+    {
+        let topology = handle
+            .scoped()
+            .get_graph_topology()
+            .await
+            .map_err(failed)?
+            .unwrap_or_default();
+        Some(CodeVersions::new(&from_topology(&topology), HashMap::new()))
+    } else {
+        None
+    };
+    let migrating: HashSet<&str> = rows.iter().map(|row| row.asset_key.as_str()).collect();
+
+    let mut migrations = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let (drain, upstream) = match &code {
+            Some(code) if row.state == AssetVersionState::Draining => {
+                let runs = drain_runs(&handle, code, row).await.map_err(failed)?;
+                let upstream = code
+                    .reads(&row.asset_key)
+                    .iter()
+                    .filter(|key| migrating.contains(key.as_str()))
+                    .cloned()
+                    .collect();
+                (runs.into_iter().map(|run| run.run_id).collect(), upstream)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        let state = match row.state {
+            AssetVersionState::Pending | AssetVersionState::Ready => MigrationState::Pending,
+            AssetVersionState::Draining => MigrationState::Draining,
+            AssetVersionState::Running => MigrationState::Running,
+            AssetVersionState::Failed => MigrationState::Failed,
+            AssetVersionState::Blocked => MigrationState::Blocked,
+        };
+        migrations.push(AssetMigration {
+            asset_key: row.asset_key.clone(),
+            applied_version: row.applied_version,
+            state,
+            target_version: row.target_version,
+            reason: row.reason.clone(),
+            run_id: row.run_id.clone(),
+            backfill_id: row.backfill_id.clone(),
+            drain_runs: drain,
+            upstream,
+        });
+    }
+    Ok(migrations)
 }

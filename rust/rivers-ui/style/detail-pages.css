@@ -267,3 +267,36 @@
 .event-row-traceback-toggle:hover { text-decoration: underline; }
 .event-row-traceback { grid-column: 1 / -1; }
 .event-row-traceback-note { font-size: var(--fs-sm); color: var(--text-muted); }
+
+/* ── Asset migration panel (asset page) ── */
+.migration-panel {
+    background: var(--bg-surface);
+    border-left: 2px solid var(--secondary);
+    border-radius: var(--round-sm);
+    padding: 12px 16px;
+    margin: 14px 0 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.migration-panel--stopped { border-left-color: var(--error); }
+.migration-panel-title {
+    font-family: var(--font-mono);
+    font-size: var(--fs-md);
+    color: var(--text);
+}
+.migration-panel-line {
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+}
+.migration-panel-runs { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.migration-panel-reason {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.migration-panel-actions { display: flex; gap: 8px; margin-top: 4px; }

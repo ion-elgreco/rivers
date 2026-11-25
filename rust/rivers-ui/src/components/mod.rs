@@ -1,5 +1,6 @@
 //! Reusable Leptos UI components.
 
+pub mod asset_migration;
 pub mod code_editor;
 pub mod config_editor;
 pub mod dag;

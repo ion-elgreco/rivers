@@ -58,6 +58,10 @@ pub struct AssetDefinitionInfo {
     /// The asset's metadata as defined; a launch may add or replace keys.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// The version of the stored data that the code declares; `None` for a
+    /// node whose data rivers does not store.
+    #[serde(default)]
+    pub schema_version: Option<u32>,
 }
 
 /// Mirror of the gRPC `ActionInfo`.

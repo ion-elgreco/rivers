@@ -35,6 +35,18 @@ CREATE TABLE asset_version_history (
     PRIMARY KEY (code_location_id, asset_key, version)
 );
 
+-- The UI server listens to the version rows, as to the tables of
+-- `schema/notify.sql`.
+CREATE TRIGGER asset_versions_notify_insert AFTER INSERT ON asset_versions
+    REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify_changed();
+CREATE TRIGGER asset_versions_notify_update AFTER UPDATE ON asset_versions
+    REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify_changed();
+CREATE TRIGGER asset_versions_notify_delete AFTER DELETE ON asset_versions
+    REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION rivers_notify_changed();
+
 -- Additive: no older build reads or writes the tables. The V17 floors carry
 -- forward.
 INSERT INTO migration_meta (version, class, min_reader, min_writer)

@@ -52,7 +52,7 @@ pub const LIVE_CHANNELS: &[LiveChannel] = &[
     LiveChannel {
         name: "assets",
         event_name: "assets-changed",
-        tables: &["assets", "asset_partitions"],
+        tables: &["assets", "asset_partitions", "asset_versions"],
     },
     LiveChannel {
         name: "events",
@@ -75,12 +75,12 @@ pub const LIVE_CHANNELS: &[LiveChannel] = &[
         tables: &["concurrency_pools", "concurrency_slots", "pending_steps"],
     },
     // Subscribers on this channel care about which assets light up on the
-    // DAG (materialization / staleness changes), not the topology itself —
+    // DAG (materialization / staleness changes, migrations), not the topology itself —
     // that changes only when the code location reloads (`code_location`).
     LiveChannel {
         name: "lineage",
         event_name: "lineage-changed",
-        tables: &["assets", "asset_partitions"],
+        tables: &["assets", "asset_partitions", "asset_versions"],
     },
     // No table feeds this channel: the `rivers dev` host kicks it once a
     // reloaded code location is serving, so pages refetch definitions after

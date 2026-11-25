@@ -262,8 +262,9 @@ mod tests {
     }
 
     /// V18 adds the version rows of the assets and their history to a schema
-    /// at V17. No older build reads or writes them, so a V17 build still
-    /// reads and writes.
+    /// at V17, with the triggers that notify the UI server of changed version
+    /// rows. No older build reads or writes them, so a V17 build still reads
+    /// and writes.
     #[tokio::test]
     async fn test_v18_adds_the_asset_version_tables_and_keeps_the_floors() {
         let Some(url) = super::super::PostgresStorage::test_url() else {
@@ -302,6 +303,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tables, ["asset_version_history", "asset_versions"]);
+        // The UI server listens to the version rows.
+        let triggers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT trigger_name::text FROM information_schema.triggers \
+             WHERE trigger_schema = current_schema() AND event_object_table = 'asset_versions' \
+             ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            triggers,
+            [
+                "asset_versions_notify_delete",
+                "asset_versions_notify_insert",
+                "asset_versions_notify_update",
+            ]
+        );
 
         let stamps = read_schema_stamps(&pool).await.unwrap().unwrap();
         assert_eq!(

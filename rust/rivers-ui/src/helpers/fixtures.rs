@@ -27,6 +27,7 @@ pub(super) fn make_info(asset_key: &str, keys: Option<&[&str]>) -> AssetDefiniti
         actions: vec![],
         config_schema: None,
         metadata: Default::default(),
+        schema_version: None,
     }
 }
 

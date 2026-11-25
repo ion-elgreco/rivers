@@ -133,6 +133,30 @@ pub fn to_topology(graph: &AssetGraph) -> GraphTopology {
     GraphTopology { nodes, edges }
 }
 
+/// The graph of `topology`: the names, kinds and edges of [`to_topology`],
+/// without the inputs and outputs of the nodes. For a process that has the
+/// stored topology but not the code, such as the UI server.
+pub fn from_topology(topology: &GraphTopology) -> AssetGraph {
+    let mut graph = AssetGraph::new();
+    let index: HashMap<&str, NodeIndex> = topology
+        .nodes
+        .iter()
+        .map(|node| {
+            let dag_node = DagNode {
+                kind: node.kind,
+                ..DagNode::new(&node.name)
+            };
+            (node.name.as_str(), graph.add_node(dag_node))
+        })
+        .collect();
+    for (from, to) in &topology.edges {
+        if let (Some(&from), Some(&to)) = (index.get(from.as_str()), index.get(to.as_str())) {
+            graph.add_edge(from, to, ());
+        }
+    }
+    graph
+}
+
 /// Format a cycle as "a -> b -> c -> a" using node names from the graph.
 fn format_cycle(graph: &AssetGraph, scc: &[NodeIndex]) -> String {
     let mut names: Vec<&str> = scc.iter().map(|idx| graph[*idx].name.as_str()).collect();
@@ -447,6 +471,21 @@ mod tests {
         let mut repo = make_repo(assets);
         repo.resolve_asset_graph().unwrap();
         repo.graph.unwrap()
+    }
+
+    #[test]
+    fn from_topology_gives_back_the_names_kinds_and_edges() {
+        let graph = make_graph(vec![("a", vec![]), ("b", vec!["a"]), ("c", vec!["a", "b"])]);
+        let topology = to_topology(&graph);
+
+        let again = to_topology(&from_topology(&topology));
+
+        let names = |t: &GraphTopology| -> Vec<(String, NodeKind)> {
+            t.nodes.iter().map(|n| (n.name.clone(), n.kind)).collect()
+        };
+        assert_eq!(names(&again), names(&topology));
+        assert_eq!(again.edges, topology.edges);
+        assert_eq!(again.edges.len(), 3);
     }
 
     #[test]

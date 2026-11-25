@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 
+use crate::components::asset_migration::AssetMigrationPanel;
 use crate::components::icons::IconPlay;
 use crate::components::live::{LiveStatusChip, use_definitions, use_live_kick};
 use crate::components::materialize_dialog::MaterializeDialog;
@@ -18,7 +19,9 @@ use crate::helpers::{
     JobPartitionPicker, format_timestamp, partition_picker_for_assets, short_id, use_query_param,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::assets::{get_asset, get_asset_events, get_asset_events_page, get_assets};
+use crate::server_fns::assets::{
+    get_asset, get_asset_events, get_asset_events_page, get_asset_migrations, get_assets,
+};
 use crate::server_fns::automation::{get_condition_evals, observe_asset};
 use crate::server_fns::graph::{get_graph_topology, get_remote_downstream, get_remote_statuses};
 use crate::server_fns::mutations::{materialize_missing_partitions, trigger_materialize};
@@ -169,6 +172,10 @@ pub fn AssetDetailPage() -> impl IntoView {
     let assets_info = Resource::new(
         move || (loc.get(), live.definitions.get()),
         |((ns, name), _)| async move { get_assets_info(ns, name).await },
+    );
+    let migrations = Resource::new(
+        move || (loc.get(), refresh_tick.get()),
+        |((ns, name), _)| get_asset_migrations(ns, name),
     );
     let graph = Resource::new(
         move || (loc.get(), live.definitions.get()),
@@ -515,12 +522,20 @@ pub fn AssetDetailPage() -> impl IntoView {
                     let Some(record) = rec else {
                         return view! { <EmptyState message="Asset not found" compact=true/> }.into_any();
                     };
+                    let migration = migrations
+                        .get()
+                        .and_then(|r| r.ok())
+                        .and_then(|all| all.into_iter().find(|m| m.asset_key == current_key));
+                    let declared = info.as_ref().and_then(|i| i.schema_version);
 
                     let kind_val = if record.kinds.is_empty() { "—".to_string() } else { record.kinds.join(", ") };
                     let group_val = record.asset_group.clone().unwrap_or_else(|| "—".to_string());
                     let last_ts = record.last_timestamp;
                     let last_ts_abs = format_timestamp(record.last_timestamp);
-                    let status_kind = crate::helpers::stale_status_kind(&record.stale_status);
+                    let status_kind = migration.as_ref().map_or_else(
+                        || crate::helpers::stale_status_kind(&record.stale_status),
+                        crate::types::AssetMigration::chip_kind,
+                    );
                     let last_label = if is_external.get() { "LAST OBSERVED" } else { "LAST MATERIALIZED" };
                     let partitioned_val = info
                         .as_ref()
@@ -583,6 +598,8 @@ pub fn AssetDetailPage() -> impl IntoView {
                                 <div class="meta-tile-value">{partitioned_val}</div>
                             </div>
                         </div>
+
+                        {migration.map(|migration| view! { <AssetMigrationPanel migration declared/> })}
 
                         <button
                             class="meta-toggle-btn"

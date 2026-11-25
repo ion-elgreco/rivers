@@ -13,7 +13,7 @@ use crate::helpers::{
     common_actions, partition_picker_for_assets, sorted_verbs, use_query_param_list,
 };
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::assets::{get_asset, get_assets};
+use crate::server_fns::assets::{get_asset, get_asset_migrations, get_assets};
 use crate::server_fns::graph::{
     get_graph_layout, get_graph_topology, get_node_lineage, get_remote_statuses,
 };
@@ -181,6 +181,23 @@ pub fn GraphPage() -> impl IntoView {
         move || (loc.get(), refresh_tick.get()),
         |((ns, name), _)| get_assets(ns, name, None, None, None),
     );
+    let migrations = Resource::new(
+        move || (loc.get(), refresh_tick.get()),
+        |((ns, name), _)| get_asset_migrations(ns, name),
+    );
+    let migrations_value = crate::helpers::resource_value(migrations);
+    let migrating = Memo::new(move |_| {
+        migrations_value
+            .read()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(|all| {
+                all.iter()
+                    .map(|m| (m.asset_key.clone(), m.stopped()))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default()
+    });
 
     // Multi-selection in click order; the last entry is the focused node.
     let (selected_nodes, set_selected_nodes) = signal(Vec::<String>::new());
@@ -683,6 +700,7 @@ pub fn GraphPage() -> impl IntoView {
 
                                 let ga_names = graph_asset_names.get();
                                 let exp_graphs = expanded_graphs.get();
+                                let migrating_nodes = migrating.get();
 
                                 // Snapshot for the minimap before DagGraph consumes layout_result.
                                 let mini_nodes: Vec<MinimapNode> = layout_result.nodes.iter().map(|n| {
@@ -742,6 +760,7 @@ pub fn GraphPage() -> impl IntoView {
                                         viewport=viewport
                                         graph_asset_names=ga_names
                                         expanded_graphs=exp_graphs
+                                        migrating=migrating_nodes
                                     />
                                     <div style:display=move || if graph_in_view.get() { "none" } else { "" }>
                                         <DagMinimap

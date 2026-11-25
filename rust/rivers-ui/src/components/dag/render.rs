@@ -88,6 +88,10 @@ pub fn DagGraph(
     /// "NEW" chip + accent ring. Empty = nothing flagged.
     #[prop(optional)]
     changed_keys: HashSet<String>,
+    /// Nodes whose stored data migrates, with a chip: `true` when the
+    /// migration stopped (it failed, or cannot start).
+    #[prop(optional)]
+    migrating: HashMap<String, bool>,
 ) -> impl IntoView {
     let has_selection = !selected_nodes.is_empty();
     let node_ref_map: HashMap<String, &LayoutNode> =
@@ -286,6 +290,7 @@ pub fn DagGraph(
                     let ga_names = &graph_asset_names;
                     let exp_graphs = &expanded_graphs;
                     let chg_keys = &changed_keys;
+                    let migrating = &migrating;
 
                     visible_nodes.get().into_iter().map(|node| {
                         match cur_lod {
@@ -306,6 +311,7 @@ pub fn DagGraph(
                                 ga_names,
                                 exp_graphs,
                                 chg_keys,
+                                migrating,
                             ),
                         }
                     }).collect::<Vec<_>>()
@@ -331,6 +337,7 @@ fn render_node_full(
     graph_asset_names: &HashSet<String>,
     expanded_graphs: &HashSet<String>,
     changed_keys: &HashSet<String>,
+    migrating: &HashMap<String, bool>,
 ) -> AnyView {
     let accent = kind_accent(&node.kind);
     let kind_text = kind_label(&node.kind);
@@ -359,6 +366,13 @@ fn render_node_full(
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
     let is_changed = changed_keys.contains(&node.id);
+    let migration_chip = migrating.get(&node.id).map(|&stopped| {
+        if stopped {
+            ("migration failed", "#ff6e84")
+        } else {
+            ("migrating", "#50e1f9")
+        }
+    });
     let remote_chip: Option<(&'static str, String, &'static str)> = remote.and_then(|r| {
         if !r.resolved {
             return Some((
@@ -630,6 +644,38 @@ fn render_node_full(
                 let chip_y = y - 6.0;
                 view! {
                     <g class=class>
+                        <rect
+                            x={chip_x.to_string()}
+                            y={chip_y.to_string()}
+                            width={chip_w.to_string()}
+                            height="12"
+                            rx="2"
+                            fill="#24272b"
+                            stroke="#535559"
+                            stroke-width="1"
+                        />
+                        <text
+                            x={(chip_x + chip_w / 2.0).to_string()}
+                            y={(chip_y + 9.0).to_string()}
+                            text-anchor="middle"
+                            fill=fill
+                            font-size="8"
+                            font-family="JetBrains Mono, monospace"
+                        >
+                            {text}
+                        </text>
+                    </g>
+                }
+            })}
+
+            // Top left, clear of the "NEW" chip: a version bump that starts a
+            // migration also changes the node.
+            {migration_chip.map(|(text, fill)| {
+                let chip_w = 5.0 * text.len() as f64 + 2.0;
+                let chip_x = x + 6.0;
+                let chip_y = y - 6.0;
+                view! {
+                    <g class="dag-node-migration">
                         <rect
                             x={chip_x.to_string()}
                             y={chip_y.to_string()}

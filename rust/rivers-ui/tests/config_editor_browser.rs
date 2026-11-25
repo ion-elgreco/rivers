@@ -55,6 +55,7 @@ fn definition(key: &str, config_schema: &str) -> AssetDefinitionInfo {
         actions: vec![],
         config_schema: Some(config_schema.to_string()),
         metadata: Default::default(),
+        schema_version: None,
     }
 }
 

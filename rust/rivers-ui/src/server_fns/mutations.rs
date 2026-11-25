@@ -552,6 +552,51 @@ pub async fn cancel_run(run_id: String) -> Result<bool, ServerFnError> {
     Ok(resp.into_inner().success)
 }
 
+/// Run the failed migration of `asset_key` again, through its code
+/// location. `false` when the migration had not failed.
+#[server]
+pub async fn retry_migration(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::RetryMigrationRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .retry_migration(RetryMigrationRequest { asset_key })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp.into_inner().success)
+}
+
+/// Stop the migration of `asset_key` before it runs, through its code
+/// location: the asset goes back to ready at its stored version. `false`
+/// when the migration was not pending or draining.
+#[server]
+pub async fn cancel_migration(
+    loc_ns: String,
+    loc_name: String,
+    asset_key: String,
+) -> Result<bool, ServerFnError> {
+    use rivers_api::rivers::CancelMigrationRequest;
+
+    let state = expect_context::<crate::state::AppState>();
+    let (_, mut client) = state
+        .connect_to(&loc_ns, &loc_name)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let resp = client
+        .cancel_migration(CancelMigrationRequest { asset_key })
+        .await
+        .map_err(super::grpc_err)?;
+    Ok(resp.into_inner().success)
+}
+
 /// Cancel a backfill through the code location that owns it, which also
 /// cancels the runs of the backfill that have not ended. One whose runs all
 /// ended keeps its own final status. Returns `true` once the code location
