@@ -12,12 +12,13 @@ use crate::executor::ops::now_ts;
 use crate::job::PyJob;
 use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey};
 use crate::storage::{DetachOnClose, PyStorageType};
+use rivers_core::assets::migrations::{cancel_migration, retry_migration};
 use rivers_core::assets::versions::{CodeVersions, VersionGate};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
-    BackfillFailurePolicy, BackfillRecord, BackfillStatus, CodeLocationContext, LaunchedBy,
-    PartitionKey, RunRecord, RunStatus, StorageBackend, tag_keys,
+    AssetVersionRecord, BackfillFailurePolicy, BackfillRecord, BackfillStatus, CodeLocationContext,
+    LaunchedBy, PartitionKey, RunRecord, RunStatus, StorageBackend, tag_keys,
 };
 
 use super::resolved_node::ResolvedNode;
@@ -548,6 +549,47 @@ impl RepoHandle {
     pub(crate) async fn asset_version_gate(&self, selection: &[String]) -> PyResult<VersionGate> {
         self.resolved()?
             .asset_version_gate(None, selection)
+            .await
+            .map_err(crate::storage::to_py_err)
+    }
+
+    /// The version of the stored data of `asset_key` that this code
+    /// declares. `None` for a node whose data rivers does not store, or an
+    /// unknown name. GIL-free.
+    pub(crate) fn declared_version(&self, asset_key: &str) -> PyResult<Option<u32>> {
+        Ok(self.resolved()?.code_versions.declared(asset_key))
+    }
+
+    /// The version row of each asset of this code location, or of `keys`.
+    /// GIL-free.
+    pub(crate) async fn asset_versions(
+        &self,
+        keys: Option<&[String]>,
+    ) -> PyResult<Vec<AssetVersionRecord>> {
+        let state = self.resolved()?;
+        let ctx = CodeLocationContext::new(state.code_location_id.as_str());
+        state
+            .storage
+            .for_code_location(&ctx)
+            .get_asset_versions(keys)
+            .await
+            .map_err(crate::storage::to_py_err)
+    }
+
+    /// See [`retry_migration`]. GIL-free.
+    pub(crate) async fn retry_migration(&self, asset_key: &str) -> PyResult<bool> {
+        let state = self.resolved()?;
+        let ctx = CodeLocationContext::new(state.code_location_id.as_str());
+        retry_migration(&state.storage.for_code_location(&ctx), asset_key)
+            .await
+            .map_err(crate::storage::to_py_err)
+    }
+
+    /// See [`cancel_migration`]. GIL-free.
+    pub(crate) async fn cancel_migration(&self, asset_key: &str) -> PyResult<bool> {
+        let state = self.resolved()?;
+        let ctx = CodeLocationContext::new(state.code_location_id.as_str());
+        cancel_migration(&state.storage.for_code_location(&ctx), asset_key)
             .await
             .map_err(crate::storage::to_py_err)
     }

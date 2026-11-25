@@ -165,6 +165,16 @@ impl CodeLocationImpl {
         )))
     }
 
+    /// The version of the stored data of `asset_key` that this code declares.
+    /// NOT_FOUND when this code stores no data under that name.
+    #[allow(clippy::result_large_err)]
+    fn declared_version(&self, asset_key: &str) -> Result<u32, Status> {
+        self.handle
+            .declared_version(asset_key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("Asset '{asset_key}' not found")))
+    }
+
     /// FAILED_PRECONDITION with the reason when the asset version gate holds
     /// or refuses a new manual run that writes `selection`.
     #[allow(clippy::result_large_err)]
@@ -602,6 +612,8 @@ impl CodeLocationService for CodeLocationImpl {
                         actions,
                         config_schema,
                         metadata: node.metadata().cloned().unwrap_or_default(),
+                        schema_version: state.code_versions.declared(name),
+                        stored_version: None,
                     });
                 }
 
@@ -626,6 +638,23 @@ impl CodeLocationService for CodeLocationImpl {
                 Ok(GetAssetsInfoResponse { assets, resources })
             })
             .await?;
+        let mut resp = resp;
+        match self.handle.asset_versions(None).await {
+            Ok(rows) => {
+                let mut rows: HashMap<String, _> = rows
+                    .into_iter()
+                    .map(|row| (row.asset_key.clone(), row))
+                    .collect();
+                for asset in &mut resp.assets {
+                    asset.stored_version = rows.remove(&asset.asset_key).map(asset_version_info);
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "rivers::grpc",
+                error = %e,
+                "asset versions unavailable"
+            ),
+        }
         Ok(Response::new(resp))
     }
 
@@ -1109,6 +1138,50 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CancelRunResponse { success }))
+    }
+
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.retry_migration")]
+    async fn retry_migration(
+        &self,
+        request: Request<RetryMigrationRequest>,
+    ) -> Result<Response<RetryMigrationResponse>, Status> {
+        let key = request.into_inner().asset_key;
+        self.declared_version(&key)?;
+        let success = self
+            .handle
+            .retry_migration(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RetryMigrationResponse { success }))
+    }
+
+    /// Refused while this code declares a higher version than the stored
+    /// data: the daemon would start the migration again.
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.cancel_migration")]
+    async fn cancel_migration(
+        &self,
+        request: Request<CancelMigrationRequest>,
+    ) -> Result<Response<CancelMigrationResponse>, Status> {
+        let key = request.into_inner().asset_key;
+        let declared = self.declared_version(&key)?;
+        let rows = self
+            .handle
+            .asset_versions(Some(std::slice::from_ref(&key)))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(row) = rows.first()
+            && declared > row.applied_version
+        {
+            return Err(Status::failed_precondition(format!(
+                "this code declares version {declared} of {key}; its migration would start again"
+            )));
+        }
+        let success = self
+            .handle
+            .cancel_migration(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CancelMigrationResponse { success }))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.delete_run")]

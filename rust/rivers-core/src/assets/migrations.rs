@@ -720,6 +720,46 @@ pub async fn retry_migration<S: StorageBackend>(
     bail!("asset '{asset_key}': other writers changed its version row {RETRY_ATTEMPTS} times")
 }
 
+/// Stop a migration that has not started to run: `pending` or `draining` →
+/// `ready` at the applied version. `Ok(false)` when the migration of
+/// `asset_key` is not pending or draining. A daemon whose code declares a
+/// higher version starts the migration again.
+pub async fn cancel_migration<S: StorageBackend>(
+    storage: &ScopedStorage<'_, S>,
+    asset_key: &str,
+) -> Result<bool> {
+    for _ in 0..RETRY_ATTEMPTS {
+        let Some(row) = storage
+            .get_asset_versions(Some(&[asset_key.to_string()]))
+            .await?
+            .pop()
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            row.state,
+            AssetVersionState::Pending | AssetVersionState::Draining
+        ) {
+            return Ok(false);
+        }
+        let next = AssetVersionRecord {
+            state: AssetVersionState::Ready,
+            target_version: None,
+            reason: None,
+            started_at: None,
+            run_id: None,
+            backfill_id: None,
+            owner: None,
+            lease_expires_at: None,
+            ..row.clone()
+        };
+        if storage.put_asset_version(&next, Some(row.revision)).await? {
+            return Ok(true);
+        }
+    }
+    bail!("asset '{asset_key}': other writers changed its version row {RETRY_ATTEMPTS} times")
+}
+
 /// Whether the migration in `row` is on its way to a version that the code,
 /// which declares `declared`, drives.
 fn on_its_way(row: &AssetVersionRecord, declared: u32) -> bool {
@@ -1131,6 +1171,38 @@ mod tests {
         f.pass(&a).await;
         let retried = f.launches.one_run();
         assert_ne!(retried, run_id);
+    }
+
+    #[tokio::test]
+    async fn a_migration_can_be_canceled_only_before_it_runs() {
+        let f = Fixture::new().await;
+        f.put(&pending("orders", 1, 2)).await;
+        let rolled_back = daemon("a", &[("orders", &[])]);
+
+        assert!(
+            cancel_migration(&f.handle.scoped(), "orders")
+                .await
+                .unwrap()
+        );
+
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.applied_version, row.target_version),
+            (AssetVersionState::Ready, 1, None)
+        );
+        assert!(!f.pass(&rolled_back).await);
+        assert_eq!(f.row("orders").await.state, AssetVersionState::Ready);
+
+        f.put(&pending("summary", 1, 2)).await;
+        f.pass(&daemon("b", &[("summary", &[Convert])])).await;
+        f.launches.one_run();
+        assert_eq!(f.row("summary").await.state, AssetVersionState::Running);
+        assert!(
+            !cancel_migration(&f.handle.scoped(), "summary")
+                .await
+                .unwrap()
+        );
+        assert!(!cancel_migration(&f.handle.scoped(), "nope").await.unwrap());
     }
 
     #[tokio::test]

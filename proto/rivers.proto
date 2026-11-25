@@ -29,6 +29,11 @@ service CodeLocationService {
   rpc CancelBackfill(CancelBackfillRequest) returns (CancelBackfillResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc DeleteRun(DeleteRunRequest) returns (DeleteRunResponse);
+  // Run a failed asset migration again, from its drain.
+  rpc RetryMigration(RetryMigrationRequest) returns (RetryMigrationResponse);
+  // Stop an asset migration that has not started to run: the asset goes back
+  // to ready at its stored version.
+  rpc CancelMigration(CancelMigrationRequest) returns (CancelMigrationResponse);
   // Check a launch document with each selected asset's config class, as a run
   // builds it, with the document's values or none.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
@@ -280,6 +285,29 @@ message AssetDefinitionInfo {
   optional string config_schema = 15;
   // The asset's metadata as defined; a launch document may add or replace keys.
   map<string, string> metadata = 16;
+  // The version of the stored data that this code declares. Unset for a node
+  // whose data rivers does not store.
+  optional uint32 schema_version = 17;
+  // The version of the stored data, and its migration. Unset when the store
+  // has no record for the asset, or the record could not be read.
+  optional AssetVersionInfo stored_version = 18;
+}
+
+// The version of an asset's stored data, and its migration.
+message AssetVersionInfo {
+  uint32 applied_version = 1;
+  // "ready" | "pending" | "draining" | "running" | "failed" | "blocked"
+  string state = 2;
+  // The version that the migration moves the data to. Unset when ready.
+  optional uint32 target_version = 3;
+  // Why the state is failed or blocked.
+  optional string reason = 4;
+  // The run of the convert or rebuild that runs now, or that failed.
+  optional string run_id = 5;
+  // The backfill of a rebuild of a partitioned asset.
+  optional string backfill_id = 6;
+  // Nanosecond timestamp at which the migration began to run.
+  optional int64 started_at = 7;
 }
 
 message ActionInfo {
@@ -565,6 +593,26 @@ message CancelBackfillRequest {
 }
 
 message CancelBackfillResponse {
+  bool success = 1;
+}
+
+// --- Asset migrations ---
+
+message RetryMigrationRequest {
+  string asset_key = 1;
+}
+
+// `success` is false when the migration had not failed.
+message RetryMigrationResponse {
+  bool success = 1;
+}
+
+message CancelMigrationRequest {
+  string asset_key = 1;
+}
+
+// `success` is false when the migration was not pending or draining.
+message CancelMigrationResponse {
   bool success = 1;
 }
 

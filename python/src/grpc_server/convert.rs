@@ -497,3 +497,18 @@ pub(super) fn proto_strategy_to_py(s: BackfillStrategyProto) -> Result<PyBackfil
         }),
     }
 }
+
+/// The version row of an asset, for `AssetDefinitionInfo.stored_version`.
+pub(super) fn asset_version_info(
+    row: rivers_core::storage::AssetVersionRecord,
+) -> AssetVersionInfo {
+    AssetVersionInfo {
+        applied_version: row.applied_version,
+        state: row.state.as_str().to_string(),
+        target_version: row.target_version,
+        reason: row.reason,
+        run_id: row.run_id,
+        backfill_id: row.backfill_id,
+        started_at: row.started_at,
+    }
+}
