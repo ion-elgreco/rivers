@@ -280,6 +280,7 @@
     gap: 6px;
 }
 .migration-panel--stopped { border-left-color: var(--error); }
+.migration-panel--needed { border-left-color: var(--warning); }
 .migration-panel-title {
     font-family: var(--font-mono);
     font-size: var(--fs-md);

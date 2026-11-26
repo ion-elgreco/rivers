@@ -88,10 +88,10 @@ pub fn DagGraph(
     /// "NEW" chip + accent ring. Empty = nothing flagged.
     #[prop(optional)]
     changed_keys: HashSet<String>,
-    /// Nodes whose stored data migrates, with a chip: `true` when the
-    /// migration stopped (it failed, or cannot start).
+    /// Nodes whose stored data migrates, with the kind of their chip (see
+    /// `AssetMigration::chip_kind`).
     #[prop(optional)]
-    migrating: HashMap<String, bool>,
+    migrating: HashMap<String, &'static str>,
 ) -> impl IntoView {
     let has_selection = !selected_nodes.is_empty();
     let node_ref_map: HashMap<String, &LayoutNode> =
@@ -337,7 +337,7 @@ fn render_node_full(
     graph_asset_names: &HashSet<String>,
     expanded_graphs: &HashSet<String>,
     changed_keys: &HashSet<String>,
-    migrating: &HashMap<String, bool>,
+    migrating: &HashMap<String, &'static str>,
 ) -> AnyView {
     let accent = kind_accent(&node.kind);
     let kind_text = kind_label(&node.kind);
@@ -366,12 +366,10 @@ fn render_node_full(
     let is_descendant = descendant_keys.contains(&node.id);
     let is_in_lineage = is_selected || is_ancestor || is_descendant;
     let is_changed = changed_keys.contains(&node.id);
-    let migration_chip = migrating.get(&node.id).map(|&stopped| {
-        if stopped {
-            ("migration failed", "#ff6e84")
-        } else {
-            ("migrating", "#50e1f9")
-        }
+    let migration_chip = migrating.get(&node.id).map(|&kind| match kind {
+        "migration-failed" => ("migration failed", "#ff6e84"),
+        "migration-needed" => ("migration needed", "#f5c563"),
+        _ => ("migrating", "#50e1f9"),
     });
     let remote_chip: Option<(&'static str, String, &'static str)> = remote.and_then(|r| {
         if !r.resolved {

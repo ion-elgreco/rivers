@@ -193,7 +193,7 @@ pub fn GraphPage() -> impl IntoView {
             .and_then(|r| r.as_ref().ok())
             .map(|all| {
                 all.iter()
-                    .map(|m| (m.asset_key.clone(), m.stopped()))
+                    .map(|m| (m.asset_key.clone(), m.chip_kind()))
                     .collect::<std::collections::HashMap<_, _>>()
             })
             .unwrap_or_default()

@@ -12,7 +12,7 @@ use leptos::mount::mount_to;
 use leptos::prelude::*;
 use leptos_router::components::Router;
 use rivers_ui::components::asset_migration::AssetMigrationPanel;
-use rivers_ui::types::{AssetMigration, MigrationState};
+use rivers_ui::types::{AssetMigration, FillProgress, MigrationState};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -46,6 +46,7 @@ fn migration(state: MigrationState) -> AssetMigration {
         backfill_id: None,
         drain_runs: Vec::new(),
         upstream: Vec::new(),
+        fill: None,
     }
 }
 
@@ -219,4 +220,83 @@ fn start_now_needs_a_start_time_later_and_code_that_runs_the_migration() {
             .unwrap_or_default()
             .contains("Starts at")
     );
+}
+
+#[wasm_bindgen_test]
+fn a_running_rebuild_shows_how_many_partitions_it_filled() {
+    let host = mount(
+        AssetMigration {
+            backfill_id: Some("cccccccc-3333".into()),
+            fill: Some(FillProgress {
+                partitions: 744,
+                filled: Some(12),
+                failed: Some(1),
+            }),
+            ..migration(MigrationState::Running)
+        },
+        Some(2),
+        None,
+    );
+
+    let text = host.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Rebuilds 744 partitions in backfill cccccccc"),
+        "got: {text}"
+    );
+    assert!(text.contains("12 filled, 1 failed."), "got: {text}");
+}
+
+#[wasm_bindgen_test]
+fn a_convert_that_changes_the_partition_keys_shows_the_partitions_that_it_fills() {
+    let host = mount(
+        AssetMigration {
+            run_id: Some("dddddddd-4444".into()),
+            fill: Some(FillProgress {
+                partitions: 48,
+                filled: None,
+                failed: None,
+            }),
+            ..migration(MigrationState::Running)
+        },
+        Some(2),
+        None,
+    );
+
+    let text = host.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Fills 48 partitions in run dddddddd"),
+        "got: {text}"
+    );
+    assert!(!text.contains("filled"), "got: {text}");
+}
+
+#[wasm_bindgen_test]
+fn a_blocked_migration_says_that_the_partition_keys_changed() {
+    let reason = "the partition keys of orders changed (before: daily from 2024-01-01; now: \
+                  hourly from 2024-01-01T00:00); raise schema_version to 2 and add \
+                  AssetMigration(to=2): a convert, a rebuild of 48 partitions (rebuild=True), or \
+                  rebuild=True, partitions=[] to start empty";
+    let blocked = AssetMigration {
+        target_version: None,
+        reason: Some(reason.into()),
+        ..migration(MigrationState::Blocked)
+    };
+    assert_eq!(blocked.chip_kind(), "migration-needed");
+    let host = mount(blocked, Some(1), None);
+
+    assert_eq!(query_all(&host, ".migration-panel--needed").len(), 1);
+    assert_eq!(query_all(&host, ".migration-panel--stopped").len(), 0);
+    assert_eq!(
+        query_one(&host, ".migration-panel-title")
+            .text_content()
+            .unwrap_or_default(),
+        "The partition keys changed"
+    );
+    assert_eq!(
+        query_one(&host, "pre.migration-panel-reason")
+            .text_content()
+            .unwrap_or_default(),
+        reason
+    );
+    assert!(buttons(&host).is_empty());
 }

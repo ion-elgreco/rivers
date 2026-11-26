@@ -7,7 +7,15 @@ use crate::helpers::{format_timestamp_nanos, short_id};
 use crate::loc::{loc_path, use_current_location};
 use crate::now::use_now;
 use crate::server_fns::mutations::{cancel_migration, retry_migration, start_migration};
-use crate::types::{AssetMigration, MigrationState};
+use crate::types::{AssetMigration, FillProgress, MigrationState};
+
+/// `"1 partition"`, `"744 partitions"`.
+fn partitions(count: u64) -> String {
+    match count {
+        1 => "1 partition".to_string(),
+        _ => format!("{count} partitions"),
+    }
+}
 
 /// What the migration of the asset waits for or runs, or why it stopped.
 /// Retry for a failed migration; Start now for one that waits for its start
@@ -32,7 +40,7 @@ pub fn AssetMigrationPanel(
         .filter(|&at| migration.state == MigrationState::Pending && at > now * 1_000_000_000);
     let title = match migration.state {
         MigrationState::Failed => format!("The migration to version {target} failed"),
-        MigrationState::Blocked => format!("The migration to version {target} cannot start"),
+        MigrationState::Blocked => "The partition keys changed".to_string(),
         _ => format!("Migrating to version {target}"),
     };
 
@@ -88,21 +96,39 @@ pub fn AssetMigrationPanel(
             lines
         }
         MigrationState::Running => {
-            let work = match (&migration.backfill_id, &migration.run_id) {
+            let fills = migration
+                .fill
+                .map(|fill| format!("{} ", partitions(fill.partitions)))
+                .unwrap_or_default();
+            let mut lines = vec![match (&migration.backfill_id, &migration.run_id) {
                 (Some(backfill_id), _) => {
                     let href = link(format!("backfills/{backfill_id}"));
                     let label = short_id(backfill_id, 8);
-                    view! { <span>"Rebuilds in backfill " <A href=href>{label}</A></span> }
+                    view! { <span>{format!("Rebuilds {fills}in backfill ")} <A href=href>{label}</A></span> }
                         .into_any()
                 }
                 (None, Some(run_id)) => {
                     let href = link(format!("runs/{run_id}"));
                     let label = short_id(run_id, 8);
-                    view! { <span>"Runs in run " <A href=href>{label}</A></span> }.into_any()
+                    let verb = if fills.is_empty() { "Runs" } else { "Fills" };
+                    view! { <span>{format!("{verb} {fills}in run ")} <A href=href>{label}</A></span> }
+                        .into_any()
                 }
                 (None, None) => view! { <span>"Runs."</span> }.into_any(),
-            };
-            vec![work]
+            }];
+            if let Some(FillProgress {
+                filled: Some(filled),
+                failed,
+                ..
+            }) = migration.fill
+            {
+                let failed = failed
+                    .filter(|&failed| failed > 0)
+                    .map(|failed| format!(", {failed} failed"))
+                    .unwrap_or_default();
+                lines.push(view! { <span>{format!("{filled} filled{failed}.")}</span> }.into_any());
+            }
+            lines
         }
         MigrationState::Failed | MigrationState::Blocked => {
             let reason = migration.reason.clone().unwrap_or_default();
@@ -149,10 +175,10 @@ pub fn AssetMigrationPanel(
         MigrationState::Pending | MigrationState::Draining
     ) && declared.is_some_and(|declared| declared <= applied);
 
-    let class = if migration.stopped() {
-        "migration-panel migration-panel--stopped"
-    } else {
-        "migration-panel"
+    let class = match migration.state {
+        MigrationState::Failed => "migration-panel migration-panel--stopped",
+        MigrationState::Blocked => "migration-panel migration-panel--needed",
+        _ => "migration-panel",
     };
     view! {
         <div class=class>

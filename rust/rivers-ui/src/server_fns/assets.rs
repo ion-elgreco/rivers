@@ -169,7 +169,8 @@ pub async fn get_dynamic_partitions(
 
 /// The migrations of the stored data of this location's assets that have not
 /// ended. Of one that drains: the started runs that it waits for, and the
-/// assets that it reads which migrate first.
+/// assets that it reads which migrate first. Of one that runs: the
+/// partitions that its work fills.
 #[server]
 pub async fn get_asset_migrations(
     loc_ns: String,
@@ -181,9 +182,9 @@ pub async fn get_asset_migrations(
     use rivers_core::assets::graph::from_topology;
     use rivers_core::assets::migrations::drain_runs;
     use rivers_core::assets::versions::CodeVersions;
-    use rivers_core::storage::{AssetVersionState, ScopedStorageHandle};
+    use rivers_core::storage::{AssetVersionState, ScopedStorageHandle, StorageBackend};
 
-    use crate::types::MigrationState;
+    use crate::types::{FillProgress, MigrationState};
 
     let ctx = super::resolve_identity(&loc_ns, &loc_name).await?;
     let state = expect_context::<crate::state::AppState>();
@@ -228,6 +229,31 @@ pub async fn get_asset_migrations(
             }
             _ => (Vec::new(), Vec::new()),
         };
+        let fill = match (&row.backfill_id, &row.run_id) {
+            _ if row.state != AssetVersionState::Running => None,
+            (Some(backfill_id), _) => handle
+                .backend()
+                .get_backfill(backfill_id)
+                .await
+                .map_err(failed)?
+                .map(|backfill| FillProgress {
+                    partitions: backfill.num_partitions,
+                    filled: Some(backfill.completed_partitions),
+                    failed: Some(backfill.failed_partitions),
+                }),
+            (None, Some(run_id)) => handle
+                .backend()
+                .get_run(run_id)
+                .await
+                .map_err(failed)?
+                .and_then(|run| run.partition_key)
+                .map(|key| FillProgress {
+                    partitions: key.member_count() as u64,
+                    filled: None,
+                    failed: None,
+                }),
+            (None, None) => None,
+        };
         let state = match row.state {
             AssetVersionState::Pending | AssetVersionState::Ready => MigrationState::Pending,
             AssetVersionState::Draining => MigrationState::Draining,
@@ -245,6 +271,7 @@ pub async fn get_asset_migrations(
             backfill_id: row.backfill_id.clone(),
             drain_runs: drain,
             upstream,
+            fill,
         });
     }
     Ok(migrations)

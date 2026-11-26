@@ -21,6 +21,7 @@
 .dot-failed                   { background: var(--error);      box-shadow: 0 0 8px var(--error); }
 .dot-migrating                { background: var(--secondary);  box-shadow: 0 0 8px var(--secondary); animation: pulse-op 1.8s ease-in-out infinite; }
 .dot-migration-failed         { background: var(--error);      box-shadow: 0 0 8px var(--error); }
+.dot-migration-needed         { background: var(--warning);    box-shadow: 0 0 8px var(--warning); }
 .dot-stale                    { background: var(--warning);    box-shadow: 0 0 8px var(--warning); }
 .dot-queued                   { background: var(--warning);    opacity: 0.85; }
 .dot-pending, .dot-missing    { background: var(--text-muted); opacity: 0.65; }

@@ -37,20 +37,28 @@ pub struct AssetMigration {
     pub drain_runs: Vec<String>,
     /// While draining: the assets that it reads, which migrate first.
     pub upstream: Vec<String>,
+    /// While running: the partitions that its work fills.
+    pub fill: Option<FillProgress>,
+}
+
+/// The partitions that the work of a running migration fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FillProgress {
+    pub partitions: u64,
+    /// Of a backfill: the partitions that it filled so far, and the ones
+    /// that failed. A run fills all of its partitions when it ends.
+    pub filled: Option<u64>,
+    pub failed: Option<u64>,
 }
 
 impl AssetMigration {
-    /// Whether the migration waits for a person: it failed, or is blocked.
-    pub fn stopped(&self) -> bool {
-        matches!(self.state, MigrationState::Failed | MigrationState::Blocked)
-    }
-
-    /// The kind of its status chip: `migrating` or `migration-failed`.
+    /// The kind of its status chip: `migrating`, `migration-failed`, or
+    /// `migration-needed` for an asset whose partition keys changed.
     pub fn chip_kind(&self) -> &'static str {
-        if self.stopped() {
-            "migration-failed"
-        } else {
-            "migrating"
+        match self.state {
+            MigrationState::Failed => "migration-failed",
+            MigrationState::Blocked => "migration-needed",
+            _ => "migrating",
         }
     }
 }
