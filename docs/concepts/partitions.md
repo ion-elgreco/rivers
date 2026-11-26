@@ -224,6 +224,24 @@ def all_regions(region_ab) -> int:
     return region_ab if region_ab is not None else 0
 ```
 
+## Changing a partitions definition
+
+rivers stores the partitions of an asset by their keys. A new definition that names the same partitions changes nothing:
+
+- `start` or `end` moves.
+- Static keys are added or removed. A stored partition whose key is no longer in the definition stays stored.
+- With `interval_seconds`, `start` moves by a whole number of intervals.
+- A dynamic definition keeps its name.
+- A multi-dimensional definition keeps the names of its dimensions, and each dimension keeps its keys.
+
+Each other change gives new keys: another schedule, interval, or `fmt`; another kind, for example static to daily; `start` moved by part of the interval; dimensions added, removed, or renamed; partitions added to or removed from an asset. The stored partitions then do not name partitions of the new definition. An asset with stored data waits for a migration: runs that write or read it wait, with the reason:
+
+```text
+the partition keys of orders changed (before: daily from 2024-01-01; now: hourly from 2024-01-01T00:00); raise schema_version to 2 and add AssetMigration(to=2): a convert, a rebuild of 744 partitions (rebuild=True), or rebuild=True, partitions=[] to start empty
+```
+
+The migration fills the partitions of the new definition from the stored partitions. See [Changing the partition keys](migrations.md#changing-the-partition-keys). To end the wait without a migration, deploy the definition before again. An asset without stored data takes the new definition at once.
+
 ## Partitions in the UI
 
 The **Partitions** tab of an asset shows the state of each partition. A partition is *materialized*, *failed* (it failed and was not materialized again), or *missing*.

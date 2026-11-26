@@ -733,6 +733,13 @@ read the asset again:
 | `None` or `ActionResult.unchanged()` | Readers stay up to date. |
 | `ActionResult.materialized()` | Each materialized partition (or the unpartitioned asset) gets a new data version, so its readers become stale. |
 
+A migration whose step changes the asset's partition keys fills the
+partitions of the new definition that the stored partitions cover, or the ones
+that `partitions` names. A convert then gets them in `ctx.partition`, and
+rivers records a materialization of each of them, whatever the function
+returns. A rebuild backfills them. See
+[Changing the partition keys](../concepts/migrations.md#changing-the-partition-keys).
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |
@@ -743,6 +750,7 @@ read the asset again:
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for a convert function, or the name of a policy registered in `CodeRepository(retries=...)`. A rebuild uses the asset's own policy. See [Retries & Compute](retries.md). |
 | `description` | `str \| None` | `None` | What the migration changes. |
 | `start_at` | `datetime \| None` | `None` | The migration does not start before this time. It needs a time zone; a datetime without one raises `AssetDefinitionError`. |
+| `partitions` | `list[PartitionKey] \| None` | `None` | The partitions of the new definition that the migration fills when it changes the partition keys. Give them when rivers cannot find them; `[]` starts the asset empty. A migration that keeps the keys ignores it. |
 
 Applying the instance to a function (`AssetMigration(...)(fn)`) returns a new
 convert with `fn` as its function. The instance itself does not change.
@@ -750,7 +758,8 @@ Applying a function to a migration that has one, or to a rebuild, raises
 `AssetDefinitionError`.
 
 **Properties:** `to`, `breaking`, `rebuild`, `description`, `start_at` (in
-UTC), and `kind`: one of `"convert"`, `"rebuild"`, or `"version_only"`.
+UTC), `partitions`, and `kind`: one of `"convert"`, `"rebuild"`, or
+`"version_only"`.
 
 When you define the asset, these raise `AssetDefinitionError` with the asset's
 name in the message:
@@ -760,6 +769,7 @@ name in the message:
 - Two migrations to one version. For a multi-asset output, the check runs on
   the merged list.
 - `retry` on a migration without a function.
+- `partitions` on a migration that only records the version.
 
 `Asset.external()` and `Asset.remote()` take no `schema_version` and no
 `migrations`, because rivers does not own their data. In an `ExternalAsset`
@@ -785,9 +795,10 @@ class Orders(rs.Asset):
             con.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'EUR'")
 ```
 
-**Parameters:** `to`, `breaking`, `retry`, `description`, `start_at`: the same
-set that [`AssetMigration`](#assetmigration) takes. A rebuild or a version-only
-migration has no function, so list it in `migrations = [...]`.
+**Parameters:** `to`, `breaking`, `retry`, `description`, `start_at`,
+`partitions`: the same set that [`AssetMigration`](#assetmigration) takes. A
+rebuild or a version-only migration has no function, so list it in
+`migrations = [...]`.
 
 A prebuilt `AssetMigration` can also be assigned as a class attribute. rivers
 collects migrations across the MRO: a subclass's migration to a version

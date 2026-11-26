@@ -400,7 +400,7 @@ Every executor runs the same check. The parallel executor runs it in the worker 
 def daily_totals(orders: pl.DataFrame) -> pl.DataFrame: ...
 ```
 
-See [Asset Migrations](migrations.md).
+A partitions definition that names other partitions needs a migration too. See [Asset Migrations](migrations.md) and [Changing the partition keys](migrations.md#changing-the-partition-keys).
 
 ## Asset metadata
 

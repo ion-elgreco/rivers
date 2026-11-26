@@ -216,7 +216,8 @@ def add_currency(ctx: rs.MigrationContext, warehouse: DuckDBResource) -> None:
 To unit-test a convert, build a context by hand and call the function with it:
 `rs.MigrationContext(asset_name="orders", to_version=2, io_handler=...)`
 (`run_id` defaults to `""`; everything else to `None`). A `to_version` below 2
-raises `ValueError`.
+raises `ValueError`. For a convert that changes the partition keys, also pass
+`partition=rs.PartitionContext(keys, definition)`.
 
 ### Properties
 
@@ -229,7 +230,24 @@ raises `ValueError`.
 | `io_handler` | `Any` | The asset's resolved IO handler: where its stored data is. |
 | `asset_metadata` | `dict[str, str] \| None` | Per-asset metadata that IO resolution honors. |
 | `config` | `ConfigT \| None` | Typed config from a `MigrationContext[Config]` annotation; `None` without one. |
+| `partition` | `PartitionContext \| None` | When the migration changes the partition keys: the partitions of the new definition that the convert fills. `None` otherwise. |
 | `log` | `logging.Logger` | Logger named `code-repo.migrations.<asset_name>`. |
+
+### Methods
+
+#### `mark_partition_failed(partition_key, error)`
+
+Record one partition that the convert could not fill, when the migration
+changes the partition keys. rivers records a failure for it, and a
+materialization of each other partition in `ctx.partition.keys`. A key that is
+not in `ctx.partition.keys` raises `ExecutionError`.
+
+```python
+def by_hour(ctx: rs.MigrationContext) -> None:
+    for key in ctx.partition.keys:
+        if not copy_hour(key):
+            ctx.mark_partition_failed(key, "no source rows")
+```
 
 ---
 

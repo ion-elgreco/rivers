@@ -331,7 +331,7 @@ machine. The run page in the UI shows it.
 
 ### `AssetVersionRecord`
 
-The version of an asset's stored data. Only an asset that declares a `schema_version` above 1 has one: `get_asset_version` returns `None` for the others.
+The version of an asset's stored data. Only an asset that declares a `schema_version` above 1 has one, or an asset whose partition keys changed while it had stored data: `get_asset_version` returns `None` for the others.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -349,7 +349,7 @@ The version of an asset's stored data. Only an asset that declares a `schema_ver
 | `revision` | `int` | 1 for a new record; each write adds 1. |
 | `updated_at` | `int` | Nanosecond timestamp of the last write. |
 
-When a code location registers, an asset whose code declares a higher version than `applied_version` gets `state` `"pending"`. Stored data written before the asset declared a version is at version 1; an asset without stored data starts at its declared version.
+When a code location registers, an asset whose code declares a higher version than `applied_version` gets `state` `"pending"`. Stored data written before the asset declared a version is at version 1; an asset without stored data starts at its declared version. An asset whose partition keys change while it has stored data gets `state` `"blocked"` until its code declares a higher version (see [Changing the partition keys](../concepts/migrations.md#changing-the-partition-keys)).
 
 ### `StaleCause`
 

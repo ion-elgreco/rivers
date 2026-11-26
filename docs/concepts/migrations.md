@@ -20,7 +20,7 @@ def orders(warehouse: DuckDBResource) -> None:
 
 ## Versions
 
-Each asset declares the version of its stored data with `schema_version`, `1` by default. rivers keeps the version that the stored data is at, in a [version record](../api-reference/storage.md#assetversionrecord) per asset. Only an asset that declares a version above 1 has a record.
+Each asset declares the version of its stored data with `schema_version`, `1` by default. rivers keeps the version that the stored data is at, in a [version record](../api-reference/storage.md#assetversionrecord) per asset. Only an asset that declares a version above 1 has a record, or an asset whose [partition keys changed](#changing-the-partition-keys) while it had stored data.
 
 - An asset without stored data starts at the version that it declares. There is nothing to migrate.
 - Data that was stored before the asset declared a version is at version 1.
@@ -36,7 +36,7 @@ Each asset declares the version of its stored data with `schema_version`, `1` by
 | Rebuild | `rs.AssetMigration(to=2, rebuild=True)` | Runs the asset's own function again: one run, or a backfill over the materialized partitions. |
 | Version only | `rs.AssetMigration(to=2)` | Records the version. The new data arrives through normal materializations. |
 
-A convert function receives a [`MigrationContext`](../api-reference/context.md#migrationcontext), then resources by name. For a partitioned asset, the convert runs once, for the whole asset. A retry runs the function again from the start, so the function must be safe to run twice: in SQL, use `IF NOT EXISTS` and `CREATE OR REPLACE`. When the convert changes values that readers use, return `rs.ActionResult.materialized()`: the readers then become stale.
+A convert function receives a [`MigrationContext`](../api-reference/context.md#migrationcontext), then resources by name. For a partitioned asset, the convert runs once, for the whole asset. When the migration changes the partition keys, `ctx.partition` holds the partitions to fill (see [Changing the partition keys](#changing-the-partition-keys)). A retry runs the function again from the start, so the function must be safe to run twice: in SQL, use `IF NOT EXISTS` and `CREATE OR REPLACE`. When the convert changes values that readers use, return `rs.ActionResult.materialized()`: the readers then become stale.
 
 See [`AssetMigration`](../api-reference/assets.md#assetmigration) for all parameters, and [`@migration`](../api-reference/assets.md#migration) for class-form assets.
 
@@ -101,6 +101,57 @@ def orders(warehouse: DuckDBResource) -> None: ...
 - **Start now** on the asset page, the gRPC `StartMigration`, and `repo.migrate()` start the migration before its time.
 - The time is the same in each environment that runs the code, staging too. To start sooner there, start the migration by hand, or read the time from an environment variable.
 
+## Changing the partition keys
+
+A new partitions definition can name other partitions than the stored ones, for example hours instead of days (see [Changing a partitions definition](partitions.md#changing-a-partitions-definition)). In the deploy that changes the definition, raise `schema_version` and add a migration to the new version:
+
+```python
+from datetime import datetime
+
+
+def by_hour(ctx: rs.MigrationContext, warehouse: DuckDBResource) -> None:
+    ctx.log.info("fills %d hours", len(ctx.partition.keys))
+    with warehouse.get_connection() as con:
+        con.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS hour TIMESTAMP")
+        con.execute("UPDATE orders SET hour = date_trunc('hour', created_at)")
+
+
+@rs.Asset(
+    partitions_def=rs.PartitionsDefinition.hourly(start=datetime(2024, 1, 1)),  # was daily
+    schema_version=2,
+    migrations=[rs.AssetMigration(to=2)(by_hour)],
+)
+def orders(context: rs.AssetExecutionContext, warehouse: DuckDBResource) -> None: ...
+```
+
+Without the migration, an asset with stored data gets the state `blocked`. It waits as an asset that migrates does, and the reason names the migration to add.
+
+The migration fills the partitions of the new definition that the stored partitions cover:
+
+| Change | Partitions to fill |
+|--------|--------------------|
+| Time windows to other time windows | Each new partition whose whole window the stored partitions cover. Daily to hourly: the 24 hours of each stored day. Hourly to daily: each day whose 24 hours are all stored. |
+| Multi-dimensional, when only one dimension changes, from time windows to time windows | The same, for each value of the other dimensions. A value that a static dimension no longer has fills nothing. |
+| Partitions to no partitions | The whole asset, when a partition is stored. |
+| Each other change | rivers cannot find them. Name them with `partitions=`, else a convert or a rebuild fails the migration. |
+
+`partitions=[...]` names the partitions to fill, also when rivers can find them. `partitions=[]` starts the asset empty.
+
+The kind of migration tells how rivers fills them:
+
+| Kind | Fills the partitions |
+|------|----------------------|
+| Convert | In one run of `migrate`. `ctx.partition.keys` lists the partitions to fill. rivers records a materialization of each of them, whatever the function returns, except the ones that the function marks with `ctx.mark_partition_failed(key, error)`. |
+| Rebuild | In a backfill. |
+| Version only | None: the asset starts empty. |
+
+Then the stored partitions of the definition before go: rivers records one deletion of the whole asset, at the time when the work started, so that the partitions that the work wrote stay. A partition that the work did not fill holds no data. Automation or a backfill materializes it with the new code.
+
+- When the daemon takes the migration, it cancels the queued runs and the backfills of the asset that were made before the deploy: they name the old keys. It waits for the started runs, as for each migration.
+- Only the step to the declared version changes the keys. The steps before it see the old keys. A rebuild among them fails the migration, because the code defines only the new partitions.
+- A change of the partition keys is breaking, also with `breaking=False`.
+- A migration that keeps the partition keys ignores `partitions=`, with a warning in the daemon log.
+
 ## While an asset migrates
 
 A run that writes or reads the asset waits:
@@ -148,13 +199,14 @@ assert (record.state, record.applied_version) == ("ready", 2)
 
 ## In the UI
 
-- **Asset page.** STATUS shows `migrating` or `migration-failed`. A panel shows the stored version and the target version, then when the migration starts, what it waits for, what it runs (with links to the runs or the backfill), or why it failed. It has **Retry** for a failed migration, **Start now** for a migration that starts later, and **Cancel migration** after a rollback.
-- **Graph.** The node of an asset that migrates has a `migrating` or `migration failed` chip.
+- **Asset page.** STATUS shows `migrating`, `migration-failed`, or `migration-needed` for an asset whose partition keys changed without a migration. A panel shows the stored version and the target version, then when the migration starts, what it waits for, what it runs (with links to the runs or the backfill, and the number of partitions that it fills), or why it failed or cannot start. It has **Retry** for a failed migration, **Start now** for a migration that starts later, and **Cancel migration** after a rollback.
+- **Graph.** The node of an asset that migrates has a `migrating`, `migration failed`, or `migration needed` chip.
 
 The gRPC `GetAssetsInfo` returns the declared `schema_version` and the `stored_version` of each asset, with `start_at` for a migration that starts later.
 
 ## Limits
 
-- A migration keeps the partition keys of the asset. Do not change the partitions definition in the deploy that raises `schema_version`.
+- rivers finds the partitions to fill only when one dimension changes. For a change of two dimensions, name them with `partitions=`.
+- `MigrationContext` does not give the partitions definition before the change. The convert's code knows it.
 - Readers in other code locations are not held, and the migration does not wait for their runs.
 - `breaking=` has no effect yet. rivers records it for readers in other code locations.
