@@ -1246,7 +1246,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::assets::graph::{AssetGraph, DagNode, NodeKind};
+    use crate::assets::graph::{AssetGraph, DagNode, GraphTopology, NodeKind, TopologyNode};
     use crate::assets::versions::{CodePartitions, first_version_row};
     use crate::storage::any::AnyStorage;
     use crate::storage::{
@@ -2037,16 +2037,24 @@ mod tests {
         partitions: Option<Vec<PartitionKey>>,
     ) -> MigrationLoop {
         let last = 1 + steps.len() as u32;
-        let migrations = (2..)
-            .zip(steps)
-            .map(|(to, &kind)| DeclaredMigration {
-                to,
-                kind,
-                breaking: false,
-                start_at: None,
-                partitions: (to == last).then(|| partitions.clone()).flatten(),
-            })
-            .collect();
+        hourly_loop(
+            (2..)
+                .zip(steps)
+                .map(|(to, &kind)| DeclaredMigration {
+                    to,
+                    kind,
+                    breaking: false,
+                    start_at: None,
+                    partitions: (to == last).then(|| partitions.clone()).flatten(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The loop of daemon `a`, whose code declares `orders` with hourly
+    /// partitions and `migrations`.
+    fn hourly_loop(migrations: Vec<DeclaredMigration>) -> MigrationLoop {
+        let last = migrations.last().map_or(1, |migration| migration.to);
         let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), last)]))
             .with_migrations(
                 HashMap::from([("orders".to_string(), migrations)]),
@@ -2139,6 +2147,19 @@ mod tests {
                 .collect();
             keys.sort();
             keys
+        }
+
+        async fn run_status(&self, run_id: &str) -> RunStatus {
+            self.storage.get_run(run_id).await.unwrap().unwrap().status
+        }
+    }
+
+    /// A run of `orders` that waits in the queue from `start_time`.
+    fn queued(run_id: &str, start_time: i64) -> RunRecord {
+        RunRecord {
+            status: RunStatus::Queued,
+            start_time,
+            ..started_run(run_id, CL, &["orders"], LaunchedBy::default())
         }
     }
 
@@ -2361,11 +2382,6 @@ mod tests {
         let f = Fixture::new().await;
         stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
         let pending_since = f.row("orders").await.updated_at;
-        let queued = |run_id: &str, start_time| RunRecord {
-            status: RunStatus::Queued,
-            start_time,
-            ..started_run(run_id, CL, &["orders"], LaunchedBy::default())
-        };
         f.storage
             .enqueue_run(&queued("before", pending_since - 1))
             .await
@@ -2381,8 +2397,87 @@ mod tests {
             ("before", RunStatus::Canceled),
             ("after", RunStatus::Queued),
         ] {
-            let run = f.storage.get_run(run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, status, "{run_id}");
+            assert_eq!(f.run_status(run_id).await, status, "{run_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_of_keys_waits_for_its_start_time() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+        let pending_since = f.row("orders").await.updated_at;
+        f.storage
+            .enqueue_run(&queued("before", pending_since - 1))
+            .await
+            .unwrap();
+        let rebuild_at = |start_at| {
+            hourly_loop(vec![DeclaredMigration {
+                to: 2,
+                kind: Rebuild,
+                breaking: false,
+                start_at: Some(start_at),
+                partitions: None,
+            }])
+        };
+
+        assert!(!f.pass(&rebuild_at(now_ts() + HOUR)).await);
+        assert!(f.launches.taken().is_empty());
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.partitions),
+            (AssetVersionState::Pending, json(&daily()))
+        );
+        assert_eq!(f.materialized().await, ["2024-01-01"]);
+        assert_eq!(f.run_status("before").await, RunStatus::Queued);
+
+        f.pass(&rebuild_at(now_ts() - HOUR)).await;
+
+        let launched = f.launches.taken();
+        let [(_, 2, MigrationWork::RebuildBackfill { keys, .. })] = launched.as_slice() else {
+            panic!("expected one backfill, got {launched:?}");
+        };
+        assert_eq!(
+            keys.iter()
+                .map(PartitionKey::member_count)
+                .collect::<Vec<_>>(),
+            [24]
+        );
+        assert_eq!(f.run_status("before").await, RunStatus::Canceled);
+    }
+
+    #[tokio::test]
+    async fn starting_a_change_of_keys_now_cancels_the_work_with_the_keys_before() {
+        for (name, code, status) in [
+            ("hourly", hourly(), RunStatus::Canceled),
+            ("daily", daily(), RunStatus::Queued),
+        ] {
+            let f = Fixture::new().await;
+            stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+            let pending_since = f.row("orders").await.updated_at;
+            f.storage
+                .enqueue_run(&queued("before", pending_since - 1))
+                .await
+                .unwrap();
+            let topology = GraphTopology {
+                nodes: vec![TopologyNode {
+                    name: "orders".to_string(),
+                    kind: NodeKind::Asset,
+                    group: None,
+                    parent_graph: None,
+                    remote: None,
+                    partitions: Some(code),
+                }],
+                edges: Vec::new(),
+            };
+            f.handle
+                .scoped()
+                .set_graph_topology(&topology, &[])
+                .await
+                .unwrap();
+
+            assert!(start_migration(&f.handle.scoped(), "orders").await.unwrap());
+
+            assert_eq!(f.run_status("before").await, status, "{name}");
         }
     }
 }

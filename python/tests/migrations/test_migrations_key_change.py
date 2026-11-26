@@ -3,9 +3,11 @@ stored partitions waits, because its stored partitions do not name partitions
 of the new definition. The migration to a new version fills the partitions of
 the new definition that the stored partitions cover."""
 
+import contextlib
 import pickle
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -27,6 +29,7 @@ BLOCKED = (
     "add AssetMigration(to=2): a convert, a rebuild of 48 partitions (rebuild=True), or "
     "rebuild=True, partitions=[] to start empty"
 )
+LATER = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 
 def _repo(storage, io, partitions_def, **declared):
@@ -178,7 +181,10 @@ def test_a_convert_fills_the_new_partitions_in_one_run(storage):
     _materialize(repo, "2024-01-03T00:00")
 
 
-def test_a_rebuild_backfills_the_new_partitions(storage):
+@pytest.mark.parametrize(
+    "start_at", [None, LATER], ids=["now", "before-its-start-time"]
+)
+def test_a_rebuild_backfills_the_new_partitions(storage, start_at):
     io = rs.InMemoryIOHandler()
     _materialize(_repo(storage, io, DAILY), "2024-01-01")
     seen = []
@@ -187,7 +193,7 @@ def test_a_rebuild_backfills_the_new_partitions(storage):
         io_handler=io,
         partitions_def=HOURLY,
         schema_version=2,
-        migrations=[rs.AssetMigration(to=2, rebuild=True)],
+        migrations=[rs.AssetMigration(to=2, rebuild=True, start_at=start_at)],
     )
     def orders(context: rs.AssetExecutionContext) -> int:
         seen.extend(str(key) for key in context.partition.keys)
@@ -379,18 +385,58 @@ def test_the_daemon_fills_the_new_partitions(storage, queue):
         assets=[orders], default_executor=rs.Executor.in_process(), **extra
     )
     repo.resolve(storage=storage)
-    daemon = AutomationDaemon(repo=repo, storage=storage, condition_eval_interval="1s")
-    daemon.start()
-    try:
-        wait_for(
-            lambda: storage.get_asset_version("orders").state in ("ready", "failed"),
-            30.0,
-            "the migration of orders to end",
-        )
-    finally:
-        daemon.stop()
+
+    with _daemon(repo, storage):
+        _wait_for_the_end(storage)
 
     record = storage.get_asset_version("orders")
     assert (record.state, record.applied_version) == ("ready", 2)
     assert seen == [24]
     assert _materialized(storage) == _hours("2024-01-01")
+
+
+def test_a_key_change_keeps_the_stored_partitions_until_its_start_time(storage):
+    io = rs.InMemoryIOHandler()
+    _materialize(_repo(storage, io, DAILY), "2024-01-01")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start_at = now + timedelta(seconds=3)
+    migration = rs.AssetMigration(to=2, rebuild=True, start_at=start_at)
+    repo = _repo(storage, io, HOURLY, schema_version=2, migrations=[migration])
+
+    with pytest.raises(
+        AssetMigrationPendingError,
+        match=f"which starts at {start_at:%Y-%m-%dT%H:%M:%SZ}",
+    ):
+        _materialize(repo, "2024-01-01T00:00")
+    with _daemon(repo, storage):
+        # Each read before the start time finds the migration waiting.
+        while True:
+            seen = (_state(storage), _materialized(storage))
+            if datetime.now(timezone.utc) >= start_at:
+                break
+            assert seen == (("pending", 1), ["2024-01-01"])
+            time.sleep(0.05)
+        _wait_for_the_end(storage)
+
+    assert _state(storage) == ("ready", 2)
+    _, kind, _, _, filled, failed = _history(storage)
+    assert (kind, filled, failed) == ("rebuild", 24, 0)
+    assert _materialized(storage) == _hours("2024-01-01")
+
+
+@contextlib.contextmanager
+def _daemon(repo, storage):
+    daemon = AutomationDaemon(repo=repo, storage=storage, condition_eval_interval="1s")
+    daemon.start()
+    try:
+        yield
+    finally:
+        daemon.stop()
+
+
+def _wait_for_the_end(storage):
+    wait_for(
+        lambda: storage.get_asset_version("orders").state in ("ready", "failed"),
+        30.0,
+        "the migration of orders to end",
+    )
