@@ -19,8 +19,7 @@ use crate::runtime::io_rt;
 /// For a run of `migrate`: the version that the convert of each target moves
 /// its stored data to, by the target's version record. `Err` with the reason
 /// when no migration of a target started this run, or when this code has no
-/// convert to that version. Empty for the runs of other verbs. Blocks: call
-/// it without the GIL.
+/// convert to that version. Empty for the runs of other verbs.
 pub(crate) fn convert_versions(
     plan: &ExecutionPlan,
     node_map: &HashMap<String, ResolvedNode>,

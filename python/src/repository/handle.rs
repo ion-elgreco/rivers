@@ -545,7 +545,6 @@ impl RepoHandle {
     }
 
     /// The asset version gate for a new manual run that writes `selection`.
-    /// GIL-free.
     pub(crate) async fn asset_version_gate(&self, selection: &[String]) -> PyResult<VersionGate> {
         self.resolved()?
             .asset_version_gate(None, selection)
@@ -555,13 +554,12 @@ impl RepoHandle {
 
     /// The version of the stored data of `asset_key` that this code
     /// declares. `None` for a node whose data rivers does not store, or an
-    /// unknown name. GIL-free.
+    /// unknown name.
     pub(crate) fn declared_version(&self, asset_key: &str) -> PyResult<Option<u32>> {
         Ok(self.resolved()?.code_versions.declared(asset_key))
     }
 
     /// The version row of each asset of this code location, or of `keys`.
-    /// GIL-free.
     pub(crate) async fn asset_versions(
         &self,
         keys: Option<&[String]>,
@@ -576,7 +574,7 @@ impl RepoHandle {
             .map_err(crate::storage::to_py_err)
     }
 
-    /// See [`retry_migration`]. GIL-free.
+    /// See [`retry_migration`].
     pub(crate) async fn retry_migration(&self, asset_key: &str) -> PyResult<bool> {
         let state = self.resolved()?;
         let ctx = CodeLocationContext::new(state.code_location_id.as_str());
@@ -585,7 +583,7 @@ impl RepoHandle {
             .map_err(crate::storage::to_py_err)
     }
 
-    /// See [`cancel_migration`]. GIL-free.
+    /// See [`cancel_migration`].
     pub(crate) async fn cancel_migration(&self, asset_key: &str) -> PyResult<bool> {
         let state = self.resolved()?;
         let ctx = CodeLocationContext::new(state.code_location_id.as_str());

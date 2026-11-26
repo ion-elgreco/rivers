@@ -43,7 +43,7 @@ impl MigrationLauncher for Deferred {
 }
 
 impl PyCodeRepository {
-    /// Body of `repo.migrate()`. Blocks: call it without the GIL.
+    /// Body of `repo.migrate()`.
     pub(crate) fn migrate_inner(
         &self,
         selection: Option<Vec<String>>,

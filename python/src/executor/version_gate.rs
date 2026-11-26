@@ -120,7 +120,7 @@ pub(crate) fn gate_result(gate: VersionGate) -> PyResult<()> {
 }
 
 /// [`gate_result`] for `run`. Before it raises, a run that has a record
-/// (`recorded`) fails with the reason. Blocks: call it without the GIL.
+/// (`recorded`) fails with the reason.
 pub(crate) fn check_run(
     storage: &ScopedStorageHandle<AnyStorage>,
     run: &GatedRun<'_>,

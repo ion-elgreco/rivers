@@ -684,8 +684,7 @@ impl PyJob {
     }
 
     /// Raise when the asset version gate holds or refuses a new run of this
-    /// job, or when the run is a convert that no migration started. Blocks:
-    /// call it without the GIL.
+    /// job, or when the run is a convert that no migration started.
     pub(crate) fn check_asset_versions(
         &self,
         run_id: &str,
