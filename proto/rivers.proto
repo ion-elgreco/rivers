@@ -34,6 +34,8 @@ service CodeLocationService {
   // Stop an asset migration that has not started to run: the asset goes back
   // to ready at its stored version.
   rpc CancelMigration(CancelMigrationRequest) returns (CancelMigrationResponse);
+  // Start a pending asset migration now, before its start time.
+  rpc StartMigration(StartMigrationRequest) returns (StartMigrationResponse);
   // Check a launch document with each selected asset's config class, as a run
   // builds it, with the document's values or none.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
@@ -308,6 +310,9 @@ message AssetVersionInfo {
   optional string backfill_id = 6;
   // Nanosecond timestamp at which the migration began to run.
   optional int64 started_at = 7;
+  // Nanosecond timestamp at which a pending migration starts, by this code.
+  // Unset when it starts at once.
+  optional int64 start_at = 8;
 }
 
 message ActionInfo {
@@ -613,6 +618,15 @@ message CancelMigrationRequest {
 
 // `success` is false when the migration was not pending or draining.
 message CancelMigrationResponse {
+  bool success = 1;
+}
+
+message StartMigrationRequest {
+  string asset_key = 1;
+}
+
+// `success` is false when the migration was not pending.
+message StartMigrationResponse {
   bool success = 1;
 }
 

@@ -12,6 +12,7 @@ use super::graph::{AssetGraph, GraphTopology, NodeKind};
 use crate::storage::{
     AssetVersionRecord, AssetVersionState, MigrationKind, ScopedStorage, StorageBackend,
 };
+use crate::util::now_ts;
 
 /// How many times registration reads a version row again when another
 /// writer changed it first.
@@ -236,6 +237,9 @@ pub struct GatedRun<'a> {
     pub writes: Vec<(&'a str, Option<u32>)>,
     /// The assets that those read: their inputs and deps.
     pub reads: Vec<(&'a str, Option<u32>)>,
+    /// `(asset, version, time)` for each migration that the run's code
+    /// declares with a start time.
+    pub start_times: Vec<(&'a str, u32, i64)>,
 }
 
 impl GatedRun<'_> {
@@ -251,6 +255,28 @@ impl GatedRun<'_> {
         keys.dedup();
         keys
     }
+
+    /// When the migration in `row` starts, by the run's code.
+    fn start_at(&self, row: &AssetVersionRecord) -> Option<i64> {
+        latest_start(
+            row,
+            self.start_times
+                .iter()
+                .filter(|(key, ..)| *key == row.asset_key)
+                .map(|&(_, to, at)| (to, at)),
+        )
+    }
+}
+
+/// When the migration in `row` starts: the latest of the start times
+/// `(version, time)` of the versions that it applies. `None` when none of
+/// them has one: it starts at once.
+fn latest_start(row: &AssetVersionRecord, starts: impl Iterator<Item = (u32, i64)>) -> Option<i64> {
+    let target = row.target_version?;
+    starts
+        .filter(|&(to, _)| to > row.applied_version && to <= target)
+        .map(|(_, at)| at)
+        .max()
 }
 
 /// Whether `run` may run against the version rows `rows`. Only an asset with
@@ -313,6 +339,14 @@ fn wait_reason(
             .filter(|&declared| declared > row.applied_version)
             .map(|declared| format!("{key} waits for its migration to version {declared}")),
         _ if is_migration_work(run, row) => None,
+        AssetVersionState::Pending
+            if let Some(at) = run.start_at(row).filter(|&at| at > now_ts()) =>
+        {
+            Some(format!(
+                "{key} waits for its migration to version {target}, which starts at {}",
+                timestamp(at)
+            ))
+        }
         AssetVersionState::Pending | AssetVersionState::Draining | AssetVersionState::Running => {
             Some(format!("{key} is migrating to version {target}"))
         }
@@ -326,6 +360,12 @@ fn wait_reason(
                 .unwrap_or_else(|| format!("{key} is blocked")),
         ),
     }
+}
+
+/// `at`, nanoseconds since the epoch, as an RFC 3339 time in UTC.
+fn timestamp(at: i64) -> String {
+    jiff::Timestamp::from_nanosecond(i128::from(at))
+        .map_or_else(|_| at.to_string(), |at| at.to_string())
 }
 
 /// Whether `run` is the convert run or a run of the rebuild backfill of the
@@ -383,6 +423,8 @@ pub struct DeclaredMigration {
     pub kind: MigrationKind,
     /// Readers of the version before cannot read the new data.
     pub breaking: bool,
+    /// Nanoseconds since the epoch: the migration does not start before.
+    pub start_at: Option<i64>,
 }
 
 /// What the gate and the migration loop need from the code of a code
@@ -446,6 +488,25 @@ impl CodeVersions {
         self.partitioned.contains(key)
     }
 
+    /// When the migration in `row` starts, by this code: the latest start
+    /// time of the versions that it applies. `None` when it starts at once.
+    pub fn start_at(&self, row: &AssetVersionRecord) -> Option<i64> {
+        latest_start(
+            row,
+            self.start_times(&row.asset_key).map(|(_, to, at)| (to, at)),
+        )
+    }
+
+    /// `(asset, version, time)` for each migration of `key` with a start
+    /// time.
+    fn start_times<'a>(&'a self, key: &'a str) -> impl Iterator<Item = (&'a str, u32, i64)> {
+        self.migrations
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(move |m| Some((key, m.to, m.start_at?)))
+    }
+
     /// The assets that `key` reads: its inputs and deps.
     pub fn reads(&self, key: &str) -> &[String] {
         self.reads.get(key).map_or(&[], Vec::as_slice)
@@ -503,6 +564,11 @@ impl CodeVersions {
             .filter(|name| !written.contains(name))
             .collect();
         let declared = |name: &str| self.declared.get(name).copied();
+        let start_times = written
+            .iter()
+            .chain(&reads)
+            .flat_map(|&name| self.start_times(name))
+            .collect();
         let run = GatedRun {
             run_id,
             backfill_id,
@@ -514,6 +580,7 @@ impl CodeVersions {
                 .into_iter()
                 .map(|name| (name, declared(name)))
                 .collect(),
+            start_times,
         };
         asset_version_gate(&run, rows)
     }
@@ -729,11 +796,49 @@ mod tests {
             backfill_id: None,
             writes: writes.to_vec(),
             reads: reads.to_vec(),
+            start_times: Vec::new(),
         }
     }
 
     fn wait(reason: &str) -> VersionGate {
         VersionGate::Wait(reason.to_string())
+    }
+
+    /// 2100-01-01T00:00:00Z and 2001-01-01T00:00:00Z, in nanoseconds.
+    const LATER: i64 = 4_102_444_800_000_000_000;
+    const PASSED: i64 = 978_307_200_000_000_000;
+
+    #[test]
+    fn a_migration_that_starts_later_holds_the_run_until_its_start() {
+        let reader = |start_times| GatedRun {
+            start_times,
+            ..gated(&[("summary", Some(1))], &[("orders", Some(2))])
+        };
+        let pending = [versioned("orders", 1, AssetVersionState::Pending)];
+
+        assert_eq!(
+            asset_version_gate(&reader(vec![("orders", 2, LATER)]), &pending),
+            wait(
+                "orders waits for its migration to version 2, which starts at 2100-01-01T00:00:00Z"
+            )
+        );
+        // A start that passed, or one of a version that the migration does
+        // not apply, does not move the start.
+        for start_times in [
+            vec![("orders", 2, PASSED)],
+            vec![("orders", 3, LATER)],
+            vec![("customers", 2, LATER)],
+        ] {
+            assert_eq!(
+                asset_version_gate(&reader(start_times), &pending),
+                wait("orders is migrating to version 2")
+            );
+        }
+        let draining = [versioned("orders", 1, AssetVersionState::Draining)];
+        assert_eq!(
+            asset_version_gate(&reader(vec![("orders", 2, LATER)]), &draining),
+            wait("orders is migrating to version 2")
+        );
     }
 
     #[test]
@@ -1044,6 +1149,38 @@ mod tests {
             code.gate(None, None, &names(&["orders"]), &[newer]),
             VersionGate::Refuse(
                 "this code declares orders version 2; the stored data is at version 3".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_migration_starts_at_the_latest_start_of_the_versions_that_it_applies() {
+        let step = |to, start_at| DeclaredMigration {
+            to,
+            kind: MigrationKind::VersionOnly,
+            breaking: true,
+            start_at,
+        };
+        let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), 4)]))
+            .with_migrations(
+                HashMap::from([(
+                    "orders".to_string(),
+                    vec![step(2, Some(PASSED)), step(3, Some(LATER)), step(4, None)],
+                )]),
+                HashSet::new(),
+            );
+        let pending = |applied, target| AssetVersionRecord {
+            target_version: Some(target),
+            ..versioned("orders", applied, AssetVersionState::Pending)
+        };
+
+        assert_eq!(code.start_at(&pending(1, 4)), Some(LATER));
+        assert_eq!(code.start_at(&pending(1, 2)), Some(PASSED));
+        assert_eq!(code.start_at(&pending(3, 4)), None);
+        assert_eq!(
+            code.gate(None, None, &["summary".to_string()], &[pending(1, 4)]),
+            wait(
+                "orders waits for its migration to version 4, which starts at 2100-01-01T00:00:00Z"
             )
         );
     }

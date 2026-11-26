@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use jiff::{Timestamp, civil};
 use pyo3::prelude::*;
 use rivers_core::execution::retry::RetryRef;
 use rivers_core::storage::MigrationKind;
@@ -21,8 +22,30 @@ pub struct PyAssetMigration {
     pub rebuild: bool,
     pub retry: Option<RetryRef>,
     pub description: Option<String>,
+    /// Nanoseconds since the epoch: the migration does not start before.
+    pub start_at: Option<i64>,
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
+}
+
+/// `start_at` in nanoseconds since the epoch. A datetime without a time zone
+/// is an error: the daemon may run in another time zone than its author.
+pub(crate) fn start_at_ns(to: i64, start_at: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let error = |problem: String| {
+        AssetDefinitionError::new_err(format!("migration to version {to}: start_at {problem}"))
+    };
+    let at = match start_at.extract::<Timestamp>() {
+        Ok(at) => at,
+        Err(_) if start_at.extract::<civil::DateTime>().is_ok() => {
+            return Err(error(
+                "needs a time zone, for example \
+                 datetime(2026, 11, 27, 22, 0, tzinfo=ZoneInfo(\"Europe/Amsterdam\"))"
+                    .to_string(),
+            ));
+        }
+        Err(e) => return Err(error(format!("must be a datetime with a time zone: {e}"))),
+    };
+    i64::try_from(at.as_nanosecond()).map_err(|_| error(format!("is out of range: {at}")))
 }
 
 impl PyAssetMigration {
@@ -38,13 +61,16 @@ impl PyAssetMigration {
 #[pymethods]
 impl PyAssetMigration {
     #[new]
-    #[pyo3(signature = (to, *, breaking=true, rebuild=false, retry=None, description=None))]
+    #[pyo3(signature = (
+        to, *, breaking=true, rebuild=false, retry=None, description=None, start_at=None
+    ))]
     fn new(
         to: i64,
         breaking: bool,
         rebuild: bool,
         retry: Option<Bound<'_, PyAny>>,
         description: Option<String>,
+        start_at: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             to,
@@ -52,6 +78,7 @@ impl PyAssetMigration {
             rebuild,
             retry: crate::retry::extract_retry_ref(retry)?,
             description,
+            start_at: start_at.map(|at| start_at_ns(to, &at)).transpose()?,
             func: None,
             is_async: false,
         })
@@ -80,6 +107,7 @@ impl PyAssetMigration {
             rebuild: self.rebuild,
             retry: self.retry.clone(),
             description: self.description.clone(),
+            start_at: self.start_at,
             func: Some(func),
             is_async,
         })
@@ -105,6 +133,13 @@ impl PyAssetMigration {
         self.description.as_ref()
     }
 
+    /// The time before which the migration does not start, in UTC.
+    #[getter]
+    fn start_at(&self) -> Option<Timestamp> {
+        self.start_at
+            .and_then(|at| Timestamp::from_nanosecond(i128::from(at)).ok())
+    }
+
     /// `convert` with a function, `rebuild` with `rebuild=True`, else
     /// `version_only`.
     #[getter(kind)]
@@ -113,8 +148,12 @@ impl PyAssetMigration {
     }
 
     fn __repr__(&self) -> String {
+        let start_at = self
+            .start_at()
+            .map(|at| format!(", start_at='{at}'"))
+            .unwrap_or_default();
         format!(
-            "AssetMigration(to={}, kind='{}', breaking={})",
+            "AssetMigration(to={}, kind='{}', breaking={}{start_at})",
             self.to,
             self.kind().as_str(),
             if self.breaking { "True" } else { "False" }
@@ -130,6 +169,7 @@ impl PyAssetMigration {
             rebuild,
             retry,
             description,
+            start_at,
             func,
             is_async,
         } = self;
@@ -154,6 +194,7 @@ impl PyAssetMigration {
                 *rebuild,
                 retry,
                 description.clone(),
+                *start_at,
                 func.as_ref().map(|f| f.clone_ref(py)),
                 *is_async,
             ),
@@ -168,6 +209,7 @@ type MigrationParts = (
     bool,
     Option<String>,
     Option<String>,
+    Option<i64>,
     Option<Py<PyAny>>,
     bool,
 );
@@ -181,6 +223,7 @@ pub fn _reconstruct_asset_migration(
     rebuild: bool,
     retry: Option<String>,
     description: Option<String>,
+    start_at: Option<i64>,
     func: Option<Py<PyAny>>,
     is_async: bool,
 ) -> PyResult<PyAssetMigration> {
@@ -199,6 +242,7 @@ pub fn _reconstruct_asset_migration(
         rebuild,
         retry,
         description,
+        start_at,
         func,
         is_async,
     })
@@ -214,6 +258,8 @@ pub(crate) struct ResolvedMigration {
     pub is_async: bool,
     /// A named policy becomes inline at resolve.
     pub retry: Option<RetryRef>,
+    /// Nanoseconds since the epoch: the migration does not start before.
+    pub start_at: Option<i64>,
 }
 
 impl ResolvedMigration {
@@ -225,6 +271,7 @@ impl ResolvedMigration {
             func: m.func.as_ref().map(|f| f.clone_ref(py)),
             is_async: m.is_async,
             retry: m.retry.clone(),
+            start_at: m.start_at,
         }
     }
 
@@ -236,6 +283,7 @@ impl ResolvedMigration {
             func: self.func.as_ref().map(|f| f.clone_ref(py)),
             is_async: self.is_async,
             retry: self.retry.clone(),
+            start_at: self.start_at,
         }
     }
 }

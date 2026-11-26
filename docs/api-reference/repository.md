@@ -230,7 +230,7 @@ def migrate(
 ) -> list[AssetVersionRecord]
 ```
 
-Run the pending and failed [asset migrations](assets.md#assetmigration) in this process, for tests and scripts without a daemon. Each migration first waits until no started run writes the asset or reads it. The migrations of the assets that the selection reads run first. A convert runs in this process, and so does a rebuild, also when it is a backfill. The call returns when each selected migration has ended. A daemon that holds a migration keeps it: the call waits until it ends. A call that stops early, for example on Ctrl-C, lets go of its migrations, so that the next call, or a daemon, goes on with them at once.
+Run the pending and failed [asset migrations](assets.md#assetmigration) in this process, for tests and scripts without a daemon. Each migration first waits until no started run writes the asset or reads it. The migrations of the assets that the selection reads run first. A convert runs in this process, and so does a rebuild, also when it is a backfill. A migration with a later `start_at` starts at once. The call returns when each selected migration has ended. A daemon that holds a migration keeps it: the call waits until it ends. A call that stops early, for example on Ctrl-C, lets go of its migrations, so that the next call, or a daemon, goes on with them at once.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

@@ -76,6 +76,31 @@ Use a new `code_version` when only the logic changes and readers can read a mix 
 
 One daemon runs each migration. If that daemon stops, the migration waits about a minute. Then a daemon whose code declares the new version takes it over, also the same daemon after a restart.
 
+## Starting later
+
+With `start_at`, the deploy comes first and the migration later, for example a rebuild at night:
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+FRIDAY_NIGHT = datetime(2026, 11, 27, 22, 0, tzinfo=ZoneInfo("Europe/Amsterdam"))
+
+
+@rs.Asset(
+    schema_version=2,
+    migrations=[rs.AssetMigration(to=2, rebuild=True, start_at=FRIDAY_NIGHT)],
+)
+def orders(warehouse: DuckDBResource) -> None: ...
+```
+
+- The daemon starts the migration at `start_at`. When that time has passed by the time the code registers, the migration starts at once.
+- The asset and its readers still wait from the deploy on: the new code expects the new data, and the old code no longer runs. A held run gives the start time, for example `orders waits for its migration to version 2, which starts at 2026-11-27T21:00:00Z`. Schedules keep adding runs to the run queue while they wait.
+- `start_at` needs a time zone. A datetime without one raises `AssetDefinitionError`.
+- A migration that applies several versions starts at the latest `start_at` of those versions.
+- The gRPC `StartMigration` and `repo.migrate()` start the migration before its time.
+- The time is the same in each environment that runs the code, staging too. To start sooner there, start the migration by hand, or read the time from an environment variable.
+
 ## While an asset migrates
 
 A run that writes or reads the asset waits:

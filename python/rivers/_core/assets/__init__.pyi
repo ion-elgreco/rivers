@@ -761,6 +761,8 @@ class AssetMigration:
     """Readers written for the version before cannot read the new data."""
     rebuild: bool
     description: str | None
+    start_at: datetime.datetime | None
+    """The time before which the migration does not start, in UTC."""
     kind: Literal["convert", "rebuild", "version_only"]
     """``convert`` with a function, ``rebuild`` with ``rebuild=True``, else
     ``version_only``."""
@@ -773,11 +775,19 @@ class AssetMigration:
         rebuild: bool = False,
         retry: "RetryPolicy | str | None" = None,
         description: str | None = None,
+        start_at: datetime.datetime | None = None,
     ) -> None:
         """Declare the step to version ``to``.
 
         The asset checks ``to`` against its ``schema_version``. Only a convert
-        takes ``retry``: a rebuild runs with the asset's own.
+        takes ``retry``: a rebuild runs with the asset's own. With
+        ``start_at``, the daemon starts the migration at that time, or at once
+        when the time has passed. The asset waits for its migration from the
+        deploy on.
+
+        Raises:
+            AssetDefinitionError: ``start_at`` is not a datetime with a time
+                zone.
         """
         ...
 
@@ -942,6 +952,7 @@ def migration(
     breaking: bool = ...,
     retry: "RetryPolicy | str | None" = ...,
     description: str | None = ...,
+    start_at: datetime.datetime | None = ...,
 ) -> Callable[[_F], _F]:
     """Mark a classmethod in an asset class body as a migration's function.
 

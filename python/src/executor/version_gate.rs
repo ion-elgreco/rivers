@@ -56,6 +56,7 @@ pub(crate) fn code_versions(
                 to: m.to,
                 kind: m.kind,
                 breaking: m.breaking,
+                start_at: m.start_at,
             })
             .collect();
         if !steps.is_empty() {
@@ -83,11 +84,25 @@ pub(crate) fn plan_run<'a>(
         .filter(|dep| !writes.contains(dep))
         .collect();
     let declared = |name: &'a str| (name, node_map.get(name).and_then(declared_version));
+    let start_times = writes
+        .iter()
+        .chain(&reads)
+        .filter_map(|&name| match node_map.get(name) {
+            Some(ResolvedNode::Asset(asset)) => Some((name, &asset.migrations)),
+            _ => None,
+        })
+        .flat_map(|(name, migrations)| {
+            migrations
+                .iter()
+                .filter_map(move |m| Some((name, m.to, m.start_at?)))
+        })
+        .collect();
     GatedRun {
         run_id: Some(run_id),
         backfill_id,
         writes: writes.into_iter().map(declared).collect(),
         reads: reads.into_iter().map(declared).collect(),
+        start_times,
     }
 }
 

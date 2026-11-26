@@ -713,6 +713,10 @@ backfill over its materialized partitions; a partition that the rebuild does
 not write then holds no data. A failed migration holds the asset and its
 readers.
 
+With `start_at`, the daemon starts the migration at that time, or at once when
+the time has passed. The asset and its readers wait from the deploy on. See
+[Starting later](../concepts/migrations.md#starting-later).
+
 The first parameter of a convert function is the
 [`MigrationContext`](context.md#migrationcontext). Later parameters are
 resources, injected by name, as for actions. The function can be sync or async.
@@ -738,14 +742,15 @@ read the asset again:
 | `rebuild` | `bool` | `False` | Run the asset's own function again. A rebuild takes no function of its own. |
 | `retry` | `RetryPolicy \| str \| None` | `None` | Retry policy for a convert function, or the name of a policy registered in `CodeRepository(retries=...)`. A rebuild uses the asset's own policy. See [Retries & Compute](retries.md). |
 | `description` | `str \| None` | `None` | What the migration changes. |
+| `start_at` | `datetime \| None` | `None` | The migration does not start before this time. It needs a time zone; a datetime without one raises `AssetDefinitionError`. |
 
 Applying the instance to a function (`AssetMigration(...)(fn)`) returns a new
 convert with `fn` as its function. The instance itself does not change.
 Applying a function to a migration that has one, or to a rebuild, raises
 `AssetDefinitionError`.
 
-**Properties:** `to`, `breaking`, `rebuild`, `description`, and `kind`: one of
-`"convert"`, `"rebuild"`, or `"version_only"`.
+**Properties:** `to`, `breaking`, `rebuild`, `description`, `start_at` (in
+UTC), and `kind`: one of `"convert"`, `"rebuild"`, or `"version_only"`.
 
 When you define the asset, these raise `AssetDefinitionError` with the asset's
 name in the message:
@@ -780,8 +785,8 @@ class Orders(rs.Asset):
             con.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'EUR'")
 ```
 
-**Parameters:** `to`, `breaking`, `retry`, `description`: the same set that
-[`AssetMigration`](#assetmigration) takes. A rebuild or a version-only
+**Parameters:** `to`, `breaking`, `retry`, `description`, `start_at`: the same
+set that [`AssetMigration`](#assetmigration) takes. A rebuild or a version-only
 migration has no function, so list it in `migrations = [...]`.
 
 A prebuilt `AssetMigration` can also be assigned as a class attribute. rivers

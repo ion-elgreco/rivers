@@ -104,6 +104,8 @@ pub struct MigrationLoop {
     /// The assets whose migrations the loop moves: all of the code's when
     /// `None`.
     only: Option<HashSet<String>>,
+    /// Start each migration now, also one whose start time is later.
+    at_once: bool,
 }
 
 impl MigrationLoop {
@@ -112,6 +114,7 @@ impl MigrationLoop {
             owner,
             code,
             only: None,
+            at_once: false,
         }
     }
 
@@ -119,6 +122,15 @@ impl MigrationLoop {
     pub fn only(self, keys: HashSet<String>) -> Self {
         Self {
             only: Some(keys),
+            ..self
+        }
+    }
+
+    /// The same loop, which starts each migration now: for a caller that
+    /// asks for the migration, such as `repo.migrate()`.
+    pub fn at_once(self) -> Self {
+        Self {
+            at_once: true,
             ..self
         }
     }
@@ -192,7 +204,9 @@ impl MigrationLoop {
         loop {
             let now = now_ts();
             match self.next(storage, &row, declared, now).await? {
-                Next::Wait => return Ok(on_its_way(&row, declared)),
+                Next::Wait => {
+                    return Ok(on_its_way(&row, declared) && !self.starts_later(&row, now));
+                }
                 Next::Write(next, work) => {
                     // Another writer changed the row: the next pass reads it again.
                     if !storage
@@ -231,6 +245,7 @@ impl MigrationLoop {
             AssetVersionState::Failed | AssetVersionState::Blocked => Ok(Next::Wait),
             // The migration of newer code, or one that another daemon holds.
             _ if target > declared || self.held_by_other(row, now) => Ok(Next::Wait),
+            AssetVersionState::Pending if self.starts_later(row, now) => Ok(Next::Wait),
             AssetVersionState::Pending => Ok(Next::Write(
                 self.hold(
                     AssetVersionRecord {
@@ -574,6 +589,13 @@ impl MigrationLoop {
             .map(|run| format!("run {} is started", run.run_id)))
     }
 
+    /// Whether the migration in `row` waits for its start time.
+    fn starts_later(&self, row: &AssetVersionRecord, now: i64) -> bool {
+        !self.at_once
+            && row.state == AssetVersionState::Pending
+            && self.code.start_at(row).is_some_and(|at| at > now)
+    }
+
     /// Whether the stored data of `row` is not at the version that this code
     /// declares.
     fn migrates(&self, row: &AssetVersionRecord) -> bool {
@@ -709,6 +731,37 @@ pub async fn retry_migration<S: StorageBackend>(
             started_at: None,
             run_id: None,
             backfill_id: None,
+            owner: None,
+            lease_expires_at: None,
+            ..row.clone()
+        };
+        if storage.put_asset_version(&next, Some(row.revision)).await? {
+            return Ok(true);
+        }
+    }
+    bail!("asset '{asset_key}': other writers changed its version row {RETRY_ATTEMPTS} times")
+}
+
+/// Start a migration that waits for its start time now: `pending` →
+/// `draining`, held by no daemon. `Ok(false)` when the migration of
+/// `asset_key` is not pending.
+pub async fn start_migration<S: StorageBackend>(
+    storage: &ScopedStorage<'_, S>,
+    asset_key: &str,
+) -> Result<bool> {
+    for _ in 0..RETRY_ATTEMPTS {
+        let Some(row) = storage
+            .get_asset_versions(Some(&[asset_key.to_string()]))
+            .await?
+            .pop()
+        else {
+            return Ok(false);
+        };
+        if row.state != AssetVersionState::Pending {
+            return Ok(false);
+        }
+        let next = AssetVersionRecord {
+            state: AssetVersionState::Draining,
             owner: None,
             lease_expires_at: None,
             ..row.clone()
@@ -1015,6 +1068,7 @@ mod tests {
                         to,
                         kind,
                         breaking: true,
+                        start_at: None,
                     })
                     .collect();
                 (key.to_string(), steps)
@@ -1205,6 +1259,61 @@ mod tests {
         assert!(!cancel_migration(&f.handle.scoped(), "nope").await.unwrap());
     }
 
+    const HOUR: i64 = 3_600_000_000_000;
+
+    /// The loop of a daemon, `owner`, whose code declares `orders` at version
+    /// 2, with a convert that starts at `start_at`.
+    fn starting_at(owner: &str, start_at: i64) -> MigrationLoop {
+        let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), 2)]))
+            .with_migrations(
+                HashMap::from([(
+                    "orders".to_string(),
+                    vec![DeclaredMigration {
+                        to: 2,
+                        kind: Convert,
+                        breaking: true,
+                        start_at: Some(start_at),
+                    }],
+                )]),
+                HashSet::new(),
+            );
+        MigrationLoop::new(owner.to_string(), Arc::new(code))
+    }
+
+    #[tokio::test]
+    async fn a_migration_waits_for_its_start_time() {
+        let f = Fixture::new().await;
+        f.put(&pending("orders", 1, 2)).await;
+
+        // Not on its way: the daemon looks again at its slow pace.
+        assert!(!f.pass(&starting_at("a", now_ts() + HOUR)).await);
+        assert!(f.launches.taken().is_empty());
+        assert_eq!(f.row("orders").await.state, AssetVersionState::Pending);
+
+        f.pass(&starting_at("a", now_ts() - HOUR)).await;
+        f.launches.one_run();
+        assert_eq!(f.row("orders").await.state, AssetVersionState::Running);
+    }
+
+    #[tokio::test]
+    async fn a_migration_starts_before_its_start_time_when_asked() {
+        let f = Fixture::new().await;
+        f.put(&pending("orders", 1, 2)).await;
+
+        assert!(start_migration(&f.handle.scoped(), "orders").await.unwrap());
+        assert!(!start_migration(&f.handle.scoped(), "orders").await.unwrap());
+        assert!(!start_migration(&f.handle.scoped(), "nope").await.unwrap());
+        let row = f.row("orders").await;
+        assert_eq!((row.state, row.owner), (AssetVersionState::Draining, None));
+        f.pass(&starting_at("a", now_ts() + HOUR)).await;
+        f.launches.one_run();
+
+        let f = Fixture::new().await;
+        f.put(&pending("orders", 1, 2)).await;
+        f.pass(&starting_at("b", now_ts() + HOUR).at_once()).await;
+        f.launches.one_run();
+    }
+
     #[tokio::test]
     async fn a_canceled_convert_fails_the_migration() {
         let f = Fixture::new().await;
@@ -1236,6 +1345,7 @@ mod tests {
                         to: 3,
                         kind: VersionOnly,
                         breaking: true,
+                        start_at: None,
                     }],
                 )]),
                 HashSet::new(),

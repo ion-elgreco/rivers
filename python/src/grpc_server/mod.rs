@@ -646,7 +646,10 @@ impl CodeLocationService for CodeLocationImpl {
                     .map(|row| (row.asset_key.clone(), row))
                     .collect();
                 for asset in &mut resp.assets {
-                    asset.stored_version = rows.remove(&asset.asset_key).map(asset_version_info);
+                    asset.stored_version = rows.remove(&asset.asset_key).map(|row| {
+                        let start_at = self.handle.migration_start(&row).ok().flatten();
+                        asset_version_info(row, start_at)
+                    });
                 }
             }
             Err(e) => tracing::warn!(
@@ -1182,6 +1185,36 @@ impl CodeLocationService for CodeLocationImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CancelMigrationResponse { success }))
+    }
+
+    /// Refused when this code does not declare the version that the
+    /// migration moves the data to: its daemon would not run the migration.
+    #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.start_migration")]
+    async fn start_migration(
+        &self,
+        request: Request<StartMigrationRequest>,
+    ) -> Result<Response<StartMigrationResponse>, Status> {
+        let key = request.into_inner().asset_key;
+        let declared = self.declared_version(&key)?;
+        let rows = self
+            .handle
+            .asset_versions(Some(std::slice::from_ref(&key)))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(target) = rows.first().and_then(|row| row.target_version)
+            && target > declared
+        {
+            return Err(Status::failed_precondition(format!(
+                "this code declares version {declared} of {key}; it does not run the migration \
+                 to version {target}"
+            )));
+        }
+        let success = self
+            .handle
+            .start_migration(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(StartMigrationResponse { success }))
     }
 
     #[tracing::instrument(skip_all, target = "rivers::grpc", name = "grpc.delete_run")]

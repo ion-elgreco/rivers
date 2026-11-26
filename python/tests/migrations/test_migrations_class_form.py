@@ -2,6 +2,8 @@
 ``AssetMigration`` attributes and the ``migrations = [...]`` list, collected
 across the MRO."""
 
+import datetime
+
 import pytest
 
 import rivers as rs
@@ -57,6 +59,25 @@ def test_marker_registers_a_convert(body, is_async):
     assert func.__func__ is body
     assert func.__self__ is Orders
     assert detected is is_async
+
+
+def test_marker_keeps_the_start_time():
+    friday_night = datetime.datetime(2026, 11, 27, 21, 0, tzinfo=datetime.timezone.utc)
+    marked = rs.migration(to=2, start_at=friday_night)(classmethod(convert))
+    Orders = type(
+        "Orders",
+        (rs.Asset,),
+        {"schema_version": 2, "materialize": classmethod(_materialize), "add": marked},
+    )
+
+    (migration,) = desugar(Orders).migrations
+
+    assert migration.start_at == friday_night
+
+
+def test_marker_start_time_needs_a_time_zone():
+    with pytest.raises(AssetDefinitionError, match="start_at needs a time zone"):
+        rs.migration(to=2, start_at=datetime.datetime(2026, 11, 27, 22, 0))
 
 
 def test_list_and_attribute_register_migrations_without_a_function():

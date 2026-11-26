@@ -12,13 +12,13 @@ use crate::executor::ops::now_ts;
 use crate::job::PyJob;
 use crate::partitions::{PartitionsDefinition, PyBackfillStrategy, PyPartitionKey};
 use crate::storage::{DetachOnClose, PyStorageType};
-use rivers_core::assets::migrations::{cancel_migration, retry_migration};
+use rivers_core::assets::migrations::{cancel_migration, retry_migration, start_migration};
 use rivers_core::assets::versions::{CodeVersions, VersionGate};
 use rivers_core::repo::CodeRepository;
 use rivers_core::storage::any::AnyStorage;
 use rivers_core::storage::{
-    AssetVersionRecord, BackfillFailurePolicy, BackfillRecord, BackfillStatus, CodeLocationContext,
-    LaunchedBy, PartitionKey, RunRecord, RunStatus, StorageBackend, tag_keys,
+    AssetVersionRecord, AssetVersionState, BackfillFailurePolicy, BackfillRecord, BackfillStatus,
+    CodeLocationContext, LaunchedBy, PartitionKey, RunRecord, RunStatus, StorageBackend, tag_keys,
 };
 
 use super::resolved_node::ResolvedNode;
@@ -592,6 +592,24 @@ impl RepoHandle {
         cancel_migration(&state.storage.for_code_location(&ctx), asset_key)
             .await
             .map_err(crate::storage::to_py_err)
+    }
+
+    /// See [`start_migration`].
+    pub(crate) async fn start_migration(&self, asset_key: &str) -> PyResult<bool> {
+        let state = self.resolved()?;
+        let ctx = CodeLocationContext::new(state.code_location_id.as_str());
+        start_migration(&state.storage.for_code_location(&ctx), asset_key)
+            .await
+            .map_err(crate::storage::to_py_err)
+    }
+
+    /// When the pending migration in `row` starts, by this code: `None` when
+    /// it starts at once or is not pending.
+    pub(crate) fn migration_start(&self, row: &AssetVersionRecord) -> PyResult<Option<i64>> {
+        if row.state != AssetVersionState::Pending {
+            return Ok(None);
+        }
+        Ok(self.resolved()?.code_versions.start_at(row))
     }
 
     /// GIL-free. Used by gRPC `materialize` to expand empty selection

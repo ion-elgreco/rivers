@@ -1,3 +1,4 @@
+import datetime
 from typing import reveal_type
 
 from pydantic import BaseModel
@@ -47,7 +48,11 @@ reveal_type(bound_mig)
     migrations=[
         bound_mig,
         rs.AssetMigration(to=3, rebuild=True),
-        rs.AssetMigration(to=4, description="new readers only"),
+        rs.AssetMigration(
+            to=4,
+            description="new readers only",
+            start_at=datetime.datetime(2026, 11, 27, 21, tzinfo=datetime.timezone.utc),
+        ),
     ],
 )
 def versioned():
@@ -186,7 +191,12 @@ class Orders(rs.Asset):
     def materialize(cls, ctx: rs.AssetExecutionContext) -> int:
         return 1
 
-    @rs.migration(to=2, breaking=False, description="add currency")
+    @rs.migration(
+        to=2,
+        breaking=False,
+        description="add currency",
+        start_at=datetime.datetime(2026, 11, 27, 21, tzinfo=datetime.timezone.utc),
+    )
     @classmethod
     def add_currency(cls, ctx: rs.MigrationContext[TuneConfig]) -> None:
         reveal_type(ctx.config)

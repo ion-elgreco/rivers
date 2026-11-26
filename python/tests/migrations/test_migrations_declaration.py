@@ -1,6 +1,8 @@
 """``rs.AssetMigration``: its kinds, binding a function, and pickling."""
 
+import datetime
 import pickle
+from zoneinfo import ZoneInfo
 
 import cloudpickle
 import pytest
@@ -26,15 +28,45 @@ BODIES = pytest.mark.parametrize(
 
 def _state(migration):
     """What the migration pickles: (to, breaking, rebuild, retry, description,
-    function, is_async)."""
+    start_at, function, is_async)."""
     return migration.__reduce__()[1]
+
+
+FRIDAY_NIGHT = datetime.datetime(
+    2026, 11, 27, 22, 0, tzinfo=ZoneInfo("Europe/Amsterdam")
+)
 
 
 def test_defaults():
     m = rs.AssetMigration(to=2)
 
     assert (m.to, m.breaking, m.rebuild, m.description) == (2, True, False, None)
+    assert m.start_at is None
     assert m.kind == "version_only"
+
+
+def test_start_at_is_kept_in_utc():
+    m = rs.AssetMigration(to=2, rebuild=True, start_at=FRIDAY_NIGHT)
+
+    assert m.start_at == FRIDAY_NIGHT
+    assert m.start_at.utcoffset() == datetime.timedelta(0)
+    assert m.start_at.hour == 21
+
+
+@pytest.mark.parametrize(
+    ("start_at", "message"),
+    [
+        (datetime.datetime(2026, 11, 27, 22, 0), "start_at needs a time zone"),
+        (datetime.date(2026, 11, 27), "start_at must be a datetime with a time zone"),
+        ("2026-11-27T22:00:00Z", "start_at must be a datetime with a time zone"),
+    ],
+    ids=["naive", "date", "str"],
+)
+def test_start_at_must_be_a_datetime_with_a_time_zone(start_at, message):
+    with pytest.raises(
+        AssetDefinitionError, match=f"migration to version 2: {message}"
+    ):
+        rs.AssetMigration(to=2, start_at=start_at)
 
 
 @pytest.mark.parametrize(
@@ -58,6 +90,7 @@ def test_binding_returns_a_convert_and_keeps_the_settings(body, is_async):
         breaking=False,
         retry=rs.RetryPolicy(max_retries=2),
         description="add currency",
+        start_at=FRIDAY_NIGHT,
     )
 
     bound = unbound(body)
@@ -68,6 +101,7 @@ def test_binding_returns_a_convert_and_keeps_the_settings(body, is_async):
         False,
         "add currency",
     )
+    assert bound.start_at == FRIDAY_NIGHT
     assert bound.kind == "convert"
     assert unbound.kind == "version_only"
     *_, func, detected = _state(bound)
@@ -107,6 +141,11 @@ def test_repr():
         repr(rs.AssetMigration(to=3, rebuild=True))
         == "AssetMigration(to=3, kind='rebuild', breaking=True)"
     )
+    assert (
+        repr(rs.AssetMigration(to=3, rebuild=True, start_at=FRIDAY_NIGHT))
+        == "AssetMigration(to=3, kind='rebuild', breaking=True, "
+        "start_at='2026-11-27T21:00:00Z')"
+    )
 
 
 @pytest.mark.parametrize(
@@ -119,7 +158,9 @@ def test_repr():
             description="add currency",
         )(add_currency),
         rs.AssetMigration(to=2, retry="flaky")(add_currency_async),
-        rs.AssetMigration(to=3, rebuild=True, description="recompute totals"),
+        rs.AssetMigration(
+            to=3, rebuild=True, description="recompute totals", start_at=FRIDAY_NIGHT
+        ),
         rs.AssetMigration(to=4),
     ],
     ids=["convert-sync", "convert-async", "rebuild", "version-only"],

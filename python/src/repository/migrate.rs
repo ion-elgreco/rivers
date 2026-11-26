@@ -90,8 +90,9 @@ impl PyCodeRepository {
             }
         }
 
-        let migrations =
-            MigrationLoop::new(uuid::Uuid::new_v4().to_string(), Arc::clone(&code)).only(only);
+        let migrations = MigrationLoop::new(uuid::Uuid::new_v4().to_string(), Arc::clone(&code))
+            .only(only)
+            .at_once();
         let moved = self.move_migrations(&handle, &migrations);
         if moved.is_err()
             && let Err(e) = io_rt().block_on(migrations.release(&handle))
