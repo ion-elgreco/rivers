@@ -9,6 +9,8 @@ use anyhow::{Result, bail};
 use petgraph::Direction;
 
 use super::graph::{AssetGraph, GraphTopology, NodeKind};
+use super::partition_change::{describe_change, partitions_to_fill, same_keys};
+use super::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use crate::storage::{
     AssetVersionRecord, AssetVersionState, MigrationKind, ScopedStorage, StorageBackend,
 };
@@ -49,17 +51,17 @@ pub fn first_version_row(
 }
 
 /// `row` after code that declares `declared` registers, or `None` when the
-/// row does not change. A `ready` row below `declared` gets a pending
-/// migration to it, and a pending migration moves its target up to it. A
-/// migration that began, failed or is blocked keeps its target. Code that
-/// declares the applied version or a lower one is old code: it changes
-/// nothing.
+/// row does not change. A `ready` row below `declared`, or one blocked by a
+/// change of its partition keys, gets a pending migration to it, and a
+/// pending migration moves its target up to it. A migration that began or
+/// failed keeps its target. Code that declares the applied version or a
+/// lower one changes nothing here: see [`registered_row`].
 pub fn registered_version(row: &AssetVersionRecord, declared: u32) -> Option<AssetVersionRecord> {
     if declared <= row.applied_version {
         return None;
     }
     match row.state {
-        AssetVersionState::Ready => Some(AssetVersionRecord {
+        AssetVersionState::Ready | AssetVersionState::Blocked => Some(AssetVersionRecord {
             state: AssetVersionState::Pending,
             target_version: Some(declared),
             reason: None,
@@ -80,47 +82,252 @@ pub fn registered_version(row: &AssetVersionRecord, declared: u32) -> Option<Ass
     }
 }
 
+/// What the partitions of the code do to the stored partitions of an asset,
+/// at the version that the code declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionsChange {
+    /// The keys stay the same, or no data is stored: the row takes the
+    /// code's partitions definition, as JSON.
+    Take(Option<String>),
+    /// The keys change and data is stored: the asset waits for a migration.
+    /// `before` is the definition of the stored data, as JSON.
+    Blocks {
+        before: Option<String>,
+        reason: String,
+    },
+}
+
+/// `row` after code that declares `declared` registers, `change` being what
+/// the code's partitions do when it declares the applied version. A blocked
+/// row whose keys are the same again is ready. `None` when the row does not
+/// change; code older than the applied version never changes it.
+pub fn registered_row(
+    row: &AssetVersionRecord,
+    declared: u32,
+    change: Option<&PartitionsChange>,
+) -> Option<AssetVersionRecord> {
+    if declared != row.applied_version {
+        return registered_version(row, declared);
+    }
+    if !matches!(
+        row.state,
+        AssetVersionState::Ready | AssetVersionState::Blocked
+    ) {
+        return None;
+    }
+    let next = match change? {
+        PartitionsChange::Take(partitions) => AssetVersionRecord {
+            state: AssetVersionState::Ready,
+            partitions: partitions.clone(),
+            reason: None,
+            target_version: None,
+            ..row.clone()
+        },
+        PartitionsChange::Blocks { reason, .. } => AssetVersionRecord {
+            state: AssetVersionState::Blocked,
+            reason: Some(reason.clone()),
+            target_version: None,
+            ..row.clone()
+        },
+    };
+    (next != *row).then_some(next)
+}
+
 /// Record the versions that this code declares, `(asset key, version)` for
-/// each asset that it owns, before `topology`, the code's own, replaces the
-/// stored topology. Only an asset that declares a version above 1 gets a
-/// row. For the first row of an asset with stored data, the stored topology
-/// gives the partitions definition of that data.
+/// each asset whose data rivers stores, before `topology`, the code's own,
+/// replaces the stored topology; `key_lists` are its static keys. An asset
+/// gets a row when it declares a version above 1, or when its partition
+/// keys change while data is stored. For the first row of an asset with
+/// stored data, the stored topology gives the partitions definition of that
+/// data.
 pub async fn register_asset_versions<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
     declared: &[(&str, u32)],
     topology: &GraphTopology,
+    key_lists: &[KeyList<'_>],
 ) -> Result<()> {
-    let declared: Vec<(&str, u32)> = declared
-        .iter()
-        .copied()
-        .filter(|&(_, version)| version > 1)
-        .collect();
     if declared.is_empty() {
         return Ok(());
     }
-
-    let keys: Vec<String> = declared.iter().map(|(key, _)| key.to_string()).collect();
     let mut rows: HashMap<String, AssetVersionRecord> = storage
-        .get_asset_versions(Some(&keys))
+        .get_asset_versions(None)
         .await?
         .into_iter()
         .map(|row| (row.asset_key.clone(), row))
         .collect();
-    let mut first_rows = first_version_rows(storage, &declared, &rows, topology).await?;
+    let stored = storage.get_graph_topology().await?;
 
-    for (key, version) in declared {
+    let versioned: Vec<(&str, u32)> = declared
+        .iter()
+        .copied()
+        .filter(|&(_, version)| version > 1)
+        .collect();
+    let mut first_rows =
+        first_version_rows(storage, &versioned, &rows, stored.as_ref(), topology).await?;
+
+    for &(key, version) in declared {
         let row = rows.remove(key);
-        let first = first_rows.remove(key);
-        register_version(storage, key, version, row, first).await?;
+        let mut first = first_rows.remove(key);
+        // Code at the applied version keeps the keys of the stored data, or
+        // waits for a migration.
+        let at_applied = row
+            .as_ref()
+            .map_or(version == 1, |row| row.applied_version == version);
+        let change = if at_applied {
+            let stored_partitions = match &row {
+                Some(row) => Some(parse_partitions(row.partitions.as_deref())?),
+                None => stored
+                    .as_ref()
+                    .and_then(|stored| stored.owned_node(key))
+                    .map(|node| node.partitions.clone()),
+            };
+            match stored_partitions {
+                Some(before) => {
+                    partitions_change(storage, key, version, before, topology, key_lists).await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if row.is_none()
+            && let Some(PartitionsChange::Blocks { before, reason }) = &change
+        {
+            first = Some(blocked_row(storage.code_location_id(), key, before, reason));
+        }
+        if row.is_none() && first.is_none() {
+            continue;
+        }
+        register_version(storage, key, version, row, first, change.as_ref()).await?;
     }
     Ok(())
 }
 
+fn parse_partitions(partitions: Option<&str>) -> Result<Option<PartitionsFingerprint>> {
+    partitions
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// What the code's partitions in `topology` do to the stored partitions of
+/// `key`, made under `before`. `None` when the code has no node for it.
+async fn partitions_change<S: StorageBackend>(
+    storage: &ScopedStorage<'_, S>,
+    key: &str,
+    declared: u32,
+    before: Option<PartitionsFingerprint>,
+    topology: &GraphTopology,
+    key_lists: &[KeyList<'_>],
+) -> Result<Option<PartitionsChange>> {
+    let Some(node) = topology.owned_node(key) else {
+        return Ok(None);
+    };
+    let after = node.partitions.as_ref();
+    let take = || {
+        after
+            .map(serde_json::to_string)
+            .transpose()
+            .map(PartitionsChange::Take)
+    };
+    if same_keys(before.as_ref(), after) {
+        return Ok(Some(take()?));
+    }
+
+    let stored = match &before {
+        Some(_) => storage.get_materialized_partitions(key).await?,
+        None => Vec::new(),
+    };
+    let has_data = match &before {
+        Some(_) => !stored.is_empty(),
+        None => storage
+            .get_asset_records_by_keys(&[key.to_string()])
+            .await?
+            .iter()
+            .any(|record| record.last_timestamp.is_some()),
+    };
+    if !has_data {
+        return Ok(Some(take()?));
+    }
+
+    let next = declared + 1;
+    let rebuild = match partitions_to_fill(
+        before.as_ref(),
+        after,
+        &stored,
+        &static_keys(after, key_lists),
+    ) {
+        Ok(fill) => {
+            let count = fill.count();
+            let noun = if count == 1 {
+                "partition"
+            } else {
+                "partitions"
+            };
+            format!("a rebuild of {count} {noun} (rebuild=True)")
+        }
+        Err(_) => {
+            "a rebuild of the partitions that you name (rebuild=True, partitions=[...])".to_string()
+        }
+    };
+    let reason = format!(
+        "the partition keys of {key} changed ({}); raise schema_version to {next} and add \
+         AssetMigration(to={next}): a convert, {rebuild}, or rebuild=True, partitions=[] to start \
+         empty",
+        describe_change(before.as_ref(), after)
+    );
+    Ok(Some(PartitionsChange::Blocks {
+        before: before.as_ref().map(serde_json::to_string).transpose()?,
+        reason,
+    }))
+}
+
+/// The keys of each static dimension of `partitions` by its name, from
+/// `key_lists`.
+pub fn static_keys(
+    partitions: Option<&PartitionsFingerprint>,
+    key_lists: &[KeyList<'_>],
+) -> HashMap<String, HashSet<String>> {
+    let Some(PartitionsFingerprint::Multi { dimensions }) = partitions else {
+        return HashMap::new();
+    };
+    dimensions
+        .iter()
+        .filter_map(|(name, dimension)| match dimension {
+            PartitionsFingerprint::Static { digest, .. } => key_lists
+                .iter()
+                .find(|list| &list.digest == digest)
+                .map(|list| {
+                    let keys = list.keys.iter().map(|key| key.to_string()).collect();
+                    (name.clone(), keys)
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first row of an asset at version 1 whose partition keys changed
+/// while data is stored.
+fn blocked_row(
+    code_location_id: &str,
+    asset_key: &str,
+    before: &Option<String>,
+    reason: &str,
+) -> AssetVersionRecord {
+    AssetVersionRecord {
+        state: AssetVersionState::Blocked,
+        reason: Some(reason.to_string()),
+        ..first_version_row(code_location_id, asset_key, 1, true, before.clone())
+    }
+}
+
 /// The first rows of the `declared` assets that have no row in `rows`.
+/// `stored` is the stored topology.
 async fn first_version_rows<S: StorageBackend>(
     storage: &ScopedStorage<'_, S>,
     declared: &[(&str, u32)],
     rows: &HashMap<String, AssetVersionRecord>,
+    stored: Option<&GraphTopology>,
     topology: &GraphTopology,
 ) -> Result<HashMap<String, AssetVersionRecord>> {
     let new: Vec<(&str, u32)> = declared
@@ -140,11 +347,6 @@ async fn first_version_rows<S: StorageBackend>(
         .filter(|record| record.last_timestamp.is_some())
         .map(|record| record.asset_key)
         .collect();
-    let stored = if with_data.is_empty() {
-        None
-    } else {
-        storage.get_graph_topology().await?
-    };
 
     let mut first_rows = HashMap::new();
     for (key, version) in new {
@@ -152,7 +354,6 @@ async fn first_version_rows<S: StorageBackend>(
         // Stored data has the definition in the stored topology; without
         // stored data or a stored node, the code's definition applies.
         let node = stored
-            .as_ref()
             .filter(|_| has_data)
             .and_then(|stored| stored.owned_node(key))
             .or_else(|| topology.owned_node(key));
@@ -180,10 +381,11 @@ async fn register_version<S: StorageBackend>(
     declared: u32,
     mut row: Option<AssetVersionRecord>,
     first: Option<AssetVersionRecord>,
+    change: Option<&PartitionsChange>,
 ) -> Result<()> {
     for _ in 0..REGISTER_ATTEMPTS {
         let (next, expected) = match (&row, &first) {
-            (Some(row), _) => match registered_version(row, declared) {
+            (Some(row), _) => match registered_row(row, declared, change) {
                 Some(next) => (next, Some(row.revision)),
                 None => return Ok(()),
             },
@@ -760,12 +962,11 @@ mod tests {
     }
 
     #[test]
-    fn a_migration_that_began_failed_or_is_blocked_keeps_its_target() {
+    fn a_migration_that_began_or_failed_keeps_its_target() {
         for state in [
             AssetVersionState::Draining,
             AssetVersionState::Running,
             AssetVersionState::Failed,
-            AssetVersionState::Blocked,
         ] {
             let busy = AssetVersionRecord {
                 target_version: Some(3),
@@ -773,6 +974,68 @@ mod tests {
             };
             assert_eq!(registered_version(&busy, 4), None, "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_new_version_ends_the_block_of_a_change_of_partition_keys() {
+        let blocked = AssetVersionRecord {
+            reason: Some("the partition keys of orders changed".to_string()),
+            ..row(1, AssetVersionState::Blocked)
+        };
+
+        let pending = registered_version(&blocked, 2).unwrap();
+
+        assert_eq!(
+            (pending.state, pending.target_version, pending.reason),
+            (AssetVersionState::Pending, Some(2), None)
+        );
+        assert_eq!(pending.partitions, blocked.partitions);
+    }
+
+    #[test]
+    fn code_at_the_applied_version_blocks_or_takes_its_partitions() {
+        let ready = row(2, AssetVersionState::Ready);
+        let blocks = PartitionsChange::Blocks {
+            before: ready.partitions.clone(),
+            reason: "the partition keys of orders changed".to_string(),
+        };
+        let take = PartitionsChange::Take(Some(
+            "{\"kind\":\"dynamic\",\"name\":\"files\"}".to_string(),
+        ));
+
+        let blocked = registered_row(&ready, 2, Some(&blocks)).unwrap();
+        assert_eq!(
+            (
+                blocked.state,
+                blocked.target_version,
+                blocked.reason.as_deref()
+            ),
+            (
+                AssetVersionState::Blocked,
+                None,
+                Some("the partition keys of orders changed")
+            )
+        );
+        assert_eq!(registered_row(&blocked, 2, Some(&blocks)), None);
+
+        let unblocked = registered_row(&blocked, 2, Some(&take)).unwrap();
+        assert_eq!(
+            (unblocked.state, unblocked.reason.as_deref()),
+            (AssetVersionState::Ready, None)
+        );
+        assert_eq!(
+            unblocked.partitions.as_deref(),
+            Some("{\"kind\":\"dynamic\",\"name\":\"files\"}")
+        );
+        assert_eq!(registered_row(&unblocked, 2, Some(&take)), None);
+
+        // Old code, and a migration that runs, change nothing.
+        assert_eq!(registered_row(&ready, 1, Some(&blocks)), None);
+        let running = AssetVersionRecord {
+            target_version: Some(3),
+            ..row(2, AssetVersionState::Running)
+        };
+        assert_eq!(registered_row(&running, 2, Some(&blocks)), None);
     }
 
     fn versioned(

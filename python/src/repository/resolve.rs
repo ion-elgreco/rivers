@@ -391,11 +391,19 @@ impl PyCodeRepository {
                 }
             }
 
-            // The stored topology still describes the stored data.
+            // The stored topology still describes the stored data. rivers
+            // does not store the data of external and remote assets.
             let declared: Vec<(&str, u32)> = node_map
                 .iter()
                 .filter_map(|(name, node)| match node {
-                    ResolvedNode::Asset(asset) => Some((name.as_str(), asset.schema_version)),
+                    ResolvedNode::Asset(asset)
+                        if !matches!(
+                            asset.kind,
+                            resolved_node::AssetKind::External | resolved_node::AssetKind::Remote
+                        ) =>
+                    {
+                        Some((name.as_str(), asset.schema_version))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -404,6 +412,7 @@ impl PyCodeRepository {
                     &storage_handle.scoped(),
                     &declared,
                     &topology,
+                    &key_lists,
                 ))
                 .map_err(crate::storage::to_py_err)?;
 
