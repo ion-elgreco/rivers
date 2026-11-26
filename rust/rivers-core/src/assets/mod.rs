@@ -2,6 +2,7 @@
 
 pub mod graph;
 pub mod migrations;
+pub mod partition_change;
 pub mod partitions_fingerprint;
 pub mod remote;
 pub mod versions;

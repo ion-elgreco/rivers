@@ -25,7 +25,7 @@ pub struct TimeGrid {
 
 impl TimeGrid {
     /// Effective end bound: the explicit `end`, else now.
-    fn end_bound(&self) -> civil::DateTime {
+    pub(crate) fn end_bound(&self) -> civil::DateTime {
         self.end.unwrap_or_else(|| jiff::Zoned::now().datetime())
     }
 
