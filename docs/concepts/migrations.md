@@ -98,7 +98,7 @@ def orders(warehouse: DuckDBResource) -> None: ...
 - The asset and its readers still wait from the deploy on: the new code expects the new data, and the old code no longer runs. A held run gives the start time, for example `orders waits for its migration to version 2, which starts at 2026-11-27T21:00:00Z`. Schedules keep adding runs to the run queue while they wait.
 - `start_at` needs a time zone. A datetime without one raises `AssetDefinitionError`.
 - A migration that applies several versions starts at the latest `start_at` of those versions.
-- The gRPC `StartMigration` and `repo.migrate()` start the migration before its time.
+- **Start now** on the asset page, the gRPC `StartMigration`, and `repo.migrate()` start the migration before its time.
 - The time is the same in each environment that runs the code, staging too. To start sooner there, start the migration by hand, or read the time from an environment variable.
 
 ## While an asset migrates
@@ -148,10 +148,10 @@ assert (record.state, record.applied_version) == ("ready", 2)
 
 ## In the UI
 
-- **Asset page.** STATUS shows `migrating` or `migration-failed`. A panel shows the stored version and the target version, then what the migration waits for, what it runs (with links to the runs or the backfill), or why it failed. It has **Retry** for a failed migration, and **Cancel migration** after a rollback.
+- **Asset page.** STATUS shows `migrating` or `migration-failed`. A panel shows the stored version and the target version, then when the migration starts, what it waits for, what it runs (with links to the runs or the backfill), or why it failed. It has **Retry** for a failed migration, **Start now** for a migration that starts later, and **Cancel migration** after a rollback.
 - **Graph.** The node of an asset that migrates has a `migrating` or `migration failed` chip.
 
-The gRPC `GetAssetsInfo` returns the declared `schema_version` and the `stored_version` of each asset.
+The gRPC `GetAssetsInfo` returns the declared `schema_version` and the `stored_version` of each asset, with `start_at` for a migration that starts later.
 
 ## Limits
 

@@ -527,6 +527,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                         .and_then(|r| r.ok())
                         .and_then(|all| all.into_iter().find(|m| m.asset_key == current_key));
                     let declared = info.as_ref().and_then(|i| i.schema_version);
+                    let start_at = info.as_ref().and_then(|i| i.migration_start_at);
 
                     let kind_val = if record.kinds.is_empty() { "—".to_string() } else { record.kinds.join(", ") };
                     let group_val = record.asset_group.clone().unwrap_or_else(|| "—".to_string());
@@ -599,7 +600,7 @@ pub fn AssetDetailPage() -> impl IntoView {
                             </div>
                         </div>
 
-                        {migration.map(|migration| view! { <AssetMigrationPanel migration declared/> })}
+                        {migration.map(|migration| view! { <AssetMigrationPanel migration declared start_at/> })}
 
                         <button
                             class="meta-toggle-btn"

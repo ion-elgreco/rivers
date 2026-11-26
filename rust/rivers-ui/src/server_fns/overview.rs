@@ -212,6 +212,7 @@ pub async fn get_assets_info(
                 config_schema: a.config_schema,
                 metadata: a.metadata,
                 schema_version: a.schema_version,
+                migration_start_at: a.stored_version.and_then(|v| v.start_at),
             }
         })
         .collect();

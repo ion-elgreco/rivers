@@ -501,6 +501,7 @@ async fn materialize_sends_the_edited_config() {
                 config_schema: config_schema.map(str::to_string),
                 metadata: Default::default(),
                 schema_version: None,
+                migration_start_at: None,
             },
         );
     }

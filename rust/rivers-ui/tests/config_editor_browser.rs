@@ -56,6 +56,7 @@ fn definition(key: &str, config_schema: &str) -> AssetDefinitionInfo {
         config_schema: Some(config_schema.to_string()),
         metadata: Default::default(),
         schema_version: None,
+        migration_start_at: None,
     }
 }
 

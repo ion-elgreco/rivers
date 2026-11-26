@@ -565,6 +565,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             schema_version: None,
+            migration_start_at: None,
         }
     }
 

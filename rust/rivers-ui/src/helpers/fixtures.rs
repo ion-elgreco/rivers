@@ -28,6 +28,7 @@ pub(super) fn make_info(asset_key: &str, keys: Option<&[&str]>) -> AssetDefiniti
         config_schema: None,
         metadata: Default::default(),
         schema_version: None,
+        migration_start_at: None,
     }
 }
 

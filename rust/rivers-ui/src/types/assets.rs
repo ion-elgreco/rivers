@@ -62,6 +62,10 @@ pub struct AssetDefinitionInfo {
     /// node whose data rivers does not store.
     #[serde(default)]
     pub schema_version: Option<u32>,
+    /// When the pending migration of the stored data starts, by the code:
+    /// nanoseconds since the epoch. `None` when it starts at once.
+    #[serde(default)]
+    pub migration_start_at: Option<i64>,
 }
 
 /// Mirror of the gRPC `ActionInfo`.

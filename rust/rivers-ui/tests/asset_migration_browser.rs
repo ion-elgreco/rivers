@@ -17,11 +17,19 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-fn mount(migration: AssetMigration, declared: Option<u32>) -> web_sys::HtmlElement {
+/// 2100-01-01T00:00:00Z and 2001-01-01T00:00:00Z, in nanoseconds.
+const LATER: i64 = 4_102_444_800_000_000_000;
+const PASSED: i64 = 978_307_200_000_000_000;
+
+fn mount(
+    migration: AssetMigration,
+    declared: Option<u32>,
+    start_at: Option<i64>,
+) -> web_sys::HtmlElement {
     nav_to("/locations/dev/shop/assets/orders");
     let target = fresh_mount_target();
     mount_to(target.clone(), move || {
-        view! { <Router><AssetMigrationPanel migration declared/></Router> }
+        view! { <Router><AssetMigrationPanel migration declared start_at/></Router> }
     })
     .forget();
     target
@@ -57,6 +65,7 @@ fn a_draining_migration_names_what_it_waits_for() {
             ..migration(MigrationState::Draining)
         },
         Some(2),
+        None,
     );
 
     let text = host.text_content().unwrap_or_default();
@@ -95,6 +104,7 @@ fn a_running_rebuild_links_its_backfill() {
             ..migration(MigrationState::Running)
         },
         Some(2),
+        None,
     );
 
     let link = query_one(&host, ".migration-panel a");
@@ -115,6 +125,7 @@ async fn a_failed_migration_shows_its_reason_and_retries() {
             ..migration(MigrationState::Failed)
         },
         Some(2),
+        None,
     );
 
     assert_eq!(query_all(&host, ".migration-panel--stopped").len(), 1);
@@ -146,7 +157,7 @@ async fn a_failed_migration_shows_its_reason_and_retries() {
 
 #[wasm_bindgen_test]
 fn a_pending_migration_can_be_canceled_only_after_a_rollback() {
-    let rolled_back = mount(migration(MigrationState::Pending), Some(1));
+    let rolled_back = mount(migration(MigrationState::Pending), Some(1), None);
     assert_eq!(buttons(&rolled_back), ["Cancel migration"]);
     assert!(
         rolled_back
@@ -155,6 +166,57 @@ fn a_pending_migration_can_be_canceled_only_after_a_rollback() {
             .contains("Waits for the daemon to start it.")
     );
 
-    let deployed = mount(migration(MigrationState::Pending), Some(2));
+    let deployed = mount(migration(MigrationState::Pending), Some(2), None);
     assert!(buttons(&deployed).is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn a_migration_that_starts_later_shows_its_time_and_starts_now() {
+    let (_mock, requests) = install_recording_fetch_mock("true");
+    let host = mount(migration(MigrationState::Pending), Some(2), Some(LATER));
+
+    let text = host.text_content().unwrap_or_default();
+    assert!(
+        text.contains(
+            "Starts at 2100-01-01 00:00:00 UTC. Until then, runs that write or read the asset wait."
+        ),
+        "got: {text}"
+    );
+    assert_eq!(buttons(&host), ["Start now"]);
+
+    click(&query_one(&host, "button"), false);
+
+    assert!(wait_until(|| requests.borrow().len() == 1).await);
+    let sent: Vec<web_sys::Request> = requests.borrow().iter().cloned().collect();
+    assert!(
+        sent[0].url().contains("start_migration"),
+        "got: {}",
+        sent[0].url()
+    );
+    let bodies = request_bodies(&sent).await;
+    assert!(bodies[0].contains("asset_key=orders"), "got: {}", bodies[0]);
+}
+
+#[wasm_bindgen_test]
+fn start_now_needs_a_start_time_later_and_code_that_runs_the_migration() {
+    let passed = mount(migration(MigrationState::Pending), Some(2), Some(PASSED));
+    assert!(buttons(&passed).is_empty());
+    assert!(
+        passed
+            .text_content()
+            .unwrap_or_default()
+            .contains("Waits for the daemon to start it.")
+    );
+
+    let older_code = mount(migration(MigrationState::Pending), Some(1), Some(LATER));
+    assert_eq!(buttons(&older_code), ["Cancel migration"]);
+
+    let draining = mount(migration(MigrationState::Draining), Some(2), Some(LATER));
+    assert!(buttons(&draining).is_empty());
+    assert!(
+        !draining
+            .text_content()
+            .unwrap_or_default()
+            .contains("Starts at")
+    );
 }

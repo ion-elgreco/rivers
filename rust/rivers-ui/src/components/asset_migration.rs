@@ -3,23 +3,33 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
-use crate::helpers::short_id;
+use crate::helpers::{format_timestamp_nanos, short_id};
 use crate::loc::{loc_path, use_current_location};
-use crate::server_fns::mutations::{cancel_migration, retry_migration};
+use crate::now::use_now;
+use crate::server_fns::mutations::{cancel_migration, retry_migration, start_migration};
 use crate::types::{AssetMigration, MigrationState};
 
 /// What the migration of the asset waits for or runs, or why it stopped.
-/// Retry for a failed migration; Cancel for one that waits while the code
-/// declares no higher version than the stored data (after a rollback).
-/// `declared` is the version that the code declares.
+/// Retry for a failed migration; Start now for one that waits for its start
+/// time; Cancel for one that waits while the code declares no higher version
+/// than the stored data (after a rollback). `declared` is the version that
+/// the code declares; `start_at` is when the code starts the pending
+/// migration, in nanoseconds since the epoch.
 #[component]
-pub fn AssetMigrationPanel(migration: AssetMigration, declared: Option<u32>) -> impl IntoView {
+pub fn AssetMigrationPanel(
+    migration: AssetMigration,
+    declared: Option<u32>,
+    start_at: Option<i64>,
+) -> impl IntoView {
     let loc = use_current_location();
     let (lns, lnm) = loc.get_untracked();
     let link = move |path: String| loc_path(&lns, &lnm, &path);
 
     let applied = migration.applied_version;
     let target = migration.target_version.unwrap_or(applied);
+    let now = use_now().get_untracked();
+    let start_at = start_at
+        .filter(|&at| migration.state == MigrationState::Pending && at > now * 1_000_000_000);
     let title = match migration.state {
         MigrationState::Failed => format!("The migration to version {target} failed"),
         MigrationState::Blocked => format!("The migration to version {target} cannot start"),
@@ -27,9 +37,20 @@ pub fn AssetMigrationPanel(migration: AssetMigration, declared: Option<u32>) -> 
     };
 
     let lines: Vec<AnyView> = match migration.state {
-        MigrationState::Pending => {
-            vec![view! { <span>"Waits for the daemon to start it."</span> }.into_any()]
-        }
+        MigrationState::Pending => match start_at {
+            Some(at) => {
+                let at = format_timestamp_nanos(at);
+                vec![
+                    view! {
+                        <span>
+                            {format!("Starts at {at} UTC. Until then, runs that write or read the asset wait.")}
+                        </span>
+                    }
+                    .into_any(),
+                ]
+            }
+            None => vec![view! { <span>"Waits for the daemon to start it."</span> }.into_any()],
+        },
         MigrationState::Draining => {
             let mut lines = Vec::new();
             if !migration.upstream.is_empty() {
@@ -101,15 +122,28 @@ pub fn AssetMigrationPanel(migration: AssetMigration, declared: Option<u32>) -> 
         let key = key.clone();
         async move { cancel_migration(ns, name, key).await }
     });
-    let busy = Signal::derive(move || retry.pending().get() || cancel.pending().get());
+    let key = migration.asset_key.clone();
+    let start = Action::new(move |_: &()| {
+        let (ns, name) = loc.get_untracked();
+        let key = key.clone();
+        async move { start_migration(ns, name, key).await }
+    });
+    let busy = Signal::derive(move || {
+        retry.pending().get() || cancel.pending().get() || start.pending().get()
+    });
     let error = Signal::derive(move || {
-        [retry.value().get(), cancel.value().get()]
-            .into_iter()
-            .flatten()
-            .find_map(|outcome| outcome.err())
-            .map(|e| crate::helpers::err_text(&e))
+        [
+            retry.value().get(),
+            cancel.value().get(),
+            start.value().get(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|outcome| outcome.err())
+        .map(|e| crate::helpers::err_text(&e))
     });
     let can_retry = migration.state == MigrationState::Failed;
+    let can_start = start_at.is_some() && declared.is_some_and(|declared| declared >= target);
     let can_cancel = matches!(
         migration.state,
         MigrationState::Pending | MigrationState::Draining
@@ -125,11 +159,16 @@ pub fn AssetMigrationPanel(migration: AssetMigration, declared: Option<u32>) -> 
             <div class="migration-panel-title">{title}</div>
             <div class="migration-panel-line">{format!("The stored data is at version {applied}.")}</div>
             {lines.into_iter().map(|line| view! { <div class="migration-panel-line">{line}</div> }).collect::<Vec<_>>()}
-            {(can_retry || can_cancel).then(|| view! {
+            {(can_retry || can_start || can_cancel).then(|| view! {
                 <div class="migration-panel-actions">
                     {can_retry.then(|| view! {
                         <button class="btn" disabled=busy on:click=move |_| { retry.dispatch(()); }>
                             "Retry"
+                        </button>
+                    })}
+                    {can_start.then(|| view! {
+                        <button class="btn" disabled=busy on:click=move |_| { start.dispatch(()); }>
+                            "Start now"
                         </button>
                     })}
                     {can_cancel.then(|| view! {

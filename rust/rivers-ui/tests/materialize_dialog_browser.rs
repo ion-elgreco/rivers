@@ -766,6 +766,7 @@ fn definition(key: &str, config_schema: Option<&str>) -> rivers_ui::types::Asset
         config_schema: config_schema.map(str::to_string),
         metadata: Default::default(),
         schema_version: None,
+        migration_start_at: None,
     }
 }
 
