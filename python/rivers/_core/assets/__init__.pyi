@@ -747,7 +747,10 @@ class AssetMigration:
     increases, with ``to`` set to the new version. A function makes it a
     convert, which runs once to change the stored data; ``rebuild=True`` runs
     the asset's own function again, as a backfill; with neither, the step only
-    records the version. Apply as a decorator to bind the function::
+    records the version. When the step changes the asset's partition keys,
+    it fills the partitions of the new definition that the stored partitions
+    cover, or the ones that ``partitions`` names. Apply as a decorator to bind
+    the function::
 
         add_currency = rs.AssetMigration(to=2, breaking=False)(_add_currency)
 
@@ -763,6 +766,9 @@ class AssetMigration:
     description: str | None
     start_at: datetime.datetime | None
     """The time before which the migration does not start, in UTC."""
+    partitions: list[PartitionKey] | None
+    """The partitions that the migration fills when it changes the partition
+    keys."""
     kind: Literal["convert", "rebuild", "version_only"]
     """``convert`` with a function, ``rebuild`` with ``rebuild=True``, else
     ``version_only``."""
@@ -776,6 +782,7 @@ class AssetMigration:
         retry: "RetryPolicy | str | None" = None,
         description: str | None = None,
         start_at: datetime.datetime | None = None,
+        partitions: list[PartitionKey] | None = None,
     ) -> None:
         """Declare the step to version ``to``.
 
@@ -785,9 +792,15 @@ class AssetMigration:
         when the time has passed. The asset waits for its migration from the
         deploy on.
 
+        ``partitions`` names the partitions of the new definition that a step
+        that changes the partition keys fills, for a change where rivers cannot
+        find them; ``[]`` starts the asset empty. A step that keeps the keys
+        ignores it.
+
         Raises:
             AssetDefinitionError: ``start_at`` is not a datetime with a time
-                zone.
+                zone. The asset raises it for ``partitions`` on a migration
+                that only records the version.
         """
         ...
 
@@ -814,6 +827,11 @@ class MigrationContext(Generic[ConfigT]):
     when the data changed for readers: each materialized partition gets a new
     data version, so its readers become stale.
 
+    When the migration changes the partition keys, ``partition`` holds the
+    partitions of the new definition that the convert fills. rivers records a
+    materialization of each of them, whatever the convert returns, except the
+    ones that it marks with ``mark_partition_failed``.
+
     Annotate the parameter as ``rs.MigrationContext[MyConfig]`` to receive an
     instance of ``MyConfig`` with its default values.
     """
@@ -826,6 +844,9 @@ class MigrationContext(Generic[ConfigT]):
     asset_metadata: dict[str, str] | None
     io_handler: Any
     config: ConfigT | None
+    partition: PartitionContext | None
+    """The partitions that the convert fills when the migration changes the
+    partition keys; ``None`` otherwise."""
 
     def __init__(
         self,
@@ -835,6 +856,7 @@ class MigrationContext(Generic[ConfigT]):
         asset_metadata: dict[str, str] | None = None,
         io_handler: Any = None,
         config: ConfigT | None = None,
+        partition: PartitionContext | None = None,
     ) -> None:
         """Build a context by hand — to call a convert function directly in a
         unit test. Runs build their own.
@@ -846,6 +868,14 @@ class MigrationContext(Generic[ConfigT]):
 
     @property
     def log(self) -> logging.Logger: ...
+    def mark_partition_failed(self, partition_key: PartitionKey, error: str) -> None:
+        """Record one partition that the convert could not fill.
+
+        rivers records a failure for it instead of a materialization.
+
+        Raises:
+            ExecutionError: The key is not in ``partition.keys``.
+        """
 
 class ActionContext(Generic[ConfigT]):
     """Context injected into action functions as their first parameter.
@@ -953,6 +983,7 @@ def migration(
     retry: "RetryPolicy | str | None" = ...,
     description: str | None = ...,
     start_at: datetime.datetime | None = ...,
+    partitions: list[PartitionKey] | None = ...,
 ) -> Callable[[_F], _F]:
     """Mark a classmethod in an asset class body as a migration's function.
 

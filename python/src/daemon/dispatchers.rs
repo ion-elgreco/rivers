@@ -554,9 +554,12 @@ impl MigrationLauncher for MigrationDispatcher {
             asset_key: asset_key.to_string(),
             to_version: to,
         };
-        let (run_id, action) = match work {
-            MigrationWork::Convert { run_id } => (run_id, Some(MIGRATE.to_string())),
-            MigrationWork::RebuildRun { run_id } => (run_id, None),
+        let (run_id, action, partition_key) = match work {
+            MigrationWork::Convert {
+                run_id,
+                partition_key,
+            } => (run_id, Some(MIGRATE.to_string()), partition_key),
+            MigrationWork::RebuildRun { run_id } => (run_id, None, None),
             MigrationWork::RebuildBackfill { backfill_id, keys } => {
                 let request = BackfillRequestData {
                     target: RunType::Materialization(vec![asset_key.to_string()]),
@@ -579,7 +582,7 @@ impl MigrationLauncher for MigrationDispatcher {
         let request = MaterializationRequestData {
             run_id,
             asset_selection: vec![asset_key.to_string()],
-            partition_key: None,
+            partition_key,
             tags: Vec::new(),
             launched_by,
             action,

@@ -167,12 +167,15 @@ impl PyCodeRepository {
         };
         let selection = vec![asset_key];
         match work {
-            MigrationWork::Convert { run_id } => self
+            MigrationWork::Convert {
+                run_id,
+                partition_key,
+            } => self
                 .run_action_with_launcher(
                     MIGRATE.to_string(),
                     Some(selection),
-                    None,
-                    None,
+                    partition_key.as_ref().map(PyPartitionKey::from),
+                    partition_key,
                     None,
                     false,
                     None,

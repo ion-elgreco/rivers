@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use rivers_core::assets::versions::convert_version;
+use rivers_core::assets::versions::{changes_keys, convert_version};
 use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::execution::plan::ExecutionPlan;
 use rivers_core::storage::ScopedStorageHandle;
@@ -13,19 +13,21 @@ use rivers_core::storage::any::AnyStorage;
 
 use crate::assets::action::MIGRATE;
 use crate::errors::ExecutionError;
+use crate::partitions::PartitionsDefinition;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::io_rt;
 
 /// For a run of `migrate`: the version that the convert of each target moves
-/// its stored data to, by the target's version record. `Err` with the reason
-/// when no migration of a target started this run, or when this code has no
-/// convert to that version. Empty for the runs of other verbs.
+/// its stored data to, by the target's version record, and whether that step
+/// changes the target's partition keys. `Err` with the reason when no
+/// migration of a target started this run, or when this code has no convert
+/// to that version. Empty for the runs of other verbs.
 pub(crate) fn convert_versions(
     plan: &ExecutionPlan,
     node_map: &HashMap<String, ResolvedNode>,
     storage: &ScopedStorageHandle<AnyStorage>,
     run_id: &str,
-) -> PyResult<Result<Vec<(String, u32)>, String>> {
+) -> PyResult<Result<Vec<(String, u32, bool)>, String>> {
     if plan.verb() != Some(MIGRATE) {
         return Ok(Ok(Vec::new()));
     }
@@ -38,12 +40,21 @@ pub(crate) fn convert_versions(
         .map(|target| {
             let row = rows.iter().find(|row| row.asset_key == target);
             let to = convert_version(&target, row, run_id)?;
-            match node_map.get(&target) {
-                Some(ResolvedNode::Asset(asset)) if asset.has_convert(to) => Ok((target, to)),
-                _ => Err(format!(
-                    "this code has no convert of {target} to version {to}"
-                )),
-            }
+            let node = match node_map.get(&target) {
+                Some(node @ ResolvedNode::Asset(asset)) if asset.has_convert(to) => node,
+                _ => {
+                    return Err(format!(
+                        "this code has no convert of {target} to version {to}"
+                    ));
+                }
+            };
+            let code = node.partitions_def().map(PartitionsDefinition::fingerprint);
+            let changes = row
+                .map(|row| changes_keys(row, to, code.as_ref()))
+                .transpose()
+                .map_err(|e| format!("{e:#}"))?
+                .unwrap_or(false);
+            Ok((target, to, changes))
         })
         .collect())
 }
@@ -81,10 +92,10 @@ pub(crate) fn bind_converts(
     };
 
     let mut bound = node_map.clone();
-    for (target, to) in versions {
+    for (target, to, changes_keys) in versions {
         if let Some(ResolvedNode::Asset(asset)) = bound.get_mut(&target) {
             let converting = asset
-                .with_convert(py, to)
+                .with_convert(py, to, changes_keys)
                 .expect("convert_versions found the convert");
             *asset = Arc::new(converting);
         }

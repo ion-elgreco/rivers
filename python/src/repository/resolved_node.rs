@@ -377,6 +377,7 @@ impl ResolvedAsset {
                     retry: None,
                     description: Some("Record an observation of external data".to_string()),
                     converts_to: None,
+                    changes_keys: false,
                 }],
                 None => Vec::new(),
             },
@@ -492,9 +493,10 @@ impl ResolvedAsset {
             .any(|m| m.to == to && m.func.is_some())
     }
 
-    /// A copy whose built-in `migrate` runs the convert to version `to`;
-    /// `None` when this code has no convert to that version.
-    pub(crate) fn with_convert(&self, py: Python, to: u32) -> Option<Self> {
+    /// A copy whose built-in `migrate` runs the convert to version `to`, which
+    /// `changes_keys` of the partitions or not; `None` when this code has no
+    /// convert to that version.
+    pub(crate) fn with_convert(&self, py: Python, to: u32, changes_keys: bool) -> Option<Self> {
         let convert = self.migrations.iter().find(|m| m.to == to)?;
         let func = convert.func.as_ref()?;
         let mut bound = self.clone_ref(py);
@@ -506,6 +508,7 @@ impl ResolvedAsset {
         migrate.is_async = convert.is_async;
         migrate.retry = convert.retry.clone();
         migrate.converts_to = Some(to);
+        migrate.changes_keys = changes_keys;
         Some(bound)
     }
 }

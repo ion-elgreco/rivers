@@ -6,6 +6,7 @@ use pyo3::types::{PyDict, PyType};
 
 use super::{definition_error, is_classmethod_or_static, marker, marker_meta, type_name, user_mro};
 use crate::assets::migration::{PyAssetMigration, start_at_ns};
+use crate::partitions::PyPartitionKey;
 
 const MIGRATION_META_ATTR: &str = "__rivers_migration_meta__";
 
@@ -15,7 +16,9 @@ const MIGRATION_META_ATTR: &str = "__rivers_migration_meta__";
 ///     @classmethod
 ///     def add_currency(cls, ctx, warehouse) -> None: ...
 #[pyfunction]
-#[pyo3(signature = (*, to, breaking=true, retry=None, description=None, start_at=None))]
+#[pyo3(signature = (
+    *, to, breaking=true, retry=None, description=None, start_at=None, partitions=None
+))]
 pub(crate) fn migration(
     py: Python<'_>,
     to: i64,
@@ -23,6 +26,7 @@ pub(crate) fn migration(
     retry: Option<Py<PyAny>>,
     description: Option<String>,
     start_at: Option<Bound<'_, PyAny>>,
+    partitions: Option<Vec<PyPartitionKey>>,
 ) -> PyResult<Py<PyAny>> {
     if let Some(at) = &start_at {
         start_at_ns(to, at)?;
@@ -33,6 +37,7 @@ pub(crate) fn migration(
     meta.set_item("retry", retry)?;
     meta.set_item("description", description)?;
     meta.set_item("start_at", start_at)?;
+    meta.set_item("partitions", partitions)?;
     marker(py, MIGRATION_META_ATTR, meta.unbind())
 }
 
@@ -163,7 +168,7 @@ pub(super) fn collect_migrations<'py>(
             MigrationEntry::Ready(v) => built.push(v.clone()),
             MigrationEntry::Marker(meta) => {
                 let kwargs = PyDict::new(py);
-                for key in ["breaking", "retry", "description", "start_at"] {
+                for key in ["breaking", "retry", "description", "start_at", "partitions"] {
                     kwargs.set_item(key, meta.get_item(key)?)?;
                 }
                 let m = py

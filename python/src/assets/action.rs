@@ -234,6 +234,10 @@ pub(crate) struct ResolvedAction {
     /// For the built-in `migrate`: the version that the convert moves the
     /// stored data to. Set when a run binds the convert, at its start.
     pub converts_to: Option<u32>,
+    /// The bound convert changes the partition keys: the run writes a
+    /// `Materialization` of each partition that it fills, whatever the
+    /// convert returns.
+    pub changes_keys: bool,
 }
 
 impl ResolvedAction {
@@ -250,11 +254,13 @@ impl ResolvedAction {
             retry: a.retry.clone(),
             description: a.description.clone(),
             converts_to: None,
+            changes_keys: false,
         }
     }
 
     /// The built-in `migrate` of an asset with converts, before a run binds
-    /// one. Shared: the asset version gate keeps other work away.
+    /// one. Shared: the asset version gate keeps other work away. A keyed
+    /// run fills the partitions of a change of partition keys.
     pub(crate) fn migrate() -> Self {
         Self {
             name: MIGRATE.to_string(),
@@ -263,10 +269,11 @@ impl ResolvedAction {
             exclusive: false,
             ordering: ActionOrdering::UpstreamFirst,
             outcome: ActionOutcome::MayMaterialize,
-            partitioning: PyActionPartitioning::Keyless,
+            partitioning: PyActionPartitioning::Optional,
             retry: None,
             description: None,
             converts_to: None,
+            changes_keys: false,
         }
     }
 
@@ -282,6 +289,7 @@ impl ResolvedAction {
             retry: self.retry.clone(),
             description: self.description.clone(),
             converts_to: self.converts_to,
+            changes_keys: self.changes_keys,
         }
     }
 }

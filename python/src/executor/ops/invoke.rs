@@ -533,6 +533,7 @@ pub(crate) fn execute_action_step(
                         node.metadata().cloned(),
                         handler,
                         config_instance,
+                        partition,
                     ),
                 )?
                 .into_any(),
@@ -625,12 +626,16 @@ pub(crate) fn execute_action_step(
     }
 
     // An observe body marks keys on its `AssetExecutionContext`; a user action
-    // marks them on its `ActionContext`. Exactly one of the two exists per call.
+    // marks them on its `ActionContext`, a convert on its `MigrationContext`.
+    // One of them exists per call.
     let mut failed_partitions: Vec<(crate::partitions::PyPartitionKey, String)> = action_ctx
         .as_ref()
         .and_then(|c| {
-            c.bind(py)
-                .cast::<crate::context::action::PyActionContext>()
+            let c = c.bind(py);
+            if let Ok(b) = c.cast::<crate::context::action::PyActionContext>() {
+                return Some(b.get().drain_failed_partitions().into_iter().collect());
+            }
+            c.cast::<crate::context::migration::PyMigrationContext>()
                 .ok()
                 .map(|b| b.get().drain_failed_partitions().into_iter().collect())
         })

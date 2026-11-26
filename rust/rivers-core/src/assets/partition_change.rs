@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use jiff::{SignedDuration, civil};
 
 use super::partitions_fingerprint::{PartitionsFingerprint, describe_partitions};
+use crate::execution::backfill_spans::{DimensionGrid, with_spans};
 use crate::storage::PartitionKey;
 use crate::timegrid::{TimeGrid, cron_ticks, parse_cron};
 use crate::util::parse_key_datetime;
@@ -203,6 +204,89 @@ fn fill_multi(
         }
     }
     Ok(Some(keys))
+}
+
+/// `keys`, partitions of `partitions` with one value per dimension, as the
+/// key of one run, with each row of time windows written as a span. `None`
+/// for no keys.
+pub fn run_key(
+    keys: Vec<PartitionKey>,
+    partitions: &PartitionsFingerprint,
+) -> Option<PartitionKey> {
+    let grids: Vec<DimensionGrid> = match partitions {
+        PartitionsFingerprint::TimeWindow(grid) => vec![(None, grid.clone())],
+        PartitionsFingerprint::Multi { dimensions } => dimensions
+            .iter()
+            .filter_map(|(name, dimension)| match dimension {
+                PartitionsFingerprint::TimeWindow(grid) => Some((Some(name.clone()), grid.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let key = match keys.as_slice() {
+        [] => return None,
+        [_] => keys.into_iter().next()?,
+        _ if keys
+            .iter()
+            .all(|key| matches!(key, PartitionKey::Single { .. })) =>
+        {
+            PartitionKey::Single {
+                keys: keys
+                    .into_iter()
+                    .flat_map(|key| match key {
+                        PartitionKey::Single { keys } => keys,
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+            }
+        }
+        _ => match grids.first() {
+            Some((Some(time_dim), _)) => by_time_rows(keys, time_dim),
+            _ => PartitionKey::Set { keys },
+        },
+    };
+    with_spans(vec![key], &grids).pop()
+}
+
+/// The dimensions of a key other than its time dimension.
+type OtherDims = Vec<(String, Vec<String>)>;
+
+/// Multi-dimension `keys` as one key per value of the dimensions other than
+/// `time_dim`, each with the values of `time_dim` in order.
+fn by_time_rows(keys: Vec<PartitionKey>, time_dim: &str) -> PartitionKey {
+    let mut rows: Vec<(OtherDims, Vec<String>)> = Vec::new();
+    let mut place: HashMap<OtherDims, usize> = HashMap::new();
+    let mut rest = Vec::new();
+    for key in keys {
+        let PartitionKey::Multi { dims } = key else {
+            rest.push(key);
+            continue;
+        };
+        let (time, others): (Vec<_>, Vec<_>) =
+            dims.into_iter().partition(|(name, _)| name == time_dim);
+        let values = time.into_iter().flat_map(|(_, values)| values);
+        match place.get(&others) {
+            Some(&i) => rows[i].1.extend(values),
+            None => {
+                place.insert(others.clone(), rows.len());
+                rows.push((others, values.collect()));
+            }
+        }
+    }
+    let mut keys: Vec<PartitionKey> = rows
+        .into_iter()
+        .map(|(mut dims, values)| {
+            dims.push((time_dim.to_string(), values));
+            dims.sort();
+            PartitionKey::Multi { dims }
+        })
+        .collect();
+    keys.extend(rest);
+    match keys.len() {
+        1 => keys.pop().expect("one key"),
+        _ => PartitionKey::Set { keys },
+    }
 }
 
 /// The starts of the windows of `after` that the windows of `before` at
@@ -607,6 +691,49 @@ mod tests {
         assert!(error.contains("'01/02/2024' is not a key"), "got: {error}");
     }
 
+    #[test]
+    fn the_partitions_to_fill_run_as_one_key_with_spans() {
+        let hours: Vec<PartitionKey> = (0..30)
+            .map(|hour| single(&format!("2024-01-{:02}-{:02}:00", 1 + hour / 24, hour % 24)))
+            .collect();
+        let gap = [&hours[..10], &hours[12..]].concat();
+
+        let key = run_key(gap.clone(), &time(hourly())).unwrap();
+
+        let PartitionKey::SingleItems { items } = &key else {
+            panic!("expected spans, got {key:?}");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(key.members(), gap);
+        assert_eq!(run_key(Vec::new(), &time(hourly())), None);
+        assert_eq!(
+            run_key(vec![single("eu")], &statics(&["eu"])),
+            Some(single("eu"))
+        );
+    }
+
+    #[test]
+    fn multi_partitions_to_fill_run_as_a_row_of_windows_per_other_value() {
+        let after = by_date_and_region(hourly(), &["eu", "us"]);
+        let hour = |h: u32| format!("2024-01-01-{h:02}:00");
+        let keys: Vec<PartitionKey> = ["eu", "us"]
+            .into_iter()
+            .flat_map(|region| (0..5).map(move |h| multi(&hour(h), region)))
+            .collect();
+
+        let key = run_key(keys.clone(), &after).unwrap();
+
+        let PartitionKey::Set { keys: rows } = &key else {
+            panic!("expected one row per region, got {key:?}");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row, PartitionKey::MultiItems { .. }))
+        );
+        assert_eq!(key.members(), keys);
+    }
+
     /// `cargo test --release -p rivers-core --lib -- --ignored million`.
     #[test]
     #[ignore = "timing: run on a release build"]
@@ -631,10 +758,18 @@ mod tests {
             .collect();
 
         let started = std::time::Instant::now();
-        let filled = fill(&time(long), &time(hours), &stored);
+        let filled = fill(&time(long), &time(hours.clone()), &stored);
         let elapsed = started.elapsed();
-
         assert_eq!(filled.count(), 1_000_008);
         eprintln!("1,000,008 hours to fill in {elapsed:?}");
+
+        let Fill::Keys(keys) = filled else {
+            unreachable!()
+        };
+        let started = std::time::Instant::now();
+        let key = run_key(keys, &time(hours)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(key.member_count(), 1_000_008);
+        eprintln!("as one run key in {elapsed:?}: {}", key.to_display());
     }
 }

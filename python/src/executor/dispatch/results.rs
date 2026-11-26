@@ -504,6 +504,7 @@ fn handle_action_result(
     let converts_partitions = action.is_some_and(|a| a.converts_to.is_some())
         && ctx.scope.partition_key.is_none()
         && node.is_some_and(|n| n.partitions_def().is_some());
+    let changes_keys = action.is_some_and(|a| a.changes_keys);
 
     if outcome == Some(ActionOutcome::Observe) {
         py.detach(|| handle_observation_result(ctx, step_name, &step_result));
@@ -545,6 +546,28 @@ fn handle_action_result(
         );
         return;
     };
+
+    // A convert that changes the partition keys fills each partition of its
+    // run whatever it returns: the stored partitions of the keys before go.
+    if changes_keys {
+        let (metadata, data_version) = match report {
+            Report::Materialized(metadata, data_version) => (metadata, data_version),
+            Report::Unchanged(metadata) => (metadata, None),
+            Report::Completed => (Vec::new(), None),
+        };
+        let data_version = data_version.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        ctx.emit_materialization(
+            step_name,
+            &metadata,
+            Some(data_version.clone()),
+            Vec::new(),
+            now_ts(),
+        );
+        ctx.state
+            .record_data_version(step_name.to_string(), data_version);
+        ctx.emit_success(step_name);
+        return;
+    }
 
     match report {
         Report::Materialized(metadata, data_version) => {

@@ -14,7 +14,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::versions::{CodeVersions, DeclaredMigration, registered_version};
+use super::partition_change::{Fill, partitions_to_fill, run_key, same_keys};
+use super::partitions_fingerprint::PartitionsFingerprint;
+use super::versions::{
+    CodeVersions, DeclaredMigration, changes_keys, parse_partitions, registered_version,
+};
 use crate::storage::{
     AssetVersionHistoryEntry, AssetVersionRecord, AssetVersionState, BackfillStatus, EventRecord,
     EventType, MigrationKind, PartitionKey, RunRecord, RunStatus, ScopedStorage,
@@ -37,8 +41,13 @@ pub const REBUILD_CONCURRENCY: u32 = 4;
 /// The work that moves the stored data of an asset by one version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationWork {
-    /// A run of the built-in `migrate` verb on the asset: its convert.
-    Convert { run_id: String },
+    /// A run of the built-in `migrate` verb on the asset: its convert. A
+    /// convert that changes the partition keys runs with the partitions that
+    /// it fills, as one key.
+    Convert {
+        run_id: String,
+        partition_key: Option<PartitionKey>,
+    },
     /// A run that materializes the asset again: the rebuild of an asset
     /// without partitions.
     RebuildRun { run_id: String },
@@ -53,7 +62,9 @@ pub enum MigrationWork {
 impl MigrationWork {
     fn ids(&self) -> (Option<String>, Option<String>) {
         match self {
-            Self::Convert { run_id } | Self::RebuildRun { run_id } => (Some(run_id.clone()), None),
+            Self::Convert { run_id, .. } | Self::RebuildRun { run_id } => {
+                (Some(run_id.clone()), None)
+            }
             Self::RebuildBackfill { backfill_id, .. } => (None, Some(backfill_id.clone())),
         }
     }
@@ -94,6 +105,8 @@ struct Done {
     backfill_id: Option<String>,
     filled: Option<u64>,
     failed: Option<u64>,
+    /// The work changed the partition keys to the code's definition.
+    changed_keys: bool,
 }
 
 /// The part of one daemon in the migrations of its code location.
@@ -217,6 +230,18 @@ impl MigrationLoop {
                         return Ok(true);
                     }
                     self.log_change(&row, &next);
+                    if row.state == AssetVersionState::Pending
+                        && next.state == AssetVersionState::Draining
+                        && self.changes_keys_at_target(&row)?
+                        && let Err(e) = cancel_work_with_old_keys(&storage.scoped(), &row).await
+                    {
+                        tracing::warn!(
+                            target: "rivers::migrations",
+                            asset = %row.asset_key,
+                            error = %format!("{e:#}"),
+                            "could not cancel the work with the partition keys before"
+                        );
+                    }
                     row = AssetVersionRecord {
                         revision: row.revision + 1,
                         updated_at: now,
@@ -297,8 +322,9 @@ impl MigrationLoop {
         now: i64,
     ) -> Result<Next> {
         let to = row.applied_version + 1;
-        if to > row.target_version.unwrap_or(row.applied_version) {
-            return Ok(self.finished(row, declared));
+        let target = row.target_version.unwrap_or(row.applied_version);
+        if to > target {
+            return self.finished(row, declared);
         }
         let Some(migration) = self.code.migration(&row.asset_key, to) else {
             return Ok(Next::Write(
@@ -306,6 +332,22 @@ impl MigrationLoop {
                 None,
             ));
         };
+        if changes_keys(row, to, self.code_partitions(&row.asset_key))? {
+            return self.change_keys(storage, row, migration, now).await;
+        }
+        if migration.kind == MigrationKind::Rebuild && self.changes_keys_at_target(row)? {
+            let reason = "a rebuild before the change of partition keys cannot run: this code \
+                          defines only the new partitions";
+            return Ok(Next::Write(failed(row, reason.to_string()), None));
+        }
+        if migration.partitions.is_some() && row.run_id.is_none() && row.backfill_id.is_none() {
+            tracing::warn!(
+                target: "rivers::migrations",
+                asset = %row.asset_key,
+                to_version = to,
+                "the migration does not change the partition keys: its partitions= does not apply"
+            );
+        }
         match migration.kind {
             MigrationKind::VersionOnly => {
                 self.applied(storage, row, migration, Done::default(), now)
@@ -323,17 +365,20 @@ impl MigrationLoop {
         &self,
         storage: &ScopedStorageHandle<S>,
         row: &AssetVersionRecord,
-        migration: DeclaredMigration,
+        migration: &DeclaredMigration,
         now: i64,
     ) -> Result<Next> {
         let to = migration.to;
+        let convert = |run_id| MigrationWork::Convert {
+            run_id,
+            partition_key: None,
+        };
         let Some(run_id) = row.run_id.clone() else {
-            let run_id = new_id();
-            return Ok(self.launch(row, to, MigrationWork::Convert { run_id }, now));
+            return Ok(self.launch(row, to, convert(new_id()), now));
         };
         // Without a record, the work never started: start it again, with its id.
         let Some(run) = storage.backend().get_run(&run_id).await? else {
-            return Ok(self.launch(row, to, MigrationWork::Convert { run_id }, now));
+            return Ok(self.launch(row, to, convert(run_id), now));
         };
         match run.status {
             RunStatus::Success => {
@@ -361,7 +406,7 @@ impl MigrationLoop {
         &self,
         storage: &ScopedStorageHandle<S>,
         row: &AssetVersionRecord,
-        migration: DeclaredMigration,
+        migration: &DeclaredMigration,
         now: i64,
     ) -> Result<Next> {
         let to = migration.to;
@@ -410,7 +455,7 @@ impl MigrationLoop {
         &self,
         storage: &ScopedStorageHandle<S>,
         row: &AssetVersionRecord,
-        migration: DeclaredMigration,
+        migration: &DeclaredMigration,
         now: i64,
     ) -> Result<Next> {
         let to = migration.to;
@@ -472,10 +517,24 @@ impl MigrationLoop {
         &self,
         storage: &ScopedStorageHandle<S>,
         row: &AssetVersionRecord,
-        migration: DeclaredMigration,
+        migration: &DeclaredMigration,
         done: Done,
         now: i64,
     ) -> Result<Next> {
+        // Readers of the keys before cannot read the new keys.
+        if done.changed_keys && !migration.breaking {
+            tracing::warn!(
+                target: "rivers::migrations",
+                asset = %row.asset_key,
+                to_version = migration.to,
+                "the migration changes the partition keys, so it is breaking: its breaking=False \
+                 does not apply"
+            );
+        }
+        let partitions = match done.changed_keys {
+            true => self.code.partitions_json(&row.asset_key)?,
+            false => row.partitions.clone(),
+        };
         storage
             .scoped()
             .add_asset_version_history(&AssetVersionHistoryEntry {
@@ -483,7 +542,7 @@ impl MigrationLoop {
                 asset_key: row.asset_key.clone(),
                 version: migration.to,
                 kind: migration.kind,
-                breaking: migration.breaking,
+                breaking: migration.breaking || done.changed_keys,
                 run_id: done.run_id,
                 backfill_id: done.backfill_id,
                 filled: done.filled,
@@ -495,6 +554,7 @@ impl MigrationLoop {
             self.hold(
                 AssetVersionRecord {
                     applied_version: migration.to,
+                    partitions,
                     run_id: None,
                     backfill_id: None,
                     ..row.clone()
@@ -505,9 +565,10 @@ impl MigrationLoop {
         ))
     }
 
-    /// The row once its data is at the target: `ready`, or `pending` for a
-    /// higher version that this code declares.
-    fn finished(&self, row: &AssetVersionRecord, declared: u32) -> Next {
+    /// The row once its data is at the target: `ready` in the code's
+    /// partitions definition, or `pending` for a higher version that this
+    /// code declares.
+    fn finished(&self, row: &AssetVersionRecord, declared: u32) -> Result<Next> {
         let ready = AssetVersionRecord {
             state: AssetVersionState::Ready,
             target_version: None,
@@ -517,9 +578,219 @@ impl MigrationLoop {
             backfill_id: None,
             owner: None,
             lease_expires_at: None,
+            partitions: self.code.partitions_json(&row.asset_key)?,
             ..row.clone()
         };
-        Next::Write(registered_version(&ready, declared).unwrap_or(ready), None)
+        Ok(Next::Write(
+            registered_version(&ready, declared).unwrap_or(ready),
+            None,
+        ))
+    }
+
+    /// The step to the target version when it changes the partition keys of
+    /// the asset to the code's definition. Its work fills the partitions of
+    /// the new definition that the stored partitions cover: a convert in one
+    /// run, a rebuild as a backfill, and a version-only step none. Then the
+    /// stored partitions of the definition before go.
+    async fn change_keys<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorageHandle<S>,
+        row: &AssetVersionRecord,
+        migration: &DeclaredMigration,
+        now: i64,
+    ) -> Result<Next> {
+        let to = migration.to;
+        if let Some(backfill_id) = &row.backfill_id
+            && let Some(backfill) = storage.backend().get_backfill(backfill_id).await?
+        {
+            if matches!(
+                backfill.status,
+                BackfillStatus::Requested | BackfillStatus::InProgress
+            ) {
+                return Ok(self.renewed(row, now));
+            }
+            let filled = backfill.completed_partitions;
+            let done = Done {
+                backfill_id: Some(backfill_id.clone()),
+                filled: Some(filled),
+                failed: Some(backfill.num_partitions.saturating_sub(filled)),
+                changed_keys: true,
+                ..Done::default()
+            };
+            return self
+                .keys_changed(storage, row, migration, done, backfill.create_time, now)
+                .await;
+        }
+        if let Some(run_id) = &row.run_id
+            && let Some(run) = storage.backend().get_run(run_id).await?
+        {
+            let (filled, failed) = match (&run.status, migration.kind) {
+                (RunStatus::Queued | RunStatus::NotStarted | RunStatus::Started, _) => {
+                    return Ok(self.renewed(row, now));
+                }
+                (RunStatus::Success, _) => {
+                    let failed = storage
+                        .backend()
+                        .get_run_failed_partitions(run_id)
+                        .await?
+                        .len() as u64;
+                    let fill = run
+                        .partition_key
+                        .as_ref()
+                        .map_or(1, |key| key.member_count());
+                    ((fill as u64).saturating_sub(failed), failed)
+                }
+                (RunStatus::Failure | RunStatus::Canceled, MigrationKind::Convert) => {
+                    let what = format!("the convert to version {to}");
+                    let reason = run_failure(storage, &run, &what).await?;
+                    return Ok(Next::Write(failed(row, reason), None));
+                }
+                // The rebuild of an asset without partitions: it starts empty.
+                (RunStatus::Failure | RunStatus::Canceled, _) => (0, 1),
+            };
+            let done = Done {
+                run_id: Some(run_id.clone()),
+                filled: Some(filled),
+                failed: Some(failed),
+                changed_keys: true,
+                ..Done::default()
+            };
+            return self
+                .keys_changed(storage, row, migration, done, run.start_time, now)
+                .await;
+        }
+
+        // No work yet, or work without a record: start it, with its id.
+        let fill = match self.fill(storage, row, migration).await? {
+            Ok(fill) => fill,
+            Err(reason) => return Ok(Next::Write(failed(row, reason), None)),
+        };
+        let code = self.code_partitions(&row.asset_key);
+        let key = match &fill {
+            Fill::Whole => None,
+            Fill::Keys(keys) => match code.and_then(|code| run_key(keys.clone(), code)) {
+                Some(key) => Some(key),
+                None => {
+                    let done = Done {
+                        filled: Some(0),
+                        failed: Some(0),
+                        changed_keys: true,
+                        ..Done::default()
+                    };
+                    return self
+                        .keys_changed(storage, row, migration, done, now, now)
+                        .await;
+                }
+            },
+        };
+        let run_id = || row.run_id.clone().unwrap_or_else(new_id);
+        let work = match (migration.kind, key) {
+            (MigrationKind::Convert, partition_key) => MigrationWork::Convert {
+                run_id: run_id(),
+                partition_key,
+            },
+            (_, None) => MigrationWork::RebuildRun { run_id: run_id() },
+            (_, Some(key)) => MigrationWork::RebuildBackfill {
+                backfill_id: row.backfill_id.clone().unwrap_or_else(new_id),
+                keys: vec![key],
+            },
+        };
+        tracing::info!(
+            target: "rivers::migrations",
+            asset = %row.asset_key,
+            to_version = to,
+            partitions = fill.count(),
+            "the migration changes the partition keys"
+        );
+        Ok(self.launch(row, to, work, now))
+    }
+
+    /// The partitions of the code's definition that the step to `migration`
+    /// fills: the ones that it names, else the ones that the stored
+    /// partitions cover. `Ok(Err)` with the reason when rivers cannot find
+    /// them.
+    async fn fill<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorageHandle<S>,
+        row: &AssetVersionRecord,
+        migration: &DeclaredMigration,
+    ) -> Result<std::result::Result<Fill, String>> {
+        if let Some(keys) = &migration.partitions {
+            if !keys.is_empty() && !self.code.is_partitioned(&row.asset_key) {
+                return Ok(Err(format!(
+                    "partitions= names partitions, but this code defines {} without partitions",
+                    row.asset_key
+                )));
+            }
+            return Ok(Ok(Fill::Keys(keys.clone())));
+        }
+        if migration.kind == MigrationKind::VersionOnly {
+            return Ok(Ok(Fill::Keys(Vec::new())));
+        }
+        let before = parse_partitions(row.partitions.as_deref())?;
+        let stored = match &before {
+            Some(_) => {
+                storage
+                    .scoped()
+                    .get_materialized_partitions(&row.asset_key)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let has_data = match &before {
+            Some(_) => !stored.is_empty(),
+            None => storage
+                .scoped()
+                .get_asset_records_by_keys(std::slice::from_ref(&row.asset_key))
+                .await?
+                .iter()
+                .any(|record| record.last_timestamp.is_some()),
+        };
+        if !has_data {
+            return Ok(Ok(Fill::Keys(Vec::new())));
+        }
+        let code = self.code.partitions(&row.asset_key);
+        let no_static_keys = Default::default();
+        Ok(partitions_to_fill(
+            before.as_ref(),
+            code.map(|code| &code.fingerprint),
+            &stored,
+            code.map_or(&no_static_keys, |code| &code.static_keys),
+        ))
+    }
+
+    /// The step that changed the partition keys ended: the stored partitions
+    /// of the definition before go, with one whole-asset `Deletion` at
+    /// `since`, the start of the step's work, and the row takes the code's
+    /// definition. Rows that the work wrote stay.
+    async fn keys_changed<S: StorageBackend>(
+        &self,
+        storage: &ScopedStorageHandle<S>,
+        row: &AssetVersionRecord,
+        migration: &DeclaredMigration,
+        done: Done,
+        since: i64,
+        now: i64,
+    ) -> Result<Next> {
+        let work_id = done
+            .run_id
+            .clone()
+            .or_else(|| done.backfill_id.clone())
+            .unwrap_or_else(new_id);
+        delete_older(storage, &row.asset_key, &work_id, since).await?;
+        self.applied(storage, row, migration, done, now).await
+    }
+
+    /// The code's partitions definition of `key`.
+    fn code_partitions(&self, key: &str) -> Option<&PartitionsFingerprint> {
+        self.code.partitions(key).map(|code| &code.fingerprint)
+    }
+
+    /// Whether the migration in `row` changes the partition keys of the
+    /// asset at its target version.
+    fn changes_keys_at_target(&self, row: &AssetVersionRecord) -> Result<bool> {
+        let target = row.target_version.unwrap_or(row.applied_version);
+        changes_keys(row, target, self.code_partitions(&row.asset_key))
     }
 
     /// Hold the row with the id of `work` on it, then start the work. Of the
@@ -699,6 +970,49 @@ pub async fn drain_runs<S: StorageBackend>(
         .collect())
 }
 
+/// Cancel the work on the asset of `row` that names partitions of the
+/// definition before a change of its partition keys: its queued runs and its
+/// requested or running backfills, created before the migration in `row`
+/// went pending. Started runs are drained.
+async fn cancel_work_with_old_keys<S: StorageBackend>(
+    storage: &ScopedStorage<'_, S>,
+    row: &AssetVersionRecord,
+) -> Result<()> {
+    let key = row.asset_key.as_str();
+    for run in storage.get_queued_runs().await? {
+        let touches = run.node_names.is_empty() || run.node_names.iter().any(|name| name == key);
+        if touches
+            && run.start_time < row.updated_at
+            && !is_own_work(row, &run)
+            && storage.cancel_queued_run(&run.run_id).await?
+        {
+            tracing::info!(
+                target: "rivers::migrations",
+                asset = %key,
+                run_id = %run.run_id,
+                "canceled a queued run: the partition keys of the asset change"
+            );
+        }
+    }
+    for status in [BackfillStatus::Requested, BackfillStatus::InProgress] {
+        for backfill in storage.get_backfills(None, Some(status)).await? {
+            if backfill.create_time < row.updated_at
+                && backfill.asset_selection.iter().any(|name| name == key)
+                && row.backfill_id.as_deref() != Some(backfill.backfill_id.as_str())
+            {
+                storage.cancel_backfill(&backfill.backfill_id).await?;
+                tracing::info!(
+                    target: "rivers::migrations",
+                    asset = %key,
+                    backfill_id = %backfill.backfill_id,
+                    "canceled a backfill: the partition keys of the asset change"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether `run` is the convert or rebuild of the migration in `row`.
 fn is_own_work(row: &AssetVersionRecord, run: &RunRecord) -> bool {
     row.run_id.as_deref() == Some(run.run_id.as_str())
@@ -767,10 +1081,33 @@ pub async fn start_migration<S: StorageBackend>(
             ..row.clone()
         };
         if storage.put_asset_version(&next, Some(row.revision)).await? {
+            if changes_keys_to_stored_code(storage, &row).await? {
+                cancel_work_with_old_keys(storage, &row).await?;
+            }
             return Ok(true);
         }
     }
     bail!("asset '{asset_key}': other writers changed its version row {RETRY_ATTEMPTS} times")
+}
+
+/// Whether the migration in `row` changes the partition keys of the asset
+/// to the definition of the code that the stored topology describes.
+async fn changes_keys_to_stored_code<S: StorageBackend>(
+    storage: &ScopedStorage<'_, S>,
+    row: &AssetVersionRecord,
+) -> Result<bool> {
+    let Some(topology) = storage.get_graph_topology().await? else {
+        return Ok(false);
+    };
+    let Some(node) = topology
+        .nodes
+        .iter()
+        .find(|node| node.name == row.asset_key)
+    else {
+        return Ok(false);
+    };
+    let before = parse_partitions(row.partitions.as_deref())?;
+    Ok(!same_keys(before.as_ref(), node.partitions.as_ref()))
 }
 
 /// Stop a migration that has not started to run: `pending` or `draining` →
@@ -871,6 +1208,8 @@ async fn run_failure<S: StorageBackend>(
 /// Remove the state of each partition of `asset_key` that a rebuild did not
 /// write: one whole-asset `Deletion` at `since`, the start of the rebuild,
 /// under the id of the rebuild's run or backfill. Rows written later stay.
+/// A step that changes the partition keys removes the partitions of the
+/// definition before in the same way.
 async fn delete_older<S: StorageBackend>(
     storage: &ScopedStorageHandle<S>,
     asset_key: &str,
@@ -908,7 +1247,7 @@ mod tests {
 
     use super::*;
     use crate::assets::graph::{AssetGraph, DagNode, NodeKind};
-    use crate::assets::versions::first_version_row;
+    use crate::assets::versions::{CodePartitions, first_version_row};
     use crate::storage::any::AnyStorage;
     use crate::storage::{
         AssetRecord, CodeLocationContext, DEFAULT_CODE_LOCATION_ID, LaunchedBy, RunRecord,
@@ -928,13 +1267,20 @@ mod tests {
             if let Some(error) = self.refuse {
                 bail!("{error}");
             }
-            if let MigrationWork::Convert { run_id } | MigrationWork::RebuildRun { run_id } = &work
+            if let MigrationWork::Convert { run_id, .. } | MigrationWork::RebuildRun { run_id } =
+                &work
             {
                 let launched_by = LaunchedBy::Migration {
                     asset_key: asset_key.to_string(),
                     to_version: to,
                 };
-                let run = started_run(run_id, CL, &[asset_key], launched_by);
+                let run = RunRecord {
+                    partition_key: match &work {
+                        MigrationWork::Convert { partition_key, .. } => partition_key.clone(),
+                        _ => None,
+                    },
+                    ..started_run(run_id, CL, &[asset_key], launched_by)
+                };
                 self.storage.create_run(&run).await?;
             }
             self.seen
@@ -957,7 +1303,8 @@ mod tests {
                     (
                         _,
                         _,
-                        MigrationWork::Convert { run_id } | MigrationWork::RebuildRun { run_id },
+                        MigrationWork::Convert { run_id, .. }
+                        | MigrationWork::RebuildRun { run_id },
                     ),
                 ] => run_id.clone(),
                 other => panic!("expected one run, got {other:?}"),
@@ -1069,13 +1416,14 @@ mod tests {
                         kind,
                         breaking: true,
                         start_at: None,
+                        partitions: None,
                     })
                     .collect();
                 (key.to_string(), steps)
             })
             .collect::<HashMap<_, _>>();
         let code =
-            CodeVersions::new(&graph(), versions).with_migrations(migrations, HashSet::new());
+            CodeVersions::new(&graph(), versions).with_migrations(migrations, HashMap::new());
         MigrationLoop::new(owner.to_string(), Arc::new(code))
     }
 
@@ -1273,9 +1621,10 @@ mod tests {
                         kind: Convert,
                         breaking: true,
                         start_at: Some(start_at),
+                        partitions: None,
                     }],
                 )]),
-                HashSet::new(),
+                HashMap::new(),
             );
         MigrationLoop::new(owner.to_string(), Arc::new(code))
     }
@@ -1346,9 +1695,10 @@ mod tests {
                         kind: VersionOnly,
                         breaking: true,
                         start_at: None,
+                        partitions: None,
                     }],
                 )]),
-                HashSet::new(),
+                HashMap::new(),
             );
 
         f.pass(&MigrationLoop::new("a".to_string(), Arc::new(code)))
@@ -1504,6 +1854,7 @@ mod tests {
         let started = launcher.0.into_inner().unwrap();
         let lost = MigrationWork::Convert {
             run_id: "lost".to_string(),
+            partition_key: None,
         };
         assert_eq!(started, [lost]);
         assert_eq!(f.row("orders").await.owner.as_deref(), Some("a"));
@@ -1648,5 +1999,390 @@ mod tests {
         assert_eq!(f.row("orders").await.state, AssetVersionState::Ready);
         assert_eq!(f.history("orders").await, [(2, Rebuild, Some(0), Some(0))]);
         assert!(f.launches.taken().is_empty());
+    }
+
+    fn grid(cron: &str, fmt: &str) -> PartitionsFingerprint {
+        PartitionsFingerprint::TimeWindow(crate::timegrid::TimeGrid {
+            cron_schedule: Some(cron.to_string()),
+            interval_seconds: None,
+            start: jiff::civil::date(2024, 1, 1).at(0, 0, 0, 0),
+            end: Some(jiff::civil::date(2025, 1, 1).at(0, 0, 0, 0)),
+            fmt: fmt.to_string(),
+        })
+    }
+
+    fn daily() -> PartitionsFingerprint {
+        grid("0 0 * * *", "%Y-%m-%d")
+    }
+
+    fn hourly() -> PartitionsFingerprint {
+        grid("0 * * * *", "%Y-%m-%dT%H:00")
+    }
+
+    fn json(partitions: &PartitionsFingerprint) -> Option<String> {
+        Some(serde_json::to_string(partitions).unwrap())
+    }
+
+    fn key(value: &str) -> PartitionKey {
+        PartitionKey::Single {
+            keys: vec![value.to_string()],
+        }
+    }
+
+    /// The loop of daemon `a`, whose code declares `orders` with hourly
+    /// partitions and the migrations `steps` from version 2. The last step
+    /// names `partitions`, and none is breaking.
+    fn hourly_daemon(
+        steps: &[MigrationKind],
+        partitions: Option<Vec<PartitionKey>>,
+    ) -> MigrationLoop {
+        let last = 1 + steps.len() as u32;
+        let migrations = (2..)
+            .zip(steps)
+            .map(|(to, &kind)| DeclaredMigration {
+                to,
+                kind,
+                breaking: false,
+                start_at: None,
+                partitions: (to == last).then(|| partitions.clone()).flatten(),
+            })
+            .collect();
+        let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), last)]))
+            .with_migrations(
+                HashMap::from([("orders".to_string(), migrations)]),
+                HashMap::from([(
+                    "orders".to_string(),
+                    CodePartitions {
+                        fingerprint: hourly(),
+                        static_keys: HashMap::new(),
+                    },
+                )]),
+            );
+        MigrationLoop::new("a".to_string(), Arc::new(code))
+    }
+
+    /// `orders` with a materialization of each of `keys` and the row of a
+    /// migration to `target`, both made under `before`.
+    async fn stored_orders(
+        f: &Fixture,
+        before: &PartitionsFingerprint,
+        keys: &[&str],
+        target: u32,
+    ) {
+        f.handle
+            .scoped()
+            .register_assets(vec![AssetRecord {
+                code_location_id: CL.to_string(),
+                asset_key: "orders".to_string(),
+                tags: Vec::new(),
+                kinds: Vec::new(),
+                asset_group: None,
+                code_version: None,
+                last_event_id: None,
+                last_run_id: None,
+                last_timestamp: None,
+                last_data_version: None,
+                last_materialization_code_version: None,
+                last_input_data_versions: Vec::new(),
+                pool: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        for (i, value) in keys.iter().enumerate() {
+            f.event(
+                "old-run",
+                EventType::Materialization { data_version: None },
+                value,
+                now_ts() - 1_000 - i as i64,
+            )
+            .await;
+        }
+        f.put(&AssetVersionRecord {
+            partitions: json(before),
+            ..pending("orders", 1, target)
+        })
+        .await;
+    }
+
+    impl Fixture {
+        async fn event(
+            &self,
+            run_id: &str,
+            event_type: EventType,
+            partition: &str,
+            timestamp: i64,
+        ) {
+            self.storage
+                .store_event(&EventRecord {
+                    code_location_id: CL.to_string(),
+                    event_type,
+                    asset_key: Some("orders".to_string()),
+                    run_id: run_id.to_string(),
+                    partition_key: Some(key(partition)),
+                    timestamp,
+                    metadata: Vec::new(),
+                    input_data_versions: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn materialized(&self) -> Vec<String> {
+            let mut keys: Vec<String> = self
+                .handle
+                .scoped()
+                .get_materialized_partitions("orders")
+                .await
+                .unwrap()
+                .iter()
+                .map(PartitionKey::to_display)
+                .collect();
+            keys.sort();
+            keys
+        }
+    }
+
+    #[tokio::test]
+    async fn a_convert_that_changes_the_keys_fills_the_new_partitions_in_one_run() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01", "2024-01-02"], 2).await;
+        let a = hourly_daemon(&[Convert], None);
+
+        f.pass(&a).await;
+        let (run_id, run_key) = match f.launches.taken().as_slice() {
+            [
+                (
+                    _,
+                    2,
+                    MigrationWork::Convert {
+                        run_id,
+                        partition_key: Some(key),
+                    },
+                ),
+            ] => (run_id.clone(), key.clone()),
+            other => panic!("expected one convert of some partitions, got {other:?}"),
+        };
+        assert_eq!(run_key.member_count(), 48);
+        // The run writes one partition, and marks another failed.
+        let written = EventType::Materialization { data_version: None };
+        f.event(&run_id, written, "2024-01-01T00:00", now_ts())
+            .await;
+        f.event(
+            &run_id,
+            EventType::StepFailure,
+            "2024-01-01T01:00",
+            now_ts(),
+        )
+        .await;
+        f.end_run(&run_id, RunStatus::Success).await;
+        f.pass(&a).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.applied_version),
+            (AssetVersionState::Ready, 2)
+        );
+        assert_eq!(row.partitions, json(&hourly()));
+        let history = f
+            .handle
+            .scoped()
+            .get_asset_version_history("orders")
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| (entry.filled, entry.failed, entry.breaking))
+                .collect::<Vec<_>>(),
+            [(Some(47), Some(1), true)]
+        );
+        // The daily partitions went; the partition that the run wrote stayed.
+        assert_eq!(f.materialized().await, ["2024-01-01T00:00"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_convert_that_changes_the_keys_keeps_the_stored_partitions() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+        let a = hourly_daemon(&[Convert], None);
+
+        f.pass(&a).await;
+        let run_id = f.launches.one_run();
+        f.end_run(&run_id, RunStatus::Failure).await;
+        f.pass(&a).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.applied_version),
+            (AssetVersionState::Failed, 1)
+        );
+        assert_eq!(row.partitions, json(&daily()));
+        assert_eq!(f.materialized().await, ["2024-01-01"]);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_that_changes_the_keys_backfills_the_new_partitions() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+
+        f.pass(&hourly_daemon(&[Rebuild], None)).await;
+
+        let launched = f.launches.taken();
+        let [(_, 2, MigrationWork::RebuildBackfill { backfill_id, keys })] = launched.as_slice()
+        else {
+            panic!("expected one backfill, got {launched:?}");
+        };
+        assert_eq!(
+            keys.iter()
+                .map(PartitionKey::member_count)
+                .collect::<Vec<_>>(),
+            [24]
+        );
+        assert_eq!(
+            f.row("orders").await.backfill_id.as_ref(),
+            Some(backfill_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_only_step_that_changes_the_keys_starts_the_asset_empty() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+
+        f.pass(&hourly_daemon(&[VersionOnly], None)).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.applied_version),
+            (AssetVersionState::Ready, 2)
+        );
+        assert_eq!(row.partitions, json(&hourly()));
+        assert_eq!(
+            f.history("orders").await,
+            [(2, VersionOnly, Some(0), Some(0))]
+        );
+        assert!(f.materialized().await.is_empty());
+        assert!(f.launches.taken().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_before_the_change_of_keys_fails_the_migration() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 3).await;
+
+        f.pass(&hourly_daemon(&[Rebuild, Convert], None)).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(row.state, AssetVersionState::Failed);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(
+                "a rebuild before the change of partition keys cannot run: this code defines \
+                 only the new partitions"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn partitions_that_rivers_cannot_find_come_from_the_migration() {
+        let regions = PartitionsFingerprint::static_keys(["eu", "us"]);
+        let f = Fixture::new().await;
+        stored_orders(&f, &regions, &["eu"], 2).await;
+
+        f.pass(&hourly_daemon(&[Convert], None)).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(row.state, AssetVersionState::Failed);
+        assert!(
+            row.reason
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with("give them with partitions=")),
+            "{:?}",
+            row.reason
+        );
+
+        let named = vec![key("2024-01-01T00:00")];
+        retry_migration(&f.handle.scoped(), "orders").await.unwrap();
+        f.pass(&hourly_daemon(&[Convert], Some(named.clone())))
+            .await;
+        let launched = f.launches.taken();
+        let [(_, 2, MigrationWork::Convert { partition_key, .. })] = launched.as_slice() else {
+            panic!("expected one convert, got {launched:?}");
+        };
+        assert_eq!(partition_key.as_ref(), named.first());
+    }
+
+    #[tokio::test]
+    async fn partitions_for_an_asset_without_partitions_fail_the_migration() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+        let migration = DeclaredMigration {
+            to: 2,
+            kind: Convert,
+            breaking: true,
+            start_at: None,
+            partitions: Some(vec![key("2024-01-01")]),
+        };
+        let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), 2)]))
+            .with_migrations(
+                HashMap::from([("orders".to_string(), vec![migration])]),
+                HashMap::new(),
+            );
+
+        f.pass(&MigrationLoop::new("a".to_string(), Arc::new(code)))
+            .await;
+
+        let row = f.row("orders").await;
+        assert_eq!(row.state, AssetVersionState::Failed);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("partitions= names partitions, but this code defines orders without partitions")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_partitions_to_fill_start_the_asset_empty() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+
+        f.pass(&hourly_daemon(&[Convert], Some(Vec::new()))).await;
+
+        let row = f.row("orders").await;
+        assert_eq!(
+            (row.state, row.applied_version),
+            (AssetVersionState::Ready, 2)
+        );
+        assert!(f.materialized().await.is_empty());
+        assert!(f.launches.taken().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_change_of_keys_cancels_the_work_queued_with_the_keys_before() {
+        let f = Fixture::new().await;
+        stored_orders(&f, &daily(), &["2024-01-01"], 2).await;
+        let pending_since = f.row("orders").await.updated_at;
+        let queued = |run_id: &str, start_time| RunRecord {
+            status: RunStatus::Queued,
+            start_time,
+            ..started_run(run_id, CL, &["orders"], LaunchedBy::default())
+        };
+        f.storage
+            .enqueue_run(&queued("before", pending_since - 1))
+            .await
+            .unwrap();
+        f.storage
+            .enqueue_run(&queued("after", pending_since + HOUR))
+            .await
+            .unwrap();
+
+        f.pass(&hourly_daemon(&[Convert], None)).await;
+
+        for (run_id, status) in [
+            ("before", RunStatus::Canceled),
+            ("after", RunStatus::Queued),
+        ] {
+            let run = f.storage.get_run(run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, status, "{run_id}");
+        }
     }
 }

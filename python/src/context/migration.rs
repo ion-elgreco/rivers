@@ -1,9 +1,13 @@
 //! MigrationContext — passed to the convert of an asset migration.
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
+
+use crate::errors::ExecutionError;
+use crate::partitions::{PartitionContext, PyPartitionKey};
 
 /// Context injected into a convert function as its first parameter.
 #[pyclass(name = "MigrationContext", frozen, module = "rivers._core")]
@@ -24,10 +28,16 @@ pub struct PyMigrationContext {
     /// Config instance built from the `MigrationContext[Config]` annotation.
     #[pyo3(get)]
     pub config: Option<Py<PyAny>>,
+    /// The partitions that a convert that changes the partition keys fills,
+    /// in the new definition.
+    #[pyo3(get)]
+    pub partition: Option<Py<PartitionContext>>,
     _logger: PyOnceLock<Py<PyAny>>,
+    _failed_partitions: Mutex<HashMap<PyPartitionKey, String>>,
 }
 
 impl PyMigrationContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         asset_name: String,
         run_id: String,
@@ -35,6 +45,7 @@ impl PyMigrationContext {
         asset_metadata: Option<HashMap<String, String>>,
         io_handler: Option<Py<PyAny>>,
         config: Option<Py<PyAny>>,
+        partition: Option<Py<PartitionContext>>,
     ) -> Self {
         Self {
             asset_name,
@@ -43,8 +54,14 @@ impl PyMigrationContext {
             asset_metadata,
             io_handler,
             config,
+            partition,
             _logger: PyOnceLock::new(),
+            _failed_partitions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn drain_failed_partitions(&self) -> HashMap<PyPartitionKey, String> {
+        std::mem::take(&mut *self._failed_partitions.lock().unwrap())
     }
 }
 
@@ -53,7 +70,8 @@ impl PyMigrationContext {
     /// Build a context by hand — for calling a convert function directly in a
     /// unit test. Runs build their own.
     #[new]
-    #[pyo3(signature = (asset_name, to_version, run_id=String::new(), asset_metadata=None, io_handler=None, config=None))]
+    #[pyo3(signature = (asset_name, to_version, run_id=String::new(), asset_metadata=None, io_handler=None, config=None, partition=None))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         asset_name: String,
         to_version: u32,
@@ -61,6 +79,7 @@ impl PyMigrationContext {
         asset_metadata: Option<HashMap<String, String>>,
         io_handler: Option<Py<PyAny>>,
         config: Option<Py<PyAny>>,
+        partition: Option<Py<PartitionContext>>,
     ) -> PyResult<Self> {
         if to_version < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -74,7 +93,28 @@ impl PyMigrationContext {
             asset_metadata,
             io_handler,
             config,
+            partition,
         ))
+    }
+
+    /// Mark one partition that the convert could not fill. rivers writes a
+    /// failure for it, and a materialization of each other partition.
+    fn mark_partition_failed(&self, partition_key: PyPartitionKey, error: String) -> PyResult<()> {
+        let valid = self
+            .partition
+            .as_ref()
+            .is_some_and(|p| p.get().contains(&partition_key));
+        if !valid {
+            return Err(ExecutionError::new_err(format!(
+                "partition key {} is not one of the partitions that this convert fills",
+                partition_key.__repr__()
+            )));
+        }
+        self._failed_partitions
+            .lock()
+            .unwrap()
+            .insert(partition_key, error);
+        Ok(())
     }
 
     /// The version of the stored data before the convert.

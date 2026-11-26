@@ -7,14 +7,15 @@ use std::collections::{HashMap, HashSet};
 use pyo3::prelude::*;
 use rivers_core::assets::graph::AssetGraph;
 use rivers_core::assets::versions::{
-    CodeVersions, DeclaredMigration, GatedRun, VersionGate, check_asset_versions,
+    CodePartitions, CodeVersions, DeclaredMigration, GatedRun, VersionGate, check_asset_versions,
 };
 use rivers_core::concurrency::fail_unlaunched_run;
 use rivers_core::execution::plan::ExecutionPlan;
-use rivers_core::storage::ScopedStorageHandle;
 use rivers_core::storage::any::AnyStorage;
+use rivers_core::storage::{PartitionKey, ScopedStorageHandle};
 
 use crate::errors::{AssetMigrationPendingError, AssetVersionMismatchError};
+use crate::partitions::PartitionsDefinition;
 use crate::repository::resolved_node::ResolvedNode;
 use crate::runtime::io_rt;
 
@@ -38,7 +39,7 @@ pub(crate) fn code_versions(
         .filter_map(|(name, node)| Some((name.clone(), declared_version(node)?)))
         .collect();
     let mut migrations = HashMap::new();
-    let mut partitioned = HashSet::new();
+    let mut partitions = HashMap::new();
     for (name, node) in node_map {
         let ResolvedNode::Asset(asset) = node else {
             continue;
@@ -46,8 +47,8 @@ pub(crate) fn code_versions(
         if asset.remote.is_some() {
             continue;
         }
-        if node.partitions_def().is_some() {
-            partitioned.insert(name.clone());
+        if let Some(def) = node.partitions_def() {
+            partitions.insert(name.clone(), code_partitions(def));
         }
         let steps: Vec<DeclaredMigration> = asset
             .migrations
@@ -57,13 +58,38 @@ pub(crate) fn code_versions(
                 kind: m.kind,
                 breaking: m.breaking,
                 start_at: m.start_at,
+                partitions: m
+                    .partitions
+                    .as_ref()
+                    .map(|keys| keys.iter().map(PartitionKey::from).collect()),
             })
             .collect();
         if !steps.is_empty() {
             migrations.insert(name.clone(), steps);
         }
     }
-    CodeVersions::new(graph, declared).with_migrations(migrations, partitioned)
+    CodeVersions::new(graph, declared).with_migrations(migrations, partitions)
+}
+
+/// `def`, with the keys of each static dimension of a multi-partitions
+/// definition.
+fn code_partitions(def: &PartitionsDefinition) -> CodePartitions {
+    let static_keys = match def {
+        PartitionsDefinition::Multi { dimensions } => dimensions
+            .iter()
+            .filter_map(|(name, dimension)| match dimension {
+                PartitionsDefinition::Static { keys } => {
+                    Some((name.clone(), keys.iter().cloned().collect()))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
+    CodePartitions {
+        fingerprint: def.fingerprint(),
+        static_keys,
+    }
 }
 
 /// The run of `plan` as the gate sees it: the assets that the plan writes and

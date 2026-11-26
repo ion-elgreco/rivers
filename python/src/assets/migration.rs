@@ -9,6 +9,7 @@ use rivers_core::execution::retry::RetryRef;
 use rivers_core::storage::MigrationKind;
 
 use crate::errors::AssetDefinitionError;
+use crate::partitions::PyPartitionKey;
 
 /// The step that moves an asset's stored data from version `to - 1` to `to`.
 /// A bound function makes it a convert, `rebuild=True` a rebuild, and neither
@@ -24,6 +25,9 @@ pub struct PyAssetMigration {
     pub description: Option<String>,
     /// Nanoseconds since the epoch: the migration does not start before.
     pub start_at: Option<i64>,
+    /// The partitions that the migration fills when it changes the
+    /// partition keys; empty to start the asset empty.
+    pub partitions: Option<Vec<PyPartitionKey>>,
     pub func: Option<Py<PyAny>>,
     pub is_async: bool,
 }
@@ -62,8 +66,10 @@ impl PyAssetMigration {
 impl PyAssetMigration {
     #[new]
     #[pyo3(signature = (
-        to, *, breaking=true, rebuild=false, retry=None, description=None, start_at=None
+        to, *, breaking=true, rebuild=false, retry=None, description=None, start_at=None,
+        partitions=None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         to: i64,
         breaking: bool,
@@ -71,6 +77,7 @@ impl PyAssetMigration {
         retry: Option<Bound<'_, PyAny>>,
         description: Option<String>,
         start_at: Option<Bound<'_, PyAny>>,
+        partitions: Option<Vec<PyPartitionKey>>,
     ) -> PyResult<Self> {
         Ok(Self {
             to,
@@ -79,6 +86,7 @@ impl PyAssetMigration {
             retry: crate::retry::extract_retry_ref(retry)?,
             description,
             start_at: start_at.map(|at| start_at_ns(to, &at)).transpose()?,
+            partitions,
             func: None,
             is_async: false,
         })
@@ -108,6 +116,7 @@ impl PyAssetMigration {
             retry: self.retry.clone(),
             description: self.description.clone(),
             start_at: self.start_at,
+            partitions: self.partitions.clone(),
             func: Some(func),
             is_async,
         })
@@ -140,6 +149,13 @@ impl PyAssetMigration {
             .and_then(|at| Timestamp::from_nanosecond(i128::from(at)).ok())
     }
 
+    /// The partitions that the migration fills when it changes the
+    /// partition keys.
+    #[getter]
+    fn partitions(&self) -> Option<Vec<PyPartitionKey>> {
+        self.partitions.clone()
+    }
+
     /// `convert` with a function, `rebuild` with `rebuild=True`, else
     /// `version_only`.
     #[getter(kind)]
@@ -170,6 +186,7 @@ impl PyAssetMigration {
             retry,
             description,
             start_at,
+            partitions,
             func,
             is_async,
         } = self;
@@ -195,6 +212,7 @@ impl PyAssetMigration {
                 retry,
                 description.clone(),
                 *start_at,
+                partitions.clone(),
                 func.as_ref().map(|f| f.clone_ref(py)),
                 *is_async,
             ),
@@ -210,6 +228,7 @@ type MigrationParts = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    Option<Vec<PyPartitionKey>>,
     Option<Py<PyAny>>,
     bool,
 );
@@ -217,6 +236,7 @@ type MigrationParts = (
 /// Rebuild an `AssetMigration` from `__reduce__`'s parts. The constructor
 /// can't carry the bound function.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 pub fn _reconstruct_asset_migration(
     to: i64,
     breaking: bool,
@@ -224,6 +244,7 @@ pub fn _reconstruct_asset_migration(
     retry: Option<String>,
     description: Option<String>,
     start_at: Option<i64>,
+    partitions: Option<Vec<PyPartitionKey>>,
     func: Option<Py<PyAny>>,
     is_async: bool,
 ) -> PyResult<PyAssetMigration> {
@@ -243,6 +264,7 @@ pub fn _reconstruct_asset_migration(
         retry,
         description,
         start_at,
+        partitions,
         func,
         is_async,
     })
@@ -260,6 +282,9 @@ pub(crate) struct ResolvedMigration {
     pub retry: Option<RetryRef>,
     /// Nanoseconds since the epoch: the migration does not start before.
     pub start_at: Option<i64>,
+    /// The partitions that the migration fills when it changes the
+    /// partition keys.
+    pub partitions: Option<Vec<PyPartitionKey>>,
 }
 
 impl ResolvedMigration {
@@ -272,6 +297,7 @@ impl ResolvedMigration {
             is_async: m.is_async,
             retry: m.retry.clone(),
             start_at: m.start_at,
+            partitions: m.partitions.clone(),
         }
     }
 
@@ -284,6 +310,7 @@ impl ResolvedMigration {
             is_async: self.is_async,
             retry: self.retry.clone(),
             start_at: self.start_at,
+            partitions: self.partitions.clone(),
         }
     }
 }
@@ -326,6 +353,12 @@ pub(crate) fn check_migrations(
                 "migration to version {to} has no function, so it takes no retry=: a rebuild \
                  runs the asset's own function with the asset's retry, and a version-only \
                  migration runs nothing"
+            )));
+        }
+        if m.kind() == MigrationKind::VersionOnly && m.partitions.is_some() {
+            return Err(error(format!(
+                "migration to version {to} only records the version, so it takes no \
+                 partitions=: it fills no partition"
             )));
         }
     }

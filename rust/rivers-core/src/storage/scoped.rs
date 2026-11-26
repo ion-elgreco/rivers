@@ -582,6 +582,17 @@ impl<'a, S: PerCodeLocationStorage + ?Sized> ScopedStorage<'a, S> {
 
 /// Per-CL methods that need to reach the unscoped `StorageBackend` KV API.
 impl<'a, S: StorageBackend + ?Sized> ScopedStorage<'a, S> {
+    /// Cancel a run that has not started: `Queued` or `NotStarted` to
+    /// `Canceled`. `Ok(false)` when it has started or ended.
+    pub async fn cancel_queued_run(&self, run_id: &str) -> Result<bool> {
+        self.backend.cancel_queued_run(run_id).await
+    }
+
+    /// Cancel a backfill; see [`StorageBackend::cancel_backfill`].
+    pub async fn cancel_backfill(&self, backfill_id: &str) -> Result<BackfillStatus> {
+        self.backend.cancel_backfill(backfill_id).await
+    }
+
     /// Compute staleness for every asset in this code location.
     pub async fn compute_staleness(
         &self,

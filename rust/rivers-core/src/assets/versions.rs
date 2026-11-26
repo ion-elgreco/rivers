@@ -12,7 +12,8 @@ use super::graph::{AssetGraph, GraphTopology, NodeKind};
 use super::partition_change::{describe_change, partitions_to_fill, same_keys};
 use super::partitions_fingerprint::{KeyList, PartitionsFingerprint};
 use crate::storage::{
-    AssetVersionRecord, AssetVersionState, MigrationKind, ScopedStorage, StorageBackend,
+    AssetVersionRecord, AssetVersionState, MigrationKind, PartitionKey, ScopedStorage,
+    StorageBackend,
 };
 use crate::util::now_ts;
 
@@ -203,7 +204,8 @@ pub async fn register_asset_versions<S: StorageBackend>(
     Ok(())
 }
 
-fn parse_partitions(partitions: Option<&str>) -> Result<Option<PartitionsFingerprint>> {
+/// The partitions definition that a version row stores, as JSON.
+pub(crate) fn parse_partitions(partitions: Option<&str>) -> Result<Option<PartitionsFingerprint>> {
     partitions
         .map(serde_json::from_str)
         .transpose()
@@ -619,7 +621,7 @@ pub async fn check_asset_versions<S: StorageBackend>(
 
 /// A migration that the code declares: the step of an asset's stored data
 /// to version `to`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredMigration {
     pub to: u32,
     pub kind: MigrationKind,
@@ -627,6 +629,33 @@ pub struct DeclaredMigration {
     pub breaking: bool,
     /// Nanoseconds since the epoch: the migration does not start before.
     pub start_at: Option<i64>,
+    /// The partitions that the step fills when it changes the partition keys;
+    /// empty to start the asset empty. `None`: rivers finds them.
+    pub partitions: Option<Vec<PartitionKey>>,
+}
+
+/// The partitions definition of an asset in the code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodePartitions {
+    pub fingerprint: PartitionsFingerprint,
+    /// The keys of each static dimension of a multi-partitions definition,
+    /// by its name.
+    pub static_keys: HashMap<String, HashSet<String>>,
+}
+
+/// Whether the step of the migration in `row` to version `to` changes the
+/// partition keys of the stored data to the code's definition `code`. Only
+/// the step to the target version changes them.
+pub fn changes_keys(
+    row: &AssetVersionRecord,
+    to: u32,
+    code: Option<&PartitionsFingerprint>,
+) -> Result<bool> {
+    if row.target_version != Some(to) {
+        return Ok(false);
+    }
+    let before = parse_partitions(row.partitions.as_deref())?;
+    Ok(!same_keys(before.as_ref(), code))
 }
 
 /// What the gate and the migration loop need from the code of a code
@@ -637,7 +666,7 @@ pub struct CodeVersions {
     declared: HashMap<String, u32>,
     reads: HashMap<String, Vec<String>>,
     migrations: HashMap<String, Vec<DeclaredMigration>>,
-    partitioned: HashSet<String>,
+    partitions: HashMap<String, CodePartitions>,
 }
 
 impl CodeVersions {
@@ -657,16 +686,16 @@ impl CodeVersions {
         }
     }
 
-    /// The same, with the migrations of each asset and the assets that have
-    /// partitions.
+    /// The same, with the migrations of each asset and the partitions
+    /// definition of each asset that has partitions.
     pub fn with_migrations(
         self,
         migrations: HashMap<String, Vec<DeclaredMigration>>,
-        partitioned: HashSet<String>,
+        partitions: HashMap<String, CodePartitions>,
     ) -> Self {
         Self {
             migrations,
-            partitioned,
+            partitions,
             ..self
         }
     }
@@ -678,16 +707,29 @@ impl CodeVersions {
     }
 
     /// The migration of `key` to version `to`.
-    pub fn migration(&self, key: &str, to: u32) -> Option<DeclaredMigration> {
+    pub fn migration(&self, key: &str, to: u32) -> Option<&DeclaredMigration> {
         self.migrations
             .get(key)?
             .iter()
             .find(|migration| migration.to == to)
-            .copied()
     }
 
     pub fn is_partitioned(&self, key: &str) -> bool {
-        self.partitioned.contains(key)
+        self.partitions.contains_key(key)
+    }
+
+    /// The partitions definition of `key`: `None` for an asset without
+    /// partitions.
+    pub fn partitions(&self, key: &str) -> Option<&CodePartitions> {
+        self.partitions.get(key)
+    }
+
+    /// The partitions definition of `key` as a version row stores it.
+    pub fn partitions_json(&self, key: &str) -> Result<Option<String>> {
+        self.partitions(key)
+            .map(|partitions| serde_json::to_string(&partitions.fingerprint))
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// When the migration in `row` starts, by this code: the latest start
@@ -1423,6 +1465,7 @@ mod tests {
             kind: MigrationKind::VersionOnly,
             breaking: true,
             start_at,
+            partitions: None,
         };
         let code = CodeVersions::new(&graph(), HashMap::from([("orders".to_string(), 4)]))
             .with_migrations(
@@ -1430,7 +1473,7 @@ mod tests {
                     "orders".to_string(),
                     vec![step(2, Some(PASSED)), step(3, Some(LATER)), step(4, None)],
                 )]),
-                HashSet::new(),
+                HashMap::new(),
             );
         let pending = |applied, target| AssetVersionRecord {
             target_version: Some(target),
